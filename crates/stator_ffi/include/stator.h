@@ -12,6 +12,72 @@
 #include <stdlib.h>
 
 /**
+ * Stable classification of a Stator engine error or message.
+ *
+ * Mirrors the structural categories embedders care about — JavaScript
+ * built-in error kinds, internal engine errors, termination, and unknown.
+ * Backed by a C `int`-shaped enum so the discriminants are stable across
+ * the C ABI and can be compared by value from C/C++.
+ *
+ * New variants may be appended in future versions; embedders should treat
+ * unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+ */
+typedef enum StatorMessageKind {
+  /**
+   * No classification available.
+   */
+  StatorMessageKindUnknown = 0,
+  /**
+   * JavaScript `SyntaxError`, or a parse/compile error from the engine
+   * front-end.
+   */
+  StatorMessageKindSyntax = 1,
+  /**
+   * JavaScript `TypeError`.
+   */
+  StatorMessageKindType = 2,
+  /**
+   * JavaScript `RangeError`.
+   */
+  StatorMessageKindRange = 3,
+  /**
+   * JavaScript `ReferenceError`.
+   */
+  StatorMessageKindReference = 4,
+  /**
+   * JavaScript `URIError`.
+   */
+  StatorMessageKindURI = 5,
+  /**
+   * WebAssembly compilation, instantiation, or execution failure.
+   */
+  StatorMessageKindWasm = 6,
+  /**
+   * An internal engine error (`stator_jse::error::StatorError::Internal`)
+   * or a programmer-induced FFI misuse (e.g. null source pointer).
+   */
+  StatorMessageKindInternal = 7,
+  /**
+   * Script execution was interrupted by an explicit termination request
+   * (`stator_isolate_terminate_execution` or equivalent).
+   */
+  StatorMessageKindTermination = 8,
+  /**
+   * An uncaught JavaScript exception value that does not map to one of
+   * the structured kinds above.
+   */
+  StatorMessageKindJsException = 9,
+  /**
+   * The engine ran out of heap memory.
+   */
+  StatorMessageKindOutOfMemory = 10,
+  /**
+   * A sandbox bounds-check violation.
+   */
+  StatorMessageKindSandboxViolation = 11,
+} StatorMessageKind;
+
+/**
  * Host-visible Promise rejection event kind.
  */
 typedef enum StatorPromiseRejectionEventKind {
@@ -143,6 +209,33 @@ typedef struct StatorHandleScope StatorHandleScope;
  * multiple threads requires external synchronisation.
  */
 typedef struct StatorIsolate StatorIsolate;
+
+/**
+ * An opaque structured message describing an engine error.
+ *
+ * Carries the information embedders need to surface a Stator failure
+ * without parsing the human-readable text:
+ *
+ * - **kind** — a [`StatorMessageKind`] classifying the error.
+ * - **text** — the engine's UTF-8 message string.
+ * - **resource_name** — the script's resource URL when the message was
+ *   produced during script execution, otherwise `None`.
+ * - **line / column** — script position when available.  Currently not
+ *   populated by the engine; getters return `false` so callers can detect
+ *   the missing data rather than treat a zero as truthful.
+ * - **terminated** — `true` when the message was raised because execution
+ *   was being terminated (see [`StatorMessageKind::StatorMessageKindTermination`]).
+ *
+ * Created internally by the engine and exposed via:
+ * - [`stator_isolate_take_pending_message`] (ownership transfer)
+ * - [`stator_isolate_peek_pending_message`] (borrowed view)
+ * - [`stator_try_catch_message`] (borrowed view, valid for the lifetime of
+ *   the try-catch scope)
+ *
+ * Ownership-transferred messages must be freed with
+ * [`stator_message_destroy`].
+ */
+typedef struct StatorMessage StatorMessage;
 
 /**
  * An opaque handle to a JavaScript object.
@@ -2064,6 +2157,142 @@ int32_t stator_object_template_internal_field_count(const struct StatorObjectTem
 struct StatorObject *stator_object_template_new_instance(const struct StatorObjectTemplate *tmpl);
 
 /**
+ * Return the structured [`StatorMessageKind`] of `msg`.
+ *
+ * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+ *
+ * # Safety
+ * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ */
+enum StatorMessageKind stator_message_kind(const struct StatorMessage *msg);
+
+/**
+ * Return a null-terminated UTF-8 description of `msg`, or null when `msg`
+ * is null.
+ *
+ * The returned pointer is borrowed: it is valid as long as `msg` is alive
+ * and must not be freed by the caller.
+ *
+ * # Safety
+ * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ */
+const char *stator_message_text(const struct StatorMessage *msg);
+
+/**
+ * Return the script resource name associated with `msg`, or null when no
+ * resource name was attached (e.g. for embedder-thrown exceptions) or
+ * `msg` is null.
+ *
+ * The returned pointer is borrowed: it is valid as long as `msg` is alive
+ * and must not be freed by the caller.
+ *
+ * # Safety
+ * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ */
+const char *stator_message_resource_name(const struct StatorMessage *msg);
+
+/**
+ * If `msg` carries a 1-based line number, write it into `*out_line` and
+ * return `true`; otherwise leave `*out_line` untouched and return `false`.
+ *
+ * Returns `false` when `msg` or `out_line` is null.  Callers must treat a
+ * `false` return as "line is unknown" rather than assuming zero.
+ *
+ * # Safety
+ * - `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ * - `out_line`, when non-null, must be aligned and valid for a write of an
+ *   `i32`.
+ */
+bool stator_message_get_line(const struct StatorMessage *msg, int32_t *out_line);
+
+/**
+ * If `msg` carries a 1-based column number, write it into `*out_column`
+ * and return `true`; otherwise leave `*out_column` untouched and return
+ * `false`.
+ *
+ * Returns `false` when `msg` or `out_column` is null.  Callers must treat
+ * a `false` return as "column is unknown" rather than assuming zero.
+ *
+ * # Safety
+ * - `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ * - `out_column`, when non-null, must be aligned and valid for a write of
+ *   an `i32`.
+ */
+bool stator_message_get_column(const struct StatorMessage *msg, int32_t *out_column);
+
+/**
+ * Return `true` if `msg` was produced because execution was being
+ * terminated.  Returns `false` when `msg` is null.
+ *
+ * # Safety
+ * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+ */
+bool stator_message_terminated(const struct StatorMessage *msg);
+
+/**
+ * Destroy a [`StatorMessage`] previously transferred to the embedder by
+ * [`stator_isolate_take_pending_message`].
+ *
+ * Does nothing when `msg` is null.  Borrowed pointers returned by
+ * `_peek_` / `_try_catch_message` must NOT be passed to this function;
+ * they remain owned by the isolate / try-catch scope.
+ *
+ * # Safety
+ * `msg` must be either null or a pointer obtained from
+ * [`stator_isolate_take_pending_message`] and not previously destroyed.
+ */
+void stator_message_destroy(struct StatorMessage *msg);
+
+/**
+ * Borrow the structured pending message on `isolate`, or return null when
+ * none is set.
+ *
+ * The returned pointer is owned by the isolate and remains valid only
+ * until the next call that mutates the pending exception slot
+ * (`stator_isolate_throw_exception`, `stator_isolate_clear_pending_exception`,
+ * `stator_isolate_take_pending_message`, script execution, or a
+ * try-catch scope capturing the exception).
+ *
+ * # Safety
+ * `isolate` must be either null or a valid pointer to a live
+ * [`StatorIsolate`].
+ */
+const struct StatorMessage *stator_isolate_peek_pending_message(const struct StatorIsolate *isolate);
+
+/**
+ * Take ownership of the structured pending message on `isolate`.
+ *
+ * Returns null when `isolate` is null or no structured message is
+ * available.  The caller owns the returned pointer and must eventually
+ * pass it to [`stator_message_destroy`].
+ *
+ * This does NOT clear the pending exception value; callers that want to
+ * fully consume the exception should also call
+ * [`stator_isolate_clear_pending_exception`] (and `stator_value_destroy`
+ * on the result).
+ *
+ * # Safety
+ * `isolate` must be either null or a valid pointer to a live
+ * [`StatorIsolate`].
+ */
+struct StatorMessage *stator_isolate_take_pending_message(struct StatorIsolate *isolate);
+
+/**
+ * Return the structured [`StatorMessageKind`] of `script`'s compile error,
+ * or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+ * is null.
+ *
+ * Parse and bytecode-generator failures are classified as
+ * [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+ * is classified as [`StatorMessageKind::StatorMessageKindInternal`].
+ *
+ * # Safety
+ * `script` must be either null or a valid pointer to a live
+ * [`StatorScript`].
+ */
+enum StatorMessageKind stator_script_error_kind(const struct StatorScript *script);
+
+/**
  * Create a new try-catch scope on `isolate`.
  *
  * Returns a null pointer if `isolate` is null.  The caller must eventually
@@ -2096,6 +2325,20 @@ bool stator_try_catch_has_caught(struct StatorTryCatch *tc);
  * `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
  */
 struct StatorValue *stator_try_catch_exception(const struct StatorTryCatch *tc);
+
+/**
+ * Return a borrowed structured message describing the caught exception,
+ * or null when none was caught or no structured information is available
+ * (e.g. an embedder-thrown raw exception value).
+ *
+ * The returned pointer is owned by the try-catch scope and remains valid
+ * until [`stator_try_catch_reset`] or [`stator_try_catch_destroy`] is
+ * called.  The caller must NOT pass it to [`stator_message_destroy`].
+ *
+ * # Safety
+ * `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+ */
+const struct StatorMessage *stator_try_catch_message(const struct StatorTryCatch *tc);
 
 /**
  * Reset the try-catch scope, clearing any caught exception.

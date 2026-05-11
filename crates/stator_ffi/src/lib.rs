@@ -63,6 +63,13 @@ pub struct StatorIsolate {
     /// Whether `pending_exception` is owned by the FFI layer and should be
     /// destroyed when a try-catch scope clears it.
     pending_exception_owned: bool,
+    /// Structured classification of the pending exception, populated by FFI
+    /// script execution when an interpreter or compile error crosses the
+    /// boundary.  Embedders read it through [`StatorMessage`] APIs and may
+    /// inspect it without disturbing `pending_exception`.  `None` when no
+    /// structured information is available (e.g. an embedder-thrown raw
+    /// exception value).
+    pending_message: Option<Box<StatorMessage>>,
     /// The innermost active [`StatorHandleScope`] on this isolate, or null if
     /// no scope is currently open.  This forms a linked list via each scope's
     /// `previous` field.
@@ -105,6 +112,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         current_context: std::ptr::null_mut(),
         pending_exception: None,
         pending_exception_owned: false,
+        pending_message: None,
         active_handle_scope: std::ptr::null_mut(),
         jit_disabled: false,
         terminating: AtomicBool::new(false),
@@ -395,6 +403,11 @@ pub unsafe extern "C" fn stator_isolate_clear_pending_exception(
             .take()
             .unwrap_or(std::ptr::null_mut());
         isolate_ref.pending_exception_owned = false;
+        // The structured message is bound to the exception value; clearing
+        // the exception also clears the message.  Embedders that want to
+        // preserve it across `clear_pending_exception` should call
+        // `stator_isolate_take_pending_message` first.
+        isolate_ref.pending_message = None;
         exception
     }
 }
@@ -2130,6 +2143,11 @@ pub struct StatorScript {
     bytecodes: Option<Rc<BytecodeArray>>,
     /// Human-readable error message, or `None` on success.
     error: Option<CString>,
+    /// Structured classification of the compile error, or
+    /// [`StatorMessageKind::StatorMessageKindUnknown`] when the script compiled successfully
+    /// or the error was not classified.  Parse/compile failures are
+    /// classified as [`StatorMessageKind::StatorMessageKindSyntax`].
+    error_kind: StatorMessageKind,
     /// Resource name (typically a filename or URL) supplied by the embedder
     /// via [`stator_script_set_origin`].  Mirrors `v8::ScriptOrigin::ResourceName`.
     /// Used by browser embedders to attribute stack frames to source files.
@@ -2165,6 +2183,7 @@ pub unsafe extern "C" fn stator_script_compile(
         let script = Box::new(StatorScript {
             bytecodes: None,
             error: Some(c"null source pointer".into()),
+            error_kind: StatorMessageKind::StatorMessageKindInternal,
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
@@ -2180,6 +2199,7 @@ pub unsafe extern "C" fn stator_script_compile(
             let script = Box::new(StatorScript {
                 bytecodes: None,
                 error: Some(c"source is not valid UTF-8".into()),
+                error_kind: StatorMessageKind::StatorMessageKindInternal,
                 resource_name: None,
                 resource_line_offset: 0,
                 resource_column_offset: 0,
@@ -2196,6 +2216,7 @@ pub unsafe extern "C" fn stator_script_compile(
         Ok(bytecodes) => Box::new(StatorScript {
             bytecodes: Some(Rc::new(bytecodes)),
             error: None,
+            error_kind: StatorMessageKind::StatorMessageKindUnknown,
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
@@ -2206,6 +2227,7 @@ pub unsafe extern "C" fn stator_script_compile(
             Box::new(StatorScript {
                 bytecodes: None,
                 error: Some(cstring),
+                error_kind: StatorMessageKind::StatorMessageKindSyntax,
                 resource_name: None,
                 resource_line_offset: 0,
                 resource_column_offset: 0,
@@ -2611,9 +2633,17 @@ unsafe fn set_pending_exception(
         Some(exception)
     };
     isolate_ref.pending_exception_owned = owns_exception && !exception.is_null();
+    // Any new pending exception invalidates a previously-cached structured
+    // message.  `record_script_error` re-populates it for engine-raised
+    // errors; embedder-thrown values leave it cleared.
+    isolate_ref.pending_message = None;
 }
 
-unsafe fn record_script_error(ctx: *mut StatorContext, error: &stator_jse::error::StatorError) {
+unsafe fn record_script_error(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+    error: &stator_jse::error::StatorError,
+) {
     if ctx.is_null() {
         return;
     }
@@ -2629,6 +2659,29 @@ unsafe fn record_script_error(ctx: *mut StatorContext, error: &stator_jse::error
     };
     // SAFETY: `exception` was allocated for ownership by the pending exception.
     unsafe { set_pending_exception(isolate, exception, true) };
+
+    // Build the structured message *after* `set_pending_exception`, which
+    // unconditionally clears any previously-stored message.
+    let terminating = !isolate.is_null()
+        // SAFETY: `isolate` is valid.
+        && unsafe { (*isolate).terminating.load(Ordering::Relaxed) };
+    let kind = message_kind_for_error(error, terminating);
+    let resource_name = if script.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `script` (when non-null) is valid.
+        unsafe { (*script).resource_name.clone() }
+    };
+    let structured = Box::new(StatorMessage {
+        kind,
+        text: CString::new(message).unwrap_or_else(|_| c"script error".into()),
+        resource_name,
+        line: None,
+        column: None,
+        terminated: terminating || matches!(kind, StatorMessageKind::StatorMessageKindTermination),
+    });
+    // SAFETY: `isolate` is valid.
+    unsafe { (*isolate).pending_message = Some(structured) };
 }
 
 unsafe fn context_is_execution_terminating(ctx: *mut StatorContext) -> bool {
@@ -2813,8 +2866,8 @@ pub unsafe extern "C" fn stator_script_run(
             Box::into_raw(Box::new(StatorValue { inner, isolate }))
         }
         Err(error) => {
-            // SAFETY: `ctx` is valid for the duration of script execution.
-            unsafe { record_script_error(ctx, &error) };
+            // SAFETY: `ctx` and `script` are valid for the duration of script execution.
+            unsafe { record_script_error(script, ctx, &error) };
             std::ptr::null_mut()
         }
     }
@@ -2838,8 +2891,8 @@ pub unsafe extern "C" fn stator_script_run_no_result(
     match unsafe { run_script_no_result_inner(script, ctx) } {
         Some(Ok(_)) => true,
         Some(Err(error)) => {
-            // SAFETY: `ctx` is valid for the duration of script execution.
-            unsafe { record_script_error(ctx, &error) };
+            // SAFETY: `ctx` and `script` are valid for the duration of script execution.
+            unsafe { record_script_error(script, ctx, &error) };
             false
         }
         None => false,
@@ -4089,6 +4142,345 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
     }))
 }
 
+// ── Structured messages ──────────────────────────────────────────────────────
+
+/// Stable classification of a Stator engine error or message.
+///
+/// Mirrors the structural categories embedders care about — JavaScript
+/// built-in error kinds, internal engine errors, termination, and unknown.
+/// Backed by a C `int`-shaped enum so the discriminants are stable across
+/// the C ABI and can be compared by value from C/C++.
+///
+/// New variants may be appended in future versions; embedders should treat
+/// unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorMessageKind {
+    /// No classification available.
+    StatorMessageKindUnknown = 0,
+    /// JavaScript `SyntaxError`, or a parse/compile error from the engine
+    /// front-end.
+    StatorMessageKindSyntax = 1,
+    /// JavaScript `TypeError`.
+    StatorMessageKindType = 2,
+    /// JavaScript `RangeError`.
+    StatorMessageKindRange = 3,
+    /// JavaScript `ReferenceError`.
+    StatorMessageKindReference = 4,
+    /// JavaScript `URIError`.
+    StatorMessageKindURI = 5,
+    /// WebAssembly compilation, instantiation, or execution failure.
+    StatorMessageKindWasm = 6,
+    /// An internal engine error (`stator_jse::error::StatorError::Internal`)
+    /// or a programmer-induced FFI misuse (e.g. null source pointer).
+    StatorMessageKindInternal = 7,
+    /// Script execution was interrupted by an explicit termination request
+    /// (`stator_isolate_terminate_execution` or equivalent).
+    StatorMessageKindTermination = 8,
+    /// An uncaught JavaScript exception value that does not map to one of
+    /// the structured kinds above.
+    StatorMessageKindJsException = 9,
+    /// The engine ran out of heap memory.
+    StatorMessageKindOutOfMemory = 10,
+    /// A sandbox bounds-check violation.
+    StatorMessageKindSandboxViolation = 11,
+}
+
+/// An opaque structured message describing an engine error.
+///
+/// Carries the information embedders need to surface a Stator failure
+/// without parsing the human-readable text:
+///
+/// - **kind** — a [`StatorMessageKind`] classifying the error.
+/// - **text** — the engine's UTF-8 message string.
+/// - **resource_name** — the script's resource URL when the message was
+///   produced during script execution, otherwise `None`.
+/// - **line / column** — script position when available.  Currently not
+///   populated by the engine; getters return `false` so callers can detect
+///   the missing data rather than treat a zero as truthful.
+/// - **terminated** — `true` when the message was raised because execution
+///   was being terminated (see [`StatorMessageKind::StatorMessageKindTermination`]).
+///
+/// Created internally by the engine and exposed via:
+/// - [`stator_isolate_take_pending_message`] (ownership transfer)
+/// - [`stator_isolate_peek_pending_message`] (borrowed view)
+/// - [`stator_try_catch_message`] (borrowed view, valid for the lifetime of
+///   the try-catch scope)
+///
+/// Ownership-transferred messages must be freed with
+/// [`stator_message_destroy`].
+pub struct StatorMessage {
+    kind: StatorMessageKind,
+    text: CString,
+    resource_name: Option<CString>,
+    line: Option<i32>,
+    column: Option<i32>,
+    terminated: bool,
+}
+
+// SAFETY: `StatorMessage` contains only owned heap data; it is `Send` on the
+// same single-threaded model as `StatorIsolate`.
+unsafe impl Send for StatorMessage {}
+
+/// Classify a [`stator_jse::error::StatorError`] into a stable
+/// [`StatorMessageKind`].
+///
+/// `terminating` is the isolate-wide termination flag observed at the point
+/// of error capture; when set it upgrades a generic `Internal("script
+/// execution terminated")` (or any error raised while the flag is live) to
+/// [`StatorMessageKind::StatorMessageKindTermination`].
+fn message_kind_for_error(
+    error: &stator_jse::error::StatorError,
+    terminating: bool,
+) -> StatorMessageKind {
+    use stator_jse::error::StatorError as E;
+    if terminating {
+        return StatorMessageKind::StatorMessageKindTermination;
+    }
+    match error {
+        E::OutOfMemory => StatorMessageKind::StatorMessageKindOutOfMemory,
+        E::TypeError(_) => StatorMessageKind::StatorMessageKindType,
+        E::SyntaxError(_) => StatorMessageKind::StatorMessageKindSyntax,
+        E::ReferenceError(_) => StatorMessageKind::StatorMessageKindReference,
+        E::RangeError(_) => StatorMessageKind::StatorMessageKindRange,
+        E::URIError(_) => StatorMessageKind::StatorMessageKindURI,
+        E::WasmError(_) => StatorMessageKind::StatorMessageKindWasm,
+        E::JsException(_) => StatorMessageKind::StatorMessageKindJsException,
+        E::SandboxViolation { .. } => StatorMessageKind::StatorMessageKindSandboxViolation,
+        E::Internal(msg) => {
+            // The FFI layer raises this synthetic error when termination is
+            // detected before script entry; classify it as Termination even
+            // when the atomic flag has since been cleared.
+            if msg == "script execution terminated" {
+                StatorMessageKind::StatorMessageKindTermination
+            } else {
+                StatorMessageKind::StatorMessageKindInternal
+            }
+        }
+        E::DebuggerPaused { .. } => StatorMessageKind::StatorMessageKindInternal,
+    }
+}
+
+/// Return the structured [`StatorMessageKind`] of `msg`.
+///
+/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+///
+/// # Safety
+/// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_kind(msg: *const StatorMessage) -> StatorMessageKind {
+    if msg.is_null() {
+        return StatorMessageKind::StatorMessageKindUnknown;
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    unsafe { (*msg).kind }
+}
+
+/// Return a null-terminated UTF-8 description of `msg`, or null when `msg`
+/// is null.
+///
+/// The returned pointer is borrowed: it is valid as long as `msg` is alive
+/// and must not be freed by the caller.
+///
+/// # Safety
+/// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_text(msg: *const StatorMessage) -> *const c_char {
+    if msg.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    unsafe { (*msg).text.as_ptr() }
+}
+
+/// Return the script resource name associated with `msg`, or null when no
+/// resource name was attached (e.g. for embedder-thrown exceptions) or
+/// `msg` is null.
+///
+/// The returned pointer is borrowed: it is valid as long as `msg` is alive
+/// and must not be freed by the caller.
+///
+/// # Safety
+/// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_resource_name(msg: *const StatorMessage) -> *const c_char {
+    if msg.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    match unsafe { &(*msg).resource_name } {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// If `msg` carries a 1-based line number, write it into `*out_line` and
+/// return `true`; otherwise leave `*out_line` untouched and return `false`.
+///
+/// Returns `false` when `msg` or `out_line` is null.  Callers must treat a
+/// `false` return as "line is unknown" rather than assuming zero.
+///
+/// # Safety
+/// - `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+/// - `out_line`, when non-null, must be aligned and valid for a write of an
+///   `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_get_line(
+    msg: *const StatorMessage,
+    out_line: *mut i32,
+) -> bool {
+    if msg.is_null() || out_line.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    match unsafe { (*msg).line } {
+        Some(line) => {
+            // SAFETY: caller guarantees `out_line` is valid for one i32.
+            unsafe { *out_line = line };
+            true
+        }
+        None => false,
+    }
+}
+
+/// If `msg` carries a 1-based column number, write it into `*out_column`
+/// and return `true`; otherwise leave `*out_column` untouched and return
+/// `false`.
+///
+/// Returns `false` when `msg` or `out_column` is null.  Callers must treat
+/// a `false` return as "column is unknown" rather than assuming zero.
+///
+/// # Safety
+/// - `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+/// - `out_column`, when non-null, must be aligned and valid for a write of
+///   an `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_get_column(
+    msg: *const StatorMessage,
+    out_column: *mut i32,
+) -> bool {
+    if msg.is_null() || out_column.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    match unsafe { (*msg).column } {
+        Some(column) => {
+            // SAFETY: caller guarantees `out_column` is valid for one i32.
+            unsafe { *out_column = column };
+            true
+        }
+        None => false,
+    }
+}
+
+/// Return `true` if `msg` was produced because execution was being
+/// terminated.  Returns `false` when `msg` is null.
+///
+/// # Safety
+/// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_terminated(msg: *const StatorMessage) -> bool {
+    if msg.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `msg` is valid.
+    unsafe { (*msg).terminated }
+}
+
+/// Destroy a [`StatorMessage`] previously transferred to the embedder by
+/// [`stator_isolate_take_pending_message`].
+///
+/// Does nothing when `msg` is null.  Borrowed pointers returned by
+/// `_peek_` / `_try_catch_message` must NOT be passed to this function;
+/// they remain owned by the isolate / try-catch scope.
+///
+/// # Safety
+/// `msg` must be either null or a pointer obtained from
+/// [`stator_isolate_take_pending_message`] and not previously destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_message_destroy(msg: *mut StatorMessage) {
+    if !msg.is_null() {
+        // SAFETY: caller guarantees `msg` came from `Box::into_raw`.
+        drop(unsafe { Box::from_raw(msg) });
+    }
+}
+
+/// Borrow the structured pending message on `isolate`, or return null when
+/// none is set.
+///
+/// The returned pointer is owned by the isolate and remains valid only
+/// until the next call that mutates the pending exception slot
+/// (`stator_isolate_throw_exception`, `stator_isolate_clear_pending_exception`,
+/// `stator_isolate_take_pending_message`, script execution, or a
+/// try-catch scope capturing the exception).
+///
+/// # Safety
+/// `isolate` must be either null or a valid pointer to a live
+/// [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_peek_pending_message(
+    isolate: *const StatorIsolate,
+) -> *const StatorMessage {
+    if isolate.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    match unsafe { &(*isolate).pending_message } {
+        Some(msg) => msg.as_ref() as *const StatorMessage,
+        None => std::ptr::null(),
+    }
+}
+
+/// Take ownership of the structured pending message on `isolate`.
+///
+/// Returns null when `isolate` is null or no structured message is
+/// available.  The caller owns the returned pointer and must eventually
+/// pass it to [`stator_message_destroy`].
+///
+/// This does NOT clear the pending exception value; callers that want to
+/// fully consume the exception should also call
+/// [`stator_isolate_clear_pending_exception`] (and `stator_value_destroy`
+/// on the result).
+///
+/// # Safety
+/// `isolate` must be either null or a valid pointer to a live
+/// [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_take_pending_message(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorMessage {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    match unsafe { (*isolate).pending_message.take() } {
+        Some(msg) => Box::into_raw(msg),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Return the structured [`StatorMessageKind`] of `script`'s compile error,
+/// or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+/// is null.
+///
+/// Parse and bytecode-generator failures are classified as
+/// [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+/// is classified as [`StatorMessageKind::StatorMessageKindInternal`].
+///
+/// # Safety
+/// `script` must be either null or a valid pointer to a live
+/// [`StatorScript`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_error_kind(
+    script: *const StatorScript,
+) -> StatorMessageKind {
+    if script.is_null() {
+        return StatorMessageKind::StatorMessageKindUnknown;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    unsafe { (*script).error_kind }
+}
+
 // ── TryCatch ─────────────────────────────────────────────────────────────────
 
 /// An opaque try-catch scope for catching exceptions across the FFI boundary.
@@ -4108,6 +4500,11 @@ pub struct StatorTryCatch {
     owns_exception: bool,
     /// Whether an exception has been caught by this scope.
     has_caught: bool,
+    /// Structured classification of the captured exception, taken from the
+    /// isolate's `pending_message` slot when the scope first observes a
+    /// pending exception.  `None` when no structured information is
+    /// available (embedder-thrown raw values).
+    caught_message: Option<Box<StatorMessage>>,
 }
 
 // SAFETY: `StatorTryCatch` is single-threaded; same rationale as `StatorIsolate`.
@@ -4130,6 +4527,7 @@ pub unsafe extern "C" fn stator_try_catch_new(isolate: *mut StatorIsolate) -> *m
         exception: std::ptr::null_mut(),
         owns_exception: false,
         has_caught: false,
+        caught_message: None,
     }))
 }
 
@@ -4158,6 +4556,9 @@ pub unsafe extern "C" fn stator_try_catch_has_caught(tc: *mut StatorTryCatch) ->
             tc_ref.exception = exc;
             tc_ref.owns_exception = unsafe { (*tc_ref.isolate).pending_exception_owned };
             unsafe { (*tc_ref.isolate).pending_exception_owned = false };
+            // SAFETY: isolate is valid; transfer the structured message
+            // alongside the exception value.
+            tc_ref.caught_message = unsafe { (*tc_ref.isolate).pending_message.take() };
             tc_ref.has_caught = true;
         }
     }
@@ -4181,6 +4582,30 @@ pub unsafe extern "C" fn stator_try_catch_exception(tc: *const StatorTryCatch) -
     unsafe { (*tc).exception }
 }
 
+/// Return a borrowed structured message describing the caught exception,
+/// or null when none was caught or no structured information is available
+/// (e.g. an embedder-thrown raw exception value).
+///
+/// The returned pointer is owned by the try-catch scope and remains valid
+/// until [`stator_try_catch_reset`] or [`stator_try_catch_destroy`] is
+/// called.  The caller must NOT pass it to [`stator_message_destroy`].
+///
+/// # Safety
+/// `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_message(
+    tc: *const StatorTryCatch,
+) -> *const StatorMessage {
+    if tc.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `tc` is valid.
+    match unsafe { &(*tc).caught_message } {
+        Some(msg) => msg.as_ref() as *const StatorMessage,
+        None => std::ptr::null(),
+    }
+}
+
 /// Reset the try-catch scope, clearing any caught exception.
 ///
 /// After this call, [`stator_try_catch_has_caught`] returns `false` and
@@ -4199,6 +4624,7 @@ pub unsafe extern "C" fn stator_try_catch_reset(tc: *mut StatorTryCatch) {
             (*tc).exception = std::ptr::null_mut();
             (*tc).owns_exception = false;
             (*tc).has_caught = false;
+            (*tc).caught_message = None;
         }
     }
 }
@@ -10191,6 +10617,312 @@ mod tests {
             assert!(stator_script_get_resource_name(std::ptr::null()).is_null());
             assert_eq!(stator_script_get_line_offset(std::ptr::null()), 0);
             assert_eq!(stator_script_get_column_offset(std::ptr::null()), 0);
+        }
+    }
+
+    // ── Structured message FFI ────────────────────────────────────────────
+
+    #[test]
+    fn test_message_null_safety() {
+        // All accessors on a null message return the documented defaults
+        // rather than dereferencing.
+        // SAFETY: passing null is documented as supported by every accessor.
+        unsafe {
+            assert_eq!(
+                stator_message_kind(std::ptr::null()),
+                StatorMessageKind::StatorMessageKindUnknown
+            );
+            assert!(stator_message_text(std::ptr::null()).is_null());
+            assert!(stator_message_resource_name(std::ptr::null()).is_null());
+            let mut line: i32 = 42;
+            assert!(!stator_message_get_line(std::ptr::null(), &mut line));
+            assert_eq!(line, 42, "out param must not be touched on null msg");
+            let mut col: i32 = 7;
+            assert!(!stator_message_get_column(std::ptr::null(), &mut col));
+            assert_eq!(col, 7, "out param must not be touched on null msg");
+            assert!(!stator_message_terminated(std::ptr::null()));
+            stator_message_destroy(std::ptr::null_mut());
+            assert!(stator_isolate_peek_pending_message(std::ptr::null()).is_null());
+            assert!(stator_isolate_take_pending_message(std::ptr::null_mut()).is_null());
+            assert!(stator_try_catch_message(std::ptr::null()).is_null());
+            assert_eq!(
+                stator_script_error_kind(std::ptr::null()),
+                StatorMessageKind::StatorMessageKindUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn test_message_get_line_column_rejects_null_out_param() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"throw 1;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+        }
+        let msg = unsafe { stator_isolate_peek_pending_message(iso.as_ptr()) };
+        assert!(!msg.is_null());
+        unsafe {
+            assert!(!stator_message_get_line(msg, std::ptr::null_mut()));
+            assert!(!stator_message_get_column(msg, std::ptr::null_mut()));
+            stator_isolate_clear_pending_exception(iso.as_ptr());
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_syntax_error_classified() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // A malformed source surfaces as a parse error.
+        let src = b"function (";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+        unsafe {
+            // Existing string-based API still works.
+            assert!(!stator_script_get_error(script).is_null());
+            // New structured API classifies it as a syntax error.
+            assert_eq!(
+                stator_script_error_kind(script),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_success_has_unknown_kind() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"1 + 1";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            assert!(stator_script_get_error(script).is_null());
+            assert_eq!(
+                stator_script_error_kind(script),
+                StatorMessageKind::StatorMessageKindUnknown
+            );
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_null_source_classified_internal() {
+        let script = unsafe { stator_script_compile(std::ptr::null_mut(), std::ptr::null(), 0) };
+        assert!(!script.is_null());
+        unsafe {
+            assert!(!stator_script_get_error(script).is_null());
+            assert_eq!(
+                stator_script_error_kind(script),
+                StatorMessageKind::StatorMessageKindInternal
+            );
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_pending_message_runtime_type_error() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"var notFn = 1; notFn();";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        // Attach a resource name so the message surfaces it.
+        let resource = c"file:///t.js";
+        unsafe { stator_script_set_origin(script, resource.as_ptr(), 0, 0) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            let msg = stator_isolate_peek_pending_message(iso.as_ptr());
+            assert!(!msg.is_null(), "structured message must be populated");
+            assert_eq!(
+                stator_message_kind(msg),
+                StatorMessageKind::StatorMessageKindType
+            );
+            let text = stator_message_text(msg);
+            assert!(!text.is_null());
+            let text_s = CStr::from_ptr(text).to_string_lossy();
+            assert!(text_s.contains("TypeError"), "message text was {text_s:?}");
+            let rname = stator_message_resource_name(msg);
+            assert!(!rname.is_null());
+            assert_eq!(CStr::from_ptr(rname).to_string_lossy(), "file:///t.js");
+            // No line/column info plumbed yet — getters must report missing
+            // data rather than fabricate zeros.
+            let mut line: i32 = -1;
+            assert!(!stator_message_get_line(msg, &mut line));
+            assert_eq!(line, -1);
+            let mut col: i32 = -1;
+            assert!(!stator_message_get_column(msg, &mut col));
+            assert_eq!(col, -1);
+            assert!(!stator_message_terminated(msg));
+
+            // Clean up: drain the pending exception/message.
+            let exc = stator_isolate_clear_pending_exception(iso.as_ptr());
+            if !exc.is_null() {
+                stator_value_destroy(exc);
+            }
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_pending_message_classifies_js_exception_throw() {
+        // `throw 1;` propagates as an uncaught JS exception value; the
+        // engine classifies the resulting structured error as JsException.
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"throw 1;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            let msg = stator_isolate_peek_pending_message(iso.as_ptr());
+            assert!(!msg.is_null());
+            assert_eq!(
+                stator_message_kind(msg),
+                StatorMessageKind::StatorMessageKindJsException
+            );
+            let exc = stator_isolate_clear_pending_exception(iso.as_ptr());
+            if !exc.is_null() {
+                stator_value_destroy(exc);
+            }
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_pending_message_termination_classified() {
+        // Terminating execution before script entry surfaces a Termination
+        // message and `terminated == true`.
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"42";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            // SAFETY: `iso` is valid.
+            (*iso.as_ptr()).terminating.store(true, Ordering::Relaxed);
+            assert!(stator_script_run(script, ctx).is_null());
+            let msg = stator_isolate_peek_pending_message(iso.as_ptr());
+            assert!(!msg.is_null());
+            assert_eq!(
+                stator_message_kind(msg),
+                StatorMessageKind::StatorMessageKindTermination
+            );
+            assert!(stator_message_terminated(msg));
+            // Reset the termination flag so the destructor path doesn't keep
+            // poisoning subsequent helpers.
+            (*iso.as_ptr()).terminating.store(false, Ordering::Relaxed);
+            let exc = stator_isolate_clear_pending_exception(iso.as_ptr());
+            if !exc.is_null() {
+                stator_value_destroy(exc);
+            }
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_take_pending_message_transfers_ownership() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"throw 1;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            // peek returns Some, take returns the same data and clears the slot.
+            assert!(!stator_isolate_peek_pending_message(iso.as_ptr()).is_null());
+            let owned = stator_isolate_take_pending_message(iso.as_ptr());
+            assert!(!owned.is_null());
+            assert!(stator_isolate_peek_pending_message(iso.as_ptr()).is_null());
+            // Owner can still read fields.
+            assert!(!stator_message_text(owned).is_null());
+            // Destroy via the dedicated API.
+            stator_message_destroy(owned);
+            // The pending exception value itself is still set and must be
+            // released through the existing API.
+            let exc = stator_isolate_clear_pending_exception(iso.as_ptr());
+            if !exc.is_null() {
+                stator_value_destroy(exc);
+            }
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_try_catch_message_for_script_run_error() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let src = b"var x = 1; x();";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let resource = c"file:///tc.js";
+        unsafe { stator_script_set_origin(script, resource.as_ptr(), 0, 0) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            assert!(stator_try_catch_has_caught(tc));
+            let msg = stator_try_catch_message(tc);
+            assert!(!msg.is_null());
+            assert_eq!(
+                stator_message_kind(msg),
+                StatorMessageKind::StatorMessageKindType
+            );
+            let rname = stator_message_resource_name(msg);
+            assert!(!rname.is_null());
+            assert_eq!(CStr::from_ptr(rname).to_string_lossy(), "file:///tc.js");
+            // Reset clears the structured message as well.
+            stator_try_catch_reset(tc);
+            assert!(stator_try_catch_message(tc).is_null());
+
+            stator_try_catch_destroy(tc);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_try_catch_message_absent_for_embedder_thrown_exception() {
+        // Embedder-thrown raw values have no structured classification.
+        let iso = IsolateGuard::new();
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let exc = unsafe { stator_value_new_string(iso.as_ptr(), c"oops".as_ptr(), 4) };
+        unsafe { stator_isolate_throw_exception(iso.as_ptr(), exc) };
+        unsafe {
+            assert!(stator_try_catch_has_caught(tc));
+            assert!(stator_try_catch_message(tc).is_null());
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(exc);
+        }
+    }
+
+    #[test]
+    fn test_clear_pending_exception_drops_message() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"throw 1;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            assert!(!stator_isolate_peek_pending_message(iso.as_ptr()).is_null());
+            let exc = stator_isolate_clear_pending_exception(iso.as_ptr());
+            if !exc.is_null() {
+                stator_value_destroy(exc);
+            }
+            assert!(stator_isolate_peek_pending_message(iso.as_ptr()).is_null());
+            stator_script_free(script);
+            stator_context_destroy(ctx);
         }
     }
 }
