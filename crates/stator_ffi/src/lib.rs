@@ -7337,6 +7337,275 @@ pub unsafe extern "C" fn stator_event_loop_pending_task_count(el: *mut StatorEve
     unsafe { &*el }.inner.pending_task_count()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Inspector (in-process CDP) FFI
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The inspector surface is **additive** — it does not modify or replace the
+// existing standalone WebSocket CDP server.  Embedders that prefer to drive
+// the CDP dispatcher directly (e.g. Edge DevTools) construct a
+// `StatorInspector` from a `StatorContext`, open one or more
+// `StatorInspectorSession`s, and exchange JSON-RPC frames synchronously.
+//
+// # Threading and lifetime
+//
+// All inspector calls are **synchronous**, **non-reentrant**, and must be
+// issued from the isolate's owning thread.  `ctx` must outlive the
+// inspector and the inspector must outlive every session it produces.
+// Pointers returned by `stator_inspector_next_message` are engine-owned
+// and remain valid only until the next inspector call on the same session.
+
+/// Opaque in-process inspector handle.
+///
+/// Owns a script registry and a set of sessions sharing a single
+/// [`StatorContext`]'s globals environment.
+pub struct StatorInspector {
+    inner: stator_jse::inspector::api::InProcessInspector,
+}
+
+/// Opaque inspector session handle.  Lifetime is bounded by the inspector
+/// that produced it; never freed directly by the embedder.
+pub struct StatorInspectorSession {
+    inner: *mut stator_jse::inspector::api::InProcessInspectorSession,
+}
+
+/// Build an inspector that shares its context's globals environment.
+///
+/// Returns a null pointer if `ctx` is null.  The returned pointer must
+/// eventually be released via [`stator_inspector_destroy`].
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - The returned inspector borrows `ctx`'s globals; `ctx` must outlive the
+///   inspector.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_create(ctx: *mut StatorContext) -> *mut StatorInspector {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let globals = unsafe { Rc::clone(&(*ctx).globals) };
+    Box::into_raw(Box::new(StatorInspector {
+        inner: stator_jse::inspector::api::InProcessInspector::new(globals),
+    }))
+}
+
+/// Destroy an inspector previously returned by [`stator_inspector_create`].
+///
+/// All sessions still open on this inspector are dropped first; any
+/// session handles previously returned by [`stator_inspector_connect`]
+/// become invalid immediately.  Passing a null pointer is a no-op.
+///
+/// # Safety
+/// `inspector` must be either null or a pointer previously returned by
+/// [`stator_inspector_create`] and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_destroy(inspector: *mut StatorInspector) {
+    if !inspector.is_null() {
+        // SAFETY: caller guarantees `inspector` is a live, unique pointer.
+        unsafe {
+            drop(Box::from_raw(inspector));
+        }
+    }
+}
+
+/// Open a new CDP session against `inspector` and return a borrowed,
+/// engine-owned handle.
+///
+/// `session_id` is an opaque embedder-supplied identifier echoed back via
+/// future inspector APIs; it has no protocol-level meaning.  Returns a
+/// null pointer if `inspector` is null.
+///
+/// # Safety
+/// `inspector` must be a non-null pointer returned by
+/// [`stator_inspector_create`].  The returned session pointer is owned by
+/// the inspector and must not be freed by the embedder; release it via
+/// [`stator_inspector_disconnect`] instead.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_connect(
+    inspector: *mut StatorInspector,
+    session_id: u32,
+) -> *mut StatorInspectorSession {
+    if inspector.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    let inner_session = unsafe { (*inspector).inner.connect(session_id) }
+        as *mut stator_jse::inspector::api::InProcessInspectorSession;
+    Box::into_raw(Box::new(StatorInspectorSession {
+        inner: inner_session,
+    }))
+}
+
+/// Close a session previously returned by [`stator_inspector_connect`].
+///
+/// The underlying session is removed from the inspector and dropped.  The
+/// outer handle is also freed.  Either argument being null is a no-op.
+///
+/// # Safety
+/// - `inspector` must be either null or a live [`StatorInspector`] pointer.
+/// - `session` must be either null or a pointer returned by
+///   [`stator_inspector_connect`] on `inspector` and not yet disconnected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_disconnect(
+    inspector: *mut StatorInspector,
+    session: *mut StatorInspectorSession,
+) {
+    if inspector.is_null() || session.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees both pointers are valid.
+    unsafe {
+        let session_box = Box::from_raw(session);
+        (*inspector).inner.disconnect(session_box.inner);
+    }
+}
+
+/// Submit a JSON-RPC request `json` (`len` bytes, UTF-8) to `session`.
+///
+/// Returns `0` on success: the request parsed as JSON and a corresponding
+/// protocol response (plus any associated events) has been pushed onto the
+/// session's outbox.  In-protocol errors such as "unknown method" or
+/// missing parameters also return `0`; the error payload is delivered via
+/// the outbox.
+///
+/// Returns `-1` if `session` or `json` is null, or if `len` overflows.
+/// Returns `1` if `json` is not a valid UTF-8 JSON-RPC request; a
+/// parse-error response is still pushed onto the outbox as a courtesy to
+/// the caller.
+///
+/// # Safety
+/// - `session` must be a non-null pointer returned by
+///   [`stator_inspector_connect`].
+/// - `json` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_dispatch(
+    session: *mut StatorInspectorSession,
+    json: *const c_char,
+    len: usize,
+) -> i32 {
+    if session.is_null() || json.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `json` is valid for `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    // SAFETY: caller guarantees `session` is a live FFI wrapper whose
+    // `inner` points to a session owned by the parent inspector.
+    let inner = unsafe { &mut *(*session).inner };
+    match inner.dispatch_json(text) {
+        stator_jse::inspector::cdp::DispatchOutcome::Ok => 0,
+        stator_jse::inspector::cdp::DispatchOutcome::ParseError => 1,
+    }
+}
+
+/// Number of protocol messages currently waiting in `session`'s outbox.
+///
+/// Returns `0` if `session` is null.
+///
+/// # Safety
+/// `session` must be either null or a non-null pointer returned by
+/// [`stator_inspector_connect`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_pending_count(
+    session: *const StatorInspectorSession,
+) -> usize {
+    if session.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `session` is a live wrapper.
+    let inner = unsafe { &*(*session).inner };
+    inner.pending_count()
+}
+
+/// Pop the oldest message from `session`'s outbox.
+///
+/// On success returns a non-null pointer to UTF-8 bytes (no trailing NUL)
+/// and writes the byte length to `*out_len`.  The returned pointer is
+/// engine-owned and remains valid until the **next inspector call on this
+/// session** (any of `stator_inspector_dispatch`,
+/// `stator_inspector_next_message`, or `stator_inspector_disconnect`).
+///
+/// Returns a null pointer when the outbox is empty.  When `session` is
+/// null, returns null without touching `out_len`.  When `out_len` is null,
+/// the function still returns the data pointer and the caller must
+/// supply the length itself (e.g. via [`stator_inspector_pending_count`]
+/// before the call); however, this mode is discouraged.
+///
+/// # Safety
+/// - `session` must be either null or a non-null pointer returned by
+///   [`stator_inspector_connect`].
+/// - `out_len` must be either null or a valid writable `size_t` location.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_next_message(
+    session: *mut StatorInspectorSession,
+    out_len: *mut usize,
+) -> *const u8 {
+    if session.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `session` is a live wrapper.
+    let inner = unsafe { &mut *(*session).inner };
+    match inner.take_next_bytes() {
+        Some(bytes) => {
+            if !out_len.is_null() {
+                // SAFETY: caller guarantees `out_len` is writable when non-null.
+                unsafe {
+                    *out_len = bytes.len();
+                }
+            }
+            bytes.as_ptr()
+        }
+        None => {
+            if !out_len.is_null() {
+                // SAFETY: caller guarantees `out_len` is writable when non-null.
+                unsafe {
+                    *out_len = 0;
+                }
+            }
+            std::ptr::null()
+        }
+    }
+}
+
+/// Register `source` (`source_len` UTF-8 bytes) with `inspector`'s script
+/// registry and emit `Debugger.scriptParsed` to every session whose
+/// `Debugger` domain has been enabled.
+///
+/// Returns the freshly assigned, monotonically increasing non-zero script
+/// ID, or `0` on error (null inspector, null source, or invalid UTF-8).
+/// The `_script` argument is currently retained for future linkage between
+/// the script handle and the inspector's registry; passing null is
+/// allowed.
+///
+/// # Safety
+/// - `inspector` must be a non-null pointer returned by
+///   [`stator_inspector_create`].
+/// - `source` must be valid for reads of `source_len` bytes.
+/// - `_script` is treated as opaque and may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_register_script(
+    inspector: *mut StatorInspector,
+    _script: *mut StatorScript,
+    source: *const c_char,
+    source_len: usize,
+) -> u32 {
+    if inspector.is_null() || source.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `source` is valid for `source_len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, source_len) };
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.register_script(text) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12980,5 +13249,214 @@ mod tests {
             stator_function_template_destroy(tmpl);
             stator_context_destroy(ctx);
         }
+    }
+
+    // ── Inspector FFI ────────────────────────────────────────────────────────
+
+    /// Drain `session`'s outbox into owned `String`s, asserting that each
+    /// pop invalidates the previous engine-owned buffer (cached pointer
+    /// changes after every successful `next_message`).
+    fn drain_inspector_session(session: *mut StatorInspectorSession) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut len: usize = 0;
+            let ptr = unsafe { stator_inspector_next_message(session, &mut len) };
+            if ptr.is_null() {
+                assert_eq!(len, 0, "out_len must be zeroed when no message available");
+                break;
+            }
+            // SAFETY: returned pointer is valid until the next inspector
+            // call on this session; we copy out before re-entering.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            out.push(String::from_utf8(bytes).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn test_inspector_create_null_ctx_returns_null() {
+        let p = unsafe { stator_inspector_create(std::ptr::null_mut()) };
+        assert!(p.is_null());
+        // Destroy on null is a no-op.
+        unsafe { stator_inspector_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_inspector_runtime_enable_emits_event_and_ack() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        assert!(!inspector.is_null());
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+        assert!(!session.is_null());
+
+        let req = br#"{"id":7,"method":"Runtime.enable","params":{}}"#;
+        let rc =
+            unsafe { stator_inspector_dispatch(session, req.as_ptr() as *const c_char, req.len()) };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { stator_inspector_pending_count(session) }, 2);
+
+        let msgs = drain_inspector_session(session);
+        assert_eq!(msgs.len(), 2);
+        let event: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Runtime.executionContextCreated");
+        let ack: serde_json::Value = serde_json::from_str(&msgs[1]).unwrap();
+        assert_eq!(ack["id"], 7u64);
+        assert!(ack.get("error").is_none());
+
+        // After draining, pending count is zero.
+        assert_eq!(unsafe { stator_inspector_pending_count(session) }, 0);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_unknown_method_returns_protocol_error_ok_status() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+
+        let req = br#"{"id":5,"method":"NoSuch.method","params":{}}"#;
+        let rc =
+            unsafe { stator_inspector_dispatch(session, req.as_ptr() as *const c_char, req.len()) };
+        assert_eq!(rc, 0, "unknown method must report transport success");
+        let msgs = drain_inspector_session(session);
+        assert_eq!(msgs.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert!(resp.get("error").is_some(), "domain error expected");
+        assert_eq!(resp["id"], 5u64);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_malformed_json_returns_transport_error() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+
+        let req = b"not-json";
+        let rc =
+            unsafe { stator_inspector_dispatch(session, req.as_ptr() as *const c_char, req.len()) };
+        assert_eq!(rc, 1, "malformed JSON must surface as transport error");
+        let msgs = drain_inspector_session(session);
+        assert_eq!(msgs.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(resp["error"]["code"], -32700);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_dispatch_rejects_null_pointers() {
+        let rc = unsafe { stator_inspector_dispatch(std::ptr::null_mut(), std::ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+        let rc2 = unsafe { stator_inspector_dispatch(session, std::ptr::null(), 0) };
+        assert_eq!(rc2, -1);
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_next_message_null_safety() {
+        let mut len: usize = 99;
+        let p = unsafe { stator_inspector_next_message(std::ptr::null_mut(), &mut len) };
+        assert!(p.is_null());
+        // Null session must not touch out_len.
+        assert_eq!(len, 99);
+        assert_eq!(
+            unsafe { stator_inspector_pending_count(std::ptr::null()) },
+            0
+        );
+    }
+
+    #[test]
+    fn test_inspector_register_script_fans_out_to_debugger_enabled() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let s1 = unsafe { stator_inspector_connect(inspector, 1) };
+        let s2 = unsafe { stator_inspector_connect(inspector, 2) };
+
+        // s1 enables Debugger; s2 does not.
+        let enable = br#"{"id":1,"method":"Debugger.enable","params":{}}"#;
+        let rc = unsafe {
+            stator_inspector_dispatch(s1, enable.as_ptr() as *const c_char, enable.len())
+        };
+        assert_eq!(rc, 0);
+        // Drain the ack on s1 so the outbox starts empty before
+        // register_script runs.
+        let _ = drain_inspector_session(s1);
+
+        let src = b"var x = 1;";
+        let id = unsafe {
+            stator_inspector_register_script(
+                inspector,
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert_eq!(id, 1);
+
+        assert_eq!(unsafe { stator_inspector_pending_count(s1) }, 1);
+        assert_eq!(unsafe { stator_inspector_pending_count(s2) }, 0);
+
+        let msgs = drain_inspector_session(s1);
+        let ev: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(ev["method"], "Debugger.scriptParsed");
+        assert_eq!(ev["params"]["scriptId"], "1");
+
+        // Second call increments the ID.
+        let id2 = unsafe {
+            stator_inspector_register_script(
+                inspector,
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert_eq!(id2, 2);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, s1);
+            stator_inspector_disconnect(inspector, s2);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_register_script_rejects_null_inspector() {
+        let id = unsafe {
+            stator_inspector_register_script(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                b"x".as_ptr() as *const c_char,
+                1,
+            )
+        };
+        assert_eq!(id, 0);
     }
 }

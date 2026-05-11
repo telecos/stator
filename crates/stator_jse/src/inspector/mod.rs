@@ -27,3 +27,11 @@ pub mod heap_snapshot;
 /// Sampling CPU profiler: SIGPROF/setitimer-based sample collection and CDP
 /// `Profiler.Profile` emission.
 pub mod profiler;
+
+/// Transport-agnostic in-process inspector handle and session container.
+///
+/// Embedders construct an [`api::InProcessInspector`] alongside their
+/// context to drive the CDP dispatcher without standing up a WebSocket
+/// server.  This is the engine-side type behind the FFI
+/// `StatorInspector` handle.
+pub mod api;

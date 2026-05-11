@@ -43,6 +43,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
@@ -56,7 +57,7 @@ use crate::error::StatorResult;
 use crate::inspector::console::drain_messages;
 use crate::inspector::heap_snapshot::HeapSnapshotBuilder;
 use crate::inspector::profiler::CpuProfiler;
-use crate::interpreter::{Interpreter, InterpreterFrame};
+use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use crate::objects::value::JsValue;
 use crate::parser;
 
@@ -99,83 +100,115 @@ pub struct CdpEvent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Session
+// Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A single CDP debugging session backed by one WebSocket connection.
+/// Outcome of attempting to process a JSON-RPC text frame via
+/// [`CdpDispatcher::dispatch_json`].
 ///
-/// `CdpSession` owns the WebSocket stream and maintains the per-session
-/// globals environment used by `Runtime.evaluate`.
-pub struct CdpSession {
-    ws: WebSocket<TcpStream>,
-    globals: Rc<RefCell<crate::interpreter::GlobalEnv>>,
+/// The dispatcher always writes exactly one protocol reply (and any
+/// associated events) into its outbox.  Transport-level failures — currently
+/// limited to malformed JSON — are surfaced through this enum so that
+/// transports can distinguish them from in-protocol errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// The text frame parsed as a JSON-RPC request and was dispatched.  A
+    /// response message (success or in-protocol error) has been pushed onto
+    /// the outbox.
+    Ok,
+    /// The text frame failed to parse as JSON.  A JSON-RPC parse-error
+    /// response has been pushed onto the outbox as a courtesy to the peer.
+    ParseError,
+}
+
+/// Transport-agnostic CDP protocol dispatcher.
+///
+/// `CdpDispatcher` owns the per-session protocol state (globals environment,
+/// profiler, domain enable flags, breakpoint counter) and an outbox of
+/// serialised messages waiting to be sent to the peer.  Protocol responses
+/// and events are pushed into the outbox rather than written directly to a
+/// transport, so the same dispatcher can drive a WebSocket session or an
+/// in-process FFI session interchangeably.
+///
+/// This type is not thread-safe.  All methods must be invoked from the
+/// owning isolate thread.
+pub struct CdpDispatcher {
+    globals: Rc<RefCell<GlobalEnv>>,
     profiler: CpuProfiler,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
+    /// Whether the `Debugger` domain has been enabled by the client.  Used
+    /// to gate fan-out of `Debugger.scriptParsed` events.
+    debugger_enabled: bool,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
+    /// FIFO queue of serialised JSON-RPC messages waiting to be drained by
+    /// the transport (or by an embedder via the in-process inspector API).
+    outbox: VecDeque<String>,
 }
 
-impl CdpSession {
-    /// Wrap an accepted WebSocket connection in a new session.
-    fn new(ws: WebSocket<TcpStream>) -> Self {
+impl CdpDispatcher {
+    /// Build a dispatcher with a fresh, isolated globals environment.
+    pub fn new() -> Self {
+        Self::with_globals(Rc::new(RefCell::new(GlobalEnv::new())))
+    }
+
+    /// Build a dispatcher that shares the supplied globals environment with
+    /// its owner (typically a [`StatorContext`](crate::inspector) FFI handle).
+    pub fn with_globals(globals: Rc<RefCell<GlobalEnv>>) -> Self {
         Self {
-            ws,
-            globals: Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new())),
+            globals,
             profiler: CpuProfiler::new(),
             console_enabled: false,
+            debugger_enabled: false,
             next_breakpoint_id: 1,
+            outbox: VecDeque::new(),
         }
     }
 
-    /// Drive the session until the client disconnects or a fatal error occurs.
+    /// Number of serialised messages currently waiting in the outbox.
+    pub fn pending_count(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// Pop the oldest outbox message, if any.
+    pub fn take_next(&mut self) -> Option<String> {
+        self.outbox.pop_front()
+    }
+
+    /// Push a pre-serialised event/response onto the outbox.  Used by
+    /// inspector producers (e.g. `Debugger.scriptParsed` fan-out) that
+    /// emit events outside a request/response turn.
+    pub fn push_raw(&mut self, message: String) {
+        self.outbox.push_back(message);
+    }
+
+    /// Returns `true` if the `Debugger` domain is currently enabled.
+    pub fn debugger_enabled(&self) -> bool {
+        self.debugger_enabled
+    }
+
+    /// Parse `text` as a JSON-RPC request, dispatch it, and enqueue the
+    /// reply (and any pre-reply events) on the outbox.
     ///
-    /// Each incoming text frame is parsed as a [`CdpRequest`], dispatched to
-    /// the appropriate domain handler, and a [`CdpResponse`] (or error) is
-    /// sent back.
-    pub fn run(&mut self) -> io::Result<()> {
-        loop {
-            let msg = match self.ws.read() {
-                Ok(m) => m,
-                Err(tungstenite::Error::ConnectionClosed)
-                | Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
-                Err(tungstenite::Error::Io(e)) => return Err(e),
-                Err(e) => {
-                    return Err(io::Error::other(e.to_string()));
-                }
-            };
-
-            match msg {
-                Message::Text(text) => {
-                    let reply = self.handle_text(&text);
-                    self.ws
-                        .send(Message::Text(reply.into()))
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                }
-                Message::Close(_) => return Ok(()),
-                // Ignore binary / ping / pong frames.
-                _ => {}
-            }
-        }
-    }
-
-    /// Parse `text` as a [`CdpRequest`] and return a serialised reply.
-    fn handle_text(&mut self, text: &str) -> String {
+    /// Returns [`DispatchOutcome::ParseError`] when `text` is not a valid
+    /// JSON-RPC request; a JSON-RPC parse-error response is still pushed
+    /// onto the outbox so the peer can correlate the failure.
+    pub fn dispatch_json(&mut self, text: &str) -> DispatchOutcome {
         let request: CdpRequest = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
-                // Return a JSON parse error.
                 let resp = json!({
                     "id": 0u64,
                     "error": {"code": -32700, "message": format!("Parse error: {e}")}
                 });
-                return resp.to_string();
+                self.outbox.push_back(resp.to_string());
+                return DispatchOutcome::ParseError;
             }
         };
 
         let id = request.id;
         let result = self.dispatch(&request);
-
         let resp = match result {
             Ok(value) => CdpResponse {
                 id,
@@ -191,11 +224,25 @@ impl CdpSession {
                 })),
             },
         };
-
-        serde_json::to_string(&resp).unwrap_or_else(|_| {
+        let serialised = serde_json::to_string(&resp).unwrap_or_else(|_| {
             json!({"id": id, "error": {"code": -32603, "message": "serialization error"}})
                 .to_string()
-        })
+        });
+        self.outbox.push_back(serialised);
+        DispatchOutcome::Ok
+    }
+
+    /// Push a CDP event of the form `{"method": method, "params": params}`
+    /// onto the outbox.  Best-effort: silently drops the event if it cannot
+    /// be serialised.
+    fn push_event(&mut self, method: &str, params: Value) {
+        let event = CdpEvent {
+            method: method.to_string(),
+            params,
+        };
+        if let Ok(s) = serde_json::to_string(&event) {
+            self.outbox.push_back(s);
+        }
     }
 
     /// Route a parsed request to the correct domain handler.
@@ -208,9 +255,12 @@ impl CdpSession {
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
 
             // ── Debugger ──────────────────────────────────────────────────
-            "Debugger.enable" => Ok(json!({
-                "debuggerId": "stator-debugger-0"
-            })),
+            "Debugger.enable" => {
+                self.debugger_enabled = true;
+                Ok(json!({
+                    "debuggerId": "stator-debugger-0"
+                }))
+            }
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
             "Debugger.resume" => Ok(json!({})),
@@ -247,10 +297,11 @@ impl CdpSession {
     // ── Runtime.enable ────────────────────────────────────────────────────────
 
     fn runtime_enable(&mut self) -> StatorResult<Value> {
-        // Emit executionContextCreated event (best-effort; ignore send failure).
-        let event = CdpEvent {
-            method: "Runtime.executionContextCreated".to_string(),
-            params: json!({
+        // Emit executionContextCreated event before the ack so the peer sees
+        // the context before the response is correlated.
+        self.push_event(
+            "Runtime.executionContextCreated",
+            json!({
                 "context": {
                     "id": 1,
                     "origin": "stator",
@@ -258,10 +309,7 @@ impl CdpSession {
                     "uniqueId": "1"
                 }
             }),
-        };
-        if let Ok(s) = serde_json::to_string(&event) {
-            let _ = self.ws.send(Message::Text(s.into()));
-        }
+        );
         Ok(json!({}))
     }
 
@@ -411,19 +459,16 @@ impl CdpSession {
 
         // Flush any buffered console messages as `Console.messageAdded` events.
         for msg in drain_messages() {
-            let event = json!({
-                "method": "Console.messageAdded",
-                "params": {
+            self.push_event(
+                "Console.messageAdded",
+                json!({
                     "message": {
                         "source": "console-api",
                         "level": msg.level.as_cdp_str(),
                         "text": msg.text,
                     }
-                }
-            });
-            if let Ok(s) = serde_json::to_string(&event) {
-                let _ = self.ws.send(Message::Text(s.into()));
-            }
+                }),
+            );
         }
 
         Ok(json!({}))
@@ -458,25 +503,19 @@ impl CdpSession {
         let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow().vars);
         let chunk = snapshot.to_json();
         // Emit the snapshot as an addHeapSnapshotChunk event.
-        let event = json!({
-            "method": "HeapProfiler.addHeapSnapshotChunk",
-            "params": { "chunk": chunk }
-        });
-        if let Ok(s) = serde_json::to_string(&event) {
-            let _ = self.ws.send(Message::Text(s.into()));
-        }
+        self.push_event(
+            "HeapProfiler.addHeapSnapshotChunk",
+            json!({ "chunk": chunk }),
+        );
         // Emit reportHeapSnapshotProgress to signal completion.
-        let done_event = json!({
-            "method": "HeapProfiler.reportHeapSnapshotProgress",
-            "params": {
+        self.push_event(
+            "HeapProfiler.reportHeapSnapshotProgress",
+            json!({
                 "done": snapshot.snapshot.node_count,
                 "total": snapshot.snapshot.node_count,
                 "finished": true
-            }
-        });
-        if let Ok(s) = serde_json::to_string(&done_event) {
-            let _ = self.ws.send(Message::Text(s.into()));
-        }
+            }),
+        );
         Ok(json!({}))
     }
 
@@ -497,6 +536,71 @@ impl CdpSession {
             .map(|r| json!({ "id": r.id, "size": r.size }))
             .collect();
         Ok(json!({ "stats": stats }))
+    }
+}
+
+impl Default for CdpDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket-backed session
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single CDP debugging session backed by one WebSocket connection.
+///
+/// `CdpSession` adapts the transport-agnostic [`CdpDispatcher`] to a
+/// WebSocket stream: it reads JSON-RPC text frames from the wire, hands
+/// them to the dispatcher, and drains the dispatcher's outbox back onto
+/// the wire after every frame.
+pub struct CdpSession {
+    ws: WebSocket<TcpStream>,
+    dispatcher: CdpDispatcher,
+}
+
+impl CdpSession {
+    /// Wrap an accepted WebSocket connection in a new session.
+    fn new(ws: WebSocket<TcpStream>) -> Self {
+        Self {
+            ws,
+            dispatcher: CdpDispatcher::new(),
+        }
+    }
+
+    /// Drive the session until the client disconnects or a fatal error occurs.
+    ///
+    /// Each incoming text frame is forwarded to the dispatcher; afterwards
+    /// any messages queued in the dispatcher's outbox (events emitted
+    /// before the ack plus the ack itself) are sent to the peer in FIFO
+    /// order.
+    pub fn run(&mut self) -> io::Result<()> {
+        loop {
+            let msg = match self.ws.read() {
+                Ok(m) => m,
+                Err(tungstenite::Error::ConnectionClosed)
+                | Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
+                Err(tungstenite::Error::Io(e)) => return Err(e),
+                Err(e) => {
+                    return Err(io::Error::other(e.to_string()));
+                }
+            };
+
+            match msg {
+                Message::Text(text) => {
+                    let _ = self.dispatcher.dispatch_json(&text);
+                    while let Some(out) = self.dispatcher.take_next() {
+                        self.ws
+                            .send(Message::Text(out.into()))
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                    }
+                }
+                Message::Close(_) => return Ok(()),
+                // Ignore binary / ping / pong frames.
+                _ => {}
+            }
+        }
     }
 }
 

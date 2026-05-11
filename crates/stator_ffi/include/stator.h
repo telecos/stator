@@ -286,6 +286,20 @@ typedef struct StatorFunctionTemplate StatorFunctionTemplate;
 typedef struct StatorHandleScope StatorHandleScope;
 
 /**
+ * Opaque in-process inspector handle.
+ *
+ * Owns a script registry and a set of sessions sharing a single
+ * [`StatorContext`]'s globals environment.
+ */
+typedef struct StatorInspector StatorInspector;
+
+/**
+ * Opaque inspector session handle.  Lifetime is bounded by the inspector
+ * that produced it; never freed directly by the embedder.
+ */
+typedef struct StatorInspectorSession StatorInspectorSession;
+
+/**
  * An opaque isolate handle.
  *
  * An isolate is an independent instance of the Stator engine with its own
@@ -3563,6 +3577,142 @@ bool stator_event_loop_is_idle(struct StatorEventLoop *el);
  * `el` must be a valid event loop pointer.
  */
 size_t stator_event_loop_pending_task_count(struct StatorEventLoop *el);
+
+/**
+ * Build an inspector that shares its context's globals environment.
+ *
+ * Returns a null pointer if `ctx` is null.  The returned pointer must
+ * eventually be released via [`stator_inspector_destroy`].
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - The returned inspector borrows `ctx`'s globals; `ctx` must outlive the
+ *   inspector.
+ */
+struct StatorInspector *stator_inspector_create(struct StatorContext *ctx);
+
+/**
+ * Destroy an inspector previously returned by [`stator_inspector_create`].
+ *
+ * All sessions still open on this inspector are dropped first; any
+ * session handles previously returned by [`stator_inspector_connect`]
+ * become invalid immediately.  Passing a null pointer is a no-op.
+ *
+ * # Safety
+ * `inspector` must be either null or a pointer previously returned by
+ * [`stator_inspector_create`] and not yet destroyed.
+ */
+void stator_inspector_destroy(struct StatorInspector *inspector);
+
+/**
+ * Open a new CDP session against `inspector` and return a borrowed,
+ * engine-owned handle.
+ *
+ * `session_id` is an opaque embedder-supplied identifier echoed back via
+ * future inspector APIs; it has no protocol-level meaning.  Returns a
+ * null pointer if `inspector` is null.
+ *
+ * # Safety
+ * `inspector` must be a non-null pointer returned by
+ * [`stator_inspector_create`].  The returned session pointer is owned by
+ * the inspector and must not be freed by the embedder; release it via
+ * [`stator_inspector_disconnect`] instead.
+ */
+struct StatorInspectorSession *stator_inspector_connect(struct StatorInspector *inspector,
+                                                        uint32_t session_id);
+
+/**
+ * Close a session previously returned by [`stator_inspector_connect`].
+ *
+ * The underlying session is removed from the inspector and dropped.  The
+ * outer handle is also freed.  Either argument being null is a no-op.
+ *
+ * # Safety
+ * - `inspector` must be either null or a live [`StatorInspector`] pointer.
+ * - `session` must be either null or a pointer returned by
+ *   [`stator_inspector_connect`] on `inspector` and not yet disconnected.
+ */
+void stator_inspector_disconnect(struct StatorInspector *inspector,
+                                 struct StatorInspectorSession *session);
+
+/**
+ * Submit a JSON-RPC request `json` (`len` bytes, UTF-8) to `session`.
+ *
+ * Returns `0` on success: the request parsed as JSON and a corresponding
+ * protocol response (plus any associated events) has been pushed onto the
+ * session's outbox.  In-protocol errors such as "unknown method" or
+ * missing parameters also return `0`; the error payload is delivered via
+ * the outbox.
+ *
+ * Returns `-1` if `session` or `json` is null, or if `len` overflows.
+ * Returns `1` if `json` is not a valid UTF-8 JSON-RPC request; a
+ * parse-error response is still pushed onto the outbox as a courtesy to
+ * the caller.
+ *
+ * # Safety
+ * - `session` must be a non-null pointer returned by
+ *   [`stator_inspector_connect`].
+ * - `json` must be valid for reads of `len` bytes.
+ */
+int32_t stator_inspector_dispatch(struct StatorInspectorSession *session,
+                                  const char *json,
+                                  size_t len);
+
+/**
+ * Number of protocol messages currently waiting in `session`'s outbox.
+ *
+ * Returns `0` if `session` is null.
+ *
+ * # Safety
+ * `session` must be either null or a non-null pointer returned by
+ * [`stator_inspector_connect`].
+ */
+size_t stator_inspector_pending_count(const struct StatorInspectorSession *session);
+
+/**
+ * Pop the oldest message from `session`'s outbox.
+ *
+ * On success returns a non-null pointer to UTF-8 bytes (no trailing NUL)
+ * and writes the byte length to `*out_len`.  The returned pointer is
+ * engine-owned and remains valid until the **next inspector call on this
+ * session** (any of `stator_inspector_dispatch`,
+ * `stator_inspector_next_message`, or `stator_inspector_disconnect`).
+ *
+ * Returns a null pointer when the outbox is empty.  When `session` is
+ * null, returns null without touching `out_len`.  When `out_len` is null,
+ * the function still returns the data pointer and the caller must
+ * supply the length itself (e.g. via [`stator_inspector_pending_count`]
+ * before the call); however, this mode is discouraged.
+ *
+ * # Safety
+ * - `session` must be either null or a non-null pointer returned by
+ *   [`stator_inspector_connect`].
+ * - `out_len` must be either null or a valid writable `size_t` location.
+ */
+const uint8_t *stator_inspector_next_message(struct StatorInspectorSession *session,
+                                             size_t *out_len);
+
+/**
+ * Register `source` (`source_len` UTF-8 bytes) with `inspector`'s script
+ * registry and emit `Debugger.scriptParsed` to every session whose
+ * `Debugger` domain has been enabled.
+ *
+ * Returns the freshly assigned, monotonically increasing non-zero script
+ * ID, or `0` on error (null inspector, null source, or invalid UTF-8).
+ * The `_script` argument is currently retained for future linkage between
+ * the script handle and the inspector's registry; passing null is
+ * allowed.
+ *
+ * # Safety
+ * - `inspector` must be a non-null pointer returned by
+ *   [`stator_inspector_create`].
+ * - `source` must be valid for reads of `source_len` bytes.
+ * - `_script` is treated as opaque and may be null.
+ */
+uint32_t stator_inspector_register_script(struct StatorInspector *inspector,
+                                          struct StatorScript *_script,
+                                          const char *source,
+                                          size_t source_len);
 
 #ifdef __cplusplus
 }  // extern "C"

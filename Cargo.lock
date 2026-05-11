@@ -1704,6 +1704,7 @@ version = "0.2.9"
 dependencies = [
  "cbindgen",
  "log",
+ "serde_json",
  "stator_jse",
 ]
 
