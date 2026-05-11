@@ -12,6 +12,59 @@
 #include <stdlib.h>
 
 /**
+ * Stable status code returned by typed-accessor and Maybe-style FFI entry
+ * points so that C callers can distinguish a missing value, an invalid
+ * argument, an unsupported operation, and a JavaScript exception without
+ * reaching for out-of-band channels.
+ *
+ * Variants:
+ * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+ *   out-pointer was written.
+ * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+ *   a structural "no" answer (e.g. property missing, type mismatch on a
+ *   typed get).  Out-pointers are left untouched or zero-cleared, never
+ *   carrying a stale value.
+ * * [`StatorStatusException`][Self::StatorStatusException] — the operation
+ *   raised (or captured) a JavaScript exception.  When applicable, the
+ *   isolate's pending exception is populated and can be inspected through
+ *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
+ * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+ *   required argument was null or otherwise malformed; nothing was mutated.
+ * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+ *   operation is well-formed but not yet implemented for this kind of
+ *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
+ *   discriminants are stable; embedders should treat unknown values as
+ *   `StatorStatusUnsupported`.
+ *
+ * Backed by a C `int`-shaped enum so the discriminants are stable across
+ * the C ABI and can be compared by value from C/C++.
+ */
+typedef enum StatorStatus {
+  /**
+   * Operation succeeded.
+   */
+  StatorStatusOk = 0,
+  /**
+   * Operation succeeded with a structural "no" answer (missing property,
+   * type mismatch on a typed accessor).
+   */
+  StatorStatusFalse = 1,
+  /**
+   * A JavaScript exception was raised or captured.  The isolate's pending
+   * exception is set when this is returned by a Maybe-style API.
+   */
+  StatorStatusException = 2,
+  /**
+   * At least one argument was null or malformed.
+   */
+  StatorStatusInvalidArg = 3,
+  /**
+   * The operation is not supported for this value/object kind.
+   */
+  StatorStatusUnsupported = 4,
+} StatorStatus;
+
+/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -243,6 +296,12 @@ typedef struct StatorMessage StatorMessage;
  * Created by [`stator_object_new`] and destroyed by [`stator_object_destroy`].
  * Named properties can be set and retrieved via [`stator_object_set`] and
  * [`stator_object_get`].
+ *
+ * The underlying [`JsObject`] storage is reference-counted, allowing the
+ * same object identity to be exposed through multiple FFI handles via
+ * [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
+ * through one handle are observed through all other handles that share the
+ * same backing storage.
  */
 typedef struct StatorObject StatorObject;
 
@@ -1879,6 +1938,308 @@ bool stator_value_to_boolean(const struct StatorValue *val);
  * pointer.
  */
 bool stator_value_strict_equals(const struct StatorValue *a, const struct StatorValue *b);
+
+/**
+ * Read the boolean value of `val` into `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript boolean.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ *   boolean.  `*out` is left untouched.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `out` must be either null or a valid pointer to a `bool`.
+ */
+enum StatorStatus stator_value_get_boolean(const struct StatorValue *val, bool *out);
+
+/**
+ * Read the numeric value of `val` into `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript number.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ *   number.  `*out` is left untouched.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `out` must be either null or a valid pointer to an `f64`.
+ */
+enum StatorStatus stator_value_get_number(const struct StatorValue *val, double *out);
+
+/**
+ * Read `val` as a signed 32-bit integer into `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+ *   range `[−2³¹, 2³¹−1]`; `*out` is set to the exact value.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+ *   exactly representable as an `i32` (non-number, fractional, ±Infinity,
+ *   `NaN`, or out of range).  `*out` is left untouched.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ *
+ * Mirrors the semantics of `v8::Value::Int32Value` for the success case but
+ * without the implicit `ToNumber` coercion — embedders that want the lossy
+ * truncating conversion should call [`stator_value_to_int32`] instead.
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `out` must be either null or a valid pointer to an `i32`.
+ */
+enum StatorStatus stator_value_get_int32(const struct StatorValue *val, int32_t *out);
+
+/**
+ * Read `val` as an unsigned 32-bit integer into `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+ *   range `[0, 2³²−1]`; `*out` is set to the exact value.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+ *   exactly representable as a `u32`.  `*out` is left untouched.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `out` must be either null or a valid pointer to a `u32`.
+ */
+enum StatorStatus stator_value_get_uint32(const struct StatorValue *val, uint32_t *out);
+
+/**
+ * Read the UTF-8 byte length of the string stored in `val` into `*out`.
+ *
+ * The returned length does **not** include a terminating null byte and is
+ * the count of raw UTF-8 bytes — sufficient for sizing a buffer passed to
+ * [`stator_value_write_string_utf8`].
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when `val` is a string; `*out` is the
+ *   byte length.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ *   string.  `*out` is left untouched.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `out` must be either null or a valid pointer to a `usize`.
+ */
+enum StatorStatus stator_value_get_string_utf8_length(const struct StatorValue *val, size_t *out);
+
+/**
+ * Copy the UTF-8 representation of the string stored in `val` into `buf`.
+ *
+ * The write APIs work in explicit byte counts: no implicit `strlen` is
+ * performed on the source side and no terminating null byte is appended to
+ * the destination.  This makes the API safe to use with input data that
+ * contains, or buffers that should accommodate, embedded NUL bytes.
+ *
+ * At most `buf_size` bytes are written.  If `buf_size` is smaller than the
+ * string's byte length the output is truncated; callers can size their
+ * buffer with [`stator_value_get_string_utf8_length`] and inspect
+ * `*written` to detect truncation.
+ *
+ * On success, `*written` (if non-null) is set to the number of bytes
+ * actually written.  On any non-OK return `*written` is set to zero so
+ * callers never see stale length information.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on a (possibly truncated) successful
+ *   write.
+ * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ *   string.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `buf` is null.
+ *   A null `written` pointer is allowed (and simply discards the length).
+ *
+ * # Safety
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `buf` must be valid for writes of `buf_size` bytes (unless null).
+ * * `written` must be either null or a valid pointer to a `usize`.
+ */
+enum StatorStatus stator_value_write_string_utf8(const struct StatorValue *val,
+                                                 char *buf,
+                                                 size_t buf_size,
+                                                 size_t *written);
+
+/**
+ * Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
+ * shares the same underlying `JsObject` storage.
+ *
+ * The returned value's `typeof` is `"object"`; passing it to
+ * [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
+ * property mutations are observed through `obj` and vice versa.  This is
+ * the FFI mechanism for round-tripping object identity across the
+ * value/object boundary.
+ *
+ * Returns a null pointer when `obj` is null.  The caller owns the returned
+ * value pointer and must release it with [`stator_value_destroy`] (or rely
+ * on the active handle scope).
+ *
+ * # Safety
+ * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ */
+struct StatorValue *stator_object_as_value(const struct StatorObject *obj);
+
+/**
+ * Wrap a [`StatorValue`] holding an object-as-value handle as a fresh
+ * [`StatorObject`] handle that shares the same underlying `JsObject`
+ * storage.
+ *
+ * Identity is only preserved for values produced by
+ * [`stator_object_as_value`] (or by future FFI APIs that allocate the
+ * shared-storage representation).  Tag-only object values created via
+ * [`stator_value_new_object`], `stator_value_new_array_tag`, and the other
+ * tag constructors carry no per-instance storage; passing such a value
+ * here returns a null pointer to make the limitation explicit at the call
+ * site rather than silently materialising a divergent empty object.
+ *
+ * Returns a null pointer when `val` is null, is not an object-like value,
+ * or is a tag-only object value.  The caller owns the returned object
+ * pointer and must release it with [`stator_object_destroy`].
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+struct StatorObject *stator_value_as_object(const struct StatorValue *val);
+
+/**
+ * Read the property named `(key, key_len)` from `obj` and, on success, write
+ * a freshly-allocated [`StatorValue`] handle to `*out_val`.
+ *
+ * Maybe-style semantics:
+ * * [`StatorStatus::StatorStatusOk`] when the property exists.  The
+ *   returned value mirrors the property value, including an explicit
+ *   `undefined` if that is what is stored.
+ * * [`StatorStatus::StatorStatusFalse`] when the property is missing from
+ *   `obj` and its prototype chain.  `*out_val` is set to null.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or
+ *   `out_val` is null, when the key bytes are not valid UTF-8, or when the
+ *   object has no associated isolate.
+ *
+ * The caller owns the [`StatorValue`] handed back through `*out_val` and
+ * must release it with [`stator_value_destroy`] (or rely on the active
+ * handle scope).
+ *
+ * # Safety
+ * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `key` must be valid for reads of `key_len` bytes (or null).
+ * * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+ */
+enum StatorStatus stator_object_get_property(const struct StatorObject *obj,
+                                             const char *key,
+                                             size_t key_len,
+                                             struct StatorValue **out_val);
+
+/**
+ * Write `val` to the property named `(key, key_len)` on `obj`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when the property was created or
+ *   updated.
+ * * [`StatorStatus::StatorStatusException`] when the underlying `[[Set]]`
+ *   raised an error (e.g. assigning to a read-only property).  The
+ *   isolate's pending exception is populated with a stringified error and
+ *   a structured [`StatorMessage`] classified as
+ *   [`StatorMessageKind::StatorMessageKindType`].
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `val` is
+ *   null, when the key bytes are not valid UTF-8, or when the object has
+ *   no associated isolate.
+ *
+ * # Safety
+ * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `key` must be valid for reads of `key_len` bytes (or null).
+ * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorStatus stator_object_set_property(struct StatorObject *obj,
+                                             const char *key,
+                                             size_t key_len,
+                                             const struct StatorValue *val);
+
+/**
+ * Test whether `obj` has a property named `(key, key_len)` (own or
+ * inherited).  The result is written to `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success; `*out` is `true` iff the
+ *   property exists.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+ *   null, or when the key bytes are not valid UTF-8.
+ *
+ * # Safety
+ * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `key` must be valid for reads of `key_len` bytes (or null).
+ * * `out` must be either null or a valid pointer to a `bool`.
+ */
+enum StatorStatus stator_object_has_property(const struct StatorObject *obj,
+                                             const char *key,
+                                             size_t key_len,
+                                             bool *out);
+
+/**
+ * Delete the property named `(key, key_len)` from `obj`.  The boolean
+ * outcome of the underlying `[[Delete]]` is written to `*out`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success.  `*out` is `true` when
+ *   the property no longer exists (either it was successfully deleted or
+ *   was already absent) and `false` when deletion was rejected (e.g. a
+ *   non-configurable own property).
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+ *   null, or when the key bytes are not valid UTF-8.
+ *
+ * # Safety
+ * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `key` must be valid for reads of `key_len` bytes (or null).
+ * * `out` must be either null or a valid pointer to a `bool`.
+ */
+enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
+                                                const char *key,
+                                                size_t key_len,
+                                                bool *out);
+
+/**
+ * Invoke a callable [`StatorValue`] with `argc` arguments and, on success,
+ * write the returned value to `*out_val`.
+ *
+ * This first slice only supports native functions installed via
+ * [`stator_function_template_get_function`] or returned through the FFI by
+ * a native callback — i.e. values whose internal representation is a
+ * reference-counted [`NativeFn`].  Bytecode-backed function values
+ * ([`StatorValueInner::Function`]) cannot yet be invoked through this API
+ * because the FFI does not yet model a receiver, an argv array, or
+ * `new.target` for them; calling such a value returns
+ * [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
+ * likewise deferred.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when the native function ran to
+ *   completion; `*out_val` holds the (caller-owned) result.
+ * * [`StatorStatus::StatorStatusException`] when the native callback
+ *   returned an `Err`.  The isolate's pending exception is populated.
+ * * [`StatorStatus::StatorStatusUnsupported`] when `callable` is not a
+ *   native function (e.g. bytecode function, plain object, primitive).
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `callable`, or
+ *   `out_val` is null, when `argc` is negative, or when `args` is null
+ *   while `argc > 0`.
+ *
+ * `recv` is reserved for receiver/`this` plumbing in a future slice and is
+ * currently ignored by the native bridge.
+ *
+ * # Safety
+ * * `ctx` must be a valid, live [`StatorContext`] pointer.
+ * * `callable` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `recv` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `args` must be valid for `argc` `*const StatorValue` reads when `argc > 0`
+ *   (or null when `argc == 0`).  Each non-null element must point at a
+ *   valid, live [`StatorValue`].
+ * * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+ */
+enum StatorStatus stator_value_call(struct StatorContext *ctx,
+                                    const struct StatorValue *callable,
+                                    const struct StatorValue *recv,
+                                    int32_t argc,
+                                    const struct StatorValue *const *args,
+                                    struct StatorValue **out_val);
 
 /**
  * Register a native function named `name` on `ctx`.

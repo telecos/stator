@@ -693,7 +693,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         _isolate: isolate,
         enter_count: 0,
         global: StatorObject {
-            inner: JsObject::new(),
+            inner: Rc::new(RefCell::new(JsObject::new())),
             isolate,
         },
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
@@ -872,7 +872,19 @@ enum StatorValueInner {
     Str(CString),
     /// A JavaScript object (plain objects, GC-heap objects, generators,
     /// iterators, errors).
+    ///
+    /// Tag-only placeholder used by [`stator_value_new_object`] and friends.
+    /// Carries no per-instance state, so identity is not preserved across
+    /// FFI round trips.  Use [`StatorValueInner::ObjectHandle`] (produced by
+    /// [`stator_object_as_value`]) when identity must survive.
     Object,
+    /// A JavaScript object backed by a real, shared [`JsObject`] storage.
+    ///
+    /// Produced by [`stator_object_as_value`].  Multiple [`StatorValue`] /
+    /// [`StatorObject`] handles that share the same `Rc<RefCell<JsObject>>`
+    /// observe one another's mutations and round-trip through
+    /// [`stator_value_as_object`] without identity loss.
+    ObjectHandle(Rc<RefCell<JsObject>>),
     /// A callable JavaScript function (bytecode or native).
     Function,
     /// A native function created via a [`StatorFunctionTemplate`], carrying
@@ -1494,6 +1506,7 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
             c"function".as_ptr()
         }
         StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -1526,6 +1539,7 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
             }
         }
         StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -1557,6 +1571,7 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Null
         | StatorValueInner::Boolean(_)
         | StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -1653,6 +1668,7 @@ pub unsafe extern "C" fn stator_value_is_object(val: *const StatorValue) -> bool
     matches!(
         unsafe { &(*val).inner },
         StatorValueInner::Object
+            | StatorValueInner::ObjectHandle(_)
             | StatorValueInner::Array
             | StatorValueInner::Date
             | StatorValueInner::RegExp
@@ -1801,8 +1817,14 @@ pub unsafe extern "C" fn stator_value_is_set(val: *const StatorValue) -> bool {
 /// Created by [`stator_object_new`] and destroyed by [`stator_object_destroy`].
 /// Named properties can be set and retrieved via [`stator_object_set`] and
 /// [`stator_object_get`].
+///
+/// The underlying [`JsObject`] storage is reference-counted, allowing the
+/// same object identity to be exposed through multiple FFI handles via
+/// [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
+/// through one handle are observed through all other handles that share the
+/// same backing storage.
 pub struct StatorObject {
-    inner: JsObject,
+    inner: Rc<RefCell<JsObject>>,
     isolate: *mut StatorIsolate,
 }
 
@@ -1823,7 +1845,7 @@ pub unsafe extern "C" fn stator_object_new(isolate: *mut StatorIsolate) -> *mut 
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe { (*isolate).live_objects += 1 };
     Box::into_raw(Box::new(StatorObject {
-        inner: JsObject::new(),
+        inner: Rc::new(RefCell::new(JsObject::new())),
         isolate,
     }))
 }
@@ -1871,7 +1893,7 @@ pub unsafe extern "C" fn stator_object_set(
     // SAFETY: caller guarantees `val` is valid.
     let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
     // SAFETY: caller guarantees `obj` is valid.
-    let _ = unsafe { (*obj).inner.set_property(&key_str, js_val) };
+    let _ = unsafe { (*obj).inner.borrow_mut().set_property(&key_str, js_val) };
 }
 
 /// Get the named property `key` from `obj` as a new [`StatorValue`].
@@ -1894,7 +1916,7 @@ pub unsafe extern "C" fn stator_object_get(
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    let js_val = unsafe { (*obj).inner.get_property(&key_str) };
+    let js_val = unsafe { (*obj).inner.borrow().get_property(&key_str) };
     let inner = match js_val {
         JsValue::HeapNumber(n) => StatorValueInner::Number(n),
         JsValue::Smi(n) => StatorValueInner::Number(f64::from(n)),
@@ -1937,7 +1959,7 @@ pub unsafe extern "C" fn stator_object_has(obj: *const StatorObject, key: *const
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    unsafe { (*obj).inner.has_property(&key_str) }
+    unsafe { (*obj).inner.borrow().has_property(&key_str) }
 }
 
 /// Delete the named property `key` from `obj`.
@@ -1961,7 +1983,13 @@ pub unsafe extern "C" fn stator_object_delete(obj: *mut StatorObject, key: *cons
     // `delete_own_property` returns `Ok(false)` when the property is
     // non-configurable and `Err(_)` on internal engine errors; both cases
     // map to `false` here, consistent with ECMAScript's [[Delete]] semantics.
-    unsafe { (*obj).inner.delete_own_property(&key_str).unwrap_or(false) }
+    unsafe {
+        (*obj)
+            .inner
+            .borrow_mut()
+            .delete_own_property(&key_str)
+            .unwrap_or(false)
+    }
 }
 
 /// An opaque snapshot of the own property names of a JavaScript object.
@@ -1990,7 +2018,7 @@ pub unsafe extern "C" fn stator_object_get_property_names(
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `obj` is valid.
-    let keys = unsafe { (*obj).inner.own_property_keys() };
+    let keys = unsafe { (*obj).inner.borrow().own_property_keys() };
     let names = keys
         .into_iter()
         .map(|k| {
@@ -3069,6 +3097,7 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         StatorValueInner::Str(cs) => !cs.as_bytes().is_empty(),
         // All object-like values are truthy.
         StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -3126,8 +3155,762 @@ pub unsafe extern "C" fn stator_value_strict_equals(
             x == y
         }
         (StatorValueInner::Str(x), StatorValueInner::Str(y)) => x == y,
+        // Two shared-storage object handles compare equal iff they point at
+        // the same underlying `Rc<RefCell<JsObject>>` (pointer identity).
+        (StatorValueInner::ObjectHandle(x), StatorValueInner::ObjectHandle(y)) => Rc::ptr_eq(x, y),
         // Object-like tags carry no identity in FFI handles → never equal.
         _ => false,
+    }
+}
+
+// ── Status enum, typed accessors, and identity bridge ────────────────────────
+
+/// Stable status code returned by typed-accessor and Maybe-style FFI entry
+/// points so that C callers can distinguish a missing value, an invalid
+/// argument, an unsupported operation, and a JavaScript exception without
+/// reaching for out-of-band channels.
+///
+/// Variants:
+/// * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+///   out-pointer was written.
+/// * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+///   a structural "no" answer (e.g. property missing, type mismatch on a
+///   typed get).  Out-pointers are left untouched or zero-cleared, never
+///   carrying a stale value.
+/// * [`StatorStatusException`][Self::StatorStatusException] — the operation
+///   raised (or captured) a JavaScript exception.  When applicable, the
+///   isolate's pending exception is populated and can be inspected through
+///   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
+/// * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+///   required argument was null or otherwise malformed; nothing was mutated.
+/// * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+///   operation is well-formed but not yet implemented for this kind of
+///   value/object (e.g. calling a bytecode function via the FFI).  Reserved
+///   discriminants are stable; embedders should treat unknown values as
+///   `StatorStatusUnsupported`.
+///
+/// Backed by a C `int`-shaped enum so the discriminants are stable across
+/// the C ABI and can be compared by value from C/C++.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StatorStatus {
+    /// Operation succeeded.
+    StatorStatusOk = 0,
+    /// Operation succeeded with a structural "no" answer (missing property,
+    /// type mismatch on a typed accessor).
+    StatorStatusFalse = 1,
+    /// A JavaScript exception was raised or captured.  The isolate's pending
+    /// exception is set when this is returned by a Maybe-style API.
+    StatorStatusException = 2,
+    /// At least one argument was null or malformed.
+    StatorStatusInvalidArg = 3,
+    /// The operation is not supported for this value/object kind.
+    StatorStatusUnsupported = 4,
+}
+
+/// Read the boolean value of `val` into `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript boolean.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+///   boolean.  `*out` is left untouched.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `out` must be either null or a valid pointer to a `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_get_boolean(
+    val: *const StatorValue,
+    out: *mut bool,
+) -> StatorStatus {
+    if val.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Boolean(b) => {
+            // SAFETY: caller guarantees `out` is valid.
+            unsafe { *out = *b };
+            StatorStatus::StatorStatusOk
+        }
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Read the numeric value of `val` into `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript number.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+///   number.  `*out` is left untouched.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `out` must be either null or a valid pointer to an `f64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_get_number(
+    val: *const StatorValue,
+    out: *mut f64,
+) -> StatorStatus {
+    if val.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Number(n) => {
+            // SAFETY: caller guarantees `out` is valid.
+            unsafe { *out = *n };
+            StatorStatus::StatorStatusOk
+        }
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Read `val` as a signed 32-bit integer into `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+///   range `[−2³¹, 2³¹−1]`; `*out` is set to the exact value.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+///   exactly representable as an `i32` (non-number, fractional, ±Infinity,
+///   `NaN`, or out of range).  `*out` is left untouched.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+///
+/// Mirrors the semantics of `v8::Value::Int32Value` for the success case but
+/// without the implicit `ToNumber` coercion — embedders that want the lossy
+/// truncating conversion should call [`stator_value_to_int32`] instead.
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `out` must be either null or a valid pointer to an `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_get_int32(
+    val: *const StatorValue,
+    out: *mut i32,
+) -> StatorStatus {
+    if val.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    if let StatorValueInner::Number(n) = unsafe { &(*val).inner }
+        && n.is_finite()
+        && n.fract() == 0.0
+        && *n >= i32::MIN as f64
+        && *n <= i32::MAX as f64
+    {
+        // SAFETY: caller guarantees `out` is valid.
+        unsafe { *out = *n as i32 };
+        return StatorStatus::StatorStatusOk;
+    }
+    StatorStatus::StatorStatusFalse
+}
+
+/// Read `val` as an unsigned 32-bit integer into `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+///   range `[0, 2³²−1]`; `*out` is set to the exact value.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+///   exactly representable as a `u32`.  `*out` is left untouched.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `out` must be either null or a valid pointer to a `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_get_uint32(
+    val: *const StatorValue,
+    out: *mut u32,
+) -> StatorStatus {
+    if val.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    if let StatorValueInner::Number(n) = unsafe { &(*val).inner }
+        && n.is_finite()
+        && n.fract() == 0.0
+        && *n >= 0.0
+        && *n <= u32::MAX as f64
+    {
+        // SAFETY: caller guarantees `out` is valid.
+        unsafe { *out = *n as u32 };
+        return StatorStatus::StatorStatusOk;
+    }
+    StatorStatus::StatorStatusFalse
+}
+
+/// Read the UTF-8 byte length of the string stored in `val` into `*out`.
+///
+/// The returned length does **not** include a terminating null byte and is
+/// the count of raw UTF-8 bytes — sufficient for sizing a buffer passed to
+/// [`stator_value_write_string_utf8`].
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when `val` is a string; `*out` is the
+///   byte length.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+///   string.  `*out` is left untouched.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `out` must be either null or a valid pointer to a `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_get_string_utf8_length(
+    val: *const StatorValue,
+    out: *mut usize,
+) -> StatorStatus {
+    if val.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Str(cs) => {
+            // SAFETY: caller guarantees `out` is valid.
+            unsafe { *out = cs.as_bytes().len() };
+            StatorStatus::StatorStatusOk
+        }
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Copy the UTF-8 representation of the string stored in `val` into `buf`.
+///
+/// The write APIs work in explicit byte counts: no implicit `strlen` is
+/// performed on the source side and no terminating null byte is appended to
+/// the destination.  This makes the API safe to use with input data that
+/// contains, or buffers that should accommodate, embedded NUL bytes.
+///
+/// At most `buf_size` bytes are written.  If `buf_size` is smaller than the
+/// string's byte length the output is truncated; callers can size their
+/// buffer with [`stator_value_get_string_utf8_length`] and inspect
+/// `*written` to detect truncation.
+///
+/// On success, `*written` (if non-null) is set to the number of bytes
+/// actually written.  On any non-OK return `*written` is set to zero so
+/// callers never see stale length information.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on a (possibly truncated) successful
+///   write.
+/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+///   string.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `buf` is null.
+///   A null `written` pointer is allowed (and simply discards the length).
+///
+/// # Safety
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `buf` must be valid for writes of `buf_size` bytes (unless null).
+/// * `written` must be either null or a valid pointer to a `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_write_string_utf8(
+    val: *const StatorValue,
+    buf: *mut c_char,
+    buf_size: usize,
+    written: *mut usize,
+) -> StatorStatus {
+    if !written.is_null() {
+        // SAFETY: caller guarantees `written` is valid when non-null.
+        unsafe { *written = 0 };
+    }
+    if val.is_null() || buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let bytes = match unsafe { &(*val).inner } {
+        StatorValueInner::Str(cs) => cs.as_bytes(),
+        _ => return StatorStatus::StatorStatusFalse,
+    };
+    let n = bytes.len().min(buf_size);
+    if n > 0 {
+        // SAFETY: `buf` is valid for `buf_size` bytes; `n <= buf_size`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n) };
+    }
+    if !written.is_null() {
+        // SAFETY: caller guarantees `written` is valid when non-null.
+        unsafe { *written = n };
+    }
+    StatorStatus::StatorStatusOk
+}
+
+// ── Object / value identity bridge ───────────────────────────────────────────
+
+/// Borrow the shared backing storage of an [`StatorObject`] handle so that
+/// the same `Rc<RefCell<JsObject>>` can be reused by both [`StatorObject`]
+/// and [`StatorValue`] handles created from it.  Returns `None` if the
+/// object's pointer is null.
+///
+/// # Safety
+/// `obj` must be either null or a valid, live [`StatorObject`] pointer.
+unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCell<JsObject>>> {
+    if obj.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `obj` is valid.
+    Some(Rc::clone(&unsafe { &*obj }.inner))
+}
+
+/// Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
+/// shares the same underlying `JsObject` storage.
+///
+/// The returned value's `typeof` is `"object"`; passing it to
+/// [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
+/// property mutations are observed through `obj` and vice versa.  This is
+/// the FFI mechanism for round-tripping object identity across the
+/// value/object boundary.
+///
+/// Returns a null pointer when `obj` is null.  The caller owns the returned
+/// value pointer and must release it with [`stator_value_destroy`] (or rely
+/// on the active handle scope).
+///
+/// # Safety
+/// `obj` must be either null or a valid, live [`StatorObject`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_as_value(obj: *const StatorObject) -> *mut StatorValue {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `obj` is valid.
+    let rc = match unsafe { stator_object_inner_clone(obj) } {
+        Some(rc) => rc,
+        None => return std::ptr::null_mut(),
+    };
+    // SAFETY: caller guarantees `obj` is valid.
+    let isolate = unsafe { (*obj).isolate };
+    if !isolate.is_null() {
+        // SAFETY: `isolate` is valid for the lifetime of `obj`.
+        unsafe { (*isolate).live_objects += 1 };
+    }
+    let val = Box::into_raw(Box::new(StatorValue {
+        inner: StatorValueInner::ObjectHandle(rc),
+        isolate,
+    }));
+    if !isolate.is_null() {
+        // SAFETY: `isolate` is valid; `active_handle_scope` is null or valid.
+        unsafe {
+            let scope = (*isolate).active_handle_scope;
+            if !scope.is_null() {
+                (*scope).handles.push(val);
+            }
+        }
+    }
+    val
+}
+
+/// Wrap a [`StatorValue`] holding an object-as-value handle as a fresh
+/// [`StatorObject`] handle that shares the same underlying `JsObject`
+/// storage.
+///
+/// Identity is only preserved for values produced by
+/// [`stator_object_as_value`] (or by future FFI APIs that allocate the
+/// shared-storage representation).  Tag-only object values created via
+/// [`stator_value_new_object`], `stator_value_new_array_tag`, and the other
+/// tag constructors carry no per-instance storage; passing such a value
+/// here returns a null pointer to make the limitation explicit at the call
+/// site rather than silently materialising a divergent empty object.
+///
+/// Returns a null pointer when `val` is null, is not an object-like value,
+/// or is a tag-only object value.  The caller owns the returned object
+/// pointer and must release it with [`stator_object_destroy`].
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_as_object(val: *const StatorValue) -> *mut StatorObject {
+    if val.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let rc = match unsafe { &(*val).inner } {
+        StatorValueInner::ObjectHandle(rc) => Rc::clone(rc),
+        _ => return std::ptr::null_mut(),
+    };
+    // SAFETY: caller guarantees `val` is valid.
+    let isolate = unsafe { (*val).isolate };
+    if !isolate.is_null() {
+        // SAFETY: `isolate` is valid for the lifetime of `val`.
+        unsafe { (*isolate).live_objects += 1 };
+    }
+    Box::into_raw(Box::new(StatorObject { inner: rc, isolate }))
+}
+
+// ── Maybe-style property APIs ────────────────────────────────────────────────
+
+/// Decode a `(ptr, len)` UTF-8 key buffer as a borrowed `&str`.
+///
+/// Returns `None` when the pointer is null or the bytes are not valid UTF-8.
+/// Embedded NUL bytes inside the key are preserved (they participate in the
+/// property name verbatim).
+///
+/// # Safety
+/// `key` must be valid for reads of `key_len` bytes, or null.
+unsafe fn decode_property_key<'a>(key: *const c_char, key_len: usize) -> Option<&'a str> {
+    if key.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `key` is valid for `key_len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(key as *const u8, key_len) };
+    std::str::from_utf8(bytes).ok()
+}
+
+/// Build a fresh owned [`StatorValue`] from a [`JsValue`] returned by an
+/// underlying [`JsObject`] property read.
+///
+/// The new value is registered with the isolate's live-object counter and
+/// (if open) the innermost handle scope.  Returns a null pointer when
+/// `isolate` is null or allocation fails.
+fn js_value_to_owned_stator_value(
+    isolate: *mut StatorIsolate,
+    js_val: &JsValue,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = jsvalue_to_stator_value_inner(js_val);
+    // SAFETY: caller guarantees `isolate` is valid; bookkeeping only.
+    unsafe { (*isolate).live_objects += 1 };
+    let val = Box::into_raw(Box::new(StatorValue { inner, isolate }));
+    // SAFETY: `isolate` is valid; `active_handle_scope` is null or valid.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+    val
+}
+
+/// Read the property named `(key, key_len)` from `obj` and, on success, write
+/// a freshly-allocated [`StatorValue`] handle to `*out_val`.
+///
+/// Maybe-style semantics:
+/// * [`StatorStatus::StatorStatusOk`] when the property exists.  The
+///   returned value mirrors the property value, including an explicit
+///   `undefined` if that is what is stored.
+/// * [`StatorStatus::StatorStatusFalse`] when the property is missing from
+///   `obj` and its prototype chain.  `*out_val` is set to null.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or
+///   `out_val` is null, when the key bytes are not valid UTF-8, or when the
+///   object has no associated isolate.
+///
+/// The caller owns the [`StatorValue`] handed back through `*out_val` and
+/// must release it with [`stator_value_destroy`] (or rely on the active
+/// handle scope).
+///
+/// # Safety
+/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `key` must be valid for reads of `key_len` bytes (or null).
+/// * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_get_property(
+    obj: *const StatorObject,
+    key: *const c_char,
+    key_len: usize,
+    out_val: *mut *mut StatorValue,
+) -> StatorStatus {
+    if !out_val.is_null() {
+        // SAFETY: caller guarantees `out_val` is valid when non-null.
+        unsafe { *out_val = std::ptr::null_mut() };
+    }
+    if obj.is_null() || out_val.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `key` is valid for `key_len` bytes.
+    let key_str = match unsafe { decode_property_key(key, key_len) } {
+        Some(s) => s,
+        None => return StatorStatus::StatorStatusInvalidArg,
+    };
+    // SAFETY: caller guarantees `obj` is valid.
+    let inner_rc = Rc::clone(&unsafe { &*obj }.inner);
+    // SAFETY: caller guarantees `obj` is valid.
+    let isolate = unsafe { (*obj).isolate };
+    if isolate.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let (present, js_val) = {
+        let borrowed = inner_rc.borrow();
+        let present = borrowed.has_property(key_str);
+        if present {
+            (true, borrowed.get_property(key_str))
+        } else {
+            (false, JsValue::Undefined)
+        }
+    };
+    if !present {
+        return StatorStatus::StatorStatusFalse;
+    }
+    let val = js_value_to_owned_stator_value(isolate, &js_val);
+    if val.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `out_val` is valid.
+    unsafe { *out_val = val };
+    StatorStatus::StatorStatusOk
+}
+
+/// Write `val` to the property named `(key, key_len)` on `obj`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the property was created or
+///   updated.
+/// * [`StatorStatus::StatorStatusException`] when the underlying `[[Set]]`
+///   raised an error (e.g. assigning to a read-only property).  The
+///   isolate's pending exception is populated with a stringified error and
+///   a structured [`StatorMessage`] classified as
+///   [`StatorMessageKind::StatorMessageKindType`].
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `val` is
+///   null, when the key bytes are not valid UTF-8, or when the object has
+///   no associated isolate.
+///
+/// # Safety
+/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `key` must be valid for reads of `key_len` bytes (or null).
+/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_set_property(
+    obj: *mut StatorObject,
+    key: *const c_char,
+    key_len: usize,
+    val: *const StatorValue,
+) -> StatorStatus {
+    if obj.is_null() || val.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `key` is valid for `key_len` bytes.
+    let key_str = match unsafe { decode_property_key(key, key_len) } {
+        Some(s) => s,
+        None => return StatorStatus::StatorStatusInvalidArg,
+    };
+    // SAFETY: caller guarantees `obj` is valid.
+    let inner_rc = Rc::clone(&unsafe { &*obj }.inner);
+    // SAFETY: caller guarantees `val` is valid.
+    let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
+    let result = inner_rc.borrow_mut().set_property(key_str, js_val);
+    match result {
+        Ok(()) => StatorStatus::StatorStatusOk,
+        Err(err) => {
+            // SAFETY: caller guarantees `obj` is valid.
+            let isolate = unsafe { (*obj).isolate };
+            if !isolate.is_null() {
+                let message = err.to_string();
+                // SAFETY: `isolate` is valid; the string is copied by the callee.
+                let exception = unsafe {
+                    stator_value_new_string(
+                        isolate,
+                        message.as_ptr() as *const c_char,
+                        message.len(),
+                    )
+                };
+                // SAFETY: `exception` was allocated for ownership.
+                unsafe { set_pending_exception(isolate, exception, true) };
+                // Build a structured TypeError message so embedders can route
+                // it through their existing exception pipeline.
+                let structured = Box::new(StatorMessage {
+                    kind: StatorMessageKind::StatorMessageKindType,
+                    text: CString::new(message).unwrap_or_else(|_| c"property set error".into()),
+                    resource_name: None,
+                    line: None,
+                    column: None,
+                    terminated: false,
+                });
+                // SAFETY: `isolate` is valid.
+                unsafe { (*isolate).pending_message = Some(structured) };
+            }
+            StatorStatus::StatorStatusException
+        }
+    }
+}
+
+/// Test whether `obj` has a property named `(key, key_len)` (own or
+/// inherited).  The result is written to `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success; `*out` is `true` iff the
+///   property exists.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+///   null, or when the key bytes are not valid UTF-8.
+///
+/// # Safety
+/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `key` must be valid for reads of `key_len` bytes (or null).
+/// * `out` must be either null or a valid pointer to a `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_has_property(
+    obj: *const StatorObject,
+    key: *const c_char,
+    key_len: usize,
+    out: *mut bool,
+) -> StatorStatus {
+    if obj.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `key` is valid for `key_len` bytes.
+    let key_str = match unsafe { decode_property_key(key, key_len) } {
+        Some(s) => s,
+        None => return StatorStatus::StatorStatusInvalidArg,
+    };
+    // SAFETY: caller guarantees `obj` is valid.
+    let present = unsafe { &*obj }.inner.borrow().has_property(key_str);
+    // SAFETY: caller guarantees `out` is valid.
+    unsafe { *out = present };
+    StatorStatus::StatorStatusOk
+}
+
+/// Delete the property named `(key, key_len)` from `obj`.  The boolean
+/// outcome of the underlying `[[Delete]]` is written to `*out`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.  `*out` is `true` when
+///   the property no longer exists (either it was successfully deleted or
+///   was already absent) and `false` when deletion was rejected (e.g. a
+///   non-configurable own property).
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+///   null, or when the key bytes are not valid UTF-8.
+///
+/// # Safety
+/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `key` must be valid for reads of `key_len` bytes (or null).
+/// * `out` must be either null or a valid pointer to a `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_delete_property(
+    obj: *mut StatorObject,
+    key: *const c_char,
+    key_len: usize,
+    out: *mut bool,
+) -> StatorStatus {
+    if obj.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `key` is valid for `key_len` bytes.
+    let key_str = match unsafe { decode_property_key(key, key_len) } {
+        Some(s) => s,
+        None => return StatorStatus::StatorStatusInvalidArg,
+    };
+    // SAFETY: caller guarantees `obj` is valid.
+    let deleted = unsafe { &*obj }
+        .inner
+        .borrow_mut()
+        .delete_own_property(key_str)
+        .unwrap_or(false);
+    // SAFETY: caller guarantees `out` is valid.
+    unsafe { *out = deleted };
+    StatorStatus::StatorStatusOk
+}
+
+// ── Native-function call bridge ──────────────────────────────────────────────
+
+/// Invoke a callable [`StatorValue`] with `argc` arguments and, on success,
+/// write the returned value to `*out_val`.
+///
+/// This first slice only supports native functions installed via
+/// [`stator_function_template_get_function`] or returned through the FFI by
+/// a native callback — i.e. values whose internal representation is a
+/// reference-counted [`NativeFn`].  Bytecode-backed function values
+/// ([`StatorValueInner::Function`]) cannot yet be invoked through this API
+/// because the FFI does not yet model a receiver, an argv array, or
+/// `new.target` for them; calling such a value returns
+/// [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
+/// likewise deferred.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the native function ran to
+///   completion; `*out_val` holds the (caller-owned) result.
+/// * [`StatorStatus::StatorStatusException`] when the native callback
+///   returned an `Err`.  The isolate's pending exception is populated.
+/// * [`StatorStatus::StatorStatusUnsupported`] when `callable` is not a
+///   native function (e.g. bytecode function, plain object, primitive).
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `callable`, or
+///   `out_val` is null, when `argc` is negative, or when `args` is null
+///   while `argc > 0`.
+///
+/// `recv` is reserved for receiver/`this` plumbing in a future slice and is
+/// currently ignored by the native bridge.
+///
+/// # Safety
+/// * `ctx` must be a valid, live [`StatorContext`] pointer.
+/// * `callable` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `recv` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `args` must be valid for `argc` `*const StatorValue` reads when `argc > 0`
+///   (or null when `argc == 0`).  Each non-null element must point at a
+///   valid, live [`StatorValue`].
+/// * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_call(
+    ctx: *mut StatorContext,
+    callable: *const StatorValue,
+    recv: *const StatorValue,
+    argc: i32,
+    args: *const *const StatorValue,
+    out_val: *mut *mut StatorValue,
+) -> StatorStatus {
+    let _ = recv; // Receiver plumbing reserved for a future slice.
+    if !out_val.is_null() {
+        // SAFETY: caller guarantees `out_val` is valid when non-null.
+        unsafe { *out_val = std::ptr::null_mut() };
+    }
+    if ctx.is_null() || callable.is_null() || out_val.is_null() || argc < 0 {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    if argc > 0 && args.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    if isolate.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `callable` is valid.
+    let native = match unsafe { &(*callable).inner } {
+        StatorValueInner::NativeFunctionValue(f) => Rc::clone(f),
+        _ => return StatorStatus::StatorStatusUnsupported,
+    };
+    // Build a JsValue argv from the C-side argv array.
+    let mut js_args: Vec<JsValue> = Vec::with_capacity(argc as usize);
+    if argc > 0 {
+        // SAFETY: caller guarantees `args` is valid for `argc` pointers.
+        let slice = unsafe { std::slice::from_raw_parts(args, argc as usize) };
+        for &p in slice {
+            if p.is_null() {
+                js_args.push(JsValue::Undefined);
+            } else {
+                // SAFETY: each non-null pointer is a valid StatorValue.
+                js_args.push(stator_value_inner_to_jsvalue(unsafe { &(*p).inner }));
+            }
+        }
+    }
+    match native(js_args) {
+        Ok(js_val) => {
+            let val = js_value_to_owned_stator_value(isolate, &js_val);
+            if val.is_null() {
+                return StatorStatus::StatorStatusInvalidArg;
+            }
+            // SAFETY: caller guarantees `out_val` is valid.
+            unsafe { *out_val = val };
+            StatorStatus::StatorStatusOk
+        }
+        Err(err) => {
+            let message = err.to_string();
+            // SAFETY: `isolate` is valid.
+            let exception = unsafe {
+                stator_value_new_string(isolate, message.as_ptr() as *const c_char, message.len())
+            };
+            // SAFETY: `exception` was allocated for ownership.
+            unsafe { set_pending_exception(isolate, exception, true) };
+            let kind = message_kind_for_error(&err, false);
+            let structured = Box::new(StatorMessage {
+                kind,
+                text: CString::new(message).unwrap_or_else(|_| c"native call error".into()),
+                resource_name: None,
+                line: None,
+                column: None,
+                terminated: false,
+            });
+            // SAFETY: `isolate` is valid.
+            unsafe { (*isolate).pending_message = Some(structured) };
+            StatorStatus::StatorStatusException
+        }
     }
 }
 
@@ -3614,6 +4397,7 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
             trimmed.parse::<f64>().unwrap_or(f64::NAN)
         }
         StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -3648,7 +4432,9 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
             }
         }
         StatorValueInner::Str(cs) => cs.to_string_lossy().into_owned(),
-        StatorValueInner::Object => "[object Object]".to_owned(),
+        StatorValueInner::Object | StatorValueInner::ObjectHandle(_) => {
+            "[object Object]".to_owned()
+        }
         StatorValueInner::Function | StatorValueInner::NativeFunctionValue(_) => {
             "function () { [native code] }".to_owned()
         }
@@ -3689,6 +4475,16 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         | StatorValueInner::Promise
         | StatorValueInner::Map
         | StatorValueInner::Set => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
+        StatorValueInner::ObjectHandle(_) => {
+            // Identity-preserving bridge from `StatorValueInner::ObjectHandle`
+            // into the interpreter heap is not yet implemented.  Round-trips
+            // through this conversion (e.g. when an object handle is passed
+            // through a script-visible global) lose identity: a fresh empty
+            // `PlainObject` is materialised here.  FFI-level property reads
+            // and writes via `stator_object_*` APIs still observe shared
+            // state because they operate directly on the `Rc<RefCell<JsObject>>`.
+            JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
+        }
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))
@@ -4058,6 +4854,7 @@ pub unsafe extern "C" fn stator_object_template_set(
         StatorValueInner::Null => StatorValueInner::Null,
         StatorValueInner::Str(cs) => StatorValueInner::Str(cs.clone()),
         StatorValueInner::Object => StatorValueInner::Object,
+        StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
         StatorValueInner::Function => StatorValueInner::Function,
         StatorValueInner::NativeFunctionValue(f) => {
             StatorValueInner::NativeFunctionValue(Rc::clone(f))
@@ -4137,7 +4934,7 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
     // SAFETY: isolate is valid.
     unsafe { (*isolate).live_objects += 1 };
     Box::into_raw(Box::new(StatorObject {
-        inner: obj,
+        inner: Rc::new(RefCell::new(obj)),
         isolate,
     }))
 }
@@ -10922,6 +11719,598 @@ mod tests {
             }
             assert!(stator_isolate_peek_pending_message(iso.as_ptr()).is_null());
             stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    // ── Status enum / typed accessors / Maybe-style property API tests ──────
+
+    /// Build a non-empty `StatorObject` via a helper to share setup across
+    /// the new-API tests.  The returned object has a single own property
+    /// `"key"` set to the integer 42.
+    fn make_object_with_key_42(iso: *mut StatorIsolate) -> *mut StatorObject {
+        // SAFETY: `iso` is valid for the lifetime of the test guard.
+        let obj = unsafe { stator_object_new(iso) };
+        let key = c"key";
+        // SAFETY: `iso` and `obj` are valid.
+        let val = unsafe { stator_value_new_number(iso, 42.0) };
+        let status = unsafe {
+            stator_object_set_property(
+                obj,
+                key.as_ptr(),
+                key.to_bytes().len(),
+                val as *const StatorValue,
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        unsafe { stator_value_destroy(val) };
+        obj
+    }
+
+    #[test]
+    fn test_status_get_boolean_matrix() {
+        let iso = IsolateGuard::new();
+        let mut out = false;
+        // Null val → InvalidArg.
+        assert_eq!(
+            unsafe { stator_value_get_boolean(std::ptr::null(), &mut out) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let bool_val = unsafe { stator_value_new_boolean(iso.as_ptr(), true) };
+        let num_val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // Null out → InvalidArg.
+        assert_eq!(
+            unsafe { stator_value_get_boolean(bool_val, std::ptr::null_mut()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Wrong type → False, out untouched.
+        out = false;
+        assert_eq!(
+            unsafe { stator_value_get_boolean(num_val, &mut out) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert!(!out);
+        // Right type → Ok, out filled.
+        assert_eq!(
+            unsafe { stator_value_get_boolean(bool_val, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(out);
+        unsafe {
+            stator_value_destroy(bool_val);
+            stator_value_destroy(num_val);
+        }
+    }
+
+    #[test]
+    fn test_status_get_number_matrix() {
+        let iso = IsolateGuard::new();
+        let num_val = unsafe { stator_value_new_number(iso.as_ptr(), 3.5) };
+        let str_val = unsafe { stator_value_new_string(iso.as_ptr(), c"x".as_ptr(), 1) };
+        let mut out = 0.0;
+        assert_eq!(
+            unsafe { stator_value_get_number(num_val, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out, 3.5);
+        assert_eq!(
+            unsafe { stator_value_get_number(str_val, &mut out) },
+            StatorStatus::StatorStatusFalse
+        );
+        // Out preserved.
+        assert_eq!(out, 3.5);
+        unsafe {
+            stator_value_destroy(num_val);
+            stator_value_destroy(str_val);
+        }
+    }
+
+    #[test]
+    fn test_status_get_int32_in_and_out_of_range() {
+        let iso = IsolateGuard::new();
+        let in_range = unsafe { stator_value_new_number(iso.as_ptr(), -7.0) };
+        let frac = unsafe { stator_value_new_number(iso.as_ptr(), 1.5) };
+        let too_big = unsafe { stator_value_new_number(iso.as_ptr(), 2.0_f64.powi(35)) };
+        let mut out: i32 = 99;
+        assert_eq!(
+            unsafe { stator_value_get_int32(in_range, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out, -7);
+        out = 99;
+        assert_eq!(
+            unsafe { stator_value_get_int32(frac, &mut out) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(out, 99);
+        assert_eq!(
+            unsafe { stator_value_get_int32(too_big, &mut out) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(out, 99);
+        unsafe {
+            stator_value_destroy(in_range);
+            stator_value_destroy(frac);
+            stator_value_destroy(too_big);
+        }
+    }
+
+    #[test]
+    fn test_status_get_uint32_rejects_negative() {
+        let iso = IsolateGuard::new();
+        let pos = unsafe { stator_value_new_number(iso.as_ptr(), 4_000_000_000.0) };
+        let neg = unsafe { stator_value_new_number(iso.as_ptr(), -1.0) };
+        let mut out: u32 = 0;
+        assert_eq!(
+            unsafe { stator_value_get_uint32(pos, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out, 4_000_000_000);
+        assert_eq!(
+            unsafe { stator_value_get_uint32(neg, &mut out) },
+            StatorStatus::StatorStatusFalse
+        );
+        unsafe {
+            stator_value_destroy(pos);
+            stator_value_destroy(neg);
+        }
+    }
+
+    #[test]
+    fn test_string_write_utf8_non_ascii_and_truncation() {
+        let iso = IsolateGuard::new();
+        // "héllo" — h, é (2 bytes in UTF-8), l, l, o → 6 bytes.
+        let src = "héllo".as_bytes();
+        let val = unsafe {
+            stator_value_new_string(iso.as_ptr(), src.as_ptr() as *const c_char, src.len())
+        };
+        let mut len: usize = 0;
+        assert_eq!(
+            unsafe { stator_value_get_string_utf8_length(val, &mut len) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(len, 6);
+
+        // Full-size buffer round-trips bytes.
+        let mut buf = vec![0u8; 6];
+        let mut written: usize = 0;
+        assert_eq!(
+            unsafe {
+                stator_value_write_string_utf8(
+                    val,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                    &mut written,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(written, 6);
+        assert_eq!(&buf[..], src);
+
+        // Smaller buffer truncates without writing a NUL terminator.
+        let mut small = [0xAAu8; 3];
+        written = 999;
+        assert_eq!(
+            unsafe {
+                stator_value_write_string_utf8(
+                    val,
+                    small.as_mut_ptr() as *mut c_char,
+                    small.len(),
+                    &mut written,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(written, 3);
+        assert_eq!(&small[..], &src[..3]);
+
+        // Wrong type → False, written cleared to 0.
+        let num = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let mut buf2 = [0u8; 4];
+        written = 17;
+        assert_eq!(
+            unsafe {
+                stator_value_write_string_utf8(
+                    num,
+                    buf2.as_mut_ptr() as *mut c_char,
+                    buf2.len(),
+                    &mut written,
+                )
+            },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(written, 0);
+
+        // Null val / null buf → InvalidArg, written cleared.
+        written = 17;
+        assert_eq!(
+            unsafe {
+                stator_value_write_string_utf8(
+                    std::ptr::null(),
+                    buf2.as_mut_ptr() as *mut c_char,
+                    buf2.len(),
+                    &mut written,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(written, 0);
+
+        unsafe {
+            stator_value_destroy(val);
+            stator_value_destroy(num);
+        }
+    }
+
+    #[test]
+    fn test_string_write_utf8_embedded_nul_in_buffer_args_is_respected() {
+        let iso = IsolateGuard::new();
+        // Three ASCII bytes, no embedded NUL — the API must NOT call strlen
+        // on the source side.  We verify by sizing exactly to byte length.
+        let src = b"abc";
+        let val = unsafe {
+            stator_value_new_string(iso.as_ptr(), src.as_ptr() as *const c_char, src.len())
+        };
+        // Buffer pre-filled with 0xCC sentinels so we can detect over-write.
+        let mut buf = [0xCCu8; 5];
+        let mut written: usize = 0;
+        assert_eq!(
+            unsafe {
+                stator_value_write_string_utf8(
+                    val,
+                    buf.as_mut_ptr() as *mut c_char,
+                    3,
+                    &mut written,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(written, 3);
+        assert_eq!(&buf[..3], b"abc");
+        // Bytes past the size limit must remain untouched (no NUL terminator).
+        assert_eq!(buf[3], 0xCC);
+        assert_eq!(buf[4], 0xCC);
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_object_as_value_round_trip_preserves_identity() {
+        let iso = IsolateGuard::new();
+        let obj = make_object_with_key_42(iso.as_ptr());
+
+        let val = unsafe { stator_object_as_value(obj) };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_object(val) });
+
+        let obj2 = unsafe { stator_value_as_object(val) };
+        assert!(!obj2.is_null());
+        // Mutating through obj2 must be visible through obj.
+        let key = c"shared";
+        let v100 = unsafe { stator_value_new_number(iso.as_ptr(), 100.0) };
+        assert_eq!(
+            unsafe {
+                stator_object_set_property(
+                    obj2,
+                    key.as_ptr(),
+                    key.to_bytes().len(),
+                    v100 as *const StatorValue,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut has = false;
+        assert_eq!(
+            unsafe {
+                stator_object_has_property(obj, key.as_ptr(), key.to_bytes().len(), &mut has)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(has, "mutations on obj2 should be observed through obj");
+
+        // Strict-equals on two ObjectHandle values pointing at same Rc → true.
+        let val2 = unsafe { stator_object_as_value(obj2) };
+        assert!(unsafe { stator_value_strict_equals(val, val2) });
+
+        unsafe {
+            stator_value_destroy(v100);
+            stator_value_destroy(val);
+            stator_value_destroy(val2);
+            stator_object_destroy(obj);
+            stator_object_destroy(obj2);
+        }
+    }
+
+    #[test]
+    fn test_value_as_object_returns_null_for_tag_only() {
+        let iso = IsolateGuard::new();
+        let val = unsafe { stator_value_new_object(iso.as_ptr()) };
+        // Tag-only object value has no shared storage → as_object returns null.
+        let obj = unsafe { stator_value_as_object(val) };
+        assert!(obj.is_null());
+        // Also returns null for primitives.
+        let n = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        assert!(unsafe { stator_value_as_object(n) }.is_null());
+        // And null for the null value pointer itself.
+        assert!(unsafe { stator_value_as_object(std::ptr::null()) }.is_null());
+        unsafe {
+            stator_value_destroy(val);
+            stator_value_destroy(n);
+        }
+    }
+
+    #[test]
+    fn test_maybe_get_missing_returns_false() {
+        let iso = IsolateGuard::new();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"absent";
+        let mut out: *mut StatorValue = 0x1 as *mut StatorValue; // sentinel
+        assert_eq!(
+            unsafe {
+                stator_object_get_property(obj, key.as_ptr(), key.to_bytes().len(), &mut out)
+            },
+            StatorStatus::StatorStatusFalse
+        );
+        // The out-pointer must always be cleared on non-OK.
+        assert!(out.is_null());
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_maybe_get_existing_undefined_is_ok_with_undefined_value() {
+        let iso = IsolateGuard::new();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"u";
+        let undef = unsafe { stator_value_new_undefined(iso.as_ptr()) };
+        assert_eq!(
+            unsafe {
+                stator_object_set_property(
+                    obj,
+                    key.as_ptr(),
+                    key.to_bytes().len(),
+                    undef as *const StatorValue,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut got: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_object_get_property(obj, key.as_ptr(), key.to_bytes().len(), &mut got)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!got.is_null());
+        assert!(unsafe { stator_value_is_undefined(got) });
+        unsafe {
+            stator_value_destroy(got);
+            stator_value_destroy(undef);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_maybe_set_get_has_delete_for_value_types() {
+        let iso = IsolateGuard::new();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let cases: &[(&str, *mut StatorValue)] = &[
+            ("b", unsafe { stator_value_new_boolean(iso.as_ptr(), true) }),
+            ("n", unsafe { stator_value_new_number(iso.as_ptr(), 7.0) }),
+            ("nu", unsafe { stator_value_new_null(iso.as_ptr()) }),
+            ("s", unsafe {
+                stator_value_new_string(iso.as_ptr(), c"hi".as_ptr(), 2)
+            }),
+            ("o", unsafe { stator_value_new_object(iso.as_ptr()) }),
+        ];
+        for (k, v) in cases {
+            let kb = k.as_bytes();
+            assert_eq!(
+                unsafe {
+                    stator_object_set_property(
+                        obj,
+                        kb.as_ptr() as *const c_char,
+                        kb.len(),
+                        *v as *const StatorValue,
+                    )
+                },
+                StatorStatus::StatorStatusOk,
+                "set {k}"
+            );
+            let mut has = false;
+            assert_eq!(
+                unsafe {
+                    stator_object_has_property(
+                        obj,
+                        kb.as_ptr() as *const c_char,
+                        kb.len(),
+                        &mut has,
+                    )
+                },
+                StatorStatus::StatorStatusOk
+            );
+            assert!(has, "has {k}");
+            let mut got: *mut StatorValue = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    stator_object_get_property(
+                        obj,
+                        kb.as_ptr() as *const c_char,
+                        kb.len(),
+                        &mut got,
+                    )
+                },
+                StatorStatus::StatorStatusOk
+            );
+            assert!(!got.is_null(), "get {k}");
+            unsafe { stator_value_destroy(got) };
+            let mut deleted = false;
+            assert_eq!(
+                unsafe {
+                    stator_object_delete_property(
+                        obj,
+                        kb.as_ptr() as *const c_char,
+                        kb.len(),
+                        &mut deleted,
+                    )
+                },
+                StatorStatus::StatorStatusOk
+            );
+            assert!(deleted, "delete {k}");
+        }
+        for (_, v) in cases {
+            unsafe { stator_value_destroy(*v) };
+        }
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_maybe_set_invalid_args_and_non_utf8_keys() {
+        let iso = IsolateGuard::new();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // Null obj.
+        assert_eq!(
+            unsafe {
+                stator_object_set_property(
+                    std::ptr::null_mut(),
+                    c"k".as_ptr(),
+                    1,
+                    val as *const StatorValue,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Null val.
+        assert_eq!(
+            unsafe { stator_object_set_property(obj, c"k".as_ptr(), 1, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Non-UTF-8 key (0xFF is not a valid UTF-8 lead byte).
+        let bad = [0xFFu8];
+        assert_eq!(
+            unsafe {
+                stator_object_set_property(
+                    obj,
+                    bad.as_ptr() as *const c_char,
+                    bad.len(),
+                    val as *const StatorValue,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe {
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_maybe_get_null_safety() {
+        let mut got: *mut StatorValue = std::ptr::null_mut();
+        // Null obj.
+        assert_eq!(
+            unsafe { stator_object_get_property(std::ptr::null(), c"k".as_ptr(), 1, &mut got) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert!(got.is_null());
+        // Null out.
+        let iso = IsolateGuard::new();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        assert_eq!(
+            unsafe { stator_object_get_property(obj, c"k".as_ptr(), 1, std::ptr::null_mut()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_value_call_unsupported_for_bytecode_or_primitive() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let n = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { stator_value_call(ctx, n, std::ptr::null(), 0, std::ptr::null(), &mut out,) },
+            StatorStatus::StatorStatusUnsupported
+        );
+        assert!(out.is_null());
+
+        // Bytecode-tag function value → also unsupported in this slice.
+        let f_tag = unsafe { stator_value_new_function_tag(iso.as_ptr()) };
+        assert_eq!(
+            unsafe {
+                stator_value_call(ctx, f_tag, std::ptr::null(), 0, std::ptr::null(), &mut out)
+            },
+            StatorStatus::StatorStatusUnsupported
+        );
+
+        // Invalid arg: null ctx, negative argc.
+        assert_eq!(
+            unsafe {
+                stator_value_call(
+                    std::ptr::null_mut(),
+                    n,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_value_call(ctx, n, std::ptr::null(), -1, std::ptr::null(), &mut out) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe {
+            stator_value_destroy(n);
+            stator_value_destroy(f_tag);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_value_call_native_function_template_round_trip() {
+        unsafe extern "C" fn triple(info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            // SAFETY: `info` is valid for the duration of the callback.
+            let iso = unsafe { stator_function_callback_info_get_isolate(info) };
+            let argc = unsafe { stator_function_callback_info_length(info) };
+            let n = if argc < 1 {
+                0.0
+            } else {
+                let arg = unsafe { stator_function_callback_info_get(info, 0) };
+                if arg.is_null() {
+                    0.0
+                } else {
+                    unsafe { stator_value_as_number(arg) }
+                }
+            };
+            unsafe { stator_value_new_number(iso, n * 3.0) }
+        }
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), triple) };
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        assert!(unsafe { stator_value_is_function(fn_val) });
+
+        let arg = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        let argv: [*const StatorValue; 1] = [arg as *const StatorValue];
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        let status =
+            unsafe { stator_value_call(ctx, fn_val, std::ptr::null(), 1, argv.as_ptr(), &mut out) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert!(!out.is_null());
+        let mut got = 0.0;
+        assert_eq!(
+            unsafe { stator_value_get_number(out, &mut got) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(got, 21.0);
+        unsafe {
+            stator_value_destroy(out);
+            stator_value_destroy(arg);
+            stator_value_destroy(fn_val);
+            stator_function_template_destroy(tmpl);
             stator_context_destroy(ctx);
         }
     }
