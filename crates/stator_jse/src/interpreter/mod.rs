@@ -25197,7 +25197,9 @@ mod tests {
     }
 
     #[test]
-    fn test_call_runtime_dynamic_import_returns_promise() {
+    fn test_call_runtime_dynamic_import_rejects_without_host_loader() {
+        use crate::builtins::error::ErrorKind;
+        use crate::builtins::promise::PromiseState;
         use crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT;
         let ba = make_bytecode_with_pool(
             vec![
@@ -25221,9 +25223,16 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert!(
-            matches!(result, JsValue::Promise(_)),
-            "expected Promise, got {result:?}"
+        let JsValue::Promise(promise) = result else {
+            panic!("expected Promise, got {result:?}");
+        };
+        let PromiseState::Rejected(JsValue::Error(error)) = promise.state() else {
+            panic!("expected rejected TypeError promise");
+        };
+        assert_eq!(error.kind, ErrorKind::TypeError);
+        assert_eq!(
+            error.message,
+            "dynamic import is not supported by this host"
         );
     }
 

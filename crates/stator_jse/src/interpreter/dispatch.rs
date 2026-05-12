@@ -35,7 +35,7 @@ use super::{
     to_array_index, to_bigint, to_property_key, try_execute_best_jit,
     try_fast_named_property_lookup, try_inline_small_function, walk_context_chain,
 };
-use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
+use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
     proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
 };
@@ -6732,26 +6732,22 @@ fn handle_call_runtime(
     let Operand::RuntimeId(runtime_id) = *instr.operand(0) else {
         return Err(err_bad_operand("CallRuntime", 0));
     };
-    let Operand::Register(args_start_v) = *instr.operand(1) else {
+    let Operand::Register(_args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallRuntime", 1));
     };
-    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
+    let Operand::RegisterCount(_arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallRuntime", 2));
     };
 
     if runtime_id == crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT {
-        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
-
-        let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-        let specifier = args.first().cloned().unwrap_or(JsValue::Undefined);
-
-        let mut ns = PropertyMap::new();
-        ns.insert("default".into(), specifier);
-        let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
+        use crate::builtins::promise::{MicrotaskQueue, promise_reject};
 
         let queue = MicrotaskQueue::new();
-        let p = promise_resolve(ns_val, &queue);
-        queue.drain();
+        let reason = JsValue::Error(Rc::new(JsError::new(
+            ErrorKind::TypeError,
+            "dynamic import is not supported by this host".to_string(),
+        )));
+        let p = promise_reject(reason, &queue);
         ctx.frame.accumulator = JsValue::Promise(p);
     }
     // Unrecognised runtime IDs are no-ops.
