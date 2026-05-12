@@ -2645,12 +2645,13 @@ impl GlobalEnv {
         }
         self.vars.insert(key.clone(), value.clone());
         if let Some(&idx) = self.name_to_index.get(&key) {
-            self.slots[idx] = value;
+            self.slots[idx] = value.clone();
         } else {
             let idx = self.slots.len();
-            self.slots.push(value);
-            self.name_to_index.insert(key, idx);
+            self.slots.push(value.clone());
+            self.name_to_index.insert(key.clone(), idx);
         }
+        self.sync_global_object_property(&key, value);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -2664,6 +2665,7 @@ impl GlobalEnv {
             if let Some(idx) = self.name_to_index.remove(key) {
                 self.slots[idx] = JsValue::Undefined;
             }
+            self.remove_global_object_property(key);
             self.generation = self.generation.wrapping_add(1);
         }
         removed
@@ -2739,9 +2741,30 @@ impl GlobalEnv {
             recycle_object_rc(rc);
         }
         if let Some(v) = self.vars.get_mut(key) {
-            *v = value;
+            *v = value.clone();
         }
+        self.sync_global_object_property(key, value);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn sync_global_object_property(&self, key: &str, value: JsValue) {
+        if key == "globalThis" || key == "this" {
+            return;
+        }
+
+        if let Some(JsValue::PlainObject(global_object)) = self.vars.get("globalThis") {
+            global_object.borrow_mut().insert(key.to_string(), value);
+        }
+    }
+
+    fn remove_global_object_property(&self, key: &str) {
+        if key == "globalThis" || key == "this" {
+            return;
+        }
+
+        if let Some(JsValue::PlainObject(global_object)) = self.vars.get("globalThis") {
+            global_object.borrow_mut().remove(key);
+        }
     }
 
     /// Look up the slot index for a global variable name.

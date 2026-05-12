@@ -11321,6 +11321,38 @@ mod tests {
     }
 
     #[test]
+    fn test_script_globals_reflect_on_global_this() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"
+            var edgeGlobalReflection = 42;
+            edgeGlobalAssignment = edgeGlobalReflection + 1;
+            globalThis.edgeGlobalReflection + ':' + globalThis.edgeGlobalAssignment;
+        ";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null(), "expected a result");
+        // SAFETY: `result` is non-null and live.
+        let result_ptr = unsafe { stator_value_as_string(result) };
+        // SAFETY: `result_ptr` points to the live result string.
+        let actual = unsafe { CStr::from_ptr(result_ptr) }.to_string_lossy();
+        assert_eq!(actual, "42:43");
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_drain_active_microtask_queue_flushes_promise_reactions() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.

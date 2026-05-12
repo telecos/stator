@@ -367,6 +367,25 @@ mod tests {
         assert_eval_true("typeof globalThis.Object === 'function'");
     }
 
+    #[test]
+    fn e2e_global_var_reflects_on_global_this() {
+        assert_eval_true("var edgeGlobalReflection = 42; globalThis.edgeGlobalReflection === 42");
+    }
+
+    #[test]
+    fn e2e_global_store_reflects_on_global_this() {
+        assert_eval_true(
+            "var edgeGlobalStore = 0; \
+             for (var i = 0; i < 4; i++) { edgeGlobalStore = i; } \
+             globalThis.edgeGlobalStore === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_sloppy_global_assignment_reflects_on_global_this() {
+        assert_eval_true("edgeGlobalAssignment = 17; globalThis.edgeGlobalAssignment === 17");
+    }
+
     // ── Misc: typeof on undeclared variable ─────────────────────────────────
 
     #[test]
