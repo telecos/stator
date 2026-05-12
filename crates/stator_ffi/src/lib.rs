@@ -7489,13 +7489,16 @@ pub unsafe extern "C" fn stator_inspector_dispatch(
     }
     // SAFETY: caller guarantees `json` is valid for `len` bytes.
     let bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
     // SAFETY: caller guarantees `session` is a live FFI wrapper whose
     // `inner` points to a session owned by the parent inspector.
     let inner = unsafe { &mut *(*session).inner };
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            inner.dispatch_parse_error("Parse error: invalid UTF-8 JSON-RPC request".to_string());
+            return 1;
+        }
+    };
     match inner.dispatch_json(text) {
         stator_jse::inspector::cdp::DispatchOutcome::Ok => 0,
         stator_jse::inspector::cdp::DispatchOutcome::ParseError => 1,
@@ -13353,6 +13356,35 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         let resp: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(resp["error"]["code"], -32700);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_invalid_utf8_returns_transport_error_and_response() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+
+        let req = [0xff_u8, 0xfe_u8, b'{'];
+        let rc =
+            unsafe { stator_inspector_dispatch(session, req.as_ptr() as *const c_char, req.len()) };
+        assert_eq!(rc, 1, "invalid UTF-8 must surface as transport error");
+        let msgs = drain_inspector_session(session);
+        assert_eq!(msgs.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(resp["error"]["code"], -32700);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid UTF-8")
+        );
 
         unsafe {
             stator_inspector_disconnect(inspector, session);

@@ -71,6 +71,14 @@ impl InProcessInspectorSession {
         self.dispatcher.dispatch_json(text)
     }
 
+    /// Enqueue a transport-level parse error that occurred before a UTF-8
+    /// JSON-RPC request could be passed to the dispatcher.
+    pub fn dispatch_parse_error(&mut self, message: String) -> DispatchOutcome {
+        self.cached = None;
+        self.dispatcher.push_parse_error(message);
+        DispatchOutcome::ParseError
+    }
+
     /// Number of messages currently waiting in the dispatcher's outbox.
     pub fn pending_count(&self) -> usize {
         self.dispatcher.pending_count()
@@ -195,7 +203,10 @@ impl InProcessInspector {
     /// `Debugger.scriptParsed` event in its outbox.
     pub fn register_script(&mut self, source: String) -> u32 {
         let id = self.next_script_id;
-        self.next_script_id = self.next_script_id.checked_add(1).unwrap_or(1);
+        let Some(next_script_id) = self.next_script_id.checked_add(1) else {
+            return 0;
+        };
+        self.next_script_id = next_script_id;
 
         let line_count = source.lines().count().max(1) as u32;
         let last_line_columns = source
@@ -385,6 +396,17 @@ mod tests {
             0,
             "session without Debugger.enable must not receive scriptParsed events"
         );
+    }
+
+    #[test]
+    fn register_script_returns_zero_instead_of_wrapping_ids() {
+        let mut inspector = new_inspector();
+        inspector.next_script_id = u32::MAX;
+
+        let id = inspector.register_script("let overflow = true;".to_string());
+
+        assert_eq!(id, 0);
+        assert!(inspector.scripts().is_empty());
     }
 
     #[test]

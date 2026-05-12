@@ -183,6 +183,15 @@ impl CdpDispatcher {
         self.outbox.push_back(message);
     }
 
+    /// Push a JSON-RPC parse-error response onto the outbox.
+    pub fn push_parse_error(&mut self, message: String) {
+        let resp = json!({
+            "id": 0u64,
+            "error": {"code": -32700, "message": message}
+        });
+        self.outbox.push_back(resp.to_string());
+    }
+
     /// Returns `true` if the `Debugger` domain is currently enabled.
     pub fn debugger_enabled(&self) -> bool {
         self.debugger_enabled
@@ -198,11 +207,7 @@ impl CdpDispatcher {
         let request: CdpRequest = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
-                let resp = json!({
-                    "id": 0u64,
-                    "error": {"code": -32700, "message": format!("Parse error: {e}")}
-                });
-                self.outbox.push_back(resp.to_string());
+                self.push_parse_error(format!("Parse error: {e}"));
                 return DispatchOutcome::ParseError;
             }
         };
