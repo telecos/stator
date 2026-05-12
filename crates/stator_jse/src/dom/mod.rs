@@ -499,6 +499,20 @@ impl DomObjectWrap {
         self.properties.borrow_mut().insert(key.to_string(), value);
     }
 
+    /// Attempt to write a named property through the interceptor only.
+    ///
+    /// Returns `true` when an installed setter handled the write.  Unlike
+    /// [`set_property`][Self::set_property], this helper never falls through to
+    /// the own-property map when the interceptor declines the write.
+    pub fn set_intercepted_property(&self, key: &str, value: JsValue) -> bool {
+        if let Some(cfg) = &self.named_handler
+            && let Some(setter) = cfg.setter()
+        {
+            return setter(key, &value, self.data_ptr());
+        }
+        false
+    }
+
     /// Query whether a named property exists, consulting the interceptor.
     pub fn has_property(&self, key: &str) -> bool {
         if let Some(cfg) = &self.named_handler

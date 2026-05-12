@@ -4344,6 +4344,129 @@ pub unsafe extern "C" fn stator_context_global_set(
     }
 }
 
+fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
+    if wrap.is_null() {
+        return None;
+    }
+
+    let wrap_addr = wrap as usize;
+    // SAFETY: caller guarantees `wrap` is valid for the lifetime of the
+    // installed JS global.  We copy the enumerable property names now and route
+    // each accessor back through the live wrapper so named handlers stay active.
+    let names = unsafe { (*wrap).inner.property_names() };
+    let mut object = PropertyMap::new();
+    let mut installed_names: Vec<String> = Vec::new();
+
+    for name in names {
+        if name.starts_with("__get_")
+            || name.starts_with("__set_")
+            || installed_names.iter().any(|installed| installed == &name)
+        {
+            continue;
+        }
+        installed_names.push(name.clone());
+
+        let getter_name = name.clone();
+        let getter_wrap_addr = wrap_addr;
+        object.insert_builtin(
+            format!("__get_{name}__"),
+            JsValue::NativeFunction(Rc::new(move |_args| {
+                let wrap = getter_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Ok(JsValue::Undefined);
+                }
+                // SAFETY: the embedder must keep the wrapper alive for as long
+                // as the installed global can be observed.
+                Ok(unsafe { (*wrap).inner.get_property(&getter_name) })
+            })),
+        );
+
+        if unsafe { (*wrap).has_named_setter } {
+            let setter_name = name.clone();
+            let setter_wrap_addr = wrap_addr;
+            object.insert_builtin(
+                format!("__set_{name}__"),
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let wrap = setter_wrap_addr as *mut StatorDomObjectWrap;
+                    if wrap.is_null() {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    // SAFETY: the embedder must keep the wrapper alive until
+                    // the owning context is destroyed.
+                    unsafe {
+                        (*wrap).inner.set_intercepted_property(&setter_name, value);
+                    }
+                    Ok(JsValue::Undefined)
+                })),
+            );
+        }
+
+        object.insert(name, JsValue::Undefined);
+    }
+
+    Some(JsValue::PlainObject(Rc::new(RefCell::new(object))))
+}
+
+/// Install a DOM object wrapper as a named global on `ctx`.
+///
+/// The installed value is backed by a Stator `PlainObject` whose enumerable
+/// properties are snapshotted from the wrapper's named-property enumerator and
+/// own-property list at install time.  Reads of those properties dispatch back
+/// to the wrapper's named getter; writes dispatch back only when the wrapper has
+/// a named setter installed.  This lets embedders expose P0 DOM globals such as
+/// `document.title` without V8.
+///
+/// This is intentionally narrower than a general `StatorDomObjectWrap` →
+/// `StatorValue` conversion: it requires a context and installs the value
+/// directly into that context's global environment.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the global was installed.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
+///   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
+///   different isolate than `ctx`.
+///
+/// # Safety
+/// - `ctx` must be a valid, live [`StatorContext`] pointer.
+/// - `name` must be a valid, null-terminated C string.
+/// - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer that remains
+///   alive until `ctx` is destroyed.  Replacing the global slot is not enough to
+///   release `wrap`, because page code may still hold aliases to the installed
+///   object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_global_set_dom_object_wrap(
+    ctx: *mut StatorContext,
+    name: *const c_char,
+    wrap: *mut StatorDomObjectWrap,
+) -> StatorStatus {
+    if ctx.is_null() || name.is_null() || wrap.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    // SAFETY: caller guarantees pointers are valid.
+    let ctx_isolate = unsafe { (*ctx)._isolate };
+    let wrap_isolate = unsafe { (*wrap).isolate };
+    if ctx_isolate.is_null() || ctx_isolate != wrap_isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    // SAFETY: caller guarantees `name` is a valid C string.
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => return StatorStatus::StatorStatusInvalidArg,
+    };
+
+    let Some(js_value) = dom_object_wrap_js_value(wrap) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+
+    // SAFETY: caller guarantees `ctx` is valid.
+    let globals = unsafe { Rc::clone(&(*ctx).globals) };
+    globals.borrow_mut().insert(name_str, js_value);
+    StatorStatus::StatorStatusOk
+}
+
 /// Convert a [`StatorValueInner`] to a number following ECMAScript §7.1.4 **ToNumber**.
 ///
 /// Object-like tags (`Object`, `Function`, `Array`, `Date`, `RegExp`,
@@ -6688,6 +6811,10 @@ type StatorDomWeakCb = unsafe extern "C" fn(data: *mut c_void);
 pub struct StatorDomObjectWrap {
     inner: DomObjectWrap,
     isolate: *mut StatorIsolate,
+    /// Whether the current named handler has a setter.  The FFI global-install
+    /// helper uses this to avoid manufacturing write access for read-only DOM
+    /// properties.
+    has_named_setter: bool,
     /// Embedder-assigned class identifier (0 = unassigned).
     class_id: u32,
     /// Opaque embedder-assigned native object identity pointer.  Distinct
@@ -6720,6 +6847,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
     Box::into_raw(Box::new(StatorDomObjectWrap {
         inner: DomObjectWrap::new(field_count as usize),
         isolate,
+        has_named_setter: false,
         class_id: 0,
         native_ptr: std::ptr::null_mut(),
     }))
@@ -6841,6 +6969,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_named_getter(
             })
             .build(),
     );
+    unsafe { (*wrap).has_named_setter = false };
     let _ = isolate; // keep variable used for future extensions
 }
 
@@ -6878,6 +7007,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_named_setter(
             })
             .build(),
     );
+    unsafe { (*wrap).has_named_setter = true };
 }
 
 /// Install an indexed-property getter interceptor on `wrap`.
@@ -7556,7 +7686,10 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_named_handler(
     }
 
     // SAFETY: caller guarantees `wrap` is valid.
-    unsafe { (*wrap).inner.set_named_handler(builder.build()) };
+    unsafe {
+        (*wrap).inner.set_named_handler(builder.build());
+        (*wrap).has_named_setter = h.setter.is_some();
+    }
     StatorStatus::StatorStatusOk
 }
 
@@ -12475,6 +12608,70 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn named_get_document_property(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let value = match key {
+            "title" => ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow().clone()),
+            "URL" | "documentURI" => "https://example.test/stator.html".to_string(),
+            "readonlyMissing" => return StatorStatus::StatorStatusFalse,
+            _ => return StatorStatus::StatorStatusFalse,
+        };
+        let bytes = value.as_bytes();
+        let v =
+            unsafe { stator_value_new_string(iso, bytes.as_ptr() as *const c_char, bytes.len()) };
+        unsafe { *out = v };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_set_document_property(
+        name: *const c_char,
+        name_len: usize,
+        value: *const StatorValue,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key != "title" {
+            return StatorStatus::StatorStatusFalse;
+        }
+        let ptr = unsafe { stator_value_as_string(value) };
+        if ptr.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let title = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        ACTIVE_DOCUMENT_TITLE.with(|stored| *stored.borrow_mut() = title);
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_enumerate_document(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        for name in [
+            b"title".as_slice(),
+            b"URL".as_slice(),
+            b"documentURI".as_slice(),
+            b"readonlyMissing".as_slice(),
+        ] {
+            let status = unsafe {
+                stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len())
+            };
+            if status != StatorStatus::StatorStatusOk {
+                return status;
+            }
+        }
+        StatorStatus::StatorStatusOk
+    }
+
     unsafe extern "C" fn indexed_get_zero(
         index: u32,
         _data: *mut c_void,
@@ -12501,6 +12698,7 @@ mod tests {
     thread_local! {
         static ACTIVE_ISO: std::cell::Cell<*mut StatorIsolate> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
+        static ACTIVE_DOCUMENT_TITLE: RefCell<String> = RefCell::new(String::new());
     }
 
     #[test]
@@ -12587,6 +12785,137 @@ mod tests {
         assert!(names.iter().any(|n| n == "beta"));
 
         unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_context_global_set_dom_object_wrap_dispatches_named_handlers() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| *title.borrow_mut() = "Initial".to_string());
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_document_property),
+            setter: Some(named_set_document_property),
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_document),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let global_name = c"document";
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, global_name.as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"document.title + '|' + document.URL + '|' + document.documentURI";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(
+            actual,
+            "Initial|https://example.test/stator.html|https://example.test/stator.html"
+        );
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+        }
+
+        let write_src = b"document.title = 'Updated'; document.title";
+        let write_script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                write_src.as_ptr() as *const c_char,
+                write_src.len(),
+            )
+        };
+        let write_result = unsafe { stator_script_run(write_script, ctx) };
+        assert!(!write_result.is_null());
+        let write_ptr = unsafe { stator_value_as_string(write_result) };
+        let updated = unsafe { CStr::from_ptr(write_ptr) }.to_string_lossy();
+        assert_eq!(updated, "Updated");
+        ACTIVE_DOCUMENT_TITLE.with(|title| assert_eq!(&*title.borrow(), "Updated"));
+
+        unsafe {
+            stator_value_destroy(write_result);
+            stator_script_free(write_script);
+        }
+
+        let rejected_write_src =
+            b"document.readonlyMissing = 'polluted'; typeof document.readonlyMissing";
+        let rejected_write_script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                rejected_write_src.as_ptr() as *const c_char,
+                rejected_write_src.len(),
+            )
+        };
+        let rejected_write_result = unsafe { stator_script_run(rejected_write_script, ctx) };
+        assert!(!rejected_write_result.is_null());
+        let rejected_write_ptr = unsafe { stator_value_as_string(rejected_write_result) };
+        let rejected_write_type = unsafe { CStr::from_ptr(rejected_write_ptr) }.to_string_lossy();
+        assert_eq!(rejected_write_type, "undefined");
+
+        unsafe {
+            stator_value_destroy(rejected_write_result);
+            stator_script_free(rejected_write_script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_context_global_set_dom_object_wrap_rejects_invalid_args() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let name = c"document";
+
+        assert_eq!(
+            unsafe {
+                stator_context_global_set_dom_object_wrap(std::ptr::null_mut(), name.as_ptr(), wrap)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, std::ptr::null(), wrap,) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe {
+                stator_context_global_set_dom_object_wrap(ctx, name.as_ptr(), std::ptr::null_mut())
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        let other_iso = IsolateGuard::new();
+        let other_wrap = unsafe { stator_dom_object_wrap_new(other_iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, name.as_ptr(), other_wrap) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        unsafe {
+            stator_dom_object_wrap_destroy(other_wrap);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]

@@ -2792,6 +2792,38 @@ void stator_context_global_set(struct StatorContext *ctx,
                                const struct StatorValue *val);
 
 /**
+ * Install a DOM object wrapper as a named global on `ctx`.
+ *
+ * The installed value is backed by a Stator `PlainObject` whose enumerable
+ * properties are snapshotted from the wrapper's named-property enumerator and
+ * own-property list at install time.  Reads of those properties dispatch back
+ * to the wrapper's named getter; writes dispatch back only when the wrapper has
+ * a named setter installed.  This lets embedders expose P0 DOM globals such as
+ * `document.title` without V8.
+ *
+ * This is intentionally narrower than a general `StatorDomObjectWrap` →
+ * `StatorValue` conversion: it requires a context and installs the value
+ * directly into that context's global environment.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when the global was installed.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
+ *   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
+ *   different isolate than `ctx`.
+ *
+ * # Safety
+ * - `ctx` must be a valid, live [`StatorContext`] pointer.
+ * - `name` must be a valid, null-terminated C string.
+ * - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer that remains
+ *   alive until `ctx` is destroyed.  Replacing the global slot is not enough to
+ *   release `wrap`, because page code may still hold aliases to the installed
+ *   object.
+ */
+enum StatorStatus stator_context_global_set_dom_object_wrap(struct StatorContext *ctx,
+                                                            const char *name,
+                                                            struct StatorDomObjectWrap *wrap);
+
+/**
  * Open a new handle scope on `isolate`.
  *
  * All [`StatorValue`] handles created after this call (and before the
