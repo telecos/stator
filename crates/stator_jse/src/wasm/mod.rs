@@ -52,9 +52,7 @@ use wasmtime::{
 };
 
 use crate::error::{StatorError, StatorResult};
-use crate::interpreter::{
-    SCRIPT_TERMINATED_MESSAGE, check_interrupt_flag, script_terminated_error,
-};
+use crate::interpreter::{SCRIPT_TERMINATED_MESSAGE, check_interrupt_flag};
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
