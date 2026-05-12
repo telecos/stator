@@ -6678,9 +6678,22 @@ type StatorDomWeakCb = unsafe extern "C" fn(data: *mut c_void);
 /// Created by [`stator_dom_object_wrap_new`] and freed by
 /// [`stator_dom_object_wrap_destroy`].  Stores opaque embedder pointers in
 /// *internal fields* and routes property access through optional interceptors.
+///
+/// In addition to the engine-level wrapper state, the FFI layer tracks two
+/// browser-embedder concepts: a *class id* (an embedder-defined integer that
+/// identifies the JS-visible interface, e.g. `HTMLDivElement`) and a *native
+/// object pointer* (an opaque pointer the embedder uses to identify the
+/// underlying C++ object regardless of which internal field is in use).
+/// Both default to zero / null and are never dereferenced by the engine.
 pub struct StatorDomObjectWrap {
     inner: DomObjectWrap,
     isolate: *mut StatorIsolate,
+    /// Embedder-assigned class identifier (0 = unassigned).
+    class_id: u32,
+    /// Opaque embedder-assigned native object identity pointer.  Distinct
+    /// from internal fields so embedders can tag the canonical native object
+    /// without consuming an internal-field slot.
+    native_ptr: *mut c_void,
 }
 
 // SAFETY: `StatorDomObjectWrap` is single-threaded; see [`StatorValue`].
@@ -6707,6 +6720,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
     Box::into_raw(Box::new(StatorDomObjectWrap {
         inner: DomObjectWrap::new(field_count as usize),
         isolate,
+        class_id: 0,
+        native_ptr: std::ptr::null_mut(),
     }))
 }
 
@@ -7031,6 +7046,569 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
         // SAFETY: pointer was created by `Box::into_raw`.
         drop(unsafe { Box::from_raw(weak) });
     }
+}
+
+// ── DOM hardened slice: class identity + V2 interceptors ──────────────────────
+//
+// The functions below extend the basic DOM wrapper FFI with concepts required
+// by a real browser embedding (Edge/Blink-style):
+//
+// * **Class identity** — `class_id` plus an opaque `native_ptr` that lets the
+//   embedder recognise a JS object as wrapping a known native C++ type without
+//   having to walk internal fields.
+// * **Aggregate interceptor install** — `StatorDomNamedHandler` and
+//   `StatorDomIndexedHandler` are POD structs of optional function pointers
+//   (any field may be `NULL`) that install all callbacks at once.  This is
+//   additive on top of the legacy `set_named_getter` / `set_named_setter` /
+//   `set_indexed_getter` / `set_indexed_setter` entry points and lets
+//   embedders register query, deleter, enumerator, and length callbacks too.
+// * **StatorStatus + explicit-length UTF-8 keys** — V2 callbacks accept
+//   `(name, name_len)` rather than a null-terminated C string and return
+//   [`StatorStatus`] so the embedder can distinguish *handled* from *missing*
+//   from *exception*.
+//
+// ### Exception bridging limitation
+//
+// The underlying [`DomObjectWrap`] property model currently distinguishes
+// only *handled* (`Some`) from *missing/fall-through* (`None`); it does not
+// yet propagate a raised exception through interceptor return values.  When
+// a V2 callback returns [`StatorStatus::StatorStatusException`], the FFI
+// bridge maps the result to fall-through (`None` / `false`).  Embedders that
+// want exception-style behaviour should call
+// [`stator_isolate_throw_exception`] from inside the callback so the
+// isolate's pending exception is set; downstream code can then observe it via
+// [`stator_isolate_has_pending_exception`].  Wiring the engine to honour
+// these pending exceptions during property access is intentionally left to a
+// future hardening slice.
+
+/// Set the embedder-defined class identifier on `wrap`.
+///
+/// A class id of 0 is treated as *unassigned*.  Does nothing when `wrap` is
+/// null.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_set_class_id(
+    wrap: *mut StatorDomObjectWrap,
+    class_id: u32,
+) {
+    if wrap.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).class_id = class_id };
+}
+
+/// Return the embedder-defined class identifier previously stored on `wrap`,
+/// or `0` when `wrap` is null or unassigned.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_get_class_id(
+    wrap: *const StatorDomObjectWrap,
+) -> u32 {
+    if wrap.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).class_id }
+}
+
+/// Store an opaque native-object identity pointer on `wrap`.
+///
+/// The engine never dereferences this pointer; it is purely an identity tag
+/// the embedder can compare against a known native object (e.g. a
+/// `blink::Element*`).  Does nothing when `wrap` is null.
+///
+/// # Safety
+/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `ptr` is treated as opaque by the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_set_native_ptr(
+    wrap: *mut StatorDomObjectWrap,
+    ptr: *mut c_void,
+) {
+    if wrap.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).native_ptr = ptr };
+}
+
+/// Retrieve the opaque native-object identity pointer previously stored on
+/// `wrap`, or null when `wrap` is null or no pointer has been set.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_get_native_ptr(
+    wrap: *const StatorDomObjectWrap,
+) -> *mut c_void {
+    if wrap.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).native_ptr }
+}
+
+// ── V2 callback signatures (explicit-length keys + StatorStatus) ──────────
+
+/// V2 named-property **getter** callback.
+///
+/// The property name is passed as a UTF-8 byte range
+/// `(name_utf8, name_len)` — it is **not** required to be null-terminated.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] — the interceptor handled the read and
+///   wrote a non-null [`StatorValue`] pointer into `*out`.  Ownership of the
+///   value transfers to Stator, which will destroy it once consumed.
+/// * [`StatorStatus::StatorStatusFalse`] — the interceptor did not handle the
+///   read; the engine falls through to the wrapper's own properties.  `*out`
+///   is ignored.
+/// * [`StatorStatus::StatorStatusException`] — the embedder raised an
+///   exception (and is expected to have populated the isolate's pending
+///   exception via [`stator_isolate_throw_exception`]); the engine falls
+///   through.  See module docs for the bridging limitation.
+/// * Any other status is treated as fall-through.
+///
+/// # Safety
+/// - `name_utf8` must be valid for `name_len` bytes.
+/// - `out` must be a writable `*mut StatorValue` slot if [`StatorStatus::StatorStatusOk`]
+///   is returned.
+pub type StatorDomNamedGetterCbV2 = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// V2 named-property **setter** callback.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
+/// (engine will not fall through to the wrapper's own properties),
+/// [`StatorStatus::StatorStatusFalse`] for fall-through, or
+/// [`StatorStatus::StatorStatusException`] (treated as fall-through; see the
+/// exception-bridging limitation in the module documentation).
+///
+/// # Safety
+/// `name_utf8` must be valid for `name_len` bytes; `value` must be either
+/// null or a valid, live [`StatorValue`] pointer borrowed for the call.
+pub type StatorDomNamedSetterCbV2 = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    value: *const StatorValue,
+    data: *mut c_void,
+) -> StatorStatus;
+
+/// V2 named-property **query** callback.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] when the property exists (writing
+/// `v8::PropertyAttribute` flags into `*out_attrs`; `0` = `None`),
+/// [`StatorStatus::StatorStatusFalse`] when it does not exist, or
+/// [`StatorStatus::StatorStatusException`] (treated as missing).
+///
+/// # Safety
+/// `name_utf8` must be valid for `name_len` bytes; `out_attrs` must be a
+/// writable `*mut u32` slot if [`StatorStatus::StatorStatusOk`] is returned.
+pub type StatorDomNamedQueryCb = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    data: *mut c_void,
+    out_attrs: *mut u32,
+) -> StatorStatus;
+
+/// V2 named-property **deleter** callback.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] to indicate the interceptor
+/// handled the delete and wrote the JS-visible "deleted" result into
+/// `*out_deleted` (`true` for successful delete, `false` for non-configurable
+/// / refused).  [`StatorStatus::StatorStatusFalse`] falls through to the
+/// wrapper's own properties.  [`StatorStatus::StatorStatusException`] is
+/// treated as fall-through.
+///
+/// # Safety
+/// `name_utf8` must be valid for `name_len` bytes; `out_deleted` must be a
+/// writable `*mut bool` slot if [`StatorStatus::StatorStatusOk`] is returned.
+pub type StatorDomNamedDeleterCb = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    data: *mut c_void,
+    out_deleted: *mut bool,
+) -> StatorStatus;
+
+/// V2 named-property **enumerator** callback.
+///
+/// The callback should push each enumerable name into `buf` via
+/// [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
+/// on success.  Any other status is treated as "no names produced".
+///
+/// # Safety
+/// `buf` must be the non-null pointer the FFI bridge passed in and must not
+/// outlive the callback invocation.
+pub type StatorDomNamedEnumeratorCb =
+    unsafe extern "C" fn(buf: *mut StatorDomNameBuffer, data: *mut c_void) -> StatorStatus;
+
+/// V2 indexed-property **getter** callback.
+///
+/// Semantics mirror [`StatorDomNamedGetterCbV2`] but the property key is a
+/// numeric `u32` index.
+///
+/// # Safety
+/// `out` must be a writable `*mut StatorValue` slot if
+/// [`StatorStatus::StatorStatusOk`] is returned.
+pub type StatorDomIndexedGetterCbV2 =
+    unsafe extern "C" fn(index: u32, data: *mut c_void, out: *mut *mut StatorValue) -> StatorStatus;
+
+/// V2 indexed-property **setter** callback.
+///
+/// Semantics mirror [`StatorDomNamedSetterCbV2`] for indexed access.
+///
+/// # Safety
+/// `value` must be either null or a valid, live [`StatorValue`] pointer
+/// borrowed for the call.
+pub type StatorDomIndexedSetterCbV2 =
+    unsafe extern "C" fn(index: u32, value: *const StatorValue, data: *mut c_void) -> StatorStatus;
+
+/// V2 indexed-property **query** callback.
+///
+/// Semantics mirror [`StatorDomNamedQueryCb`] for indexed access.
+///
+/// # Safety
+/// `out_attrs` must be a writable `*mut u32` slot if
+/// [`StatorStatus::StatorStatusOk`] is returned.
+pub type StatorDomIndexedQueryCb =
+    unsafe extern "C" fn(index: u32, data: *mut c_void, out_attrs: *mut u32) -> StatorStatus;
+
+/// V2 indexed-collection **length** callback.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] with the collection length
+/// written into `*out_len`.  Any other status is treated as "length unknown"
+/// and the engine observes `0` — embedders should therefore reserve other
+/// statuses for genuine error conditions, never for ordinary length queries.
+///
+/// # Safety
+/// `out_len` must be a writable `*mut u32` slot if
+/// [`StatorStatus::StatorStatusOk`] is returned.
+pub type StatorDomIndexedLengthCb =
+    unsafe extern "C" fn(data: *mut c_void, out_len: *mut u32) -> StatorStatus;
+
+/// POD bundle of named-property interceptors, installed in one call by
+/// [`stator_dom_object_wrap_install_named_handler`].
+///
+/// Each callback field is optional: pass `NULL` from C (or `None` from Rust)
+/// to leave a particular interceptor uninstalled.  At least one callback
+/// must be non-null for the install call to succeed.
+///
+/// `data` is an opaque embedder pointer passed verbatim to each callback;
+/// the engine never dereferences it.  It is independent of internal-field 0
+/// (which the legacy `set_named_getter` family uses for `data`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomNamedHandler {
+    /// Named-property getter, or null.
+    pub getter: Option<StatorDomNamedGetterCbV2>,
+    /// Named-property setter, or null.
+    pub setter: Option<StatorDomNamedSetterCbV2>,
+    /// Named-property `in`/query callback, or null.
+    pub query: Option<StatorDomNamedQueryCb>,
+    /// Named-property `delete` callback, or null.
+    pub deleter: Option<StatorDomNamedDeleterCb>,
+    /// Named-property enumerator callback, or null.
+    pub enumerator: Option<StatorDomNamedEnumeratorCb>,
+    /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+/// POD bundle of indexed-property interceptors, installed in one call by
+/// [`stator_dom_object_wrap_install_indexed_handler`].
+///
+/// Each callback field is optional (`NULL` to skip).  At least one callback
+/// must be non-null for the install call to succeed.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomIndexedHandler {
+    /// Indexed-property getter, or null.
+    pub getter: Option<StatorDomIndexedGetterCbV2>,
+    /// Indexed-property setter, or null.
+    pub setter: Option<StatorDomIndexedSetterCbV2>,
+    /// Indexed-property query callback, or null.
+    pub query: Option<StatorDomIndexedQueryCb>,
+    /// Indexed-collection length callback, or null.
+    pub length: Option<StatorDomIndexedLengthCb>,
+    /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+/// Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
+///
+/// The callback fills the buffer by repeatedly calling
+/// [`stator_dom_name_buffer_push`].  The buffer is owned by the FFI bridge
+/// and must not outlive the callback invocation.
+pub struct StatorDomNameBuffer {
+    names: Vec<String>,
+}
+
+// SAFETY: `StatorDomNameBuffer` only ever holds owned `String`s and is
+// accessed on the owning thread during a single callback invocation.
+unsafe impl Send for StatorDomNameBuffer {}
+
+/// Append a UTF-8 name to a [`StatorDomNameBuffer`].
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+///   `name_utf8` is null while `name_len` is non-zero, or when the byte
+///   range is not valid UTF-8.
+///
+/// # Safety
+/// - `buf` must be either null or a valid pointer to a [`StatorDomNameBuffer`]
+///   that is currently borrowed by an enumerator callback.
+/// - `name_utf8` must point to at least `name_len` valid bytes when
+///   `name_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_name_buffer_push(
+    buf: *mut StatorDomNameBuffer,
+    name_utf8: *const c_char,
+    name_len: usize,
+) -> StatorStatus {
+    if buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    if name_len > 0 && name_utf8.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let slice: &[u8] = if name_len == 0 {
+        &[]
+    } else {
+        // SAFETY: caller guarantees `name_utf8` is valid for `name_len` bytes.
+        unsafe { std::slice::from_raw_parts(name_utf8 as *const u8, name_len) }
+    };
+    match std::str::from_utf8(slice) {
+        Ok(s) => {
+            // SAFETY: caller guarantees `buf` is a live name buffer.
+            unsafe { (*buf).names.push(s.to_string()) };
+            StatorStatus::StatorStatusOk
+        }
+        Err(_) => StatorStatus::StatorStatusInvalidArg,
+    }
+}
+
+/// Install an aggregated set of named-property interceptors on `wrap`.
+///
+/// This **replaces** any previously-installed named-property handler
+/// (whether installed through this function or through the legacy
+/// [`stator_dom_object_wrap_set_named_getter`] /
+/// [`stator_dom_object_wrap_set_named_setter`] pair).  Only non-null
+/// callbacks in `handler` are installed; null callback fields are left
+/// uninstalled and the engine falls through to the wrapper's own properties
+/// for that operation.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `handler` is
+///   null, or when every callback field in `handler` is null.
+///
+/// # Safety
+/// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+/// - `handler` must be a non-null, readable pointer to a
+///   [`StatorDomNamedHandler`] struct.  The function pointers it carries must
+///   remain valid for the lifetime of the wrapper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_named_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomNamedHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.getter.is_none()
+        && h.setter.is_none()
+        && h.query.is_none()
+        && h.deleter.is_none()
+        && h.enumerator.is_none()
+    {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    let user_data_addr = h.data as usize;
+    let mut builder = NamedPropertyHandlerConfig::builder();
+
+    if let Some(cb) = h.getter {
+        builder = builder.getter(move |name, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(name.as_ptr() as *const c_char, name.len(), data, &mut out) };
+            match status {
+                StatorStatus::StatorStatusOk if !out.is_null() => {
+                    // SAFETY: callback transferred ownership of `out`.
+                    let js = stator_value_inner_to_jsvalue(unsafe { &(*out).inner });
+                    // Use `stator_value_destroy` so the isolate's live-object
+                    // counter is properly decremented.
+                    unsafe { stator_value_destroy(out) };
+                    Some(js)
+                }
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.setter {
+        builder = builder.setter(move |name, value, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let c_val = StatorValue {
+                inner: jsvalue_to_stator_value_inner(value),
+                isolate: std::ptr::null_mut(),
+            };
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(name.as_ptr() as *const c_char, name.len(), &c_val, data) };
+            matches!(status, StatorStatus::StatorStatusOk)
+        });
+    }
+    if let Some(cb) = h.query {
+        builder = builder.query(move |name, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut attrs: u32 = 0;
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status =
+                unsafe { cb(name.as_ptr() as *const c_char, name.len(), data, &mut attrs) };
+            match status {
+                StatorStatus::StatorStatusOk => Some(attrs),
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.deleter {
+        builder = builder.deleter(move |name, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut deleted = false;
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe {
+                cb(
+                    name.as_ptr() as *const c_char,
+                    name.len(),
+                    data,
+                    &mut deleted,
+                )
+            };
+            matches!(status, StatorStatus::StatorStatusOk) && deleted
+        });
+    }
+    if let Some(cb) = h.enumerator {
+        builder = builder.enumerator(move |_data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut buf = StatorDomNameBuffer { names: Vec::new() };
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&mut buf as *mut StatorDomNameBuffer, data) };
+            if matches!(status, StatorStatus::StatorStatusOk) {
+                buf.names
+            } else {
+                Vec::new()
+            }
+        });
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_named_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Install an aggregated set of indexed-property interceptors on `wrap`.
+///
+/// This **replaces** any previously-installed indexed-property handler
+/// (whether installed through this function or through the legacy
+/// [`stator_dom_object_wrap_set_indexed_getter`] /
+/// [`stator_dom_object_wrap_set_indexed_setter`] pair).  Only non-null
+/// callbacks in `handler` are installed.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `handler` is
+///   null, or when every callback field in `handler` is null.
+///
+/// # Safety
+/// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+/// - `handler` must be a non-null, readable pointer to a
+///   [`StatorDomIndexedHandler`] struct.  The function pointers it carries
+///   must remain valid for the lifetime of the wrapper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomIndexedHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.getter.is_none() && h.setter.is_none() && h.query.is_none() && h.length.is_none() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    let user_data_addr = h.data as usize;
+    let mut builder = IndexedPropertyHandlerConfig::builder();
+
+    if let Some(cb) = h.getter {
+        builder = builder.getter(move |index, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(index, data, &mut out) };
+            match status {
+                StatorStatus::StatorStatusOk if !out.is_null() => {
+                    // SAFETY: callback transferred ownership of `out`.
+                    let js = stator_value_inner_to_jsvalue(unsafe { &(*out).inner });
+                    unsafe { stator_value_destroy(out) };
+                    Some(js)
+                }
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.setter {
+        builder = builder.setter(move |index, value, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let c_val = StatorValue {
+                inner: jsvalue_to_stator_value_inner(value),
+                isolate: std::ptr::null_mut(),
+            };
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(index, &c_val, data) };
+            matches!(status, StatorStatus::StatorStatusOk)
+        });
+    }
+    if let Some(cb) = h.query {
+        builder = builder.query(move |index, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut attrs: u32 = 0;
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(index, data, &mut attrs) };
+            match status {
+                StatorStatus::StatorStatusOk => Some(attrs),
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.length {
+        builder = builder.length(move |_data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut out_len: u32 = 0;
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(data, &mut out_len) };
+            if matches!(status, StatorStatus::StatorStatusOk) {
+                out_len
+            } else {
+                0
+            }
+        });
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_indexed_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
 }
 
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
@@ -11675,6 +12253,392 @@ mod tests {
         unsafe { stator_dom_weak_ref_invoke(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_clear(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_destroy(std::ptr::null_mut()) };
+    }
+
+    // ── DOM hardened slice: class identity + V2 interceptors ───────────────
+
+    #[test]
+    fn test_dom_object_wrap_class_id_default_zero() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert!(!wrap.is_null());
+        assert_eq!(unsafe { stator_dom_object_wrap_get_class_id(wrap) }, 0);
+        assert!(unsafe { stator_dom_object_wrap_get_native_ptr(wrap) }.is_null());
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_object_wrap_class_id_roundtrip() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        unsafe { stator_dom_object_wrap_set_class_id(wrap, 42) };
+        assert_eq!(unsafe { stator_dom_object_wrap_get_class_id(wrap) }, 42);
+        let sentinel: usize = 0xCAFE_F00D;
+        unsafe { stator_dom_object_wrap_set_native_ptr(wrap, sentinel as *mut c_void) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_native_ptr(wrap) } as usize,
+            sentinel
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_object_wrap_class_id_null_safe() {
+        // get_* on null returns the zero value, set_* is a no-op.
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_class_id(std::ptr::null()) },
+            0
+        );
+        assert!(unsafe { stator_dom_object_wrap_get_native_ptr(std::ptr::null()) }.is_null());
+        unsafe { stator_dom_object_wrap_set_class_id(std::ptr::null_mut(), 7) };
+        unsafe {
+            stator_dom_object_wrap_set_native_ptr(std::ptr::null_mut(), 1 as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn test_dom_install_named_handler_rejects_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        // null handler
+        let status =
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, std::ptr::null()) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        // empty handler (all-null callbacks)
+        let empty = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &empty) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        // null wrap
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_always_handled),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let status =
+            unsafe { stator_dom_object_wrap_install_named_handler(std::ptr::null_mut(), &handler) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_install_indexed_handler_rejects_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let status =
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, std::ptr::null()) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        let empty = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &empty) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    // Helper callbacks used by the V2 interceptor tests.
+
+    unsafe extern "C" fn named_get_always_handled(
+        _name: *const c_char,
+        _name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let v = unsafe { stator_value_new_number(iso, 17.0) };
+        unsafe { *out = v };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_get_id_only(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        // SAFETY: caller passes a valid UTF-8 range.
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "id" {
+            let iso = ACTIVE_ISO.with(|c| c.get());
+            let v = unsafe { stator_value_new_number(iso, 99.0) };
+            unsafe { *out = v };
+            StatorStatus::StatorStatusOk
+        } else if key == "missing" {
+            StatorStatus::StatorStatusFalse
+        } else if key == "boom" {
+            StatorStatus::StatorStatusException
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn named_query_id(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out_attrs: *mut u32,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "id" {
+            unsafe { *out_attrs = 0 };
+            StatorStatus::StatorStatusOk
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn named_delete_id(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out_deleted: *mut bool,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "id" {
+            unsafe { *out_deleted = true };
+            StatorStatus::StatorStatusOk
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn named_enumerate_ab(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let a = b"alpha";
+        let b = b"beta";
+        let s1 = unsafe { stator_dom_name_buffer_push(buf, a.as_ptr() as *const c_char, a.len()) };
+        assert_eq!(s1, StatorStatus::StatorStatusOk);
+        let s2 = unsafe { stator_dom_name_buffer_push(buf, b.as_ptr() as *const c_char, b.len()) };
+        assert_eq!(s2, StatorStatus::StatorStatusOk);
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn indexed_get_zero(
+        index: u32,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        if index == 0 {
+            let iso = ACTIVE_ISO.with(|c| c.get());
+            let v = unsafe { stator_value_new_number(iso, 7.0) };
+            unsafe { *out = v };
+            StatorStatus::StatorStatusOk
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn indexed_length_three(
+        _data: *mut c_void,
+        out_len: *mut u32,
+    ) -> StatorStatus {
+        unsafe { *out_len = 3 };
+        StatorStatus::StatorStatusOk
+    }
+
+    thread_local! {
+        static ACTIVE_ISO: std::cell::Cell<*mut StatorIsolate> =
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_dom_named_handler_missing_vs_handled_vs_exception() {
+        use stator_jse::objects::value::JsValue;
+
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+
+        // Handled: returns the interceptor value.
+        let v_id = unsafe { (*wrap).inner.get_property("id") };
+        match v_id {
+            JsValue::Smi(n) => assert_eq!(n, 99),
+            other => panic!("expected Smi(99), got {other:?}"),
+        }
+        // Missing (StatusFalse): falls through to own properties -> Undefined.
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_property("missing") },
+            JsValue::Undefined
+        ));
+        // Exception (StatusException): currently bridged to fall-through;
+        // documented limitation.  The embedder is responsible for setting
+        // the isolate's pending exception via `stator_isolate_throw_exception`.
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_property("boom") },
+            JsValue::Undefined
+        ));
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_named_handler_query_and_delete() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: Some(named_query_id),
+            deleter: Some(named_delete_id),
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+
+        assert!(unsafe { (*wrap).inner.has_property("id") });
+        assert!(!unsafe { (*wrap).inner.has_property("missing") });
+        assert!(unsafe { (*wrap).inner.delete_property("id") });
+        assert!(!unsafe { (*wrap).inner.delete_property("missing") });
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_named_handler_enumerator() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_ab),
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+
+        let names = unsafe { (*wrap).inner.property_names() };
+        assert!(names.iter().any(|n| n == "alpha"));
+        assert!(names.iter().any(|n| n == "beta"));
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_indexed_handler_install_and_dispatch() {
+        use stator_jse::objects::value::JsValue;
+
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: Some(indexed_get_zero),
+            setter: None,
+            query: None,
+            length: Some(indexed_length_three),
+            data: std::ptr::null_mut(),
+        };
+        let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+
+        match unsafe { (*wrap).inner.get_indexed(0) } {
+            JsValue::Smi(n) => assert_eq!(n, 7),
+            other => panic!("expected Smi(7), got {other:?}"),
+        }
+        // Out-of-range falls through to Undefined.
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_indexed(5) },
+            JsValue::Undefined
+        ));
+        assert_eq!(unsafe { (*wrap).inner.indexed_length() }, 3);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_name_buffer_push_rejects_invalid_args() {
+        // null buf
+        let bytes = b"abc";
+        let status = unsafe {
+            stator_dom_name_buffer_push(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+
+        let mut buf = StatorDomNameBuffer { names: Vec::new() };
+        // null name with non-zero length
+        let status =
+            unsafe { stator_dom_name_buffer_push(&mut buf as *mut _, std::ptr::null(), 4) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        // empty name with null pointer is allowed.
+        let status =
+            unsafe { stator_dom_name_buffer_push(&mut buf as *mut _, std::ptr::null(), 0) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert_eq!(buf.names.last().map(String::as_str), Some(""));
+        // invalid UTF-8 is rejected.
+        let bad = [0xffu8, 0xfe];
+        let status = unsafe {
+            stator_dom_name_buffer_push(
+                &mut buf as *mut _,
+                bad.as_ptr() as *const c_char,
+                bad.len(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+    }
+
+    #[test]
+    fn test_dom_legacy_v1_named_getter_still_works() {
+        use stator_jse::objects::value::JsValue;
+
+        // Preserve existing v1 API: install via the legacy entry point and
+        // confirm property reads still go through the interceptor.
+        unsafe extern "C" fn v1_getter(
+            _name: *const c_char,
+            _data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> bool {
+            let iso = ACTIVE_ISO.with(|c| c.get());
+            let v = unsafe { stator_value_new_number(iso, 5.0) };
+            unsafe { *out = v };
+            true
+        }
+
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 1) };
+        unsafe { stator_dom_object_wrap_set_named_getter(wrap, v1_getter) };
+        match unsafe { (*wrap).inner.get_property("anything") } {
+            JsValue::Smi(n) => assert_eq!(n, 5),
+            other => panic!("expected Smi(5), got {other:?}"),
+        }
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
     }
 
     // ── Edge-proof Maglev tiering parity ──────────────────────────────────────
