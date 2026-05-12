@@ -7308,15 +7308,45 @@ pub type StatorDomIndexedLengthCb =
 #[derive(Copy, Clone)]
 pub struct StatorDomNamedHandler {
     /// Named-property getter, or null.
-    pub getter: Option<StatorDomNamedGetterCbV2>,
+    pub getter: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
     /// Named-property setter, or null.
-    pub setter: Option<StatorDomNamedSetterCbV2>,
+    pub setter: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            value: *const StatorValue,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Named-property `in`/query callback, or null.
-    pub query: Option<StatorDomNamedQueryCb>,
+    pub query: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            data: *mut c_void,
+            out_attrs: *mut u32,
+        ) -> StatorStatus,
+    >,
     /// Named-property `delete` callback, or null.
-    pub deleter: Option<StatorDomNamedDeleterCb>,
+    pub deleter: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            data: *mut c_void,
+            out_deleted: *mut bool,
+        ) -> StatorStatus,
+    >,
     /// Named-property enumerator callback, or null.
-    pub enumerator: Option<StatorDomNamedEnumeratorCb>,
+    pub enumerator: Option<
+        unsafe extern "C" fn(buf: *mut StatorDomNameBuffer, data: *mut c_void) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }
@@ -7330,13 +7360,27 @@ pub struct StatorDomNamedHandler {
 #[derive(Copy, Clone)]
 pub struct StatorDomIndexedHandler {
     /// Indexed-property getter, or null.
-    pub getter: Option<StatorDomIndexedGetterCbV2>,
+    pub getter: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
     /// Indexed-property setter, or null.
-    pub setter: Option<StatorDomIndexedSetterCbV2>,
+    pub setter: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            value: *const StatorValue,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Indexed-property query callback, or null.
-    pub query: Option<StatorDomIndexedQueryCb>,
+    pub query: Option<
+        unsafe extern "C" fn(index: u32, data: *mut c_void, out_attrs: *mut u32) -> StatorStatus,
+    >,
     /// Indexed-collection length callback, or null.
-    pub length: Option<StatorDomIndexedLengthCb>,
+    pub length: Option<unsafe extern "C" fn(data: *mut c_void, out_len: *mut u32) -> StatorStatus>,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }

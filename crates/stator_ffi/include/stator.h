@@ -175,24 +175,6 @@ typedef enum StatorPromiseRejectionEventKind {
   StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
 } StatorPromiseRejectionEventKind;
 
-typedef struct Option_StatorDomIndexedGetterCbV2 Option_StatorDomIndexedGetterCbV2;
-
-typedef struct Option_StatorDomIndexedLengthCb Option_StatorDomIndexedLengthCb;
-
-typedef struct Option_StatorDomIndexedQueryCb Option_StatorDomIndexedQueryCb;
-
-typedef struct Option_StatorDomIndexedSetterCbV2 Option_StatorDomIndexedSetterCbV2;
-
-typedef struct Option_StatorDomNamedDeleterCb Option_StatorDomNamedDeleterCb;
-
-typedef struct Option_StatorDomNamedEnumeratorCb Option_StatorDomNamedEnumeratorCb;
-
-typedef struct Option_StatorDomNamedGetterCbV2 Option_StatorDomNamedGetterCbV2;
-
-typedef struct Option_StatorDomNamedQueryCb Option_StatorDomNamedQueryCb;
-
-typedef struct Option_StatorDomNamedSetterCbV2 Option_StatorDomNamedSetterCbV2;
-
 /**
  * An opaque handle to a CDP WebSocket server.
  *
@@ -864,23 +846,29 @@ typedef struct StatorDomNamedHandler {
   /**
    * Named-property getter, or null.
    */
-  struct Option_StatorDomNamedGetterCbV2 getter;
+  enum StatorStatus (*getter)(const char *name_utf8,
+                              size_t name_len,
+                              void *data,
+                              struct StatorValue **out);
   /**
    * Named-property setter, or null.
    */
-  struct Option_StatorDomNamedSetterCbV2 setter;
+  enum StatorStatus (*setter)(const char *name_utf8,
+                              size_t name_len,
+                              const struct StatorValue *value,
+                              void *data);
   /**
    * Named-property `in`/query callback, or null.
    */
-  struct Option_StatorDomNamedQueryCb query;
+  enum StatorStatus (*query)(const char *name_utf8, size_t name_len, void *data, uint32_t *out_attrs);
   /**
    * Named-property `delete` callback, or null.
    */
-  struct Option_StatorDomNamedDeleterCb deleter;
+  enum StatorStatus (*deleter)(const char *name_utf8, size_t name_len, void *data, bool *out_deleted);
   /**
    * Named-property enumerator callback, or null.
    */
-  struct Option_StatorDomNamedEnumeratorCb enumerator;
+  enum StatorStatus (*enumerator)(struct StatorDomNameBuffer *buf, void *data);
   /**
    * Opaque embedder data passed to every callback.
    */
@@ -898,19 +886,19 @@ typedef struct StatorDomIndexedHandler {
   /**
    * Indexed-property getter, or null.
    */
-  struct Option_StatorDomIndexedGetterCbV2 getter;
+  enum StatorStatus (*getter)(uint32_t index, void *data, struct StatorValue **out);
   /**
    * Indexed-property setter, or null.
    */
-  struct Option_StatorDomIndexedSetterCbV2 setter;
+  enum StatorStatus (*setter)(uint32_t index, const struct StatorValue *value, void *data);
   /**
    * Indexed-property query callback, or null.
    */
-  struct Option_StatorDomIndexedQueryCb query;
+  enum StatorStatus (*query)(uint32_t index, void *data, uint32_t *out_attrs);
   /**
    * Indexed-collection length callback, or null.
    */
-  struct Option_StatorDomIndexedLengthCb length;
+  enum StatorStatus (*length)(void *data, uint32_t *out_len);
   /**
    * Opaque embedder data passed to every callback.
    */
