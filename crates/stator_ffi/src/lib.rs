@@ -2670,6 +2670,90 @@ unsafe fn set_pending_exception(
     isolate_ref.pending_message = None;
 }
 
+unsafe fn discard_pending_exception(isolate: *mut StatorIsolate) {
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if isolate_ref.pending_exception_owned
+        && let Some(exception) = isolate_ref.pending_exception.take()
+    {
+        // SAFETY: owned pending exceptions are allocated by this FFI layer.
+        unsafe { stator_value_destroy(exception) };
+    } else {
+        isolate_ref.pending_exception = None;
+    }
+    isolate_ref.pending_exception_owned = false;
+    isolate_ref.pending_message = None;
+}
+
+unsafe fn isolate_has_pending_exception(isolate: *const StatorIsolate) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid when non-null.
+    unsafe { (*isolate).pending_exception.is_some() }
+}
+
+unsafe fn context_has_pending_exception(ctx: *mut StatorContext) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    // SAFETY: `isolate` comes from a valid context.
+    unsafe { isolate_has_pending_exception(isolate) }
+}
+
+unsafe fn ensure_pending_dom_interceptor_exception(
+    isolate: *mut StatorIsolate,
+    message: &'static str,
+) {
+    // SAFETY: caller guarantees `isolate` is valid when non-null.
+    if unsafe { isolate_has_pending_exception(isolate) } {
+        return;
+    }
+    // SAFETY: `isolate` is either null or valid; the string is copied.
+    let exception = unsafe {
+        stator_value_new_string(isolate, message.as_ptr() as *const c_char, message.len())
+    };
+    // SAFETY: `exception` was allocated by this FFI layer.
+    unsafe { set_pending_exception(isolate, exception, true) };
+}
+
+unsafe fn pending_dom_interceptor_error(
+    isolate: *const StatorIsolate,
+) -> Option<stator_jse::error::StatorError> {
+    // SAFETY: caller guarantees `isolate` is valid when non-null.
+    if !unsafe { isolate_has_pending_exception(isolate) } {
+        return None;
+    }
+    let message = if isolate.is_null() {
+        "DOM interceptor exception".to_string()
+    } else {
+        // SAFETY: caller guarantees `isolate` is valid when non-null.
+        unsafe {
+            (*isolate)
+                .pending_exception
+                .and_then(|exception| {
+                    if exception.is_null() {
+                        None
+                    } else {
+                        match &(*exception).inner {
+                            StatorValueInner::Str(value) => {
+                                Some(value.to_string_lossy().into_owned())
+                            }
+                            _ => None,
+                        }
+                    }
+                })
+                .unwrap_or_else(|| "DOM interceptor exception".to_string())
+        }
+    };
+    Some(stator_jse::error::StatorError::TypeError(message))
+}
+
 unsafe fn record_script_error(
     script: *const StatorScript,
     ctx: *mut StatorContext,
@@ -2892,11 +2976,17 @@ pub unsafe extern "C" fn stator_script_run(
             let inner = jsvalue_to_stator_value_inner(&val);
             if !isolate.is_null() {
                 // SAFETY: isolate is valid.
+                unsafe { discard_pending_exception(isolate) };
+                // SAFETY: isolate is valid.
                 unsafe { (*isolate).live_objects += 1 };
             }
             Box::into_raw(Box::new(StatorValue { inner, isolate }))
         }
         Err(error) => {
+            // SAFETY: `ctx` is valid for the duration of script execution.
+            if unsafe { context_has_pending_exception(ctx) } {
+                return std::ptr::null_mut();
+            }
             // SAFETY: `ctx` and `script` are valid for the duration of script execution.
             unsafe { record_script_error(script, ctx, &error) };
             std::ptr::null_mut()
@@ -2920,8 +3010,18 @@ pub unsafe extern "C" fn stator_script_run_no_result(
     ctx: *mut StatorContext,
 ) -> bool {
     match unsafe { run_script_no_result_inner(script, ctx) } {
-        Some(Ok(_)) => true,
+        Some(Ok(_)) => {
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is valid and owns a stable isolate pointer.
+                unsafe { discard_pending_exception((*ctx)._isolate) };
+            }
+            true
+        }
         Some(Err(error)) => {
+            // SAFETY: `ctx` is valid for the duration of script execution.
+            if unsafe { context_has_pending_exception(ctx) } {
+                return false;
+            }
             // SAFETY: `ctx` and `script` are valid for the duration of script execution.
             unsafe { record_script_error(script, ctx, &error) };
             false
@@ -4377,7 +4477,12 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
                 }
                 // SAFETY: the embedder must keep the wrapper alive for as long
                 // as the installed global can be observed.
-                Ok(unsafe { (*wrap).inner.get_property(&getter_name) })
+                let value = unsafe { (*wrap).inner.get_property(&getter_name) };
+                // SAFETY: the wrapper owns the isolate pointer for this DOM object.
+                if let Some(error) = unsafe { pending_dom_interceptor_error((*wrap).isolate) } {
+                    return Err(error);
+                }
+                Ok(value)
             })),
         );
 
@@ -4396,6 +4501,9 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
                     // the owning context is destroyed.
                     unsafe {
                         (*wrap).inner.set_intercepted_property(&setter_name, value);
+                        if let Some(error) = pending_dom_interceptor_error((*wrap).isolate) {
+                            return Err(error);
+                        }
                     }
                     Ok(JsValue::Undefined)
                 })),
@@ -7199,17 +7307,11 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
 //
 // ### Exception bridging limitation
 //
-// The underlying [`DomObjectWrap`] property model currently distinguishes
-// only *handled* (`Some`) from *missing/fall-through* (`None`); it does not
-// yet propagate a raised exception through interceptor return values.  When
-// a V2 callback returns [`StatorStatus::StatorStatusException`], the FFI
-// bridge maps the result to fall-through (`None` / `false`).  Embedders that
-// want exception-style behaviour should call
-// [`stator_isolate_throw_exception`] from inside the callback so the
-// isolate's pending exception is set; downstream code can then observe it via
-// [`stator_isolate_has_pending_exception`].  Wiring the engine to honour
-// these pending exceptions during property access is intentionally left to a
-// future hardening slice.
+// A V2 callback returning [`StatorStatus::StatorStatusException`] records a
+// pending isolate exception when the embedder has not already done so.  The
+// wrapper-backed global accessor thunks then convert that pending exception
+// into a script execution failure so embedders can observe it through
+// `stator_try_catch_*`.
 
 /// Set the embedder-defined class identifier on `wrap`.
 ///
@@ -7298,9 +7400,10 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_native_ptr(
 ///   read; the engine falls through to the wrapper's own properties.  `*out`
 ///   is ignored.
 /// * [`StatorStatus::StatorStatusException`] — the embedder raised an
-///   exception (and is expected to have populated the isolate's pending
-///   exception via [`stator_isolate_throw_exception`]); the engine falls
-///   through.  See module docs for the bridging limitation.
+///   exception.  If the callback did not populate the isolate's pending
+///   exception via [`stator_isolate_throw_exception`], the FFI bridge records a
+///   generic DOM-interceptor exception before the wrapper-backed global
+///   accessor thunk fails script execution.
 /// * Any other status is treated as fall-through.
 ///
 /// # Safety
@@ -7319,8 +7422,8 @@ pub type StatorDomNamedGetterCbV2 = unsafe extern "C" fn(
 /// Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
 /// (engine will not fall through to the wrapper's own properties),
 /// [`StatorStatus::StatorStatusFalse`] for fall-through, or
-/// [`StatorStatus::StatorStatusException`] (treated as fall-through; see the
-/// exception-bridging limitation in the module documentation).
+/// [`StatorStatus::StatorStatusException`] to fail wrapper-backed global
+/// access with a pending exception.
 ///
 /// # Safety
 /// `name_utf8` must be valid for `name_len` bytes; `value` must be either
@@ -7609,11 +7712,14 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_named_handler(
     }
 
     let user_data_addr = h.data as usize;
+    // SAFETY: caller guarantees `wrap` is valid for this installation.
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
     let mut builder = NamedPropertyHandlerConfig::builder();
 
     if let Some(cb) = h.getter {
         builder = builder.getter(move |name, _data_field0| {
             let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
             let mut out: *mut StatorValue = std::ptr::null_mut();
             // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
             let status = unsafe { cb(name.as_ptr() as *const c_char, name.len(), data, &mut out) };
@@ -7626,6 +7732,16 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_named_handler(
                     unsafe { stator_value_destroy(out) };
                     Some(js)
                 }
+                StatorStatus::StatorStatusException => {
+                    // SAFETY: `isolate` is the wrapper's valid isolate pointer.
+                    unsafe {
+                        ensure_pending_dom_interceptor_exception(
+                            isolate,
+                            "DOM named getter exception",
+                        )
+                    };
+                    None
+                }
                 _ => None,
             }
         });
@@ -7633,12 +7749,19 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_named_handler(
     if let Some(cb) = h.setter {
         builder = builder.setter(move |name, value, _data_field0| {
             let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
             let c_val = StatorValue {
                 inner: jsvalue_to_stator_value_inner(value),
                 isolate: std::ptr::null_mut(),
             };
             // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
             let status = unsafe { cb(name.as_ptr() as *const c_char, name.len(), &c_val, data) };
+            if status == StatorStatus::StatorStatusException {
+                // SAFETY: `isolate` is the wrapper's valid isolate pointer.
+                unsafe {
+                    ensure_pending_dom_interceptor_exception(isolate, "DOM named setter exception")
+                };
+            }
             matches!(status, StatorStatus::StatorStatusOk)
         });
     }
@@ -12662,6 +12785,42 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn named_get_throwing_document_property(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key != "boom" {
+            return StatorStatus::StatorStatusFalse;
+        }
+
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let message = b"DOM getter boom";
+        let exception = unsafe {
+            stator_value_new_string(iso, message.as_ptr() as *const c_char, message.len())
+        };
+        unsafe { stator_isolate_throw_exception(iso, exception) };
+        StatorStatus::StatorStatusException
+    }
+
+    unsafe extern "C" fn named_get_status_exception_document_property(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "boom" {
+            StatorStatus::StatorStatusException
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
     unsafe extern "C" fn named_set_document_property(
         name: *const c_char,
         name_len: usize,
@@ -12684,6 +12843,21 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn named_set_throwing_document_property(
+        name: *const c_char,
+        name_len: usize,
+        _value: *const StatorValue,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "boom" {
+            StatorStatus::StatorStatusException
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
     unsafe extern "C" fn named_enumerate_document(
         buf: *mut StatorDomNameBuffer,
         _data: *mut c_void,
@@ -12702,6 +12876,14 @@ mod tests {
             }
         }
         StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_enumerate_boom(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let name = b"boom";
+        unsafe { stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len()) }
     }
 
     unsafe extern "C" fn indexed_get_zero(
@@ -12762,13 +12944,16 @@ mod tests {
             unsafe { (*wrap).inner.get_property("missing") },
             JsValue::Undefined
         ));
-        // Exception (StatusException): currently bridged to fall-through;
-        // documented limitation.  The embedder is responsible for setting
-        // the isolate's pending exception via `stator_isolate_throw_exception`.
+        // Exception (StatusException): direct wrapper access still falls
+        // through, but the FFI layer records a pending exception for script
+        // accessors to consume.
         assert!(matches!(
             unsafe { (*wrap).inner.get_property("boom") },
             JsValue::Undefined
         ));
+        let exception = unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        assert!(!exception.is_null());
+        unsafe { stator_value_destroy(exception) };
 
         unsafe { stator_dom_object_wrap_destroy(wrap) };
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
@@ -12910,6 +13095,224 @@ mod tests {
         }
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
         ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_context_global_dom_named_getter_exception_fails_script() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_throwing_document_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let src = b"document.boom";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let exception = unsafe { stator_try_catch_exception(tc) };
+        assert!(!exception.is_null());
+        let ptr = unsafe { stator_value_as_string(exception) };
+        let message = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(message, "DOM getter boom");
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(exception);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_context_global_dom_named_keyed_getter_exception_fails_script() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_throwing_document_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let src = b"document['boom']";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let exception = unsafe { stator_try_catch_exception(tc) };
+        assert!(!exception.is_null());
+        let ptr = unsafe { stator_value_as_string(exception) };
+        let message = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(message, "DOM getter boom");
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(exception);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_context_global_dom_named_getter_exception_caught_clears_pending_exception() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_status_exception_document_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"try { document.boom; 'missed'; } catch (e) { 'caught'; }";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(actual, "caught");
+        assert!(!unsafe { stator_isolate_has_pending_exception(iso.as_ptr()) });
+
+        let followup_src = b"21 + 21";
+        let followup_script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                followup_src.as_ptr() as *const c_char,
+                followup_src.len(),
+            )
+        };
+        let followup = unsafe { stator_script_run(followup_script, ctx) };
+        assert!(!followup.is_null());
+        assert_eq!(unsafe { stator_value_as_number(followup) }, 42.0);
+
+        unsafe {
+            stator_value_destroy(followup);
+            stator_script_free(followup_script);
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_context_global_dom_named_setter_exception_fails_script() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: None,
+            setter: Some(named_set_throwing_document_property),
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let src = b"document.boom = 1";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let exception = unsafe { stator_try_catch_exception(tc) };
+        assert!(!exception.is_null());
+        let ptr = unsafe { stator_value_as_string(exception) };
+        let message = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(message, "DOM named setter exception");
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
     }
 
     #[test]

@@ -990,9 +990,10 @@ typedef bool (*StatorWasmHostFuncCallback)(struct StatorContext *ctx,
  *   read; the engine falls through to the wrapper's own properties.  `*out`
  *   is ignored.
  * * [`StatorStatus::StatorStatusException`] — the embedder raised an
- *   exception (and is expected to have populated the isolate's pending
- *   exception via [`stator_isolate_throw_exception`]); the engine falls
- *   through.  See module docs for the bridging limitation.
+ *   exception.  If the callback did not populate the isolate's pending
+ *   exception via [`stator_isolate_throw_exception`], the FFI bridge records a
+ *   generic DOM-interceptor exception before the wrapper-backed global
+ *   accessor thunk fails script execution.
  * * Any other status is treated as fall-through.
  *
  * # Safety
@@ -1011,8 +1012,8 @@ typedef enum StatorStatus (*StatorDomNamedGetterCbV2)(const char *name_utf8,
  * Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
  * (engine will not fall through to the wrapper's own properties),
  * [`StatorStatus::StatorStatusFalse`] for fall-through, or
- * [`StatorStatus::StatorStatusException`] (treated as fall-through; see the
- * exception-bridging limitation in the module documentation).
+ * [`StatorStatus::StatorStatusException`] to fail wrapper-backed global
+ * access with a pending exception.
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `value` must be either

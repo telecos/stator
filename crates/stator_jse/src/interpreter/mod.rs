@@ -17665,6 +17665,55 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
     proto_lookup(obj, key.as_ref())
 }
 
+fn try_lookup_accessor_in_chain(
+    obj: &JsValue,
+    key: &str,
+    this_obj: &JsValue,
+) -> StatorResult<Option<JsValue>> {
+    let mut current = obj.clone();
+    for _ in 0..256 {
+        let JsValue::PlainObject(map) = &current else {
+            return Ok(None);
+        };
+        let borrow = map.borrow();
+        if borrow.has_accessors
+            && let Some(getter) = borrow.get_getter_for(key).cloned()
+        {
+            drop(borrow);
+            return dispatch_getter(&getter, this_obj).map(Some);
+        }
+        if borrow.get(key).is_some() {
+            return Ok(None);
+        }
+        let next = plain_object_proto_value(&borrow);
+        drop(borrow);
+        match next {
+            Some(next) => current = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Result-returning variant of [`proto_lookup`] for bytecode property loads
+/// where accessor errors must propagate instead of being coerced to
+/// `undefined`.
+pub(super) fn try_proto_lookup(obj: &JsValue, key: &str) -> StatorResult<JsValue> {
+    if let Some(value) = try_lookup_accessor_in_chain(obj, key, obj)? {
+        return Ok(value);
+    }
+    Ok(proto_lookup(obj, key))
+}
+
+/// Interned-key variant of [`try_proto_lookup`].
+pub(super) fn try_proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> StatorResult<JsValue> {
+    let key_str = key.as_ref();
+    if let Some(value) = try_lookup_accessor_in_chain(obj, key_str, obj)? {
+        return Ok(value);
+    }
+    Ok(proto_lookup_rc(obj, key))
+}
+
 /// Invoke a setter accessor function with the given value.
 pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
     match setter {
@@ -17989,11 +18038,11 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
     match obj {
         JsValue::Proxy(_) => {
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            try_proto_lookup(obj, &prop_name)
         }
         JsValue::PlainObject(_map) => {
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            try_proto_lookup(obj, &prop_name)
         }
         JsValue::Array(items) => {
             // "length" property
@@ -18011,7 +18060,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Named property ΓÇö delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            try_proto_lookup(obj, &prop_name)
         }
         JsValue::String(_) => {
             // "length" property
@@ -18034,12 +18083,12 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Named property ΓÇö delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            try_proto_lookup(obj, &prop_name)
         }
         _ => {
             // For any other type, try proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            try_proto_lookup(obj, &prop_name)
         }
     }
 }

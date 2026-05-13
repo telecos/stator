@@ -29,11 +29,11 @@ use super::{
     js_less_than, keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
     number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, proto_lookup_rc,
-    resolve_construct_proto, resolve_jump, restore_closure_context, run_callee_pooled,
-    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    try_fast_named_property_lookup, try_inline_small_function, walk_context_chain,
+    proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
+    resolve_jump, restore_closure_context, run_callee_pooled, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    try_inline_small_function, try_proto_lookup_rc, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -3966,7 +3966,7 @@ fn handle_lda_named_property(
     let result = if let Some(result) = try_fast_named_property_lookup(&obj, &prop_name) {
         result
     } else {
-        let result = proto_lookup_rc(&obj, &prop_name);
+        let result = try_proto_lookup_rc(&obj, &prop_name)?;
         if let JsValue::PlainObject(ref map) = obj
             && !matches!(result, JsValue::Undefined)
         {
@@ -7112,7 +7112,7 @@ fn handle_lda_named_property_from_super(
     ctx.frame.accumulator = if matches!(lookup_start, JsValue::Undefined | JsValue::Null) {
         JsValue::Undefined
     } else {
-        proto_lookup_rc(&lookup_start, &prop_name)
+        try_proto_lookup_rc(&lookup_start, &prop_name)?
     };
     Ok(DispatchAction::Continue)
 }
@@ -9253,6 +9253,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_define_property_getter_error_propagates() {
+        let error = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { throw new TypeError('getter boom'); } }); \
+             o.x",
+        )
+        .expect_err("throwing getter should fail the property load");
+        let message = error.to_string();
+        assert!(
+            message.contains("getter boom"),
+            "unexpected getter error: {message}"
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_keyed_getter_error_propagates() {
+        let error = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { throw new TypeError('keyed boom'); } }); \
+             o['x']",
+        )
+        .expect_err("throwing keyed getter should fail the property load");
+        let message = error.to_string();
+        assert!(
+            message.contains("keyed boom"),
+            "unexpected keyed getter error: {message}"
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_prototype_getter_error_propagates() {
+        let error = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             Object.defineProperty(proto, 'x', { get: function() { throw new TypeError('proto boom'); } }); \
+             var o = Object.create(proto); \
+             o.x",
+        )
+        .expect_err("throwing prototype getter should fail the property load");
+        let message = error.to_string();
+        assert!(
+            message.contains("proto boom"),
+            "unexpected prototype getter error: {message}"
+        );
     }
 
     /// Accessor setter defined via Object.defineProperty is invoked on write.
