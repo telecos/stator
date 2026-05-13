@@ -2793,6 +2793,47 @@ void stator_context_global_set(struct StatorContext *ctx,
                                const struct StatorValue *val);
 
 /**
+ * Wrap a DOM object wrapper as an identity-preserving [`StatorValue`].
+ *
+ * Multiple calls for the same wrapper return values that materialize to the
+ * same JS object, so script-visible comparisons such as
+ * `document.documentElement === document.documentElement` work without a V8
+ * wrapper.  The wrapper must remain valid until all returned values and script
+ * aliases have been released or [`stator_dom_object_wrap_invalidate`] has been
+ * called.
+ *
+ * Returns null when `wrap` is null or its owning isolate is null.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+struct StatorValue *stator_dom_object_wrap_as_value(struct StatorDomObjectWrap *wrap);
+
+/**
+ * Return the originating DOM wrapper for a value produced by
+ * [`stator_dom_object_wrap_as_value`].
+ *
+ * Returns null for primitives, ordinary objects, tag-only object values, and
+ * DOM wrapper values that have since been invalidated.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+struct StatorDomObjectWrap *stator_value_as_dom_object_wrap(const struct StatorValue *val);
+
+/**
+ * Invalidate a DOM object wrapper's script-visible materialization.
+ *
+ * Existing JS aliases to the materialized object remain safe to touch, but
+ * generated DOM accessor thunks stop dereferencing the raw wrapper pointer and
+ * return `undefined`.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
+
+/**
  * Install a DOM object wrapper as a named global on `ctx`.
  *
  * The installed value is backed by a Stator `PlainObject` whose enumerable
@@ -2802,9 +2843,9 @@ void stator_context_global_set(struct StatorContext *ctx,
  * a named setter installed.  This lets embedders expose P0 DOM globals such as
  * `document.title` without V8.
  *
- * This is intentionally narrower than a general `StatorDomObjectWrap` →
- * `StatorValue` conversion: it requires a context and installs the value
- * directly into that context's global environment.
+ * The global path shares the same cached materialization as
+ * [`stator_dom_object_wrap_as_value`], preserving identity with wrapper values
+ * returned from getters and methods.
  *
  * Returns:
  * * [`StatorStatus::StatorStatusOk`] when the global was installed.
@@ -2815,10 +2856,9 @@ void stator_context_global_set(struct StatorContext *ctx,
  * # Safety
  * - `ctx` must be a valid, live [`StatorContext`] pointer.
  * - `name` must be a valid, null-terminated C string.
- * - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer that remains
- *   alive until `ctx` is destroyed.  Replacing the global slot is not enough to
- *   release `wrap`, because page code may still hold aliases to the installed
- *   object.
+ * - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer. It must
+ *   remain alive until no script aliases can observe it, or must be invalidated
+ *   via [`stator_dom_object_wrap_invalidate`] before destruction.
  */
 enum StatorStatus stator_context_global_set_dom_object_wrap(struct StatorContext *ctx,
                                                             const char *name,

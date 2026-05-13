@@ -10,7 +10,7 @@
 //! `_create` functions and must release them with the corresponding `_destroy`
 //! function.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
@@ -31,6 +31,7 @@ use stator_jse::dom::{
 use stator_jse::gc::heap::Heap;
 use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use stator_jse::objects::js_object::JsObject;
+use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::PropertyMap;
 use stator_jse::objects::value::{JsValue, NativeFn};
 use stator_jse::parser;
@@ -888,6 +889,13 @@ enum StatorValueInner {
     /// observe one another's mutations and round-trip through
     /// [`stator_value_as_object`] without identity loss.
     ObjectHandle(Rc<RefCell<JsObject>>),
+    /// A JavaScript object backed by a DOM wrapper materialized through the
+    /// embedder FFI.
+    DomWrapHandle {
+        plain: Rc<RefCell<PropertyMap>>,
+        wrap: *mut StatorDomObjectWrap,
+        alive: Rc<Cell<bool>>,
+    },
     /// A callable JavaScript function (bytecode or native).
     Function,
     /// A native function created via a [`StatorFunctionTemplate`], carrying
@@ -921,6 +929,34 @@ pub struct StatorValue {
 // SAFETY: `StatorValue` is single-threaded; the raw pointer to `StatorIsolate`
 // is only ever accessed while the isolate is alive.
 unsafe impl Send for StatorValue {}
+
+fn register_handle_with_active_scope(isolate: *mut StatorIsolate, val: *mut StatorValue) {
+    if isolate.is_null() || val.is_null() {
+        return;
+    }
+    // SAFETY: callers pass the value's owning isolate.  The active scope, when
+    // present, is owned by the same isolate and is valid until closed.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+}
+
+unsafe fn allocate_stator_value(
+    isolate: *mut StatorIsolate,
+    inner: StatorValueInner,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).live_objects += 1 };
+    let val = Box::into_raw(Box::new(StatorValue { inner, isolate }));
+    register_handle_with_active_scope(isolate, val);
+    val
+}
 
 /// Create a new number value.
 ///
@@ -1510,6 +1546,7 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
         }
         StatorValueInner::Object
         | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. }
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -1543,6 +1580,7 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
         }
         StatorValueInner::Object
         | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. }
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -1575,6 +1613,7 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Boolean(_)
         | StatorValueInner::Object
         | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. }
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -1672,6 +1711,7 @@ pub unsafe extern "C" fn stator_value_is_object(val: *const StatorValue) -> bool
         unsafe { &(*val).inner },
         StatorValueInner::Object
             | StatorValueInner::ObjectHandle(_)
+            | StatorValueInner::DomWrapHandle { .. }
             | StatorValueInner::Array
             | StatorValueInner::Date
             | StatorValueInner::RegExp
@@ -3201,6 +3241,7 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         // All object-like values are truthy.
         StatorValueInner::Object
         | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. }
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -3261,6 +3302,10 @@ pub unsafe extern "C" fn stator_value_strict_equals(
         // Two shared-storage object handles compare equal iff they point at
         // the same underlying `Rc<RefCell<JsObject>>` (pointer identity).
         (StatorValueInner::ObjectHandle(x), StatorValueInner::ObjectHandle(y)) => Rc::ptr_eq(x, y),
+        (
+            StatorValueInner::DomWrapHandle { plain: x, .. },
+            StatorValueInner::DomWrapHandle { plain: y, .. },
+        ) => Rc::ptr_eq(x, y),
         // Object-like tags carry no identity in FFI handles → never equal.
         _ => false,
     }
@@ -4444,12 +4489,21 @@ pub unsafe extern "C" fn stator_context_global_set(
     }
 }
 
-fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
+fn dom_object_wrap_plain_object(
+    wrap: *mut StatorDomObjectWrap,
+) -> Option<Rc<RefCell<PropertyMap>>> {
     if wrap.is_null() {
         return None;
     }
 
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(existing) = unsafe { (*wrap).materialized.borrow().as_ref().cloned() } {
+        return Some(existing);
+    }
+
     let wrap_addr = wrap as usize;
+    // SAFETY: caller guarantees `wrap` is valid.
+    let alive = unsafe { Rc::clone(&(*wrap).alive) };
     // SAFETY: caller guarantees `wrap` is valid for the lifetime of the
     // installed JS global.  We copy the enumerable property names now and route
     // each accessor back through the live wrapper so named handlers stay active.
@@ -4468,9 +4522,13 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
 
         let getter_name = name.clone();
         let getter_wrap_addr = wrap_addr;
+        let getter_alive = Rc::clone(&alive);
         object.insert_builtin(
             format!("__get_{name}__"),
             JsValue::NativeFunction(Rc::new(move |_args| {
+                if !getter_alive.get() {
+                    return Ok(JsValue::Undefined);
+                }
                 let wrap = getter_wrap_addr as *mut StatorDomObjectWrap;
                 if wrap.is_null() {
                     return Ok(JsValue::Undefined);
@@ -4489,9 +4547,13 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
         if unsafe { (*wrap).has_named_setter } {
             let setter_name = name.clone();
             let setter_wrap_addr = wrap_addr;
+            let setter_alive = Rc::clone(&alive);
             object.insert_builtin(
                 format!("__set_{name}__"),
                 JsValue::NativeFunction(Rc::new(move |args| {
+                    if !setter_alive.get() {
+                        return Ok(JsValue::Undefined);
+                    }
                     let wrap = setter_wrap_addr as *mut StatorDomObjectWrap;
                     if wrap.is_null() {
                         return Ok(JsValue::Undefined);
@@ -4510,10 +4572,102 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
             );
         }
 
-        object.insert(name, JsValue::Undefined);
+        object.insert_with_attrs(name, JsValue::Undefined, PropertyAttributes::ENUMERABLE);
     }
 
-    Some(JsValue::PlainObject(Rc::new(RefCell::new(object))))
+    object.extensible = false;
+    let plain = Rc::new(RefCell::new(object));
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { *(*wrap).materialized.borrow_mut() = Some(Rc::clone(&plain)) };
+    Some(plain)
+}
+
+fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
+    dom_object_wrap_plain_object(wrap).map(JsValue::PlainObject)
+}
+
+/// Wrap a DOM object wrapper as an identity-preserving [`StatorValue`].
+///
+/// Multiple calls for the same wrapper return values that materialize to the
+/// same JS object, so script-visible comparisons such as
+/// `document.documentElement === document.documentElement` work without a V8
+/// wrapper.  The wrapper must remain valid until all returned values and script
+/// aliases have been released or [`stator_dom_object_wrap_invalidate`] has been
+/// called.
+///
+/// Returns null when `wrap` is null or its owning isolate is null.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_as_value(
+    wrap: *mut StatorDomObjectWrap,
+) -> *mut StatorValue {
+    if wrap.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let isolate = unsafe { (*wrap).isolate };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(plain) = dom_object_wrap_plain_object(wrap) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `isolate` is the wrapper's owning isolate and is live while the
+    // wrapper is live.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::DomWrapHandle {
+                plain,
+                wrap,
+                alive: Rc::clone(&(*wrap).alive),
+            },
+        )
+    }
+}
+
+/// Return the originating DOM wrapper for a value produced by
+/// [`stator_dom_object_wrap_as_value`].
+///
+/// Returns null for primitives, ordinary objects, tag-only object values, and
+/// DOM wrapper values that have since been invalidated.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_as_dom_object_wrap(
+    val: *const StatorValue,
+) -> *mut StatorDomObjectWrap {
+    if val.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::DomWrapHandle { wrap, alive, .. } if alive.get() => *wrap,
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Invalidate a DOM object wrapper's script-visible materialization.
+///
+/// Existing JS aliases to the materialized object remain safe to touch, but
+/// generated DOM accessor thunks stop dereferencing the raw wrapper pointer and
+/// return `undefined`.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invalidate(wrap: *mut StatorDomObjectWrap) {
+    if wrap.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe {
+        (*wrap).alive.set(false);
+        (*wrap).materialized.borrow_mut().take();
+    }
 }
 
 /// Install a DOM object wrapper as a named global on `ctx`.
@@ -4525,9 +4679,9 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
 /// a named setter installed.  This lets embedders expose P0 DOM globals such as
 /// `document.title` without V8.
 ///
-/// This is intentionally narrower than a general `StatorDomObjectWrap` →
-/// `StatorValue` conversion: it requires a context and installs the value
-/// directly into that context's global environment.
+/// The global path shares the same cached materialization as
+/// [`stator_dom_object_wrap_as_value`], preserving identity with wrapper values
+/// returned from getters and methods.
 ///
 /// Returns:
 /// * [`StatorStatus::StatorStatusOk`] when the global was installed.
@@ -4538,10 +4692,9 @@ fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
 /// # Safety
 /// - `ctx` must be a valid, live [`StatorContext`] pointer.
 /// - `name` must be a valid, null-terminated C string.
-/// - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer that remains
-///   alive until `ctx` is destroyed.  Replacing the global slot is not enough to
-///   release `wrap`, because page code may still hold aliases to the installed
-///   object.
+/// - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer. It must
+///   remain alive until no script aliases can observe it, or must be invalidated
+///   via [`stator_dom_object_wrap_invalidate`] before destruction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_global_set_dom_object_wrap(
     ctx: *mut StatorContext,
@@ -4632,6 +4785,7 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
         }
         StatorValueInner::Object
         | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. }
         | StatorValueInner::Function
         | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
@@ -4666,9 +4820,9 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
             }
         }
         StatorValueInner::Str(cs) => cs.to_string_lossy().into_owned(),
-        StatorValueInner::Object | StatorValueInner::ObjectHandle(_) => {
-            "[object Object]".to_owned()
-        }
+        StatorValueInner::Object
+        | StatorValueInner::ObjectHandle(_)
+        | StatorValueInner::DomWrapHandle { .. } => "[object Object]".to_owned(),
         StatorValueInner::Function | StatorValueInner::NativeFunctionValue(_) => {
             "function () { [native code] }".to_owned()
         }
@@ -4719,6 +4873,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
             // state because they operate directly on the `Rc<RefCell<JsObject>>`.
             JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
         }
+        StatorValueInner::DomWrapHandle { plain, .. } => JsValue::PlainObject(Rc::clone(plain)),
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))
@@ -5089,6 +5244,11 @@ pub unsafe extern "C" fn stator_object_template_set(
         StatorValueInner::Str(cs) => StatorValueInner::Str(cs.clone()),
         StatorValueInner::Object => StatorValueInner::Object,
         StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
+        StatorValueInner::DomWrapHandle { plain, wrap, alive } => StatorValueInner::DomWrapHandle {
+            plain: Rc::clone(plain),
+            wrap: *wrap,
+            alive: Rc::clone(alive),
+        },
         StatorValueInner::Function => StatorValueInner::Function,
         StatorValueInner::NativeFunctionValue(f) => {
             StatorValueInner::NativeFunctionValue(Rc::clone(f))
@@ -6929,6 +7089,13 @@ pub struct StatorDomObjectWrap {
     /// from internal fields so embedders can tag the canonical native object
     /// without consuming an internal-field slot.
     native_ptr: *mut c_void,
+    /// Cached JS-visible wrapper object.  Reused by globals, named getters,
+    /// and method returns so repeated conversions preserve object identity.
+    materialized: RefCell<Option<Rc<RefCell<PropertyMap>>>>,
+    /// Liveness flag captured by generated accessor closures.  The flag lets
+    /// stale JS aliases observe `undefined` instead of dereferencing a wrapper
+    /// after the embedder invalidates or destroys it.
+    alive: Rc<Cell<bool>>,
 }
 
 // SAFETY: `StatorDomObjectWrap` is single-threaded; see [`StatorValue`].
@@ -6958,6 +7125,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
         has_named_setter: false,
         class_id: 0,
         native_ptr: std::ptr::null_mut(),
+        materialized: RefCell::new(None),
+        alive: Rc::new(Cell::new(true)),
     }))
 }
 
@@ -6970,6 +7139,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_destroy(wrap: *mut StatorDomObjectWrap) {
     if !wrap.is_null() {
+        // SAFETY: caller guarantees `wrap` is valid and uniquely owned.
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
         // SAFETY: caller guarantees `wrap` is valid.
         let iso = unsafe { (*wrap).isolate };
         if !iso.is_null() {
@@ -12785,6 +12956,52 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn named_get_document_wrapper_property(
+        name: *const c_char,
+        name_len: usize,
+        data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key != "documentElement" {
+            return StatorStatus::StatorStatusFalse;
+        }
+        let value = unsafe { stator_dom_object_wrap_as_value(data as *mut StatorDomObjectWrap) };
+        if value.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        unsafe { *out = value };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_get_element_property(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        match key {
+            "nodeName" => {
+                let value = b"HTML";
+                let v = unsafe {
+                    stator_value_new_string(iso, value.as_ptr() as *const c_char, value.len())
+                };
+                unsafe { *out = v };
+                StatorStatus::StatorStatusOk
+            }
+            "nodeType" => {
+                let v = unsafe { stator_value_new_number(iso, 1.0) };
+                unsafe { *out = v };
+                StatorStatus::StatorStatusOk
+            }
+            _ => StatorStatus::StatorStatusFalse,
+        }
+    }
+
     unsafe extern "C" fn named_get_throwing_document_property(
         name: *const c_char,
         name_len: usize,
@@ -12868,6 +13085,29 @@ mod tests {
             b"documentURI".as_slice(),
             b"readonlyMissing".as_slice(),
         ] {
+            let status = unsafe {
+                stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len())
+            };
+            if status != StatorStatus::StatorStatusOk {
+                return status;
+            }
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_enumerate_document_wrapper(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let name = b"documentElement";
+        unsafe { stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len()) }
+    }
+
+    unsafe extern "C" fn named_enumerate_element(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        for name in [b"nodeName".as_slice(), b"nodeType".as_slice()] {
             let status = unsafe {
                 stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len())
             };
@@ -13090,6 +13330,151 @@ mod tests {
         unsafe {
             stator_value_destroy(rejected_write_result);
             stator_script_free(rejected_write_script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_dom_object_wrap_as_value_round_trips_identity() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert!(!wrap.is_null());
+
+        let first = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let second = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(!first.is_null());
+        assert!(!second.is_null());
+        assert!(unsafe { stator_value_is_object(first) });
+        assert!(unsafe { stator_value_strict_equals(first, second) });
+        assert_eq!(unsafe { stator_value_as_dom_object_wrap(first) }, wrap);
+
+        let plain = unsafe { stator_value_new_object(iso.as_ptr()) };
+        assert!(unsafe { stator_value_as_dom_object_wrap(plain) }.is_null());
+
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert!(unsafe { stator_value_as_dom_object_wrap(first) }.is_null());
+
+        unsafe {
+            stator_value_destroy(plain);
+            stator_value_destroy(first);
+            stator_value_destroy(second);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_object_wrap_returned_from_getter_preserves_identity() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let document_wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let element_wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        let element_handler = StatorDomNamedHandler {
+            getter: Some(named_get_element_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_element),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(element_wrap, &element_handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let document_handler = StatorDomNamedHandler {
+            getter: Some(named_get_document_wrapper_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_document_wrapper),
+            data: element_wrap as *mut c_void,
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_handler(document_wrap, &document_handler)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), document_wrap)
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"(document.documentElement === document.documentElement) + ':' + document.documentElement.nodeName + ':' + document.documentElement.nodeType";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(actual, "true:HTML:1");
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(document_wrap);
+            stator_dom_object_wrap_destroy(element_wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_object_wrap_invalidate_makes_cached_alias_safe() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| *title.borrow_mut() = "Initial".to_string());
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_document_property),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_document),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+
+        let src = b"typeof document.title";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(actual, "undefined");
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
             stator_context_destroy(ctx);
             stator_dom_object_wrap_destroy(wrap);
         }
