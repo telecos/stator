@@ -2047,12 +2047,22 @@ fn handle_create_closure(
     // Arrow functions lexically capture `new.target` from the enclosing scope
     // (ES §15.3.4) so it survives even when the arrow is called later from a
     // different context.
-    if is_arrow && !matches!(ctx.frame.new_target, JsValue::Undefined) {
-        fn_props_set(
-            &func_rc,
-            ".new_target".to_string(),
-            ctx.frame.new_target.clone(),
-        );
+    if is_arrow {
+        let lexical_this = ctx
+            .frame
+            .global_env
+            .borrow()
+            .get_this()
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        fn_props_set(&func_rc, ".this".to_string(), lexical_this);
+        if !matches!(ctx.frame.new_target, JsValue::Undefined) {
+            fn_props_set(
+                &func_rc,
+                ".new_target".to_string(),
+                ctx.frame.new_target.clone(),
+            );
+        }
     }
     if !is_arrow && func_rc.is_generator() {
         let func_val = JsValue::Function(Rc::clone(&func_rc));

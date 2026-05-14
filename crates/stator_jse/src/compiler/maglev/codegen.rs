@@ -371,7 +371,7 @@ impl MaglevCompiledCode {
         }
 
         let mem = ExecutableMemory::new(&self.code[..code_size]).map_err(|e| {
-            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+            StatorError::Internal(format!("executable memory allocation failed: {e}"))
         })?;
 
         let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; self.register_file_slots];
@@ -2046,10 +2046,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
             ValueNode::Int32Modulus { left, right } => {
-                if let Some(d) = self.try_get_i32_constant(*right) {
-                    if self.try_emit_int32_mod_by_constant(id, *left, d) {
-                        return;
-                    }
+                if let Some(d) = self.try_get_i32_constant(*right)
+                    && self.try_emit_int32_mod_by_constant(id, *left, d)
+                {
+                    return;
                 }
                 self.emit_load(*left, Reg64::R11);
                 self.emit_load(*right, Reg64::R10);
@@ -2074,10 +2074,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
             ValueNode::CheckedSmiModulus { left, right } => {
-                if let Some(d) = self.try_get_i32_constant(*right) {
-                    if self.try_emit_int32_mod_by_constant(id, *left, d) {
-                        return;
-                    }
+                if let Some(d) = self.try_get_i32_constant(*right)
+                    && self.try_emit_int32_mod_by_constant(id, *left, d)
+                {
+                    return;
                 }
                 self.emit_load(*left, Reg64::R11);
                 self.emit_load(*right, Reg64::R10);
@@ -4469,10 +4469,10 @@ impl<'a> MaglevCodegen<'a> {
     /// `u32` (`1` ⇒ embedder requested termination on this thread, `0`
     /// otherwise).  On a non-zero return the generated code jumps to
     /// `deopt_terminated_label`, which loads `JIT_DEOPT_TERMINATED` into
-    /// RAX and falls through the common deopt epilogue (callee-saved pop
-    /// + `ret`).  All caller-saved registers actually allocated by this
-    /// function are preserved across the call; the host ABI's shadow-
-    /// space requirement is honoured by
+    /// RAX and falls through the common deopt epilogue after popping
+    /// callee-saved registers and returning.  All caller-saved registers
+    /// actually allocated by this function are preserved across the call;
+    /// the host ABI's shadow-space requirement is honoured by
     /// [`Self::emit_helper_call_pre_adjust`].
     ///
     /// The whole sequence on a "typical" loop with no caller-saved
@@ -6121,12 +6121,11 @@ impl<'a> MaglevCodegen<'a> {
         // i32 divisor).  Replaces the ~20-cycle IDIV with a 4–6 cycle
         // multiply-by-magic sequence.  Critical for tight loops like
         // `for (i…) total += (i % 5)`.
-        if self.smi_guarded.contains(&left) {
-            if let Some(d) = self.try_get_i32_constant(right) {
-                if self.try_emit_int32_mod_by_constant(id, left, d) {
-                    return;
-                }
-            }
+        if self.smi_guarded.contains(&left)
+            && let Some(d) = self.try_get_i32_constant(right)
+            && self.try_emit_int32_mod_by_constant(id, left, d)
+        {
+            return;
         }
         // When both inputs are smi_guarded, skip Smi checks but guard
         // against division by zero.

@@ -8556,8 +8556,8 @@ pub(crate) mod jit_runtime {
     /// This struct is **never** returned across the FFI boundary — see
     /// [`jit_runtime_fill_named_ic_r15`] for the ABI-safe packed
     /// contract that generated code consumes.  Two-register struct
-    /// returns (`RAX:RDX`) work under SysV but Win64 returns
-    /// > 8-byte structs via a hidden pointer, so the JIT cannot read
+    /// returns (`RAX:RDX`) work under SysV but Win64 returns structs
+    /// larger than 8 bytes via a hidden pointer, so the JIT cannot read
     /// the second word from `RDX`.
     #[repr(C)]
     pub struct NamedIcResult {
@@ -10876,20 +10876,21 @@ pub(crate) mod jit_runtime {
                 // SAFETY: cached pointer is valid for the thread
                 // lifetime; no concurrent borrows during JIT execution.
                 let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
-                if l_idx < heap.len() && r_idx < heap.len() {
-                    if let (JsValue::String(a), JsValue::String(b)) = (&heap[l_idx], &heap[r_idx]) {
-                        RT_INPLACE_CONCAT_STATS.with(|c| {
-                            let (h, m) = c.get();
-                            c.set((h, m + 1));
-                        });
-                        let mut out = String::with_capacity(a.len() + b.len());
-                        out.push_str(a);
-                        out.push_str(b);
-                        let new_str: Rc<str> = Rc::<str>::from(out);
-                        let idx = heap.len();
-                        heap.push(JsValue::String(new_str));
-                        return JIT_HEAP_TAG + idx as i64;
-                    }
+                if l_idx < heap.len()
+                    && r_idx < heap.len()
+                    && let (JsValue::String(a), JsValue::String(b)) = (&heap[l_idx], &heap[r_idx])
+                {
+                    RT_INPLACE_CONCAT_STATS.with(|c| {
+                        let (h, m) = c.get();
+                        c.set((h, m + 1));
+                    });
+                    let mut out = String::with_capacity(a.len() + b.len());
+                    out.push_str(a);
+                    out.push_str(b);
+                    let new_str: Rc<str> = Rc::<str>::from(out);
+                    let idx = heap.len();
+                    heap.push(JsValue::String(new_str));
+                    return JIT_HEAP_TAG + idx as i64;
                 }
             }
         }
@@ -11074,6 +11075,7 @@ pub(crate) mod jit_runtime {
     ///   the generic add path so semantics stay correct);
     /// - the slot is otherwise unsuitable (out-of-range index,
     ///   mismatched indices, …).
+    ///
     /// Read and clear the in-place string-concat fast-path
     /// diagnostic counters.  Returns `(fast_path_hits,
     /// slow_path_misses)` accumulated since the last call.  Test
@@ -12440,7 +12442,7 @@ impl CompiledCode {
         }
 
         let mem = ExecutableMemory::new(&self.code).map_err(|e| {
-            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+            StatorError::Internal(format!("executable memory allocation failed: {e}"))
         })?;
 
         // Keep small register files on the stack to avoid per-call heap churn
@@ -12553,7 +12555,7 @@ impl CachedExecutableCode {
         }
 
         let mem = ExecutableMemory::new(code).map_err(|e| {
-            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+            StatorError::Internal(format!("executable memory allocation failed: {e}"))
         })?;
 
         // SAFETY:

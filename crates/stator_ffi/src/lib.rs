@@ -6329,10 +6329,7 @@ unsafe fn build_host_imports(
 
     let mut out: Vec<HostFunc> = Vec::with_capacity(funcs.len());
     for f in funcs {
-        let cb_fn = match f.callback {
-            Some(cb) => cb,
-            None => return None,
-        };
+        let cb_fn = f.callback?;
         if f.module_name.is_null() || f.field_name.is_null() {
             return None;
         }

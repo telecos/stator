@@ -133,6 +133,8 @@ pub struct InProcessInspector {
     globals: Rc<RefCell<GlobalEnv>>,
     /// Active sessions, in insertion order.  Iteration is used by
     /// `register_script` for `Debugger.scriptParsed` fan-out.
+    // Boxed sessions keep FFI session handles stable across Vec reallocations.
+    #[allow(clippy::vec_box)]
     sessions: Vec<Box<InProcessInspectorSession>>,
     /// Cached script registry, keyed by monotonically increasing ID.
     scripts: Vec<RegisteredScript>,
@@ -173,7 +175,7 @@ impl InProcessInspector {
         if let Some(idx) = self
             .sessions
             .iter()
-            .position(|s| s.as_ref() as *const _ == session)
+            .position(|s| std::ptr::eq(s.as_ref(), session))
         {
             self.sessions.remove(idx);
             true

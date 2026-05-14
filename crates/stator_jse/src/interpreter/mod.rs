@@ -13012,7 +13012,22 @@ fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
 /// sites that do not need to inspect the frame after execution completes.
 #[inline(always)]
 fn run_callee_pooled(mut callee_frame: InterpreterFrame) -> StatorResult<JsValue> {
+    let saved_arrow_this =
+        if callee_frame.bytecode_array.is_arrow() && callee_frame.bytecode_array.has_fn_props() {
+            let lexical_this = fn_props_get(&callee_frame.bytecode_array, ".this");
+            let old_this = callee_frame.global_env.borrow().get_this().cloned();
+            callee_frame.global_env.borrow_mut().set_this(lexical_this);
+            Some(old_this)
+        } else {
+            None
+        };
     let result = run_callee(&mut callee_frame);
+    if let Some(old_this) = saved_arrow_this {
+        match old_this {
+            Some(value) => callee_frame.global_env.borrow_mut().set_this(value),
+            None => callee_frame.global_env.borrow_mut().remove_this(),
+        }
+    }
     release_frame(callee_frame);
     result
 }

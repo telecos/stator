@@ -136,11 +136,7 @@ impl AbiX64 {
     /// Returns `0` when every argument fits in the ABI's register set.
     pub const fn helper_stack_arg_count(self, total_args: usize) -> usize {
         let regs = self.helper_arg_register_count();
-        if total_args > regs {
-            total_args - regs
-        } else {
-            0
-        }
+        total_args.saturating_sub(regs)
     }
 
     /// Stack offset (bytes from `RSP` *after* the matching
