@@ -916,6 +916,29 @@ enum StatorValueInner {
     Set,
 }
 
+type MaterializedDomWrapRegistry = HashMap<usize, (*mut StatorDomObjectWrap, Rc<Cell<bool>>)>;
+
+thread_local! {
+    static DOM_WRAP_MATERIALIZED_REGISTRY: RefCell<MaterializedDomWrapRegistry> =
+        RefCell::new(HashMap::new());
+}
+
+fn dom_wrap_inner_for_plain_object(plain: &Rc<RefCell<PropertyMap>>) -> Option<StatorValueInner> {
+    let key = Rc::as_ptr(plain) as usize;
+    DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let (wrap, alive) = registry.get(&key)?;
+        if wrap.is_null() || !alive.get() {
+            return None;
+        }
+        Some(StatorValueInner::DomWrapHandle {
+            plain: Rc::clone(plain),
+            wrap: *wrap,
+            alive: Rc::clone(alive),
+        })
+    })
+}
+
 /// An opaque handle to a JavaScript value (number or string).
 ///
 /// Created by [`stator_value_new_number`] or [`stator_value_new_string`] and
@@ -3973,8 +3996,8 @@ pub unsafe extern "C" fn stator_object_delete_property(
 /// a native callback — i.e. values whose internal representation is a
 /// reference-counted [`NativeFn`].  Bytecode-backed function values
 /// ([`StatorValueInner::Function`]) cannot yet be invoked through this API
-/// because the FFI does not yet model a receiver, an argv array, or
-/// `new.target` for them; calling such a value returns
+/// because the FFI does not yet model `new.target` or bytecode-function call
+/// frames for direct embedder calls; calling such a value returns
 /// [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
 /// likewise deferred.
 ///
@@ -3989,8 +4012,8 @@ pub unsafe extern "C" fn stator_object_delete_property(
 ///   `out_val` is null, when `argc` is negative, or when `args` is null
 ///   while `argc > 0`.
 ///
-/// `recv` is reserved for receiver/`this` plumbing in a future slice and is
-/// currently ignored by the native bridge.
+/// `recv` is used as the native callback receiver (`this`).  A null receiver is
+/// treated as JavaScript `undefined`.
 ///
 /// # Safety
 /// * `ctx` must be a valid, live [`StatorContext`] pointer.
@@ -4009,7 +4032,6 @@ pub unsafe extern "C" fn stator_value_call(
     args: *const *const StatorValue,
     out_val: *mut *mut StatorValue,
 ) -> StatorStatus {
-    let _ = recv; // Receiver plumbing reserved for a future slice.
     if !out_val.is_null() {
         // SAFETY: caller guarantees `out_val` is valid when non-null.
         unsafe { *out_val = std::ptr::null_mut() };
@@ -4044,7 +4066,17 @@ pub unsafe extern "C" fn stator_value_call(
             }
         }
     }
-    match native(js_args) {
+    let this_val = if recv.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `recv` is valid when non-null.
+        stator_value_inner_to_jsvalue(unsafe { &(*recv).inner })
+    };
+    // SAFETY: caller guarantees `ctx` is valid.
+    let global_env = unsafe { Rc::clone(&(*ctx).globals) };
+    match stator_jse::interpreter::invoke_native_with_this_in_global_env(
+        &native, global_env, this_val, js_args,
+    ) {
         Ok(js_val) => {
             let val = js_value_to_owned_stator_value(isolate, &js_val);
             if val.is_null() {
@@ -4219,10 +4251,11 @@ pub unsafe extern "C" fn stator_register_native_function(
 /// C-callable function-template callback signature.
 ///
 /// The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
-/// provides access to the call arguments and isolate.  It must return either
-/// a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
-/// frees it automatically) or a null pointer (treated as `undefined` unless
-/// the isolate has a pending exception, in which case script execution fails).
+/// provides access to the call receiver, arguments, and isolate.  It must
+/// return either a new [`StatorValue`] (the caller — i.e. the engine wrapper —
+/// owns it and frees it automatically) or a null pointer (treated as
+/// `undefined` unless the isolate has a pending exception, in which case script
+/// execution fails).
 type StatorFunctionTemplateCallback =
     unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue;
 
@@ -4234,6 +4267,8 @@ type StatorFunctionTemplateCallback =
 pub struct StatorFunctionCallbackInfo {
     /// Temporary argument values valid for the duration of the call.
     args: Vec<StatorValue>,
+    /// Temporary receiver value valid for the duration of the call.
+    this_value: StatorValue,
     /// The isolate this call is happening on.
     isolate: *mut StatorIsolate,
 }
@@ -4285,6 +4320,25 @@ pub unsafe extern "C" fn stator_function_callback_info_get(
         return std::ptr::null();
     }
     &args[idx] as *const StatorValue
+}
+
+/// Return the receiver (`this`) associated with this call.
+///
+/// The returned pointer is valid only for the duration of the callback
+/// invocation.  Returns a null pointer when `info` is null.
+///
+/// # Safety
+/// `info` must be either null or a valid pointer to a live
+/// [`StatorFunctionCallbackInfo`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_callback_info_get_this(
+    info: *const StatorFunctionCallbackInfo,
+) -> *const StatorValue {
+    if info.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `info` is valid.
+    unsafe { &(*info).this_value as *const StatorValue }
 }
 
 /// Return the isolate associated with this call.
@@ -4395,6 +4449,13 @@ pub unsafe extern "C" fn stator_function_template_get_function(
 
         let info = StatorFunctionCallbackInfo {
             args: c_vals,
+            this_value: StatorValue {
+                inner: stator_jse::interpreter::current_this()
+                    .as_ref()
+                    .map(jsvalue_to_stator_value_inner)
+                    .unwrap_or(StatorValueInner::Undefined),
+                isolate: std::ptr::null_mut(),
+            },
             isolate,
         };
 
@@ -4615,6 +4676,11 @@ fn dom_object_wrap_plain_object(
 
     object.extensible = false;
     let plain = Rc::new(RefCell::new(object));
+    DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+        registry
+            .borrow_mut()
+            .insert(Rc::as_ptr(&plain) as usize, (wrap, Rc::clone(&alive)));
+    });
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { *(*wrap).materialized.borrow_mut() = Some(Rc::clone(&plain)) };
     Some(plain)
@@ -4704,7 +4770,11 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invalidate(wrap: *mut StatorDomO
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe {
         (*wrap).alive.set(false);
-        (*wrap).materialized.borrow_mut().take();
+        if let Some(plain) = (*wrap).materialized.borrow_mut().take() {
+            DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+                registry.borrow_mut().remove(&(Rc::as_ptr(&plain) as usize));
+            });
+        }
     }
 }
 
@@ -4946,12 +5016,14 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         }
         JsValue::Function(_) | JsValue::NativeFunction(_) => StatorValueInner::Function,
         JsValue::Array(_) => StatorValueInner::Array,
+        JsValue::PlainObject(plain) => {
+            dom_wrap_inner_for_plain_object(plain).unwrap_or(StatorValueInner::Object)
+        }
         JsValue::Object(_)
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
         | JsValue::Error(_)
-        | JsValue::Promise(_)
-        | JsValue::PlainObject(_) => StatorValueInner::Object,
+        | JsValue::Promise(_) => StatorValueInner::Object,
         JsValue::Symbol(_)
         | JsValue::BigInt(_)
         | JsValue::Context(_)
@@ -11540,6 +11612,12 @@ mod tests {
     }
 
     #[test]
+    fn test_function_callback_info_get_this_null_is_safe() {
+        let this = unsafe { stator_function_callback_info_get_this(std::ptr::null()) };
+        assert!(this.is_null());
+    }
+
+    #[test]
     fn test_function_template_get_function_called_returns_value() {
         let iso = IsolateGuard::new();
         // Callback: returns the first argument doubled.
@@ -13118,6 +13196,60 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn capture_dom_this(
+        info: *const StatorFunctionCallbackInfo,
+    ) -> *mut StatorValue {
+        let this = unsafe { stator_function_callback_info_get_this(info) };
+        if !this.is_null() {
+            let wrap = unsafe { stator_value_as_dom_object_wrap(this) };
+            if !wrap.is_null() {
+                CAPTURED_DOM_THIS_CLASS_ID.store(
+                    unsafe { stator_dom_object_wrap_get_class_id(wrap) },
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                CAPTURED_DOM_THIS_NATIVE_PTR.store(
+                    unsafe { stator_dom_object_wrap_get_native_ptr(wrap) } as usize,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        let iso = unsafe { stator_function_callback_info_get_isolate(info) };
+        unsafe { stator_value_new_number(iso, 1.0) }
+    }
+
+    unsafe extern "C" fn named_get_capture_method(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key != "captureThis" {
+            return StatorStatus::StatorStatusFalse;
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let tmpl = unsafe { stator_function_template_new(iso, capture_dom_this) };
+        if tmpl.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let value = unsafe { stator_function_template_get_function(tmpl, std::ptr::null_mut()) };
+        unsafe { stator_function_template_destroy(tmpl) };
+        if value.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        unsafe { *out = value };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_enumerate_capture_method(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let name = b"captureThis";
+        unsafe { stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len()) }
+    }
+
     unsafe extern "C" fn named_get_element_property(
         name: *const c_char,
         name_len: usize,
@@ -13297,6 +13429,10 @@ mod tests {
             const { std::cell::Cell::new(std::ptr::null_mut()) };
         static ACTIVE_DOCUMENT_TITLE: RefCell<String> = RefCell::new(String::new());
     }
+    static CAPTURED_DOM_THIS_CLASS_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    static CAPTURED_DOM_THIS_NATIVE_PTR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     #[test]
     fn test_dom_named_handler_missing_vs_handled_vs_exception() {
@@ -13571,6 +13707,66 @@ mod tests {
             stator_context_destroy(ctx);
             stator_dom_object_wrap_destroy(document_wrap);
             stator_dom_object_wrap_destroy(element_wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_object_wrap_method_receiver_round_trips_to_wrap() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        CAPTURED_DOM_THIS_CLASS_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+        CAPTURED_DOM_THIS_NATIVE_PTR.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let mut native_tag = 0u8;
+        let native = &mut native_tag as *mut u8 as *mut c_void;
+        unsafe {
+            stator_dom_object_wrap_set_class_id(wrap, 42);
+            stator_dom_object_wrap_set_native_ptr(wrap, native);
+        }
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_capture_method),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_capture_method),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"document.captureThis()";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert_eq!(
+            CAPTURED_DOM_THIS_CLASS_ID.load(std::sync::atomic::Ordering::SeqCst),
+            42
+        );
+        assert_eq!(
+            CAPTURED_DOM_THIS_NATIVE_PTR.load(std::sync::atomic::Ordering::SeqCst),
+            native as usize
+        );
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
         }
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
     }
@@ -15548,6 +15744,47 @@ mod tests {
         unsafe {
             stator_value_destroy(out);
             stator_value_destroy(arg);
+            stator_value_destroy(fn_val);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_value_call_native_function_uses_receiver() {
+        unsafe extern "C" fn return_this(
+            info: *const StatorFunctionCallbackInfo,
+        ) -> *mut StatorValue {
+            let iso = unsafe { stator_function_callback_info_get_isolate(info) };
+            let this = unsafe { stator_function_callback_info_get_this(info) };
+            let n = if this.is_null() {
+                0.0
+            } else {
+                unsafe { stator_value_as_number(this) }
+            };
+            unsafe { stator_value_new_number(iso, n) }
+        }
+
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), return_this) };
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        let recv = unsafe { stator_value_new_number(iso.as_ptr(), 321.0) };
+
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        let status = unsafe { stator_value_call(ctx, fn_val, recv, 0, std::ptr::null(), &mut out) };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert!(!out.is_null());
+        let mut got = 0.0;
+        assert_eq!(
+            unsafe { stator_value_get_number(out, &mut got) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(got, 321.0);
+
+        unsafe {
+            stator_value_destroy(out);
+            stator_value_destroy(recv);
             stator_value_destroy(fn_val);
             stator_function_template_destroy(tmpl);
             stator_context_destroy(ctx);

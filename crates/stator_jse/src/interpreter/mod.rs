@@ -212,7 +212,7 @@ use crate::objects::property_map::{
     acquire_object_rc_from_template_with_values, recycle_object_rc,
 };
 use crate::objects::string_intern::intern;
-use crate::objects::value::{JsContext, JsValue};
+use crate::objects::value::{JsContext, JsValue, NativeFn};
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_jse::interpreter` (backwards-compatible path).
@@ -519,6 +519,12 @@ pub(super) fn init_generator_state_prototype(
 /// Return the current thread's active global environment, if any.
 pub(crate) fn current_global_env() -> Option<Rc<RefCell<GlobalEnv>>> {
     CURRENT_GLOBALS.with(|g| g.borrow().clone())
+}
+
+/// Return the current call receiver (`this`) from the active global
+/// environment, if any.
+pub fn current_this() -> Option<JsValue> {
+    current_global_env().and_then(|globals| globals.borrow().get_this().cloned())
 }
 
 /// Read a property using the interpreter's ordinary `[[Get]]` semantics.
@@ -17851,25 +17857,7 @@ pub fn dispatch_call_with_this(
             pop_call_frame();
             result
         }
-        JsValue::NativeFunction(f) => {
-            let globals = CURRENT_GLOBALS
-                .with(|g| g.borrow().clone())
-                .ok_or_else(|| {
-                    StatorError::ReferenceError("global environment unavailable".into())
-                })?;
-            let old_this = globals.borrow().get_this().cloned();
-            globals.borrow_mut().set_this(this_val);
-            let result = f(args.into_vec());
-            match old_this {
-                Some(value) => {
-                    globals.borrow_mut().set_this(value);
-                }
-                None => {
-                    globals.borrow_mut().remove_this();
-                }
-            }
-            result
-        }
+        JsValue::NativeFunction(f) => invoke_native_with_this(f, this_val, args.into_vec()),
         JsValue::PlainObject(map) => {
             let call_fn = map.borrow().get("__call__").cloned();
             if let Some(f) = call_fn {
@@ -17881,6 +17869,76 @@ pub fn dispatch_call_with_this(
         JsValue::Proxy(proxy) => proxy_apply(&mut proxy.borrow_mut(), this_val, args.into_vec()),
         _ => Err(StatorError::TypeError("value is not a function".into())),
     }
+}
+
+/// Invoke a native function with a specific receiver in the current global
+/// environment.
+pub fn invoke_native_with_this(
+    f: &NativeFn,
+    this_val: JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<JsValue> {
+    let globals = current_global_env()
+        .ok_or_else(|| StatorError::ReferenceError("global environment unavailable".into()))?;
+    invoke_native_with_this_in_global_env(f, globals, this_val, args)
+}
+
+/// Invoke a native function with a specific receiver and global environment.
+pub fn invoke_native_with_this_in_global_env(
+    f: &NativeFn,
+    global_env: Rc<RefCell<GlobalEnv>>,
+    this_val: JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<JsValue> {
+    let env_ptr = Rc::as_ptr(&global_env) as usize;
+    let previous_globals = CURRENT_GLOBALS.with(|globals| {
+        let previous = globals.borrow().clone();
+        *globals.borrow_mut() = Some(Rc::clone(&global_env));
+        previous
+    });
+    let previous_globals_ptr = LAST_GLOBALS_PTR.with(|ptr| {
+        let previous = ptr.get();
+        ptr.set(env_ptr);
+        previous
+    });
+
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    {
+        use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+        jit_runtime_set_global_env(global_env.clone());
+    }
+
+    let old_this = global_env.borrow().get_this().cloned();
+    global_env.borrow_mut().set_this(this_val);
+    let result = f(args);
+
+    match old_this {
+        Some(value) => {
+            global_env.borrow_mut().set_this(value);
+        }
+        None => {
+            global_env.borrow_mut().remove_this();
+        }
+    }
+
+    CURRENT_GLOBALS.with(|globals| {
+        *globals.borrow_mut() = previous_globals.clone();
+    });
+    LAST_GLOBALS_PTR.with(|ptr| ptr.set(previous_globals_ptr));
+
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    if let Some(previous) = previous_globals {
+        use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+        jit_runtime_set_global_env(previous);
+    }
+
+    result
 }
 
 /// Like [`dispatch_call_with_this`] but additionally sets `new.target` on the

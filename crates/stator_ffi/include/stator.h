@@ -630,10 +630,11 @@ typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
  * C-callable function-template callback signature.
  *
  * The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
- * provides access to the call arguments and isolate.  It must return either
- * a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
- * frees it automatically) or a null pointer (treated as `undefined` unless
- * the isolate has a pending exception, in which case script execution fails).
+ * provides access to the call receiver, arguments, and isolate.  It must
+ * return either a new [`StatorValue`] (the caller — i.e. the engine wrapper —
+ * owns it and frees it automatically) or a null pointer (treated as
+ * `undefined` unless the isolate has a pending exception, in which case script
+ * execution fails).
  */
 typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct StatorFunctionCallbackInfo*);
 
@@ -2634,8 +2635,8 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
  * a native callback — i.e. values whose internal representation is a
  * reference-counted [`NativeFn`].  Bytecode-backed function values
  * ([`StatorValueInner::Function`]) cannot yet be invoked through this API
- * because the FFI does not yet model a receiver, an argv array, or
- * `new.target` for them; calling such a value returns
+ * because the FFI does not yet model `new.target` or bytecode-function call
+ * frames for direct embedder calls; calling such a value returns
  * [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
  * likewise deferred.
  *
@@ -2650,8 +2651,8 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
  *   `out_val` is null, when `argc` is negative, or when `args` is null
  *   while `argc > 0`.
  *
- * `recv` is reserved for receiver/`this` plumbing in a future slice and is
- * currently ignored by the native bridge.
+ * `recv` is used as the native callback receiver (`this`).  A null receiver is
+ * treated as JavaScript `undefined`.
  *
  * # Safety
  * * `ctx` must be a valid, live [`StatorContext`] pointer.
@@ -2717,6 +2718,18 @@ int32_t stator_function_callback_info_length(const struct StatorFunctionCallback
  */
 const struct StatorValue *stator_function_callback_info_get(const struct StatorFunctionCallbackInfo *info,
                                                             int32_t index);
+
+/**
+ * Return the receiver (`this`) associated with this call.
+ *
+ * The returned pointer is valid only for the duration of the callback
+ * invocation.  Returns a null pointer when `info` is null.
+ *
+ * # Safety
+ * `info` must be either null or a valid pointer to a live
+ * [`StatorFunctionCallbackInfo`].
+ */
+const struct StatorValue *stator_function_callback_info_get_this(const struct StatorFunctionCallbackInfo *info);
 
 /**
  * Return the isolate associated with this call.
