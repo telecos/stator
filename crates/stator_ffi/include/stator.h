@@ -619,7 +619,8 @@ typedef struct StatorScriptTierStatus {
  * The callback receives the active context, an array of `argc` argument
  * pointers (owned by the Rust side; **do not free them**), and the count.
  * It must return either a new [`StatorValue`] (caller must free it) or a
- * null pointer (treated as `undefined`).
+ * null pointer (treated as `undefined` unless the isolate has a pending
+ * exception, in which case script execution fails).
  */
 typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
                                                     const struct StatorValue *const *args,
@@ -631,7 +632,8 @@ typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
  * The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
  * provides access to the call arguments and isolate.  It must return either
  * a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
- * frees it automatically) or a null pointer (treated as `undefined`).
+ * frees it automatically) or a null pointer (treated as `undefined` unless
+ * the isolate has a pending exception, in which case script execution fails).
  */
 typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct StatorFunctionCallbackInfo*);
 

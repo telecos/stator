@@ -2675,7 +2675,8 @@ pub unsafe extern "C" fn stator_script_free(script: *mut StatorScript) {
 /// The callback receives the active context, an array of `argc` argument
 /// pointers (owned by the Rust side; **do not free them**), and the count.
 /// It must return either a new [`StatorValue`] (caller must free it) or a
-/// null pointer (treated as `undefined`).
+/// null pointer (treated as `undefined` unless the isolate has a pending
+/// exception, in which case script execution fails).
 type StatorNativeCallback = unsafe extern "C" fn(
     ctx: *mut StatorContext,
     args: *const *const StatorValue,
@@ -2762,15 +2763,16 @@ unsafe fn ensure_pending_dom_interceptor_exception(
     unsafe { set_pending_exception(isolate, exception, true) };
 }
 
-unsafe fn pending_dom_interceptor_error(
+unsafe fn pending_exception_error(
     isolate: *const StatorIsolate,
+    fallback_message: &str,
 ) -> Option<stator_jse::error::StatorError> {
     // SAFETY: caller guarantees `isolate` is valid when non-null.
     if !unsafe { isolate_has_pending_exception(isolate) } {
         return None;
     }
     let message = if isolate.is_null() {
-        "DOM interceptor exception".to_string()
+        fallback_message.to_string()
     } else {
         // SAFETY: caller guarantees `isolate` is valid when non-null.
         unsafe {
@@ -2788,10 +2790,24 @@ unsafe fn pending_dom_interceptor_error(
                         }
                     }
                 })
-                .unwrap_or_else(|| "DOM interceptor exception".to_string())
+                .unwrap_or_else(|| fallback_message.to_string())
         }
     };
     Some(stator_jse::error::StatorError::TypeError(message))
+}
+
+unsafe fn pending_dom_interceptor_error(
+    isolate: *const StatorIsolate,
+) -> Option<stator_jse::error::StatorError> {
+    // SAFETY: caller guarantees `isolate` is valid when non-null.
+    unsafe { pending_exception_error(isolate, "DOM interceptor exception") }
+}
+
+unsafe fn pending_native_callback_error(
+    isolate: *const StatorIsolate,
+) -> Option<stator_jse::error::StatorError> {
+    // SAFETY: caller guarantees `isolate` is valid when non-null.
+    unsafe { pending_exception_error(isolate, "Native callback exception") }
 }
 
 unsafe fn record_script_error(
@@ -4145,7 +4161,20 @@ pub unsafe extern "C" fn stator_register_native_function(
         // FFI contract), and the argument pointers are valid for this call.
         let ret = unsafe { callback(ctx_ptr, c_ptrs.as_ptr(), c_ptrs.len() as i32) };
 
-        if ret.is_null() {
+        let isolate = if ctx_ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            // SAFETY: `ctx_ptr` is valid for the lifetime of the registered callback.
+            unsafe { (*ctx_ptr)._isolate }
+        };
+        // SAFETY: `isolate` is the context isolate when present.
+        if let Some(error) = unsafe { pending_native_callback_error(isolate) } {
+            if !ret.is_null() {
+                // SAFETY: `ret` was allocated by Box::into_raw in the callback.
+                unsafe { stator_value_destroy(ret) };
+            }
+            Err(error)
+        } else if ret.is_null() {
             Ok(JsValue::Undefined)
         } else {
             // Convert returned StatorValue to JsValue, then free it.
@@ -4192,7 +4221,8 @@ pub unsafe extern "C" fn stator_register_native_function(
 /// The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
 /// provides access to the call arguments and isolate.  It must return either
 /// a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
-/// frees it automatically) or a null pointer (treated as `undefined`).
+/// frees it automatically) or a null pointer (treated as `undefined` unless
+/// the isolate has a pending exception, in which case script execution fails).
 type StatorFunctionTemplateCallback =
     unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue;
 
@@ -4393,7 +4423,15 @@ pub unsafe extern "C" fn stator_function_template_get_function(
             unsafe { (*isolate).active_handle_scope = saved_scope };
         }
 
-        if ret.is_null() {
+        // SAFETY: `isolate` is the callback isolate and remains valid for the
+        // lifetime of the function value.
+        if let Some(error) = unsafe { pending_native_callback_error(isolate) } {
+            if !ret.is_null() {
+                // SAFETY: `ret` was allocated by `Box::into_raw` in the callback.
+                unsafe { stator_value_destroy(ret) };
+            }
+            Err(error)
+        } else if ret.is_null() {
             Ok(JsValue::Undefined)
         } else {
             // Convert the returned StatorValue to JsValue, then free it.
@@ -11559,6 +11597,114 @@ mod tests {
             stator_value_destroy(result);
             stator_script_free(script);
             stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_pending_exception_fails_script() {
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        static THROWN_EXCEPTION: AtomicPtr<StatorValue> = AtomicPtr::new(std::ptr::null_mut());
+
+        unsafe extern "C" fn throw_from_template(
+            info: *const StatorFunctionCallbackInfo,
+        ) -> *mut StatorValue {
+            // SAFETY: `info` is valid for this callback invocation.
+            let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+            // SAFETY: `isolate` is valid and the string bytes are copied.
+            let exception =
+                unsafe { stator_value_new_string(isolate, c"template failure".as_ptr(), 16) };
+            THROWN_EXCEPTION.store(exception, Ordering::SeqCst);
+            // SAFETY: `isolate` and `exception` are valid for the pending-exception window.
+            unsafe { stator_isolate_throw_exception(isolate, exception) };
+            std::ptr::null_mut()
+        }
+
+        THROWN_EXCEPTION.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), throw_from_template) };
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        unsafe { stator_context_global_set(ctx, c"boom".as_ptr(), fn_val) };
+        unsafe { stator_value_destroy(fn_val) };
+
+        let src = b"boom(); 13";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert!(!script.is_null());
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let caught = unsafe { stator_try_catch_exception(tc) };
+        assert_eq!(caught, THROWN_EXCEPTION.load(Ordering::SeqCst));
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(caught);
+            stator_script_free(script);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_registered_native_pending_exception_fails_script() {
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        static THROWN_EXCEPTION: AtomicPtr<StatorValue> = AtomicPtr::new(std::ptr::null_mut());
+
+        unsafe extern "C" fn throw_from_native(
+            ctx: *mut StatorContext,
+            _args: *const *const StatorValue,
+            _argc: i32,
+        ) -> *mut StatorValue {
+            let isolate = if ctx.is_null() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: `ctx` is valid for this callback invocation.
+                unsafe { (*ctx)._isolate }
+            };
+            // SAFETY: `isolate` is valid and the string bytes are copied.
+            let exception =
+                unsafe { stator_value_new_string(isolate, c"native failure".as_ptr(), 14) };
+            THROWN_EXCEPTION.store(exception, Ordering::SeqCst);
+            // SAFETY: `isolate` and `exception` are valid for the pending-exception window.
+            unsafe { stator_isolate_throw_exception(isolate, exception) };
+            std::ptr::null_mut()
+        }
+
+        THROWN_EXCEPTION.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        unsafe { stator_register_native_function(ctx, c"boom".as_ptr(), throw_from_native) };
+
+        let src = b"boom(); 13";
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert!(!script.is_null());
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let caught = unsafe { stator_try_catch_exception(tc) };
+        assert_eq!(caught, THROWN_EXCEPTION.load(Ordering::SeqCst));
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(caught);
+            stator_script_free(script);
             stator_context_destroy(ctx);
         }
     }
