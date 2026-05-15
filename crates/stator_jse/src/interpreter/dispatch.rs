@@ -8420,22 +8420,38 @@ fn handle_lda_import_meta(
 
 /// `GetModuleNamespace <module_request_idx>`
 ///
-/// Creates a module namespace exotic object for the module identified by
-/// the constant-pool string at `module_request_idx` and loads it into the
-/// accumulator.  Used by `import * as ns from "…"` and
+/// Loads the module namespace object for the dependency identified by the
+/// constant-pool string at `module_request_idx` into the accumulator.  Used
+/// by `import * as ns from "…"`, `export * as ns from "…"`, and bare
 /// `export * from "…"`.
 ///
-/// Returns a fresh empty plain object (full namespace resolution depends
-/// on the module linker which is not yet wired up).
+/// Namespace objects are published into the shared global environment under
+/// the key `__mod_ns:{specifier}` by the module evaluator before the
+/// importing module runs.  When no namespace has been published (because
+/// the importer is being executed as a standalone script in tests, or
+/// because the host did not run the linked dependency), this falls back to
+/// a fresh empty `PlainObject` so direct interpreter use of the opcode does
+/// not crash.
 #[cold]
 fn handle_get_module_namespace(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(_req_idx) = *instr.operand(0) else {
+    let Operand::ConstantPoolIdx(req_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("GetModuleNamespace", 0));
     };
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    let specifier = match ctx.frame.bytecode_array.get_constant(req_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "GetModuleNamespace: module specifier is not a string".into(),
+            ));
+        }
+    };
+    let key = format!("__mod_ns:{specifier}");
+    let value = ctx.frame.global_env.borrow().get(&key).cloned();
+    ctx.frame.accumulator =
+        value.unwrap_or_else(|| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))));
     Ok(DispatchAction::Continue)
 }
 
