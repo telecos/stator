@@ -4508,46 +4508,72 @@ unsafe fn instantiate_module_graph(
     Ok(())
 }
 
-/// Returns true if `dep` directly or transitively (via `export *` re-exports)
-/// exposes an export named `name`. Default exports are never propagated through
-/// bare star re-exports, matching ECMAScript module semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleExportResolution {
+    Missing,
+    Resolved,
+    Ambiguous,
+}
+
+/// Resolves a named export through a module's explicit exports and transitive
+/// bare-star re-exports. Default exports are never propagated through bare
+/// `export *`, matching ECMAScript module semantics. Multiple star providers
+/// for the same name are treated as ambiguous so linking fails closed instead
+/// of silently choosing one dependency.
 ///
 /// # Safety
 /// `dep` must be a non-null pointer to a live, linked module record.
-unsafe fn dep_has_export(dep: *mut StatorModule, name: &str) -> bool {
+unsafe fn resolve_module_export(dep: *mut StatorModule, name: &str) -> ModuleExportResolution {
     let mut visited: HashSet<*mut StatorModule> = HashSet::new();
-    unsafe { dep_has_export_inner(dep, name, &mut visited) }
+    unsafe { resolve_module_export_inner(dep, name, &mut visited) }
 }
 
-unsafe fn dep_has_export_inner(
+unsafe fn resolve_module_export_inner(
     dep: *mut StatorModule,
     name: &str,
     visited: &mut HashSet<*mut StatorModule>,
-) -> bool {
+) -> ModuleExportResolution {
     if dep.is_null() || !visited.insert(dep) {
-        return false;
+        return ModuleExportResolution::Missing;
     }
     // SAFETY: caller guarantees `dep` is a live module pointer.
     let module = unsafe { &*dep };
     if module.direct_exports.contains(name) {
-        return true;
+        return ModuleExportResolution::Resolved;
     }
     if name == "default" {
-        return false;
+        return ModuleExportResolution::Missing;
     }
+
+    let mut found = false;
     for request in &module.module_requests {
-        if matches!(request.imports.first(), Some(RequestedExport::Star))
-            && unsafe { dep_has_export_inner(request.resolved.get(), name, visited) }
-        {
-            return true;
+        if !matches!(request.imports.first(), Some(RequestedExport::Star)) {
+            continue;
+        }
+        match unsafe { resolve_module_export_inner(request.resolved.get(), name, visited) } {
+            ModuleExportResolution::Missing => {}
+            ModuleExportResolution::Resolved if found => return ModuleExportResolution::Ambiguous,
+            ModuleExportResolution::Resolved => found = true,
+            ModuleExportResolution::Ambiguous => return ModuleExportResolution::Ambiguous,
         }
     }
-    false
+
+    if found {
+        ModuleExportResolution::Resolved
+    } else {
+        ModuleExportResolution::Missing
+    }
 }
 
 fn missing_export_error(specifier: &str, name: &str) -> stator_jse::error::StatorError {
     stator_jse::error::StatorError::SyntaxError(format!(
         "module '{specifier}' has no export named '{name}'"
+    ))
+}
+
+fn ambiguous_export_error(specifier: &str, name: &str) -> stator_jse::error::StatorError {
+    stator_jse::error::StatorError::SyntaxError(format!(
+        "module '{specifier}' has ambiguous star exports for '{name}'"
     ))
 }
 
@@ -4599,16 +4625,65 @@ fn sync_module_request_bindings(
     Ok(())
 }
 
+/// Collect names exposed by a module for namespace publication. Direct exports
+/// take precedence; ambiguous names reachable only through star re-exports are
+/// omitted so namespace imports fail closed instead of choosing a provider.
+///
+/// # Safety
+/// `module` must be a non-null pointer to a live, linked module record.
+unsafe fn collect_module_export_names(module: *mut StatorModule) -> HashSet<String> {
+    let mut visited = HashSet::new();
+    unsafe { collect_module_export_names_inner(module, true, &mut visited) }
+}
+
+unsafe fn collect_module_export_names_inner(
+    module: *mut StatorModule,
+    include_default: bool,
+    visited: &mut HashSet<*mut StatorModule>,
+) -> HashSet<String> {
+    let mut exports = HashSet::new();
+    if module.is_null() || !visited.insert(module) {
+        return exports;
+    }
+
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &*module };
+    for name in &module_ref.direct_exports {
+        if include_default || name != "default" {
+            exports.insert(name.clone());
+        }
+    }
+
+    let mut star_names: HashMap<String, usize> = HashMap::new();
+    for request in &module_ref.module_requests {
+        if !matches!(request.imports.first(), Some(RequestedExport::Star)) {
+            continue;
+        }
+        let dep_exports =
+            unsafe { collect_module_export_names_inner(request.resolved.get(), false, visited) };
+        for name in dep_exports {
+            if !module_ref.direct_exports.contains(&name) {
+                *star_names.entry(name).or_default() += 1;
+            }
+        }
+    }
+    for (name, count) in star_names {
+        if count == 1 {
+            exports.insert(name);
+        }
+    }
+    exports
+}
+
 /// Build (and publish into `global_env`) the module namespace object that
 /// the importer's `GetModuleNamespace` opcode will load for `request`.
 ///
-/// The namespace object collects every name in the dependency module's
-/// `direct_exports` set, reading each value out of the dependency's "" cell
+/// The namespace object collects every unambiguous name in the dependency
+/// module's explicit exports and bare-star re-exports, reading each value out
+/// of the dependency's "" cell
 /// (the convention used by [`sync_module_request_bindings`]). It is frozen
 /// and marked non-extensible so importers cannot mutate or extend the
-/// namespace.  Re-exported star bindings sourced from grand-dependencies are
-/// not included yet — this slice only covers names the dependency's source
-/// declares directly.
+/// namespace.
 fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCell<GlobalEnv>>) {
     let dep = request.resolved.get();
     if dep.is_null() {
@@ -4617,7 +4692,7 @@ fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCe
     // SAFETY: `dep` is a borrowed pointer kept alive by the linked module
     // graph. We only read immutable metadata while no other code holds a
     // mutable borrow of the module record.
-    let exports: Vec<String> = unsafe { (*dep).direct_exports.iter().cloned().collect() };
+    let exports: Vec<String> = unsafe { collect_module_export_names(dep).into_iter().collect() };
     let specifier = request.specifier.to_string_lossy();
     let mut ns = PropertyMap::new();
     for name in exports {
@@ -4672,8 +4747,14 @@ unsafe fn validate_module_graph_exports(
                 }
                 RequestedExport::Named(name) => {
                     // SAFETY: `dep` is a live linked module pointer.
-                    if !unsafe { dep_has_export(dep, name) } {
-                        return Err(missing_export_error(&specifier, name));
+                    match unsafe { resolve_module_export(dep, name) } {
+                        ModuleExportResolution::Resolved => {}
+                        ModuleExportResolution::Missing => {
+                            return Err(missing_export_error(&specifier, name));
+                        }
+                        ModuleExportResolution::Ambiguous => {
+                            return Err(ambiguous_export_error(&specifier, name));
+                        }
                     }
                 }
                 RequestedExport::Namespace | RequestedExport::Star => {}
@@ -13075,6 +13156,237 @@ mod tests {
             stator_value_destroy(result);
             stator_module_free(root);
             stator_module_free(re);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_star_reexport_import_reads_dependency_binding() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x } from './mid.js'; x + 1;");
+        let mid = compile_module_src("export * from './dep.js';");
+        let dep = compile_module_src("export const x = 41;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(mid);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_star_reexport_excludes_default() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import value from './mid.js'; value;");
+        let mid = compile_module_src("export * from './dep.js';");
+        let dep = compile_module_src("export default 41; export const named = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("default"));
+            stator_module_free(root);
+            stator_module_free(mid);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_explicit_export_precedes_star_reexport() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x } from './mid.js'; x;");
+        let mid = compile_module_src("export * from './dep.js'; export const x = 2;");
+        let dep = compile_module_src("export const x = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 2.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(mid);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_ambiguous_star_reexport_fails_closed() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x } from './mid.js'; x;");
+        let mid = compile_module_src("export * from './a.js'; export * from './b.js';");
+        let a = compile_module_src("export const x = 1;");
+        let b = compile_module_src("export const x = 2;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./a.js".to_string(), a);
+        modules.insert("./b.js".to_string(), b);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("ambiguous"));
+            stator_module_free(root);
+            stator_module_free(mid);
+            stator_module_free(a);
+            stator_module_free(b);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_namespace_import_includes_star_reexports() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import * as ns from './mid.js'; ns.x + ns.y;");
+        let mid = compile_module_src("export * from './dep.js'; export const y = 2;");
+        let dep = compile_module_src("export const x = 40; export default 100;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(mid);
             stator_module_free(dep);
             stator_context_destroy(ctx);
         }
