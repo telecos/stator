@@ -78,6 +78,36 @@ typedef enum StatorMessageKind {
 } StatorMessageKind;
 
 /**
+ * Link/evaluation state for a [`StatorModule`].
+ */
+typedef enum StatorModuleStatus {
+  /**
+   * The module failed to compile or a null module handle was supplied.
+   */
+  StatorModuleStatusErrored = -1,
+  /**
+   * The module compiled but has not been linked.
+   */
+  StatorModuleStatusUnlinked = 0,
+  /**
+   * The module is currently linking.
+   */
+  StatorModuleStatusLinking = 1,
+  /**
+   * The module has completed dependency-free linking.
+   */
+  StatorModuleStatusLinked = 2,
+  /**
+   * The module is currently evaluating.
+   */
+  StatorModuleStatusEvaluating = 3,
+  /**
+   * The module completed evaluation successfully.
+   */
+  StatorModuleStatusEvaluated = 4,
+} StatorModuleStatus;
+
+/**
  * Stable status code returned by typed-accessor and Maybe-style FFI entry
  * points so that C callers can distinguish a missing value, an invalid
  * argument, an unsupported operation, and a JavaScript exception without
@@ -355,8 +385,8 @@ typedef struct StatorMessage StatorMessage;
  * A browser-facing compiled ES module record.
  *
  * Created by [`stator_module_compile`] and released by [`stator_module_free`].
- * The handle owns parsed/compiled module bytecode and origin metadata, but it
- * does not perform module linking, import resolution, or evaluation yet.
+ * The handle owns parsed/compiled module bytecode, origin metadata, and the
+ * current module linking/evaluation status.
  */
 typedef struct StatorModule StatorModule;
 
@@ -2102,9 +2132,9 @@ struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
  * The caller must eventually pass the returned pointer to
  * [`stator_module_free`].
  *
- * This API intentionally stops at creating a module-record-like handle: it
- * parses with module semantics and compiles module bytecode, but does not
- * resolve imports, link dependencies, or evaluate the module.
+ * The resulting module can be evaluated with [`stator_module_evaluate`]
+ * when it has no static imports or re-exports. Dependency-bearing modules
+ * require host import resolution before evaluation.
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -2338,6 +2368,46 @@ size_t stator_module_bytecode_count(const struct StatorModule *module);
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 bool stator_module_is_async(const struct StatorModule *module);
+
+/**
+ * Return whether `module` contains static imports or re-exports.
+ *
+ * Dependency-bearing modules require a host resolver/linker before this FFI
+ * layer can safely evaluate them. Dependency-free modules can be evaluated by
+ * [`stator_module_evaluate`].
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+bool stator_module_has_dependencies(const struct StatorModule *module);
+
+/**
+ * Return the current link/evaluation status for `module`.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+enum StatorModuleStatus stator_module_get_status(const struct StatorModule *module);
+
+/**
+ * Link and evaluate a dependency-free compiled module.
+ *
+ * This is the first module-runtime slice: it drives the module record through
+ * `Unlinked -> Linking -> Linked -> Evaluating -> Evaluated` and runs modules
+ * that do not need host import resolution. On success it returns the top-level
+ * completion value as a new [`StatorValue`]. On failure it returns null,
+ * stores the error on `module`, and publishes a pending exception on `ctx`
+ * when a context is supplied.
+ *
+ * Modules with static imports or re-exports currently fail with an internal
+ * error so that dedicated host import-resolution work can provide the linker.
+ *
+ * # Safety
+ * - `module` must be a non-null pointer returned by [`stator_module_compile`].
+ * - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+ *   case an empty global environment is used).
+ */
+struct StatorValue *stator_module_evaluate(struct StatorModule *module, struct StatorContext *ctx);
 
 /**
  * Free a [`StatorModule`] previously returned by [`stator_module_compile`].
