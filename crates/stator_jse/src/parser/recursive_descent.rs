@@ -30,15 +30,15 @@ use crate::parser::ast::{
     ClassBody, ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt,
     EmptyStmt, ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl,
     ExportSpecifier, Expr, ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt,
-    ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportExpr, ImportNamedSpecifier,
-    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LabeledStmt, LogicalExpr,
-    LogicalOp, MemberProp, MetaPropExpr, MethodDef, MethodKind, ModuleDecl, ModuleExportName,
-    NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat,
-    PrivateIdent, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef, RegExpLit,
-    RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement, StaticBlock,
-    Stmt, StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt,
-    UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
-    YieldExpr,
+    ForStmt, Ident, IfStmt, ImportAttribute, ImportDecl, ImportDefaultSpecifier, ImportExpr,
+    ImportNamedSpecifier, ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LabeledStmt,
+    LogicalExpr, LogicalOp, MemberProp, MetaPropExpr, MethodDef, MethodKind, ModuleDecl,
+    ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp,
+    Param, Pat, PrivateIdent, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef,
+    RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement,
+    StaticBlock, Stmt, StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt,
+    TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
+    WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue, cook_template_raw};
 
@@ -1617,13 +1617,14 @@ impl<'src> Parser<'src> {
         // Side-effect import: `import "module";`
         if self.peek_kind() == TokenKind::StringLiteral {
             let source = self.parse_string_lit_token()?;
+            let attributes = self.parse_import_attributes()?;
             let end = source.loc;
             self.consume_semicolon()?;
             return Ok(ImportDecl {
                 loc: Self::merge_spans(start, end),
                 specifiers: vec![],
                 source,
-                attributes: vec![],
+                attributes,
             });
         }
 
@@ -1675,6 +1676,7 @@ impl<'src> Parser<'src> {
         // `from "source"`
         self.expect(TokenKind::From)?;
         let source = self.parse_string_lit_token()?;
+        let attributes = self.parse_import_attributes()?;
         let end = source.loc;
         self.consume_semicolon()?;
 
@@ -1682,8 +1684,69 @@ impl<'src> Parser<'src> {
             loc: Self::merge_spans(start, end),
             specifiers,
             source,
-            attributes: vec![],
+            attributes,
         })
+    }
+
+    /// Parse optional import attributes: `with { key: "value" }` or legacy
+    /// `assert { key: "value" }`.
+    fn parse_import_attributes(&mut self) -> StatorResult<Vec<ImportAttribute>> {
+        let clause_start = self.current_span();
+        let has_clause = self.peek_kind() == TokenKind::With
+            || (self.peek_kind() == TokenKind::Identifier
+                && matches!(&self.current.value, TokenValue::Str(name) if name == "assert"));
+        if !has_clause {
+            return Ok(Vec::new());
+        }
+        self.bump()?;
+
+        self.expect(TokenKind::LeftBrace)?;
+        let mut attributes = Vec::new();
+        while self.peek_kind() != TokenKind::RightBrace {
+            if self.peek_kind() == TokenKind::Eof {
+                return Err(self.error("unexpected end of input in import attributes"));
+            }
+            let key_tok = self.bump()?;
+            let key = match key_tok.kind {
+                TokenKind::Identifier => self.ident_from_token(&key_tok)?,
+                TokenKind::StringLiteral => {
+                    let value = match &key_tok.value {
+                        TokenValue::Str(value) => value.clone(),
+                        _ => return Err(Self::error_at(key_tok.span, "expected attribute key")),
+                    };
+                    Ident {
+                        loc: key_tok.span,
+                        name: value,
+                    }
+                }
+                _ => {
+                    return Err(Self::error_at(
+                        key_tok.span,
+                        "expected import attribute key",
+                    ));
+                }
+            };
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_string_lit_token()?;
+            attributes.push(ImportAttribute {
+                loc: Self::merge_spans(key.loc, value.loc),
+                key,
+                value,
+            });
+            if !self.eat(TokenKind::Comma)? {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace)?.span;
+        if attributes.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let first_loc = attributes[0].loc;
+            attributes[0].loc = Self::merge_spans(clause_start, first_loc);
+            let last_idx = attributes.len() - 1;
+            attributes[last_idx].loc = Self::merge_spans(attributes[last_idx].loc, end);
+            Ok(attributes)
+        }
     }
 
     /// Parse the `{ a, b as c }` portion of an import and push specifiers.
@@ -1904,6 +1967,11 @@ impl<'src> Parser<'src> {
                 } else {
                     None
                 };
+                let attributes = if source.is_some() {
+                    self.parse_import_attributes()?
+                } else {
+                    Vec::new()
+                };
 
                 let end = source.as_ref().map(|s| s.loc).unwrap_or(rbrace.span);
                 self.consume_semicolon()?;
@@ -1913,7 +1981,7 @@ impl<'src> Parser<'src> {
                     specifiers,
                     source,
                     declaration: None,
-                    attributes: vec![],
+                    attributes,
                 }))
             }
 
@@ -1928,6 +1996,7 @@ impl<'src> Parser<'src> {
                 };
                 self.expect(TokenKind::From)?;
                 let source = self.parse_string_lit_token()?;
+                let attributes = self.parse_import_attributes()?;
                 let end = source.loc;
                 self.consume_semicolon()?;
 
@@ -1935,7 +2004,7 @@ impl<'src> Parser<'src> {
                     loc: Self::merge_spans(start, end),
                     exported,
                     source,
-                    attributes: vec![],
+                    attributes,
                 }))
             }
 

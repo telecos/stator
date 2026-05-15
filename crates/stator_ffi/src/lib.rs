@@ -2340,6 +2340,8 @@ pub struct StatorString {
 pub struct StatorModule {
     /// Compiled module bytecodes on success; `None` on parse / compile error.
     bytecodes: Option<Rc<BytecodeArray>>,
+    /// Host-visible source kind supplied at compile time.
+    source_type: StatorModuleType,
     /// Whether this module needs host import resolution before evaluation.
     has_dependencies: bool,
     /// Static import and re-export requests in source order.
@@ -2386,6 +2388,24 @@ pub struct StatorImportAttribute {
     pub value: *const c_char,
     /// Number of bytes in `value`.
     pub value_len: usize,
+}
+
+/// Host-visible source kind for a compiled module record.
+///
+/// JavaScript modules are parsed and compiled by Stator today. Other source
+/// kinds are recorded as metadata so embedders can compare import attributes
+/// against host policy while execution support lands separately.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorModuleType {
+    /// ECMAScript source text module.
+    StatorModuleTypeJavaScript = 0,
+    /// JSON module source.
+    StatorModuleTypeJson = 1,
+    /// WebAssembly module source.
+    StatorModuleTypeWebAssembly = 2,
+    /// CSS module source.
+    StatorModuleTypeCss = 3,
 }
 
 /// Result returned by a host module resolver callback.
@@ -2487,8 +2507,9 @@ fn module_request_attributes(attributes: &[ImportAttribute]) -> Vec<StatorModule
     attributes
         .iter()
         .filter_map(|attribute| {
-            let key = CString::new(attribute.key.name.as_str()).ok()?;
-            let value = CString::new(attribute.value.value.as_str()).ok()?;
+            let key = CString::new(module_request_specifier_value(&attribute.key.name)).ok()?;
+            let value =
+                CString::new(module_request_specifier_value(&attribute.value.value)).ok()?;
             Some(StatorModuleRequestAttribute { key, value })
         })
         .collect()
@@ -2669,15 +2690,16 @@ pub unsafe extern "C" fn stator_script_compile(
 /// # Safety
 /// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
 /// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn stator_module_compile(
+unsafe fn compile_module_source(
     _ctx: *mut StatorContext,
     source: *const c_char,
     source_len: usize,
+    source_type: StatorModuleType,
 ) -> *mut StatorModule {
     if source.is_null() {
         let module = Box::new(StatorModule {
             bytecodes: None,
+            source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
             status: StatorModuleStatus::StatorModuleStatusErrored,
@@ -2698,6 +2720,7 @@ pub unsafe extern "C" fn stator_module_compile(
         Err(_) => {
             let module = Box::new(StatorModule {
                 bytecodes: None,
+                source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
@@ -2712,6 +2735,32 @@ pub unsafe extern "C" fn stator_module_compile(
         }
     };
 
+    if source_type != StatorModuleType::StatorModuleTypeJavaScript {
+        let type_name = match source_type {
+            StatorModuleType::StatorModuleTypeJavaScript => "JavaScript",
+            StatorModuleType::StatorModuleTypeJson => "JSON",
+            StatorModuleType::StatorModuleTypeWebAssembly => "WebAssembly",
+            StatorModuleType::StatorModuleTypeCss => "CSS",
+        };
+        let module = Box::new(StatorModule {
+            bytecodes: None,
+            source_type,
+            has_dependencies: false,
+            module_requests: Vec::new(),
+            status: StatorModuleStatus::StatorModuleStatusErrored,
+            last_result: None,
+            error: Some(
+                CString::new(format!("{type_name} module source is not executable yet"))
+                    .unwrap_or_else(|_| c"typed module source is not executable yet".into()),
+            ),
+            error_kind: StatorMessageKind::StatorMessageKindInternal,
+            resource_name: None,
+            resource_line_offset: 0,
+            resource_column_offset: 0,
+        });
+        return Box::into_raw(module);
+    }
+
     let result = parser::parse_module(src).and_then(|program| {
         let has_dependencies = program_has_module_dependencies(&program);
         let module_requests = collect_module_requests(&program);
@@ -2722,6 +2771,7 @@ pub unsafe extern "C" fn stator_module_compile(
     let module = match result {
         Ok((bytecodes, has_dependencies, module_requests)) => Box::new(StatorModule {
             bytecodes: Some(Rc::new(bytecodes)),
+            source_type,
             has_dependencies,
             module_requests,
             status: StatorModuleStatus::StatorModuleStatusUnlinked,
@@ -2737,6 +2787,7 @@ pub unsafe extern "C" fn stator_module_compile(
             let cstring = CString::new(msg).unwrap_or_else(|_| c"module compilation error".into());
             Box::new(StatorModule {
                 bytecodes: None,
+                source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
@@ -2750,6 +2801,54 @@ pub unsafe extern "C" fn stator_module_compile(
         }
     };
     Box::into_raw(module)
+}
+
+/// Compile `source` (a UTF-8 string of `source_len` bytes) as a JavaScript ES module.
+///
+/// This is equivalent to [`stator_module_compile_typed`] with
+/// [`StatorModuleType::StatorModuleTypeJavaScript`].
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+) -> *mut StatorModule {
+    // SAFETY: forwards the caller-provided raw source slice to the shared
+    // compiler using the JavaScript/default module type.
+    unsafe {
+        compile_module_source(
+            ctx,
+            source,
+            source_len,
+            StatorModuleType::StatorModuleTypeJavaScript,
+        )
+    }
+}
+
+/// Compile `source` as a module with host-provided source kind metadata.
+///
+/// JavaScript modules are parsed and compiled normally. JSON, WebAssembly, and
+/// CSS module source kinds are recorded on the returned module handle but
+/// currently produce an unsupported compile error because their module
+/// evaluators are not implemented in Stator yet.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile_typed(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    source_type: StatorModuleType,
+) -> *mut StatorModule {
+    // SAFETY: forwards the caller-provided raw source slice to the shared
+    // compiler while preserving the requested source type metadata.
+    unsafe { compile_module_source(ctx, source, source_len, source_type) }
 }
 
 /// Return a null-terminated error message if `script` compiled with an error.
@@ -3365,6 +3464,22 @@ pub unsafe extern "C" fn stator_module_get_status(
     }
     // SAFETY: caller guarantees `module` is valid.
     unsafe { (*module).status }
+}
+
+/// Return the source kind metadata recorded on `module`.
+///
+/// Null module pointers report JavaScript so embedders can treat legacy/default
+/// paths as JavaScript-compatible.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_type(module: *const StatorModule) -> StatorModuleType {
+    if module.is_null() {
+        return StatorModuleType::StatorModuleTypeJavaScript;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).source_type }
 }
 
 unsafe fn module_result_to_value(ctx: *mut StatorContext, val: &JsValue) -> *mut StatorValue {
@@ -10846,6 +10961,29 @@ mod tests {
         modules: HashMap<String, *mut StatorModule>,
         status: StatorResolveStatus,
         calls: Vec<String>,
+        attributes: Vec<Vec<(String, String)>>,
+    }
+
+    unsafe fn import_attribute_pair(attribute: &StatorImportAttribute) -> (String, String) {
+        let key = if attribute.key.is_null() {
+            String::new()
+        } else {
+            // SAFETY: test callers pass valid FFI attribute slices.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(attribute.key as *const u8, attribute.key_len)
+            };
+            std::str::from_utf8(bytes).unwrap().to_string()
+        };
+        let value = if attribute.value.is_null() {
+            String::new()
+        } else {
+            // SAFETY: test callers pass valid FFI attribute slices.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(attribute.value as *const u8, attribute.value_len)
+            };
+            std::str::from_utf8(bytes).unwrap().to_string()
+        };
+        (key, value)
     }
 
     unsafe extern "C" fn test_graph_resolver_cb(
@@ -10871,6 +11009,21 @@ mod tests {
             unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
         let specifier = std::str::from_utf8(specifier_bytes).unwrap().to_string();
         data.calls.push(specifier.clone());
+        let attributes = if attributes_len == 0 {
+            Vec::new()
+        } else {
+            assert!(!attributes.is_null());
+            // SAFETY: callback contract supplies `attributes_len` valid entries.
+            let slice = unsafe { std::slice::from_raw_parts(attributes, attributes_len) };
+            slice
+                .iter()
+                .map(|attribute| {
+                    // SAFETY: `slice` was built from valid FFI attribute entries.
+                    unsafe { import_attribute_pair(attribute) }
+                })
+                .collect()
+        };
+        data.attributes.push(attributes);
         if !out_error.is_null() {
             // SAFETY: out pointer is valid for one write in these tests.
             unsafe { *out_error = std::ptr::null_mut() };
@@ -11114,6 +11267,75 @@ mod tests {
     }
 
     #[test]
+    fn test_module_request_enumeration_reports_import_attributes() {
+        let module = compile_module_src(
+            "import data from './data.json' with { type: 'json', mode: 'strict' };
+             export * from './style.css' assert { type: 'css' };",
+        );
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(stator_module_get_request_count(module), 2);
+
+            let mut specifier = std::ptr::null();
+            let mut specifier_len = 0usize;
+            let mut attributes = std::ptr::null();
+            let mut attributes_len = 0usize;
+            assert!(stator_module_get_request(
+                module,
+                0,
+                &mut specifier,
+                &mut specifier_len,
+                &mut attributes,
+                &mut attributes_len,
+            ));
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(
+                    specifier as *const u8,
+                    specifier_len
+                ))
+                .unwrap(),
+                "./data.json"
+            );
+            assert_eq!(attributes_len, 2);
+            assert!(!attributes.is_null());
+            let attrs = std::slice::from_raw_parts(attributes, attributes_len);
+            assert_eq!(
+                import_attribute_pair(&attrs[0]),
+                ("type".into(), "json".into())
+            );
+            assert_eq!(
+                import_attribute_pair(&attrs[1]),
+                ("mode".into(), "strict".into())
+            );
+
+            assert!(stator_module_get_request(
+                module,
+                1,
+                &mut specifier,
+                &mut specifier_len,
+                &mut attributes,
+                &mut attributes_len,
+            ));
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(
+                    specifier as *const u8,
+                    specifier_len
+                ))
+                .unwrap(),
+                "./style.css"
+            );
+            assert_eq!(attributes_len, 1);
+            let attrs = std::slice::from_raw_parts(attributes, attributes_len);
+            assert_eq!(
+                import_attribute_pair(&attrs[0]),
+                ("type".into(), "css".into())
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
     fn test_module_instantiate_reports_missing_resolver() {
         let module = compile_module_src("import './dep.js';");
         assert!(!module.is_null());
@@ -11146,6 +11368,7 @@ mod tests {
             modules: HashMap::new(),
             status: StatorResolveStatus::StatorResolveStatusTypeError,
             calls: Vec::new(),
+            attributes: Vec::new(),
         };
         // SAFETY: callback and user data remain live for this test.
         assert!(unsafe {
@@ -11183,6 +11406,7 @@ mod tests {
             modules,
             status: StatorResolveStatus::StatorResolveStatusOk,
             calls: Vec::new(),
+            attributes: Vec::new(),
         };
         // SAFETY: callback and user data remain live for this test.
         assert!(unsafe {
@@ -11213,6 +11437,42 @@ mod tests {
     }
 
     #[test]
+    fn test_module_instantiate_passes_import_attributes_to_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import data from './data.json' with { type: 'json' };");
+        let dep = compile_module_src("export default 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./data.json".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./data.json"]);
+            assert_eq!(data.attributes, vec![vec![("type".into(), "json".into())]]);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_module_instantiate_handles_resolver_cycle() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -11226,6 +11486,7 @@ mod tests {
             modules,
             status: StatorResolveStatus::StatorResolveStatusOk,
             calls: Vec::new(),
+            attributes: Vec::new(),
         };
         // SAFETY: callback and user data remain live for this test.
         assert!(unsafe {
@@ -11288,6 +11549,53 @@ mod tests {
     }
 
     #[test]
+    fn test_module_compile_defaults_to_javascript_type() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_type(module),
+                StatorModuleType::StatorModuleTypeJavaScript
+            );
+            assert!(stator_module_get_error(module).is_null());
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_typed_records_unsupported_source_type() {
+        let source = b"{\"answer\":42}";
+        // SAFETY: null ctx is permitted; source bytes are valid UTF-8.
+        let module = unsafe {
+            stator_module_compile_typed(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                StatorModuleType::StatorModuleTypeJson,
+            )
+        };
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_type(module),
+                StatorModuleType::StatorModuleTypeJson
+            );
+            assert!(!stator_module_get_error(module).is_null());
+            assert_eq!(
+                stator_module_error_kind(module),
+                StatorMessageKind::StatorMessageKindInternal
+            );
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
     fn test_module_origin_defaults_and_roundtrip() {
         let module = compile_module_src("export const x = 1;");
         assert!(!module.is_null());
@@ -11330,6 +11638,10 @@ mod tests {
             assert_eq!(
                 stator_module_get_status(std::ptr::null()),
                 StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert_eq!(
+                stator_module_get_type(std::ptr::null()),
+                StatorModuleType::StatorModuleTypeJavaScript
             );
             stator_module_set_origin(std::ptr::null_mut(), std::ptr::null(), 1, 2);
             assert!(stator_module_get_resource_name(std::ptr::null()).is_null());

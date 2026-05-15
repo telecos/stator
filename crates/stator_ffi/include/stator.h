@@ -38,6 +38,32 @@ typedef enum StatorResolveStatus {
 } StatorResolveStatus;
 
 /**
+ * Host-visible source kind for a compiled module record.
+ *
+ * JavaScript modules are parsed and compiled by Stator today. Other source
+ * kinds are recorded as metadata so embedders can compare import attributes
+ * against host policy while execution support lands separately.
+ */
+typedef enum StatorModuleType {
+  /**
+   * ECMAScript source text module.
+   */
+  StatorModuleTypeJavaScript = 0,
+  /**
+   * JSON module source.
+   */
+  StatorModuleTypeJson = 1,
+  /**
+   * WebAssembly module source.
+   */
+  StatorModuleTypeWebAssembly = 2,
+  /**
+   * CSS module source.
+   */
+  StatorModuleTypeCss = 3,
+} StatorModuleType;
+
+/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -2256,24 +2282,35 @@ struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
                                            size_t source_len);
 
 /**
- * Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
+ * Compile `source` (a UTF-8 string of `source_len` bytes) as a JavaScript ES module.
  *
- * Returns a non-null [`StatorModule`] pointer in all cases (even on error).
- * Call [`stator_module_get_error`] to check whether compilation succeeded.
- * The caller must eventually pass the returned pointer to
- * [`stator_module_free`].
- *
- * The resulting module can be evaluated with [`stator_module_evaluate`]
- * when it has no static imports or re-exports. Dependency-bearing modules
- * require host import resolution before evaluation.
+ * This is equivalent to [`stator_module_compile_typed`] with
+ * [`StatorModuleType::StatorModuleTypeJavaScript`].
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
  * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
  */
-struct StatorModule *stator_module_compile(struct StatorContext *_ctx,
+struct StatorModule *stator_module_compile(struct StatorContext *ctx,
                                            const char *source,
                                            size_t source_len);
+
+/**
+ * Compile `source` as a module with host-provided source kind metadata.
+ *
+ * JavaScript modules are parsed and compiled normally. JSON, WebAssembly, and
+ * CSS module source kinds are recorded on the returned module handle but
+ * currently produce an unsupported compile error because their module
+ * evaluators are not implemented in Stator yet.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ */
+struct StatorModule *stator_module_compile_typed(struct StatorContext *ctx,
+                                                 const char *source,
+                                                 size_t source_len,
+                                                 enum StatorModuleType source_type);
 
 /**
  * Return a null-terminated error message if `script` compiled with an error.
@@ -2550,6 +2587,17 @@ bool stator_module_get_request(const struct StatorModule *module,
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 enum StatorModuleStatus stator_module_get_status(const struct StatorModule *module);
+
+/**
+ * Return the source kind metadata recorded on `module`.
+ *
+ * Null module pointers report JavaScript so embedders can treat legacy/default
+ * paths as JavaScript-compatible.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+enum StatorModuleType stator_module_get_type(const struct StatorModule *module);
 
 /**
  * Link a compiled module graph by resolving all static import/re-export requests.
