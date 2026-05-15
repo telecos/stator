@@ -4551,6 +4551,54 @@ fn missing_export_error(specifier: &str, name: &str) -> stator_jse::error::Stato
     ))
 }
 
+fn module_cell_for_binding(binding: &str) -> i32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in binding.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    (hash & 0x3fff_ffff) as i32
+}
+
+fn module_cell_key(specifier: &str, binding: &str) -> String {
+    format!("__mod:{specifier}:{}", module_cell_for_binding(binding))
+}
+
+fn requested_export_name(export: &RequestedExport) -> Option<&str> {
+    match export {
+        RequestedExport::Default => Some("default"),
+        RequestedExport::Named(name) => Some(name),
+        RequestedExport::Namespace | RequestedExport::Star => None,
+    }
+}
+
+fn uninitialized_module_binding_error(binding: &str) -> stator_jse::error::StatorError {
+    stator_jse::error::StatorError::ReferenceError(format!(
+        "Cannot access imported binding '{binding}' before initialization"
+    ))
+}
+
+fn sync_module_request_bindings(
+    request: &StatorModuleRequest,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Result<(), stator_jse::error::StatorError> {
+    let specifier = request.specifier.to_string_lossy();
+    for import in &request.imports {
+        let Some(binding) = requested_export_name(import) else {
+            continue;
+        };
+        let export_key = module_cell_key("", binding);
+        let value = global_env
+            .borrow()
+            .get(&export_key)
+            .cloned()
+            .ok_or_else(|| uninitialized_module_binding_error(binding))?;
+        let import_key = module_cell_key(&specifier, binding);
+        global_env.borrow_mut().insert(import_key, value);
+    }
+    Ok(())
+}
+
 /// Walk the linked module graph rooted at `root` and ensure every static
 /// `import`/`export … from` references a binding the source module actually
 /// exports. Cycles are tracked via `validated`. Star re-exports are followed
@@ -4649,80 +4697,12 @@ pub unsafe extern "C" fn stator_module_instantiate(
     }
 }
 
-/// Link and evaluate a dependency-free compiled module.
-///
-/// This is the first module-runtime slice: it drives the module record through
-/// `Unlinked -> Linking -> Linked -> Evaluating -> Evaluated` and runs modules
-/// that do not need host import resolution. On success it returns the top-level
-/// completion value as a new [`StatorValue`]. On failure it returns null,
-/// stores the error on `module`, and publishes a pending exception on `ctx`
-/// when a context is supplied.
-///
-/// Modules with static imports or re-exports currently fail with an internal
-/// error, even after successful [`stator_module_instantiate`], because runtime
-/// live binding and namespace object wiring is not implemented yet.
-///
-/// # Safety
-/// - `module` must be a non-null pointer returned by [`stator_module_compile`].
-/// - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
-///   case an empty global environment is used).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn stator_module_evaluate(
-    module: *mut StatorModule,
+unsafe fn run_module_bytecodes(
     ctx: *mut StatorContext,
-) -> *mut StatorValue {
-    if module.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: caller guarantees `module` is valid.
-    let module_ref = unsafe { &mut *module };
-    let bytecodes = match &module_ref.bytecodes {
-        Some(bytecodes) => Rc::clone(bytecodes),
-        None => return std::ptr::null_mut(),
-    };
-
-    match module_ref.status {
-        StatorModuleStatus::StatorModuleStatusEvaluated => {
-            return match &module_ref.last_result {
-                Some(result) => unsafe { module_result_to_value(ctx, result) },
-                None => unsafe { module_result_to_value(ctx, &JsValue::Undefined) },
-            };
-        }
-        StatorModuleStatus::StatorModuleStatusErrored => return std::ptr::null_mut(),
-        StatorModuleStatus::StatorModuleStatusEvaluating
-        | StatorModuleStatus::StatorModuleStatusLinking => {
-            let error =
-                stator_jse::error::StatorError::Internal("module is already active".to_string());
-            // SAFETY: `module_ref` and `ctx` are valid for this call.
-            unsafe { set_module_error(module_ref, ctx, &error) };
-            return std::ptr::null_mut();
-        }
-        StatorModuleStatus::StatorModuleStatusUnlinked
-        | StatorModuleStatus::StatorModuleStatusLinked => {}
-    }
-
-    if module_ref.has_dependencies {
-        let error = stator_jse::error::StatorError::Internal(
-            "module evaluation requires host import resolution".to_string(),
-        );
-        // SAFETY: `module_ref` and `ctx` are valid for this call.
-        unsafe { set_module_error(module_ref, ctx, &error) };
-        return std::ptr::null_mut();
-    }
-
-    if unsafe { context_is_execution_terminating(ctx) } {
-        let error =
-            stator_jse::error::StatorError::Internal("script execution terminated".to_string());
-        // SAFETY: `module_ref` and `ctx` are valid for this call.
-        unsafe { set_module_error(module_ref, ctx, &error) };
-        return std::ptr::null_mut();
-    }
-
-    module_ref.status = StatorModuleStatus::StatorModuleStatusLinking;
-    module_ref.status = StatorModuleStatus::StatorModuleStatusLinked;
-    module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluating;
-
-    let _interrupt_scope = InterruptFlagScope::new(ctx);
+    module: *mut StatorModule,
+    bytecodes: Rc<BytecodeArray>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> stator_jse::error::StatorResult<JsValue> {
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };
@@ -4734,15 +4714,8 @@ pub unsafe extern "C" fn stator_module_evaluate(
         }
     }
 
-    let owned_global_env;
-    let global_env = if !ctx.is_null() {
-        // SAFETY: caller guarantees `ctx` is valid.
-        unsafe { &(*ctx).globals }
-    } else {
-        owned_global_env = Rc::new(RefCell::new(GlobalEnv::new()));
-        &owned_global_env
-    };
-
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &*module };
     let module_url = module_ref
         .resource_name
         .as_ref()
@@ -4771,13 +4744,194 @@ pub unsafe extern "C" fn stator_module_evaluate(
         );
         Interpreter::run(&mut frame)
     };
+    result.and_then(module_evaluation_completion)
+}
 
-    match result.and_then(module_evaluation_completion) {
+unsafe fn evaluate_module_graph(
+    ctx: *mut StatorContext,
+    module: *mut StatorModule,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    active: &mut HashSet<*mut StatorModule>,
+) -> stator_jse::error::StatorResult<JsValue> {
+    if module.is_null() {
+        return Err(stator_jse::error::StatorError::Internal(
+            "null module in evaluation graph".to_string(),
+        ));
+    }
+
+    // SAFETY: caller guarantees `module` is valid for this evaluation.
+    let status = unsafe { (*module).status };
+    match status {
+        StatorModuleStatus::StatorModuleStatusEvaluated => {
+            // SAFETY: `module` is valid and evaluated.
+            return Ok(unsafe { (*module).last_result.clone() }.unwrap_or(JsValue::Undefined));
+        }
+        StatorModuleStatus::StatorModuleStatusErrored => {
+            return Err(stator_jse::error::StatorError::Internal(
+                "module has already failed evaluation".to_string(),
+            ));
+        }
+        StatorModuleStatus::StatorModuleStatusEvaluating => {
+            return Err(stator_jse::error::StatorError::ReferenceError(
+                "Cannot access cyclic module before initialization".to_string(),
+            ));
+        }
+        StatorModuleStatus::StatorModuleStatusLinking => {
+            return Err(stator_jse::error::StatorError::Internal(
+                "module is already linking".to_string(),
+            ));
+        }
+        StatorModuleStatus::StatorModuleStatusUnlinked
+        | StatorModuleStatus::StatorModuleStatusLinked => {}
+    }
+
+    if !active.insert(module) {
+        return Err(stator_jse::error::StatorError::ReferenceError(
+            "Cannot access cyclic module before initialization".to_string(),
+        ));
+    }
+
+    // SAFETY: `module` is valid and uniquely driven by this evaluation call.
+    let bytecodes = match unsafe { &*module }.bytecodes.as_ref().map(Rc::clone) {
+        Some(bytecodes) => bytecodes,
+        None => {
+            active.remove(&module);
+            return Err(stator_jse::error::StatorError::Internal(
+                "module has no bytecode".to_string(),
+            ));
+        }
+    };
+
+    // SAFETY: `module` is valid and uniquely driven by this evaluation call.
+    let module_ref = unsafe { &mut *module };
+    if module_ref.has_dependencies
+        && matches!(
+            module_ref.status,
+            StatorModuleStatus::StatorModuleStatusUnlinked
+        )
+    {
+        active.remove(&module);
+        return Err(stator_jse::error::StatorError::Internal(
+            "module evaluation requires host import resolution".to_string(),
+        ));
+    }
+    module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluating;
+
+    let result = (|| {
+        // SAFETY: `module` remains valid throughout evaluation.
+        let request_len = unsafe { (*module).module_requests.len() };
+        for request_idx in 0..request_len {
+            // SAFETY: request index is in bounds and module is valid.
+            let dep = unsafe { (&(*module).module_requests)[request_idx].resolved.get() };
+            if dep.is_null() {
+                return Err(stator_jse::error::StatorError::Internal(
+                    "module evaluation requires host import resolution".to_string(),
+                ));
+            }
+            // SAFETY: dependency pointers are supplied by successful graph instantiation.
+            unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+            // SAFETY: request index is in bounds and module is valid.
+            let request = unsafe { &(&(*module).module_requests)[request_idx] };
+            sync_module_request_bindings(request, global_env)?;
+        }
+        // SAFETY: bytecode and module are valid for this evaluation.
+        unsafe { run_module_bytecodes(ctx, module, bytecodes, global_env) }
+    })();
+
+    active.remove(&module);
+    match result {
         Ok(result) => {
+            // SAFETY: `module` is valid and uniquely driven by this evaluation call.
+            let module_ref = unsafe { &mut *module };
             module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluated;
             module_ref.last_result = Some(result.clone());
             module_ref.error = None;
             module_ref.error_kind = StatorMessageKind::StatorMessageKindUnknown;
+            Ok(result)
+        }
+        Err(error) => {
+            // SAFETY: `module` is valid and uniquely driven by this evaluation call.
+            let module_ref = unsafe { &mut *module };
+            // SAFETY: `module_ref` and `ctx` are valid for this call.
+            unsafe { set_module_error(module_ref, ctx, &error) };
+            Err(error)
+        }
+    }
+}
+
+/// Link and evaluate a compiled module.
+///
+/// This module-runtime slice drives the module record through
+/// `Unlinked -> Linking -> Linked -> Evaluating -> Evaluated`. On success it
+/// returns the top-level completion value as a new [`StatorValue`]. On failure
+/// it returns null, stores the error on `module`, and publishes a pending
+/// exception on `ctx` when a context is supplied.
+///
+/// For linked module graphs, dependencies are evaluated depth-first and simple
+/// named/default import cells are copied from dependency exports before the
+/// importing module runs. Namespace objects and TLA remain incomplete.
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by [`stator_module_compile`].
+/// - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+///   case an empty global environment is used).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_evaluate(
+    module: *mut StatorModule,
+    ctx: *mut StatorContext,
+) -> *mut StatorValue {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let status = unsafe { (*module).status };
+    match status {
+        StatorModuleStatus::StatorModuleStatusEvaluated => {
+            // SAFETY: caller guarantees `module` is valid.
+            let module_ref = unsafe { &*module };
+            return match &module_ref.last_result {
+                Some(result) => unsafe { module_result_to_value(ctx, result) },
+                None => unsafe { module_result_to_value(ctx, &JsValue::Undefined) },
+            };
+        }
+        StatorModuleStatus::StatorModuleStatusErrored => return std::ptr::null_mut(),
+        StatorModuleStatus::StatorModuleStatusEvaluating
+        | StatorModuleStatus::StatorModuleStatusLinking => {
+            let error =
+                stator_jse::error::StatorError::Internal("module is already active".to_string());
+            // SAFETY: caller guarantees `module` is valid.
+            let module_ref = unsafe { &mut *module };
+            // SAFETY: `module_ref` and `ctx` are valid for this call.
+            unsafe { set_module_error(module_ref, ctx, &error) };
+            return std::ptr::null_mut();
+        }
+        StatorModuleStatus::StatorModuleStatusUnlinked
+        | StatorModuleStatus::StatorModuleStatusLinked => {}
+    }
+
+    if unsafe { context_is_execution_terminating(ctx) } {
+        let error =
+            stator_jse::error::StatorError::Internal("script execution terminated".to_string());
+        // SAFETY: caller guarantees `module` is valid.
+        let module_ref = unsafe { &mut *module };
+        // SAFETY: `module_ref` and `ctx` are valid for this call.
+        unsafe { set_module_error(module_ref, ctx, &error) };
+        return std::ptr::null_mut();
+    }
+
+    let _interrupt_scope = InterruptFlagScope::new(ctx);
+    let owned_global_env;
+    let global_env = if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        unsafe { &(*ctx).globals }
+    } else {
+        owned_global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+        &owned_global_env
+    };
+
+    let mut active = HashSet::new();
+    match unsafe { evaluate_module_graph(ctx, module, global_env, &mut active) } {
+        Ok(result) => {
             if !ctx.is_null() {
                 // SAFETY: `ctx` is valid and owns a stable isolate pointer.
                 unsafe { discard_pending_exception((*ctx)._isolate) };
@@ -4786,6 +4940,8 @@ pub unsafe extern "C" fn stator_module_evaluate(
             unsafe { module_result_to_value(ctx, &result) }
         }
         Err(error) => {
+            // SAFETY: caller guarantees `module` is valid.
+            let module_ref = unsafe { &mut *module };
             // SAFETY: `module_ref` and `ctx` are valid for this call.
             unsafe { set_module_error(module_ref, ctx, &error) };
             std::ptr::null_mut()
@@ -12599,7 +12755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_module_evaluate_blocks_static_dependencies() {
+    fn test_module_evaluate_blocks_unlinked_static_dependencies() {
         let module = compile_module_src("import value from 'dep'; value;");
         assert!(!module.is_null());
         // SAFETY: `module` is non-null and live; null context is documented.
@@ -12620,6 +12776,134 @@ mod tests {
                 .unwrap();
             assert!(err.contains("host import resolution"));
             stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_named_import_reads_exported_const() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { value } from './dep.js'; value + 1;");
+        let dep = compile_module_src("export const value = 41;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 42.0);
+            assert_eq!(
+                stator_module_get_status(dep),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_default_import_reads_default_expression() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import answer from './dep.js'; answer + 1;");
+        let dep = compile_module_src("export default 41;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_exported_let_update_remains_pending() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { counter } from './dep.js'; counter;");
+        let dep = compile_module_src("export let counter = 0; counter = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            // Current bytecode only stores the declaration initializer into the
+            // module cell; subsequent local assignments do not update it yet.
+            assert_eq!(stator_value_to_number(result), 0.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
         }
     }
 
@@ -12998,18 +13282,14 @@ mod tests {
                 StatorModuleStatus::StatorModuleStatusLinked
             );
 
-            // Linking succeeds, but evaluation of dependency-bearing modules is
-            // intentionally fail-closed until runtime live bindings land.
             let result = stator_module_evaluate(root, ctx);
-            assert!(result.is_null());
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 1.0);
             assert_eq!(
                 stator_module_error_kind(root),
-                StatorMessageKind::StatorMessageKindInternal
+                StatorMessageKind::StatorMessageKindUnknown
             );
-            let err = CStr::from_ptr(stator_module_get_error(root))
-                .to_str()
-                .unwrap();
-            assert!(err.contains("host import resolution"));
+            stator_value_destroy(result);
             stator_module_free(root);
             stator_module_free(dep);
             stator_module_free(ns);
@@ -13156,7 +13436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_module_instantiate_cyclic_import_bindings_link_without_tdz_evaluation() {
+    fn test_module_evaluate_cyclic_import_bindings_fail_closed_with_reference_error() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
@@ -13192,10 +13472,14 @@ mod tests {
             );
             let result = stator_module_evaluate(root, ctx);
             assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindReference
+            );
             let err = CStr::from_ptr(stator_module_get_error(root))
                 .to_str()
                 .unwrap();
-            assert!(err.contains("host import resolution"));
+            assert!(err.contains("cyclic module"));
             stator_module_free(root);
             stator_module_free(dep);
             stator_context_destroy(ctx);

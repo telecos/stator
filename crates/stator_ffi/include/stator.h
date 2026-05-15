@@ -2963,18 +2963,17 @@ enum StatorModuleType stator_module_get_type(const struct StatorModule *module);
 bool stator_module_instantiate(struct StatorContext *ctx, struct StatorModule *module);
 
 /**
- * Link and evaluate a dependency-free compiled module.
+ * Link and evaluate a compiled module.
  *
- * This is the first module-runtime slice: it drives the module record through
- * `Unlinked -> Linking -> Linked -> Evaluating -> Evaluated` and runs modules
- * that do not need host import resolution. On success it returns the top-level
- * completion value as a new [`StatorValue`]. On failure it returns null,
- * stores the error on `module`, and publishes a pending exception on `ctx`
- * when a context is supplied.
+ * This module-runtime slice drives the module record through
+ * `Unlinked -> Linking -> Linked -> Evaluating -> Evaluated`. On success it
+ * returns the top-level completion value as a new [`StatorValue`]. On failure
+ * it returns null, stores the error on `module`, and publishes a pending
+ * exception on `ctx` when a context is supplied.
  *
- * Modules with static imports or re-exports currently fail with an internal
- * error, even after successful [`stator_module_instantiate`], because runtime
- * live binding and namespace object wiring is not implemented yet.
+ * For linked module graphs, dependencies are evaluated depth-first and simple
+ * named/default import cells are copied from dependency exports before the
+ * importing module runs. Namespace objects and TLA remain incomplete.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by [`stator_module_compile`].

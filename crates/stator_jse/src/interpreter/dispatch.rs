@@ -8292,9 +8292,9 @@ fn handle_define_private_brand(
 /// entry at `module_request_idx` holds the source module specifier string,
 /// and `cell_idx` identifies the binding cell within that module.
 ///
-/// Since full module linking is not yet wired up, module variables are
-/// backed by the shared global environment keyed as
-/// `__mod:{specifier}:{cell}`.
+/// Module variables are backed by the shared global environment keyed as
+/// `__mod:{specifier}:{cell}`. Missing cells throw so unsupported cycles fail
+/// closed instead of silently producing `undefined`.
 #[cold]
 fn handle_lda_module_variable(
     ctx: &mut DispatchContext,
@@ -8321,7 +8321,11 @@ fn handle_lda_module_variable(
         .borrow()
         .get(&key)
         .cloned()
-        .unwrap_or(JsValue::Undefined);
+        .ok_or_else(|| {
+            StatorError::ReferenceError(format!(
+                "Cannot access module binding key '{key}' before initialization"
+            ))
+        })?;
     Ok(DispatchAction::Continue)
 }
 

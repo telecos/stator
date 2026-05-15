@@ -268,8 +268,6 @@ struct FunctionCompiler {
     /// that parameterise [`Opcode::LdaModuleVariable`] and
     /// [`Opcode::StaModuleVariable`].
     module_variables: HashMap<String, (u32, i32)>,
-    /// Counter for assigning unique cell indices to module variable bindings.
-    next_module_cell: i32,
     /// `true` when the expression currently being compiled is in tail
     /// position (i.e. its value is immediately returned).  Set by
     /// [`compile_return`] and consumed by [`compile_call`] /
@@ -353,7 +351,6 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
-            next_module_cell: 0,
             in_tail_position: false,
             is_strict: false,
             using_vars: vec![Vec::new()],
@@ -2500,7 +2497,6 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
-            next_module_cell: 0,
             in_tail_position: false,
             is_strict: true,
             using_vars: vec![Vec::new()],
@@ -6761,6 +6757,28 @@ impl FunctionCompiler {
 
     // ── Module compilation ───────────────────────────────────────────────────
 
+    /// Return the stable module-cell index for a binding name.
+    fn module_cell_for_binding(binding: &str) -> i32 {
+        let mut hash = 0x811c_9dc5u32;
+        for byte in binding.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        (hash & 0x3fff_ffff) as i32
+    }
+
+    fn module_specifier_value(specifier: &str) -> &str {
+        let bytes = specifier.as_bytes();
+        if bytes.len() >= 2
+            && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+                || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+        {
+            &specifier[1..specifier.len() - 1]
+        } else {
+            specifier
+        }
+    }
+
     /// Allocate (or retrieve) a module variable entry for the given binding.
     ///
     /// Returns `(module_request_idx, cell_idx)` where `module_request_idx` is
@@ -6772,8 +6790,7 @@ impl FunctionCompiler {
             return pair;
         }
         let module_request_idx = self.add_string(source);
-        let cell_idx = self.next_module_cell;
-        self.next_module_cell += 1;
+        let cell_idx = Self::module_cell_for_binding(binding);
         self.module_variables
             .insert(key, (module_request_idx, cell_idx));
         (module_request_idx, cell_idx)
@@ -6784,7 +6801,7 @@ impl FunctionCompiler {
     /// For each specifier, creates a module variable binding so that
     /// subsequent identifier references emit [`Opcode::LdaModuleVariable`].
     fn compile_import_decl(&mut self, decl: &crate::parser::ast::ImportDecl) -> StatorResult<()> {
-        let source = &decl.source.value;
+        let source = Self::module_specifier_value(&decl.source.value);
         for spec in &decl.specifiers {
             match spec {
                 ImportSpecifier::Named(named) => {
@@ -6857,8 +6874,10 @@ impl FunctionCompiler {
                     ModuleExportName::Ident(id) => id.name.as_str(),
                     ModuleExportName::Str(s) => s.value.as_str(),
                 };
-                let (req_idx, cell) =
-                    self.get_or_create_module_variable(&source.value, imported_name);
+                let (req_idx, cell) = self.get_or_create_module_variable(
+                    Self::module_specifier_value(&source.value),
+                    imported_name,
+                );
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaModuleVariable,
                     vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
@@ -6923,7 +6942,7 @@ impl FunctionCompiler {
 
     /// Compile an `export * [as name] from "source"` declaration.
     fn compile_export_all(&mut self, decl: &crate::parser::ast::ExportAllDecl) -> StatorResult<()> {
-        let req_idx = self.add_string(&decl.source.value);
+        let req_idx = self.add_string(Self::module_specifier_value(&decl.source.value));
         self.emit(Instruction::new_unchecked(
             Opcode::GetModuleNamespace,
             vec![Operand::ConstantPoolIdx(req_idx)],
