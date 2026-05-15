@@ -268,6 +268,11 @@ struct FunctionCompiler {
     /// that parameterise [`Opcode::LdaModuleVariable`] and
     /// [`Opcode::StaModuleVariable`].
     module_variables: HashMap<String, (u32, i32)>,
+    /// Local binding names directly exported by this module.
+    ///
+    /// Assignments to these names write through to the corresponding module
+    /// cell so later import binding snapshots observe the final exported value.
+    exported_module_bindings: HashSet<String>,
     /// `true` when the expression currently being compiled is in tail
     /// position (i.e. its value is immediately returned).  Set by
     /// [`compile_return`] and consumed by [`compile_call`] /
@@ -351,6 +356,7 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
+            exported_module_bindings: HashSet::new(),
             in_tail_position: false,
             is_strict: false,
             using_vars: vec![Vec::new()],
@@ -1653,7 +1659,7 @@ impl FunctionCompiler {
                     }
                     self.compile_ident_store(&ident.name)?;
                     Ok(None)
-                } else if self.is_program && is_var {
+                } else if self.is_program && is_var && !self.is_module {
                     // Program-level `var`: store exclusively via StaGlobal
                     // so that nested callbacks (which also use StaGlobal /
                     // LdaGlobal) share the same storage.  Without this,
@@ -2497,6 +2503,7 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
+            exported_module_bindings: HashSet::new(),
             in_tail_position: false,
             is_strict: true,
             using_vars: vec![Vec::new()],
@@ -3580,6 +3587,7 @@ impl FunctionCompiler {
                 Opcode::StaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(slot)],
             ));
+            self.emit_exported_module_write_through(name);
             return Ok(());
         }
         // Context bindings: outer function writing its own captured variable.
@@ -3588,6 +3596,7 @@ impl FunctionCompiler {
                 Opcode::StaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(slot)],
             ));
+            self.emit_exported_module_write_through(name);
             return Ok(());
         }
         if let Some(binding) = self.lookup_var(name) {
@@ -3614,6 +3623,7 @@ impl FunctionCompiler {
             } else {
                 self.emit_star(binding.reg);
             }
+            self.emit_exported_module_write_through(name);
         } else {
             let name_idx = self.add_string(name);
             if self.with_depth > 0 {
@@ -3628,8 +3638,20 @@ impl FunctionCompiler {
                     vec![Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
+            self.emit_exported_module_write_through(name);
         }
         Ok(())
+    }
+
+    fn emit_exported_module_write_through(&mut self, name: &str) {
+        if !self.is_module || !self.exported_module_bindings.contains(name) {
+            return;
+        }
+        let (req_idx, cell) = self.get_or_create_module_variable("", name);
+        self.emit(Instruction::new_unchecked(
+            Opcode::StaModuleVariable,
+            vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+        ));
     }
 
     /// Compile a unary expression.
@@ -6815,7 +6837,7 @@ impl FunctionCompiler {
                         Opcode::LdaModuleVariable,
                         vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
                     ));
-                    let reg = self.define_local(&named.local.name);
+                    let reg = self.define_const_local(&named.local.name);
                     self.emit_star(reg);
                 }
                 ImportSpecifier::Default(def) => {
@@ -6824,7 +6846,7 @@ impl FunctionCompiler {
                         Opcode::LdaModuleVariable,
                         vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
                     ));
-                    let reg = self.define_local(&def.local.name);
+                    let reg = self.define_const_local(&def.local.name);
                     self.emit_star(reg);
                 }
                 ImportSpecifier::Namespace(ns) => {
@@ -6833,7 +6855,7 @@ impl FunctionCompiler {
                         Opcode::GetModuleNamespace,
                         vec![Operand::ConstantPoolIdx(req_idx)],
                     ));
-                    let reg = self.define_local(&ns.local.name);
+                    let reg = self.define_const_local(&ns.local.name);
                     self.emit_star(reg);
                 }
             }
@@ -7013,6 +7035,27 @@ impl FunctionCompiler {
             Stmt::ClassDecl(decl) => decl.id.iter().map(|id| id.name.clone()).collect(),
             _ => vec![],
         }
+    }
+
+    fn local_export_names(program: &Program) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for item in &program.body {
+            let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) = item else {
+                continue;
+            };
+            if decl.source.is_some() {
+                continue;
+            }
+            for spec in &decl.specifiers {
+                if let ModuleExportName::Ident(id) = &spec.local {
+                    names.insert(id.name.clone());
+                }
+            }
+            if let Some(stmt) = &decl.declaration {
+                names.extend(Self::declared_names(stmt));
+            }
+        }
+        names
     }
 
     // ── Finalization ─────────────────────────────────────────────────────────
@@ -8372,6 +8415,9 @@ impl BytecodeGenerator {
         compiler.is_program = true;
         let is_module = program.source_type == SourceType::Module;
         compiler.is_module = is_module;
+        if is_module {
+            compiler.exported_module_bindings = FunctionCompiler::local_export_names(program);
+        }
         // Modules are always strict; scripts inherit the AST flag.
         compiler.is_strict = program.is_strict || is_module;
         // Modules implicitly support top-level `await` (ES2022).
@@ -8393,8 +8439,13 @@ impl BytecodeGenerator {
             .collect();
         let stmts_owned: Vec<Stmt> = top_stmts.iter().map(|s| (*s).clone()).collect();
 
-        // Hoist `var` declarations into the global env (set to undefined).
-        compiler.hoist_var_declarations_global(&stmts_owned);
+        // Hoist `var` declarations. Scripts use the global env; modules keep
+        // top-level `var` module-scoped so exports can write through cells.
+        if is_module {
+            compiler.hoist_var_declarations(&stmts_owned);
+        } else {
+            compiler.hoist_var_declarations_global(&stmts_owned);
+        }
 
         // Annex B: in non-strict mode, function declarations
         // inside blocks also hoist as var-like globals.
@@ -11480,6 +11531,44 @@ mod tests {
         assert!(
             sta_count >= 1,
             "export let must emit at least one StaModuleVariable for live binding"
+        );
+    }
+
+    #[test]
+    fn test_exported_let_assignment_emits_write_through_store() {
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget, ExportNamedDecl, ModuleDecl};
+
+        let prog = module_program(vec![
+            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(ExportNamedDecl {
+                loc: span(),
+                specifiers: vec![],
+                source: None,
+                declaration: Some(Box::new(var_decl_stmt(
+                    VarKind::Let,
+                    "counter",
+                    Some(num_expr(0.0)),
+                ))),
+                attributes: vec![],
+            })),
+            ProgramItem::Stmt(Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::Assign,
+                    left: AssignTarget::Expr(Box::new(ident_expr("counter"))),
+                    right: Box::new(num_expr(1.0)),
+                }))),
+            })),
+        ]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        let sta_count = instrs
+            .iter()
+            .filter(|i| i.opcode == Opcode::StaModuleVariable)
+            .count();
+        assert_eq!(
+            sta_count, 2,
+            "exported let initializer and later assignment must both store module cells"
         );
     }
 
