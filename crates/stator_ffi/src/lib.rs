@@ -38,7 +38,10 @@ use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::PropertyMap;
 use stator_jse::objects::value::{JsValue, NativeFn};
 use stator_jse::parser;
-use stator_jse::parser::ast::{ImportAttribute, ModuleDecl, Program, ProgramItem};
+use stator_jse::parser::ast::{
+    ImportAttribute, ImportSpecifier, ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program,
+    ProgramItem, Stmt,
+};
 use stator_jse::wasm::{
     HostFunc, HostFuncCallback, HostVal, HostValKind, WasmEngine, WasmInstance, WasmModule,
 };
@@ -2452,6 +2455,12 @@ pub struct StatorModule {
     has_dependencies: bool,
     /// Static import and re-export requests in source order.
     module_requests: Vec<StatorModuleRequest>,
+    /// Names directly exported by this module's source (including `default`
+    /// when an explicit default export is present, and aliases introduced by
+    /// `export { local as exported }` / `export * as ns from "..."`). This is
+    /// used by the link-time validator to detect missing imports/re-exports
+    /// without requiring a full live-binding evaluator.
+    direct_exports: HashSet<String>,
     /// Link/evaluation status for this module record.
     status: StatorModuleStatus,
     /// Last successful evaluation result.
@@ -2482,6 +2491,30 @@ struct StatorModuleRequest {
     specifier: CString,
     _attributes_storage: Vec<StatorModuleRequestAttribute>,
     attributes: Vec<StatorImportAttribute>,
+    /// Names this request expects from the resolved module. Used by the
+    /// link-time validator to fail with `SyntaxError` when an imported or
+    /// re-exported binding is missing from the source module.
+    imports: Vec<RequestedExport>,
+    /// Module pointer returned by the host resolver during link, or null
+    /// before the request has been resolved. Borrowed (not owned).
+    resolved: Cell<*mut StatorModule>,
+}
+
+/// A single binding requested from a dependency module.
+#[derive(Debug, Clone)]
+enum RequestedExport {
+    /// Default import or `export { default as ... } from "..."`.
+    Default,
+    /// Named import / re-export of `name`.
+    Named(String),
+    /// Namespace import (`import * as ns`) or namespace re-export
+    /// (`export * as ns from "..."`). Always satisfied; the namespace object
+    /// itself is built at evaluation time.
+    Namespace,
+    /// `export * from "..."` — bare star re-export. Pulls all non-default
+    /// exports of the source through, but never fails name validation on
+    /// its own.
+    Star,
 }
 
 struct StatorModuleRequestAttribute {
@@ -2774,6 +2807,7 @@ fn module_request_specifier_value(specifier: &str) -> &str {
 fn module_request_for(
     specifier: &str,
     attributes: &[ImportAttribute],
+    imports: Vec<RequestedExport>,
 ) -> Option<StatorModuleRequest> {
     let specifier = CString::new(module_request_specifier_value(specifier)).ok()?;
     let attributes_storage = module_request_attributes(attributes);
@@ -2790,27 +2824,133 @@ fn module_request_for(
         specifier,
         _attributes_storage: attributes_storage,
         attributes,
+        imports,
+        resolved: Cell::new(std::ptr::null_mut()),
     })
 }
 
-fn collect_module_requests(program: &Program) -> Vec<StatorModuleRequest> {
-    program
-        .body
-        .iter()
-        .filter_map(|item| match item {
+fn module_export_name_str(name: &ModuleExportName) -> &str {
+    match name {
+        ModuleExportName::Ident(id) => &id.name,
+        ModuleExportName::Str(s) => &s.value,
+    }
+}
+
+fn collect_pat_names(pat: &Pat, names: &mut HashSet<String>) {
+    match pat {
+        Pat::Ident(id) => {
+            names.insert(id.name.clone());
+        }
+        Pat::Array(arr) => {
+            for p in arr.elements.iter().flatten() {
+                collect_pat_names(p, names);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.properties {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => collect_pat_names(&kv.value, names),
+                    ObjectPatProp::Assign(a) => {
+                        names.insert(a.key.name.clone());
+                    }
+                    ObjectPatProp::Rest(r) => collect_pat_names(&r.argument, names),
+                }
+            }
+        }
+        Pat::Rest(r) => collect_pat_names(&r.argument, names),
+        Pat::Assign(a) => collect_pat_names(&a.left, names),
+        Pat::Expr(_) => {}
+    }
+}
+
+fn collect_decl_export_names(stmt: &Stmt, exports: &mut HashSet<String>) {
+    match stmt {
+        Stmt::VarDecl(v) => {
+            for d in &v.declarators {
+                collect_pat_names(&d.id, exports);
+            }
+        }
+        Stmt::FnDecl(f) => {
+            if let Some(id) = &f.id {
+                exports.insert(id.name.clone());
+            }
+        }
+        Stmt::ClassDecl(c) => {
+            if let Some(id) = &c.id {
+                exports.insert(id.name.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_module_requests(program: &Program) -> (Vec<StatorModuleRequest>, HashSet<String>) {
+    let mut requests = Vec::new();
+    let mut exports: HashSet<String> = HashSet::new();
+    for item in &program.body {
+        match item {
             ProgramItem::ModuleDecl(ModuleDecl::Import(decl)) => {
-                module_request_for(&decl.source.value, &decl.attributes)
+                let imports: Vec<RequestedExport> = decl
+                    .specifiers
+                    .iter()
+                    .map(|spec| match spec {
+                        ImportSpecifier::Named(n) => {
+                            RequestedExport::Named(module_export_name_str(&n.imported).to_string())
+                        }
+                        ImportSpecifier::Default(_) => RequestedExport::Default,
+                        ImportSpecifier::Namespace(_) => RequestedExport::Namespace,
+                    })
+                    .collect();
+                if let Some(req) = module_request_for(&decl.source.value, &decl.attributes, imports)
+                {
+                    requests.push(req);
+                }
             }
             ProgramItem::ModuleDecl(ModuleDecl::ExportAll(decl)) => {
-                module_request_for(&decl.source.value, &decl.attributes)
+                let imports = if let Some(name) = &decl.exported {
+                    exports.insert(module_export_name_str(name).to_string());
+                    vec![RequestedExport::Namespace]
+                } else {
+                    vec![RequestedExport::Star]
+                };
+                if let Some(req) = module_request_for(&decl.source.value, &decl.attributes, imports)
+                {
+                    requests.push(req);
+                }
             }
-            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) => decl
-                .source
-                .as_ref()
-                .and_then(|source| module_request_for(&source.value, &decl.attributes)),
-            ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(_)) | ProgramItem::Stmt(_) => None,
-        })
-        .collect()
+            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) => {
+                if let Some(source) = &decl.source {
+                    let mut imports = Vec::new();
+                    for spec in &decl.specifiers {
+                        let local = module_export_name_str(&spec.local).to_string();
+                        let exported = module_export_name_str(&spec.exported).to_string();
+                        imports.push(if local == "default" {
+                            RequestedExport::Default
+                        } else {
+                            RequestedExport::Named(local)
+                        });
+                        exports.insert(exported);
+                    }
+                    if let Some(req) = module_request_for(&source.value, &decl.attributes, imports)
+                    {
+                        requests.push(req);
+                    }
+                } else {
+                    for spec in &decl.specifiers {
+                        exports.insert(module_export_name_str(&spec.exported).to_string());
+                    }
+                    if let Some(stmt) = &decl.declaration {
+                        collect_decl_export_names(stmt, &mut exports);
+                    }
+                }
+            }
+            ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(_)) => {
+                exports.insert("default".to_string());
+            }
+            ProgramItem::Stmt(_) => {}
+        }
+    }
+    (requests, exports)
 }
 
 fn module_rejection_to_error(reason: JsValue) -> stator_jse::error::StatorError {
@@ -2946,6 +3086,7 @@ unsafe fn compile_module_source(
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
+            direct_exports: HashSet::new(),
             status: StatorModuleStatus::StatorModuleStatusErrored,
             last_result: None,
             error: Some(c"null source pointer".into()),
@@ -2972,6 +3113,7 @@ unsafe fn compile_module_source(
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
+                direct_exports: HashSet::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
                 last_result: None,
                 error: Some(c"source is not valid UTF-8".into()),
@@ -3001,6 +3143,7 @@ unsafe fn compile_module_source(
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
+            direct_exports: HashSet::new(),
             status: StatorModuleStatus::StatorModuleStatusErrored,
             last_result: None,
             error: Some(
@@ -3022,30 +3165,33 @@ unsafe fn compile_module_source(
 
     let result = parser::parse_module(src).and_then(|program| {
         let has_dependencies = program_has_module_dependencies(&program);
-        let module_requests = collect_module_requests(&program);
+        let (module_requests, direct_exports) = collect_module_requests(&program);
         BytecodeGenerator::compile_program(&program)
-            .map(|bytecodes| (bytecodes, has_dependencies, module_requests))
+            .map(|bytecodes| (bytecodes, has_dependencies, module_requests, direct_exports))
     });
 
     let module = match result {
-        Ok((bytecodes, has_dependencies, module_requests)) => Box::new(StatorModule {
-            bytecodes: Some(Rc::new(bytecodes)),
-            source_type,
-            has_dependencies,
-            module_requests,
-            status: StatorModuleStatus::StatorModuleStatusUnlinked,
-            last_result: None,
-            error: None,
-            error_kind: StatorMessageKind::StatorMessageKindUnknown,
-            resource_name: None,
-            resource_line_offset: 0,
-            resource_column_offset: 0,
-            base_url: None,
-            integrity_metadata: None,
-            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
-            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
-            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
-        }),
+        Ok((bytecodes, has_dependencies, module_requests, direct_exports)) => {
+            Box::new(StatorModule {
+                bytecodes: Some(Rc::new(bytecodes)),
+                source_type,
+                has_dependencies,
+                module_requests,
+                direct_exports,
+                status: StatorModuleStatus::StatorModuleStatusUnlinked,
+                last_result: None,
+                error: None,
+                error_kind: StatorMessageKind::StatorMessageKindUnknown,
+                resource_name: None,
+                resource_line_offset: 0,
+                resource_column_offset: 0,
+                base_url: None,
+                integrity_metadata: None,
+                credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+                referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+                parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            })
+        }
         Err(e) => {
             let msg = e.to_string();
             let cstring = CString::new(msg).unwrap_or_else(|_| c"module compilation error".into());
@@ -3054,6 +3200,7 @@ unsafe fn compile_module_source(
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
+                direct_exports: HashSet::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
                 last_result: None,
                 error: Some(cstring),
@@ -4353,10 +4500,103 @@ unsafe fn instantiate_module_graph(
             set_module_link_error(module_ref, &error);
             return Err(error);
         }
+        request.resolved.set(out_module);
     }
 
     module_ref.status = StatorModuleStatus::StatorModuleStatusLinked;
     visiting.remove(&module);
+    Ok(())
+}
+
+/// Returns true if `dep` directly or transitively (via `export *` re-exports)
+/// exposes an export named `name`. Default exports are never propagated through
+/// bare star re-exports, matching ECMAScript module semantics.
+///
+/// # Safety
+/// `dep` must be a non-null pointer to a live, linked module record.
+unsafe fn dep_has_export(dep: *mut StatorModule, name: &str) -> bool {
+    let mut visited: HashSet<*mut StatorModule> = HashSet::new();
+    unsafe { dep_has_export_inner(dep, name, &mut visited) }
+}
+
+unsafe fn dep_has_export_inner(
+    dep: *mut StatorModule,
+    name: &str,
+    visited: &mut HashSet<*mut StatorModule>,
+) -> bool {
+    if dep.is_null() || !visited.insert(dep) {
+        return false;
+    }
+    // SAFETY: caller guarantees `dep` is a live module pointer.
+    let module = unsafe { &*dep };
+    if module.direct_exports.contains(name) {
+        return true;
+    }
+    if name == "default" {
+        return false;
+    }
+    for request in &module.module_requests {
+        if matches!(request.imports.first(), Some(RequestedExport::Star))
+            && unsafe { dep_has_export_inner(request.resolved.get(), name, visited) }
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn missing_export_error(specifier: &str, name: &str) -> stator_jse::error::StatorError {
+    stator_jse::error::StatorError::SyntaxError(format!(
+        "module '{specifier}' has no export named '{name}'"
+    ))
+}
+
+/// Walk the linked module graph rooted at `root` and ensure every static
+/// `import`/`export … from` references a binding the source module actually
+/// exports. Cycles are tracked via `validated`. Star re-exports are followed
+/// transitively (ignoring `default`) so that `import { x } from "a"` is
+/// satisfied when `a` does `export * from "b"` and `b` declares `x`.
+///
+/// # Safety
+/// `root` must be a non-null pointer to a live, fully-linked module record.
+/// Each request's `resolved` pointer must be set (this is true after a
+/// successful [`instantiate_module_graph`]).
+unsafe fn validate_module_graph_exports(
+    root: *mut StatorModule,
+    validated: &mut HashSet<*mut StatorModule>,
+) -> Result<(), stator_jse::error::StatorError> {
+    if root.is_null() || !validated.insert(root) {
+        return Ok(());
+    }
+    // SAFETY: caller guarantees `root` is a live module pointer.
+    let module = unsafe { &*root };
+    for request in &module.module_requests {
+        let dep = request.resolved.get();
+        if dep.is_null() {
+            continue;
+        }
+        let specifier = request.specifier.to_string_lossy();
+        for imp in &request.imports {
+            match imp {
+                RequestedExport::Default => {
+                    // SAFETY: `dep` is a live linked module pointer.
+                    let dep_ref = unsafe { &*dep };
+                    if !dep_ref.direct_exports.contains("default") {
+                        return Err(missing_export_error(&specifier, "default"));
+                    }
+                }
+                RequestedExport::Named(name) => {
+                    // SAFETY: `dep` is a live linked module pointer.
+                    if !unsafe { dep_has_export(dep, name) } {
+                        return Err(missing_export_error(&specifier, name));
+                    }
+                }
+                RequestedExport::Namespace | RequestedExport::Star => {}
+            }
+        }
+        // SAFETY: `dep` is a live linked module pointer.
+        unsafe { validate_module_graph_exports(dep, validated)? };
+    }
     Ok(())
 }
 
@@ -4385,7 +4625,20 @@ pub unsafe extern "C" fn stator_module_instantiate(
     }
     let mut visiting = HashSet::new();
     match unsafe { instantiate_module_graph(ctx, module, &mut visiting) } {
-        Ok(()) => true,
+        Ok(()) => {
+            let mut validated = HashSet::new();
+            // SAFETY: `module` is a non-null, fully-linked module record.
+            match unsafe { validate_module_graph_exports(module, &mut validated) } {
+                Ok(()) => true,
+                Err(error) => {
+                    // SAFETY: `module` is non-null and valid by function contract.
+                    let module_ref = unsafe { &mut *module };
+                    // SAFETY: `module_ref` and `ctx` are valid for this call.
+                    unsafe { set_module_error(module_ref, ctx, &error) };
+                    false
+                }
+            }
+        }
         Err(error) => {
             // SAFETY: `module` is non-null and valid by function contract.
             let module_ref = unsafe { &mut *module };
@@ -12945,6 +13198,217 @@ mod tests {
             assert!(err.contains("host import resolution"));
             stator_module_free(root);
             stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    fn run_missing_export_case(root_src: &str, dep_src: &str, expected_substrings: &[&str]) {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(root_src);
+        let dep = compile_module_src(dep_src);
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap()
+                .to_string();
+            for needle in expected_substrings {
+                assert!(
+                    err.contains(needle),
+                    "expected error {err:?} to contain {needle:?}"
+                );
+            }
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_named_import_missing_fails_with_syntax_error() {
+        run_missing_export_case(
+            "import { missing } from './dep.js';",
+            "export const present = 1;",
+            &["./dep.js", "missing"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_default_import_missing_fails_with_syntax_error() {
+        run_missing_export_case(
+            "import x from './dep.js';",
+            "export const named = 1;",
+            &["./dep.js", "default"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_named_reexport_missing_fails_with_syntax_error() {
+        run_missing_export_case(
+            "export { missing } from './dep.js';",
+            "export const present = 1;",
+            &["./dep.js", "missing"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_default_reexport_missing_fails_with_syntax_error() {
+        run_missing_export_case(
+            "export { default as renamed } from './dep.js';",
+            "export const named = 1;",
+            &["./dep.js", "default"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_namespace_import_succeeds_without_specific_names() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import * as ns from './dep.js'; ns;");
+        let dep = compile_module_src("export const x = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_named_import_via_star_reexport_succeeds() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { deep } from './bridge.js'; deep;");
+        let bridge = compile_module_src("export * from './leaf.js';");
+        let leaf = compile_module_src("export const deep = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./bridge.js".to_string(), bridge);
+        modules.insert("./leaf.js".to_string(), leaf);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(bridge);
+            stator_module_free(leaf);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_named_import_default_via_star_reexport_fails() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x } from './bridge.js';");
+        let bridge = compile_module_src("export * from './leaf.js';");
+        // `default` is not propagated through bare star re-exports.
+        let leaf = compile_module_src("export default 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./bridge.js".to_string(), bridge);
+        modules.insert("./leaf.js".to_string(), leaf);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("./bridge.js"), "{err}");
+            assert!(err.contains("'x'"), "{err}");
+            stator_module_free(root);
+            stator_module_free(bridge);
+            stator_module_free(leaf);
             stator_context_destroy(ctx);
         }
     }
