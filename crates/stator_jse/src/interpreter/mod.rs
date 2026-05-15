@@ -3813,6 +3813,17 @@ impl Interpreter {
         Self::run_inner(frame, true)
     }
 
+    /// Publish `env` as the active global environment for this thread.
+    ///
+    /// Embedders that drive bytecode through helpers other than
+    /// [`Self::run_fast`] (notably [`Self::run_module_top_level_async`]) must
+    /// call this before constructing frames so that `CURRENT_GLOBALS` and the
+    /// JIT runtime observe the intended environment.
+    #[inline(always)]
+    pub fn publish_globals(env: &Rc<RefCell<GlobalEnv>>) {
+        Self::publish_fast_globals(env);
+    }
+
     #[inline(always)]
     fn publish_fast_globals(env: &Rc<RefCell<GlobalEnv>>) {
         // Publish globals to JIT runtime (fast TLS pointer check).
@@ -11950,6 +11961,59 @@ impl Interpreter {
                         return Ok(JsValue::Promise(rp));
                     }
                     return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Drive a module top-level (async) bytecode body to completion.
+    ///
+    /// Module bodies are compiled as async functions so that top-level
+    /// `await` (TLA) compiles via the same suspend/resume mechanism as
+    /// regular `await`. Unlike [`Self::run_async_function`] — which silently
+    /// resumes pending awaits with `undefined` to model async function
+    /// fire-and-forget semantics — this driver fails closed when an `await`
+    /// cannot be resolved synchronously, so module evaluation never reports
+    /// a fake successful result while exports remain unset.
+    ///
+    /// On success returns the body's completion value (typically
+    /// `JsValue::Undefined` for module bodies). On a rejected `await` the
+    /// rejection reason flows back through the bytecode as a JavaScript
+    /// throw; if uncaught it becomes a `StatorError`. On a pending `await`
+    /// that does not settle after draining the microtask queue, returns
+    /// `StatorError::TypeError` describing the missing event-loop primitive.
+    pub fn run_module_top_level_async(
+        bytecode_array: Rc<BytecodeArray>,
+        env: &Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<JsValue> {
+        use crate::builtins::promise::MicrotaskQueue;
+
+        Self::publish_globals(env);
+
+        let queue = MicrotaskQueue::new();
+        let state = GeneratorState::new(bytecode_array);
+        let mut input = JsValue::Undefined;
+
+        loop {
+            match Self::run_generator_step(&state, input)? {
+                GeneratorStep::Yield(awaited) => match resolve_promise_like(awaited, &queue) {
+                    AwaitResolution::Fulfilled(value) => input = value,
+                    AwaitResolution::Rejected(reason) => {
+                        state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
+                        input = JsValue::Undefined;
+                    }
+                    AwaitResolution::Pending => {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        return Err(StatorError::TypeError(
+                            "top-level await on a pending promise: Stator's module evaluation \
+                             does not yet drive an event loop"
+                                .into(),
+                        ));
+                    }
+                },
+                GeneratorStep::Return(value) => {
+                    queue.drain();
+                    return Ok(value);
                 }
             }
         }

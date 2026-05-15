@@ -2984,7 +2984,11 @@ fn module_evaluation_completion(result: JsValue) -> stator_jse::error::StatorRes
         JsValue::Promise(promise) => match promise.state() {
             PromiseState::Fulfilled(value) => Ok(value),
             PromiseState::Rejected(reason) => Err(module_rejection_to_error(reason)),
-            PromiseState::Pending => Ok(JsValue::Promise(promise)),
+            PromiseState::Pending => Err(stator_jse::error::StatorError::TypeError(
+                "top-level await on a pending promise: Stator's module evaluation does not yet \
+                 drive an event loop"
+                    .to_string(),
+            )),
         },
         value => Ok(value),
     }
@@ -4962,7 +4966,21 @@ unsafe fn run_module_bytecodes(
     };
     let _host_scope = stator_jse::host::HostScope::install(host_loader, Some(&module_url));
 
-    let result = if global_env.borrow().globals_installed {
+    let module_is_async = bytecodes.is_async();
+    let result = if module_is_async {
+        // Top-level await: drive the module body with the TLA-aware driver
+        // so a pending await fails closed instead of silently resuming
+        // with `undefined` (which would publish bogus exports).
+        if !global_env.borrow().globals_installed {
+            // Ensure builtins are installed exactly as `run_fast` would.
+            let _frame = InterpreterFrame::new_with_globals(
+                Rc::clone(&bytecodes),
+                vec![],
+                Rc::clone(global_env),
+            );
+        }
+        Interpreter::run_module_top_level_async(Rc::clone(&bytecodes), global_env)
+    } else if global_env.borrow().globals_installed {
         Interpreter::run_fast(&bytecodes, &[], global_env)
     } else {
         let mut frame = InterpreterFrame::new_with_globals(
@@ -12740,6 +12758,148 @@ mod tests {
                 stator_module_get_status(module),
                 StatorModuleStatus::StatorModuleStatusUnlinked
             );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_top_level_await_resolved_value() {
+        // `await Promise.resolve(2)` resolves synchronously when microtasks
+        // drain; the module body's completion value is observed by the FFI.
+        let module = compile_module_src("40 + (await Promise.resolve(2));");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live; null context is documented.
+        unsafe {
+            assert!(stator_module_is_async(module));
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(
+                !result.is_null(),
+                "TLA evaluate failed: {}",
+                CStr::from_ptr(stator_module_get_error(module)).to_string_lossy()
+            );
+            assert_eq!(stator_value_to_number(result), 42.0);
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+            stator_value_destroy(result);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_top_level_await_dependency_publishes_resolved_export() {
+        // The dependency uses TLA to compute its export. The importer must
+        // observe the resolved value, not undefined.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x } from './dep.js'; x + 1;");
+        let dep = compile_module_src("export const x = await Promise.resolve(41);");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(
+                !result.is_null(),
+                "TLA dep evaluate failed: {}",
+                CStr::from_ptr(stator_module_get_error(root)).to_string_lossy()
+            );
+            assert_eq!(stator_value_to_number(result), 42.0);
+            assert_eq!(
+                stator_module_get_status(dep),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_top_level_await_rejection_fails_module() {
+        // A rejected awaited promise should propagate as module evaluation
+        // failure with a TypeError classification (matching the rejection
+        // reason's message prefix).
+        let module = compile_module_src("await Promise.reject(new TypeError('boom'));");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(result.is_null(), "rejected TLA must fail evaluation");
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert!(!stator_module_get_error(module).is_null());
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_top_level_await_pending_fails_closed() {
+        // A never-settling await must not pretend success: the FFI fails
+        // closed with a clear classification rather than silently observing
+        // `undefined` for the bound name.
+        let module = compile_module_src("const x = await new Promise(() => {}); export { x };");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(
+                result.is_null(),
+                "pending TLA must fail closed instead of silently succeeding"
+            );
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                err.contains("top-level await"),
+                "error message should mention top-level await; got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_non_tla_module_remains_synchronous() {
+        // A module without `await` must keep its synchronous evaluation
+        // semantics — no spurious Promise wrapping, no fail-closed branch.
+        let module = compile_module_src("export const a = 1; 7;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 7.0);
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+            stator_value_destroy(result);
             stator_module_free(module);
         }
     }
