@@ -12,6 +12,32 @@
 #include <stdlib.h>
 
 /**
+ * Result returned by a host module resolver callback.
+ */
+typedef enum StatorResolveStatus {
+  /**
+   * Resolution succeeded and `out_module` was written.
+   */
+  StatorResolveStatusOk = 0,
+  /**
+   * The specifier was not found by the host.
+   */
+  StatorResolveStatusNotFound = 1,
+  /**
+   * Resolution failed due to an I/O or network-layer problem.
+   */
+  StatorResolveStatusNetworkError = 2,
+  /**
+   * Resolution failed due to invalid specifier/attribute usage.
+   */
+  StatorResolveStatusTypeError = 3,
+  /**
+   * Resolution will complete asynchronously in a future API slice.
+   */
+  StatorResolveStatusPending = 4,
+} StatorResolveStatus;
+
+/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -442,6 +468,14 @@ typedef struct StatorPropertyNames StatorPropertyNames;
 typedef struct StatorScript StatorScript;
 
 /**
+ * Owned UTF-8 string handle used by module resolver out-parameters.
+ *
+ * This first resolver slice only defines the ABI shape; future graph-loading
+ * code will consume values returned through `out_error`.
+ */
+typedef struct StatorString StatorString;
+
+/**
  * An opaque try-catch scope for catching exceptions across the FFI boundary.
  *
  * Mirrors V8's `TryCatch` RAII scope.  While a try-catch scope is active,
@@ -605,6 +639,31 @@ typedef struct StatorTieringStats {
    */
   uint64_t stub_call_counts[24];
 } StatorTieringStats;
+
+/**
+ * A single ECMAScript import attribute passed to a module resolver callback.
+ *
+ * Both `key` and `value` are UTF-8 byte slices and are not required to be
+ * null-terminated. They are only valid for the duration of the callback.
+ */
+typedef struct StatorImportAttribute {
+  /**
+   * Pointer to `key_len` bytes of the attribute key.
+   */
+  const char *key;
+  /**
+   * Number of bytes in `key`.
+   */
+  size_t key_len;
+  /**
+   * Pointer to `value_len` bytes of the attribute value.
+   */
+  const char *value;
+  /**
+   * Number of bytes in `value`.
+   */
+  size_t value_len;
+} StatorImportAttribute;
 
 /**
  * Per-script tiering state visible to embedders.
@@ -991,6 +1050,42 @@ typedef struct StatorEmbedderCallbacks {
    */
   StatorMonotonicTimeFn monotonic_time;
 } StatorEmbedderCallbacks;
+
+/**
+ * Free callback for resolver-owned embedder data.
+ *
+ * When a resolver is replaced, cleared, or its context is destroyed, Stator
+ * invokes this callback with the previous `user_data` pointer when both are
+ * non-null.
+ */
+typedef void (*StatorUserDataFreeCallback)(void *user_data);
+
+/**
+ * Synchronous host callback used to resolve an ES module import specifier.
+ *
+ * This callback shape is intentionally graph-linker-neutral: the host may
+ * return a compiled module through `out_module`, or an owned error string
+ * through `out_error`, but this slice only stores the callback and does not
+ * invoke it from module evaluation yet.
+ *
+ * # Safety
+ * - `ctx` is the context on which the resolver was registered.
+ * - `specifier` points to `specifier_len` UTF-8 bytes and is not necessarily
+ *   null-terminated.
+ * - `attributes` points to `attributes_len` entries, or is null when the
+ *   length is zero.
+ * - `out_module` and `out_error`, when non-null, are valid for one pointer
+ *   write each.
+ */
+typedef enum StatorResolveStatus (*StatorModuleResolverCallback)(struct StatorContext *ctx,
+                                                                 void *user_data,
+                                                                 const struct StatorModule *referrer,
+                                                                 const char *specifier,
+                                                                 size_t specifier_len,
+                                                                 const struct StatorImportAttribute *attributes,
+                                                                 size_t attributes_len,
+                                                                 struct StatorModule **out_module,
+                                                                 struct StatorString **out_error);
 
 /**
  * Synchronous host-function callback used to fulfil a Wasm import.
@@ -1531,6 +1626,42 @@ void stator_context_set_embedder_data(struct StatorContext *ctx, uint32_t slot, 
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
  */
 void *stator_context_get_embedder_data(const struct StatorContext *ctx, uint32_t slot);
+
+/**
+ * Register, replace, or clear the module resolver callback for `ctx`.
+ *
+ * The resolver is scoped to a single context and is not used by
+ * [`stator_module_evaluate`] in this slice. Passing a non-null `callback`
+ * stores `user_data` and optional `free_user_data`; any previous resolver is
+ * dropped first, invoking its free callback when applicable.
+ *
+ * To clear an existing resolver, pass a null `callback`, null `user_data`, and
+ * null `free_user_data`. Passing a null callback with non-null cleanup state is
+ * rejected and leaves the existing resolver unchanged.
+ *
+ * Returns `true` on successful registration or clear, and `false` for a null
+ * context or malformed clear request.
+ *
+ * # Safety
+ * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+ * - `callback`, when non-null, must remain callable until replaced, cleared,
+ *   or `ctx` is destroyed.
+ * - `user_data`, when non-null, must remain valid for callbacks until the
+ *   resolver is replaced/cleared/destroyed; ownership for cleanup is described
+ *   by `free_user_data`.
+ */
+bool stator_context_set_module_resolver(struct StatorContext *ctx,
+                                        enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
+                                                                             void *user_data,
+                                                                             const struct StatorModule *referrer,
+                                                                             const char *specifier,
+                                                                             size_t specifier_len,
+                                                                             const struct StatorImportAttribute *attributes,
+                                                                             size_t attributes_len,
+                                                                             struct StatorModule **out_module,
+                                                                             struct StatorString **out_error),
+                                        void *user_data,
+                                        void (*free_user_data)(void *user_data));
 
 /**
  * Create a new number value.

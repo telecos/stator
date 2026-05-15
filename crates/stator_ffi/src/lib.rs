@@ -673,6 +673,9 @@ pub struct StatorContext {
     /// `Context`.  The pointers are owned by the embedder and are not freed
     /// when the context is destroyed.
     embedder_data: Vec<*mut c_void>,
+    /// Optional host callback used by future module graph loading slices to
+    /// resolve static `import` / re-export specifiers for this context.
+    module_resolver: Option<StatorModuleResolver>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -704,6 +707,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         },
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
         embedder_data: Vec::new(),
+        module_resolver: None,
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -860,6 +864,70 @@ pub unsafe extern "C" fn stator_context_get_embedder_data(
     } else {
         std::ptr::null_mut()
     }
+}
+
+/// Register, replace, or clear the module resolver callback for `ctx`.
+///
+/// The resolver is scoped to a single context and is not used by
+/// [`stator_module_evaluate`] in this slice. Passing a non-null `callback`
+/// stores `user_data` and optional `free_user_data`; any previous resolver is
+/// dropped first, invoking its free callback when applicable.
+///
+/// To clear an existing resolver, pass a null `callback`, null `user_data`, and
+/// null `free_user_data`. Passing a null callback with non-null cleanup state is
+/// rejected and leaves the existing resolver unchanged.
+///
+/// Returns `true` on successful registration or clear, and `false` for a null
+/// context or malformed clear request.
+///
+/// # Safety
+/// - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+/// - `callback`, when non-null, must remain callable until replaced, cleared,
+///   or `ctx` is destroyed.
+/// - `user_data`, when non-null, must remain valid for callbacks until the
+///   resolver is replaced/cleared/destroyed; ownership for cleanup is described
+///   by `free_user_data`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_set_module_resolver(
+    ctx: *mut StatorContext,
+    callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            referrer: *const StatorModule,
+            specifier: *const c_char,
+            specifier_len: usize,
+            attributes: *const StatorImportAttribute,
+            attributes_len: usize,
+            out_module: *mut *mut StatorModule,
+            out_error: *mut *mut StatorString,
+        ) -> StatorResolveStatus,
+    >,
+    user_data: *mut c_void,
+    free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+
+    let resolver = match callback {
+        Some(callback) => Some(StatorModuleResolver {
+            _callback: callback,
+            user_data,
+            free_user_data,
+        }),
+        None => {
+            if !user_data.is_null() || free_user_data.is_some() {
+                return false;
+            }
+            None
+        }
+    };
+
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
+    // duration of this FFI call. Assignment drops the previous resolver, if any.
+    unsafe { (*ctx).module_resolver = resolver };
+    true
 }
 
 // ── Value ─────────────────────────────────────────────────────────────────────
@@ -2256,6 +2324,14 @@ pub struct StatorScript {
     resource_column_offset: i32,
 }
 
+/// Owned UTF-8 string handle used by module resolver out-parameters.
+///
+/// This first resolver slice only defines the ABI shape; future graph-loading
+/// code will consume values returned through `out_error`.
+pub struct StatorString {
+    _private: (),
+}
+
 /// A browser-facing compiled ES module record.
 ///
 /// Created by [`stator_module_compile`] and released by [`stator_module_free`].
@@ -2280,6 +2356,91 @@ pub struct StatorModule {
     resource_line_offset: i32,
     /// 1-based column offset of the module within `resource_name`. Defaults to 0.
     resource_column_offset: i32,
+}
+
+/// A single ECMAScript import attribute passed to a module resolver callback.
+///
+/// Both `key` and `value` are UTF-8 byte slices and are not required to be
+/// null-terminated. They are only valid for the duration of the callback.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorImportAttribute {
+    /// Pointer to `key_len` bytes of the attribute key.
+    pub key: *const c_char,
+    /// Number of bytes in `key`.
+    pub key_len: usize,
+    /// Pointer to `value_len` bytes of the attribute value.
+    pub value: *const c_char,
+    /// Number of bytes in `value`.
+    pub value_len: usize,
+}
+
+/// Result returned by a host module resolver callback.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorResolveStatus {
+    /// Resolution succeeded and `out_module` was written.
+    StatorResolveStatusOk = 0,
+    /// The specifier was not found by the host.
+    StatorResolveStatusNotFound = 1,
+    /// Resolution failed due to an I/O or network-layer problem.
+    StatorResolveStatusNetworkError = 2,
+    /// Resolution failed due to invalid specifier/attribute usage.
+    StatorResolveStatusTypeError = 3,
+    /// Resolution will complete asynchronously in a future API slice.
+    StatorResolveStatusPending = 4,
+}
+
+/// Free callback for resolver-owned embedder data.
+///
+/// When a resolver is replaced, cleared, or its context is destroyed, Stator
+/// invokes this callback with the previous `user_data` pointer when both are
+/// non-null.
+pub type StatorUserDataFreeCallback = unsafe extern "C" fn(user_data: *mut c_void);
+
+/// Synchronous host callback used to resolve an ES module import specifier.
+///
+/// This callback shape is intentionally graph-linker-neutral: the host may
+/// return a compiled module through `out_module`, or an owned error string
+/// through `out_error`, but this slice only stores the callback and does not
+/// invoke it from module evaluation yet.
+///
+/// # Safety
+/// - `ctx` is the context on which the resolver was registered.
+/// - `specifier` points to `specifier_len` UTF-8 bytes and is not necessarily
+///   null-terminated.
+/// - `attributes` points to `attributes_len` entries, or is null when the
+///   length is zero.
+/// - `out_module` and `out_error`, when non-null, are valid for one pointer
+///   write each.
+pub type StatorModuleResolverCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    user_data: *mut c_void,
+    referrer: *const StatorModule,
+    specifier: *const c_char,
+    specifier_len: usize,
+    attributes: *const StatorImportAttribute,
+    attributes_len: usize,
+    out_module: *mut *mut StatorModule,
+    out_error: *mut *mut StatorString,
+) -> StatorResolveStatus;
+
+struct StatorModuleResolver {
+    _callback: StatorModuleResolverCallback,
+    user_data: *mut c_void,
+    free_user_data: Option<StatorUserDataFreeCallback>,
+}
+
+impl Drop for StatorModuleResolver {
+    fn drop(&mut self) {
+        if let Some(free_user_data) = self.free_user_data
+            && !self.user_data.is_null()
+        {
+            // SAFETY: the embedder supplied this callback for exactly this
+            // resolver-owned `user_data` pointer.
+            unsafe { free_user_data(self.user_data) };
+        }
+    }
 }
 
 /// Link/evaluation state for a [`StatorModule`].
@@ -9724,6 +9885,185 @@ mod tests {
         // SAFETY: null isolate is documented to return null.
         let ctx = unsafe { stator_context_new(std::ptr::null_mut()) };
         assert!(ctx.is_null());
+    }
+
+    unsafe extern "C" fn test_resolver_free_user_data(user_data: *mut c_void) {
+        assert!(!user_data.is_null());
+        // SAFETY: tests pass a valid mutable `usize` pointer as user data.
+        let counter = unsafe { &mut *(user_data as *mut usize) };
+        *counter += 1;
+    }
+
+    unsafe extern "C" fn test_module_resolver_cb(
+        ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        referrer: *const StatorModule,
+        specifier: *const c_char,
+        specifier_len: usize,
+        attributes: *const StatorImportAttribute,
+        attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        assert!(!ctx.is_null());
+        assert!(!user_data.is_null());
+        assert!(!referrer.is_null());
+        assert!(!specifier.is_null());
+        assert!(attributes.is_null());
+        assert_eq!(attributes_len, 0);
+        // SAFETY: the test passes a valid UTF-8 specifier buffer.
+        let specifier =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        assert_eq!(specifier, b"./dep.js");
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_module = std::ptr::null_mut() };
+        }
+        if !out_error.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_error = std::ptr::null_mut() };
+        }
+        StatorResolveStatus::StatorResolveStatusNotFound
+    }
+
+    #[test]
+    fn test_context_set_module_resolver_rejects_malformed_clear() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let mut counter = 0usize;
+
+        // SAFETY: null callback with non-null cleanup state is rejected.
+        let ok = unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                None,
+                &mut counter as *mut usize as *mut c_void,
+                Some(test_resolver_free_user_data),
+            )
+        };
+        assert!(!ok);
+        assert_eq!(counter, 0);
+        // SAFETY: `ctx` is valid and visible inside crate tests.
+        assert!(unsafe { (*ctx).module_resolver.is_none() });
+
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_set_module_resolver_replaces_and_frees_user_data() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let mut first_counter = 0usize;
+        let mut second_counter = 0usize;
+
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_module_resolver_cb),
+                &mut first_counter as *mut usize as *mut c_void,
+                Some(test_resolver_free_user_data),
+            )
+        });
+        assert_eq!(first_counter, 0);
+
+        // SAFETY: replacing drops the previous resolver and frees its data.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_module_resolver_cb),
+                &mut second_counter as *mut usize as *mut c_void,
+                Some(test_resolver_free_user_data),
+            )
+        });
+        assert_eq!(first_counter, 1);
+        assert_eq!(second_counter, 0);
+
+        // SAFETY: clearing drops the active resolver and frees its data.
+        assert!(unsafe {
+            stator_context_set_module_resolver(ctx, None, std::ptr::null_mut(), None)
+        });
+        assert_eq!(first_counter, 1);
+        assert_eq!(second_counter, 1);
+
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_module_resolver_frees_user_data_on_destroy() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let mut counter = 0usize;
+
+        // SAFETY: callback and user data remain live until context destroy.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_module_resolver_cb),
+                &mut counter as *mut usize as *mut c_void,
+                Some(test_resolver_free_user_data),
+            )
+        });
+        // SAFETY: dropping the context drops the resolver.
+        unsafe { stator_context_destroy(ctx) };
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn test_context_module_resolver_callback_shape_invokes() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let mut user_data = 7usize;
+        let module = compile_module_src("export const value = 1;");
+        assert!(!module.is_null());
+
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_module_resolver_cb),
+                &mut user_data as *mut usize as *mut c_void,
+                None,
+            )
+        });
+
+        let specifier = b"./dep.js";
+        let mut out_module: *mut StatorModule = std::ptr::null_mut();
+        let mut out_error: *mut StatorString = std::ptr::null_mut();
+        // SAFETY: the stored callback and all pointers are valid for this test.
+        let status = unsafe {
+            let resolver = (*ctx).module_resolver.as_ref().unwrap();
+            (resolver._callback)(
+                ctx,
+                resolver.user_data,
+                module,
+                specifier.as_ptr() as *const c_char,
+                specifier.len(),
+                std::ptr::null(),
+                0,
+                &mut out_module,
+                &mut out_error,
+            )
+        };
+        assert_eq!(status, StatorResolveStatus::StatorResolveStatusNotFound);
+        assert!(out_module.is_null());
+        assert!(out_error.is_null());
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
