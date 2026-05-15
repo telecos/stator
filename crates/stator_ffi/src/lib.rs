@@ -2619,6 +2619,63 @@ pub enum StatorParserMetadata {
     StatorParserMetadataParserInserted = 1,
 }
 
+/// Browser-facing source identity and policy options for module compilation.
+///
+/// All pointer/length pairs are optional when their length is zero. Non-empty
+/// buffers are copied by Stator before the call returns. `resource_name` is the
+/// stable URL/resource identity used by `import.meta.url`, diagnostics, and
+/// module cache validation. Source-map URLs are not represented yet in Stator's
+/// module metadata model, so this options struct intentionally does not accept
+/// one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorModuleCompileOptions {
+    /// Host-visible source kind to compile.
+    pub source_type: StatorModuleType,
+    /// Pointer to `resource_name_len` bytes of the resource URL/name.
+    pub resource_name: *const c_char,
+    /// Number of bytes in `resource_name`.
+    pub resource_name_len: usize,
+    /// 1-based line offset within the resource.
+    pub line_offset: i32,
+    /// 1-based column offset within the resource.
+    pub column_offset: i32,
+    /// Pointer to `base_url_len` bytes of browser base URL metadata.
+    pub base_url: *const c_char,
+    /// Number of bytes in `base_url`.
+    pub base_url_len: usize,
+    /// Browser credentials mode applied to the module fetch.
+    pub credentials_mode: StatorCredentialsMode,
+    /// Pointer to `integrity_metadata_len` bytes of Subresource Integrity data.
+    pub integrity_metadata: *const c_char,
+    /// Number of bytes in `integrity_metadata`.
+    pub integrity_metadata_len: usize,
+    /// Browser referrer policy applied to subsequent module fetches.
+    pub referrer_policy: StatorReferrerPolicy,
+    /// HTML parser-metadata classification for this module script.
+    pub parser_metadata: StatorParserMetadata,
+}
+
+/// Status for module code-cache operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorModuleCacheStatus {
+    /// Operation succeeded and produced a validated metadata cache blob.
+    StatorModuleCacheStatusProducedMetadata = 0,
+    /// Cache blob matched, but Stator recompiled because bytecode serialization
+    /// is not available yet. This avoids silently pretending to consume
+    /// executable cached bytecode.
+    StatorModuleCacheStatusAcceptedValidatedRecompiled = 1,
+    /// A pointer/length pair or output argument was invalid.
+    StatorModuleCacheStatusInvalidArgument = 2,
+    /// The source module was not successfully compiled.
+    StatorModuleCacheStatusCompileError = 3,
+    /// Cache bytes were malformed or failed source/version/options validation.
+    StatorModuleCacheStatusRejected = 4,
+    /// Full bytecode/object serialization is unsupported by this engine build.
+    StatorModuleCacheStatusUnsupported = 5,
+}
+
 /// Read-only view of the browser policy/origin metadata associated with a
 /// referrer module, supplied to host module resolver callbacks.
 ///
@@ -2994,6 +3051,401 @@ fn module_evaluation_completion(result: JsValue) -> stator_jse::error::StatorRes
     }
 }
 
+fn module_error_record(
+    source_type: StatorModuleType,
+    message: &str,
+    kind: StatorMessageKind,
+) -> Box<StatorModule> {
+    Box::new(StatorModule {
+        bytecodes: None,
+        source_type,
+        has_dependencies: false,
+        module_requests: Vec::new(),
+        direct_exports: HashSet::new(),
+        status: StatorModuleStatus::StatorModuleStatusErrored,
+        last_result: None,
+        error: Some(CString::new(message).unwrap_or_else(|_| c"module error".into())),
+        error_kind: kind,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+        base_url: None,
+        integrity_metadata: None,
+        credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+        referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+        parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        namespace: None,
+    })
+}
+
+fn module_type_to_u32(source_type: StatorModuleType) -> u32 {
+    source_type as u32
+}
+
+fn credentials_mode_to_u32(mode: StatorCredentialsMode) -> u32 {
+    mode as u32
+}
+
+fn referrer_policy_to_u32(policy: StatorReferrerPolicy) -> u32 {
+    policy as u32
+}
+
+fn parser_metadata_to_u32(metadata: StatorParserMetadata) -> u32 {
+    metadata as u32
+}
+
+fn module_type_from_u32(value: u32) -> Option<StatorModuleType> {
+    match value {
+        0 => Some(StatorModuleType::StatorModuleTypeJavaScript),
+        1 => Some(StatorModuleType::StatorModuleTypeJson),
+        2 => Some(StatorModuleType::StatorModuleTypeWebAssembly),
+        3 => Some(StatorModuleType::StatorModuleTypeCss),
+        _ => None,
+    }
+}
+
+fn credentials_mode_from_u32(value: u32) -> Option<StatorCredentialsMode> {
+    match value {
+        0 => Some(StatorCredentialsMode::StatorCredentialsModeDefault),
+        1 => Some(StatorCredentialsMode::StatorCredentialsModeOmit),
+        2 => Some(StatorCredentialsMode::StatorCredentialsModeSameOrigin),
+        3 => Some(StatorCredentialsMode::StatorCredentialsModeInclude),
+        _ => None,
+    }
+}
+
+fn referrer_policy_from_u32(value: u32) -> Option<StatorReferrerPolicy> {
+    match value {
+        0 => Some(StatorReferrerPolicy::StatorReferrerPolicyDefault),
+        1 => Some(StatorReferrerPolicy::StatorReferrerPolicyNoReferrer),
+        2 => Some(StatorReferrerPolicy::StatorReferrerPolicyNoReferrerWhenDowngrade),
+        3 => Some(StatorReferrerPolicy::StatorReferrerPolicySameOrigin),
+        4 => Some(StatorReferrerPolicy::StatorReferrerPolicyOrigin),
+        5 => Some(StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin),
+        6 => Some(StatorReferrerPolicy::StatorReferrerPolicyOriginWhenCrossOrigin),
+        7 => Some(StatorReferrerPolicy::StatorReferrerPolicyStrictOriginWhenCrossOrigin),
+        8 => Some(StatorReferrerPolicy::StatorReferrerPolicyUnsafeUrl),
+        _ => None,
+    }
+}
+
+fn parser_metadata_from_u32(value: u32) -> Option<StatorParserMetadata> {
+    match value {
+        0 => Some(StatorParserMetadata::StatorParserMetadataNotParserInserted),
+        1 => Some(StatorParserMetadata::StatorParserMetadataParserInserted),
+        _ => None,
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+unsafe fn ffi_bytes<'a>(ptr: *const c_char, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `ptr` is valid for `len` readable bytes.
+    Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+unsafe fn owned_ffi_bytes(ptr: *const c_char, len: usize) -> Option<Vec<u8>> {
+    // SAFETY: forwards the caller-provided pointer/length pair to `ffi_bytes`.
+    unsafe { ffi_bytes(ptr, len).map(<[u8]>::to_vec) }
+}
+
+fn module_options_source_type(options: *const StatorModuleCompileOptions) -> StatorModuleType {
+    if options.is_null() {
+        StatorModuleType::StatorModuleTypeJavaScript
+    } else {
+        // SAFETY: callers pass a valid options pointer when non-null.
+        unsafe { (*options).source_type }
+    }
+}
+
+unsafe fn apply_module_compile_options(
+    module: *mut StatorModule,
+    options: *const StatorModuleCompileOptions,
+) -> bool {
+    if module.is_null() || options.is_null() {
+        return !module.is_null();
+    }
+    // SAFETY: caller guarantees `options` is valid.
+    let options_ref = unsafe { &*options };
+    // SAFETY: validates and copies each pointer/length pair from options.
+    let resource_name = match unsafe {
+        owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)
+    } {
+        Some(bytes) if bytes.is_empty() => None,
+        Some(bytes) => match CString::new(bytes) {
+            Ok(name) => Some(name),
+            Err(_) => return false,
+        },
+        None => return false,
+    };
+    // SAFETY: validates and copies each pointer/length pair from options.
+    let base_url = match unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len) }
+    {
+        Some(bytes) if bytes.is_empty() => None,
+        Some(bytes) => Some(bytes),
+        None => return false,
+    };
+    // SAFETY: validates and copies each pointer/length pair from options.
+    let integrity_metadata = match unsafe {
+        owned_ffi_bytes(
+            options_ref.integrity_metadata,
+            options_ref.integrity_metadata_len,
+        )
+    } {
+        Some(bytes) if bytes.is_empty() => None,
+        Some(bytes) => Some(bytes),
+        None => return false,
+    };
+
+    // SAFETY: caller guarantees `module` is valid and uniquely mutable.
+    unsafe {
+        (*module).resource_name = resource_name;
+        (*module).resource_line_offset = options_ref.line_offset;
+        (*module).resource_column_offset = options_ref.column_offset;
+        (*module).base_url = base_url;
+        (*module).integrity_metadata = integrity_metadata;
+        (*module).credentials_mode = options_ref.credentials_mode;
+        (*module).referrer_policy = options_ref.referrer_policy;
+        (*module).parser_metadata = options_ref.parser_metadata;
+    }
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleCacheRecord {
+    source_hash: u64,
+    source_len: u64,
+    source_type: StatorModuleType,
+    line_offset: i32,
+    column_offset: i32,
+    resource_name: Vec<u8>,
+    base_url: Vec<u8>,
+    integrity_metadata: Vec<u8>,
+    credentials_mode: StatorCredentialsMode,
+    referrer_policy: StatorReferrerPolicy,
+    parser_metadata: StatorParserMetadata,
+}
+
+const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
+const MODULE_CACHE_FORMAT_VERSION: u32 = 1;
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let Ok(len) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    push_u32(out, len);
+    out.extend_from_slice(bytes);
+    true
+}
+
+struct CacheReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CacheReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let slice = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(slice)
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        let bytes: [u8; 4] = self.take(4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    fn read_i32(&mut self) -> Option<i32> {
+        let bytes: [u8; 4] = self.take(4)?.try_into().ok()?;
+        Some(i32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn read_bytes(&mut self) -> Option<Vec<u8>> {
+        let len = self.read_u32()? as usize;
+        Some(self.take(len)?.to_vec())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MODULE_CACHE_MAGIC);
+    push_u32(&mut out, MODULE_CACHE_FORMAT_VERSION);
+    if !push_bytes(&mut out, env!("CARGO_PKG_VERSION").as_bytes()) {
+        return None;
+    }
+    push_u64(&mut out, record.source_hash);
+    push_u64(&mut out, record.source_len);
+    push_u32(&mut out, module_type_to_u32(record.source_type));
+    push_i32(&mut out, record.line_offset);
+    push_i32(&mut out, record.column_offset);
+    push_u32(&mut out, credentials_mode_to_u32(record.credentials_mode));
+    push_u32(&mut out, referrer_policy_to_u32(record.referrer_policy));
+    push_u32(&mut out, parser_metadata_to_u32(record.parser_metadata));
+    if !push_bytes(&mut out, &record.resource_name)
+        || !push_bytes(&mut out, &record.base_url)
+        || !push_bytes(&mut out, &record.integrity_metadata)
+    {
+        return None;
+    }
+    Some(out)
+}
+
+fn parse_module_cache_record(bytes: &[u8]) -> Option<ModuleCacheRecord> {
+    let mut reader = CacheReader::new(bytes);
+    if reader.take(MODULE_CACHE_MAGIC.len())? != MODULE_CACHE_MAGIC {
+        return None;
+    }
+    if reader.read_u32()? != MODULE_CACHE_FORMAT_VERSION {
+        return None;
+    }
+    if reader.read_bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
+        return None;
+    }
+    let source_hash = reader.read_u64()?;
+    let source_len = reader.read_u64()?;
+    let source_type = module_type_from_u32(reader.read_u32()?)?;
+    let line_offset = reader.read_i32()?;
+    let column_offset = reader.read_i32()?;
+    let credentials_mode = credentials_mode_from_u32(reader.read_u32()?)?;
+    let referrer_policy = referrer_policy_from_u32(reader.read_u32()?)?;
+    let parser_metadata = parser_metadata_from_u32(reader.read_u32()?)?;
+    let resource_name = reader.read_bytes()?;
+    let base_url = reader.read_bytes()?;
+    let integrity_metadata = reader.read_bytes()?;
+    if !reader.is_finished() {
+        return None;
+    }
+    Some(ModuleCacheRecord {
+        source_hash,
+        source_len,
+        source_type,
+        line_offset,
+        column_offset,
+        resource_name,
+        base_url,
+        integrity_metadata,
+        credentials_mode,
+        referrer_policy,
+        parser_metadata,
+    })
+}
+
+unsafe fn module_cache_record_from_options(
+    source: &[u8],
+    options: *const StatorModuleCompileOptions,
+) -> Option<ModuleCacheRecord> {
+    if options.is_null() {
+        return Some(ModuleCacheRecord {
+            source_hash: fnv1a64(source),
+            source_len: source.len() as u64,
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            line_offset: 0,
+            column_offset: 0,
+            resource_name: Vec::new(),
+            base_url: Vec::new(),
+            integrity_metadata: Vec::new(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        });
+    }
+    // SAFETY: caller guarantees `options` is valid.
+    let options_ref = unsafe { &*options };
+    Some(ModuleCacheRecord {
+        source_hash: fnv1a64(source),
+        source_len: source.len() as u64,
+        source_type: options_ref.source_type,
+        line_offset: options_ref.line_offset,
+        column_offset: options_ref.column_offset,
+        // SAFETY: validates and copies option byte buffers.
+        resource_name: unsafe {
+            owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
+        },
+        // SAFETY: validates and copies option byte buffers.
+        base_url: unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len)? },
+        // SAFETY: validates and copies option byte buffers.
+        integrity_metadata: unsafe {
+            owned_ffi_bytes(
+                options_ref.integrity_metadata,
+                options_ref.integrity_metadata_len,
+            )?
+        },
+        credentials_mode: options_ref.credentials_mode,
+        referrer_policy: options_ref.referrer_policy,
+        parser_metadata: options_ref.parser_metadata,
+    })
+}
+
+fn module_cache_record_from_module(source: &[u8], module: &StatorModule) -> ModuleCacheRecord {
+    ModuleCacheRecord {
+        source_hash: fnv1a64(source),
+        source_len: source.len() as u64,
+        source_type: module.source_type,
+        line_offset: module.resource_line_offset,
+        column_offset: module.resource_column_offset,
+        resource_name: module
+            .resource_name
+            .as_ref()
+            .map(|name| name.as_bytes().to_vec())
+            .unwrap_or_default(),
+        base_url: module.base_url.clone().unwrap_or_default(),
+        integrity_metadata: module.integrity_metadata.clone().unwrap_or_default(),
+        credentials_mode: module.credentials_mode,
+        referrer_policy: module.referrer_policy,
+        parser_metadata: module.parser_metadata,
+    }
+}
+
+fn module_cache_rejection_record(
+    source_type: StatorModuleType,
+    message: &str,
+) -> *mut StatorModule {
+    Box::into_raw(module_error_record(
+        source_type,
+        message,
+        StatorMessageKind::StatorMessageKindInternal,
+    ))
+}
+
 /// Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
 ///
 /// Returns a non-null [`StatorScript`] pointer in all cases (even on error).
@@ -3281,6 +3733,185 @@ pub unsafe extern "C" fn stator_module_compile_typed(
     // SAFETY: forwards the caller-provided raw source slice to the shared
     // compiler while preserving the requested source type metadata.
     unsafe { compile_module_source(ctx, source, source_len, source_type) }
+}
+
+/// Compile `source` as a module with stable source identity and policy options.
+///
+/// This is the browser-oriented compile entry point for embedders that know the
+/// module URL/resource name before compilation. `options` may be null, in which
+/// case this is equivalent to [`stator_module_compile`]. When present, Stator
+/// copies all option buffers and stores them on the returned module before it is
+/// evaluated, so `import.meta.url`, resolver-origin metadata, and cache
+/// validation all observe the same stable identity.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+/// - `options`, when non-null, must point to a valid
+///   [`StatorModuleCompileOptions`] whose pointer/length pairs are readable
+///   when their lengths are non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile_with_options(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    options: *const StatorModuleCompileOptions,
+) -> *mut StatorModule {
+    let source_type = module_options_source_type(options);
+    // SAFETY: forwards the caller-provided raw source slice to the shared
+    // compiler while preserving the requested source type metadata.
+    let module = unsafe { compile_module_source(ctx, source, source_len, source_type) };
+    // SAFETY: `module` is newly allocated and options pointer is valid by
+    // caller contract when non-null.
+    if unsafe { apply_module_compile_options(module, options) } {
+        module
+    } else {
+        // SAFETY: `module` was allocated by `compile_module_source`.
+        unsafe { stator_module_free(module) };
+        Box::into_raw(module_error_record(
+            source_type,
+            "invalid module compile options",
+            StatorMessageKind::StatorMessageKindInternal,
+        ))
+    }
+}
+
+/// Create an engine-owned module cache blob for `module` and `source`.
+///
+/// The returned [`StatorString`] owns an opaque metadata cache record. It is not
+/// serialized bytecode: Stator does not yet expose safe bytecode/object
+/// serialization. Consumers must inspect `out_status`; successful production
+/// reports [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`].
+/// Later [`stator_module_compile_cached`] validates the blob against the source
+/// hash, engine version, module type, resource name, and browser policy options,
+/// then explicitly reports that it recompiled from source after validation.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes when non-null.
+/// - `out_status`, when non-null, must be valid for one status write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_create_code_cache(
+    module: *const StatorModule,
+    source: *const c_char,
+    source_len: usize,
+    out_status: *mut StatorModuleCacheStatus,
+) -> *mut StatorString {
+    if !out_status.is_null() {
+        // SAFETY: caller guarantees `out_status` is valid when non-null.
+        unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument };
+    }
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let module_ref = unsafe { &*module };
+    if module_ref.bytecodes.is_none() || module_ref.error.is_some() {
+        if !out_status.is_null() {
+            // SAFETY: caller guarantees `out_status` is valid when non-null.
+            unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusCompileError };
+        }
+        return std::ptr::null_mut();
+    }
+    // SAFETY: validates the caller-provided source pointer/length pair.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return std::ptr::null_mut();
+    };
+    let record = module_cache_record_from_module(source_bytes, module_ref);
+    let Some(bytes) = serialize_module_cache_record(&record) else {
+        if !out_status.is_null() {
+            // SAFETY: caller guarantees `out_status` is valid when non-null.
+            unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported };
+        }
+        return std::ptr::null_mut();
+    };
+    if !out_status.is_null() {
+        // SAFETY: caller guarantees `out_status` is valid when non-null.
+        unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata };
+    }
+    Box::into_raw(Box::new(StatorString { bytes }))
+}
+
+/// Compile a module from `source` using a previously-produced cache blob.
+///
+/// The cache is accepted only when its magic, format version, engine crate
+/// version, source length/hash, module type, resource name, offsets, and browser
+/// policy options all match. Malformed, stale, or incompatible blobs fail
+/// closed by returning an errored [`StatorModule`] and reporting
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. Accepted blobs
+/// currently report
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`]
+/// because Stator lacks full bytecode serialization; embedders get explicit
+/// telemetry instead of a silent reparse.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+/// - `cache_data` must be valid for reads of `cache_len` bytes.
+/// - `options`, when non-null, must point to readable compile options.
+/// - `out_status`, when non-null, must be valid for one status write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile_cached(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    cache_data: *const c_char,
+    cache_len: usize,
+    options: *const StatorModuleCompileOptions,
+    out_status: *mut StatorModuleCacheStatus,
+) -> *mut StatorModule {
+    if !out_status.is_null() {
+        // SAFETY: caller guarantees `out_status` is valid when non-null.
+        unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument };
+    }
+    let source_type = module_options_source_type(options);
+    // SAFETY: validates caller-provided source and cache pointer/length pairs.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return module_cache_rejection_record(source_type, "invalid module source pointer");
+    };
+    // SAFETY: validates caller-provided source and cache pointer/length pairs.
+    let Some(cache_bytes) = (unsafe { ffi_bytes(cache_data, cache_len) }) else {
+        return module_cache_rejection_record(source_type, "invalid module cache pointer");
+    };
+    // SAFETY: copies and validates option byte buffers.
+    let Some(expected) = (unsafe { module_cache_record_from_options(source_bytes, options) })
+    else {
+        return module_cache_rejection_record(source_type, "invalid module compile options");
+    };
+    let Some(actual) = parse_module_cache_record(cache_bytes) else {
+        if !out_status.is_null() {
+            // SAFETY: caller guarantees `out_status` is valid when non-null.
+            unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusRejected };
+        }
+        return module_cache_rejection_record(source_type, "module cache rejected: malformed blob");
+    };
+    if actual != expected {
+        if !out_status.is_null() {
+            // SAFETY: caller guarantees `out_status` is valid when non-null.
+            unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusRejected };
+        }
+        return module_cache_rejection_record(
+            source_type,
+            "module cache rejected: source, version, resource name, or options mismatch",
+        );
+    }
+
+    // SAFETY: forwards the original source slice for a validated recompile.
+    let module = unsafe { compile_module_source(ctx, source, source_len, actual.source_type) };
+    // SAFETY: options were validated above and `module` is newly allocated.
+    if !unsafe { apply_module_compile_options(module, options) } {
+        // SAFETY: `module` was allocated by `compile_module_source`.
+        unsafe { stator_module_free(module) };
+        return module_cache_rejection_record(source_type, "invalid module compile options");
+    }
+    if !out_status.is_null() {
+        // SAFETY: caller guarantees `out_status` is valid when non-null.
+        unsafe {
+            *out_status =
+                StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled;
+        }
+    }
+    module
 }
 
 /// Return a null-terminated error message if `script` compiled with an error.
@@ -12466,6 +13097,27 @@ mod tests {
         }
     }
 
+    fn module_compile_options(
+        resource_name: &[u8],
+        base_url: &[u8],
+        integrity: &[u8],
+    ) -> StatorModuleCompileOptions {
+        StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            resource_name: resource_name.as_ptr() as *const c_char,
+            resource_name_len: resource_name.len(),
+            line_offset: 7,
+            column_offset: 11,
+            base_url: base_url.as_ptr() as *const c_char,
+            base_url_len: base_url.len(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeInclude,
+            integrity_metadata: integrity.as_ptr() as *const c_char,
+            integrity_metadata_len: integrity.len(),
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyStrictOriginWhenCrossOrigin,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataParserInserted,
+        }
+    }
+
     struct TestGraphResolverData {
         modules: HashMap<String, *mut StatorModule>,
         status: StatorResolveStatus,
@@ -16030,6 +16682,349 @@ mod tests {
                 StatorParserMetadata::StatorParserMetadataNotParserInserted
             );
             stator_module_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_roundtrip_matching_source_and_options() {
+        let source = "import.meta.url;";
+        let resource = b"https://edge.example.test/app/root.mjs";
+        let base_url = b"https://edge.example.test/app/";
+        let integrity = b"sha384-root";
+        let options = module_compile_options(resource, base_url, integrity);
+        let bytes = source.as_bytes();
+
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        assert!(!module.is_null());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live; status is a valid out pointer.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        // SAFETY: cache handle and source/options are live.
+        let cached = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        );
+
+        // SAFETY: cached module is live.
+        unsafe {
+            assert!(stator_module_get_error(cached).is_null());
+            let got = CStr::from_ptr(stator_module_get_resource_name(cached))
+                .to_str()
+                .unwrap();
+            assert_eq!(got.as_bytes(), resource);
+            assert_eq!(stator_module_get_line_offset(cached), 7);
+            assert_eq!(stator_module_get_column_offset(cached), 11);
+            let mut len = 0usize;
+            let ptr = stator_module_get_base_url(cached, &mut len);
+            assert_eq!(std::slice::from_raw_parts(ptr as *const u8, len), base_url);
+            let result = stator_module_evaluate(cached, std::ptr::null_mut());
+            assert!(!result.is_null());
+            let meta_url = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(meta_url.as_bytes(), resource);
+            stator_value_destroy(result);
+            stator_string_free(cache);
+            stator_module_free(cached);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_rejects_stale_source_or_options() {
+        let source = "export const value = 1;";
+        let stale_source = "export const value = 2;";
+        let resource = b"https://edge.example.test/app/root.mjs";
+        let base_url = b"https://edge.example.test/app/";
+        let integrity = b"sha384-root";
+        let options = module_compile_options(resource, base_url, integrity);
+        let bytes = source.as_bytes();
+        let stale_bytes = stale_source.as_bytes();
+
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+
+        // SAFETY: stale source and cache bytes are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                stale_bytes.as_ptr() as *const c_char,
+                stale_bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: rejected module is an errored module handle.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(rejected),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(rejected))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("cache rejected"));
+            stator_module_free(rejected);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_retains_requests_attributes_and_import_meta_url() {
+        let source = "import data from './data.json' with { type: 'json' }; import.meta.url;";
+        let resource = b"https://edge.example.test/app/with-attrs.mjs";
+        let options = module_compile_options(resource, b"https://edge.example.test/app/", b"");
+        let bytes = source.as_bytes();
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache handle and source/options are live.
+        let cached = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        // SAFETY: cached module is live.
+        unsafe {
+            assert_eq!(stator_module_get_request_count(cached), 1);
+            let mut specifier = std::ptr::null();
+            let mut specifier_len = 0usize;
+            let mut attributes = std::ptr::null();
+            let mut attributes_len = 0usize;
+            assert!(stator_module_get_request(
+                cached,
+                0,
+                &mut specifier,
+                &mut specifier_len,
+                &mut attributes,
+                &mut attributes_len,
+            ));
+            assert_eq!(
+                std::slice::from_raw_parts(specifier as *const u8, specifier_len),
+                b"./data.json"
+            );
+            assert_eq!(attributes_len, 1);
+            let attr = *attributes;
+            assert_eq!(
+                std::slice::from_raw_parts(attr.key as *const u8, attr.key_len),
+                b"type"
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(attr.value as *const u8, attr.value_len),
+                b"json"
+            );
+            let got = CStr::from_ptr(stator_module_get_resource_name(cached))
+                .to_str()
+                .unwrap();
+            assert_eq!(got.as_bytes(), resource);
+            stator_string_free(cache);
+            stator_module_free(cached);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_link_evaluate_namespace_and_tla() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root_source = "import * as ns from './dep.js'; ns.value;";
+        let root_bytes = root_source.as_bytes();
+        let root_options = module_compile_options(
+            b"https://edge.example.test/app/root.mjs",
+            b"https://edge.example.test/app/",
+            b"",
+        );
+        // SAFETY: source and options point to live buffers.
+        let root = unsafe {
+            stator_module_compile_with_options(
+                ctx,
+                root_bytes.as_ptr() as *const c_char,
+                root_bytes.len(),
+                &root_options,
+            )
+        };
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                root,
+                root_bytes.as_ptr() as *const c_char,
+                root_bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache handle and source/options are live.
+        let cached_root = unsafe {
+            stator_module_compile_cached(
+                ctx,
+                root_bytes.as_ptr() as *const c_char,
+                root_bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &root_options,
+                &mut status,
+            )
+        };
+        let dep = compile_module_src("export let value = 40; value = 42;");
+        let tla = compile_module_src("const value = await Promise.resolve(7); value;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, cached_root));
+            let result = stator_module_evaluate(cached_root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+
+            let tla_result = stator_module_evaluate(tla, ctx);
+            assert!(!tla_result.is_null());
+            assert_eq!(stator_value_to_number(tla_result), 7.0);
+            stator_value_destroy(tla_result);
+
+            stator_string_free(cache);
+            stator_module_free(tla);
+            stator_module_free(cached_root);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_invalid_bytes_fail_safely() {
+        let source = "export const value = 1;";
+        let resource = b"https://edge.example.test/app/root.mjs";
+        let options = module_compile_options(resource, b"https://edge.example.test/app/", b"");
+        let bytes = source.as_bytes();
+        let invalid = b"not a stator cache blob";
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: source, cache bytes, and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                invalid.as_ptr() as *const c_char,
+                invalid.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!module.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: module is a live errored handle.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert!(!stator_module_get_error(module).is_null());
+            stator_module_free(module);
         }
     }
 

@@ -149,6 +149,38 @@ typedef enum StatorModuleType {
 } StatorModuleType;
 
 /**
+ * Status for module code-cache operations.
+ */
+typedef enum StatorModuleCacheStatus {
+  /**
+   * Operation succeeded and produced a validated metadata cache blob.
+   */
+  StatorModuleCacheStatusProducedMetadata = 0,
+  /**
+   * Cache blob matched, but Stator recompiled because bytecode serialization
+   * is not available yet. This avoids silently pretending to consume
+   * executable cached bytecode.
+   */
+  StatorModuleCacheStatusAcceptedValidatedRecompiled = 1,
+  /**
+   * A pointer/length pair or output argument was invalid.
+   */
+  StatorModuleCacheStatusInvalidArgument = 2,
+  /**
+   * The source module was not successfully compiled.
+   */
+  StatorModuleCacheStatusCompileError = 3,
+  /**
+   * Cache bytes were malformed or failed source/version/options validation.
+   */
+  StatorModuleCacheStatusRejected = 4,
+  /**
+   * Full bytecode/object serialization is unsupported by this engine build.
+   */
+  StatorModuleCacheStatusUnsupported = 5,
+} StatorModuleCacheStatus;
+
+/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -821,6 +853,67 @@ typedef struct StatorImportAttribute {
    */
   size_t value_len;
 } StatorImportAttribute;
+
+/**
+ * Browser-facing source identity and policy options for module compilation.
+ *
+ * All pointer/length pairs are optional when their length is zero. Non-empty
+ * buffers are copied by Stator before the call returns. `resource_name` is the
+ * stable URL/resource identity used by `import.meta.url`, diagnostics, and
+ * module cache validation. Source-map URLs are not represented yet in Stator's
+ * module metadata model, so this options struct intentionally does not accept
+ * one.
+ */
+typedef struct StatorModuleCompileOptions {
+  /**
+   * Host-visible source kind to compile.
+   */
+  enum StatorModuleType source_type;
+  /**
+   * Pointer to `resource_name_len` bytes of the resource URL/name.
+   */
+  const char *resource_name;
+  /**
+   * Number of bytes in `resource_name`.
+   */
+  size_t resource_name_len;
+  /**
+   * 1-based line offset within the resource.
+   */
+  int32_t line_offset;
+  /**
+   * 1-based column offset within the resource.
+   */
+  int32_t column_offset;
+  /**
+   * Pointer to `base_url_len` bytes of browser base URL metadata.
+   */
+  const char *base_url;
+  /**
+   * Number of bytes in `base_url`.
+   */
+  size_t base_url_len;
+  /**
+   * Browser credentials mode applied to the module fetch.
+   */
+  enum StatorCredentialsMode credentials_mode;
+  /**
+   * Pointer to `integrity_metadata_len` bytes of Subresource Integrity data.
+   */
+  const char *integrity_metadata;
+  /**
+   * Number of bytes in `integrity_metadata`.
+   */
+  size_t integrity_metadata_len;
+  /**
+   * Browser referrer policy applied to subsequent module fetches.
+   */
+  enum StatorReferrerPolicy referrer_policy;
+  /**
+   * HTML parser-metadata classification for this module script.
+   */
+  enum StatorParserMetadata parser_metadata;
+} StatorModuleCompileOptions;
 
 /**
  * Per-script tiering state visible to embedders.
@@ -2557,6 +2650,77 @@ struct StatorModule *stator_module_compile_typed(struct StatorContext *ctx,
                                                  const char *source,
                                                  size_t source_len,
                                                  enum StatorModuleType source_type);
+
+/**
+ * Compile `source` as a module with stable source identity and policy options.
+ *
+ * This is the browser-oriented compile entry point for embedders that know the
+ * module URL/resource name before compilation. `options` may be null, in which
+ * case this is equivalent to [`stator_module_compile`]. When present, Stator
+ * copies all option buffers and stores them on the returned module before it is
+ * evaluated, so `import.meta.url`, resolver-origin metadata, and cache
+ * validation all observe the same stable identity.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ * - `options`, when non-null, must point to a valid
+ *   [`StatorModuleCompileOptions`] whose pointer/length pairs are readable
+ *   when their lengths are non-zero.
+ */
+struct StatorModule *stator_module_compile_with_options(struct StatorContext *ctx,
+                                                        const char *source,
+                                                        size_t source_len,
+                                                        const struct StatorModuleCompileOptions *options);
+
+/**
+ * Create an engine-owned module cache blob for `module` and `source`.
+ *
+ * The returned [`StatorString`] owns an opaque metadata cache record. It is not
+ * serialized bytecode: Stator does not yet expose safe bytecode/object
+ * serialization. Consumers must inspect `out_status`; successful production
+ * reports [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`].
+ * Later [`stator_module_compile_cached`] validates the blob against the source
+ * hash, engine version, module type, resource name, and browser policy options,
+ * then explicitly reports that it recompiled from source after validation.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes when non-null.
+ * - `out_status`, when non-null, must be valid for one status write.
+ */
+struct StatorString *stator_module_create_code_cache(const struct StatorModule *module,
+                                                     const char *source,
+                                                     size_t source_len,
+                                                     enum StatorModuleCacheStatus *out_status);
+
+/**
+ * Compile a module from `source` using a previously-produced cache blob.
+ *
+ * The cache is accepted only when its magic, format version, engine crate
+ * version, source length/hash, module type, resource name, offsets, and browser
+ * policy options all match. Malformed, stale, or incompatible blobs fail
+ * closed by returning an errored [`StatorModule`] and reporting
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. Accepted blobs
+ * currently report
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`]
+ * because Stator lacks full bytecode serialization; embedders get explicit
+ * telemetry instead of a silent reparse.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ * - `cache_data` must be valid for reads of `cache_len` bytes.
+ * - `options`, when non-null, must point to readable compile options.
+ * - `out_status`, when non-null, must be valid for one status write.
+ */
+struct StatorModule *stator_module_compile_cached(struct StatorContext *ctx,
+                                                  const char *source,
+                                                  size_t source_len,
+                                                  const char *cache_data,
+                                                  size_t cache_len,
+                                                  const struct StatorModuleCompileOptions *options,
+                                                  enum StatorModuleCacheStatus *out_status);
 
 /**
  * Return a null-terminated error message if `script` compiled with an error.
