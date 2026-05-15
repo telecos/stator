@@ -2326,10 +2326,88 @@ pub struct StatorScript {
 
 /// Owned UTF-8 string handle used by module resolver out-parameters.
 ///
-/// This first resolver slice only defines the ABI shape; future graph-loading
-/// code will consume values returned through `out_error`.
+/// Hosts construct values with [`stator_string_new`] and may transfer ownership
+/// to Stator through resolver `out_error` parameters. Stator releases received
+/// strings with [`stator_string_free`]. The byte buffer is not required to be
+/// null-terminated and may legally contain interior NULs.
 pub struct StatorString {
-    _private: (),
+    bytes: Vec<u8>,
+}
+
+/// Allocate a new owned [`StatorString`] from `len` UTF-8 bytes at `data`.
+///
+/// Returns a non-null handle on success. When `data` is null and `len` is
+/// zero, an empty string is returned. When `data` is null and `len` is
+/// non-zero, returns null. The bytes are copied into engine-owned storage and
+/// are not interpreted, validated, or required to be null-terminated.
+///
+/// # Safety
+/// - `data` must either be null (with `len == 0`) or point to at least `len`
+///   readable bytes for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_new(data: *const c_char, len: usize) -> *mut StatorString {
+    if data.is_null() && len != 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = if len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees `data` points to `len` readable bytes.
+        let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+        slice.to_vec()
+    };
+    Box::into_raw(Box::new(StatorString { bytes }))
+}
+
+/// Return a pointer to the UTF-8 bytes held by `string`.
+///
+/// The returned pointer is valid until `string` is freed and is **not**
+/// guaranteed to be null-terminated. Returns null when `string` is null.
+///
+/// # Safety
+/// - `string` must be either null or a valid pointer to a live
+///   [`StatorString`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_data(string: *const StatorString) -> *const c_char {
+    if string.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `string` is live.
+    let s = unsafe { &*string };
+    s.bytes.as_ptr() as *const c_char
+}
+
+/// Return the byte length of `string`.
+///
+/// Returns `0` when `string` is null.
+///
+/// # Safety
+/// - `string` must be either null or a valid pointer to a live
+///   [`StatorString`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_len(string: *const StatorString) -> usize {
+    if string.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `string` is live.
+    unsafe { (*string).bytes.len() }
+}
+
+/// Free a [`StatorString`] previously returned by [`stator_string_new`] or
+/// transferred from a host resolver to Stator.
+///
+/// Passing null is a no-op.
+///
+/// # Safety
+/// - `string` must either be null or a pointer obtained from
+///   [`stator_string_new`] that has not already been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_free(string: *mut StatorString) {
+    if string.is_null() {
+        return;
+    }
+    // SAFETY: caller transferred ownership of `string` to this call.
+    unsafe { drop(Box::from_raw(string)) };
 }
 
 /// A browser-facing compiled ES module record.
@@ -2433,10 +2511,30 @@ pub type StatorUserDataFreeCallback = unsafe extern "C" fn(user_data: *mut c_voi
 
 /// Synchronous host callback used to resolve an ES module import specifier.
 ///
-/// This callback shape is intentionally graph-linker-neutral: the host may
-/// return a compiled module through `out_module`, or an owned error string
-/// through `out_error`, but this slice only stores the callback and does not
-/// invoke it from module evaluation yet.
+/// The callback is invoked depth-first by [`stator_module_instantiate`] for
+/// every static `import`, re-export, or import-with-attributes request in the
+/// referrer module. On success the host writes a live, compiled module pointer
+/// through `out_module`. On failure the host returns a non-`Ok` status and may
+/// optionally allocate an owned diagnostic via [`stator_string_new`] and
+/// transfer it through `out_error`. The engine consumes any non-null
+/// `out_error` and releases it with [`stator_string_free`], so hosts must not
+/// retain or free it themselves after returning.
+///
+/// The status drives the typed error surfaced through the module status/error
+/// accessors and any future evaluation rejection:
+///
+/// - [`StatorResolveStatus::StatorResolveStatusNotFound`] →
+///   `ReferenceError` (`StatorMessageKindReference`).
+/// - [`StatorResolveStatus::StatorResolveStatusNetworkError`] →
+///   `TypeError` (`StatorMessageKindType`) modelled on the HTML module-loading
+///   spec for fetch failures.
+/// - [`StatorResolveStatus::StatorResolveStatusTypeError`] →
+///   `TypeError` (`StatorMessageKindType`).
+/// - Other failure statuses surface as internal engine errors.
+///
+/// The optional `out_error` detail, when supplied, is appended to the engine's
+/// canonical message so the actionable host context (URL, fetch failure, etc.)
+/// flows through the module error accessors verbatim.
 ///
 /// # Safety
 /// - `ctx` is the context on which the resolver was registered.
@@ -2445,7 +2543,8 @@ pub type StatorUserDataFreeCallback = unsafe extern "C" fn(user_data: *mut c_voi
 /// - `attributes` points to `attributes_len` entries, or is null when the
 ///   length is zero.
 /// - `out_module` and `out_error`, when non-null, are valid for one pointer
-///   write each.
+///   write each. Any non-null value written through `out_error` must have been
+///   produced by [`stator_string_new`] and is owned by the engine after return.
 pub type StatorModuleResolverCallback = unsafe extern "C" fn(
     ctx: *mut StatorContext,
     user_data: *mut c_void,
@@ -3539,34 +3638,51 @@ unsafe fn set_module_error(
     unsafe { (*isolate).pending_message = Some(structured) };
 }
 
+/// Convert a resolver `out_error` pointer into an owned `String` and free the
+/// FFI handle.
+///
+/// Returns `None` when `out_error` is null or contains no bytes. Invalid UTF-8
+/// is replaced with the Unicode replacement character so that non-conforming
+/// hosts still surface a printable diagnostic instead of being collapsed to a
+/// generic engine message.
+unsafe fn take_resolver_error_string(out_error: *mut StatorString) -> Option<String> {
+    if out_error.is_null() {
+        return None;
+    }
+    // SAFETY: hosts transfer ownership of `out_error` to the engine on return.
+    let owned = unsafe { Box::from_raw(out_error) };
+    if owned.bytes.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&owned.bytes).into_owned())
+}
+
 fn resolver_status_error(
     status: StatorResolveStatus,
     specifier: &str,
+    detail: Option<&str>,
 ) -> stator_jse::error::StatorError {
+    use stator_jse::error::StatorError;
+    let suffix = match detail {
+        Some(message) if !message.is_empty() => format!(": {message}"),
+        _ => String::new(),
+    };
     match status {
-        StatorResolveStatus::StatorResolveStatusOk => stator_jse::error::StatorError::Internal(
-            "module resolver returned ok without a module".to_string(),
-        ),
-        StatorResolveStatus::StatorResolveStatusNotFound => {
-            stator_jse::error::StatorError::ReferenceError(format!(
-                "module specifier '{specifier}' was not found"
-            ))
-        }
+        StatorResolveStatus::StatorResolveStatusOk => StatorError::Internal(format!(
+            "module resolver returned ok without a module for '{specifier}'{suffix}"
+        )),
+        StatorResolveStatus::StatorResolveStatusNotFound => StatorError::ReferenceError(format!(
+            "module specifier '{specifier}' was not found{suffix}"
+        )),
         StatorResolveStatus::StatorResolveStatusNetworkError => {
-            stator_jse::error::StatorError::Internal(format!(
-                "module specifier '{specifier}' failed to load"
-            ))
+            StatorError::TypeError(format!("failed to fetch module '{specifier}'{suffix}"))
         }
-        StatorResolveStatus::StatorResolveStatusTypeError => {
-            stator_jse::error::StatorError::TypeError(format!(
-                "module specifier '{specifier}' was rejected by resolver"
-            ))
-        }
-        StatorResolveStatus::StatorResolveStatusPending => {
-            stator_jse::error::StatorError::Internal(format!(
-                "module specifier '{specifier}' requires asynchronous resolution"
-            ))
-        }
+        StatorResolveStatus::StatorResolveStatusTypeError => StatorError::TypeError(format!(
+            "module specifier '{specifier}' was rejected by resolver{suffix}"
+        )),
+        StatorResolveStatus::StatorResolveStatusPending => StatorError::Internal(format!(
+            "module specifier '{specifier}' requires asynchronous resolution{suffix}"
+        )),
     }
 }
 
@@ -3664,15 +3780,22 @@ unsafe fn instantiate_module_graph(
         };
 
         let specifier = request.specifier.to_string_lossy();
+        // SAFETY: hosts may transfer ownership of an error string via
+        // `out_error`. We always reclaim and free it here, even on success.
+        let detail = unsafe { take_resolver_error_string(out_error) };
         if status != StatorResolveStatus::StatorResolveStatusOk {
             visiting.remove(&module);
-            let error = resolver_status_error(status, &specifier);
+            let error = resolver_status_error(status, &specifier, detail.as_deref());
             set_module_link_error(module_ref, &error);
             return Err(error);
         }
         if out_module.is_null() {
             visiting.remove(&module);
-            let error = resolver_status_error(status, &specifier);
+            let error = resolver_status_error(
+                StatorResolveStatus::StatorResolveStatusNotFound,
+                &specifier,
+                detail.as_deref(),
+            );
             set_module_link_error(module_ref, &error);
             return Err(error);
         }
@@ -11512,6 +11635,252 @@ mod tests {
             );
             stator_module_free(root);
             stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    struct TestErrorResolverData {
+        status: StatorResolveStatus,
+        detail: Option<&'static str>,
+    }
+
+    unsafe extern "C" fn test_error_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        _specifier: *const c_char,
+        _specifier_len: usize,
+        _attributes: *const StatorImportAttribute,
+        _attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &*(user_data as *const TestErrorResolverData) };
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_module = std::ptr::null_mut() };
+        }
+        if !out_error.is_null() {
+            let err = if let Some(detail) = data.detail {
+                let bytes = detail.as_bytes();
+                // SAFETY: `bytes` are valid for the duration of this call.
+                unsafe { stator_string_new(bytes.as_ptr() as *const c_char, bytes.len()) }
+            } else {
+                std::ptr::null_mut()
+            };
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_error = err };
+        }
+        data.status
+    }
+
+    fn run_resolver_failure_case(
+        status: StatorResolveStatus,
+        detail: Option<&'static str>,
+        expected_kind: StatorMessageKind,
+        expected_substrings: &[&str],
+    ) {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './missing.js';");
+        let mut data = TestErrorResolverData { status, detail };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_error_resolver_cb),
+                &mut data as *mut TestErrorResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert_eq!(stator_module_error_kind(root), expected_kind);
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap()
+                .to_string();
+            for needle in expected_substrings {
+                assert!(
+                    err.contains(needle),
+                    "expected error {err:?} to contain {needle:?}"
+                );
+            }
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_not_found_maps_to_reference_error() {
+        run_resolver_failure_case(
+            StatorResolveStatus::StatorResolveStatusNotFound,
+            None,
+            StatorMessageKind::StatorMessageKindReference,
+            &["./missing.js", "not found"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_not_found_propagates_resolver_detail() {
+        run_resolver_failure_case(
+            StatorResolveStatus::StatorResolveStatusNotFound,
+            Some("file:///app/missing.js (404)"),
+            StatorMessageKind::StatorMessageKindReference,
+            &["./missing.js", "file:///app/missing.js", "404"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_network_error_maps_to_type_error() {
+        run_resolver_failure_case(
+            StatorResolveStatus::StatorResolveStatusNetworkError,
+            Some("connection reset"),
+            StatorMessageKind::StatorMessageKindType,
+            &["./missing.js", "fetch", "connection reset"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_type_error_maps_to_type_error() {
+        run_resolver_failure_case(
+            StatorResolveStatus::StatorResolveStatusTypeError,
+            Some("invalid 'type' attribute"),
+            StatorMessageKind::StatorMessageKindType,
+            &["./missing.js", "rejected", "invalid 'type' attribute"],
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_distinct_kinds_per_status() {
+        // Sanity check that the three concrete failure statuses produce
+        // distinct, typed error kinds rather than collapsing to one.
+        let cases: Vec<(StatorResolveStatus, StatorMessageKind)> = vec![
+            (
+                StatorResolveStatus::StatorResolveStatusNotFound,
+                StatorMessageKind::StatorMessageKindReference,
+            ),
+            (
+                StatorResolveStatus::StatorResolveStatusNetworkError,
+                StatorMessageKind::StatorMessageKindType,
+            ),
+            (
+                StatorResolveStatus::StatorResolveStatusTypeError,
+                StatorMessageKind::StatorMessageKindType,
+            ),
+        ];
+        let mut seen_kinds: Vec<StatorMessageKind> = Vec::new();
+        for (status, expected_kind) in cases {
+            let iso = IsolateGuard::new();
+            // SAFETY: `iso` is valid.
+            let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+            let root = compile_module_src("import './x.js';");
+            let mut data = TestErrorResolverData {
+                status,
+                detail: None,
+            };
+            // SAFETY: callback and user data are live for this test scope.
+            assert!(unsafe {
+                stator_context_set_module_resolver(
+                    ctx,
+                    Some(test_error_resolver_cb),
+                    &mut data as *mut TestErrorResolverData as *mut c_void,
+                    None,
+                )
+            });
+            // SAFETY: pointers are valid.
+            unsafe {
+                assert!(!stator_module_instantiate(ctx, root));
+                let kind = stator_module_error_kind(root);
+                assert_eq!(kind, expected_kind);
+                seen_kinds.push(kind);
+                stator_module_free(root);
+                stator_context_destroy(ctx);
+            }
+        }
+        assert!(seen_kinds.contains(&StatorMessageKind::StatorMessageKindReference));
+        assert!(seen_kinds.contains(&StatorMessageKind::StatorMessageKindType));
+    }
+
+    #[test]
+    fn test_stator_string_new_data_len_roundtrip() {
+        let payload = b"hello\0world";
+        // SAFETY: `payload` is a live byte slice.
+        let s = unsafe { stator_string_new(payload.as_ptr() as *const c_char, payload.len()) };
+        assert!(!s.is_null());
+        // SAFETY: `s` is live and was just allocated.
+        unsafe {
+            assert_eq!(stator_string_len(s), payload.len());
+            let data = stator_string_data(s);
+            assert!(!data.is_null());
+            let slice = std::slice::from_raw_parts(data as *const u8, stator_string_len(s));
+            assert_eq!(slice, payload);
+            stator_string_free(s);
+        }
+    }
+
+    #[test]
+    fn test_stator_string_new_empty_returns_handle() {
+        // SAFETY: zero-length payload with null pointer is permitted.
+        let s = unsafe { stator_string_new(std::ptr::null(), 0) };
+        assert!(!s.is_null());
+        // SAFETY: `s` is live.
+        unsafe {
+            assert_eq!(stator_string_len(s), 0);
+            stator_string_free(s);
+        }
+    }
+
+    #[test]
+    fn test_stator_string_new_rejects_null_with_length() {
+        // SAFETY: null pointer with non-zero length is invalid by contract.
+        let s = unsafe { stator_string_new(std::ptr::null(), 4) };
+        assert!(s.is_null());
+    }
+
+    #[test]
+    fn test_stator_string_free_accepts_null() {
+        // SAFETY: passing null is a documented no-op.
+        unsafe { stator_string_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_module_instantiate_resolver_returns_ok_with_null_module_is_reference_error() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './x.js';");
+        // Resolver returns Ok but writes a null module — engine treats this
+        // as NotFound rather than panicking.
+        let mut data = TestErrorResolverData {
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            detail: None,
+        };
+        // SAFETY: callback and user data are live for this test scope.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_error_resolver_cb),
+                &mut data as *mut TestErrorResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are valid.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindReference
+            );
+            stator_module_free(root);
             stator_context_destroy(ctx);
         }
     }

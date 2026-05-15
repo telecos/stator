@@ -496,8 +496,10 @@ typedef struct StatorScript StatorScript;
 /**
  * Owned UTF-8 string handle used by module resolver out-parameters.
  *
- * This first resolver slice only defines the ABI shape; future graph-loading
- * code will consume values returned through `out_error`.
+ * Hosts construct values with [`stator_string_new`] and may transfer ownership
+ * to Stator through resolver `out_error` parameters. Stator releases received
+ * strings with [`stator_string_free`]. The byte buffer is not required to be
+ * null-terminated and may legally contain interior NULs.
  */
 typedef struct StatorString StatorString;
 
@@ -1089,10 +1091,30 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
 /**
  * Synchronous host callback used to resolve an ES module import specifier.
  *
- * This callback shape is intentionally graph-linker-neutral: the host may
- * return a compiled module through `out_module`, or an owned error string
- * through `out_error`, but this slice only stores the callback and does not
- * invoke it from module evaluation yet.
+ * The callback is invoked depth-first by [`stator_module_instantiate`] for
+ * every static `import`, re-export, or import-with-attributes request in the
+ * referrer module. On success the host writes a live, compiled module pointer
+ * through `out_module`. On failure the host returns a non-`Ok` status and may
+ * optionally allocate an owned diagnostic via [`stator_string_new`] and
+ * transfer it through `out_error`. The engine consumes any non-null
+ * `out_error` and releases it with [`stator_string_free`], so hosts must not
+ * retain or free it themselves after returning.
+ *
+ * The status drives the typed error surfaced through the module status/error
+ * accessors and any future evaluation rejection:
+ *
+ * - [`StatorResolveStatus::StatorResolveStatusNotFound`] →
+ *   `ReferenceError` (`StatorMessageKindReference`).
+ * - [`StatorResolveStatus::StatorResolveStatusNetworkError`] →
+ *   `TypeError` (`StatorMessageKindType`) modelled on the HTML module-loading
+ *   spec for fetch failures.
+ * - [`StatorResolveStatus::StatorResolveStatusTypeError`] →
+ *   `TypeError` (`StatorMessageKindType`).
+ * - Other failure statuses surface as internal engine errors.
+ *
+ * The optional `out_error` detail, when supplied, is appended to the engine's
+ * canonical message so the actionable host context (URL, fetch failure, etc.)
+ * flows through the module error accessors verbatim.
  *
  * # Safety
  * - `ctx` is the context on which the resolver was registered.
@@ -1101,7 +1123,8 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
  * - `attributes` points to `attributes_len` entries, or is null when the
  *   length is zero.
  * - `out_module` and `out_error`, when non-null, are valid for one pointer
- *   write each.
+ *   write each. Any non-null value written through `out_error` must have been
+ *   produced by [`stator_string_new`] and is owned by the engine after return.
  */
 typedef enum StatorResolveStatus (*StatorModuleResolverCallback)(struct StatorContext *ctx,
                                                                  void *user_data,
@@ -2261,6 +2284,55 @@ size_t stator_heap_used(const struct StatorIsolate *isolate);
  * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
  */
 size_t stator_heap_capacity(const struct StatorIsolate *isolate);
+
+/**
+ * Allocate a new owned [`StatorString`] from `len` UTF-8 bytes at `data`.
+ *
+ * Returns a non-null handle on success. When `data` is null and `len` is
+ * zero, an empty string is returned. When `data` is null and `len` is
+ * non-zero, returns null. The bytes are copied into engine-owned storage and
+ * are not interpreted, validated, or required to be null-terminated.
+ *
+ * # Safety
+ * - `data` must either be null (with `len == 0`) or point to at least `len`
+ *   readable bytes for the duration of this call.
+ */
+struct StatorString *stator_string_new(const char *data, size_t len);
+
+/**
+ * Return a pointer to the UTF-8 bytes held by `string`.
+ *
+ * The returned pointer is valid until `string` is freed and is **not**
+ * guaranteed to be null-terminated. Returns null when `string` is null.
+ *
+ * # Safety
+ * - `string` must be either null or a valid pointer to a live
+ *   [`StatorString`].
+ */
+const char *stator_string_data(const struct StatorString *string);
+
+/**
+ * Return the byte length of `string`.
+ *
+ * Returns `0` when `string` is null.
+ *
+ * # Safety
+ * - `string` must be either null or a valid pointer to a live
+ *   [`StatorString`].
+ */
+size_t stator_string_len(const struct StatorString *string);
+
+/**
+ * Free a [`StatorString`] previously returned by [`stator_string_new`] or
+ * transferred from a host resolver to Stator.
+ *
+ * Passing null is a no-op.
+ *
+ * # Safety
+ * - `string` must either be null or a pointer obtained from
+ *   [`stator_string_new`] that has not already been freed.
+ */
+void stator_string_free(struct StatorString *string);
 
 /**
  * Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
