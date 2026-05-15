@@ -18,6 +18,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use stator_jse::builtins::error::{ErrorKind, JsError};
 use stator_jse::builtins::promise::PromiseState;
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
@@ -30,6 +31,7 @@ use stator_jse::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
 use stator_jse::gc::heap::Heap;
+use stator_jse::host::HostModuleLoader;
 use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
@@ -674,9 +676,10 @@ pub struct StatorContext {
     /// when the context is destroyed.
     embedder_data: Vec<*mut c_void>,
     /// Optional host callback used to resolve static `import` / re-export
-    /// specifiers for this context. The resolver owns its `user_data` cleanup
-    /// contract and is dropped when replaced, cleared, or when the context is
-    /// destroyed.
+    /// specifiers and module-evaluation dynamic `import()` /
+    /// `import.meta.resolve` requests for this context. The resolver owns its
+    /// `user_data` cleanup contract and is dropped when replaced, cleared, or
+    /// when the context is destroyed.
     module_resolver: Option<StatorModuleResolver>,
 }
 
@@ -881,12 +884,21 @@ pub unsafe extern "C" fn stator_context_get_embedder_data(
 /// [`stator_context_destroy`] also drops the active resolver, if any.
 ///
 /// Resolver callbacks are invoked synchronously by [`stator_module_instantiate`]
-/// on the same thread that called into Stator; Stator does not dispatch module
-/// resolution to background worker threads. The callback must not destroy `ctx`,
-/// replace or clear the currently-running resolver, free the `referrer`, or
-/// otherwise re-enter APIs that mutate the same module graph while a resolver
-/// invocation is active. The FFI context/module graph APIs are single-threaded;
-/// embedders must serialize access to a context and its modules.
+/// and, during [`stator_module_evaluate`], by dynamic `import()` and
+/// `import.meta.resolve` on the same thread that called into Stator; Stator does
+/// not dispatch module resolution to background worker threads. Dynamic imports
+/// use the currently-evaluating module as `referrer`, pass an empty attributes
+/// slice, instantiate/evaluate the returned module synchronously, and reject the
+/// import promise with the same typed status/detail mapping used for static
+/// resolver failures. `import.meta.resolve` calls the same resolver and returns
+/// the resolved module's resource name when available, otherwise the original
+/// specifier.
+///
+/// The callback must not destroy `ctx`, replace or clear the currently-running
+/// resolver, free the `referrer`, or otherwise re-enter APIs that mutate the
+/// same module graph while a resolver invocation is active. The FFI
+/// context/module graph APIs are single-threaded; embedders must serialize
+/// access to a context and its modules.
 ///
 /// Returns `true` on successful registration or clear, and `false` for a null
 /// context or malformed clear request.
@@ -4068,6 +4080,124 @@ fn resolver_status_error(
     }
 }
 
+fn js_error_from_stator_error(error: stator_jse::error::StatorError) -> JsError {
+    use stator_jse::error::StatorError;
+    match error {
+        StatorError::TypeError(message) => JsError::new(ErrorKind::TypeError, message),
+        StatorError::SyntaxError(message) => JsError::new(ErrorKind::SyntaxError, message),
+        StatorError::ReferenceError(message) => JsError::new(ErrorKind::ReferenceError, message),
+        StatorError::RangeError(message) => JsError::new(ErrorKind::RangeError, message),
+        StatorError::URIError(message) => JsError::new(ErrorKind::URIError, message),
+        other => JsError::new(ErrorKind::TypeError, other.to_string()),
+    }
+}
+
+struct FfiHostModuleLoader {
+    ctx: *mut StatorContext,
+    referrer: *mut StatorModule,
+}
+
+impl FfiHostModuleLoader {
+    fn resolve_module(&self, specifier: &str) -> Result<*mut StatorModule, Box<JsError>> {
+        if self.ctx.is_null() || self.referrer.is_null() {
+            return Err(Box::new(JsError::new(
+                ErrorKind::TypeError,
+                "module resolver is not installed".to_string(),
+            )));
+        }
+
+        // SAFETY: `ctx` is valid for the active module evaluation and access is
+        // serialized by the FFI contract.
+        let (callback, user_data) = match unsafe { (*self.ctx).module_resolver.as_ref() } {
+            Some(resolver) => (resolver.callback, resolver.user_data),
+            None => {
+                return Err(Box::new(JsError::new(
+                    ErrorKind::TypeError,
+                    "module resolver is not installed".to_string(),
+                )));
+            }
+        };
+
+        // SAFETY: `referrer` is the live module currently being evaluated.
+        let origin = unsafe { module_origin_view(&*self.referrer) };
+        let mut out_module: *mut StatorModule = std::ptr::null_mut();
+        let mut out_error: *mut StatorString = std::ptr::null_mut();
+        let specifier_ptr = specifier.as_ptr() as *const c_char;
+        // SAFETY: resolver registration guarantees the callback remains
+        // callable while installed. `specifier` and `origin` are valid for this
+        // synchronous call, attributes are empty for dynamic import, and out
+        // pointers are valid locals.
+        let status = unsafe {
+            callback(
+                self.ctx,
+                user_data,
+                self.referrer,
+                &origin,
+                specifier_ptr,
+                specifier.len(),
+                std::ptr::null(),
+                0,
+                &mut out_module,
+                &mut out_error,
+            )
+        };
+        // SAFETY: resolver callbacks transfer any non-null detail string to us.
+        let detail = unsafe { take_resolver_error_string(out_error) };
+
+        if status != StatorResolveStatus::StatorResolveStatusOk {
+            return Err(Box::new(js_error_from_stator_error(resolver_status_error(
+                status,
+                specifier,
+                detail.as_deref(),
+            ))));
+        }
+        if out_module.is_null() {
+            return Err(Box::new(js_error_from_stator_error(resolver_status_error(
+                StatorResolveStatus::StatorResolveStatusNotFound,
+                specifier,
+                detail.as_deref(),
+            ))));
+        }
+        Ok(out_module)
+    }
+}
+
+impl HostModuleLoader for FfiHostModuleLoader {
+    fn dynamic_import(&self, specifier: &str, _referrer: Option<&str>) -> Result<JsValue, JsError> {
+        let module = self.resolve_module(specifier).map_err(|error| *error)?;
+        let mut visiting = HashSet::new();
+        // SAFETY: the resolver returned a live module pointer by contract.
+        if let Err(error) = unsafe { instantiate_module_graph(self.ctx, module, &mut visiting) } {
+            return Err(js_error_from_stator_error(error));
+        }
+
+        // SAFETY: the resolver returned a live module pointer by contract.
+        let result = unsafe { stator_module_evaluate(module, self.ctx) };
+        if result.is_null() {
+            // SAFETY: `module` is live for the duration of this synchronous
+            // dynamic import.
+            let error = unsafe { module_stored_error(&*module) };
+            return Err(js_error_from_stator_error(error));
+        }
+        // SAFETY: `stator_module_evaluate` returned a value owned by us.
+        unsafe { stator_value_destroy(result) };
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+            PropertyMap::new(),
+        ))))
+    }
+
+    fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {
+        let module = self.resolve_module(specifier).map_err(|error| *error)?;
+        // SAFETY: the resolver returned a live module pointer by contract.
+        let module_ref = unsafe { &*module };
+        Ok(module_ref
+            .resource_name
+            .as_ref()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| specifier.to_string()))
+    }
+}
+
 fn set_module_link_error(module: &mut StatorModule, error: &stator_jse::error::StatorError) {
     module.status = StatorModuleStatus::StatorModuleStatusErrored;
     module.last_result = None;
@@ -4364,7 +4494,19 @@ pub unsafe extern "C" fn stator_module_evaluate(
         .resource_name
         .as_ref()
         .map(|cs| cs.to_string_lossy().into_owned());
-    let _host_scope = stator_jse::host::HostScope::install(None, module_url.as_deref());
+    let host_loader = if ctx.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `ctx` is valid when non-null.
+        let has_resolver = unsafe { (*ctx).module_resolver.is_some() };
+        has_resolver.then(|| {
+            Rc::new(FfiHostModuleLoader {
+                ctx,
+                referrer: module,
+            }) as Rc<dyn HostModuleLoader>
+        })
+    };
+    let _host_scope = stator_jse::host::HostScope::install(host_loader, module_url.as_deref());
 
     let result = if global_env.borrow().globals_installed {
         Interpreter::run_fast(&bytecodes, &[], global_env)
@@ -11771,6 +11913,47 @@ mod tests {
         data.cleanup_calls += 1;
     }
 
+    struct TestDetailResolverData {
+        status: StatorResolveStatus,
+        detail: &'static str,
+        calls: Vec<String>,
+    }
+
+    unsafe extern "C" fn test_detail_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        _attributes: *const StatorImportAttribute,
+        attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        assert_eq!(attributes_len, 0);
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestDetailResolverData) };
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        data.calls
+            .push(std::str::from_utf8(specifier_bytes).unwrap().to_string());
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_module = std::ptr::null_mut() };
+        }
+        if !out_error.is_null() {
+            let detail = data.detail.as_bytes();
+            // SAFETY: detail bytes are valid for the duration of this call and
+            // `stator_string_new` copies them.
+            unsafe {
+                *out_error = stator_string_new(detail.as_ptr() as *const c_char, detail.len());
+            }
+        }
+        data.status
+    }
+
     struct TestAttributeGateResolverData {
         modules: HashMap<String, *mut StatorModule>,
         expected: Vec<(String, String)>,
@@ -11961,6 +12144,205 @@ mod tests {
             assert!(!stator_module_get_error(module).is_null());
             stator_module_free(module);
         }
+    }
+
+    #[test]
+    fn test_module_evaluate_dynamic_import_uses_ffi_resolver_error_detail() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import('./missing.js');");
+        let mut data = TestDetailResolverData {
+            status: StatorResolveStatus::StatorResolveStatusNetworkError,
+            detail: "offline while fetching",
+            calls: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_detail_resolver_cb),
+                &mut data as *mut TestDetailResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            assert_eq!(data.calls, vec!["./missing.js"]);
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindType
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("failed to fetch module './missing.js'"));
+            assert!(err.contains("offline while fetching"));
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_resolve_routes_to_ffi_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import.meta.resolve('./dep.js');");
+        let dep = compile_module_src("export const value = 1;");
+        let dep_url = c"https://cdn.example.test/dep.js";
+        // SAFETY: `dep` is valid and `dep_url` is a valid C string.
+        unsafe { stator_module_set_origin(dep, dep_url.as_ptr(), 0, 0) };
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(data.calls, vec!["./dep.js"]);
+            let resolved = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(resolved, "https://cdn.example.test/dep.js");
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_resolve_fails_closed_without_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import.meta.resolve('./dep.js');");
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindType
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("import.meta.resolve is not supported by this host"));
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_url_uses_resource_name() {
+        let module = compile_module_src("import.meta.url;");
+        let url = c"https://app.example.test/root.mjs";
+        // SAFETY: `module` is valid and `url` is a valid C string.
+        unsafe { stator_module_set_origin(module, url.as_ptr(), 0, 0) };
+
+        // SAFETY: `module` is non-null and live; null context is documented.
+        unsafe {
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(!result.is_null());
+            let meta_url = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(meta_url, "https://app.example.test/root.mjs");
+            stator_value_destroy(result);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_ffi_resolver_replacement_uses_current_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import.meta.resolve('./dep2.js');");
+        let dep1 = compile_module_src("export const value = 1;");
+        let dep2 = compile_module_src("export const value = 2;");
+        let dep2_url = c"https://cdn.example.test/dep2.js";
+        // SAFETY: `dep2` is valid and `dep2_url` is a valid C string.
+        unsafe { stator_module_set_origin(dep2, dep2_url.as_ptr(), 0, 0) };
+
+        let mut modules1 = HashMap::new();
+        modules1.insert("./dep1.js".to_string(), dep1);
+        let mut data1 = TestGraphResolverData {
+            modules: modules1,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        let mut modules2 = HashMap::new();
+        modules2.insert("./dep2.js".to_string(), dep2);
+        let mut data2 = TestGraphResolverData {
+            modules: modules2,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+
+        // SAFETY: callbacks and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data1 as *mut TestGraphResolverData as *mut c_void,
+                Some(test_graph_resolver_free_user_data),
+            )
+        });
+        // SAFETY: replacing the resolver is permitted outside callback entry.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data2 as *mut TestGraphResolverData as *mut c_void,
+                Some(test_graph_resolver_free_user_data),
+            )
+        });
+        assert_eq!(data1.cleanup_calls, 1);
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert!(data1.calls.is_empty());
+            assert_eq!(data2.calls, vec!["./dep2.js"]);
+            let resolved = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(resolved, "https://cdn.example.test/dep2.js");
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep1);
+            stator_module_free(dep2);
+            stator_context_destroy(ctx);
+        }
+        assert_eq!(data2.cleanup_calls, 1);
     }
 
     #[test]

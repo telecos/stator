@@ -1841,12 +1841,21 @@ void *stator_context_get_embedder_data(const struct StatorContext *ctx, uint32_t
  * [`stator_context_destroy`] also drops the active resolver, if any.
  *
  * Resolver callbacks are invoked synchronously by [`stator_module_instantiate`]
- * on the same thread that called into Stator; Stator does not dispatch module
- * resolution to background worker threads. The callback must not destroy `ctx`,
- * replace or clear the currently-running resolver, free the `referrer`, or
- * otherwise re-enter APIs that mutate the same module graph while a resolver
- * invocation is active. The FFI context/module graph APIs are single-threaded;
- * embedders must serialize access to a context and its modules.
+ * and, during [`stator_module_evaluate`], by dynamic `import()` and
+ * `import.meta.resolve` on the same thread that called into Stator; Stator does
+ * not dispatch module resolution to background worker threads. Dynamic imports
+ * use the currently-evaluating module as `referrer`, pass an empty attributes
+ * slice, instantiate/evaluate the returned module synchronously, and reject the
+ * import promise with the same typed status/detail mapping used for static
+ * resolver failures. `import.meta.resolve` calls the same resolver and returns
+ * the resolved module's resource name when available, otherwise the original
+ * specifier.
+ *
+ * The callback must not destroy `ctx`, replace or clear the currently-running
+ * resolver, free the `referrer`, or otherwise re-enter APIs that mutate the
+ * same module graph while a resolver invocation is active. The FFI
+ * context/module graph APIs are single-threaded; embedders must serialize
+ * access to a context and its modules.
  *
  * Returns `true` on successful registration or clear, and `false` for a null
  * context or malformed clear request.
