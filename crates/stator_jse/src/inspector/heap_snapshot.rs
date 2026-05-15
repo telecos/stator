@@ -293,6 +293,7 @@ impl HeapSnapshotBuilder {
             JsValue::Array(_) => NODE_TYPE_ARRAY,
             JsValue::Object(_) | JsValue::PlainObject(_) => NODE_TYPE_OBJECT,
             JsValue::NativeFunction(_) => NODE_TYPE_NATIVE,
+            JsValue::ModuleBinding(cell) => Self::value_node_type(&cell.read()),
             JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => NODE_TYPE_OBJECT,
             JsValue::Promise(_) => NODE_TYPE_OBJECT,
             JsValue::Context(_) => NODE_TYPE_OBJECT,
@@ -339,6 +340,7 @@ impl HeapSnapshotBuilder {
             JsValue::Object(_) => "Object".to_string(),
             JsValue::PlainObject(_) => "Object".to_string(),
             JsValue::NativeFunction(_) => "NativeFunction".to_string(),
+            JsValue::ModuleBinding(cell) => Self::value_name(&cell.read()),
             JsValue::Generator(_) => "Generator".to_string(),
             JsValue::Iterator(_) => "Iterator".to_string(),
             JsValue::Error(e) => {

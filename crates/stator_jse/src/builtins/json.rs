@@ -1036,6 +1036,7 @@ fn js_value_to_json_inner(
     seen: &mut HashSet<usize>,
 ) -> StatorResult<Option<JsonValue>> {
     match value {
+        JsValue::ModuleBinding(cell) => js_value_to_json_inner(&cell.read(), seen),
         JsValue::Undefined
         | JsValue::TheHole
         | JsValue::Symbol(_)

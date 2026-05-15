@@ -3440,6 +3440,14 @@ fn json_serialize_value(
     in_progress: &mut HashSet<usize>,
 ) -> StatorResult<Option<String>> {
     match value {
+        JsValue::ModuleBinding(cell) => json_serialize_value(
+            &cell.read(),
+            replacer_fn,
+            property_list,
+            indent,
+            depth,
+            in_progress,
+        ),
         JsValue::Undefined
         | JsValue::TheHole
         | JsValue::Symbol(_)
@@ -5449,7 +5457,7 @@ fn make_object() -> JsValue {
                             Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
                         } else if let Some(value) = borrowed.get(&key) {
                             Ok(data_desc(
-                                value.clone(),
+                                value.resolve_live_binding(),
                                 borrowed.is_writable(&key),
                                 borrowed.is_enumerable(&key),
                                 borrowed.is_configurable(&key),

@@ -450,6 +450,7 @@ fn write_str32(buf: &mut Vec<u8>, s: &str) {
 
 fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
     match value {
+        JsValue::ModuleBinding(cell) => write_jsvalue(buf, &cell.read(), ctx),
         JsValue::Undefined => write_u8(buf, TAG_UNDEFINED),
         JsValue::Null => write_u8(buf, TAG_NULL),
         JsValue::Boolean(b) => {

@@ -2041,6 +2041,13 @@ fn handle_create_closure(
         _ => None,
     };
     let func_rc = Rc::new(ba.clone_for_closure(closure_ctx));
+    if let Some(module_url) = crate::host::current_module_url() {
+        fn_props_set(
+            &func_rc,
+            ".module_url".to_string(),
+            JsValue::String(module_url.to_string().into()),
+        );
+    }
 
     // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
     let is_arrow = matches!(instr.operand_at(2), Some(Operand::Flag(1)));
@@ -3878,7 +3885,7 @@ fn handle_lda_named_property(
             && layout as usize == cached_layout
             && let Some(val) = pm.get_by_offset(cached_offset)
         {
-            ctx.frame.accumulator = val.cheap_clone();
+            ctx.frame.accumulator = val.resolve_live_binding();
             return Ok(DispatchAction::Continue);
         }
 
@@ -3893,7 +3900,7 @@ fn handle_lda_named_property(
                 if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
                     && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
                 {
-                    let v = val.cheap_clone();
+                    let v = val.resolve_live_binding();
                     drop(pm);
                     ctx.frame.accumulator = v;
                     return Ok(DispatchAction::Continue);
@@ -3907,7 +3914,7 @@ fn handle_lda_named_property(
                         && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
                         && let Some(val) = proto_pm.get_by_offset(offset as usize)
                     {
-                        let v = val.cheap_clone();
+                        let v = val.resolve_live_binding();
                         drop(proto_pm);
                         drop(pm);
                         ctx.frame.accumulator = v;
@@ -4418,7 +4425,7 @@ fn handle_lda_keyed_property(
             let borrow = map.borrow();
             let key_str = itoa_stack(idx_val as u32);
             if let Some(val) = borrow.get(key_str.as_str()) {
-                let result = val.cheap_clone();
+                let result = val.resolve_live_binding();
                 drop(borrow);
                 ctx.frame.accumulator = result;
                 return Ok(DispatchAction::Continue);
@@ -5213,37 +5220,7 @@ fn handle_debugger(
 }
 
 fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
-    let type_str = match &ctx.frame.accumulator {
-        JsValue::Undefined | JsValue::TheHole => "undefined",
-        JsValue::Null => "object",
-        JsValue::Boolean(_) => "boolean",
-        JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
-        JsValue::String(_) => "string",
-        JsValue::Symbol(_) => "symbol",
-        JsValue::BigInt(_) => "bigint",
-        JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
-        JsValue::Object(_) | JsValue::Array(_) | JsValue::Error(_) => "object",
-        JsValue::PlainObject(map) => {
-            if map.borrow().get("__call__").is_some() {
-                "function"
-            } else {
-                "object"
-            }
-        }
-        JsValue::Generator(_) => "object",
-        JsValue::Iterator(_) => "object",
-        JsValue::Promise(_) => "object",
-        JsValue::Context(_) => "object",
-        JsValue::Proxy(p) => {
-            let proxy = p.borrow();
-            if proxy.is_callable() {
-                "function"
-            } else {
-                "object"
-            }
-        }
-        JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => "object",
-    };
+    let type_str = ctx.frame.accumulator.type_of_name();
     ctx.frame.accumulator = JsValue::String(type_str.to_owned().into());
     Ok(DispatchAction::Continue)
 }
@@ -5351,6 +5328,7 @@ fn handle_to_object(
         | JsValue::ArrayBuffer(_)
         | JsValue::TypedArray(_)
         | JsValue::DataView(_) => ctx.frame.accumulator.cheap_clone(),
+        JsValue::ModuleBinding(cell) => cell.read().to_object()?,
         // ECMAScript §7.1.18 – Boolean wrapper object.
         JsValue::Boolean(b) => {
             let b_val = *b;
@@ -8314,6 +8292,16 @@ fn handle_lda_module_variable(
             ));
         }
     };
+    let specifier = if specifier.is_empty() {
+        match fn_props_get(&ctx.frame.bytecode_array, ".module_url") {
+            JsValue::String(url) => url.to_string(),
+            _ => crate::host::current_module_url()
+                .map(|url| url.to_string())
+                .unwrap_or_default(),
+        }
+    } else {
+        specifier.to_string()
+    };
     let key = format!("__mod:{specifier}:{cell}");
     ctx.frame.accumulator = ctx
         .frame
@@ -8355,8 +8343,25 @@ fn handle_sta_module_variable(
             ));
         }
     };
-    let key = format!("__mod:{specifier}:{cell}");
+    let specifier = if specifier.is_empty() {
+        match fn_props_get(&ctx.frame.bytecode_array, ".module_url") {
+            JsValue::String(url) => url.to_string(),
+            _ => crate::host::current_module_url()
+                .map(|url| url.to_string())
+                .unwrap_or_default(),
+        }
+    } else {
+        specifier.to_string()
+    };
     let val = ctx.frame.accumulator.cheap_clone();
+    if let JsValue::Function(ba) = &val {
+        fn_props_set(
+            ba,
+            ".module_url".to_string(),
+            JsValue::String(specifier.clone().into()),
+        );
+    }
+    let key = format!("__mod:{specifier}:{cell}");
     ctx.frame.global_env.borrow_mut().insert(key, val);
     Ok(DispatchAction::Continue)
 }

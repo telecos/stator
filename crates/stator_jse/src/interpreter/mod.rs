@@ -7327,42 +7327,7 @@ impl Interpreter {
                             }
                             Opcode::TypeOf => {
                                 let type_str = if smi_acc_spilled {
-                                    match &acc {
-                                        JsValue::Undefined | JsValue::TheHole => "undefined",
-                                        JsValue::Null => "object",
-                                        JsValue::Boolean(_) => "boolean",
-                                        JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
-                                        JsValue::String(_) => "string",
-                                        JsValue::Symbol(_) => "symbol",
-                                        JsValue::BigInt(_) => "bigint",
-                                        JsValue::Function(_) | JsValue::NativeFunction(_) => {
-                                            "function"
-                                        }
-                                        JsValue::Object(_)
-                                        | JsValue::Array(_)
-                                        | JsValue::Error(_)
-                                        | JsValue::Generator(_)
-                                        | JsValue::Iterator(_)
-                                        | JsValue::Promise(_)
-                                        | JsValue::Context(_)
-                                        | JsValue::ArrayBuffer(_)
-                                        | JsValue::TypedArray(_)
-                                        | JsValue::DataView(_) => "object",
-                                        JsValue::PlainObject(map) => {
-                                            if map.borrow().get("__call__").is_some() {
-                                                "function"
-                                            } else {
-                                                "object"
-                                            }
-                                        }
-                                        JsValue::Proxy(proxy) => {
-                                            if proxy.borrow().is_callable() {
-                                                "function"
-                                            } else {
-                                                "object"
-                                            }
-                                        }
-                                    }
+                                    acc.type_of_name()
                                 } else if smi_acc_bool {
                                     "boolean"
                                 } else {
@@ -14649,7 +14614,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             };
         }
         if let Some(val) = borrow.get(key) {
-            return val.clone();
+            return val.resolve_live_binding();
         }
         // If this PlainObject is an array literal, delegate to Array.prototype
         // BEFORE falling through to Object.prototype methods (e.g. toString).
@@ -17295,7 +17260,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
             if let Some(val) = borrow.get(key) {
-                return val.clone();
+                return val.resolve_live_binding();
             }
             if borrow.has_accessors
                 && let Some(getter) = borrow.get_getter_for(key).cloned()
@@ -17423,7 +17388,7 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
                 };
             }
             if let Some(val) = borrow.get(key) {
-                return val.clone();
+                return val.resolve_live_binding();
             }
             let next = plain_object_proto_value(&borrow);
             if next.is_none() && is_known_object_prototype_builtin(key) {
@@ -17465,7 +17430,7 @@ fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -
                 };
             }
             if let Some(val) = borrow.get_by_rc(key) {
-                return val.clone();
+                return val.resolve_live_binding();
             }
             let next = plain_object_proto_value(&borrow);
             if next.is_none() && is_known_object_prototype_builtin(key_str) {
@@ -17529,7 +17494,7 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
             };
         }
         if let Some(val) = borrow.get_by_rc(key) {
-            return val.clone();
+            return val.resolve_live_binding();
         }
         if borrow
             .get("__is_array__")

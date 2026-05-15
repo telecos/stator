@@ -182,6 +182,9 @@ struct FunctionCompileOptions {
     /// parent compiler so the inner function can emit context-slot operations
     /// instead of global loads/stores.  Maps variable name → context slot index.
     closure_captures: HashMap<String, u32>,
+    is_module: bool,
+    module_variables: HashMap<String, (u32, i32)>,
+    exported_module_bindings: HashSet<String>,
 }
 
 const CLASS_STATIC_INITIALIZER_SLOT_NAME: &str = "__class_static_initializer__";
@@ -1770,6 +1773,9 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(decl.loc),
                 closure_captures: self.context_bindings.clone(),
+                is_module: self.is_module,
+                module_variables: self.module_variables.clone(),
+                exported_module_bindings: self.exported_module_bindings.clone(),
             },
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
@@ -3508,6 +3514,12 @@ impl FunctionCompiler {
                     vec![Operand::ConstantPoolIdx(name_idx)],
                 ));
             }
+        } else if self.is_module && self.exported_module_bindings.contains(name) {
+            let (req_idx, cell) = self.get_or_create_module_variable("", name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaModuleVariable,
+                vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+            ));
         } else {
             let name_idx = self.add_string(name);
             if self.with_depth > 0 {
@@ -3623,6 +3635,8 @@ impl FunctionCompiler {
             } else {
                 self.emit_star(binding.reg);
             }
+            self.emit_exported_module_write_through(name);
+        } else if self.is_module && self.exported_module_bindings.contains(name) {
             self.emit_exported_module_write_through(name);
         } else {
             let name_idx = self.add_string(name);
@@ -5117,6 +5131,9 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                is_module: self.is_module,
+                module_variables: self.module_variables.clone(),
+                exported_module_bindings: self.exported_module_bindings.clone(),
             },
         )?;
         let func_array = if let Some(name) = self_name {
@@ -5161,6 +5178,9 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                is_module: self.is_module,
+                module_variables: self.module_variables.clone(),
+                exported_module_bindings: self.exported_module_bindings.clone(),
             },
         )?
         .with_function_name(name);
@@ -5210,6 +5230,9 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                is_module: self.is_module,
+                module_variables: self.module_variables.clone(),
+                exported_module_bindings: self.exported_module_bindings.clone(),
             },
         )?
         .with_arrow_flag(true)
@@ -5291,6 +5314,9 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                is_module: self.is_module,
+                module_variables: self.module_variables.clone(),
+                exported_module_bindings: self.exported_module_bindings.clone(),
             },
         )?
         .with_arrow_flag(true);
@@ -7231,6 +7257,9 @@ fn compile_function_with_private_names(
             source_text: None,
             source_span: None,
             closure_captures: HashMap::new(),
+            is_module: false,
+            module_variables: HashMap::new(),
+            exported_module_bindings: HashSet::new(),
         },
     )
 }
@@ -8220,10 +8249,17 @@ fn compile_function_inner(
         source_text,
         source_span,
         closure_captures,
+        is_module,
+        module_variables,
+        exported_module_bindings,
     } = options;
     compiler.private_names = private_names;
     compiler.source_text = source_text;
     compiler.closure_captures = closure_captures;
+    compiler.is_module = is_module;
+    let _ = module_variables;
+    compiler.module_variables = HashMap::new();
+    compiler.exported_module_bindings = exported_module_bindings;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,

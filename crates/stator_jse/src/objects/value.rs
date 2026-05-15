@@ -221,6 +221,34 @@ impl NativeIterator {
 /// Used by [`JsValue::NativeFunction`].
 pub type NativeFn = Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>>;
 
+/// Internal read-through cell for values backed by a module live binding.
+#[derive(Clone)]
+pub struct ModuleBindingCell {
+    /// Shared global environment containing the backing module cell.
+    pub global_env: Rc<RefCell<crate::interpreter::GlobalEnv>>,
+    /// Global-environment key for the backing module cell.
+    pub key: Rc<str>,
+}
+
+impl std::fmt::Debug for ModuleBindingCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleBindingCell")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModuleBindingCell {
+    /// Read the current value from the backing module binding.
+    pub fn read(&self) -> JsValue {
+        self.global_env
+            .borrow()
+            .get(&self.key)
+            .cloned()
+            .unwrap_or(JsValue::Undefined)
+    }
+}
+
 /// Hint for the [`JsValue::to_primitive`] abstract operation (ECMAScript §7.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToPrimitiveHint {
@@ -323,6 +351,8 @@ pub enum JsValue {
     /// Used to expose host-provided functionality (e.g. `console.log`,
     /// `print`) to JavaScript code without compiling a bytecode body.
     NativeFunction(NativeFn),
+    /// Internal live module binding read-through value.
+    ModuleBinding(Rc<ModuleBindingCell>),
     /// A lightweight property map representing a plain JavaScript object.
     ///
     /// Each property carries [`PropertyAttributes`] flags alongside its
@@ -503,6 +533,7 @@ impl std::fmt::Debug for JsValue {
             Self::Iterator(i) => write!(f, "Iterator({i:?})"),
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::NativeFunction(_) => write!(f, "NativeFunction"),
+            Self::ModuleBinding(cell) => write!(f, "ModuleBinding({cell:?})"),
             Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
             Self::Promise(p) => write!(f, "Promise({:?})", p.state()),
             Self::Context(ctx) => write!(f, "Context({ctx:?})"),
@@ -542,6 +573,7 @@ impl PartialEq for JsValue {
             (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
             // NativeFunction has no comparable content; use pointer identity.
             (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
+            (Self::ModuleBinding(a), Self::ModuleBinding(b)) => Rc::ptr_eq(a, b),
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
             (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
@@ -796,6 +828,15 @@ impl JsValue {
         }
     }
 
+    /// Resolve an internal live module binding to its current value.
+    #[inline]
+    pub fn resolve_live_binding(&self) -> Self {
+        match self {
+            Self::ModuleBinding(cell) => cell.read(),
+            _ => self.cheap_clone(),
+        }
+    }
+
     /// Clone a value that is known to be stack-only.
     ///
     /// # Safety
@@ -942,7 +983,47 @@ impl JsValue {
             | Self::ArrayBuffer(_)
             | Self::TypedArray(_)
             | Self::DataView(_) => true,
+            Self::ModuleBinding(cell) => cell.read().to_boolean(),
             Self::BigInt(n) => **n != 0,
+        }
+    }
+
+    /// Return the ECMAScript `typeof` result string for this value.
+    pub fn type_of_name(&self) -> &'static str {
+        match self {
+            Self::Undefined | Self::TheHole => "undefined",
+            Self::Null => "object",
+            Self::Boolean(_) => "boolean",
+            Self::Smi(_) | Self::HeapNumber(_) => "number",
+            Self::String(_) => "string",
+            Self::Symbol(_) => "symbol",
+            Self::BigInt(_) => "bigint",
+            Self::Function(_) | Self::NativeFunction(_) => "function",
+            Self::PlainObject(map) => {
+                if map.borrow().get("__call__").is_some() {
+                    "function"
+                } else {
+                    "object"
+                }
+            }
+            Self::Proxy(proxy) => {
+                if proxy.borrow().is_callable() {
+                    "function"
+                } else {
+                    "object"
+                }
+            }
+            Self::ModuleBinding(cell) => cell.read().type_of_name(),
+            Self::Object(_)
+            | Self::Array(_)
+            | Self::Error(_)
+            | Self::Generator(_)
+            | Self::Iterator(_)
+            | Self::Promise(_)
+            | Self::Context(_)
+            | Self::ArrayBuffer(_)
+            | Self::TypedArray(_)
+            | Self::DataView(_) => "object",
         }
     }
 
@@ -972,6 +1053,7 @@ impl JsValue {
 
             // TheHole is an internal sentinel — treat as undefined.
             Self::TheHole => Ok(JsValue::Undefined),
+            Self::ModuleBinding(cell) => cell.read().to_primitive(hint),
 
             // Object-like values: @@toPrimitive, then OrdinaryToPrimitive.
             _ => {
@@ -1026,6 +1108,7 @@ impl JsValue {
             Self::BigInt(_) => Err(StatorError::TypeError(
                 "Cannot convert a BigInt value to a number".to_string(),
             )),
+            Self::ModuleBinding(cell) => cell.read().to_number(),
             // Object-like types: ToPrimitive(input, number) then ToNumber.
             _ => {
                 let prim = self.to_primitive(ToPrimitiveHint::Number)?;
@@ -1053,6 +1136,7 @@ impl JsValue {
                 "Cannot convert a Symbol value to a string".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
+            Self::ModuleBinding(cell) => cell.read().to_js_string(),
             // Array.prototype.toString — join elements with ",".
             // Handles the common case directly without a ToPrimitive roundtrip.
             Self::Array(items) => {
@@ -1366,6 +1450,11 @@ impl JsValue {
     /// * `NaN` is considered equal to `NaN`.
     /// * `+0` is **not** considered equal to `-0`.
     pub fn same_value(&self, other: &JsValue) -> bool {
+        if matches!(self, Self::ModuleBinding(_)) || matches!(other, Self::ModuleBinding(_)) {
+            return self
+                .resolve_live_binding()
+                .same_value(&other.resolve_live_binding());
+        }
         match (self, other) {
             (Self::HeapNumber(x), Self::HeapNumber(y)) => {
                 if x.is_nan() && y.is_nan() {
@@ -1399,6 +1488,11 @@ impl JsValue {
     /// Like [`same_value`](Self::same_value) except `+0` **is** considered
     /// equal to `-0`.  Used by `Map`, `Set`, and `Array.prototype.includes`.
     pub fn same_value_zero(&self, other: &JsValue) -> bool {
+        if matches!(self, Self::ModuleBinding(_)) || matches!(other, Self::ModuleBinding(_)) {
+            return self
+                .resolve_live_binding()
+                .same_value_zero(&other.resolve_live_binding());
+        }
         match (self, other) {
             (Self::HeapNumber(x), Self::HeapNumber(y)) => {
                 if x.is_nan() && y.is_nan() {
@@ -1622,6 +1716,13 @@ impl Trace for JsValue {
             // GC heap pointers — only Strings, Rc-reference-counted JsErrors,
             // and an ErrorKind enum.  Nothing to report to the tracer.
             Self::Error(_) => {}
+            Self::ModuleBinding(cell) => {
+                if let Ok(env) = cell.global_env.try_borrow()
+                    && let Some(value) = env.get(&cell.key)
+                {
+                    value.trace(tracer);
+                }
+            }
             // JsPromise uses Rc<RefCell<_>> internally with no raw GC pointers.
             Self::Promise(_) => {}
             // JsProxy uses Rc<RefCell<_>> internally with no raw GC pointers.
