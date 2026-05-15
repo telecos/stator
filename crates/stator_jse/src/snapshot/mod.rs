@@ -408,6 +408,28 @@ pub fn deserialize_globals(bytes: &[u8]) -> StatorResult<HashMap<String, JsValue
     Ok(globals)
 }
 
+/// Serialize a single [`BytecodeArray`] (and its constant pool, including any
+/// nested function templates) into a self-contained byte buffer.
+///
+/// The encoding is the same `BytecodeArray` payload used by
+/// [`serialize_globals`], with no surrounding magic header or checksum: callers
+/// (e.g. the FFI module code-cache layer) supply their own outer framing,
+/// engine version checks, and source identity validation.
+pub fn serialize_bytecode_array(ba: &BytecodeArray) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_bytecode_array(&mut buf, ba);
+    buf
+}
+
+/// Deserialize a [`BytecodeArray`] produced by [`serialize_bytecode_array`].
+///
+/// `cursor` is advanced past the consumed bytes. Returns
+/// [`StatorError::Internal`] if the buffer is truncated or contains invalid
+/// constant pool tags.
+pub fn deserialize_bytecode_array(bytes: &[u8], cursor: &mut usize) -> StatorResult<BytecodeArray> {
+    read_bytecode_array(bytes, cursor)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Write helpers
 // ─────────────────────────────────────────────────────────────────────────────

@@ -153,13 +153,20 @@ typedef enum StatorModuleType {
  */
 typedef enum StatorModuleCacheStatus {
   /**
-   * Operation succeeded and produced a validated metadata cache blob.
+   * Operation succeeded and produced a versioned cache blob containing
+   * validation metadata, the module's import/export shape, and serialized
+   * bytecode that [`stator_module_compile_cached`] can restore without
+   * re-parsing or regenerating bytecode.
    */
   StatorModuleCacheStatusProducedMetadata = 0,
   /**
-   * Cache blob matched, but Stator recompiled because bytecode serialization
-   * is not available yet. This avoids silently pretending to consume
-   * executable cached bytecode.
+   * Legacy status — emitted by older Stator builds when a cache blob
+   * matched but bytecode serialization was unavailable, forcing a
+   * reparse. The current build always produces a parser-skip result on
+   * success and reports
+   * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`]
+   * instead. Retained for stable persisted numbering and embedder
+   * compatibility.
    */
   StatorModuleCacheStatusAcceptedValidatedRecompiled = 1,
   /**
@@ -178,6 +185,12 @@ typedef enum StatorModuleCacheStatus {
    * Full bytecode/object serialization is unsupported by this engine build.
    */
   StatorModuleCacheStatusUnsupported = 5,
+  /**
+   * Cache blob matched and Stator restored the module's bytecode and
+   * import/export shape directly from it, skipping parsing and bytecode
+   * generation.
+   */
+  StatorModuleCacheStatusAcceptedBytecodeRestored = 6,
 } StatorModuleCacheStatus;
 
 /**
@@ -2676,13 +2689,14 @@ struct StatorModule *stator_module_compile_with_options(struct StatorContext *ct
 /**
  * Create an engine-owned module cache blob for `module` and `source`.
  *
- * The returned [`StatorString`] owns an opaque metadata cache record. It is not
- * serialized bytecode: Stator does not yet expose safe bytecode/object
- * serialization. Consumers must inspect `out_status`; successful production
- * reports [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`].
- * Later [`stator_module_compile_cached`] validates the blob against the source
- * hash, engine version, module type, resource name, and browser policy options,
- * then explicitly reports that it recompiled from source after validation.
+ * The returned [`StatorString`] owns a versioned cache blob containing
+ * validation metadata (engine crate version, source hash/length, module type,
+ * resource name/offsets, and browser policy options) plus the compiled
+ * bytecode and the module's static import/export shape. On a successful
+ * production [`out_status`] is set to
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`]; a
+ * later [`stator_module_compile_cached`] call uses the blob to restore the
+ * module without re-parsing or regenerating bytecode.
  *
  * # Safety
  * - `module` must be either null or a valid, live [`StatorModule`] pointer.
@@ -2698,14 +2712,16 @@ struct StatorString *stator_module_create_code_cache(const struct StatorModule *
  * Compile a module from `source` using a previously-produced cache blob.
  *
  * The cache is accepted only when its magic, format version, engine crate
- * version, source length/hash, module type, resource name, offsets, and browser
- * policy options all match. Malformed, stale, or incompatible blobs fail
- * closed by returning an errored [`StatorModule`] and reporting
- * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. Accepted blobs
- * currently report
- * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`]
- * because Stator lacks full bytecode serialization; embedders get explicit
- * telemetry instead of a silent reparse.
+ * version, source length/hash, module type, resource name, offsets, and
+ * browser policy options all match. Malformed, stale, or incompatible blobs
+ * fail closed by returning an errored [`StatorModule`] and reporting
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. On a clean
+ * match Stator deserializes the module's bytecode and import/export shape
+ * from the blob — skipping parsing and bytecode generation — and reports
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`].
+ * The returned module behaves identically to a freshly-compiled one for
+ * linking, dynamic import, `import.meta.url`, live bindings, and TLA
+ * fail-closed evaluation.
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -2714,7 +2730,7 @@ struct StatorString *stator_module_create_code_cache(const struct StatorModule *
  * - `options`, when non-null, must point to readable compile options.
  * - `out_status`, when non-null, must be valid for one status write.
  */
-struct StatorModule *stator_module_compile_cached(struct StatorContext *ctx,
+struct StatorModule *stator_module_compile_cached(struct StatorContext *_ctx,
                                                   const char *source,
                                                   size_t source_len,
                                                   const char *cache_data,
