@@ -16034,7 +16034,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                         "queueMicrotask: argument must be a function".into(),
                     ));
                 }
-                dispatch_call_value(cb, vec![])?;
+                let cb = cb.clone();
+                let queued_cb = cb.clone();
+                if !crate::builtins::promise::enqueue_active_microtask(Box::new(move || {
+                    let _ = dispatch_call_value(&queued_cb, vec![]);
+                })) {
+                    dispatch_call_value(&cb, vec![])?;
+                }
                 Ok(JsValue::Undefined)
             }),
         );
@@ -37004,11 +37010,15 @@ mod tests {
 
     #[test]
     fn e2e_queue_microtask_runs_callback() {
-        let result = global_eval(
-            "var order = []; queueMicrotask(function () { order.push('microtask'); }); order[0]",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("microtask".into()));
+        let result =
+            global_eval("var order = []; queueMicrotask(function () { order.push('microtask'); }); order.length")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+        drain_microtasks();
+        assert_eq!(
+            global_eval("order[0]").unwrap(),
+            JsValue::String("microtask".into())
+        );
     }
 
     #[test]
@@ -37021,14 +37031,30 @@ mod tests {
     fn e2e_queue_microtask_accepts_arrow_function() {
         let result =
             global_eval("var value = 0; queueMicrotask(() => { value = 3; }); value").unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        assert_eq!(result, JsValue::Smi(0));
+        drain_microtasks();
+        assert_eq!(global_eval("value").unwrap(), JsValue::Smi(3));
     }
 
     #[test]
-    fn e2e_queue_microtask_propagates_errors() {
+    fn e2e_queue_microtask_errors_do_not_throw_synchronously() {
         assert_eval_true(
-            "try { queueMicrotask(function () { throw new Error('boom'); }); false; } catch (e) { e.message === 'boom'; }",
+            "var caught = false; try { queueMicrotask(function () { throw new Error('boom'); }); } catch (e) { caught = true; } caught === false",
         );
+        drain_microtasks();
+    }
+
+    #[test]
+    fn e2e_queue_microtask_uses_fifo_order_with_promises() {
+        global_eval(
+            "var order = [];
+             queueMicrotask(function () { order.push('queue-1'); });
+             Promise.resolve().then(function () { order.push('promise'); });
+             queueMicrotask(function () { order.push('queue-2'); });",
+        )
+        .unwrap();
+        drain_microtasks();
+        assert_eval_true("order.join(',') === 'queue-1,promise,queue-2'");
     }
 
     #[test]
