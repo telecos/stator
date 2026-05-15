@@ -20,12 +20,20 @@
 //!
 //! # Byte input format
 //!
-//! Because this engine has no `Uint8Array` or `ArrayBuffer`, Wasm byte inputs
-//! are accepted in two forms:
+//! Per the WebAssembly JS API, Wasm entry points accept a `BufferSource`
+//! (ArrayBuffer or any ArrayBufferView).  Stator additionally accepts a few
+//! convenience forms for environments that don't construct buffers directly:
 //!
+//! - **`JsValue::ArrayBuffer`** — bytes copied from `[0, byteLength)`.
+//! - **`JsValue::TypedArray`** — bytes copied from the underlying buffer,
+//!   honouring `byteOffset` and the (possibly auto-tracked) byte length.
+//! - **`JsValue::DataView`** — bytes copied from the underlying buffer,
+//!   honouring `byteOffset` and `byteLength`.
 //! - **`JsValue::Array` of `Smi`/`HeapNumber` values (0–255)** — raw binary.
 //! - **`JsValue::String`** — WebAssembly Text Format (WAT); compiled via
 //!   Wasmtime's built-in WAT parser.
+//!
+//! Detached `ArrayBuffer`s (and views over them) raise a `TypeError`.
 //!
 //! # Object representation
 //!
@@ -65,18 +73,76 @@ fn is_wat(bytes: &[u8]) -> bool {
     !bytes.starts_with(b"\0asm")
 }
 
-/// Extract a `Vec<u8>` from a [`JsValue`].
+/// Extract a `Vec<u8>` from a [`JsValue`] for use as Wasm source bytes.
 ///
-/// - `JsValue::Array` of `Smi`/`HeapNumber` → raw bytes (each value clamped to
-///   0–255).
+/// Accepts the WebAssembly JS API `BufferSource` shapes plus a couple of
+/// engine-specific conveniences:
+///
+/// - `JsValue::ArrayBuffer` → a copy of the buffer's bytes.
+/// - `JsValue::TypedArray` → a copy of the bytes covered by the view
+///   (`byteOffset .. byteOffset + byteLength`).
+/// - `JsValue::DataView` → a copy of the bytes covered by the view
+///   (`byteOffset .. byteOffset + byteLength`).
+/// - `JsValue::Array` of `Smi`/`HeapNumber` → raw bytes (each value in 0–255).
 /// - `JsValue::String` → UTF-8 encoding of the string (treated as WAT source).
 ///
 /// # Errors
 ///
-/// Returns [`StatorError::TypeError`] if `val` is neither an array nor a string,
-/// or if an array element is not a number in `[0, 255]`.
+/// Returns [`StatorError::TypeError`] if `val` is not one of the supported
+/// shapes, if an array element is not a number in `[0, 255]`, or if an
+/// `ArrayBuffer` (or the buffer backing a view) is detached.  Returns
+/// [`StatorError::RangeError`] if a view's `byteOffset`/`byteLength` extends
+/// past the end of its underlying buffer.
 fn bytes_from_js_value(val: &JsValue) -> StatorResult<Vec<u8>> {
     match val {
+        JsValue::ArrayBuffer(buf) => {
+            let buf = buf.borrow();
+            if buf.detached {
+                return Err(StatorError::TypeError(
+                    "WebAssembly source ArrayBuffer is detached".into(),
+                ));
+            }
+            Ok(buf.data.clone())
+        }
+        JsValue::TypedArray(ta) => {
+            let ta = ta.borrow();
+            let buf = ta.buffer.borrow();
+            if buf.detached {
+                return Err(StatorError::TypeError(
+                    "WebAssembly source TypedArray is backed by a detached ArrayBuffer".into(),
+                ));
+            }
+            let byte_len = ta.effective_byte_length();
+            let start = ta.byte_offset;
+            let end = start
+                .checked_add(byte_len)
+                .ok_or_else(|| StatorError::RangeError("TypedArray range overflow".into()))?;
+            if end > buf.data.len() {
+                return Err(StatorError::RangeError(
+                    "WebAssembly source TypedArray extends past end of ArrayBuffer".into(),
+                ));
+            }
+            Ok(buf.data[start..end].to_vec())
+        }
+        JsValue::DataView(dv) => {
+            let dv = dv.borrow();
+            let buf = dv.buffer.borrow();
+            if buf.detached {
+                return Err(StatorError::TypeError(
+                    "WebAssembly source DataView is backed by a detached ArrayBuffer".into(),
+                ));
+            }
+            let start = dv.byte_offset;
+            let end = start
+                .checked_add(dv.byte_length)
+                .ok_or_else(|| StatorError::RangeError("DataView range overflow".into()))?;
+            if end > buf.data.len() {
+                return Err(StatorError::RangeError(
+                    "WebAssembly source DataView extends past end of ArrayBuffer".into(),
+                ));
+            }
+            Ok(buf.data[start..end].to_vec())
+        }
         JsValue::Array(items) => {
             let mut bytes = Vec::with_capacity(items.borrow().len());
             for (i, item) in items.borrow().iter().enumerate() {
@@ -100,7 +166,7 @@ fn bytes_from_js_value(val: &JsValue) -> StatorResult<Vec<u8>> {
         }
         JsValue::String(s) => Ok(s.as_bytes().to_vec()),
         other => Err(StatorError::TypeError(format!(
-            "WebAssembly source must be an Array of bytes or a WAT string, got {other:?}"
+            "WebAssembly source must be an ArrayBuffer, ArrayBufferView, Array of bytes, or WAT string, got {other:?}"
         ))),
     }
 }
@@ -925,6 +991,154 @@ mod tests {
         let arr = JsValue::new_array(vec![JsValue::Smi(256)]);
         let err = bytes_from_js_value(&arr).unwrap_err();
         assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    // ── bytes_from_js_value: ArrayBuffer / TypedArray / DataView ──────────────
+
+    fn make_buffer(bytes: &[u8]) -> Rc<RefCell<crate::builtins::typed_array::JsArrayBuffer>> {
+        let mut buf = crate::builtins::typed_array::arraybuffer_new(bytes.len());
+        buf.data.copy_from_slice(bytes);
+        Rc::new(RefCell::new(buf))
+    }
+
+    #[test]
+    fn test_bytes_from_arraybuffer() {
+        let buf = make_buffer(&[0x00, 0x61, 0x73, 0x6d]);
+        let val = JsValue::ArrayBuffer(buf);
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![0x00, 0x61, 0x73, 0x6d]);
+    }
+
+    #[test]
+    fn test_bytes_from_detached_arraybuffer_errors() {
+        let buf = make_buffer(&[1, 2, 3]);
+        buf.borrow_mut().detached = true;
+        let err = bytes_from_js_value(&JsValue::ArrayBuffer(buf)).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_bytes_from_typed_array_full_view() {
+        let buf = make_buffer(&[10, 20, 30, 40]);
+        let ta = crate::builtins::typed_array::JsTypedArray {
+            buffer: buf,
+            kind: crate::builtins::typed_array::TypedArrayKind::Uint8,
+            byte_offset: 0,
+            length: 4,
+            auto_length: false,
+        };
+        let val = JsValue::TypedArray(Rc::new(RefCell::new(ta)));
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_bytes_from_typed_array_subarray_with_offset() {
+        let buf = make_buffer(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let ta = crate::builtins::typed_array::JsTypedArray {
+            buffer: buf,
+            kind: crate::builtins::typed_array::TypedArrayKind::Uint8,
+            byte_offset: 2,
+            length: 4,
+            auto_length: false,
+        };
+        let val = JsValue::TypedArray(Rc::new(RefCell::new(ta)));
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_bytes_from_typed_array_multibyte_element() {
+        // Uint16Array of length 2 starting at byte_offset 2 over an 8-byte buffer:
+        // covers bytes [2..6).
+        let buf = make_buffer(&[0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04, 0xCC, 0xDD]);
+        let ta = crate::builtins::typed_array::JsTypedArray {
+            buffer: buf,
+            kind: crate::builtins::typed_array::TypedArrayKind::Uint16,
+            byte_offset: 2,
+            length: 2,
+            auto_length: false,
+        };
+        let val = JsValue::TypedArray(Rc::new(RefCell::new(ta)));
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_bytes_from_typed_array_detached_buffer_errors() {
+        let buf = make_buffer(&[1, 2, 3, 4]);
+        let ta = crate::builtins::typed_array::JsTypedArray {
+            buffer: Rc::clone(&buf),
+            kind: crate::builtins::typed_array::TypedArrayKind::Uint8,
+            byte_offset: 0,
+            length: 4,
+            auto_length: false,
+        };
+        buf.borrow_mut().detached = true;
+        let err = bytes_from_js_value(&JsValue::TypedArray(Rc::new(RefCell::new(ta)))).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_bytes_from_dataview_full() {
+        let buf = make_buffer(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let dv = crate::builtins::typed_array::dataview_new(buf, 0, None).unwrap();
+        let val = JsValue::DataView(Rc::new(RefCell::new(dv)));
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_bytes_from_dataview_with_offset_and_length() {
+        let buf = make_buffer(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let dv = crate::builtins::typed_array::dataview_new(buf, 3, Some(4)).unwrap();
+        let val = JsValue::DataView(Rc::new(RefCell::new(dv)));
+        let bytes = bytes_from_js_value(&val).unwrap();
+        assert_eq!(bytes, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_bytes_from_dataview_detached_buffer_errors() {
+        let buf = make_buffer(&[1, 2, 3, 4]);
+        let dv = crate::builtins::typed_array::dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        buf.borrow_mut().detached = true;
+        let err = bytes_from_js_value(&JsValue::DataView(Rc::new(RefCell::new(dv)))).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_validate_accepts_arraybuffer_input() {
+        let buf = make_buffer(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+        let result = wasm_validate(vec![JsValue::ArrayBuffer(buf)]).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_validate_accepts_typed_array_subview() {
+        // Pad the magic bytes so we can exercise byte_offset.
+        let mut data = vec![0xFFu8, 0xFFu8];
+        data.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+        let buf = make_buffer(&data);
+        let ta = crate::builtins::typed_array::JsTypedArray {
+            buffer: buf,
+            kind: crate::builtins::typed_array::TypedArrayKind::Uint8,
+            byte_offset: 2,
+            length: 8,
+            auto_length: false,
+        };
+        let result = wasm_validate(vec![JsValue::TypedArray(Rc::new(RefCell::new(ta)))]).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_validate_accepts_dataview_subrange() {
+        let mut data = vec![0xCCu8];
+        data.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+        data.push(0xCC);
+        let buf = make_buffer(&data);
+        let dv = crate::builtins::typed_array::dataview_new(buf, 1, Some(8)).unwrap();
+        let result = wasm_validate(vec![JsValue::DataView(Rc::new(RefCell::new(dv)))]).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── is_wat ───────────────────────────────────────────────────────────────

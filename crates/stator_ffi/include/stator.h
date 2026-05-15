@@ -12,59 +12,6 @@
 #include <stdlib.h>
 
 /**
- * Stable status code returned by typed-accessor and Maybe-style FFI entry
- * points so that C callers can distinguish a missing value, an invalid
- * argument, an unsupported operation, and a JavaScript exception without
- * reaching for out-of-band channels.
- *
- * Variants:
- * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
- *   out-pointer was written.
- * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
- *   a structural "no" answer (e.g. property missing, type mismatch on a
- *   typed get).  Out-pointers are left untouched or zero-cleared, never
- *   carrying a stale value.
- * * [`StatorStatusException`][Self::StatorStatusException] — the operation
- *   raised (or captured) a JavaScript exception.  When applicable, the
- *   isolate's pending exception is populated and can be inspected through
- *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
- * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
- *   required argument was null or otherwise malformed; nothing was mutated.
- * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
- *   operation is well-formed but not yet implemented for this kind of
- *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
- *   discriminants are stable; embedders should treat unknown values as
- *   `StatorStatusUnsupported`.
- *
- * Backed by a C `int`-shaped enum so the discriminants are stable across
- * the C ABI and can be compared by value from C/C++.
- */
-typedef enum StatorStatus {
-  /**
-   * Operation succeeded.
-   */
-  StatorStatusOk = 0,
-  /**
-   * Operation succeeded with a structural "no" answer (missing property,
-   * type mismatch on a typed accessor).
-   */
-  StatorStatusFalse = 1,
-  /**
-   * A JavaScript exception was raised or captured.  The isolate's pending
-   * exception is set when this is returned by a Maybe-style API.
-   */
-  StatorStatusException = 2,
-  /**
-   * At least one argument was null or malformed.
-   */
-  StatorStatusInvalidArg = 3,
-  /**
-   * The operation is not supported for this value/object kind.
-   */
-  StatorStatusUnsupported = 4,
-} StatorStatus;
-
-/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -129,6 +76,59 @@ typedef enum StatorMessageKind {
    */
   StatorMessageKindSandboxViolation = 11,
 } StatorMessageKind;
+
+/**
+ * Stable status code returned by typed-accessor and Maybe-style FFI entry
+ * points so that C callers can distinguish a missing value, an invalid
+ * argument, an unsupported operation, and a JavaScript exception without
+ * reaching for out-of-band channels.
+ *
+ * Variants:
+ * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+ *   out-pointer was written.
+ * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+ *   a structural "no" answer (e.g. property missing, type mismatch on a
+ *   typed get).  Out-pointers are left untouched or zero-cleared, never
+ *   carrying a stale value.
+ * * [`StatorStatusException`][Self::StatorStatusException] — the operation
+ *   raised (or captured) a JavaScript exception.  When applicable, the
+ *   isolate's pending exception is populated and can be inspected through
+ *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
+ * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+ *   required argument was null or otherwise malformed; nothing was mutated.
+ * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+ *   operation is well-formed but not yet implemented for this kind of
+ *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
+ *   discriminants are stable; embedders should treat unknown values as
+ *   `StatorStatusUnsupported`.
+ *
+ * Backed by a C `int`-shaped enum so the discriminants are stable across
+ * the C ABI and can be compared by value from C/C++.
+ */
+typedef enum StatorStatus {
+  /**
+   * Operation succeeded.
+   */
+  StatorStatusOk = 0,
+  /**
+   * Operation succeeded with a structural "no" answer (missing property,
+   * type mismatch on a typed accessor).
+   */
+  StatorStatusFalse = 1,
+  /**
+   * A JavaScript exception was raised or captured.  The isolate's pending
+   * exception is set when this is returned by a Maybe-style API.
+   */
+  StatorStatusException = 2,
+  /**
+   * At least one argument was null or malformed.
+   */
+  StatorStatusInvalidArg = 3,
+  /**
+   * The operation is not supported for this value/object kind.
+   */
+  StatorStatusUnsupported = 4,
+} StatorStatus;
 
 /**
  * C-ABI Wasm value kind used by host-import marshalling.
@@ -350,6 +350,15 @@ typedef struct StatorIsolate StatorIsolate;
  * [`stator_message_destroy`].
  */
 typedef struct StatorMessage StatorMessage;
+
+/**
+ * A browser-facing compiled ES module record.
+ *
+ * Created by [`stator_module_compile`] and released by [`stator_module_free`].
+ * The handle owns parsed/compiled module bytecode and origin metadata, but it
+ * does not perform module linking, import resolution, or evaluation yet.
+ */
+typedef struct StatorModule StatorModule;
 
 /**
  * An opaque handle to a JavaScript object.
@@ -2086,6 +2095,26 @@ struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
                                            size_t source_len);
 
 /**
+ * Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
+ *
+ * Returns a non-null [`StatorModule`] pointer in all cases (even on error).
+ * Call [`stator_module_get_error`] to check whether compilation succeeded.
+ * The caller must eventually pass the returned pointer to
+ * [`stator_module_free`].
+ *
+ * This API intentionally stops at creating a module-record-like handle: it
+ * parses with module semantics and compiles module bytecode, but does not
+ * resolve imports, link dependencies, or evaluate the module.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ */
+struct StatorModule *stator_module_compile(struct StatorContext *_ctx,
+                                           const char *source,
+                                           size_t source_len);
+
+/**
  * Return a null-terminated error message if `script` compiled with an error.
  *
  * Returns a null pointer when `script` compiled successfully.  The returned
@@ -2226,6 +2255,98 @@ void stator_script_reset_jit_deopts(struct StatorScript *script);
  * and must not be used again after this call.
  */
 void stator_script_free(struct StatorScript *script);
+
+/**
+ * Return a null-terminated error message if `module` compiled with an error.
+ *
+ * Returns a null pointer when `module` compiled successfully. The returned
+ * pointer is valid as long as `module` is alive.
+ *
+ * # Safety
+ * `module` must be a non-null pointer returned by [`stator_module_compile`].
+ */
+const char *stator_module_get_error(const struct StatorModule *module);
+
+/**
+ * Return the structured [`StatorMessageKind`] of `module`'s compile error.
+ *
+ * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+ * compiled successfully or is null.
+ *
+ * # Safety
+ * `module` must be either null or a valid pointer to a live [`StatorModule`].
+ */
+enum StatorMessageKind stator_module_error_kind(const struct StatorModule *module);
+
+/**
+ * Attach origin metadata (resource name and offsets) to `module`.
+ *
+ * `resource_name` may be null to clear an existing name; otherwise it must be
+ * a valid, null-terminated UTF-8 C string. The contents are copied.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - When non-null, `resource_name` must be a valid, null-terminated UTF-8
+ *   C string.
+ */
+void stator_module_set_origin(struct StatorModule *module,
+                              const char *resource_name,
+                              int32_t line_offset,
+                              int32_t column_offset);
+
+/**
+ * Return the resource name previously set on `module`, or null if none.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+const char *stator_module_get_resource_name(const struct StatorModule *module);
+
+/**
+ * Return the line offset previously set on `module` (default 0).
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+int32_t stator_module_get_line_offset(const struct StatorModule *module);
+
+/**
+ * Return the column offset previously set on `module` (default 0).
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+int32_t stator_module_get_column_offset(const struct StatorModule *module);
+
+/**
+ * Return the number of bytecode instructions in a compiled module.
+ *
+ * Returns 0 if `module` is null, failed to compile, or cannot be decoded.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+size_t stator_module_bytecode_count(const struct StatorModule *module);
+
+/**
+ * Return whether the compiled module bytecode is marked as async.
+ *
+ * Modules are compiled with async capability so hosts can later drive
+ * top-level-await evaluation. Returns false for null or failed modules.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+bool stator_module_is_async(const struct StatorModule *module);
+
+/**
+ * Free a [`StatorModule`] previously returned by [`stator_module_compile`].
+ *
+ * # Safety
+ * `module` must be a non-null pointer returned by [`stator_module_compile`]
+ * and must not be used again after this call.
+ */
+void stator_module_free(struct StatorModule *module);
 
 /**
  * Execute a compiled script in `ctx` and return the result as a

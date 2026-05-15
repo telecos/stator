@@ -2254,6 +2254,26 @@ pub struct StatorScript {
     resource_column_offset: i32,
 }
 
+/// A browser-facing compiled ES module record.
+///
+/// Created by [`stator_module_compile`] and released by [`stator_module_free`].
+/// The handle owns parsed/compiled module bytecode and origin metadata, but it
+/// does not perform module linking, import resolution, or evaluation yet.
+pub struct StatorModule {
+    /// Compiled module bytecodes on success; `None` on parse / compile error.
+    bytecodes: Option<Rc<BytecodeArray>>,
+    /// Human-readable error message, or `None` on success.
+    error: Option<CString>,
+    /// Structured classification of the compile error.
+    error_kind: StatorMessageKind,
+    /// Resource name (typically a URL) supplied by the embedder.
+    resource_name: Option<CString>,
+    /// 1-based line offset of the module within `resource_name`. Defaults to 0.
+    resource_line_offset: i32,
+    /// 1-based column offset of the module within `resource_name`. Defaults to 0.
+    resource_column_offset: i32,
+}
+
 /// Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
 ///
 /// Returns a non-null [`StatorScript`] pointer in all cases (even on error).
@@ -2329,6 +2349,83 @@ pub unsafe extern "C" fn stator_script_compile(
         }
     };
     Box::into_raw(script)
+}
+
+/// Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
+///
+/// Returns a non-null [`StatorModule`] pointer in all cases (even on error).
+/// Call [`stator_module_get_error`] to check whether compilation succeeded.
+/// The caller must eventually pass the returned pointer to
+/// [`stator_module_free`].
+///
+/// This API intentionally stops at creating a module-record-like handle: it
+/// parses with module semantics and compiles module bytecode, but does not
+/// resolve imports, link dependencies, or evaluate the module.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile(
+    _ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+) -> *mut StatorModule {
+    if source.is_null() {
+        let module = Box::new(StatorModule {
+            bytecodes: None,
+            error: Some(c"null source pointer".into()),
+            error_kind: StatorMessageKind::StatorMessageKindInternal,
+            resource_name: None,
+            resource_line_offset: 0,
+            resource_column_offset: 0,
+        });
+        return Box::into_raw(module);
+    }
+
+    // SAFETY: caller guarantees `source` is valid for `source_len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, source_len) };
+    let src = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            let module = Box::new(StatorModule {
+                bytecodes: None,
+                error: Some(c"source is not valid UTF-8".into()),
+                error_kind: StatorMessageKind::StatorMessageKindInternal,
+                resource_name: None,
+                resource_line_offset: 0,
+                resource_column_offset: 0,
+            });
+            return Box::into_raw(module);
+        }
+    };
+
+    let result =
+        parser::parse_module(src).and_then(|program| BytecodeGenerator::compile_program(&program));
+
+    let module = match result {
+        Ok(bytecodes) => Box::new(StatorModule {
+            bytecodes: Some(Rc::new(bytecodes)),
+            error: None,
+            error_kind: StatorMessageKind::StatorMessageKindUnknown,
+            resource_name: None,
+            resource_line_offset: 0,
+            resource_column_offset: 0,
+        }),
+        Err(e) => {
+            let msg = e.to_string();
+            let cstring = CString::new(msg).unwrap_or_else(|_| c"module compilation error".into());
+            Box::new(StatorModule {
+                bytecodes: None,
+                error: Some(cstring),
+                error_kind: StatorMessageKind::StatorMessageKindSyntax,
+                resource_name: None,
+                resource_line_offset: 0,
+                resource_column_offset: 0,
+            })
+        }
+    };
+    Box::into_raw(module)
 }
 
 /// Return a null-terminated error message if `script` compiled with an error.
@@ -2688,6 +2785,172 @@ pub unsafe extern "C" fn stator_script_free(script: *mut StatorScript) {
         // SAFETY: pointer was created by `Box::into_raw` in
         // `stator_script_compile`.
         drop(unsafe { Box::from_raw(script) });
+    }
+}
+
+/// Return a null-terminated error message if `module` compiled with an error.
+///
+/// Returns a null pointer when `module` compiled successfully. The returned
+/// pointer is valid as long as `module` is alive.
+///
+/// # Safety
+/// `module` must be a non-null pointer returned by [`stator_module_compile`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_error(module: *const StatorModule) -> *const c_char {
+    if module.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    match unsafe { &(*module).error } {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Return the structured [`StatorMessageKind`] of `module`'s compile error.
+///
+/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+/// compiled successfully or is null.
+///
+/// # Safety
+/// `module` must be either null or a valid pointer to a live [`StatorModule`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_error_kind(
+    module: *const StatorModule,
+) -> StatorMessageKind {
+    if module.is_null() {
+        return StatorMessageKind::StatorMessageKindUnknown;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).error_kind }
+}
+
+/// Attach origin metadata (resource name and offsets) to `module`.
+///
+/// `resource_name` may be null to clear an existing name; otherwise it must be
+/// a valid, null-terminated UTF-8 C string. The contents are copied.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - When non-null, `resource_name` must be a valid, null-terminated UTF-8
+///   C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_set_origin(
+    module: *mut StatorModule,
+    resource_name: *const c_char,
+    line_offset: i32,
+    column_offset: i32,
+) {
+    if module.is_null() {
+        return;
+    }
+    let name = if resource_name.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `resource_name` is a valid null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(resource_name) };
+        Some(CString::from(cstr))
+    };
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe {
+        (*module).resource_name = name;
+        (*module).resource_line_offset = line_offset;
+        (*module).resource_column_offset = column_offset;
+    }
+}
+
+/// Return the resource name previously set on `module`, or null if none.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_resource_name(
+    module: *const StatorModule,
+) -> *const c_char {
+    if module.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    match unsafe { &(*module).resource_name } {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Return the line offset previously set on `module` (default 0).
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_line_offset(module: *const StatorModule) -> i32 {
+    if module.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).resource_line_offset }
+}
+
+/// Return the column offset previously set on `module` (default 0).
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_column_offset(module: *const StatorModule) -> i32 {
+    if module.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).resource_column_offset }
+}
+
+/// Return the number of bytecode instructions in a compiled module.
+///
+/// Returns 0 if `module` is null, failed to compile, or cannot be decoded.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_bytecode_count(module: *const StatorModule) -> usize {
+    if module.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let bytecodes = match unsafe { &(*module).bytecodes } {
+        Some(b) => b,
+        None => return 0,
+    };
+    decode(bytecodes.bytecodes())
+        .map(|instrs| instrs.len())
+        .unwrap_or(0)
+}
+
+/// Return whether the compiled module bytecode is marked as async.
+///
+/// Modules are compiled with async capability so hosts can later drive
+/// top-level-await evaluation. Returns false for null or failed modules.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_is_async(module: *const StatorModule) -> bool {
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).bytecodes.as_ref().is_some_and(|b| b.is_async()) }
+}
+
+/// Free a [`StatorModule`] previously returned by [`stator_module_compile`].
+///
+/// # Safety
+/// `module` must be a non-null pointer returned by [`stator_module_compile`]
+/// and must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_free(module: *mut StatorModule) {
+    if !module.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw` in
+        // `stator_module_compile`.
+        drop(unsafe { Box::from_raw(module) });
     }
 }
 
@@ -9589,6 +9852,21 @@ mod tests {
         }
     }
 
+    /// Helper: compile a module source string and return the `StatorModule` pointer.
+    ///
+    /// The returned pointer must be freed with `stator_module_free`.
+    fn compile_module_src(src: &str) -> *mut StatorModule {
+        let bytes = src.as_bytes();
+        // SAFETY: null ctx is permitted; `bytes` is valid UTF-8.
+        unsafe {
+            stator_module_compile(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+            )
+        }
+    }
+
     #[test]
     fn test_script_compile_simple_returns_nonnull() {
         let script = compile_src("var x = 1 + 2;");
@@ -9641,6 +9919,101 @@ mod tests {
         assert_eq!(count, 0, "expected 0 bytecodes on error");
         // SAFETY: `script` is non-null and live.
         unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_module_compile_top_level_await_returns_record() {
+        let module = compile_module_src("const x = await 1; export { x };");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert!(stator_module_get_error(module).is_null());
+            assert!(stator_module_bytecode_count(module) > 0);
+            assert!(stator_module_is_async(module));
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_syntax_error_classified() {
+        let module = compile_module_src("export {");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert!(!stator_module_get_error(module).is_null());
+            assert_eq!(
+                stator_module_error_kind(module),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            assert_eq!(stator_module_bytecode_count(module), 0);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_null_source_classified_internal() {
+        // SAFETY: null source pointer is handled as a compile error record.
+        let module = unsafe { stator_module_compile(std::ptr::null_mut(), std::ptr::null(), 0) };
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert!(!stator_module_get_error(module).is_null());
+            assert_eq!(
+                stator_module_error_kind(module),
+                StatorMessageKind::StatorMessageKindInternal
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_origin_defaults_and_roundtrip() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+
+        // SAFETY: `module` is valid.
+        unsafe {
+            assert!(stator_module_get_resource_name(module).is_null());
+            assert_eq!(stator_module_get_line_offset(module), 0);
+            assert_eq!(stator_module_get_column_offset(module), 0);
+        }
+
+        let name = c"https://example.test/foo.mjs";
+        // SAFETY: `module` is valid; `name` is a valid C string.
+        unsafe {
+            stator_module_set_origin(module, name.as_ptr(), 3, 5);
+            let got = stator_module_get_resource_name(module);
+            assert!(!got.is_null());
+            let got_str = CStr::from_ptr(got).to_str().unwrap();
+            assert_eq!(got_str, "https://example.test/foo.mjs");
+            assert_eq!(stator_module_get_line_offset(module), 3);
+            assert_eq!(stator_module_get_column_offset(module), 5);
+
+            stator_module_set_origin(module, std::ptr::null(), 0, 0);
+            assert!(stator_module_get_resource_name(module).is_null());
+            assert_eq!(stator_module_get_line_offset(module), 0);
+            assert_eq!(stator_module_get_column_offset(module), 0);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_null_accessors_are_safe() {
+        // SAFETY: passing null is documented as supported by every accessor.
+        unsafe {
+            assert!(stator_module_get_error(std::ptr::null()).is_null());
+            assert_eq!(
+                stator_module_error_kind(std::ptr::null()),
+                StatorMessageKind::StatorMessageKindUnknown
+            );
+            stator_module_set_origin(std::ptr::null_mut(), std::ptr::null(), 1, 2);
+            assert!(stator_module_get_resource_name(std::ptr::null()).is_null());
+            assert_eq!(stator_module_get_line_offset(std::ptr::null()), 0);
+            assert_eq!(stator_module_get_column_offset(std::ptr::null()), 0);
+            assert_eq!(stator_module_bytecode_count(std::ptr::null()), 0);
+            assert!(!stator_module_is_async(std::ptr::null()));
+            stator_module_free(std::ptr::null_mut());
+        }
     }
 
     #[test]
