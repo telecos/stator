@@ -139,6 +139,7 @@ use crate::builtins::typed_array::{
     typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
     typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
 };
+use crate::builtins::wasm::make_webassembly_object;
 use crate::builtins::weak_ref::{
     weak_ref_deref, weak_ref_new, weak_ref_new_plain, weak_ref_new_symbol,
 };
@@ -15643,6 +15644,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("console".into(), make_console());
         globals.insert("JSON".into(), make_json());
         globals.insert("Intl".into(), make_intl());
+        globals.insert("WebAssembly".into(), make_webassembly_object());
 
         // ── Constructor / namespace objects ──────────────────────────────────
         globals.insert("Number".into(), finalize_ctor(make_number(), "Number"));
@@ -16187,6 +16189,7 @@ mod tests {
         assert!(globals.contains_key("Reflect"));
         assert!(globals.contains_key("globalThis"));
         assert!(globals.contains_key("Intl"));
+        assert!(globals.contains_key("WebAssembly"));
         // Error constructors
         assert!(globals.contains_key("Error"));
         assert!(globals.contains_key("TypeError"));
