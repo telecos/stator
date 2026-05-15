@@ -1084,7 +1084,9 @@ typedef struct StatorEmbedderCallbacks {
  *
  * When a resolver is replaced, cleared, or its context is destroyed, Stator
  * invokes this callback with the previous `user_data` pointer when both are
- * non-null.
+ * non-null. The callback runs synchronously on the thread performing the
+ * replacement, clear, or context destruction, and Stator never invokes it more
+ * than once for a registered resolver instance.
  */
 typedef void (*StatorUserDataFreeCallback)(void *user_data);
 
@@ -1093,12 +1095,17 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
  *
  * The callback is invoked depth-first by [`stator_module_instantiate`] for
  * every static `import`, re-export, or import-with-attributes request in the
- * referrer module. On success the host writes a live, compiled module pointer
- * through `out_module`. On failure the host returns a non-`Ok` status and may
- * optionally allocate an owned diagnostic via [`stator_string_new`] and
- * transfer it through `out_error`. The engine consumes any non-null
- * `out_error` and releases it with [`stator_string_free`], so hosts must not
- * retain or free it themselves after returning.
+ * referrer module, on the same thread that called into Stator. On success the
+ * host writes a live, compiled module pointer through `out_module`. Stator
+ * borrows that module while walking the graph and may update its link status,
+ * but does not take ownership, retain a reference count, or free it; the host
+ * must keep the module alive for the duration of instantiation and remains
+ * responsible for eventually calling [`stator_module_free`]. On failure the
+ * host returns a non-`Ok` status and may optionally allocate an owned
+ * diagnostic via [`stator_string_new`] and transfer it through `out_error`. The
+ * engine consumes any non-null `out_error` and releases it with
+ * [`stator_string_free`], so hosts must not retain or free it themselves after
+ * returning.
  *
  * The status drives the typed error surfaced through the module status/error
  * accessors and any future evaluation rejection:
@@ -1118,13 +1125,22 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
  *
  * # Safety
  * - `ctx` is the context on which the resolver was registered.
+ * - `user_data` is the exact pointer registered with
+ *   [`stator_context_set_module_resolver`].
+ * - `referrer` is a read-only borrowed module pointer valid only for the
+ *   duration of the callback.
  * - `specifier` points to `specifier_len` UTF-8 bytes and is not necessarily
- *   null-terminated.
+ *   null-terminated. The bytes are read-only and valid only for this callback.
  * - `attributes` points to `attributes_len` entries, or is null when the
- *   length is zero.
+ *   length is zero. Each attribute's key/value bytes are read-only and valid
+ *   only for this callback.
  * - `out_module` and `out_error`, when non-null, are valid for one pointer
  *   write each. Any non-null value written through `out_error` must have been
  *   produced by [`stator_string_new`] and is owned by the engine after return.
+ * - The callback must not destroy `ctx`, replace/clear this resolver, free the
+ *   `referrer` or returned `out_module`, or recursively instantiate/evaluate
+ *   the same module graph. Access to the context and graph must be serialized
+ *   by the embedder.
  */
 typedef enum StatorResolveStatus (*StatorModuleResolverCallback)(struct StatorContext *ctx,
                                                                  void *user_data,
@@ -1679,14 +1695,23 @@ void *stator_context_get_embedder_data(const struct StatorContext *ctx, uint32_t
 /**
  * Register, replace, or clear the module resolver callback for `ctx`.
  *
- * The resolver is scoped to a single context and is not used by
- * [`stator_module_evaluate`] in this slice. Passing a non-null `callback`
+ * The resolver is scoped to a single context. Passing a non-null `callback`
  * stores `user_data` and optional `free_user_data`; any previous resolver is
- * dropped first, invoking its free callback when applicable.
+ * dropped first, invoking its free callback exactly once when both the
+ * previous `user_data` and previous `free_user_data` are non-null.
  *
  * To clear an existing resolver, pass a null `callback`, null `user_data`, and
  * null `free_user_data`. Passing a null callback with non-null cleanup state is
  * rejected and leaves the existing resolver unchanged.
+ * [`stator_context_destroy`] also drops the active resolver, if any.
+ *
+ * Resolver callbacks are invoked synchronously by [`stator_module_instantiate`]
+ * on the same thread that called into Stator; Stator does not dispatch module
+ * resolution to background worker threads. The callback must not destroy `ctx`,
+ * replace or clear the currently-running resolver, free the `referrer`, or
+ * otherwise re-enter APIs that mutate the same module graph while a resolver
+ * invocation is active. The FFI context/module graph APIs are single-threaded;
+ * embedders must serialize access to a context and its modules.
  *
  * Returns `true` on successful registration or clear, and `false` for a null
  * context or malformed clear request.
@@ -1696,8 +1721,12 @@ void *stator_context_get_embedder_data(const struct StatorContext *ctx, uint32_t
  * - `callback`, when non-null, must remain callable until replaced, cleared,
  *   or `ctx` is destroyed.
  * - `user_data`, when non-null, must remain valid for callbacks until the
- *   resolver is replaced/cleared/destroyed; ownership for cleanup is described
- *   by `free_user_data`.
+ *   resolver is replaced/cleared/destroyed. If `free_user_data` is non-null,
+ *   Stator calls it synchronously with that same pointer during resolver
+ *   replacement, resolver clearing, or context destruction. If `user_data` is
+ *   null, `free_user_data` is stored but not invoked.
+ * - `free_user_data`, when non-null, must remain callable until it is invoked
+ *   or until the resolver is replaced/cleared/destroyed with null `user_data`.
  */
 bool stator_context_set_module_resolver(struct StatorContext *ctx,
                                         enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
