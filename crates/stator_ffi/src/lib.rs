@@ -4075,6 +4075,40 @@ fn set_module_link_error(module: &mut StatorModule, error: &stator_jse::error::S
     module.error_kind = message_kind_for_error(error, false);
 }
 
+fn module_stored_error(module: &StatorModule) -> stator_jse::error::StatorError {
+    let message = module
+        .error
+        .as_ref()
+        .map(|error| error.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "module is already errored".to_string());
+    match module.error_kind {
+        StatorMessageKind::StatorMessageKindSyntax => {
+            stator_jse::error::StatorError::SyntaxError(message)
+        }
+        StatorMessageKind::StatorMessageKindType => {
+            stator_jse::error::StatorError::TypeError(message)
+        }
+        StatorMessageKind::StatorMessageKindReference => {
+            stator_jse::error::StatorError::ReferenceError(message)
+        }
+        StatorMessageKind::StatorMessageKindRange => {
+            stator_jse::error::StatorError::RangeError(message)
+        }
+        StatorMessageKind::StatorMessageKindURI => {
+            stator_jse::error::StatorError::URIError(message)
+        }
+        StatorMessageKind::StatorMessageKindInternal
+        | StatorMessageKind::StatorMessageKindTermination
+        | StatorMessageKind::StatorMessageKindWasm
+        | StatorMessageKind::StatorMessageKindJsException
+        | StatorMessageKind::StatorMessageKindOutOfMemory
+        | StatorMessageKind::StatorMessageKindSandboxViolation
+        | StatorMessageKind::StatorMessageKindUnknown => {
+            stator_jse::error::StatorError::Internal(message)
+        }
+    }
+}
+
 unsafe fn instantiate_module_graph(
     ctx: *mut StatorContext,
     module: *mut StatorModule,
@@ -4096,9 +4130,7 @@ unsafe fn instantiate_module_graph(
         StatorModuleStatus::StatorModuleStatusLinked
         | StatorModuleStatus::StatorModuleStatusEvaluated => return Ok(()),
         StatorModuleStatus::StatorModuleStatusErrored => {
-            return Err(stator_jse::error::StatorError::Internal(
-                "module is already errored".to_string(),
-            ));
+            return Err(module_stored_error(module_ref));
         }
         StatorModuleStatus::StatorModuleStatusEvaluating
         | StatorModuleStatus::StatorModuleStatusLinking => return Ok(()),
@@ -4244,7 +4276,8 @@ pub unsafe extern "C" fn stator_module_instantiate(
 /// when a context is supplied.
 ///
 /// Modules with static imports or re-exports currently fail with an internal
-/// error so that dedicated host import-resolution work can provide the linker.
+/// error, even after successful [`stator_module_instantiate`], because runtime
+/// live binding and namespace object wiring is not implemented yet.
 ///
 /// # Safety
 /// - `module` must be a non-null pointer returned by [`stator_module_compile`].
@@ -11662,7 +11695,7 @@ mod tests {
         _ctx: *mut StatorContext,
         user_data: *mut c_void,
         _referrer: *const StatorModule,
-        _origin: *const StatorModuleOrigin,
+        origin: *const StatorModuleOrigin,
         specifier: *const c_char,
         specifier_len: usize,
         attributes: *const StatorImportAttribute,
@@ -11672,6 +11705,7 @@ mod tests {
     ) -> StatorResolveStatus {
         assert!(!user_data.is_null());
         assert!(!specifier.is_null());
+        assert!(!origin.is_null());
         if attributes_len == 0 {
             assert!(attributes.is_null());
         }
@@ -11729,6 +11763,86 @@ mod tests {
         // SAFETY: tests pass a valid mutable `TestGraphResolverData` pointer.
         let data = unsafe { &mut *(user_data as *mut TestGraphResolverData) };
         data.cleanup_calls += 1;
+    }
+
+    struct TestAttributeGateResolverData {
+        modules: HashMap<String, *mut StatorModule>,
+        expected: Vec<(String, String)>,
+        calls: Vec<String>,
+        attributes: Vec<Vec<(String, String)>>,
+    }
+
+    unsafe extern "C" fn test_attribute_gate_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        attributes: *const StatorImportAttribute,
+        attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        assert!(!origin.is_null());
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestAttributeGateResolverData) };
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap().to_string();
+        data.calls.push(specifier.clone());
+
+        let actual = if attributes_len == 0 {
+            Vec::new()
+        } else {
+            assert!(!attributes.is_null());
+            // SAFETY: callback contract supplies `attributes_len` valid entries.
+            let slice = unsafe { std::slice::from_raw_parts(attributes, attributes_len) };
+            slice
+                .iter()
+                .map(|attribute| {
+                    // SAFETY: `slice` was built from valid FFI attribute entries.
+                    unsafe { import_attribute_pair(attribute) }
+                })
+                .collect()
+        };
+        data.attributes.push(actual.clone());
+
+        if actual != data.expected {
+            if !out_module.is_null() {
+                // SAFETY: out pointer is valid for one write in these tests.
+                unsafe { *out_module = std::ptr::null_mut() };
+            }
+            if !out_error.is_null() {
+                let detail = b"import attribute mismatch";
+                // SAFETY: `detail` is a live byte slice for this call.
+                let error =
+                    unsafe { stator_string_new(detail.as_ptr() as *const c_char, detail.len()) };
+                // SAFETY: out pointer is valid for one write in these tests.
+                unsafe { *out_error = error };
+            }
+            return StatorResolveStatus::StatorResolveStatusTypeError;
+        }
+
+        if !out_error.is_null() {
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_error = std::ptr::null_mut() };
+        }
+        let module = data
+            .modules
+            .get(&specifier)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_module = module };
+        }
+        if module.is_null() {
+            StatorResolveStatus::StatorResolveStatusNotFound
+        } else {
+            StatorResolveStatus::StatorResolveStatusOk
+        }
     }
 
     #[test]
@@ -12195,6 +12309,252 @@ mod tests {
                 stator_module_get_status(dep),
                 StatorModuleStatus::StatorModuleStatusLinked
             );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_static_import_forms_link_graph_only() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import def, { named as alias } from './dep.js';
+             import * as ns from './ns.js';
+             export { alias };
+             ns; def;",
+        );
+        let dep = compile_module_src("export default 1; export const named = 2;");
+        let ns = compile_module_src("export const side = 3;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        modules.insert("./ns.js".to_string(), ns);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./dep.js", "./ns.js"]);
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+
+            // Linking succeeds, but evaluation of dependency-bearing modules is
+            // intentionally fail-closed until runtime live bindings land.
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindInternal
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("host import resolution"));
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_module_free(ns);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_reexport_forms_link_graph() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "export { foo as bar } from './dep.js';
+             export * from './star.js';
+             export * as ns from './ns.js';",
+        );
+        let dep = compile_module_src("export const foo = 1;");
+        let star = compile_module_src("export const a = 2;");
+        let ns = compile_module_src("export const b = 3;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        modules.insert("./star.js".to_string(), star);
+        modules.insert("./ns.js".to_string(), ns);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./dep.js", "./star.js", "./ns.js"]);
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_module_free(star);
+            stator_module_free(ns);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_rejects_attribute_mismatch_from_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import data from './data.json' with { type: 'css' };");
+        let dep = compile_module_src("export default 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./data.json".to_string(), dep);
+        let mut data = TestAttributeGateResolverData {
+            modules,
+            expected: vec![("type".into(), "json".into())],
+            calls: Vec::new(),
+            attributes: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_attribute_gate_resolver_cb),
+                &mut data as *mut TestAttributeGateResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./data.json"]);
+            assert_eq!(data.attributes, vec![vec![("type".into(), "css".into())]]);
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindType
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("attribute mismatch"));
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_propagates_resolver_returned_compile_error_module() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './bad.js';");
+        let bad = compile_module_src("export {");
+        let mut modules = HashMap::new();
+        modules.insert("./bad.js".to_string(), bad);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./bad.js"]);
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindSyntax
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("SyntaxError"));
+            stator_module_free(root);
+            stator_module_free(bad);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_cyclic_import_bindings_link_without_tdz_evaluation() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { b } from './b.js'; export const a = b + 1;");
+        let dep = compile_module_src("import { a } from './a.js'; export const b = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./b.js".to_string(), dep);
+        modules.insert("./a.js".to_string(), root);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./b.js", "./a.js"]);
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("host import resolution"));
             stator_module_free(root);
             stator_module_free(dep);
             stator_context_destroy(ctx);

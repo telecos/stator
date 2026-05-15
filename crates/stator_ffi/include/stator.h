@@ -2964,7 +2964,8 @@ bool stator_module_instantiate(struct StatorContext *ctx, struct StatorModule *m
  * when a context is supplied.
  *
  * Modules with static imports or re-exports currently fail with an internal
- * error so that dedicated host import-resolution work can provide the linker.
+ * error, even after successful [`stator_module_instantiate`], because runtime
+ * live binding and namespace object wiring is not implemented yet.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by [`stator_module_compile`].
