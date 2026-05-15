@@ -393,4 +393,276 @@ mod tests {
             "expected CallRuntime opcode for dynamic import()"
         );
     }
+
+    // ── Host-routed dynamic import and import.meta ─────────────────────────────
+
+    use crate::host::{HostModuleLoader, HostScope};
+    use std::cell::RefCell;
+    use std::rc::Rc as StdRc;
+
+    struct RecordingLoader {
+        calls: RefCell<Vec<(String, Option<String>)>>,
+        result: JsValue,
+    }
+
+    impl HostModuleLoader for RecordingLoader {
+        fn dynamic_import(
+            &self,
+            specifier: &str,
+            referrer: Option<&str>,
+        ) -> Result<JsValue, crate::builtins::error::JsError> {
+            self.calls
+                .borrow_mut()
+                .push((specifier.to_string(), referrer.map(str::to_string)));
+            Ok(self.result.clone())
+        }
+
+        fn resolve(
+            &self,
+            specifier: &str,
+            referrer: Option<&str>,
+        ) -> Result<String, crate::builtins::error::JsError> {
+            self.calls
+                .borrow_mut()
+                .push((specifier.to_string(), referrer.map(str::to_string)));
+            Ok(format!("resolved:{specifier}"))
+        }
+    }
+
+    #[test]
+    fn e2e_dynamic_import_routes_to_host_loader_and_fulfills_promise() {
+        use crate::builtins::promise::PromiseState;
+
+        let loader = StdRc::new(RecordingLoader {
+            calls: RefCell::new(Vec::new()),
+            result: JsValue::Smi(123),
+        });
+        let _scope = HostScope::install(
+            Some(loader.clone() as StdRc<dyn HostModuleLoader>),
+            Some("https://example/m.js"),
+        );
+
+        let result = global_eval("import('./dep.js')").unwrap();
+        let JsValue::Promise(promise) = result else {
+            panic!("expected promise");
+        };
+        assert!(matches!(
+            promise.state(),
+            PromiseState::Fulfilled(JsValue::Smi(123))
+        ));
+        let calls = loader.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "./dep.js");
+        assert_eq!(calls[0].1.as_deref(), Some("https://example/m.js"));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_host_rejection_yields_rejected_promise() {
+        use crate::builtins::error::{ErrorKind, JsError};
+        use crate::builtins::promise::PromiseState;
+
+        struct RejectingLoader;
+        impl HostModuleLoader for RejectingLoader {
+            fn dynamic_import(
+                &self,
+                _specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<JsValue, JsError> {
+                Err(JsError::new(ErrorKind::TypeError, "nope".into()))
+            }
+            fn resolve(
+                &self,
+                _specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<String, JsError> {
+                unreachable!()
+            }
+        }
+
+        let _scope = HostScope::install(
+            Some(StdRc::new(RejectingLoader) as StdRc<dyn HostModuleLoader>),
+            None,
+        );
+        let result = global_eval("import('./bad.js')").unwrap();
+        let JsValue::Promise(promise) = result else {
+            panic!("expected promise");
+        };
+        let PromiseState::Rejected(JsValue::Error(err)) = promise.state() else {
+            panic!("expected rejected error promise");
+        };
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[test]
+    fn e2e_dynamic_import_without_loader_still_rejects_with_typeerror() {
+        use crate::builtins::error::ErrorKind;
+        use crate::builtins::promise::PromiseState;
+
+        // No HostScope installed: behaviour must match the historical
+        // host-less rejection.
+        let result = global_eval("import('foo')").unwrap();
+        let JsValue::Promise(promise) = result else {
+            panic!("expected promise");
+        };
+        let PromiseState::Rejected(JsValue::Error(err)) = promise.state() else {
+            panic!("expected rejected error promise");
+        };
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        assert_eq!(err.message, "dynamic import is not supported by this host");
+    }
+
+    #[test]
+    fn e2e_import_meta_url_reflects_published_module_url() {
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecodes::{Instruction, Opcode, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::objects::value::JsValue as Val;
+
+        let _scope = HostScope::install(None, Some("https://host/page.js"));
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        let Val::PlainObject(map) = result else {
+            panic!("expected PlainObject")
+        };
+        let url = map.borrow().get("url").cloned();
+        assert_eq!(url, Some(Val::String("https://host/page.js".into())));
+    }
+
+    #[test]
+    fn e2e_import_meta_resolve_routes_to_host_loader() {
+        let loader = StdRc::new(RecordingLoader {
+            calls: RefCell::new(Vec::new()),
+            result: JsValue::Undefined,
+        });
+        let _scope = HostScope::install(
+            Some(loader.clone() as StdRc<dyn HostModuleLoader>),
+            Some("https://host/m.js"),
+        );
+        // import.meta is only valid in module mode; build a tiny module-flagged
+        // bytecode: load import.meta, fetch the resolve method, invoke with a
+        // string literal, return the result.
+        use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+        use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallProperty1,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Register(2),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![
+                ConstantPoolEntry::String("resolve".into()),
+                ConstantPoolEntry::String("./dep".into()),
+            ],
+            3,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("resolved:./dep".into()));
+        let calls = loader.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "./dep");
+        assert_eq!(calls[0].1.as_deref(), Some("https://host/m.js"));
+    }
+
+    #[test]
+    fn e2e_import_meta_resolve_runtime_throws_without_host_loader() {
+        use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+        use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        // Ensure no scope is active.
+        assert!(crate::host::current_loader().is_none());
+
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallProperty1,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Register(2),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![
+                ConstantPoolEntry::String("resolve".into()),
+                ConstantPoolEntry::String("./dep".into()),
+            ],
+            3,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import.meta.resolve is not supported by this host"),
+            "unexpected error: {msg}"
+        );
+    }
 }

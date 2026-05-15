@@ -56,6 +56,8 @@ pub mod executable_memory;
 pub mod ffi;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.
 pub mod gc;
+/// Host module integration hooks (dynamic `import()` loader, `import.meta`).
+pub mod host;
 /// Inline-cache runtime: property load/store fast paths and call-site tracking.
 pub mod ic;
 /// Chrome DevTools Protocol (CDP) WebSocket inspector server and sampling CPU

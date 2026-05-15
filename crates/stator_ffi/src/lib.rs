@@ -4360,6 +4360,12 @@ pub unsafe extern "C" fn stator_module_evaluate(
         &owned_global_env
     };
 
+    let module_url = module_ref
+        .resource_name
+        .as_ref()
+        .map(|cs| cs.to_string_lossy().into_owned());
+    let _host_scope = stator_jse::host::HostScope::install(None, module_url.as_deref());
+
     let result = if global_env.borrow().globals_installed {
         Interpreter::run_fast(&bytecodes, &[], global_env)
     } else {

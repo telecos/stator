@@ -6750,15 +6750,52 @@ fn handle_call_runtime(
     };
 
     if runtime_id == crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT {
-        use crate::builtins::promise::{MicrotaskQueue, promise_reject};
+        use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
+        use crate::host::{current_loader, current_module_url};
+
+        let Operand::Register(args_start_v) = *instr.operand(1) else {
+            return Err(err_bad_operand("CallRuntime", 1));
+        };
+        let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
+            return Err(err_bad_operand("CallRuntime", 2));
+        };
 
         let queue = MicrotaskQueue::new();
-        let reason = JsValue::Error(Rc::new(JsError::new(
-            ErrorKind::TypeError,
-            "dynamic import is not supported by this host".to_string(),
-        )));
-        let p = promise_reject(reason, &queue);
-        ctx.frame.accumulator = JsValue::Promise(p);
+        let promise = if arg_count >= 1 {
+            let raw = ctx.frame.read_reg(args_start_v)?.cheap_clone();
+            match raw.to_js_string() {
+                Ok(specifier) => match current_loader() {
+                    Some(loader) => {
+                        let referrer = current_module_url();
+                        match loader.dynamic_import(&specifier, referrer.as_deref()) {
+                            Ok(value) => promise_resolve(value, &queue),
+                            Err(err) => promise_reject(JsValue::Error(Rc::new(err)), &queue),
+                        }
+                    }
+                    None => {
+                        let reason = JsValue::Error(Rc::new(JsError::new(
+                            ErrorKind::TypeError,
+                            "dynamic import is not supported by this host".to_string(),
+                        )));
+                        promise_reject(reason, &queue)
+                    }
+                },
+                Err(err) => {
+                    let reason = JsValue::Error(Rc::new(JsError::new(
+                        ErrorKind::TypeError,
+                        err.to_string(),
+                    )));
+                    promise_reject(reason, &queue)
+                }
+            }
+        } else {
+            let reason = JsValue::Error(Rc::new(JsError::new(
+                ErrorKind::TypeError,
+                "dynamic import requires a specifier".to_string(),
+            )));
+            promise_reject(reason, &queue)
+        };
+        ctx.frame.accumulator = JsValue::Promise(promise);
     }
     // Unrecognised runtime IDs are no-ops.
     Ok(DispatchAction::Continue)
@@ -8326,24 +8363,50 @@ fn handle_sta_module_variable(
 /// §16.2.1.7, `import.meta` is an ordinary object whose prototype is
 /// `null`.  The host may populate it with properties such as `url`.
 ///
-/// Returns a frozen plain object with a placeholder `url` and a minimal
-/// `resolve(specifier)` stub.
+/// Returns a frozen plain object whose `url` property reflects the
+/// thread-local module URL published by [`crate::host::HostScope`] (or
+/// the empty string when no module URL is available) and whose
+/// `resolve(specifier)` method routes to the host loader registered on
+/// the active thread.  When no host loader is installed, `resolve`
+/// throws a `TypeError`.
 #[cold]
 fn handle_lda_import_meta(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
+    use crate::host::{current_loader, current_module_url};
+
+    let url = current_module_url()
+        .map(|u| u.as_ref().to_string())
+        .unwrap_or_default();
     let mut meta = PropertyMap::new();
-    meta.insert("url".into(), JsValue::String(String::new().into()));
+    meta.insert("url".into(), JsValue::String(url.into()));
     meta.insert(
         "resolve".into(),
         JsValue::NativeFunction(Rc::new(|args| {
-            let value = match args.as_slice() {
-                [] => JsValue::Undefined,
-                [value] => value.clone(),
-                [_, value, ..] => value.clone(),
-            };
-            Ok(value)
+            let specifier_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let specifier = specifier_val
+                .to_js_string()
+                .map_err(|e| StatorError::TypeError(e.to_string()))?;
+            match current_loader() {
+                Some(loader) => {
+                    let referrer = current_module_url();
+                    match loader.resolve(&specifier, referrer.as_deref()) {
+                        Ok(resolved) => Ok(JsValue::String(resolved.into())),
+                        Err(err) => Err(match err.kind {
+                            ErrorKind::TypeError => StatorError::TypeError(err.message),
+                            ErrorKind::ReferenceError => StatorError::ReferenceError(err.message),
+                            ErrorKind::RangeError => StatorError::RangeError(err.message),
+                            ErrorKind::SyntaxError => StatorError::SyntaxError(err.message),
+                            ErrorKind::URIError => StatorError::URIError(err.message),
+                            _ => StatorError::TypeError(err.message),
+                        }),
+                    }
+                }
+                None => Err(StatorError::TypeError(
+                    "import.meta.resolve is not supported by this host".to_string(),
+                )),
+            }
         })),
     );
     meta.freeze();
