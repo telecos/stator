@@ -2513,12 +2513,62 @@ bool stator_module_is_async(const struct StatorModule *module);
 bool stator_module_has_dependencies(const struct StatorModule *module);
 
 /**
+ * Return the number of static import/re-export requests in `module`.
+ *
+ * Requests are reported in source order. Returns 0 for null or failed modules.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+size_t stator_module_get_request_count(const struct StatorModule *module);
+
+/**
+ * Return one static module request's specifier and import attributes.
+ *
+ * All out-pointers are optional. Returned pointers are borrowed from `module`
+ * and remain valid until [`stator_module_free`] or recompilation of a future
+ * replacement handle. The specifier is not null-terminated; use
+ * `out_specifier_len`.
+ *
+ * Returns `false` when `module` is null or `idx` is out of range.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - Each non-null out-pointer must be valid for one pointer/length write.
+ */
+bool stator_module_get_request(const struct StatorModule *module,
+                               size_t idx,
+                               const char **out_specifier,
+                               size_t *out_specifier_len,
+                               const struct StatorImportAttribute **out_attributes,
+                               size_t *out_attributes_len);
+
+/**
  * Return the current link/evaluation status for `module`.
  *
  * # Safety
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 enum StatorModuleStatus stator_module_get_status(const struct StatorModule *module);
+
+/**
+ * Link a compiled module graph by resolving all static import/re-export requests.
+ *
+ * Dependency-free modules transition to `Linked` without a context. Modules
+ * with requests require a resolver registered on `ctx`; the resolver is invoked
+ * depth-first and cycles are accepted without infinite recursion. This slice
+ * validates graph availability only: evaluation of dependency-bearing modules
+ * still returns an explicit error until live binding wiring lands.
+ *
+ * Returns `true` on successful graph instantiation. On failure returns `false`
+ * and stores an error on the root module.
+ *
+ * # Safety
+ * - `module` must be a non-null pointer returned by [`stator_module_compile`].
+ * - `ctx` must be null only for dependency-free modules, or a valid live
+ *   [`StatorContext`] pointer for modules with requests.
+ */
+bool stator_module_instantiate(struct StatorContext *ctx, struct StatorModule *module);
 
 /**
  * Link and evaluate a dependency-free compiled module.

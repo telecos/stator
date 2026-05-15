@@ -11,7 +11,7 @@
 //! function.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 use std::rc::Rc;
@@ -36,7 +36,7 @@ use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::PropertyMap;
 use stator_jse::objects::value::{JsValue, NativeFn};
 use stator_jse::parser;
-use stator_jse::parser::ast::{ModuleDecl, Program, ProgramItem};
+use stator_jse::parser::ast::{ImportAttribute, ModuleDecl, Program, ProgramItem};
 use stator_jse::wasm::{
     HostFunc, HostFuncCallback, HostVal, HostValKind, WasmEngine, WasmInstance, WasmModule,
 };
@@ -912,7 +912,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 
     let resolver = match callback {
         Some(callback) => Some(StatorModuleResolver {
-            _callback: callback,
+            callback,
             user_data,
             free_user_data,
         }),
@@ -2342,6 +2342,8 @@ pub struct StatorModule {
     bytecodes: Option<Rc<BytecodeArray>>,
     /// Whether this module needs host import resolution before evaluation.
     has_dependencies: bool,
+    /// Static import and re-export requests in source order.
+    module_requests: Vec<StatorModuleRequest>,
     /// Link/evaluation status for this module record.
     status: StatorModuleStatus,
     /// Last successful evaluation result.
@@ -2356,6 +2358,17 @@ pub struct StatorModule {
     resource_line_offset: i32,
     /// 1-based column offset of the module within `resource_name`. Defaults to 0.
     resource_column_offset: i32,
+}
+
+struct StatorModuleRequest {
+    specifier: CString,
+    _attributes_storage: Vec<StatorModuleRequestAttribute>,
+    attributes: Vec<StatorImportAttribute>,
+}
+
+struct StatorModuleRequestAttribute {
+    key: CString,
+    value: CString,
 }
 
 /// A single ECMAScript import attribute passed to a module resolver callback.
@@ -2426,7 +2439,7 @@ pub type StatorModuleResolverCallback = unsafe extern "C" fn(
 ) -> StatorResolveStatus;
 
 struct StatorModuleResolver {
-    _callback: StatorModuleResolverCallback,
+    callback: StatorModuleResolverCallback,
     user_data: *mut c_void,
     free_user_data: Option<StatorUserDataFreeCallback>,
 }
@@ -2468,6 +2481,71 @@ fn program_has_module_dependencies(program: &Program) -> bool {
         ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) => decl.source.is_some(),
         ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(_)) | ProgramItem::Stmt(_) => false,
     })
+}
+
+fn module_request_attributes(attributes: &[ImportAttribute]) -> Vec<StatorModuleRequestAttribute> {
+    attributes
+        .iter()
+        .filter_map(|attribute| {
+            let key = CString::new(attribute.key.name.as_str()).ok()?;
+            let value = CString::new(attribute.value.value.as_str()).ok()?;
+            Some(StatorModuleRequestAttribute { key, value })
+        })
+        .collect()
+}
+
+fn module_request_specifier_value(specifier: &str) -> &str {
+    let bytes = specifier.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        &specifier[1..specifier.len() - 1]
+    } else {
+        specifier
+    }
+}
+
+fn module_request_for(
+    specifier: &str,
+    attributes: &[ImportAttribute],
+) -> Option<StatorModuleRequest> {
+    let specifier = CString::new(module_request_specifier_value(specifier)).ok()?;
+    let attributes_storage = module_request_attributes(attributes);
+    let attributes = attributes_storage
+        .iter()
+        .map(|attribute| StatorImportAttribute {
+            key: attribute.key.as_ptr(),
+            key_len: attribute.key.as_bytes().len(),
+            value: attribute.value.as_ptr(),
+            value_len: attribute.value.as_bytes().len(),
+        })
+        .collect();
+    Some(StatorModuleRequest {
+        specifier,
+        _attributes_storage: attributes_storage,
+        attributes,
+    })
+}
+
+fn collect_module_requests(program: &Program) -> Vec<StatorModuleRequest> {
+    program
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ProgramItem::ModuleDecl(ModuleDecl::Import(decl)) => {
+                module_request_for(&decl.source.value, &decl.attributes)
+            }
+            ProgramItem::ModuleDecl(ModuleDecl::ExportAll(decl)) => {
+                module_request_for(&decl.source.value, &decl.attributes)
+            }
+            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) => decl
+                .source
+                .as_ref()
+                .and_then(|source| module_request_for(&source.value, &decl.attributes)),
+            ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(_)) | ProgramItem::Stmt(_) => None,
+        })
+        .collect()
 }
 
 fn module_rejection_to_error(reason: JsValue) -> stator_jse::error::StatorError {
@@ -2601,6 +2679,7 @@ pub unsafe extern "C" fn stator_module_compile(
         let module = Box::new(StatorModule {
             bytecodes: None,
             has_dependencies: false,
+            module_requests: Vec::new(),
             status: StatorModuleStatus::StatorModuleStatusErrored,
             last_result: None,
             error: Some(c"null source pointer".into()),
@@ -2620,6 +2699,7 @@ pub unsafe extern "C" fn stator_module_compile(
             let module = Box::new(StatorModule {
                 bytecodes: None,
                 has_dependencies: false,
+                module_requests: Vec::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
                 last_result: None,
                 error: Some(c"source is not valid UTF-8".into()),
@@ -2634,13 +2714,16 @@ pub unsafe extern "C" fn stator_module_compile(
 
     let result = parser::parse_module(src).and_then(|program| {
         let has_dependencies = program_has_module_dependencies(&program);
-        BytecodeGenerator::compile_program(&program).map(|bytecodes| (bytecodes, has_dependencies))
+        let module_requests = collect_module_requests(&program);
+        BytecodeGenerator::compile_program(&program)
+            .map(|bytecodes| (bytecodes, has_dependencies, module_requests))
     });
 
     let module = match result {
-        Ok((bytecodes, has_dependencies)) => Box::new(StatorModule {
+        Ok((bytecodes, has_dependencies, module_requests)) => Box::new(StatorModule {
             bytecodes: Some(Rc::new(bytecodes)),
             has_dependencies,
+            module_requests,
             status: StatorModuleStatus::StatorModuleStatusUnlinked,
             last_result: None,
             error: None,
@@ -2655,6 +2738,7 @@ pub unsafe extern "C" fn stator_module_compile(
             Box::new(StatorModule {
                 bytecodes: None,
                 has_dependencies: false,
+                module_requests: Vec::new(),
                 status: StatorModuleStatus::StatorModuleStatusErrored,
                 last_result: None,
                 error: Some(cstring),
@@ -3197,6 +3281,77 @@ pub unsafe extern "C" fn stator_module_has_dependencies(module: *const StatorMod
     unsafe { (*module).has_dependencies }
 }
 
+/// Return the number of static import/re-export requests in `module`.
+///
+/// Requests are reported in source order. Returns 0 for null or failed modules.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_request_count(module: *const StatorModule) -> usize {
+    if module.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).module_requests.len() }
+}
+
+/// Return one static module request's specifier and import attributes.
+///
+/// All out-pointers are optional. Returned pointers are borrowed from `module`
+/// and remain valid until [`stator_module_free`] or recompilation of a future
+/// replacement handle. The specifier is not null-terminated; use
+/// `out_specifier_len`.
+///
+/// Returns `false` when `module` is null or `idx` is out of range.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - Each non-null out-pointer must be valid for one pointer/length write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_request(
+    module: *const StatorModule,
+    idx: usize,
+    out_specifier: *mut *const c_char,
+    out_specifier_len: *mut usize,
+    out_attributes: *mut *const StatorImportAttribute,
+    out_attributes_len: *mut usize,
+) -> bool {
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let module_ref = unsafe { &*module };
+    let request = match module_ref.module_requests.get(idx) {
+        Some(request) => request,
+        None => return false,
+    };
+
+    if !out_specifier.is_null() {
+        // SAFETY: caller guarantees the out pointer is valid for one write.
+        unsafe { *out_specifier = request.specifier.as_ptr() };
+    }
+    if !out_specifier_len.is_null() {
+        // SAFETY: caller guarantees the out pointer is valid for one write.
+        unsafe { *out_specifier_len = request.specifier.as_bytes().len() };
+    }
+    if !out_attributes.is_null() {
+        // SAFETY: caller guarantees the out pointer is valid for one write.
+        unsafe {
+            *out_attributes = if request.attributes.is_empty() {
+                std::ptr::null()
+            } else {
+                request.attributes.as_ptr()
+            };
+        }
+    }
+    if !out_attributes_len.is_null() {
+        // SAFETY: caller guarantees the out pointer is valid for one write.
+        unsafe { *out_attributes_len = request.attributes.len() };
+    }
+    true
+}
+
 /// Return the current link/evaluation status for `module`.
 ///
 /// # Safety
@@ -3267,6 +3422,193 @@ unsafe fn set_module_error(
     });
     // SAFETY: `isolate` is valid.
     unsafe { (*isolate).pending_message = Some(structured) };
+}
+
+fn resolver_status_error(
+    status: StatorResolveStatus,
+    specifier: &str,
+) -> stator_jse::error::StatorError {
+    match status {
+        StatorResolveStatus::StatorResolveStatusOk => stator_jse::error::StatorError::Internal(
+            "module resolver returned ok without a module".to_string(),
+        ),
+        StatorResolveStatus::StatorResolveStatusNotFound => {
+            stator_jse::error::StatorError::ReferenceError(format!(
+                "module specifier '{specifier}' was not found"
+            ))
+        }
+        StatorResolveStatus::StatorResolveStatusNetworkError => {
+            stator_jse::error::StatorError::Internal(format!(
+                "module specifier '{specifier}' failed to load"
+            ))
+        }
+        StatorResolveStatus::StatorResolveStatusTypeError => {
+            stator_jse::error::StatorError::TypeError(format!(
+                "module specifier '{specifier}' was rejected by resolver"
+            ))
+        }
+        StatorResolveStatus::StatorResolveStatusPending => {
+            stator_jse::error::StatorError::Internal(format!(
+                "module specifier '{specifier}' requires asynchronous resolution"
+            ))
+        }
+    }
+}
+
+fn set_module_link_error(module: &mut StatorModule, error: &stator_jse::error::StatorError) {
+    module.status = StatorModuleStatus::StatorModuleStatusErrored;
+    module.last_result = None;
+    module.error = Some(CString::new(error.to_string()).unwrap_or_else(|_| c"module error".into()));
+    module.error_kind = message_kind_for_error(error, false);
+}
+
+unsafe fn instantiate_module_graph(
+    ctx: *mut StatorContext,
+    module: *mut StatorModule,
+    visiting: &mut HashSet<*mut StatorModule>,
+) -> Result<(), stator_jse::error::StatorError> {
+    if module.is_null() {
+        return Err(stator_jse::error::StatorError::Internal(
+            "module resolver returned null module".to_string(),
+        ));
+    }
+
+    if visiting.contains(&module) {
+        return Ok(());
+    }
+
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &mut *module };
+    match module_ref.status {
+        StatorModuleStatus::StatorModuleStatusLinked
+        | StatorModuleStatus::StatorModuleStatusEvaluated => return Ok(()),
+        StatorModuleStatus::StatorModuleStatusErrored => {
+            return Err(stator_jse::error::StatorError::Internal(
+                "module is already errored".to_string(),
+            ));
+        }
+        StatorModuleStatus::StatorModuleStatusEvaluating
+        | StatorModuleStatus::StatorModuleStatusLinking => return Ok(()),
+        StatorModuleStatus::StatorModuleStatusUnlinked => {}
+    }
+
+    module_ref.status = StatorModuleStatus::StatorModuleStatusLinking;
+    visiting.insert(module);
+
+    if module_ref.module_requests.is_empty() {
+        module_ref.status = StatorModuleStatus::StatorModuleStatusLinked;
+        visiting.remove(&module);
+        return Ok(());
+    }
+
+    if ctx.is_null() {
+        visiting.remove(&module);
+        let error = stator_jse::error::StatorError::Internal(
+            "module instantiation requires a context with a module resolver".to_string(),
+        );
+        set_module_link_error(module_ref, &error);
+        return Err(error);
+    }
+
+    // SAFETY: caller guarantees `ctx` is valid.
+    let (callback, user_data) = match unsafe { (*ctx).module_resolver.as_ref() } {
+        Some(resolver) => (resolver.callback, resolver.user_data),
+        None => {
+            visiting.remove(&module);
+            let error = stator_jse::error::StatorError::Internal(
+                "module instantiation requires a module resolver".to_string(),
+            );
+            set_module_link_error(module_ref, &error);
+            return Err(error);
+        }
+    };
+
+    for request in &module_ref.module_requests {
+        let mut out_module: *mut StatorModule = std::ptr::null_mut();
+        let mut out_error: *mut StatorString = std::ptr::null_mut();
+        let attributes_ptr = if request.attributes.is_empty() {
+            std::ptr::null()
+        } else {
+            request.attributes.as_ptr()
+        };
+        // SAFETY: resolver registration requires the callback to remain callable
+        // while installed. Request slices are borrowed from `module` for the
+        // duration of this synchronous call, and out pointers are valid locals.
+        let status = unsafe {
+            callback(
+                ctx,
+                user_data,
+                module,
+                request.specifier.as_ptr(),
+                request.specifier.as_bytes().len(),
+                attributes_ptr,
+                request.attributes.len(),
+                &mut out_module,
+                &mut out_error,
+            )
+        };
+
+        let specifier = request.specifier.to_string_lossy();
+        if status != StatorResolveStatus::StatorResolveStatusOk {
+            visiting.remove(&module);
+            let error = resolver_status_error(status, &specifier);
+            set_module_link_error(module_ref, &error);
+            return Err(error);
+        }
+        if out_module.is_null() {
+            visiting.remove(&module);
+            let error = resolver_status_error(status, &specifier);
+            set_module_link_error(module_ref, &error);
+            return Err(error);
+        }
+
+        // SAFETY: the resolver returned a live module pointer by contract.
+        if let Err(error) = unsafe { instantiate_module_graph(ctx, out_module, visiting) } {
+            visiting.remove(&module);
+            set_module_link_error(module_ref, &error);
+            return Err(error);
+        }
+    }
+
+    module_ref.status = StatorModuleStatus::StatorModuleStatusLinked;
+    visiting.remove(&module);
+    Ok(())
+}
+
+/// Link a compiled module graph by resolving all static import/re-export requests.
+///
+/// Dependency-free modules transition to `Linked` without a context. Modules
+/// with requests require a resolver registered on `ctx`; the resolver is invoked
+/// depth-first and cycles are accepted without infinite recursion. This slice
+/// validates graph availability only: evaluation of dependency-bearing modules
+/// still returns an explicit error until live binding wiring lands.
+///
+/// Returns `true` on successful graph instantiation. On failure returns `false`
+/// and stores an error on the root module.
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by [`stator_module_compile`].
+/// - `ctx` must be null only for dependency-free modules, or a valid live
+///   [`StatorContext`] pointer for modules with requests.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_instantiate(
+    ctx: *mut StatorContext,
+    module: *mut StatorModule,
+) -> bool {
+    if module.is_null() {
+        return false;
+    }
+    let mut visiting = HashSet::new();
+    match unsafe { instantiate_module_graph(ctx, module, &mut visiting) } {
+        Ok(()) => true,
+        Err(error) => {
+            // SAFETY: `module` is non-null and valid by function contract.
+            let module_ref = unsafe { &mut *module };
+            // SAFETY: `module_ref` and `ctx` are valid for this call.
+            unsafe { set_module_error(module_ref, ctx, &error) };
+            false
+        }
+    }
 }
 
 /// Link and evaluate a dependency-free compiled module.
@@ -10043,7 +10385,7 @@ mod tests {
         // SAFETY: the stored callback and all pointers are valid for this test.
         let status = unsafe {
             let resolver = (*ctx).module_resolver.as_ref().unwrap();
-            (resolver._callback)(
+            (resolver.callback)(
                 ctx,
                 resolver.user_data,
                 module,
@@ -10500,6 +10842,62 @@ mod tests {
         }
     }
 
+    struct TestGraphResolverData {
+        modules: HashMap<String, *mut StatorModule>,
+        status: StatorResolveStatus,
+        calls: Vec<String>,
+    }
+
+    unsafe extern "C" fn test_graph_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        specifier: *const c_char,
+        specifier_len: usize,
+        attributes: *const StatorImportAttribute,
+        attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        assert!(!user_data.is_null());
+        assert!(!specifier.is_null());
+        if attributes_len == 0 {
+            assert!(attributes.is_null());
+        }
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestGraphResolverData) };
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap().to_string();
+        data.calls.push(specifier.clone());
+        if !out_error.is_null() {
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_error = std::ptr::null_mut() };
+        }
+        if data.status != StatorResolveStatus::StatorResolveStatusOk {
+            if !out_module.is_null() {
+                // SAFETY: out pointer is valid for one write in these tests.
+                unsafe { *out_module = std::ptr::null_mut() };
+            }
+            return data.status;
+        }
+        let module = data
+            .modules
+            .get(&specifier)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in these tests.
+            unsafe { *out_module = module };
+        }
+        if module.is_null() {
+            StatorResolveStatus::StatorResolveStatusNotFound
+        } else {
+            StatorResolveStatus::StatorResolveStatusOk
+        }
+    }
+
     #[test]
     fn test_script_compile_simple_returns_nonnull() {
         let script = compile_src("var x = 1 + 2;");
@@ -10638,6 +11036,226 @@ mod tests {
     }
 
     #[test]
+    fn test_module_instantiate_no_request_module_links_and_evaluates() {
+        let module = compile_module_src("40 + 2;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and dependency-free, so null context is permitted.
+        unsafe {
+            assert!(stator_module_instantiate(std::ptr::null_mut(), module));
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_request_enumeration_reports_imports_and_reexports() {
+        let module = compile_module_src("import a from './a.js'; export { b } from './b.js';");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(stator_module_get_request_count(module), 2);
+
+            let mut specifier = std::ptr::null();
+            let mut specifier_len = 0usize;
+            let mut attributes = std::ptr::null();
+            let mut attributes_len = 1usize;
+            assert!(stator_module_get_request(
+                module,
+                0,
+                &mut specifier,
+                &mut specifier_len,
+                &mut attributes,
+                &mut attributes_len,
+            ));
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(
+                    specifier as *const u8,
+                    specifier_len
+                ))
+                .unwrap(),
+                "./a.js"
+            );
+            assert!(attributes.is_null());
+            assert_eq!(attributes_len, 0);
+
+            assert!(stator_module_get_request(
+                module,
+                1,
+                &mut specifier,
+                &mut specifier_len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(
+                    specifier as *const u8,
+                    specifier_len
+                ))
+                .unwrap(),
+                "./b.js"
+            );
+            assert!(!stator_module_get_request(
+                module,
+                2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_reports_missing_resolver() {
+        let module = compile_module_src("import './dep.js';");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(std::ptr::null_mut(), module));
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert_eq!(
+                stator_module_error_kind(module),
+                StatorMessageKind::StatorMessageKindInternal
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("module resolver"));
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_maps_resolver_type_error() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let mut data = TestGraphResolverData {
+            modules: HashMap::new(),
+            status: StatorResolveStatus::StatorResolveStatusTypeError,
+            calls: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./dep.js"]);
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindType
+            );
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_accepts_resolved_dependency() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./dep.js"]);
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            assert_eq!(
+                stator_module_get_status(dep),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_instantiate_handles_resolver_cycle() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("import './root.js';");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        modules.insert("./root.js".to_string(), root);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./dep.js", "./root.js"]);
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            assert_eq!(
+                stator_module_get_status(dep),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_module_compile_syntax_error_classified() {
         let module = compile_module_src("export {");
         assert!(!module.is_null());
@@ -10720,6 +11338,19 @@ mod tests {
             assert_eq!(stator_module_bytecode_count(std::ptr::null()), 0);
             assert!(!stator_module_is_async(std::ptr::null()));
             assert!(!stator_module_has_dependencies(std::ptr::null()));
+            assert_eq!(stator_module_get_request_count(std::ptr::null()), 0);
+            assert!(!stator_module_get_request(
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            assert!(!stator_module_instantiate(
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ));
             assert!(stator_module_evaluate(std::ptr::null_mut(), std::ptr::null_mut()).is_null());
             stator_module_free(std::ptr::null_mut());
         }
