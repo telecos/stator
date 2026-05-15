@@ -910,6 +910,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
             ctx: *mut StatorContext,
             user_data: *mut c_void,
             referrer: *const StatorModule,
+            origin: *const StatorModuleOrigin,
             specifier: *const c_char,
             specifier_len: usize,
             attributes: *const StatorImportAttribute,
@@ -2453,6 +2454,16 @@ pub struct StatorModule {
     resource_line_offset: i32,
     /// 1-based column offset of the module within `resource_name`. Defaults to 0.
     resource_column_offset: i32,
+    /// Owned copy of the embedder-supplied base URL bytes, if any.
+    base_url: Option<Vec<u8>>,
+    /// Owned copy of the embedder-supplied Subresource Integrity metadata, if any.
+    integrity_metadata: Option<Vec<u8>>,
+    /// Browser credentials mode applied when this module was fetched.
+    credentials_mode: StatorCredentialsMode,
+    /// Browser referrer policy carried by this module.
+    referrer_policy: StatorReferrerPolicy,
+    /// HTML parser-metadata classification carried by this module.
+    parser_metadata: StatorParserMetadata,
 }
 
 struct StatorModuleRequest {
@@ -2499,6 +2510,91 @@ pub enum StatorModuleType {
     StatorModuleTypeWebAssembly = 2,
     /// CSS module source.
     StatorModuleTypeCss = 3,
+}
+
+/// Browser credentials mode applied to a module fetch.
+///
+/// Stable persisted numbering — never reorder these variants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorCredentialsMode {
+    /// Default credentials mode (`same-origin` per HTML for module scripts).
+    StatorCredentialsModeDefault = 0,
+    /// `omit` — never send or store credentials.
+    StatorCredentialsModeOmit = 1,
+    /// `same-origin` — send credentials only for same-origin requests.
+    StatorCredentialsModeSameOrigin = 2,
+    /// `include` — always send credentials, even cross-origin.
+    StatorCredentialsModeInclude = 3,
+}
+
+/// Browser referrer policy applied to subsequent module fetches.
+///
+/// Mirrors the values of the W3C Referrer Policy spec. Stable persisted
+/// numbering — never reorder these variants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorReferrerPolicy {
+    /// Empty / default — defer to the embedder's environment policy.
+    StatorReferrerPolicyDefault = 0,
+    /// `no-referrer`.
+    StatorReferrerPolicyNoReferrer = 1,
+    /// `no-referrer-when-downgrade`.
+    StatorReferrerPolicyNoReferrerWhenDowngrade = 2,
+    /// `same-origin`.
+    StatorReferrerPolicySameOrigin = 3,
+    /// `origin`.
+    StatorReferrerPolicyOrigin = 4,
+    /// `strict-origin`.
+    StatorReferrerPolicyStrictOrigin = 5,
+    /// `origin-when-cross-origin`.
+    StatorReferrerPolicyOriginWhenCrossOrigin = 6,
+    /// `strict-origin-when-cross-origin`.
+    StatorReferrerPolicyStrictOriginWhenCrossOrigin = 7,
+    /// `unsafe-url`.
+    StatorReferrerPolicyUnsafeUrl = 8,
+}
+
+/// HTML parser-metadata classification for a module script.
+///
+/// Stable persisted numbering — never reorder these variants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorParserMetadata {
+    /// Module was not inserted by the HTML parser (default).
+    StatorParserMetadataNotParserInserted = 0,
+    /// Module was inserted by the HTML parser.
+    StatorParserMetadataParserInserted = 1,
+}
+
+/// Read-only view of the browser policy/origin metadata associated with a
+/// referrer module, supplied to host module resolver callbacks.
+///
+/// `base_url` and `integrity_metadata` point to UTF-8 byte slices owned by the
+/// referrer [`StatorModule`]; they are not required to be null-terminated and
+/// may be null when the corresponding length is zero. The pointed-to bytes
+/// (and the [`StatorModuleOrigin`] struct itself) are valid only for the
+/// duration of the resolver callback that received them — hosts must copy any
+/// data they need to retain past return.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorModuleOrigin {
+    /// Pointer to `base_url_len` bytes of the referrer's base URL, or null
+    /// when no base URL was set.
+    pub base_url: *const c_char,
+    /// Number of bytes in `base_url`. Zero when `base_url` is null.
+    pub base_url_len: usize,
+    /// Pointer to `integrity_metadata_len` bytes of Subresource Integrity
+    /// metadata associated with the referrer fetch, or null when none.
+    pub integrity_metadata: *const c_char,
+    /// Number of bytes in `integrity_metadata`. Zero when null.
+    pub integrity_metadata_len: usize,
+    /// Credentials mode applied to the referrer fetch.
+    pub credentials_mode: StatorCredentialsMode,
+    /// Referrer policy applied to subsequent module fetches.
+    pub referrer_policy: StatorReferrerPolicy,
+    /// Parser-metadata classification of the referrer module script.
+    pub parser_metadata: StatorParserMetadata,
 }
 
 /// Result returned by a host module resolver callback.
@@ -2564,6 +2660,11 @@ pub type StatorUserDataFreeCallback = unsafe extern "C" fn(user_data: *mut c_voi
 ///   [`stator_context_set_module_resolver`].
 /// - `referrer` is a read-only borrowed module pointer valid only for the
 ///   duration of the callback.
+/// - `origin` is a read-only pointer to a [`StatorModuleOrigin`] view of the
+///   referrer's policy/origin metadata. The struct and any byte slices it
+///   points to are valid only for the duration of the callback. When the
+///   referrer has no metadata configured, the struct's pointers are null with
+///   zero lengths and its enum fields hold their `Default` variants.
 /// - `specifier` points to `specifier_len` UTF-8 bytes and is not necessarily
 ///   null-terminated. The bytes are read-only and valid only for this callback.
 /// - `attributes` points to `attributes_len` entries, or is null when the
@@ -2580,6 +2681,7 @@ pub type StatorModuleResolverCallback = unsafe extern "C" fn(
     ctx: *mut StatorContext,
     user_data: *mut c_void,
     referrer: *const StatorModule,
+    origin: *const StatorModuleOrigin,
     specifier: *const c_char,
     specifier_len: usize,
     attributes: *const StatorImportAttribute,
@@ -2839,6 +2941,11 @@ unsafe fn compile_module_source(
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
+            base_url: None,
+            integrity_metadata: None,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         });
         return Box::into_raw(module);
     }
@@ -2860,6 +2967,11 @@ unsafe fn compile_module_source(
                 resource_name: None,
                 resource_line_offset: 0,
                 resource_column_offset: 0,
+                base_url: None,
+                integrity_metadata: None,
+                credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+                referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+                parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             });
             return Box::into_raw(module);
         }
@@ -2887,6 +2999,11 @@ unsafe fn compile_module_source(
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
+            base_url: None,
+            integrity_metadata: None,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         });
         return Box::into_raw(module);
     }
@@ -2911,6 +3028,11 @@ unsafe fn compile_module_source(
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
+            base_url: None,
+            integrity_metadata: None,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         }),
         Err(e) => {
             let msg = e.to_string();
@@ -2927,6 +3049,11 @@ unsafe fn compile_module_source(
                 resource_name: None,
                 resource_line_offset: 0,
                 resource_column_offset: 0,
+                base_url: None,
+                integrity_metadata: None,
+                credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+                referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+                parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             })
         }
     };
@@ -3456,6 +3583,230 @@ pub unsafe extern "C" fn stator_module_get_column_offset(module: *const StatorMo
     unsafe { (*module).resource_column_offset }
 }
 
+/// Build a [`StatorModuleOrigin`] view borrowing into a module's stored
+/// browser policy/origin metadata.
+///
+/// The returned struct's pointer fields borrow from `module` and are valid
+/// only while `module` is alive and its metadata is not overwritten.
+fn module_origin_view(module: &StatorModule) -> StatorModuleOrigin {
+    let (base_url, base_url_len) = match module.base_url.as_ref() {
+        Some(bytes) if !bytes.is_empty() => (bytes.as_ptr() as *const c_char, bytes.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    let (integrity_metadata, integrity_metadata_len) = match module.integrity_metadata.as_ref() {
+        Some(bytes) if !bytes.is_empty() => (bytes.as_ptr() as *const c_char, bytes.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    StatorModuleOrigin {
+        base_url,
+        base_url_len,
+        integrity_metadata,
+        integrity_metadata_len,
+        credentials_mode: module.credentials_mode,
+        referrer_policy: module.referrer_policy,
+        parser_metadata: module.parser_metadata,
+    }
+}
+
+/// Attach browser policy/origin metadata to `module`.
+///
+/// Records the embedder's per-module-fetch context — base URL, Subresource
+/// Integrity metadata, credentials mode, referrer policy, and parser metadata
+/// — so that the host module resolver can apply same-origin, CORS, COEP, CSP
+/// `script-src`, integrity, referrer-policy, and parser-metadata checks before
+/// returning a resolved module from a static `import`, re-export, or
+/// `import`-with-attributes request.
+///
+/// Strings (`base_url`, `integrity_metadata`) are copied into `module`; the
+/// caller retains ownership of the input buffers and may free them as soon as
+/// this call returns. The stored copies remain stable until either
+/// [`stator_module_set_origin_metadata`] is called again or the module is
+/// freed by [`stator_module_free`].
+///
+/// `base_url` / `integrity_metadata` may be null when the corresponding
+/// length is zero to clear that field. Passing a null pointer with a non-zero
+/// length is rejected as invalid input: the call returns `false` and the
+/// previously stored metadata on `module` is preserved unchanged.
+///
+/// Returns `true` on success, `false` when `module` is null or when any
+/// pointer/length pair is inconsistent.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - When `base_url_len > 0`, `base_url` must be valid for reads of
+///   `base_url_len` bytes.
+/// - When `integrity_metadata_len > 0`, `integrity_metadata` must be valid
+///   for reads of `integrity_metadata_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_set_origin_metadata(
+    module: *mut StatorModule,
+    base_url: *const c_char,
+    base_url_len: usize,
+    credentials_mode: StatorCredentialsMode,
+    integrity_metadata: *const c_char,
+    integrity_metadata_len: usize,
+    referrer_policy: StatorReferrerPolicy,
+    parser_metadata: StatorParserMetadata,
+) -> bool {
+    if module.is_null() {
+        return false;
+    }
+    if base_url.is_null() && base_url_len != 0 {
+        return false;
+    }
+    if integrity_metadata.is_null() && integrity_metadata_len != 0 {
+        return false;
+    }
+
+    let base_url_owned = if base_url.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `base_url` is valid for `base_url_len` bytes.
+        let slice = unsafe { std::slice::from_raw_parts(base_url as *const u8, base_url_len) };
+        Some(slice.to_vec())
+    };
+    let integrity_owned = if integrity_metadata.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `integrity_metadata` is valid for
+        // `integrity_metadata_len` bytes.
+        let slice = unsafe {
+            std::slice::from_raw_parts(integrity_metadata as *const u8, integrity_metadata_len)
+        };
+        Some(slice.to_vec())
+    };
+
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe {
+        (*module).base_url = base_url_owned;
+        (*module).integrity_metadata = integrity_owned;
+        (*module).credentials_mode = credentials_mode;
+        (*module).referrer_policy = referrer_policy;
+        (*module).parser_metadata = parser_metadata;
+    }
+    true
+}
+
+/// Return a pointer to the base-URL bytes previously set on `module`, or null
+/// when no base URL is set.
+///
+/// `out_len`, when non-null, receives the byte length of the base URL (zero
+/// when the return value is null). The bytes are not null-terminated and are
+/// valid as long as `module` is alive and the metadata is not overwritten by
+/// another call to [`stator_module_set_origin_metadata`].
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - `out_len`, when non-null, must be valid for one `usize` write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_base_url(
+    module: *const StatorModule,
+    out_len: *mut usize,
+) -> *const c_char {
+    if module.is_null() {
+        if !out_len.is_null() {
+            // SAFETY: caller guarantees `out_len` is valid.
+            unsafe { *out_len = 0 };
+        }
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let bytes = unsafe { (*module).base_url.as_ref() };
+    let (ptr, len) = match bytes {
+        Some(b) if !b.is_empty() => (b.as_ptr() as *const c_char, b.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    if !out_len.is_null() {
+        // SAFETY: caller guarantees `out_len` is valid for one write.
+        unsafe { *out_len = len };
+    }
+    ptr
+}
+
+/// Return a pointer to the integrity-metadata bytes previously set on
+/// `module`, or null when none is set.
+///
+/// `out_len`, when non-null, receives the byte length (zero when the return
+/// value is null). The bytes are not null-terminated and are valid as long as
+/// `module` is alive and the metadata is not overwritten by another call to
+/// [`stator_module_set_origin_metadata`].
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - `out_len`, when non-null, must be valid for one `usize` write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_integrity_metadata(
+    module: *const StatorModule,
+    out_len: *mut usize,
+) -> *const c_char {
+    if module.is_null() {
+        if !out_len.is_null() {
+            // SAFETY: caller guarantees `out_len` is valid.
+            unsafe { *out_len = 0 };
+        }
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let bytes = unsafe { (*module).integrity_metadata.as_ref() };
+    let (ptr, len) = match bytes {
+        Some(b) if !b.is_empty() => (b.as_ptr() as *const c_char, b.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    if !out_len.is_null() {
+        // SAFETY: caller guarantees `out_len` is valid for one write.
+        unsafe { *out_len = len };
+    }
+    ptr
+}
+
+/// Return the credentials mode previously set on `module`, or
+/// [`StatorCredentialsMode::StatorCredentialsModeDefault`] when unset.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_credentials_mode(
+    module: *const StatorModule,
+) -> StatorCredentialsMode {
+    if module.is_null() {
+        return StatorCredentialsMode::StatorCredentialsModeDefault;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).credentials_mode }
+}
+
+/// Return the referrer policy previously set on `module`, or
+/// [`StatorReferrerPolicy::StatorReferrerPolicyDefault`] when unset.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_referrer_policy(
+    module: *const StatorModule,
+) -> StatorReferrerPolicy {
+    if module.is_null() {
+        return StatorReferrerPolicy::StatorReferrerPolicyDefault;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).referrer_policy }
+}
+
+/// Return the parser-metadata classification previously set on `module`, or
+/// [`StatorParserMetadata::StatorParserMetadataNotParserInserted`] when unset.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_parser_metadata(
+    module: *const StatorModule,
+) -> StatorParserMetadata {
+    if module.is_null() {
+        return StatorParserMetadata::StatorParserMetadataNotParserInserted;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    unsafe { (*module).parser_metadata }
+}
+
 /// Return the number of bytecode instructions in a compiled module.
 ///
 /// Returns 0 if `module` is null, failed to compile, or cannot be decoded.
@@ -3785,6 +4136,7 @@ unsafe fn instantiate_module_graph(
         }
     };
 
+    let origin = module_origin_view(module_ref);
     for request in &module_ref.module_requests {
         let mut out_module: *mut StatorModule = std::ptr::null_mut();
         let mut out_error: *mut StatorString = std::ptr::null_mut();
@@ -3794,13 +4146,15 @@ unsafe fn instantiate_module_graph(
             request.attributes.as_ptr()
         };
         // SAFETY: resolver registration requires the callback to remain callable
-        // while installed. Request slices are borrowed from `module` for the
-        // duration of this synchronous call, and out pointers are valid locals.
+        // while installed. Request slices and origin metadata are borrowed from
+        // `module` for the duration of this synchronous call, and out pointers
+        // are valid locals.
         let status = unsafe {
             callback(
                 ctx,
                 user_data,
                 module,
+                &origin,
                 request.specifier.as_ptr(),
                 request.specifier.as_bytes().len(),
                 attributes_ptr,
@@ -10516,6 +10870,7 @@ mod tests {
         _ctx: *mut StatorContext,
         _user_data: *mut c_void,
         _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
         _specifier: *const c_char,
         _specifier_len: usize,
         _attributes: *const StatorImportAttribute,
@@ -10538,6 +10893,7 @@ mod tests {
         ctx: *mut StatorContext,
         user_data: *mut c_void,
         referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
         specifier: *const c_char,
         specifier_len: usize,
         attributes: *const StatorImportAttribute,
@@ -10802,6 +11158,15 @@ mod tests {
         let specifier = b"./dep.js";
         let mut out_module: *mut StatorModule = std::ptr::null_mut();
         let mut out_error: *mut StatorString = std::ptr::null_mut();
+        let origin = StatorModuleOrigin {
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
         // SAFETY: the stored callback and all pointers are valid for this test.
         let status = unsafe {
             let resolver = (*ctx).module_resolver.as_ref().unwrap();
@@ -10809,6 +11174,7 @@ mod tests {
                 ctx,
                 resolver.user_data,
                 module,
+                &origin,
                 specifier.as_ptr() as *const c_char,
                 specifier.len(),
                 std::ptr::null(),
@@ -11296,6 +11662,7 @@ mod tests {
         _ctx: *mut StatorContext,
         user_data: *mut c_void,
         _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
         specifier: *const c_char,
         specifier_len: usize,
         attributes: *const StatorImportAttribute,
@@ -11843,6 +12210,7 @@ mod tests {
         _ctx: *mut StatorContext,
         user_data: *mut c_void,
         _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
         _specifier: *const c_char,
         _specifier_len: usize,
         _attributes: *const StatorImportAttribute,
@@ -12191,6 +12559,409 @@ mod tests {
     }
 
     #[test]
+    fn test_module_origin_metadata_defaults_are_unset() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let mut len: usize = 99;
+            assert!(stator_module_get_base_url(module, &mut len).is_null());
+            assert_eq!(len, 0);
+            len = 99;
+            assert!(stator_module_get_integrity_metadata(module, &mut len).is_null());
+            assert_eq!(len, 0);
+            assert_eq!(
+                stator_module_get_credentials_mode(module),
+                StatorCredentialsMode::StatorCredentialsModeDefault
+            );
+            assert_eq!(
+                stator_module_get_referrer_policy(module),
+                StatorReferrerPolicy::StatorReferrerPolicyDefault
+            );
+            assert_eq!(
+                stator_module_get_parser_metadata(module),
+                StatorParserMetadata::StatorParserMetadataNotParserInserted
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_set_origin_metadata_copies_strings_and_survives_caller_mutation() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+        // Allocate caller-owned buffers we will later mutate / drop.
+        let mut base_url = b"https://example.test/app/main.mjs".to_vec();
+        let mut integrity = b"sha384-abcdef".to_vec();
+
+        // SAFETY: `module` is non-null and live; buffers are valid.
+        let ok = unsafe {
+            stator_module_set_origin_metadata(
+                module,
+                base_url.as_ptr() as *const c_char,
+                base_url.len(),
+                StatorCredentialsMode::StatorCredentialsModeInclude,
+                integrity.as_ptr() as *const c_char,
+                integrity.len(),
+                StatorReferrerPolicy::StatorReferrerPolicyStrictOriginWhenCrossOrigin,
+                StatorParserMetadata::StatorParserMetadataParserInserted,
+            )
+        };
+        assert!(ok);
+
+        // Mutate then drop the caller buffers — engine must own its own copies.
+        base_url.iter_mut().for_each(|b| *b = b'!');
+        integrity.iter_mut().for_each(|b| *b = b'?');
+        drop(base_url);
+        drop(integrity);
+
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let mut len: usize = 0;
+            let ptr = stator_module_get_base_url(module, &mut len);
+            assert!(!ptr.is_null());
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            assert_eq!(bytes, b"https://example.test/app/main.mjs");
+
+            let mut len2: usize = 0;
+            let ptr2 = stator_module_get_integrity_metadata(module, &mut len2);
+            assert!(!ptr2.is_null());
+            let bytes2 = std::slice::from_raw_parts(ptr2 as *const u8, len2);
+            assert_eq!(bytes2, b"sha384-abcdef");
+
+            assert_eq!(
+                stator_module_get_credentials_mode(module),
+                StatorCredentialsMode::StatorCredentialsModeInclude
+            );
+            assert_eq!(
+                stator_module_get_referrer_policy(module),
+                StatorReferrerPolicy::StatorReferrerPolicyStrictOriginWhenCrossOrigin
+            );
+            assert_eq!(
+                stator_module_get_parser_metadata(module),
+                StatorParserMetadata::StatorParserMetadataParserInserted
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_set_origin_metadata_clears_with_null_zero_length() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+        let url = b"https://example.test/".to_vec();
+        // SAFETY: `module` is non-null and live; `url` is valid.
+        unsafe {
+            assert!(stator_module_set_origin_metadata(
+                module,
+                url.as_ptr() as *const c_char,
+                url.len(),
+                StatorCredentialsMode::StatorCredentialsModeOmit,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyNoReferrer,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+            assert!(!stator_module_get_base_url(module, std::ptr::null_mut()).is_null());
+
+            // Now clear both string fields by passing null with length 0.
+            assert!(stator_module_set_origin_metadata(
+                module,
+                std::ptr::null(),
+                0,
+                StatorCredentialsMode::StatorCredentialsModeDefault,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyDefault,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+            let mut len: usize = 1;
+            assert!(stator_module_get_base_url(module, &mut len).is_null());
+            assert_eq!(len, 0);
+            len = 1;
+            assert!(stator_module_get_integrity_metadata(module, &mut len).is_null());
+            assert_eq!(len, 0);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_set_origin_metadata_rejects_null_pointer_with_nonzero_length() {
+        let module = compile_module_src("export const x = 1;");
+        assert!(!module.is_null());
+        let url = b"https://example.test/".to_vec();
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            // Seed valid metadata so we can verify it stays unchanged.
+            assert!(stator_module_set_origin_metadata(
+                module,
+                url.as_ptr() as *const c_char,
+                url.len(),
+                StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyOrigin,
+                StatorParserMetadata::StatorParserMetadataParserInserted,
+            ));
+
+            // Invalid: null base_url with nonzero length.
+            assert!(!stator_module_set_origin_metadata(
+                module,
+                std::ptr::null(),
+                7,
+                StatorCredentialsMode::StatorCredentialsModeOmit,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyNoReferrer,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+            // Invalid: null integrity with nonzero length.
+            assert!(!stator_module_set_origin_metadata(
+                module,
+                url.as_ptr() as *const c_char,
+                url.len(),
+                StatorCredentialsMode::StatorCredentialsModeOmit,
+                std::ptr::null(),
+                3,
+                StatorReferrerPolicy::StatorReferrerPolicyNoReferrer,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+
+            // Pre-existing metadata must still be intact.
+            let mut len = 0usize;
+            let ptr = stator_module_get_base_url(module, &mut len);
+            assert!(!ptr.is_null());
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            assert_eq!(bytes, b"https://example.test/");
+            assert_eq!(
+                stator_module_get_credentials_mode(module),
+                StatorCredentialsMode::StatorCredentialsModeSameOrigin
+            );
+            assert_eq!(
+                stator_module_get_referrer_policy(module),
+                StatorReferrerPolicy::StatorReferrerPolicyOrigin
+            );
+            assert_eq!(
+                stator_module_get_parser_metadata(module),
+                StatorParserMetadata::StatorParserMetadataParserInserted
+            );
+
+            stator_module_free(module);
+        }
+    }
+
+    struct TestOriginCaptureData {
+        modules: HashMap<String, *mut StatorModule>,
+        captured_base_url: Option<Vec<u8>>,
+        captured_integrity: Option<Vec<u8>>,
+        captured_credentials_mode: StatorCredentialsMode,
+        captured_referrer_policy: StatorReferrerPolicy,
+        captured_parser_metadata: StatorParserMetadata,
+        captured_origin_was_null: bool,
+    }
+
+    unsafe extern "C" fn test_origin_capture_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        _attributes: *const StatorImportAttribute,
+        _attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestOriginCaptureData) };
+        data.captured_origin_was_null = origin.is_null();
+        if !origin.is_null() {
+            // SAFETY: callback contract guarantees `origin` is valid for this call.
+            let view = unsafe { &*origin };
+            data.captured_base_url = if view.base_url.is_null() {
+                None
+            } else {
+                // SAFETY: contract guarantees `base_url_len` valid bytes.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(view.base_url as *const u8, view.base_url_len)
+                };
+                Some(bytes.to_vec())
+            };
+            data.captured_integrity = if view.integrity_metadata.is_null() {
+                None
+            } else {
+                // SAFETY: contract guarantees `integrity_metadata_len` valid bytes.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        view.integrity_metadata as *const u8,
+                        view.integrity_metadata_len,
+                    )
+                };
+                Some(bytes.to_vec())
+            };
+            data.captured_credentials_mode = view.credentials_mode;
+            data.captured_referrer_policy = view.referrer_policy;
+            data.captured_parser_metadata = view.parser_metadata;
+        }
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap().to_string();
+        if !out_error.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_error = std::ptr::null_mut() };
+        }
+        let module = data
+            .modules
+            .get(&specifier)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_module = module };
+        }
+        if module.is_null() {
+            StatorResolveStatus::StatorResolveStatusNotFound
+        } else {
+            StatorResolveStatus::StatorResolveStatusOk
+        }
+    }
+
+    fn fresh_origin_capture_data(
+        modules: HashMap<String, *mut StatorModule>,
+    ) -> TestOriginCaptureData {
+        TestOriginCaptureData {
+            modules,
+            captured_base_url: None,
+            captured_integrity: None,
+            captured_credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            captured_referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            captured_parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            captured_origin_was_null: true,
+        }
+    }
+
+    #[test]
+    fn test_module_resolver_receives_origin_metadata_from_referrer() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+
+        let base_url = b"https://example.test/app/main.mjs".to_vec();
+        let integrity = b"sha256-deadbeef".to_vec();
+        // SAFETY: `root` is valid; buffers are valid.
+        unsafe {
+            assert!(stator_module_set_origin_metadata(
+                root,
+                base_url.as_ptr() as *const c_char,
+                base_url.len(),
+                StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+                integrity.as_ptr() as *const c_char,
+                integrity.len(),
+                StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin,
+                StatorParserMetadata::StatorParserMetadataParserInserted,
+            ));
+        }
+
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = fresh_origin_capture_data(modules);
+
+        // SAFETY: callback and user data live for this test scope.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_origin_capture_resolver_cb),
+                &mut data as *mut TestOriginCaptureData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert!(!data.captured_origin_was_null);
+        assert_eq!(
+            data.captured_base_url.as_deref(),
+            Some(b"https://example.test/app/main.mjs".as_ref())
+        );
+        assert_eq!(
+            data.captured_integrity.as_deref(),
+            Some(b"sha256-deadbeef".as_ref())
+        );
+        assert_eq!(
+            data.captured_credentials_mode,
+            StatorCredentialsMode::StatorCredentialsModeSameOrigin
+        );
+        assert_eq!(
+            data.captured_referrer_policy,
+            StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin
+        );
+        assert_eq!(
+            data.captured_parser_metadata,
+            StatorParserMetadata::StatorParserMetadataParserInserted
+        );
+    }
+
+    #[test]
+    fn test_module_resolver_receives_default_origin_when_metadata_unset() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = fresh_origin_capture_data(modules);
+
+        // SAFETY: callback and user data live for this test scope.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_origin_capture_resolver_cb),
+                &mut data as *mut TestOriginCaptureData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert!(!data.captured_origin_was_null);
+        assert!(data.captured_base_url.is_none());
+        assert!(data.captured_integrity.is_none());
+        assert_eq!(
+            data.captured_credentials_mode,
+            StatorCredentialsMode::StatorCredentialsModeDefault
+        );
+        assert_eq!(
+            data.captured_referrer_policy,
+            StatorReferrerPolicy::StatorReferrerPolicyDefault
+        );
+        assert_eq!(
+            data.captured_parser_metadata,
+            StatorParserMetadata::StatorParserMetadataNotParserInserted
+        );
+    }
+
+    #[test]
     fn test_module_null_accessors_are_safe() {
         // SAFETY: passing null is documented as supported by every accessor.
         unsafe {
@@ -12228,6 +12999,39 @@ mod tests {
                 std::ptr::null_mut()
             ));
             assert!(stator_module_evaluate(std::ptr::null_mut(), std::ptr::null_mut()).is_null());
+            assert!(!stator_module_set_origin_metadata(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                StatorCredentialsMode::StatorCredentialsModeDefault,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyDefault,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+            let mut len = 99usize;
+            assert!(stator_module_get_base_url(std::ptr::null(), &mut len).is_null());
+            assert_eq!(len, 0);
+            len = 99;
+            assert!(stator_module_get_integrity_metadata(std::ptr::null(), &mut len).is_null());
+            assert_eq!(len, 0);
+            assert!(stator_module_get_base_url(std::ptr::null(), std::ptr::null_mut()).is_null());
+            assert!(
+                stator_module_get_integrity_metadata(std::ptr::null(), std::ptr::null_mut())
+                    .is_null()
+            );
+            assert_eq!(
+                stator_module_get_credentials_mode(std::ptr::null()),
+                StatorCredentialsMode::StatorCredentialsModeDefault
+            );
+            assert_eq!(
+                stator_module_get_referrer_policy(std::ptr::null()),
+                StatorReferrerPolicy::StatorReferrerPolicyDefault
+            );
+            assert_eq!(
+                stator_module_get_parser_metadata(std::ptr::null()),
+                StatorParserMetadata::StatorParserMetadataNotParserInserted
+            );
             stator_module_free(std::ptr::null_mut());
         }
     }

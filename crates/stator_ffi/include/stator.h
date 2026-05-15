@@ -38,6 +38,91 @@ typedef enum StatorResolveStatus {
 } StatorResolveStatus;
 
 /**
+ * Browser credentials mode applied to a module fetch.
+ *
+ * Stable persisted numbering — never reorder these variants.
+ */
+typedef enum StatorCredentialsMode {
+  /**
+   * Default credentials mode (`same-origin` per HTML for module scripts).
+   */
+  StatorCredentialsModeDefault = 0,
+  /**
+   * `omit` — never send or store credentials.
+   */
+  StatorCredentialsModeOmit = 1,
+  /**
+   * `same-origin` — send credentials only for same-origin requests.
+   */
+  StatorCredentialsModeSameOrigin = 2,
+  /**
+   * `include` — always send credentials, even cross-origin.
+   */
+  StatorCredentialsModeInclude = 3,
+} StatorCredentialsMode;
+
+/**
+ * Browser referrer policy applied to subsequent module fetches.
+ *
+ * Mirrors the values of the W3C Referrer Policy spec. Stable persisted
+ * numbering — never reorder these variants.
+ */
+typedef enum StatorReferrerPolicy {
+  /**
+   * Empty / default — defer to the embedder's environment policy.
+   */
+  StatorReferrerPolicyDefault = 0,
+  /**
+   * `no-referrer`.
+   */
+  StatorReferrerPolicyNoReferrer = 1,
+  /**
+   * `no-referrer-when-downgrade`.
+   */
+  StatorReferrerPolicyNoReferrerWhenDowngrade = 2,
+  /**
+   * `same-origin`.
+   */
+  StatorReferrerPolicySameOrigin = 3,
+  /**
+   * `origin`.
+   */
+  StatorReferrerPolicyOrigin = 4,
+  /**
+   * `strict-origin`.
+   */
+  StatorReferrerPolicyStrictOrigin = 5,
+  /**
+   * `origin-when-cross-origin`.
+   */
+  StatorReferrerPolicyOriginWhenCrossOrigin = 6,
+  /**
+   * `strict-origin-when-cross-origin`.
+   */
+  StatorReferrerPolicyStrictOriginWhenCrossOrigin = 7,
+  /**
+   * `unsafe-url`.
+   */
+  StatorReferrerPolicyUnsafeUrl = 8,
+} StatorReferrerPolicy;
+
+/**
+ * HTML parser-metadata classification for a module script.
+ *
+ * Stable persisted numbering — never reorder these variants.
+ */
+typedef enum StatorParserMetadata {
+  /**
+   * Module was not inserted by the HTML parser (default).
+   */
+  StatorParserMetadataNotParserInserted = 0,
+  /**
+   * Module was inserted by the HTML parser.
+   */
+  StatorParserMetadataParserInserted = 1,
+} StatorParserMetadata;
+
+/**
  * Host-visible source kind for a compiled module record.
  *
  * JavaScript modules are parsed and compiled by Stator today. Other source
@@ -669,6 +754,50 @@ typedef struct StatorTieringStats {
 } StatorTieringStats;
 
 /**
+ * Read-only view of the browser policy/origin metadata associated with a
+ * referrer module, supplied to host module resolver callbacks.
+ *
+ * `base_url` and `integrity_metadata` point to UTF-8 byte slices owned by the
+ * referrer [`StatorModule`]; they are not required to be null-terminated and
+ * may be null when the corresponding length is zero. The pointed-to bytes
+ * (and the [`StatorModuleOrigin`] struct itself) are valid only for the
+ * duration of the resolver callback that received them — hosts must copy any
+ * data they need to retain past return.
+ */
+typedef struct StatorModuleOrigin {
+  /**
+   * Pointer to `base_url_len` bytes of the referrer's base URL, or null
+   * when no base URL was set.
+   */
+  const char *base_url;
+  /**
+   * Number of bytes in `base_url`. Zero when `base_url` is null.
+   */
+  size_t base_url_len;
+  /**
+   * Pointer to `integrity_metadata_len` bytes of Subresource Integrity
+   * metadata associated with the referrer fetch, or null when none.
+   */
+  const char *integrity_metadata;
+  /**
+   * Number of bytes in `integrity_metadata`. Zero when null.
+   */
+  size_t integrity_metadata_len;
+  /**
+   * Credentials mode applied to the referrer fetch.
+   */
+  enum StatorCredentialsMode credentials_mode;
+  /**
+   * Referrer policy applied to subsequent module fetches.
+   */
+  enum StatorReferrerPolicy referrer_policy;
+  /**
+   * Parser-metadata classification of the referrer module script.
+   */
+  enum StatorParserMetadata parser_metadata;
+} StatorModuleOrigin;
+
+/**
  * A single ECMAScript import attribute passed to a module resolver callback.
  *
  * Both `key` and `value` are UTF-8 byte slices and are not required to be
@@ -1129,6 +1258,11 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
  *   [`stator_context_set_module_resolver`].
  * - `referrer` is a read-only borrowed module pointer valid only for the
  *   duration of the callback.
+ * - `origin` is a read-only pointer to a [`StatorModuleOrigin`] view of the
+ *   referrer's policy/origin metadata. The struct and any byte slices it
+ *   points to are valid only for the duration of the callback. When the
+ *   referrer has no metadata configured, the struct's pointers are null with
+ *   zero lengths and its enum fields hold their `Default` variants.
  * - `specifier` points to `specifier_len` UTF-8 bytes and is not necessarily
  *   null-terminated. The bytes are read-only and valid only for this callback.
  * - `attributes` points to `attributes_len` entries, or is null when the
@@ -1145,6 +1279,7 @@ typedef void (*StatorUserDataFreeCallback)(void *user_data);
 typedef enum StatorResolveStatus (*StatorModuleResolverCallback)(struct StatorContext *ctx,
                                                                  void *user_data,
                                                                  const struct StatorModule *referrer,
+                                                                 const struct StatorModuleOrigin *origin,
                                                                  const char *specifier,
                                                                  size_t specifier_len,
                                                                  const struct StatorImportAttribute *attributes,
@@ -1732,6 +1867,7 @@ bool stator_context_set_module_resolver(struct StatorContext *ctx,
                                         enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
                                                                              void *user_data,
                                                                              const struct StatorModule *referrer,
+                                                                             const struct StatorModuleOrigin *origin,
                                                                              const char *specifier,
                                                                              size_t specifier_len,
                                                                              const struct StatorImportAttribute *attributes,
@@ -2616,6 +2752,104 @@ int32_t stator_module_get_line_offset(const struct StatorModule *module);
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 int32_t stator_module_get_column_offset(const struct StatorModule *module);
+
+/**
+ * Attach browser policy/origin metadata to `module`.
+ *
+ * Records the embedder's per-module-fetch context — base URL, Subresource
+ * Integrity metadata, credentials mode, referrer policy, and parser metadata
+ * — so that the host module resolver can apply same-origin, CORS, COEP, CSP
+ * `script-src`, integrity, referrer-policy, and parser-metadata checks before
+ * returning a resolved module from a static `import`, re-export, or
+ * `import`-with-attributes request.
+ *
+ * Strings (`base_url`, `integrity_metadata`) are copied into `module`; the
+ * caller retains ownership of the input buffers and may free them as soon as
+ * this call returns. The stored copies remain stable until either
+ * [`stator_module_set_origin_metadata`] is called again or the module is
+ * freed by [`stator_module_free`].
+ *
+ * `base_url` / `integrity_metadata` may be null when the corresponding
+ * length is zero to clear that field. Passing a null pointer with a non-zero
+ * length is rejected as invalid input: the call returns `false` and the
+ * previously stored metadata on `module` is preserved unchanged.
+ *
+ * Returns `true` on success, `false` when `module` is null or when any
+ * pointer/length pair is inconsistent.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - When `base_url_len > 0`, `base_url` must be valid for reads of
+ *   `base_url_len` bytes.
+ * - When `integrity_metadata_len > 0`, `integrity_metadata` must be valid
+ *   for reads of `integrity_metadata_len` bytes.
+ */
+bool stator_module_set_origin_metadata(struct StatorModule *module,
+                                       const char *base_url,
+                                       size_t base_url_len,
+                                       enum StatorCredentialsMode credentials_mode,
+                                       const char *integrity_metadata,
+                                       size_t integrity_metadata_len,
+                                       enum StatorReferrerPolicy referrer_policy,
+                                       enum StatorParserMetadata parser_metadata);
+
+/**
+ * Return a pointer to the base-URL bytes previously set on `module`, or null
+ * when no base URL is set.
+ *
+ * `out_len`, when non-null, receives the byte length of the base URL (zero
+ * when the return value is null). The bytes are not null-terminated and are
+ * valid as long as `module` is alive and the metadata is not overwritten by
+ * another call to [`stator_module_set_origin_metadata`].
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - `out_len`, when non-null, must be valid for one `usize` write.
+ */
+const char *stator_module_get_base_url(const struct StatorModule *module, size_t *out_len);
+
+/**
+ * Return a pointer to the integrity-metadata bytes previously set on
+ * `module`, or null when none is set.
+ *
+ * `out_len`, when non-null, receives the byte length (zero when the return
+ * value is null). The bytes are not null-terminated and are valid as long as
+ * `module` is alive and the metadata is not overwritten by another call to
+ * [`stator_module_set_origin_metadata`].
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - `out_len`, when non-null, must be valid for one `usize` write.
+ */
+const char *stator_module_get_integrity_metadata(const struct StatorModule *module,
+                                                 size_t *out_len);
+
+/**
+ * Return the credentials mode previously set on `module`, or
+ * [`StatorCredentialsMode::StatorCredentialsModeDefault`] when unset.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+enum StatorCredentialsMode stator_module_get_credentials_mode(const struct StatorModule *module);
+
+/**
+ * Return the referrer policy previously set on `module`, or
+ * [`StatorReferrerPolicy::StatorReferrerPolicyDefault`] when unset.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+enum StatorReferrerPolicy stator_module_get_referrer_policy(const struct StatorModule *module);
+
+/**
+ * Return the parser-metadata classification previously set on `module`, or
+ * [`StatorParserMetadata::StatorParserMetadataNotParserInserted`] when unset.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorModule`] pointer.
+ */
+enum StatorParserMetadata stator_module_get_parser_metadata(const struct StatorModule *module);
 
 /**
  * Return the number of bytecode instructions in a compiled module.
