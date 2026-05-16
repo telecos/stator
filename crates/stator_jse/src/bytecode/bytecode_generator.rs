@@ -184,6 +184,8 @@ struct FunctionCompileOptions {
     closure_captures: HashMap<String, u32>,
     is_module: bool,
     module_variables: HashMap<String, (u32, i32)>,
+    /// Local imported binding name → `(source, imported_name)`.
+    imported_module_bindings: HashMap<String, (String, String)>,
     exported_module_bindings: HashSet<String>,
     /// Local-name → exported-alias map propagated to inner function bodies so
     /// stores into a captured module-exported binding write through to every
@@ -275,6 +277,8 @@ struct FunctionCompiler {
     /// that parameterise [`Opcode::LdaModuleVariable`] and
     /// [`Opcode::StaModuleVariable`].
     module_variables: HashMap<String, (u32, i32)>,
+    /// Local imported binding name → `(source, imported_name)` for live reads.
+    imported_module_bindings: HashMap<String, (String, String)>,
     /// Local binding names directly exported by this module.
     ///
     /// Assignments to these names write through to the corresponding module
@@ -366,6 +370,7 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
+            imported_module_bindings: HashMap::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -1783,6 +1788,7 @@ impl FunctionCompiler {
                 closure_captures: self.context_bindings.clone(),
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
+                imported_module_bindings: self.imported_module_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -1804,9 +1810,9 @@ impl FunctionCompiler {
                 self.define_local(&id.name)
             };
             self.emit_star(reg);
-            // Top-level function declarations are also stored as globals so
+            // Top-level script function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
-            if self.is_program {
+            if self.is_program && !self.is_module {
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
                 // Re-load the value from the local register first so the
@@ -1850,8 +1856,8 @@ impl FunctionCompiler {
                 .unwrap_or_else(|| self.define_local(&id.name));
             self.emit_star(reg);
             self.mark_initialized(&id.name);
-            // Top-level class declarations are also stored as globals.
-            if self.is_program {
+            // Top-level script class declarations are also stored as globals.
+            if self.is_program && !self.is_module {
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
                 self.emit_ldar(reg);
@@ -2518,6 +2524,7 @@ impl FunctionCompiler {
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
+            imported_module_bindings: HashMap::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -3515,6 +3522,14 @@ impl FunctionCompiler {
             ));
             return;
         }
+        if let Some((source, imported_name)) = self.imported_module_bindings.get(name).cloned() {
+            let (req_idx, cell) = self.get_or_create_module_variable(&source, &imported_name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaModuleVariable,
+                vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+            ));
+            return;
+        }
         if let Some(binding) = self.lookup_var(name) {
             self.emit_ldar(binding.reg);
             if binding.needs_tdz_check {
@@ -3568,6 +3583,14 @@ impl FunctionCompiler {
             self.emit(Instruction::new_unchecked(
                 Opcode::LdaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(slot)],
+            ));
+            return;
+        }
+        if let Some((source, imported_name)) = self.imported_module_bindings.get(name).cloned() {
+            let (req_idx, cell) = self.get_or_create_module_variable(&source, &imported_name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaModuleVariable,
+                vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
             ));
             return;
         }
@@ -5156,6 +5179,7 @@ impl FunctionCompiler {
                 closure_captures: self.context_bindings.clone(),
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
+                imported_module_bindings: self.imported_module_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5204,6 +5228,7 @@ impl FunctionCompiler {
                 closure_captures: self.context_bindings.clone(),
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
+                imported_module_bindings: self.imported_module_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5257,6 +5282,7 @@ impl FunctionCompiler {
                 closure_captures: self.context_bindings.clone(),
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
+                imported_module_bindings: self.imported_module_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5342,6 +5368,7 @@ impl FunctionCompiler {
                 closure_captures: self.context_bindings.clone(),
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
+                imported_module_bindings: self.imported_module_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -6884,6 +6911,10 @@ impl FunctionCompiler {
                         ModuleExportName::Ident(id) => id.name.as_str(),
                         ModuleExportName::Str(s) => s.value.as_str(),
                     };
+                    self.imported_module_bindings.insert(
+                        named.local.name.clone(),
+                        (source.to_string(), imported_name.to_string()),
+                    );
                     let (req_idx, cell) = self.get_or_create_module_variable(source, imported_name);
                     // Emit the load so the local binding is initialized.
                     self.emit(Instruction::new_unchecked(
@@ -6894,6 +6925,10 @@ impl FunctionCompiler {
                     self.emit_star(reg);
                 }
                 ImportSpecifier::Default(def) => {
+                    self.imported_module_bindings.insert(
+                        def.local.name.clone(),
+                        (source.to_string(), "default".to_string()),
+                    );
                     let (req_idx, cell) = self.get_or_create_module_variable(source, "default");
                     self.emit(Instruction::new_unchecked(
                         Opcode::LdaModuleVariable,
@@ -7308,6 +7343,7 @@ fn compile_function_with_private_names(
             closure_captures: HashMap::new(),
             is_module: false,
             module_variables: HashMap::new(),
+            imported_module_bindings: HashMap::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
         },
@@ -8301,6 +8337,7 @@ fn compile_function_inner(
         closure_captures,
         is_module,
         module_variables,
+        imported_module_bindings,
         exported_module_bindings,
         local_export_aliases,
     } = options;
@@ -8310,6 +8347,7 @@ fn compile_function_inner(
     compiler.is_module = is_module;
     let _ = module_variables;
     compiler.module_variables = HashMap::new();
+    compiler.imported_module_bindings = imported_module_bindings;
     compiler.exported_module_bindings = exported_module_bindings;
     compiler.local_export_aliases = local_export_aliases;
 

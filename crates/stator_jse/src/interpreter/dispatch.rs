@@ -2104,7 +2104,7 @@ fn handle_call_any_receiver(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallAnyReceiver", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -2215,7 +2215,7 @@ fn handle_tail_call(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("TailCall", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() || ba.is_async() {
@@ -2336,7 +2336,7 @@ fn handle_call_undefined_receiver0(
     let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallUndefinedReceiver0", 0));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
             // ── Fast path: already-JIT'd closures skip inline + tiering ──
@@ -2480,7 +2480,7 @@ fn handle_call_undefined_receiver1(
     let Operand::Register(arg1_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     if fast_array_method_name(&callee).as_deref() == Some("push")
         && let Some(JsValue::Array(arr)) = fast_array_method_target(&callee)
     {
@@ -2627,7 +2627,7 @@ fn handle_call_undefined_receiver2(
     let Operand::Register(arg2_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallUndefinedReceiver2", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
@@ -2801,7 +2801,7 @@ fn handle_call_property(
         }
     }
 
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     // Arguments reside in the registers immediately following
     // the callee register in the flat register file.
@@ -2951,7 +2951,7 @@ fn handle_call_with_spread(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallWithSpread", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
@@ -6641,7 +6641,7 @@ fn handle_call_property0(
     let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty0", 1));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     dispatch_call_property(ctx.frame, &callee, this_val, CallArgs::new())?;
     Ok(DispatchAction::Continue)
@@ -6660,7 +6660,7 @@ fn handle_call_property1(
     let Operand::Register(arg0_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty1", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     // Fast path: arr.push(val) — avoid generic dispatch overhead.
     if let JsValue::PlainObject(callee_map) = &callee {
         let obj = callee_map.borrow();
@@ -6705,7 +6705,7 @@ fn handle_call_property2(
     let Operand::Register(arg1_v) = *instr.operand(3) else {
         return Err(err_bad_operand("CallProperty2", 3));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     let arg0 = ctx.frame.read_reg(arg0_v)?.cheap_clone();
     let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
@@ -8313,7 +8313,8 @@ fn handle_lda_module_variable(
             StatorError::ReferenceError(format!(
                 "Cannot access module binding key '{key}' before initialization"
             ))
-        })?;
+        })?
+        .resolve_live_binding();
     Ok(DispatchAction::Continue)
 }
 

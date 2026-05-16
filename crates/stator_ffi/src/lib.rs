@@ -6514,12 +6514,14 @@ fn sync_module_request_bindings(
         // SAFETY: dependency pointers are populated by graph instantiation.
         let provider = unsafe { resolve_module_export_provider(dep, binding) }.unwrap_or(dep);
         let export_key = module_export_cell_key(provider, binding);
-        let value = global_env
-            .borrow()
-            .get(&export_key)
-            .cloned()
-            .ok_or_else(|| uninitialized_module_binding_error(binding))?;
+        if !global_env.borrow().contains_key(&export_key) {
+            return Err(uninitialized_module_binding_error(binding));
+        }
         let import_key = module_cell_key(&specifier, binding);
+        let value = JsValue::ModuleBinding(Rc::new(ModuleBindingCell {
+            global_env: Rc::clone(global_env),
+            key: export_key.into(),
+        }));
         global_env.borrow_mut().insert(import_key, value);
     }
     Ok(())
@@ -14672,6 +14674,64 @@ mod tests {
         }
     }
 
+    fn evaluate_module_graph_number(root_src: &str, deps: &[(&str, &str)]) -> Result<f64, String> {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(root_src);
+        let mut modules = HashMap::new();
+        for (specifier, source) in deps {
+            let module = compile_module_src(source);
+            modules.insert((*specifier).to_string(), module);
+        }
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this evaluation.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live until the cleanup below.
+        let outcome = unsafe {
+            if !stator_module_instantiate(ctx, root) {
+                Err(CStr::from_ptr(stator_module_get_error(root))
+                    .to_string_lossy()
+                    .into_owned())
+            } else {
+                let result = stator_module_evaluate(root, ctx);
+                if result.is_null() {
+                    Err(CStr::from_ptr(stator_module_get_error(root))
+                        .to_string_lossy()
+                        .into_owned())
+                } else {
+                    let number = stator_value_to_number(result);
+                    stator_value_destroy(result);
+                    Ok(number)
+                }
+            }
+        };
+
+        // SAFETY: all pointers were allocated by module/context constructors.
+        unsafe {
+            stator_module_free(root);
+            for module in data.modules.into_values() {
+                stator_module_free(module);
+            }
+            stator_context_destroy(ctx);
+        }
+        outcome
+    }
+
     fn compile_typed_module_src(src: &str, source_type: StatorModuleType) -> *mut StatorModule {
         let bytes = src.as_bytes();
         // SAFETY: null ctx is permitted; `bytes` is valid UTF-8.
@@ -15605,6 +15665,57 @@ mod tests {
             stator_module_free(dep);
             stator_context_destroy(ctx);
         }
+    }
+
+    #[test]
+    fn test_module_evaluate_imported_function_call_updates_live_binding() {
+        let result = evaluate_module_graph_number(
+            "import { bump, counter } from './dep.js'; bump(); counter;",
+            &[(
+                "./dep.js",
+                "export let counter = 0; export function bump() { counter = counter + 1; }",
+            )],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 1.0);
+    }
+
+    #[test]
+    fn test_module_evaluate_imported_closure_updates_importer_and_namespace() {
+        let result = evaluate_module_graph_number(
+            "import { inc, value } from './dep.js'; import * as ns from './dep.js'; \
+             inc(); value + ns.value;",
+            &[(
+                "./dep.js",
+                "export let value = 1; export const inc = function() { value = value + 2; };",
+            )],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 6.0);
+    }
+
+    #[test]
+    fn test_module_evaluate_default_imported_function_call() {
+        let result = evaluate_module_graph_number(
+            "import answer from './dep.js'; answer();",
+            &[("./dep.js", "export default function() { return 42; }")],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 42.0);
+    }
+
+    #[test]
+    fn test_module_evaluate_calling_non_callable_import_throws_type_error() {
+        let err = evaluate_module_graph_number(
+            "import { value } from './dep.js'; value();",
+            &[("./dep.js", "export const value = 1;")],
+        )
+        .expect_err("calling a non-callable import should fail");
+        assert!(err.contains("TypeError"), "expected TypeError, got: {err}");
+        assert!(
+            !err.contains("ReferenceError"),
+            "non-callable import call must not become ReferenceError: {err}"
+        );
     }
 
     #[test]

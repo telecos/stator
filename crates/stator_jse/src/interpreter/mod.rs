@@ -13076,6 +13076,13 @@ pub(super) fn dispatch_call(
     callee: &JsValue,
     args: CallArgs,
 ) -> StatorResult<()> {
+    let resolved_callee;
+    let callee = if matches!(callee, JsValue::ModuleBinding(_)) {
+        resolved_callee = callee.resolve_live_binding();
+        &resolved_callee
+    } else {
+        callee
+    };
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -13171,6 +13178,13 @@ pub(super) fn dispatch_call_property(
     this_val: JsValue,
     args: CallArgs,
 ) -> StatorResult<()> {
+    let resolved_callee;
+    let callee = if matches!(callee, JsValue::ModuleBinding(_)) {
+        resolved_callee = callee.resolve_live_binding();
+        &resolved_callee
+    } else {
+        callee
+    };
     if let Some(method_name) = fast_array_method_name(callee)
         && let Some(result) = dispatch_fast_array_method(&this_val, method_name.as_ref(), &args)?
     {
@@ -17846,6 +17860,13 @@ pub fn dispatch_call_with_this(
     args: impl IntoIterator<Item = JsValue>,
 ) -> StatorResult<JsValue> {
     let args: CallArgs = args.into_iter().collect();
+    let resolved_callee;
+    let callee = if matches!(callee, JsValue::ModuleBinding(_)) {
+        resolved_callee = callee.resolve_live_binding();
+        &resolved_callee
+    } else {
+        callee
+    };
     match callee {
         JsValue::Function(ba) => {
             // Generator functions return a suspended generator object instead
