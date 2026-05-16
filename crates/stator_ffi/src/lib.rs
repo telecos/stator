@@ -2602,6 +2602,20 @@ pub enum StatorModuleType {
     /// WebAssembly module source.
     StatorModuleTypeWebAssembly = 2,
     /// CSS module source.
+    ///
+    /// Currently fail-closed unsupported. Stator has no CSS parser and no
+    /// `CSSStyleSheet` object representation, so CSS module bodies cannot be
+    /// parsed, evaluated, or restored from a code cache. Compilation always
+    /// returns an errored [`StatorModule`] tagged with this `source_type`,
+    /// `stator_module_create_code_cache` reports
+    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`], and
+    /// `stator_module_compile_cached` rejects CSS source with the same
+    /// status. Resolving a request that carries `with { type: "css" }` to a
+    /// non-CSS module is a type mismatch like every other typed import.
+    /// Wiring real CSS module evaluation requires a host `CSSStyleSheet`
+    /// representation that Stator can construct and default-export; until
+    /// that primitive lands the enum value is reserved purely so embedders
+    /// can plumb metadata without silently downgrading to JavaScript.
     StatorModuleTypeCss = 3,
 }
 
@@ -3209,6 +3223,21 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
             StatorMessageKind::StatorMessageKindSyntax,
         ),
     }
+}
+
+/// CSS module bodies are not supported by Stator: there is no CSS parser and
+/// no `CSSStyleSheet` object to default-export. Always returns an errored
+/// module record so compile/instantiate/evaluate all fail closed with a
+/// precise blocker message identifying the missing host primitive.
+fn compile_css_module_source() -> Box<StatorModule> {
+    module_error_record(
+        StatorModuleType::StatorModuleTypeCss,
+        "CSS module source is not executable yet: Stator has no CSS parser \
+         or CSSStyleSheet representation; embedders must provide host \
+         CSSStyleSheet integration before CSS modules can be compiled, \
+         evaluated, or restored from a code cache",
+        StatorMessageKind::StatorMessageKindInternal,
+    )
 }
 
 fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
@@ -4601,6 +4630,10 @@ unsafe fn compile_module_source(
 
     if source_type == StatorModuleType::StatorModuleTypeJson {
         return Box::into_raw(compile_json_module_source(src));
+    }
+
+    if source_type == StatorModuleType::StatorModuleTypeCss {
+        return Box::into_raw(compile_css_module_source());
     }
 
     if source_type != StatorModuleType::StatorModuleTypeJavaScript {
@@ -18987,8 +19020,174 @@ mod tests {
                 .unwrap();
             assert!(css_err.contains("CSS"));
             assert!(css_err.contains("not executable yet"));
+            assert!(css_err.contains("CSSStyleSheet"));
+            assert!(css_err.contains("host"));
+            assert_eq!(
+                stator_module_get_type(css),
+                StatorModuleType::StatorModuleTypeCss
+            );
+            assert_eq!(
+                stator_module_get_status(css),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            // Evaluating an errored CSS module returns null without panicking
+            // and leaves the error untouched: the fail-closed contract holds
+            // through evaluate as well as compile.
+            assert!(stator_module_evaluate(css, std::ptr::null_mut()).is_null());
+            assert!(!stator_module_get_error(css).is_null());
             stator_module_free(wasm);
             stator_module_free(css);
+        }
+    }
+
+    #[test]
+    fn test_css_module_import_with_matching_attribute_fails_closed_through_instantiate() {
+        // Even when the importer correctly tags `with { type: 'css' }` and the
+        // resolver returns a CSS module, the graph cannot link because the
+        // CSS module itself is in a permanent errored state (no parser, no
+        // CSSStyleSheet). The precise CSS blocker must propagate to the root
+        // so embedders see why their CSS import failed instead of a generic
+        // "module errored" message.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root =
+            compile_module_src("import sheet from './styles.css' with { type: 'css' }; sheet;");
+        let css_dep =
+            compile_typed_module_src("/* ignored */", StatorModuleType::StatorModuleTypeCss);
+        assert!(!root.is_null());
+        assert!(!css_dep.is_null());
+        // SAFETY: `css_dep` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_type(css_dep),
+                StatorModuleType::StatorModuleTypeCss
+            );
+            assert!(!stator_module_get_error(css_dep).is_null());
+        }
+
+        let mut modules = HashMap::new();
+        modules.insert("./styles.css".to_string(), css_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            assert_eq!(data.calls, vec!["./styles.css"]);
+            assert_eq!(
+                data.attributes,
+                vec![vec![("type".to_string(), "css".to_string())]]
+            );
+            // The root surfaces the CSS-specific blocker, not a generic error.
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("CSS"));
+            assert!(err.contains("CSSStyleSheet"));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            // Evaluating the root after a fail-closed instantiate must remain
+            // null and never silently succeed against an unsupported type.
+            assert!(stator_module_evaluate(root, ctx).is_null());
+            stator_module_free(root);
+            stator_module_free(css_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_css_module_compile_cached_rejects_non_css_payload() {
+        // A JSON cache blob must never be silently accepted as a CSS module
+        // restore: CSS source_type goes through the unsupported gate before
+        // the payload is even parsed, so the call reports Unsupported rather
+        // than the misleading Rejected/Accepted statuses.
+        let json_module =
+            compile_typed_module_src(r#"{"a":1}"#, StatorModuleType::StatorModuleTypeJson);
+        assert!(!json_module.is_null());
+        let source = b"";
+        let mut produce_status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are valid for the call.
+        let json_cache = unsafe {
+            stator_module_create_code_cache(
+                json_module,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                &mut produce_status,
+            )
+        };
+        assert!(!json_cache.is_null());
+        assert_eq!(
+            produce_status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+        // SAFETY: `json_cache` came from `stator_module_create_code_cache`.
+        let cache_bytes = unsafe { stator_string_data(json_cache) };
+        // SAFETY: `json_cache` is live.
+        let cache_len = unsafe { stator_string_len(json_cache) };
+
+        let css_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeCss,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let mut restore_status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are valid for the call.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                cache_bytes,
+                cache_len,
+                &css_options,
+                &mut restore_status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            restore_status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported
+        );
+        // SAFETY: pointers are live.
+        unsafe {
+            let err = CStr::from_ptr(stator_module_get_error(restored))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("CSS"));
+            assert!(err.contains("unsupported"));
+            assert_eq!(
+                stator_module_get_type(restored),
+                StatorModuleType::StatorModuleTypeCss
+            );
+            stator_module_free(restored);
+            stator_string_free(json_cache);
+            stator_module_free(json_module);
         }
     }
 

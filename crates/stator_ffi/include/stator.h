@@ -144,6 +144,20 @@ typedef enum StatorModuleType {
   StatorModuleTypeWebAssembly = 2,
   /**
    * CSS module source.
+   *
+   * Currently fail-closed unsupported. Stator has no CSS parser and no
+   * `CSSStyleSheet` object representation, so CSS module bodies cannot be
+   * parsed, evaluated, or restored from a code cache. Compilation always
+   * returns an errored [`StatorModule`] tagged with this `source_type`,
+   * `stator_module_create_code_cache` reports
+   * [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`], and
+   * `stator_module_compile_cached` rejects CSS source with the same
+   * status. Resolving a request that carries `with { type: "css" }` to a
+   * non-CSS module is a type mismatch like every other typed import.
+   * Wiring real CSS module evaluation requires a host `CSSStyleSheet`
+   * representation that Stator can construct and default-export; until
+   * that primitive lands the enum value is reserved purely so embedders
+   * can plumb metadata without silently downgrading to JavaScript.
    */
   StatorModuleTypeCss = 3,
 } StatorModuleType;
