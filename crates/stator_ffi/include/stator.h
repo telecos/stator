@@ -125,7 +125,8 @@ typedef enum StatorParserMetadata {
 /**
  * Host-visible source kind for a compiled module record.
  *
- * JavaScript and JSON modules are executable by Stator today. Other source
+ * JavaScript and JSON modules are executable by Stator today. WebAssembly
+ * modules expose the focused import-free function-export subset. Other source
  * kinds are recorded as metadata and fail closed until safe evaluators land.
  */
 typedef enum StatorModuleType {
@@ -2626,7 +2627,8 @@ void stator_string_free(struct StatorString *string);
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
- * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ * - `source` must be valid for reads of `source_len` bytes. It must be
+ *   valid UTF-8 except for WebAssembly modules, which must be binary Wasm.
  */
 struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
                                            const char *source,
@@ -2650,14 +2652,16 @@ struct StatorModule *stator_module_compile(struct StatorContext *ctx,
  * Compile `source` as a module with host-provided source kind metadata.
  *
  * JavaScript modules are parsed and compiled normally. JSON modules are parsed
- * and expose a `default` export. WebAssembly and CSS module source kinds are
- * recorded on the returned module handle but currently produce an unsupported
- * compile error because their module evaluators are not implemented in Stator
- * yet.
+ * and expose a `default` export. WebAssembly modules compile binary Wasm and
+ * expose import-free function exports as callable named exports. CSS module
+ * source kinds are recorded on the returned module handle but currently
+ * produce an unsupported compile error because their evaluator is not
+ * implemented in Stator yet.
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
- * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ * - `source` must be valid for reads of `source_len` bytes. It must be
+ *   valid UTF-8 except for WebAssembly modules, which must be binary Wasm.
  */
 struct StatorModule *stator_module_compile_typed(struct StatorContext *ctx,
                                                  const char *source,
