@@ -155,18 +155,19 @@ typedef enum StatorModuleCacheStatus {
   /**
    * Operation succeeded and produced a versioned cache blob containing
    * validation metadata, the module's import/export shape, and serialized
-   * bytecode that [`stator_module_compile_cached`] can restore without
-   * re-parsing or regenerating bytecode.
+   * payload data. JavaScript/JSON cache payloads can restore executable
+   * metadata without re-parsing or regenerating bytecode. WebAssembly cache
+   * payloads store validated source bytes plus parsed import/export metadata;
+   * until a safe compiled-artifact deserializer is available they are
+   * accepted with
+   * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
    */
   StatorModuleCacheStatusProducedMetadata = 0,
   /**
-   * Legacy status — emitted by older Stator builds when a cache blob
-   * matched but bytecode serialization was unavailable, forcing a
-   * reparse. The current build always produces a parser-skip result on
-   * success and reports
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`]
-   * instead. Retained for stable persisted numbering and embedder
-   * compatibility.
+   * Cache blob matched and its validation metadata was accepted, but this
+   * engine still had to recompile the executable representation. Currently
+   * used for WebAssembly module cache hits because Wasmtime's compiled-module
+   * deserialization primitive is unsafe for untrusted code-cache bytes.
    */
   StatorModuleCacheStatusAcceptedValidatedRecompiled = 1,
   /**
@@ -2696,11 +2697,12 @@ struct StatorModule *stator_module_compile_with_options(struct StatorContext *ct
  * The returned [`StatorString`] owns a versioned cache blob containing
  * validation metadata (engine crate version, source hash/length, module type,
  * resource name/offsets, and browser policy options) plus the compiled
- * bytecode and the module's static import/export shape. On a successful
- * production [`out_status`] is set to
+ * bytecode/value/Wasm-byte payload and the module's static import/export
+ * shape. On a successful production [`out_status`] is set to
  * [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`]; a
- * later [`stator_module_compile_cached`] call uses the blob to restore the
- * module without re-parsing or regenerating bytecode.
+ * later [`stator_module_compile_cached`] call uses the blob to restore JS/JSON
+ * modules without re-parsing or regenerating bytecode and to validate then
+ * recompile WebAssembly modules from cached source bytes.
  *
  * # Safety
  * - `module` must be either null or a valid, live [`StatorModule`] pointer.
@@ -2720,16 +2722,19 @@ struct StatorString *stator_module_create_code_cache(const struct StatorModule *
  * browser policy options all match. Malformed, stale, or incompatible blobs
  * fail closed by returning an errored [`StatorModule`] and reporting
  * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. On a clean
- * match Stator deserializes the module's bytecode and import/export shape
- * from the blob — skipping parsing and bytecode generation — and reports
+ * JavaScript/JSON match Stator deserializes the module payload and reports
  * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`].
+ * On a clean WebAssembly match Stator validates the cached Wasm bytes and
+ * parsed metadata, recompiles through Wasmtime, and reports
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
  * The returned module behaves identically to a freshly-compiled one for
  * linking, dynamic import, `import.meta.url`, live bindings, and TLA
  * fail-closed evaluation.
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
- * - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+ * - `source` must be valid for reads of `source_len` bytes; it must be valid
+ *   UTF-8 except for WebAssembly modules, which use binary Wasm bytes.
  * - `cache_data` must be valid for reads of `cache_len` bytes.
  * - `options`, when non-null, must point to readable compile options.
  * - `out_status`, when non-null, must be valid for one status write.

@@ -2536,7 +2536,7 @@ struct StatorModuleRequest {
 /// Stored on [`StatorModule`] for executable Wasm bodies; used at evaluation
 /// time to look up the matching value from a resolved dependency module's
 /// namespace and to construct a [`HostFunc`] with the correct typed shape.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WasmFuncImport {
     /// Wasm import module namespace (e.g. `"env"`).
     module: String,
@@ -2703,16 +2703,17 @@ pub struct StatorModuleCompileOptions {
 pub enum StatorModuleCacheStatus {
     /// Operation succeeded and produced a versioned cache blob containing
     /// validation metadata, the module's import/export shape, and serialized
-    /// bytecode that [`stator_module_compile_cached`] can restore without
-    /// re-parsing or regenerating bytecode.
+    /// payload data. JavaScript/JSON cache payloads can restore executable
+    /// metadata without re-parsing or regenerating bytecode. WebAssembly cache
+    /// payloads store validated source bytes plus parsed import/export metadata;
+    /// until a safe compiled-artifact deserializer is available they are
+    /// accepted with
+    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
     StatorModuleCacheStatusProducedMetadata = 0,
-    /// Legacy status — emitted by older Stator builds when a cache blob
-    /// matched but bytecode serialization was unavailable, forcing a
-    /// reparse. The current build always produces a parser-skip result on
-    /// success and reports
-    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`]
-    /// instead. Retained for stable persisted numbering and embedder
-    /// compatibility.
+    /// Cache blob matched and its validation metadata was accepted, but this
+    /// engine still had to recompile the executable representation. Currently
+    /// used for WebAssembly module cache hits because Wasmtime's compiled-module
+    /// deserialization primitive is unsafe for untrusted code-cache bytes.
     StatorModuleCacheStatusAcceptedValidatedRecompiled = 1,
     /// A pointer/length pair or output argument was invalid.
     StatorModuleCacheStatusInvalidArgument = 2,
@@ -3539,8 +3540,11 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// serialized bytecode) so that JavaScript cache hits can skip parsing and
 /// bytecode generation. Version 3 added a parallel JSON-module payload variant
 /// (the parsed default-export value, restricted to the JSON-compatible JsValue
-/// subset) so JSON cache hits can skip JSON re-parsing.
-const MODULE_CACHE_FORMAT_VERSION: u32 = 3;
+/// subset) so JSON cache hits can skip JSON re-parsing. Version 4 added a
+/// WebAssembly payload variant containing original Wasm bytes plus import/export
+/// metadata; hits validate the payload and then recompile the Wasm bytes because
+/// no safe untrusted compiled-artifact restore primitive is available.
+const MODULE_CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
@@ -3664,6 +3668,9 @@ enum ModuleCachePayload {
     JavaScript(JsModulePayload),
     /// JSON module payload: serialized default-export value.
     Json(JsonModulePayload),
+    /// WebAssembly module payload: original Wasm bytes plus parsed import/export
+    /// metadata. The compiled Wasmtime artifact is intentionally not serialized.
+    Wasm(WasmModulePayload),
 }
 
 struct JsModulePayload {
@@ -3679,6 +3686,20 @@ struct JsonModulePayload {
     value: Vec<u8>,
 }
 
+struct WasmModulePayload {
+    wasm_bytes: Vec<u8>,
+    direct_exports: Vec<Vec<u8>>,
+    func_imports: Vec<SerializedWasmFuncImport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SerializedWasmFuncImport {
+    module: Vec<u8>,
+    name: Vec<u8>,
+    params: Vec<HostValKind>,
+    results: Vec<HostValKind>,
+}
+
 struct SerializedModuleRequest {
     specifier: Vec<u8>,
     attributes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3689,6 +3710,7 @@ fn serialize_module_cache_payload(payload: &ModuleCachePayload, out: &mut Vec<u8
     match payload {
         ModuleCachePayload::JavaScript(js) => serialize_js_module_payload(js, out),
         ModuleCachePayload::Json(json) => push_bytes(out, &json.value),
+        ModuleCachePayload::Wasm(wasm) => serialize_wasm_module_payload(wasm, out),
     }
 }
 
@@ -3747,6 +3769,48 @@ fn serialize_js_module_payload(payload: &JsModulePayload, out: &mut Vec<u8>) -> 
     true
 }
 
+fn serialize_wasm_val_kinds(kinds: &[HostValKind], out: &mut Vec<u8>) -> bool {
+    let Ok(count) = u32::try_from(kinds.len()) else {
+        return false;
+    };
+    push_u32(out, count);
+    for kind in kinds {
+        push_u8(out, *kind as u8);
+    }
+    true
+}
+
+fn serialize_wasm_module_payload(payload: &WasmModulePayload, out: &mut Vec<u8>) -> bool {
+    if !push_bytes(out, &payload.wasm_bytes) {
+        return false;
+    }
+
+    let Ok(export_count) = u32::try_from(payload.direct_exports.len()) else {
+        return false;
+    };
+    push_u32(out, export_count);
+    for name in &payload.direct_exports {
+        if !push_bytes(out, name) {
+            return false;
+        }
+    }
+
+    let Ok(import_count) = u32::try_from(payload.func_imports.len()) else {
+        return false;
+    };
+    push_u32(out, import_count);
+    for import in &payload.func_imports {
+        if !push_bytes(out, &import.module)
+            || !push_bytes(out, &import.name)
+            || !serialize_wasm_val_kinds(&import.params, out)
+            || !serialize_wasm_val_kinds(&import.results, out)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn parse_module_cache_payload(
     reader: &mut CacheReader<'_>,
     source_type: StatorModuleType,
@@ -3759,7 +3823,9 @@ fn parse_module_cache_payload(
             let value = reader.read_bytes()?;
             Some(ModuleCachePayload::Json(JsonModulePayload { value }))
         }
-        // WebAssembly has no validated compiled-module cache format yet, and
+        StatorModuleType::StatorModuleTypeWebAssembly => {
+            parse_wasm_module_payload(reader).map(ModuleCachePayload::Wasm)
+        }
         // CSS module bodies are not executable, so reject defensively.
         _ => None,
     }
@@ -3815,6 +3881,51 @@ fn parse_js_module_payload(reader: &mut CacheReader<'_>) -> Option<JsModulePaylo
         module_requests,
         direct_exports,
         bytecode,
+    })
+}
+
+fn parse_host_val_kind(tag: u8) -> Option<HostValKind> {
+    match tag {
+        0 => Some(HostValKind::I32),
+        1 => Some(HostValKind::I64),
+        2 => Some(HostValKind::F32),
+        3 => Some(HostValKind::F64),
+        _ => None,
+    }
+}
+
+fn parse_wasm_val_kinds(reader: &mut CacheReader<'_>) -> Option<Vec<HostValKind>> {
+    let count = reader.read_u32()? as usize;
+    let mut kinds = Vec::with_capacity(count);
+    for _ in 0..count {
+        kinds.push(parse_host_val_kind(reader.read_u8()?)?);
+    }
+    Some(kinds)
+}
+
+fn parse_wasm_module_payload(reader: &mut CacheReader<'_>) -> Option<WasmModulePayload> {
+    let wasm_bytes = reader.read_bytes()?;
+
+    let export_count = reader.read_u32()? as usize;
+    let mut direct_exports = Vec::with_capacity(export_count);
+    for _ in 0..export_count {
+        direct_exports.push(reader.read_bytes()?);
+    }
+
+    let import_count = reader.read_u32()? as usize;
+    let mut func_imports = Vec::with_capacity(import_count);
+    for _ in 0..import_count {
+        func_imports.push(SerializedWasmFuncImport {
+            module: reader.read_bytes()?,
+            name: reader.read_bytes()?,
+            params: parse_wasm_val_kinds(reader)?,
+            results: parse_wasm_val_kinds(reader)?,
+        });
+    }
+    Some(WasmModulePayload {
+        wasm_bytes,
+        direct_exports,
+        func_imports,
     })
 }
 
@@ -3997,12 +4108,10 @@ fn parse_module_cache_blob(bytes: &[u8]) -> Option<(ModuleCacheRecord, ModuleCac
     ))
 }
 
-#[cfg(test)]
-fn parse_module_cache_record(bytes: &[u8]) -> Option<ModuleCacheRecord> {
-    parse_module_cache_blob(bytes).map(|(record, _)| record)
-}
-
-fn module_cache_payload_from_module(module: &StatorModule) -> Option<ModuleCachePayload> {
+fn module_cache_payload_from_module(
+    module: &StatorModule,
+    source_bytes: &[u8],
+) -> Option<ModuleCachePayload> {
     match module.source_type {
         StatorModuleType::StatorModuleTypeJavaScript => {
             let bytecodes = module.bytecodes.as_ref()?;
@@ -4044,7 +4153,29 @@ fn module_cache_payload_from_module(module: &StatorModule) -> Option<ModuleCache
             let bytes = serialize_json_value_bytes(value)?;
             Some(ModuleCachePayload::Json(JsonModulePayload { value: bytes }))
         }
-        // WebAssembly has no validated compiled-module cache format yet, and
+        StatorModuleType::StatorModuleTypeWebAssembly => {
+            let mut direct_exports: Vec<Vec<u8>> = module
+                .direct_exports
+                .iter()
+                .map(|name| name.as_bytes().to_vec())
+                .collect();
+            direct_exports.sort();
+            let func_imports = module
+                .wasm_func_imports
+                .iter()
+                .map(|import| SerializedWasmFuncImport {
+                    module: import.module.as_bytes().to_vec(),
+                    name: import.name.as_bytes().to_vec(),
+                    params: import.params.clone(),
+                    results: import.results.clone(),
+                })
+                .collect();
+            Some(ModuleCachePayload::Wasm(WasmModulePayload {
+                wasm_bytes: source_bytes.to_vec(),
+                direct_exports,
+                func_imports,
+            }))
+        }
         // CSS module bodies are not executable; refuse to produce a cache blob.
         _ => None,
     }
@@ -4080,6 +4211,8 @@ fn rebuild_module_request(serialized: SerializedModuleRequest) -> Option<StatorM
 fn module_from_cache_payload(
     payload: ModuleCachePayload,
     source_type: StatorModuleType,
+    source_hash: u64,
+    source_len: u64,
 ) -> Option<Box<StatorModule>> {
     match (payload, source_type) {
         (ModuleCachePayload::JavaScript(payload), StatorModuleType::StatorModuleTypeJavaScript) => {
@@ -4087,6 +4220,9 @@ fn module_from_cache_payload(
         }
         (ModuleCachePayload::Json(payload), StatorModuleType::StatorModuleTypeJson) => {
             module_from_json_cache_payload(payload)
+        }
+        (ModuleCachePayload::Wasm(payload), StatorModuleType::StatorModuleTypeWebAssembly) => {
+            module_from_wasm_cache_payload(payload, source_hash, source_len)
         }
         // Mismatched payload/source_type combinations should never reach here
         // (the validator rejects them), but reject defensively.
@@ -4171,6 +4307,54 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
     }))
+}
+
+fn serialized_wasm_imports(imports: &[WasmFuncImport]) -> Vec<SerializedWasmFuncImport> {
+    imports
+        .iter()
+        .map(|import| SerializedWasmFuncImport {
+            module: import.module.as_bytes().to_vec(),
+            name: import.name.as_bytes().to_vec(),
+            params: import.params.clone(),
+            results: import.results.clone(),
+        })
+        .collect()
+}
+
+fn module_from_wasm_cache_payload(
+    payload: WasmModulePayload,
+    source_hash: u64,
+    source_len: u64,
+) -> Option<Box<StatorModule>> {
+    if !payload.wasm_bytes.starts_with(b"\0asm") {
+        return None;
+    }
+    if payload.wasm_bytes.len() as u64 != source_len || fnv1a64(&payload.wasm_bytes) != source_hash
+    {
+        return None;
+    }
+    let compiled = compile_wasm_module_source(&payload.wasm_bytes);
+    if compiled.error.is_some() {
+        return None;
+    }
+
+    let mut actual_exports: Vec<Vec<u8>> = compiled
+        .direct_exports
+        .iter()
+        .map(|name| name.as_bytes().to_vec())
+        .collect();
+    actual_exports.sort();
+    let mut expected_exports = payload.direct_exports;
+    expected_exports.sort();
+    if actual_exports != expected_exports {
+        return None;
+    }
+
+    if serialized_wasm_imports(&compiled.wasm_func_imports) != payload.func_imports {
+        return None;
+    }
+
+    Some(compiled)
 }
 
 unsafe fn module_cache_record_from_options(
@@ -4617,11 +4801,12 @@ pub unsafe extern "C" fn stator_module_compile_with_options(
 /// The returned [`StatorString`] owns a versioned cache blob containing
 /// validation metadata (engine crate version, source hash/length, module type,
 /// resource name/offsets, and browser policy options) plus the compiled
-/// bytecode and the module's static import/export shape. On a successful
-/// production [`out_status`] is set to
+/// bytecode/value/Wasm-byte payload and the module's static import/export
+/// shape. On a successful production [`out_status`] is set to
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata`]; a
-/// later [`stator_module_compile_cached`] call uses the blob to restore the
-/// module without re-parsing or regenerating bytecode.
+/// later [`stator_module_compile_cached`] call uses the blob to restore JS/JSON
+/// modules without re-parsing or regenerating bytecode and to validate then
+/// recompile WebAssembly modules from cached source bytes.
 ///
 /// # Safety
 /// - `module` must be either null or a valid, live [`StatorModule`] pointer.
@@ -4645,6 +4830,7 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
     let module_ref = unsafe { &*module };
     if module_ref.source_type != StatorModuleType::StatorModuleTypeJavaScript
         && module_ref.source_type != StatorModuleType::StatorModuleTypeJson
+        && module_ref.source_type != StatorModuleType::StatorModuleTypeWebAssembly
     {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
@@ -4657,6 +4843,8 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
             && module_ref.bytecodes.is_none())
         || (module_ref.source_type == StatorModuleType::StatorModuleTypeJson
             && module_ref.json_default.is_none())
+        || (module_ref.source_type == StatorModuleType::StatorModuleTypeWebAssembly
+            && module_ref.wasm_module.is_none())
     {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
@@ -4676,7 +4864,7 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
         }
         return std::ptr::null_mut();
     };
-    let Some(payload) = module_cache_payload_from_module(module_ref) else {
+    let Some(payload) = module_cache_payload_from_module(module_ref, source_bytes) else {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported };
@@ -4704,16 +4892,19 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
 /// browser policy options all match. Malformed, stale, or incompatible blobs
 /// fail closed by returning an errored [`StatorModule`] and reporting
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`]. On a clean
-/// match Stator deserializes the module's bytecode and import/export shape
-/// from the blob — skipping parsing and bytecode generation — and reports
+/// JavaScript/JSON match Stator deserializes the module payload and reports
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored`].
+/// On a clean WebAssembly match Stator validates the cached Wasm bytes and
+/// parsed metadata, recompiles through Wasmtime, and reports
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
 /// The returned module behaves identically to a freshly-compiled one for
 /// linking, dynamic import, `import.meta.url`, live bindings, and TLA
 /// fail-closed evaluation.
 ///
 /// # Safety
 /// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
-/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+/// - `source` must be valid for reads of `source_len` bytes; it must be valid
+///   UTF-8 except for WebAssembly modules, which use binary Wasm bytes.
 /// - `cache_data` must be valid for reads of `cache_len` bytes.
 /// - `options`, when non-null, must point to readable compile options.
 /// - `out_status`, when non-null, must be valid for one status write.
@@ -4738,6 +4929,7 @@ pub unsafe extern "C" fn stator_module_compile_cached(
     };
     if source_type != StatorModuleType::StatorModuleTypeJavaScript
         && source_type != StatorModuleType::StatorModuleTypeJson
+        && source_type != StatorModuleType::StatorModuleTypeWebAssembly
     {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
@@ -4778,7 +4970,12 @@ pub unsafe extern "C" fn stator_module_compile_cached(
         );
     }
 
-    let Some(restored) = module_from_cache_payload(payload, actual.source_type) else {
+    let Some(restored) = module_from_cache_payload(
+        payload,
+        actual.source_type,
+        actual.source_hash,
+        actual.source_len,
+    ) else {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusRejected };
@@ -4797,9 +4994,13 @@ pub unsafe extern "C" fn stator_module_compile_cached(
     }
     if !out_status.is_null() {
         // SAFETY: caller guarantees `out_status` is valid when non-null.
-        unsafe {
-            *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored;
-        }
+        let accepted_status = if actual.source_type == StatorModuleType::StatorModuleTypeWebAssembly
+        {
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        } else {
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored
+        };
+        unsafe { *out_status = accepted_status };
     }
     module
 }
@@ -14487,6 +14688,23 @@ mod tests {
         }
     }
 
+    fn typed_module_compile_options(source_type: StatorModuleType) -> StatorModuleCompileOptions {
+        StatorModuleCompileOptions {
+            source_type,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        }
+    }
+
     struct TestGraphResolverData {
         modules: HashMap<String, *mut StatorModule>,
         status: StatorResolveStatus,
@@ -17822,7 +18040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_code_cache_is_unsupported() {
+    fn test_module_wasm_code_cache_import_free_roundtrip_recompiles() {
         let module =
             compile_typed_module_bytes(WASM_ADD, StatorModuleType::StatorModuleTypeWebAssembly);
         let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
@@ -17835,27 +18053,13 @@ mod tests {
                 &mut status,
             )
         };
-        assert!(cache.is_null());
+        assert!(!cache.is_null());
         assert_eq!(
             status,
-            StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
         );
 
-        let options = StatorModuleCompileOptions {
-            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
-            resource_name: std::ptr::null(),
-            resource_name_len: 0,
-            line_offset: 0,
-            column_offset: 0,
-            base_url: std::ptr::null(),
-            base_url_len: 0,
-            integrity_metadata: std::ptr::null(),
-            integrity_metadata_len: 0,
-            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
-            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
-            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
-        };
-        let fake_cache = b"not a wasm cache";
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
         status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
         // SAFETY: pointers are live for the duration of the call.
         let restored = unsafe {
@@ -17863,8 +18067,8 @@ mod tests {
                 std::ptr::null_mut(),
                 WASM_ADD.as_ptr() as *const c_char,
                 WASM_ADD.len(),
-                fake_cache.as_ptr() as *const c_char,
-                fake_cache.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
                 &options,
                 &mut status,
             )
@@ -17872,12 +18076,286 @@ mod tests {
         assert!(!restored.is_null());
         assert_eq!(
             status,
-            StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
         );
         // SAFETY: pointers are non-null and live.
         unsafe {
+            assert!(stator_module_get_error(restored).is_null());
+            assert_eq!(
+                stator_module_get_type(restored),
+                StatorModuleType::StatorModuleTypeWebAssembly
+            );
+            assert_eq!(stator_module_get_request_count(restored), 0);
+            assert!(stator_module_instantiate(std::ptr::null_mut(), restored));
+            let result = stator_module_evaluate(restored, std::ptr::null_mut());
+            assert!(!result.is_null());
+            stator_value_destroy(result);
             stator_module_free(restored);
+            stator_string_free(cache);
             stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_with_function_import_roundtrip() {
+        let module = compile_typed_module_bytes(
+            WASM_IMPORT_ADD_RUN,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_IMPORT_ADD_RUN.as_ptr() as *const c_char,
+                WASM_IMPORT_ADD_RUN.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                WASM_IMPORT_ADD_RUN.as_ptr() as *const c_char,
+                WASM_IMPORT_ADD_RUN.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        );
+        // SAFETY: restored is live.
+        unsafe {
+            assert!(stator_module_get_error(restored).is_null());
+            assert_eq!(stator_module_get_request_count(restored), 1);
+            let mut specifier = std::ptr::null();
+            let mut specifier_len = 0usize;
+            assert!(stator_module_get_request(
+                restored,
+                0,
+                &mut specifier,
+                &mut specifier_len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            let specifier_bytes = std::slice::from_raw_parts(specifier as *const u8, specifier_len);
+            assert_eq!(specifier_bytes, b"env");
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_stale_source() {
+        let module =
+            compile_typed_module_bytes(WASM_ADD, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_ADD.as_ptr() as *const c_char,
+                WASM_ADD.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                WASM_DEFAULT.as_ptr() as *const c_char,
+                WASM_DEFAULT.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(!stator_module_get_error(restored).is_null());
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_invalid_payload_bytes() {
+        let module =
+            compile_typed_module_bytes(WASM_ADD, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_ADD.as_ptr() as *const c_char,
+                WASM_ADD.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache bytes are live for the copy.
+        let mut bytes = unsafe {
+            std::slice::from_raw_parts(
+                stator_string_data(cache) as *const u8,
+                stator_string_len(cache),
+            )
+            .to_vec()
+        };
+        let wasm_offset = bytes
+            .windows(4)
+            .position(|window| window == b"\0asm")
+            .expect("cache payload should contain Wasm bytes");
+        bytes[wasm_offset] = 0xff;
+
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                WASM_ADD.as_ptr() as *const c_char,
+                WASM_ADD.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(!stator_module_get_error(restored).is_null());
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_import_kind() {
+        let module = compile_typed_module_bytes(
+            WASM_IMPORT_MEMORY,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_IMPORT_MEMORY.as_ptr() as *const c_char,
+                WASM_IMPORT_MEMORY.len(),
+                &mut status,
+            )
+        };
+        assert!(cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCompileError
+        );
+        // SAFETY: module is live.
+        unsafe { stator_module_free(module) };
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_preserves_no_synthetic_default_export() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let module =
+            compile_typed_module_bytes(WASM_ADD, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_ADD.as_ptr() as *const c_char,
+                WASM_ADD.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        // SAFETY: pointers are live.
+        let cached_dep = unsafe {
+            stator_module_compile_cached(
+                ctx,
+                WASM_ADD.as_ptr() as *const c_char,
+                WASM_ADD.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!cached_dep.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        );
+        let root = compile_module_src(
+            "import add from './add.wasm' with { type: 'webassembly' }; add(1, 2);",
+        );
+        let mut modules = HashMap::new();
+        modules.insert("./add.wasm".to_string(), cached_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(!stator_module_instantiate(ctx, root));
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("default"),
+                "expected missing default diagnostic, got: {err}"
+            );
+            stator_module_free(root);
+            stator_module_free(cached_dep);
+            stator_string_free(cache);
+            stator_module_free(module);
+            stator_context_destroy(ctx);
         }
     }
 
@@ -18420,11 +18898,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_and_css_module_code_cache_remain_unsupported() {
-        for source_type in [
-            StatorModuleType::StatorModuleTypeWebAssembly,
-            StatorModuleType::StatorModuleTypeCss,
-        ] {
+    fn test_css_module_code_cache_remains_unsupported() {
+        for source_type in [StatorModuleType::StatorModuleTypeCss] {
             let module = compile_typed_module_src("", source_type);
             assert!(!module.is_null());
             let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
