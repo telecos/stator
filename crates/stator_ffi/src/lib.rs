@@ -3350,8 +3350,9 @@ fn wasm_module_function_exports(module: &WasmModule) -> HashSet<String> {
 /// Only function imports are supported in this slice. Each unique import
 /// `module` namespace becomes a single request whose `imports` list collects
 /// the import names from that namespace (`RequestedExport::Named`). Globals,
-/// tables and memories fail closed at compile time so the module record never
-/// reaches a state where it would silently bind a missing primitive.
+/// tables and memories fail closed at compile time with their declared type
+/// metadata so the module record never reaches a state where it would silently
+/// bind a missing primitive.
 fn collect_wasm_module_imports(
     module: &WasmModule,
 ) -> Result<(Vec<WasmFuncImport>, Vec<StatorModuleRequest>), String> {
@@ -3381,16 +3382,11 @@ fn collect_wasm_module_imports(
                 (params, results)
             }
             other => {
-                let kind_name = match other {
-                    stator_jse::wasm::WasmExternKind::Global => "global",
-                    stator_jse::wasm::WasmExternKind::Memory => "memory",
-                    stator_jse::wasm::WasmExternKind::Table => "table",
-                    stator_jse::wasm::WasmExternKind::Other => "unsupported",
-                    stator_jse::wasm::WasmExternKind::Func { .. } => unreachable!(),
-                };
                 return Err(format!(
-                    "WebAssembly module import '{module_name}.{field_name}' has unsupported \
-                     kind '{kind_name}'; only function imports are supported"
+                    "WebAssembly module import '{module_name}.{field_name}' has unsupported {}; \
+                     Stator can only bind function imports because no runtime/FFI primitive \
+                     safely exposes WebAssembly globals, memories, or tables as imports yet",
+                    describe_unsupported_wasm_import_kind(other)
                 ));
             }
         };
@@ -3434,6 +3430,49 @@ fn collect_wasm_module_imports(
         });
     }
     Ok((func_imports, requests))
+}
+
+fn describe_unsupported_wasm_import_kind(kind: stator_jse::wasm::WasmExternKind) -> String {
+    match kind {
+        stator_jse::wasm::WasmExternKind::Global {
+            value_type,
+            mutable,
+        } => {
+            let value_type = match value_type {
+                Ok(kind) => format!("{kind:?}"),
+                Err(error) => error,
+            };
+            let mutability = if mutable { "mutable" } else { "immutable" };
+            format!("global import ({mutability}, value_type={value_type})")
+        }
+        stator_jse::wasm::WasmExternKind::Memory {
+            minimum,
+            maximum,
+            memory64,
+            shared,
+            page_size_log2,
+        } => format!(
+            "memory import (min={minimum}, max={}, memory64={memory64}, shared={shared}, page_size_log2={page_size_log2})",
+            format_optional_u64(maximum)
+        ),
+        stator_jse::wasm::WasmExternKind::Table {
+            element,
+            minimum,
+            maximum,
+            table64,
+        } => format!(
+            "table import (element={element}, min={minimum}, max={}, table64={table64})",
+            format_optional_u64(maximum)
+        ),
+        stator_jse::wasm::WasmExternKind::Other => {
+            "extern import kind not represented by Stator".to_string()
+        }
+        stator_jse::wasm::WasmExternKind::Func { .. } => unreachable!(),
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
 fn module_type_to_u32(source_type: StatorModuleType) -> u32 {
@@ -18468,11 +18507,32 @@ mod tests {
         0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b,
     ];
 
+    // Imports a global `env.g` (no other sections). Used to assert
+    // compile-time fail-closed for unsupported (non-function) Wasm imports.
+    const WASM_IMPORT_GLOBAL: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x01, 0x67, 0x03, 0x7f, 0x00,
+    ];
+
+    // Imports a mutable global `env.g` (no other sections). Used to assert
+    // diagnostics include global mutability.
+    const WASM_IMPORT_MUT_GLOBAL: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x01, 0x67, 0x03, 0x7f, 0x01,
+    ];
+
     // Imports a memory `env.mem` (no other sections). Used to assert
     // compile-time fail-closed for unsupported (non-function) Wasm imports.
     const WASM_IMPORT_MEMORY: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0c, 0x01, 0x03, 0x65, 0x6e, 0x76,
         0x03, 0x6d, 0x65, 0x6d, 0x02, 0x00, 0x01,
+    ];
+
+    // Imports a table `env.tab` (no other sections). Used to assert
+    // compile-time fail-closed for unsupported (non-function) Wasm imports.
+    const WASM_IMPORT_TABLE: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0d, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x03, 0x74, 0x61, 0x62, 0x01, 0x70, 0x00, 0x01,
     ];
 
     // Imports `env.add: (i32,i32)->i32` and exports `run: () -> i32` whose
@@ -18839,14 +18899,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_module_wasm_unsupported_import_kind_fails_compilation() {
-        // A Wasm module that imports a memory must fail closed at compile
-        // time; only function imports are supported in this slice.
-        let module = compile_typed_module_bytes(
-            WASM_IMPORT_MEMORY,
-            StatorModuleType::StatorModuleTypeWebAssembly,
-        );
+    fn assert_wasm_unsupported_import_kind_fails_compilation(
+        bytes: &[u8],
+        expected_terms: &[&str],
+    ) {
+        let module =
+            compile_typed_module_bytes(bytes, StatorModuleType::StatorModuleTypeWebAssembly);
         // SAFETY: `module` is non-null and live.
         unsafe {
             assert_eq!(
@@ -18860,12 +18918,48 @@ mod tests {
             let err = CStr::from_ptr(stator_module_get_error(module))
                 .to_str()
                 .unwrap();
+            assert!(err.contains("unsupported"), "missing unsupported: {err}");
             assert!(
-                err.contains("unsupported") && err.contains("memory"),
-                "expected unsupported memory diagnostic, got: {err}"
+                err.contains("runtime/FFI primitive"),
+                "missing primitive blocker: {err}"
             );
+            for term in expected_terms {
+                assert!(err.contains(term), "missing '{term}' in: {err}");
+            }
             stator_module_free(module);
         }
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_global_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_GLOBAL,
+            &["env.g", "global", "immutable", "I32"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_mutable_global_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_MUT_GLOBAL,
+            &["env.g", "global", "mutable", "I32"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_memory_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_MEMORY,
+            &["env.mem", "memory", "min=1", "max=none", "memory64=false"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_table_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_TABLE,
+            &["env.tab", "table", "element", "min=1", "table64=false"],
+        );
     }
 
     #[test]
@@ -19088,19 +19182,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_module_wasm_code_cache_rejects_unsupported_import_kind() {
-        let module = compile_typed_module_bytes(
-            WASM_IMPORT_MEMORY,
-            StatorModuleType::StatorModuleTypeWebAssembly,
-        );
+    fn assert_wasm_code_cache_rejects_unsupported_import_kind(bytes: &[u8]) {
+        let module =
+            compile_typed_module_bytes(bytes, StatorModuleType::StatorModuleTypeWebAssembly);
         let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
         // SAFETY: pointers are live.
         let cache = unsafe {
             stator_module_create_code_cache(
                 module,
-                WASM_IMPORT_MEMORY.as_ptr() as *const c_char,
-                WASM_IMPORT_MEMORY.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
                 &mut status,
             )
         };
@@ -19111,6 +19202,21 @@ mod tests {
         );
         // SAFETY: module is live.
         unsafe { stator_module_free(module) };
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_global_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_GLOBAL);
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_memory_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_MEMORY);
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_table_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_TABLE);
     }
 
     #[test]

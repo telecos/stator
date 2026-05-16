@@ -215,7 +215,8 @@ impl WasmModule {
     }
 
     /// Enumerate this module's import descriptors as a list of
-    /// [`WasmImportDescriptor`] values.
+    /// [`WasmImportDescriptor`] values, including typed metadata for imports
+    /// that Stator does not yet bind at runtime.
     ///
     /// Iteration order matches the import section of the Wasm module.
     pub fn imports(&self) -> Vec<WasmImportDescriptor> {
@@ -227,9 +228,23 @@ impl WasmModule {
                         params: ft.params().map(value_type_to_host_kind).collect(),
                         results: ft.results().map(value_type_to_host_kind).collect(),
                     },
-                    wasmtime::ExternType::Global(_) => WasmExternKind::Global,
-                    wasmtime::ExternType::Memory(_) => WasmExternKind::Memory,
-                    wasmtime::ExternType::Table(_) => WasmExternKind::Table,
+                    wasmtime::ExternType::Global(gt) => WasmExternKind::Global {
+                        value_type: value_type_to_host_kind(gt.content().clone()),
+                        mutable: gt.mutability().is_var(),
+                    },
+                    wasmtime::ExternType::Memory(mt) => WasmExternKind::Memory {
+                        minimum: mt.minimum(),
+                        maximum: mt.maximum(),
+                        memory64: mt.is_64(),
+                        shared: mt.is_shared(),
+                        page_size_log2: mt.page_size_log2(),
+                    },
+                    wasmtime::ExternType::Table(tt) => WasmExternKind::Table {
+                        element: tt.element().to_string(),
+                        minimum: tt.minimum(),
+                        maximum: tt.maximum(),
+                        table64: tt.is_64(),
+                    },
                     _ => WasmExternKind::Other,
                 };
                 WasmImportDescriptor {
@@ -285,14 +300,14 @@ pub struct WasmImportDescriptor {
     pub module: String,
     /// Wasm import field name (e.g. `"add"`).
     pub name: String,
-    /// Kind and (for functions) declared signature.
+    /// Kind and declared type metadata.
     pub kind: WasmExternKind,
 }
 
-/// The kind of a Wasm import or export, with declared signature for
-/// functions. Globals, memories and tables are reported by kind only because
-/// the module graph integration in this slice only bridges function imports;
-/// callers fail closed on the other kinds with a precise diagnostic.
+/// The kind of a Wasm import or export, with declared type metadata. The
+/// module graph integration in this slice only bridges function imports;
+/// callers fail closed on globals, memories and tables with these precise
+/// descriptors so unsupported imports cannot accidentally instantiate.
 #[derive(Debug, Clone)]
 pub enum WasmExternKind {
     /// A function with the declared parameter and result kinds.
@@ -307,11 +322,36 @@ pub enum WasmExternKind {
         results: Vec<Result<HostValKind, String>>,
     },
     /// A global value.
-    Global,
+    Global {
+        /// Global value kind, or an unsupported value-type diagnostic.
+        value_type: Result<HostValKind, String>,
+        /// Whether the import requires a mutable global.
+        mutable: bool,
+    },
     /// A linear memory.
-    Memory,
+    Memory {
+        /// Minimum page count.
+        minimum: u64,
+        /// Optional maximum page count.
+        maximum: Option<u64>,
+        /// Whether this is a memory64 import.
+        memory64: bool,
+        /// Whether this is a shared-memory import.
+        shared: bool,
+        /// Log2 page size in bytes.
+        page_size_log2: u8,
+    },
     /// A table.
-    Table,
+    Table {
+        /// Wasmtime display string for the table element reference type.
+        element: String,
+        /// Minimum element count.
+        minimum: u64,
+        /// Optional maximum element count.
+        maximum: Option<u64>,
+        /// Whether this is a 64-bit table import.
+        table64: bool,
+    },
     /// Any other extern kind not bridged by this slice (e.g. tag/event types).
     Other,
 }
@@ -856,6 +896,79 @@ mod tests {
         let engine = WasmEngine::new();
         let module = WasmModule::from_wat(&engine, MINIMAL_WAT).unwrap();
         let _cloned = module.clone();
+    }
+
+    #[test]
+    fn test_wasm_module_imports_report_global_type_metadata() {
+        let engine = WasmEngine::new();
+        let module =
+            WasmModule::from_wat(&engine, r#"(module (import "env" "g" (global (mut i64))))"#)
+                .unwrap();
+        let imports = module.imports();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].module, "env");
+        assert_eq!(imports[0].name, "g");
+        match &imports[0].kind {
+            WasmExternKind::Global {
+                value_type,
+                mutable,
+            } => {
+                assert_eq!(*value_type, Ok(HostValKind::I64));
+                assert!(*mutable);
+            }
+            other => panic!("expected global import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_module_imports_report_memory_type_metadata() {
+        let engine = WasmEngine::new();
+        let module =
+            WasmModule::from_wat(&engine, r#"(module (import "env" "mem" (memory 2 5)))"#).unwrap();
+        let imports = module.imports();
+        assert_eq!(imports.len(), 1);
+        match &imports[0].kind {
+            WasmExternKind::Memory {
+                minimum,
+                maximum,
+                memory64,
+                shared,
+                page_size_log2,
+            } => {
+                assert_eq!(*minimum, 2);
+                assert_eq!(*maximum, Some(5));
+                assert!(!*memory64);
+                assert!(!*shared);
+                assert_eq!(*page_size_log2, 16);
+            }
+            other => panic!("expected memory import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_module_imports_report_table_type_metadata() {
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(
+            &engine,
+            r#"(module (import "env" "tab" (table 1 3 funcref)))"#,
+        )
+        .unwrap();
+        let imports = module.imports();
+        assert_eq!(imports.len(), 1);
+        match &imports[0].kind {
+            WasmExternKind::Table {
+                element,
+                minimum,
+                maximum,
+                table64,
+            } => {
+                assert!(element.contains("func"), "unexpected element: {element}");
+                assert_eq!(*minimum, 1);
+                assert_eq!(*maximum, Some(3));
+                assert!(!*table64);
+            }
+            other => panic!("expected table import, got {other:?}"),
+        }
     }
 
     // ── WasmInstance ────────────────────────────────────────────────────────
