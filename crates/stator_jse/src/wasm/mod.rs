@@ -48,7 +48,8 @@
 use std::sync::{Arc, Mutex};
 
 use wasmtime::{
-    Config, Engine, FuncType, Instance, Linker, Module, Store, UpdateDeadline, Val, ValType,
+    Config, Engine, FuncType, Global, GlobalType, Instance, Linker, Module, Mutability, Store,
+    UpdateDeadline, Val, ValType,
 };
 
 use crate::error::{StatorError, StatorResult};
@@ -279,6 +280,18 @@ impl WasmModule {
             .ok()?;
         Some((params, results))
     }
+
+    /// Look up the type of a named global export.
+    ///
+    /// Returns `None` when the export does not exist, is not a global, or
+    /// uses a Wasm value type that has no [`HostValKind`] representation
+    /// (`v128`, references).
+    pub fn exported_global_type(&self, name: &str) -> Option<(HostValKind, bool)> {
+        let export = self.inner.exports().find(|e| e.name() == name)?;
+        let gt = export.ty().global()?.clone();
+        let kind = value_type_to_host_kind(gt.content().clone()).ok()?;
+        Some((kind, gt.mutability().is_var()))
+    }
 }
 
 fn value_type_to_host_kind(ty: wasmtime::ValType) -> Result<HostValKind, String> {
@@ -482,6 +495,30 @@ pub struct HostFunc {
     pub callback: HostFuncCallback,
 }
 
+/// A single host global import bound into a Wasm module's import namespace.
+///
+/// `module` and `name` form the fully-qualified Wasm import name (e.g. `env`
+/// and `g`).  `value` carries the initial value and its declared
+/// [`HostValKind`]; `mutable` determines whether the bound global is of type
+/// `const` or `var` and is matched against the module's expected global type
+/// at instantiate time (any mismatch fails instantiation).
+///
+/// Globals created from a [`HostGlobal`] are owned by the Wasm store and
+/// outlive the embedder's view of the import; writes performed by the running
+/// Wasm module are not propagated back to any host-side value.  Callers that
+/// need to observe Wasm-side mutations must keep that responsibility outside
+/// this slice.
+pub struct HostGlobal {
+    /// Wasm import module name (e.g. `"env"`).
+    pub module: String,
+    /// Wasm import field name (e.g. `"g"`).
+    pub name: String,
+    /// Initial value and declared kind.
+    pub value: HostVal,
+    /// Whether the import requires a mutable (`var`) global.
+    pub mutable: bool,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmInstance
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,16 +547,9 @@ impl WasmInstance {
 
     /// Instantiate a [`WasmModule`] binding the given host-function imports.
     ///
-    /// Each [`HostFunc`] is registered in the [`wasmtime::Linker`] under its
-    /// `(module, name)` pair using a [`FuncType`] derived from the declared
-    /// `params` / `results`.  Instantiation fails if the module expects an
-    /// import that is not provided, or if a provided import's declared
-    /// signature does not match the one the module expects (Wasmtime performs
-    /// the structural match).
-    ///
-    /// Host callbacks run synchronously on the thread that called
-    /// [`WasmInstance::call`]: see the "Host imports" section above for the
-    /// termination / polling contract.
+    /// Equivalent to calling [`WasmInstance::new_with_extern_imports`] with
+    /// no host global imports.  See that method for the import-binding
+    /// contract and termination/polling guarantees.
     ///
     /// # Errors
     ///
@@ -529,6 +559,37 @@ impl WasmInstance {
         engine: &WasmEngine,
         module: &WasmModule,
         imports: Vec<HostFunc>,
+    ) -> StatorResult<Self> {
+        Self::new_with_extern_imports(engine, module, imports, Vec::new())
+    }
+
+    /// Instantiate a [`WasmModule`] binding the given host-function and
+    /// host-global imports.
+    ///
+    /// Each [`HostFunc`] is registered in the [`wasmtime::Linker`] under its
+    /// `(module, name)` pair using a [`FuncType`] derived from the declared
+    /// `params` / `results`.  Each [`HostGlobal`] is materialised as a
+    /// [`wasmtime::Global`] owned by the store and registered under its
+    /// `(module, name)` pair with the declared `value` kind and `mutable`
+    /// flag.  Instantiation fails if the module expects an import that is
+    /// not provided, or if a provided import's declared signature/type does
+    /// not match the one the module expects (Wasmtime performs the
+    /// structural match).
+    ///
+    /// Host callbacks run synchronously on the thread that called
+    /// [`WasmInstance::call`]: see the "Host imports" section above for the
+    /// termination / polling contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::WasmError`] if linker registration fails (e.g.
+    /// duplicate import names, conflicting `(module, name)` entries) or if
+    /// instantiation fails.
+    pub fn new_with_extern_imports(
+        engine: &WasmEngine,
+        module: &WasmModule,
+        funcs: Vec<HostFunc>,
+        globals: Vec<HostGlobal>,
     ) -> StatorResult<Self> {
         let mut store: Store<()> = Store::new(engine.inner(), ());
         // Configure the store so that every epoch advance reaches a callback
@@ -545,7 +606,7 @@ impl WasmInstance {
         store.set_epoch_deadline(1);
 
         let mut linker: Linker<()> = Linker::new(engine.inner());
-        for imp in imports {
+        for imp in funcs {
             let HostFunc {
                 module: m_name,
                 name: f_name,
@@ -594,6 +655,26 @@ impl WasmInstance {
                     }
                     Ok(())
                 })
+                .map_err(|e| StatorError::WasmError(e.to_string()))?;
+        }
+
+        for HostGlobal {
+            module: m_name,
+            name: g_name,
+            value,
+            mutable,
+        } in globals
+        {
+            let mutability = if mutable {
+                Mutability::Var
+            } else {
+                Mutability::Const
+            };
+            let ty = GlobalType::new(value.kind().to_wasmtime(), mutability);
+            let global = Global::new(&mut store, ty, value.to_wasm())
+                .map_err(|e| StatorError::WasmError(e.to_string()))?;
+            linker
+                .define(&store, &m_name, &g_name, global)
                 .map_err(|e| StatorError::WasmError(e.to_string()))?;
         }
 
@@ -1399,6 +1480,127 @@ mod tests {
         instance.call("go", &[]).unwrap();
         let seen = observed.lock().unwrap().expect("callback must have run");
         assert_eq!(seen, std::thread::current().id());
+    }
+
+    // ── Host globals ────────────────────────────────────────────────────────
+
+    /// Importing an immutable `i32` global binds the supplied initial value
+    /// and the imported module observes it via `global.get`.
+    #[test]
+    fn test_wasm_host_global_import_immutable_i32() {
+        let wat = r#"
+            (module
+                (import "env" "g" (global i32))
+                (func (export "get") (result i32) (global.get 0)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let globals = vec![HostGlobal {
+            module: "env".to_string(),
+            name: "g".to_string(),
+            value: HostVal::I32(123),
+            mutable: false,
+        }];
+        let mut instance =
+            WasmInstance::new_with_extern_imports(&engine, &module, Vec::new(), globals).unwrap();
+        let result = instance.call("get", &[]).unwrap();
+        assert_eq!(result[0].unwrap_i32(), 123);
+    }
+
+    /// Importing a mutable `i64` global with a matching `(mut i64)` import
+    /// declaration succeeds and the importer can both read and write it.
+    #[test]
+    fn test_wasm_host_global_import_mutable_i64_roundtrip() {
+        let wat = r#"
+            (module
+                (import "env" "g" (global (mut i64)))
+                (func (export "get") (result i64) (global.get 0))
+                (func (export "set") (param i64) (local.get 0) (global.set 0)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let globals = vec![HostGlobal {
+            module: "env".to_string(),
+            name: "g".to_string(),
+            value: HostVal::I64(7),
+            mutable: true,
+        }];
+        let mut instance =
+            WasmInstance::new_with_extern_imports(&engine, &module, Vec::new(), globals).unwrap();
+        let initial = instance.call("get", &[]).unwrap();
+        assert_eq!(initial[0].unwrap_i64(), 7);
+        instance.call("set", &[Val::I64(42)]).unwrap();
+        let updated = instance.call("get", &[]).unwrap();
+        assert_eq!(updated[0].unwrap_i64(), 42);
+    }
+
+    /// Supplying a `const` host global for an import declared `mut` fails
+    /// instantiation rather than silently coercing the mutability.
+    #[test]
+    fn test_wasm_host_global_import_mutability_mismatch_fails() {
+        let wat = r#"
+            (module (import "env" "g" (global (mut i32))))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let globals = vec![HostGlobal {
+            module: "env".to_string(),
+            name: "g".to_string(),
+            value: HostVal::I32(0),
+            mutable: false,
+        }];
+        let err = match WasmInstance::new_with_extern_imports(&engine, &module, Vec::new(), globals)
+        {
+            Ok(_) => panic!("instantiation should fail with mutability mismatch"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StatorError::WasmError(_)), "{err:?}");
+    }
+
+    /// Supplying a host global of the wrong value kind fails instantiation.
+    #[test]
+    fn test_wasm_host_global_import_kind_mismatch_fails() {
+        let wat = r#"
+            (module (import "env" "g" (global i32)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let globals = vec![HostGlobal {
+            module: "env".to_string(),
+            name: "g".to_string(),
+            value: HostVal::F64(1.5),
+            mutable: false,
+        }];
+        let err = match WasmInstance::new_with_extern_imports(&engine, &module, Vec::new(), globals)
+        {
+            Ok(_) => panic!("instantiation should fail with kind mismatch"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StatorError::WasmError(_)), "{err:?}");
+    }
+
+    /// `exported_global_type` returns the correct kind/mutability for known
+    /// global exports and `None` for missing or non-global exports.
+    #[test]
+    fn test_wasm_module_exported_global_type_reports_metadata() {
+        let wat = r#"
+            (module
+                (global (export "g") (mut f32) (f32.const 1.5))
+                (global (export "h") i64 (i64.const 9))
+                (func (export "f")))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        assert_eq!(
+            module.exported_global_type("g"),
+            Some((HostValKind::F32, true))
+        );
+        assert_eq!(
+            module.exported_global_type("h"),
+            Some((HostValKind::I64, false))
+        );
+        assert_eq!(module.exported_global_type("f"), None);
+        assert_eq!(module.exported_global_type("missing"), None);
     }
 
     // ── Value conversion ────────────────────────────────────────────────────

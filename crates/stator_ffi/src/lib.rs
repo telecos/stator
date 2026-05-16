@@ -44,8 +44,8 @@ use stator_jse::parser::ast::{
 };
 use stator_jse::snapshot::{deserialize_bytecode_array, serialize_bytecode_array};
 use stator_jse::wasm::{
-    HostFunc, HostFuncCallback, HostVal, HostValKind, WasmEngine, WasmInstance, WasmModule,
-    host_val_to_js_value, js_value_to_host_val,
+    HostFunc, HostFuncCallback, HostGlobal, HostVal, HostValKind, WasmEngine, WasmInstance,
+    WasmModule, host_val_to_js_value, js_value_to_host_val,
 };
 
 /// An opaque isolate handle.
@@ -2467,6 +2467,13 @@ pub struct StatorModule {
     /// `from_wasm_imports`; the evaluator then materialises a [`HostFunc`]
     /// per entry from the resolved dependency's named exports.
     wasm_func_imports: Vec<WasmFuncImport>,
+    /// Immutable Wasm global imports declared by this module, in source
+    /// order. Each entry records a `(module, name)` pair plus the declared
+    /// value type. At evaluation time the resolver looks up a primitive
+    /// number value from the resolved dependency's namespace and materialises
+    /// a matching [`HostGlobal`]; mutable globals, v128 / reference globals,
+    /// memories and tables continue to fail closed at compile time.
+    wasm_global_imports: Vec<WasmGlobalImport>,
     /// Host-visible source kind supplied at compile time.
     source_type: StatorModuleType,
     /// Whether this module needs host import resolution before evaluation.
@@ -2579,6 +2586,27 @@ struct WasmFuncImport {
     params: Vec<HostValKind>,
     /// Declared result kinds, in order.
     results: Vec<HostValKind>,
+}
+
+/// Declared type and target name of a single WebAssembly global import.
+///
+/// Stored on [`StatorModule`] for executable Wasm bodies. Globals are only
+/// recorded for shapes Stator can bind at runtime today (immutable globals
+/// whose value type is one of i32 / i64 / f32 / f64); unsupported shapes
+/// (mutable globals, v128 / reference value types, memory and table imports)
+/// continue to fail closed at compile time with their declared type metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WasmGlobalImport {
+    /// Wasm import module namespace (e.g. `"env"`).
+    module: String,
+    /// Wasm import field name (e.g. `"g"`).
+    name: String,
+    /// Declared global value kind.
+    value_type: HostValKind,
+    /// Whether the import requires a mutable (`var`) global. The current
+    /// slice only records immutable globals here; if this is ever `true` the
+    /// module compile path returned a fail-closed diagnostic instead.
+    mutable: bool,
 }
 
 /// A single binding requested from a dependency module.
@@ -3188,6 +3216,7 @@ fn module_error_record(
         wasm_module: None,
         wasm_instance: None,
         wasm_func_imports: Vec::new(),
+        wasm_global_imports: Vec::new(),
         source_type,
         has_dependencies: false,
         module_requests: Vec::new(),
@@ -3257,6 +3286,7 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 wasm_module: None,
                 wasm_instance: None,
                 wasm_func_imports: Vec::new(),
+                wasm_global_imports: Vec::new(),
                 source_type: StatorModuleType::StatorModuleTypeJson,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -3314,16 +3344,17 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
     match WasmModule::from_bytes(&engine, bytes) {
         Ok(module) => {
             let direct_exports = wasm_module_function_exports(&module);
-            let (wasm_func_imports, module_requests) = match collect_wasm_module_imports(&module) {
-                Ok(value) => value,
-                Err(error) => {
-                    return module_error_record(
-                        StatorModuleType::StatorModuleTypeWebAssembly,
-                        &error,
-                        StatorMessageKind::StatorMessageKindWasm,
-                    );
-                }
-            };
+            let (wasm_func_imports, wasm_global_imports, module_requests) =
+                match collect_wasm_module_imports(&module) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return module_error_record(
+                            StatorModuleType::StatorModuleTypeWebAssembly,
+                            &error,
+                            StatorMessageKind::StatorMessageKindWasm,
+                        );
+                    }
+                };
             let has_dependencies = !module_requests.is_empty();
             Box::new(StatorModule {
                 bytecodes: None,
@@ -3332,6 +3363,7 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 wasm_module: Some(module),
                 wasm_instance: None,
                 wasm_func_imports,
+                wasm_global_imports,
                 source_type: StatorModuleType::StatorModuleTypeWebAssembly,
                 has_dependencies,
                 module_requests,
@@ -3371,18 +3403,26 @@ fn wasm_module_function_exports(module: &WasmModule) -> HashSet<String> {
 
 /// Inspect a compiled WebAssembly module's import descriptors and synthesise
 /// the matching [`StatorModuleRequest`] entries plus the typed
-/// [`WasmFuncImport`] list used at evaluation time.
+/// [`WasmFuncImport`] / [`WasmGlobalImport`] lists used at evaluation time.
 ///
-/// Only function imports are supported in this slice. Each unique import
-/// `module` namespace becomes a single request whose `imports` list collects
-/// the import names from that namespace (`RequestedExport::Named`). Globals,
-/// tables and memories fail closed at compile time with their declared type
-/// metadata so the module record never reaches a state where it would silently
-/// bind a missing primitive.
-fn collect_wasm_module_imports(
-    module: &WasmModule,
-) -> Result<(Vec<WasmFuncImport>, Vec<StatorModuleRequest>), String> {
+/// Function imports and immutable globals whose value type is one of
+/// i32 / i64 / f32 / f64 are accepted. Each unique import `module` namespace
+/// becomes a single request whose `imports` list collects the import names
+/// from that namespace (`RequestedExport::Named`). Mutable globals, globals
+/// with v128 / reference value types, tables and memories fail closed at
+/// compile time with their declared type metadata so the module record never
+/// reaches a state where it would silently bind a missing primitive.
+/// Collected results of partitioning a Wasm module's import vector into the
+/// kinds the Stator runtime can resolve.
+type CollectedWasmImports = (
+    Vec<WasmFuncImport>,
+    Vec<WasmGlobalImport>,
+    Vec<StatorModuleRequest>,
+);
+
+fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImports, String> {
     let mut func_imports: Vec<WasmFuncImport> = Vec::new();
+    let mut global_imports: Vec<WasmGlobalImport> = Vec::new();
     let mut requests: Vec<StatorModuleRequest> = Vec::new();
     let mut request_index: HashMap<String, usize> = HashMap::new();
     for descriptor in module.imports() {
@@ -3391,7 +3431,21 @@ fn collect_wasm_module_imports(
             name: field_name,
             kind,
         } = descriptor;
-        let (params, results) = match kind {
+
+        // Validate then classify the import kind. Each accepted branch
+        // records itself into the appropriate typed list below; rejected
+        // branches return a precise fail-closed diagnostic.
+        enum AcceptedImport {
+            Func {
+                params: Vec<HostValKind>,
+                results: Vec<HostValKind>,
+            },
+            Global {
+                value_type: HostValKind,
+            },
+        }
+
+        let accepted = match kind {
             stator_jse::wasm::WasmExternKind::Func { params, results } => {
                 let params = params
                     .into_iter()
@@ -3405,13 +3459,19 @@ fn collect_wasm_module_imports(
                     .map_err(|e| {
                         format!("WebAssembly module import '{module_name}.{field_name}' uses {e}")
                     })?;
-                (params, results)
+                AcceptedImport::Func { params, results }
             }
+            stator_jse::wasm::WasmExternKind::Global {
+                value_type: Ok(value_type),
+                mutable: false,
+            } => AcceptedImport::Global { value_type },
             other => {
                 return Err(format!(
                     "WebAssembly module import '{module_name}.{field_name}' has unsupported {}; \
-                     Stator can only bind function imports because no runtime/FFI primitive \
-                     safely exposes WebAssembly globals, memories, or tables as imports yet",
+                     Stator can only bind function imports and immutable i32/i64/f32/f64 global \
+                     imports because no runtime/FFI primitive safely exposes mutable globals, \
+                     v128/reference globals, WebAssembly memories, or WebAssembly tables as \
+                     imports yet",
                     describe_unsupported_wasm_import_kind(other)
                 ));
             }
@@ -3448,14 +3508,26 @@ fn collect_wasm_module_imports(
                 .imports
                 .push(RequestedExport::Named(field_name.clone()));
         }
-        func_imports.push(WasmFuncImport {
-            module: module_name,
-            name: field_name,
-            params,
-            results,
-        });
+        match accepted {
+            AcceptedImport::Func { params, results } => {
+                func_imports.push(WasmFuncImport {
+                    module: module_name,
+                    name: field_name,
+                    params,
+                    results,
+                });
+            }
+            AcceptedImport::Global { value_type } => {
+                global_imports.push(WasmGlobalImport {
+                    module: module_name,
+                    name: field_name,
+                    value_type,
+                    mutable: false,
+                });
+            }
+        }
     }
-    Ok((func_imports, requests))
+    Ok((func_imports, global_imports, requests))
 }
 
 fn describe_unsupported_wasm_import_kind(kind: stator_jse::wasm::WasmExternKind) -> String {
@@ -3829,6 +3901,7 @@ struct WasmModulePayload {
     wasm_bytes: Vec<u8>,
     direct_exports: Vec<Vec<u8>>,
     func_imports: Vec<SerializedWasmFuncImport>,
+    global_imports: Vec<SerializedWasmGlobalImport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3837,6 +3910,14 @@ struct SerializedWasmFuncImport {
     name: Vec<u8>,
     params: Vec<HostValKind>,
     results: Vec<HostValKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SerializedWasmGlobalImport {
+    module: Vec<u8>,
+    name: Vec<u8>,
+    value_type: HostValKind,
+    mutable: bool,
 }
 
 struct SerializedModuleRequest {
@@ -3959,6 +4040,18 @@ fn serialize_wasm_module_payload(payload: &WasmModulePayload, out: &mut Vec<u8>)
         {
             return false;
         }
+    }
+
+    let Ok(global_count) = u32::try_from(payload.global_imports.len()) else {
+        return false;
+    };
+    push_u32(out, global_count);
+    for import in &payload.global_imports {
+        if !push_bytes(out, &import.module) || !push_bytes(out, &import.name) {
+            return false;
+        }
+        push_u8(out, import.value_type as u8);
+        push_u8(out, u8::from(import.mutable));
     }
     true
 }
@@ -4088,10 +4181,27 @@ fn parse_wasm_module_payload(reader: &mut CacheReader<'_>) -> Option<WasmModuleP
             results: parse_wasm_val_kinds(reader)?,
         });
     }
+
+    let global_count = reader.read_u32()? as usize;
+    let mut global_imports = Vec::with_capacity(global_count);
+    for _ in 0..global_count {
+        let module = reader.read_bytes()?;
+        let name = reader.read_bytes()?;
+        let value_type = parse_host_val_kind(reader.read_u8()?)?;
+        let mutable = reader.read_u8()? != 0;
+        global_imports.push(SerializedWasmGlobalImport {
+            module,
+            name,
+            value_type,
+            mutable,
+        });
+    }
+
     Some(WasmModulePayload {
         wasm_bytes,
         direct_exports,
         func_imports,
+        global_imports,
     })
 }
 
@@ -4353,10 +4463,12 @@ fn module_cache_payload_from_module(
                     results: import.results.clone(),
                 })
                 .collect();
+            let global_imports = serialize_wasm_global_imports(&module.wasm_global_imports);
             Some(ModuleCachePayload::Wasm(WasmModulePayload {
                 wasm_bytes: source_bytes.to_vec(),
                 direct_exports,
                 func_imports,
+                global_imports,
             }))
         }
         // CSS module bodies are not executable; refuse to produce a cache blob.
@@ -4445,6 +4557,7 @@ fn module_from_js_cache_payload(
         wasm_module: None,
         wasm_instance: None,
         wasm_func_imports: Vec::new(),
+        wasm_global_imports: Vec::new(),
         source_type,
         has_dependencies: payload.has_dependencies,
         module_requests,
@@ -4482,6 +4595,7 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         wasm_module: None,
         wasm_instance: None,
         wasm_func_imports: Vec::new(),
+        wasm_global_imports: Vec::new(),
         source_type: StatorModuleType::StatorModuleTypeJson,
         has_dependencies: false,
         module_requests: Vec::new(),
@@ -4516,6 +4630,18 @@ fn serialized_wasm_imports(imports: &[WasmFuncImport]) -> Vec<SerializedWasmFunc
         .collect()
 }
 
+fn serialize_wasm_global_imports(imports: &[WasmGlobalImport]) -> Vec<SerializedWasmGlobalImport> {
+    imports
+        .iter()
+        .map(|import| SerializedWasmGlobalImport {
+            module: import.module.as_bytes().to_vec(),
+            name: import.name.as_bytes().to_vec(),
+            value_type: import.value_type,
+            mutable: import.mutable,
+        })
+        .collect()
+}
+
 fn module_from_wasm_cache_payload(
     payload: WasmModulePayload,
     source_hash: u64,
@@ -4546,6 +4672,9 @@ fn module_from_wasm_cache_payload(
     }
 
     if serialized_wasm_imports(&compiled.wasm_func_imports) != payload.func_imports {
+        return None;
+    }
+    if serialize_wasm_global_imports(&compiled.wasm_global_imports) != payload.global_imports {
         return None;
     }
 
@@ -4735,6 +4864,7 @@ unsafe fn compile_module_source(
             wasm_module: None,
             wasm_instance: None,
             wasm_func_imports: Vec::new(),
+            wasm_global_imports: Vec::new(),
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
@@ -4774,6 +4904,7 @@ unsafe fn compile_module_source(
                 wasm_module: None,
                 wasm_instance: None,
                 wasm_func_imports: Vec::new(),
+                wasm_global_imports: Vec::new(),
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -4815,6 +4946,7 @@ unsafe fn compile_module_source(
             wasm_module: None,
             wasm_instance: None,
             wasm_func_imports: Vec::new(),
+            wasm_global_imports: Vec::new(),
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
@@ -4865,6 +4997,7 @@ unsafe fn compile_module_source(
                 wasm_module: None,
                 wasm_instance: None,
                 wasm_func_imports: Vec::new(),
+                wasm_global_imports: Vec::new(),
                 source_type,
                 has_dependencies,
                 module_requests,
@@ -4896,6 +5029,7 @@ unsafe fn compile_module_source(
                 wasm_module: None,
                 wasm_instance: None,
                 wasm_func_imports: Vec::new(),
+                wasm_global_imports: Vec::new(),
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -7007,11 +7141,12 @@ unsafe fn evaluate_wasm_module_graph(
             Some(instance) => Rc::clone(instance),
             None => {
                 // SAFETY: `module` is borrowed exclusively for this evaluation call.
-                let host_imports = unsafe { build_wasm_host_imports(module)? };
-                let instance = Rc::new(RefCell::new(WasmInstance::new_with_imports(
+                let (host_funcs, host_globals) = unsafe { build_wasm_host_imports(module)? };
+                let instance = Rc::new(RefCell::new(WasmInstance::new_with_extern_imports(
                     &engine,
                     &wasm_module,
-                    host_imports,
+                    host_funcs,
+                    host_globals,
                 )?));
                 module_ref.wasm_instance = Some(Rc::clone(&instance));
                 instance
@@ -7114,26 +7249,31 @@ unsafe fn lookup_wasm_import_value(
     Ok(resolved)
 }
 
-/// Build the [`HostFunc`] list used to instantiate a WebAssembly module, by
-/// pairing each declared [`WasmFuncImport`] with the matching named export of
-/// the appropriate resolved dependency module.
+/// Build the [`HostFunc`] and [`HostGlobal`] lists used to instantiate a
+/// WebAssembly module, by pairing each declared [`WasmFuncImport`] /
+/// [`WasmGlobalImport`] with the matching named export of the appropriate
+/// resolved dependency module.
 ///
 /// All non-function values, missing exports, and bytecode-backed JS function
 /// values fail closed with a precise [`StatorError::WasmError`] before the
-/// underlying Wasm linker would reject instantiation. This guarantees that a
-/// successfully instantiated module observes only typed, callable host
-/// imports of the declared shape.
+/// underlying Wasm linker would reject instantiation. Globals require the
+/// resolved dependency value to be a primitive coercible to the declared
+/// value type; mismatched kinds, mutable globals, v128 / reference globals,
+/// memories, and tables continue to fail closed (most of them already at
+/// compile time, the remainder here). This guarantees that a successfully
+/// instantiated module observes only typed, callable host imports of the
+/// declared shape.
 ///
 /// # Safety
 /// `module` must be a live WebAssembly module pointer whose graph has been
 /// fully linked (every `module_requests[i].resolved` populated).
 unsafe fn build_wasm_host_imports(
     module: *mut StatorModule,
-) -> stator_jse::error::StatorResult<Vec<HostFunc>> {
+) -> stator_jse::error::StatorResult<(Vec<HostFunc>, Vec<HostGlobal>)> {
     // SAFETY: caller guarantees `module` is a live module pointer.
     let module_ref = unsafe { &*module };
-    if module_ref.wasm_func_imports.is_empty() {
-        return Ok(Vec::new());
+    if module_ref.wasm_func_imports.is_empty() && module_ref.wasm_global_imports.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Map import-module-namespace → resolved dependency module pointer.
@@ -7148,7 +7288,7 @@ unsafe fn build_wasm_host_imports(
         );
     }
 
-    let mut out = Vec::with_capacity(module_ref.wasm_func_imports.len());
+    let mut funcs = Vec::with_capacity(module_ref.wasm_func_imports.len());
     for import in &module_ref.wasm_func_imports {
         let dep = dep_by_namespace
             .get(&import.module)
@@ -7193,7 +7333,7 @@ unsafe fn build_wasm_host_imports(
             }
         }
 
-        out.push(HostFunc {
+        funcs.push(HostFunc {
             module: import.module.clone(),
             name: import.name.clone(),
             params: import.params.clone(),
@@ -7201,7 +7341,88 @@ unsafe fn build_wasm_host_imports(
             callback,
         });
     }
-    Ok(out)
+
+    let mut globals = Vec::with_capacity(module_ref.wasm_global_imports.len());
+    for import in &module_ref.wasm_global_imports {
+        let dep = dep_by_namespace
+            .get(&import.module)
+            .copied()
+            .ok_or_else(|| {
+                stator_jse::error::StatorError::WasmError(format!(
+                    "WebAssembly import '{}.{}' has no resolved dependency module",
+                    import.module, import.name
+                ))
+            })?;
+        // SAFETY: `dep` was returned by the resolver and recorded on the
+        // module's request slot.
+        let value =
+            unsafe { lookup_wasm_import_value(dep, &import.name) }.map_err(|e| match e {
+                stator_jse::error::StatorError::WasmError(msg) => {
+                    stator_jse::error::StatorError::WasmError(format!(
+                        "WebAssembly import '{}.{}': {msg}",
+                        import.module, import.name
+                    ))
+                }
+                other => other,
+            })?;
+        let host_val = match js_value_to_host_val(&value, import.value_type) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(stator_jse::error::StatorError::WasmError(format!(
+                    "WebAssembly global import '{}.{}' cannot be initialised: {}",
+                    import.module,
+                    import.name,
+                    error_to_string(&e),
+                )));
+            }
+        };
+        if !dep.is_null() {
+            // SAFETY: `dep` is live by construction and only read here.
+            unsafe {
+                validate_wasm_to_wasm_global_match(dep, import)?;
+            }
+        }
+        globals.push(HostGlobal {
+            module: import.module.clone(),
+            name: import.name.clone(),
+            value: host_val,
+            mutable: import.mutable,
+        });
+    }
+
+    Ok((funcs, globals))
+}
+
+fn error_to_string(error: &stator_jse::error::StatorError) -> String {
+    match error {
+        stator_jse::error::StatorError::WasmError(msg) => msg.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+unsafe fn validate_wasm_to_wasm_global_match(
+    dep: *mut StatorModule,
+    import: &WasmGlobalImport,
+) -> stator_jse::error::StatorResult<()> {
+    // SAFETY: caller guarantees `dep` is a live module pointer.
+    let dep_ref = unsafe { &*dep };
+    let Some(dep_wasm) = dep_ref.wasm_module.as_ref() else {
+        return Ok(());
+    };
+    // Only fail closed if the dep is a Wasm module that does export
+    // `import.name` as a global; if it doesn't export it as a global at all,
+    // the JS-value resolution path above already produced a precise error,
+    // so leave that diagnostic in place rather than overriding it here.
+    let Some((dep_kind, dep_mut)) = dep_wasm.exported_global_type(&import.name) else {
+        return Ok(());
+    };
+    if dep_kind != import.value_type || dep_mut != import.mutable {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly global import '{}.{}' type mismatch with resolved Wasm dependency export",
+            import.module, import.name
+        )));
+    }
+    Ok(())
 }
 
 unsafe fn validate_wasm_to_wasm_signature_match(
@@ -19040,6 +19261,22 @@ mod tests {
     // Imports `env.add: (i32,i32)->i32` and exports `run: () -> i32` whose
     // body is `i32.const 1; i32.const 2; call $env.add`. Used to exercise
     // Wasm-to-Wasm function imports with a callable JS entry point.
+    // Imports `env.g: i32 (const)` and exports `get: () -> i32` whose body
+    // is `global.get 0`. Used to exercise immutable global imports resolved
+    // from a JS dependency module.
+    const WASM_IMPORT_GLOBAL_GET: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 1 type `() -> i32`
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // import section: env.g (global i32 const)
+        0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x01, 0x67, 0x03, 0x7f, 0x00,
+        // function section: 1 func of type 0
+        0x03, 0x02, 0x01, 0x00, // export section: "get" func 0
+        0x07, 0x07, 0x01, 0x03, 0x67, 0x65, 0x74, 0x00, 0x00,
+        // code section: global.get 0; end
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x23, 0x00, 0x0b,
+    ];
+
     const WASM_IMPORT_ADD_RUN: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f,
         0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x61,
@@ -19433,11 +19670,134 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_unsupported_global_import_fails_compilation() {
-        assert_wasm_unsupported_import_kind_fails_compilation(
+    fn test_module_wasm_immutable_global_import_compiles_successfully() {
+        // Immutable i32/i64/f32/f64 global imports are bound at evaluation
+        // time from the resolved dependency's namespace, so compilation
+        // succeeds and the module reaches the unlinked state with a single
+        // synthesised module request for the import namespace.
+        let module = compile_typed_module_bytes(
             WASM_IMPORT_GLOBAL,
-            &["env.g", "global", "immutable", "I32"],
+            StatorModuleType::StatorModuleTypeWebAssembly,
         );
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusUnlinked
+            );
+            assert!(stator_module_get_error(module).is_null());
+            stator_module_free(module);
+        }
+    }
+
+    /// A Wasm module importing `env.g` as an immutable `i32` global links
+    /// against a JS dependency that `export const g = N` and reads back the
+    /// value through an exported `get` function.
+    #[test]
+    fn test_module_wasm_immutable_global_import_binds_js_export() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { get } from './importer.wasm' with { type: 'webassembly' }; get();",
+        );
+        let importer = compile_typed_module_bytes(
+            WASM_IMPORT_GLOBAL_GET,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep = compile_module_src("export const g = 7;");
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 7.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    /// Resolving a Wasm global import against a JS dependency whose `g`
+    /// export is not a number-coercible primitive fails closed at evaluation
+    /// with a precise typed diagnostic instead of silently producing a zero
+    /// value.
+    #[test]
+    fn test_module_wasm_immutable_global_import_non_number_fails_evaluation() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { get } from './importer.wasm' with { type: 'webassembly' }; get();",
+        );
+        let importer = compile_typed_module_bytes(
+            WASM_IMPORT_GLOBAL_GET,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep = compile_module_src("export const g = {};");
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(importer),
+                StatorMessageKind::StatorMessageKindWasm
+            );
+            let err = CStr::from_ptr(stator_module_get_error(importer))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("env.g") && err.contains("cannot be initialised"),
+                "error did not mention env.g / cannot be initialised: {err}"
+            );
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
@@ -19707,8 +20067,11 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_code_cache_rejects_unsupported_global_import_kind() {
-        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_GLOBAL);
+    fn test_module_wasm_code_cache_rejects_unsupported_mutable_global_import_kind() {
+        // Mutable globals remain unsupported and so still reach the
+        // cache-rejection path; the immutable counterpart is exercised by the
+        // round-trip test that follows.
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_MUT_GLOBAL);
     }
 
     #[test]
