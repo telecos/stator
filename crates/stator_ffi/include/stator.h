@@ -302,6 +302,18 @@ typedef enum StatorModuleStatus {
    * The module completed evaluation successfully.
    */
   StatorModuleStatusEvaluated = 4,
+  /**
+   * The module body is suspended on a top-level `await` whose awaited
+   * promise has not yet settled after draining the local microtask
+   * queue. Exports are intentionally *not* published in this state; the
+   * embedder must drive evaluation forward by calling
+   * [`stator_module_resume_evaluation`] (after settling the awaited
+   * promise via host primitives or
+   * [`stator_module_pending_evaluation_fulfill`] /
+   * [`stator_module_pending_evaluation_reject`]) before the module's
+   * bindings become observable.
+   */
+  StatorModuleStatusPendingAsyncEvaluation = 5,
 } StatorModuleStatus;
 
 /**
@@ -3193,6 +3205,89 @@ struct StatorValue *stator_module_evaluate(struct StatorModule *module, struct S
  * and must not be used again after this call.
  */
 void stator_module_free(struct StatorModule *module);
+
+/**
+ * Returns `true` if `module` is currently parked on an unresolved
+ * top-level `await`, i.e. its status is
+ * [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+ *
+ * This is a pure status query and does not advance evaluation.
+ *
+ * # Safety
+ * `module` must be a non-null pointer returned by [`stator_module_compile`].
+ */
+bool stator_module_evaluation_is_pending(struct StatorModule *module);
+
+/**
+ * Drive a parked top-level-await module forward without changing the
+ * settlement state of its awaited promise. Use this after the embedder
+ * has settled the awaited promise via some external mechanism (e.g. a
+ * chained `then`/`resolve` performed through ordinary script execution),
+ * or simply to allow queued microtasks to drain and re-check the parked
+ * promise.
+ *
+ * Returns:
+ * - a fresh [`StatorValue`] (caller must free with [`stator_value_free`])
+ *   when the module body completes;
+ * - null when the body parks again on another await (module status stays
+ *   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`]) or
+ *   when evaluation fails (in which case the module's `error` is set and
+ *   a pending exception is published on `ctx`).
+ *
+ * # Safety
+ * - `module` must be a non-null pointer returned by
+ *   [`stator_module_compile`] whose status is
+ *   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+ * - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+ */
+struct StatorValue *stator_module_resume_evaluation(struct StatorModule *module,
+                                                    struct StatorContext *ctx);
+
+/**
+ * Fulfil the promise the module body is awaiting with `value` and then
+ * drive evaluation forward.
+ *
+ * `value` may be null, which is treated as `undefined`. The value is
+ * copied into the engine; ownership of `value` is retained by the caller.
+ *
+ * Return value and status transitions mirror
+ * [`stator_module_resume_evaluation`].
+ *
+ * # Safety
+ * - `module` must be a non-null pointer returned by
+ *   [`stator_module_compile`] whose status is
+ *   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+ * - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+ * - `value` may be null or a pointer returned by any `stator_value_*`
+ *   constructor; it remains owned by the caller.
+ */
+struct StatorValue *stator_module_pending_evaluation_fulfill(struct StatorModule *module,
+                                                             struct StatorContext *ctx,
+                                                             struct StatorValue *value);
+
+/**
+ * Reject the promise the module body is awaiting with `reason` and then
+ * drive evaluation forward. The rejection is thrown back into the module
+ * body where a surrounding `try { await … } catch { … }` may observe it;
+ * an uncaught rejection completes evaluation as `Errored`.
+ *
+ * `reason` may be null, which is treated as `undefined`. The value is
+ * copied into the engine; ownership of `reason` is retained by the caller.
+ *
+ * Return value and status transitions mirror
+ * [`stator_module_resume_evaluation`].
+ *
+ * # Safety
+ * - `module` must be a non-null pointer returned by
+ *   [`stator_module_compile`] whose status is
+ *   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+ * - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+ * - `reason` may be null or a pointer returned by any `stator_value_*`
+ *   constructor; it remains owned by the caller.
+ */
+struct StatorValue *stator_module_pending_evaluation_reject(struct StatorModule *module,
+                                                            struct StatorContext *ctx,
+                                                            struct StatorValue *reason);
 
 /**
  * Execute a compiled script in `ctx` and return the result as a

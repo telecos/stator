@@ -11973,8 +11973,9 @@ impl Interpreter {
     /// regular `await`. Unlike [`Self::run_async_function`] — which silently
     /// resumes pending awaits with `undefined` to model async function
     /// fire-and-forget semantics — this driver fails closed when an `await`
-    /// cannot be resolved synchronously, so module evaluation never reports
-    /// a fake successful result while exports remain unset.
+    /// cannot be resolved synchronously after draining the local microtask
+    /// queue, so module evaluation never reports a fake successful result
+    /// while exports remain unset.
     ///
     /// On success returns the body's completion value (typically
     /// `JsValue::Undefined` for module bodies). On a rejected `await` the
@@ -11982,43 +11983,206 @@ impl Interpreter {
     /// throw; if uncaught it becomes a `StatorError`. On a pending `await`
     /// that does not settle after draining the microtask queue, returns
     /// `StatorError::TypeError` describing the missing event-loop primitive.
+    ///
+    /// Embedders that wish to drive a pending await through their own event
+    /// loop (e.g. by settling the awaited promise after host-side I/O) should
+    /// call [`Self::start_module_top_level_async`] directly so they can park
+    /// the resulting [`ModuleTopLevelContinuation`] and later
+    /// [`ModuleTopLevelContinuation::resume`] it.
     pub fn run_module_top_level_async(
         bytecode_array: Rc<BytecodeArray>,
         env: &Rc<RefCell<GlobalEnv>>,
     ) -> StatorResult<JsValue> {
+        match Self::start_module_top_level_async(bytecode_array, env)? {
+            ModuleTopLevelStep::Completed(value) => Ok(value),
+            ModuleTopLevelStep::Pending(_continuation) => Err(StatorError::TypeError(
+                "top-level await on a pending promise: Stator's module evaluation \
+                 does not yet drive an event loop"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Begin driving a module top-level (async) bytecode body.
+    ///
+    /// Returns [`ModuleTopLevelStep::Completed`] if the body finishes after
+    /// draining the local microtask queue (the common case for purely
+    /// microtask-resolvable TLA), or [`ModuleTopLevelStep::Pending`] carrying
+    /// a [`ModuleTopLevelContinuation`] that the embedder can resume after
+    /// driving an external tick (e.g. settling the parked promise via host
+    /// primitives) by calling [`ModuleTopLevelContinuation::resume`].
+    ///
+    /// On a rejected `await` the rejection reason flows back through the
+    /// bytecode as a JavaScript throw; if uncaught it becomes a
+    /// `StatorError`.
+    pub fn start_module_top_level_async(
+        bytecode_array: Rc<BytecodeArray>,
+        env: &Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<ModuleTopLevelStep> {
         use crate::builtins::promise::MicrotaskQueue;
 
         Self::publish_globals(env);
 
         let queue = MicrotaskQueue::new();
         let state = GeneratorState::new(bytecode_array);
-        let mut input = JsValue::Undefined;
+        drive_module_top_level(&state, &queue, JsValue::Undefined, None, env)
+    }
+}
 
-        loop {
-            match Self::run_generator_step(&state, input)? {
-                GeneratorStep::Yield(awaited) => match resolve_promise_like(awaited, &queue) {
-                    AwaitResolution::Fulfilled(value) => input = value,
-                    AwaitResolution::Rejected(reason) => {
-                        state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
-                        input = JsValue::Undefined;
-                    }
-                    AwaitResolution::Pending => {
-                        state.borrow_mut().status = GeneratorStatus::Completed;
-                        return Err(StatorError::TypeError(
-                            "top-level await on a pending promise: Stator's module evaluation \
-                             does not yet drive an event loop"
-                                .into(),
-                        ));
-                    }
-                },
-                GeneratorStep::Return(value) => {
-                    queue.drain();
-                    return Ok(value);
+/// Outcome of starting or resuming a module top-level evaluation.
+pub enum ModuleTopLevelStep {
+    /// The module body completed evaluation with the given completion value.
+    Completed(JsValue),
+    /// The module body is suspended on a top-level `await` whose promise is
+    /// still pending after draining the local microtask queue. Embedders may
+    /// resume the parked body after settling the promise via host
+    /// primitives.
+    Pending(ModuleTopLevelContinuation),
+}
+
+/// Parked state for a module top-level body suspended on an unresolved
+/// top-level `await`.
+///
+/// Holds the generator's suspended bytecode position, the microtask queue
+/// used while driving the body, the JavaScript promise currently being
+/// awaited, and the global environment under which the body was being
+/// evaluated. The continuation is moved into the embedder which can
+/// inspect the awaited promise via [`Self::awaited_promise`], settle it
+/// via the engine's promise primitives, and then call [`Self::resume`] to
+/// continue evaluation.
+pub struct ModuleTopLevelContinuation {
+    state: Rc<RefCell<GeneratorState>>,
+    queue: crate::builtins::promise::MicrotaskQueue,
+    awaited: crate::builtins::promise::JsPromise,
+    env: Rc<RefCell<GlobalEnv>>,
+}
+
+impl ModuleTopLevelContinuation {
+    /// Returns a clone of the JavaScript promise the module body is parked
+    /// on. Cloning is a cheap `Rc` bump; the returned handle shares
+    /// settlement state with the parked promise so any settlement performed
+    /// through Stator's standard promise primitives will be observed when
+    /// [`Self::resume`] re-checks it.
+    pub fn awaited_promise(&self) -> crate::builtins::promise::JsPromise {
+        self.awaited.clone()
+    }
+
+    /// Returns `true` if the parked promise is still pending after draining
+    /// the local microtask queue. The drain is performed so that any
+    /// host-injected settlement that is scheduled as a microtask becomes
+    /// visible without requiring a full [`Self::resume`] call.
+    pub fn is_pending(&self) -> bool {
+        self.queue.drain();
+        self.awaited.is_pending()
+    }
+
+    /// Drive the parked module body forward.
+    ///
+    /// Drains the microtask queue, re-checks the parked promise, and either:
+    /// - returns [`ModuleTopLevelStep::Completed`] when the body completes,
+    /// - returns [`ModuleTopLevelStep::Pending`] with `self` reconstituted
+    ///   (possibly awaiting a different promise) when another suspend point
+    ///   is reached without progress past it, or
+    /// - returns a `StatorError` when the body throws an uncaught engine
+    ///   error.
+    pub fn resume(self) -> StatorResult<ModuleTopLevelStep> {
+        Interpreter::publish_globals(&self.env);
+        let Self {
+            state,
+            queue,
+            awaited,
+            env,
+        } = self;
+        drive_module_top_level(&state, &queue, JsValue::Undefined, Some(awaited), &env)
+    }
+
+    /// Fulfil the parked `await`'s promise with `value` and resume.
+    ///
+    /// Convenience for embedders that own the host-backed promise the
+    /// module body is parked on: this transitions the parked promise to
+    /// `Fulfilled(value)`, drains the microtask queue, and drives the body
+    /// forward. If the parked promise was already settled this is a no-op
+    /// on the promise itself; the body is still resumed using whichever
+    /// value the promise already holds.
+    pub fn fulfill_and_resume(self, value: JsValue) -> StatorResult<ModuleTopLevelStep> {
+        self.awaited.resolve(value, &self.queue);
+        self.resume()
+    }
+
+    /// Reject the parked `await`'s promise with `reason` and resume.
+    ///
+    /// Mirrors [`Self::fulfill_and_resume`] for the rejection path; the
+    /// rejection reason is thrown back into the module body where any
+    /// surrounding `try { await … } catch { … }` may observe it. An
+    /// uncaught rejection completes module evaluation as `Errored`.
+    pub fn reject_and_resume(self, reason: JsValue) -> StatorResult<ModuleTopLevelStep> {
+        self.awaited.reject(reason, &self.queue);
+        self.resume()
+    }
+}
+
+fn drive_module_top_level(
+    state: &Rc<RefCell<GeneratorState>>,
+    queue: &crate::builtins::promise::MicrotaskQueue,
+    initial_input: JsValue,
+    parked: Option<crate::builtins::promise::JsPromise>,
+    env: &Rc<RefCell<GlobalEnv>>,
+) -> StatorResult<ModuleTopLevelStep> {
+    let mut input = initial_input;
+    let mut pending: Option<crate::builtins::promise::JsPromise> = parked;
+
+    loop {
+        // If we have a parked promise (resuming a previously suspended
+        // module), check whether it has settled before stepping the
+        // generator. Draining the queue first gives host- or
+        // microtask-injected settlements a chance to take effect.
+        if let Some(promise) = pending.take() {
+            queue.drain();
+            if let Some(value) = promise.value() {
+                input = value;
+            } else if let Some(reason) = promise.reason() {
+                state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
+                input = JsValue::Undefined;
+            } else {
+                return Ok(ModuleTopLevelStep::Pending(ModuleTopLevelContinuation {
+                    state: Rc::clone(state),
+                    queue: queue.clone(),
+                    awaited: promise,
+                    env: Rc::clone(env),
+                }));
+            }
+        }
+
+        match Interpreter::run_generator_step(state, input)? {
+            GeneratorStep::Yield(awaited) => match resolve_promise_like(awaited.clone(), queue) {
+                AwaitResolution::Fulfilled(value) => input = value,
+                AwaitResolution::Rejected(reason) => {
+                    state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
+                    input = JsValue::Undefined;
                 }
+                AwaitResolution::Pending => {
+                    // The yielded value is the promise the body is now
+                    // parked on. `promise_resolve` returns the same handle
+                    // when given an actual `JsValue::Promise`, so the
+                    // continuation tracks the body-visible promise.
+                    let parked = crate::builtins::promise::promise_resolve(awaited, queue);
+                    return Ok(ModuleTopLevelStep::Pending(ModuleTopLevelContinuation {
+                        state: Rc::clone(state),
+                        queue: queue.clone(),
+                        awaited: parked,
+                        env: Rc::clone(env),
+                    }));
+                }
+            },
+            GeneratorStep::Return(value) => {
+                queue.drain();
+                return Ok(ModuleTopLevelStep::Completed(value));
             }
         }
     }
+}
 
+impl Interpreter {
     /// Convert a [`StatorError`] that represents a JavaScript exception into a
     /// [`JsValue`] suitable as a promise rejection reason.
     ///

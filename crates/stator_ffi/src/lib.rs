@@ -2518,6 +2518,19 @@ pub struct StatorModule {
     /// reads of the re-exported binding observe live mutations of the
     /// original cell rather than a value snapshot at link/evaluate time.
     indirect_reexports: Vec<IndirectReExport>,
+    /// Parked top-level await continuation, set when [`stator_module_evaluate`]
+    /// reaches an `await` whose promise is still pending after draining the
+    /// local microtask queue. Embedders inspect this through
+    /// [`stator_module_get_status`] (which reports
+    /// [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`]) and
+    /// drive evaluation forward through
+    /// [`stator_module_resume_evaluation`] (after settling the parked
+    /// promise via host primitives) or
+    /// [`stator_module_pending_evaluation_fulfill`] /
+    /// [`stator_module_pending_evaluation_reject`] (to settle and resume in
+    /// one step). The continuation is dropped on completion, rejection,
+    /// or [`stator_module_free`].
+    pending_eval: Option<stator_jse::interpreter::ModuleTopLevelContinuation>,
 }
 
 /// A single `export { local as exported } from "src"` indirect re-export.
@@ -2920,6 +2933,16 @@ pub enum StatorModuleStatus {
     StatorModuleStatusEvaluating = 3,
     /// The module completed evaluation successfully.
     StatorModuleStatusEvaluated = 4,
+    /// The module body is suspended on a top-level `await` whose awaited
+    /// promise has not yet settled after draining the local microtask
+    /// queue. Exports are intentionally *not* published in this state; the
+    /// embedder must drive evaluation forward by calling
+    /// [`stator_module_resume_evaluation`] (after settling the awaited
+    /// promise via host primitives or
+    /// [`stator_module_pending_evaluation_fulfill`] /
+    /// [`stator_module_pending_evaluation_reject`]) before the module's
+    /// bindings become observable.
+    StatorModuleStatusPendingAsyncEvaluation = 5,
 }
 
 fn program_has_module_dependencies(program: &Program) -> bool {
@@ -3183,6 +3206,7 @@ fn module_error_record(
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
         indirect_reexports: Vec::new(),
+        pending_eval: None,
     })
 }
 
@@ -3251,6 +3275,7 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
                 indirect_reexports: Vec::new(),
+                pending_eval: None,
             })
         }
         Err(error) => module_error_record(
@@ -3325,6 +3350,7 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
                 indirect_reexports: Vec::new(),
+                pending_eval: None,
             })
         }
         Err(error) => module_error_record(
@@ -4437,6 +4463,7 @@ fn module_from_js_cache_payload(
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
         indirect_reexports,
+        pending_eval: None,
     }))
 }
 
@@ -4473,6 +4500,7 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
         indirect_reexports: Vec::new(),
+        pending_eval: None,
     }))
 }
 
@@ -4725,6 +4753,7 @@ unsafe fn compile_module_source(
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             namespace: None,
             indirect_reexports: Vec::new(),
+            pending_eval: None,
         });
         return Box::into_raw(module);
     }
@@ -4763,6 +4792,7 @@ unsafe fn compile_module_source(
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
                 indirect_reexports: Vec::new(),
+                pending_eval: None,
             });
             return Box::into_raw(module);
         }
@@ -4806,6 +4836,7 @@ unsafe fn compile_module_source(
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             namespace: None,
             indirect_reexports: Vec::new(),
+            pending_eval: None,
         });
         return Box::into_raw(module);
     }
@@ -4852,6 +4883,7 @@ unsafe fn compile_module_source(
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
                 indirect_reexports,
+                pending_eval: None,
             })
         }
         Err(e) => {
@@ -4882,6 +4914,7 @@ unsafe fn compile_module_source(
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
                 indirect_reexports: Vec::new(),
+                pending_eval: None,
             })
         }
     };
@@ -6332,7 +6365,8 @@ unsafe fn instantiate_module_graph(
             return Err(module_stored_error(module_ref));
         }
         StatorModuleStatus::StatorModuleStatusEvaluating
-        | StatorModuleStatus::StatorModuleStatusLinking => return Ok(()),
+        | StatorModuleStatus::StatorModuleStatusLinking
+        | StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation => return Ok(()),
         StatorModuleStatus::StatorModuleStatusUnlinked => {}
     }
 
@@ -7266,12 +7300,26 @@ fn wrap_js_function_for_wasm_import(
     Ok(callback)
 }
 
+/// Outcome of running (or starting) a module body during evaluation.
+///
+/// `Completed` carries the body's normal completion value; `PendingTla`
+/// signals that a top-level `await` is parked on an unresolved promise.
+/// When `PendingTla` is returned the continuation has already been stored
+/// on the module via [`StatorModule::pending_eval`] and the module's
+/// status has been set to
+/// [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+#[derive(Debug)]
+enum ModuleBodyOutcome {
+    Completed(JsValue),
+    PendingTla,
+}
+
 unsafe fn run_module_bytecodes(
     ctx: *mut StatorContext,
     module: *mut StatorModule,
     bytecodes: Rc<BytecodeArray>,
     global_env: &Rc<RefCell<GlobalEnv>>,
-) -> stator_jse::error::StatorResult<JsValue> {
+) -> stator_jse::error::StatorResult<ModuleBodyOutcome> {
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };
@@ -7305,10 +7353,12 @@ unsafe fn run_module_bytecodes(
     let _host_scope = stator_jse::host::HostScope::install(host_loader, Some(&module_url));
 
     let module_is_async = bytecodes.is_async();
-    let result = if module_is_async {
-        // Top-level await: drive the module body with the TLA-aware driver
-        // so a pending await fails closed instead of silently resuming
-        // with `undefined` (which would publish bogus exports).
+    if module_is_async {
+        // Top-level await: drive the module body with the TLA-aware
+        // step-wise driver. A pending await is parked on the module so
+        // the embedder can resume it after settling the awaited promise,
+        // instead of being silently resumed with `undefined` (which
+        // would publish bogus exports) or fail-closed.
         if !global_env.borrow().globals_installed {
             // Ensure builtins are installed exactly as `run_fast` would.
             let _frame = InterpreterFrame::new_with_globals(
@@ -7317,18 +7367,35 @@ unsafe fn run_module_bytecodes(
                 Rc::clone(global_env),
             );
         }
-        Interpreter::run_module_top_level_async(Rc::clone(&bytecodes), global_env)
-    } else if global_env.borrow().globals_installed {
-        Interpreter::run_fast(&bytecodes, &[], global_env)
+        let step = Interpreter::start_module_top_level_async(Rc::clone(&bytecodes), global_env)?;
+        match step {
+            stator_jse::interpreter::ModuleTopLevelStep::Completed(value) => {
+                let completion = module_evaluation_completion(value)?;
+                Ok(ModuleBodyOutcome::Completed(completion))
+            }
+            stator_jse::interpreter::ModuleTopLevelStep::Pending(continuation) => {
+                // SAFETY: caller guarantees `module` is valid for this call.
+                let module_ref = unsafe { &mut *module };
+                module_ref.pending_eval = Some(continuation);
+                module_ref.status = StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation;
+                module_ref.last_result = None;
+                Ok(ModuleBodyOutcome::PendingTla)
+            }
+        }
     } else {
-        let mut frame = InterpreterFrame::new_with_globals(
-            Rc::clone(&bytecodes),
-            vec![],
-            Rc::clone(global_env),
-        );
-        Interpreter::run(&mut frame)
-    };
-    result.and_then(module_evaluation_completion)
+        let result = if global_env.borrow().globals_installed {
+            Interpreter::run_fast(&bytecodes, &[], global_env)
+        } else {
+            let mut frame = InterpreterFrame::new_with_globals(
+                Rc::clone(&bytecodes),
+                vec![],
+                Rc::clone(global_env),
+            );
+            Interpreter::run(&mut frame)
+        };
+        let completion = module_evaluation_completion(result?)?;
+        Ok(ModuleBodyOutcome::Completed(completion))
+    }
 }
 
 unsafe fn evaluate_module_graph(
@@ -7336,7 +7403,7 @@ unsafe fn evaluate_module_graph(
     module: *mut StatorModule,
     global_env: &Rc<RefCell<GlobalEnv>>,
     active: &mut HashSet<*mut StatorModule>,
-) -> stator_jse::error::StatorResult<JsValue> {
+) -> stator_jse::error::StatorResult<ModuleBodyOutcome> {
     if module.is_null() {
         return Err(stator_jse::error::StatorError::Internal(
             "null module in evaluation graph".to_string(),
@@ -7348,7 +7415,9 @@ unsafe fn evaluate_module_graph(
     match status {
         StatorModuleStatus::StatorModuleStatusEvaluated => {
             // SAFETY: `module` is valid and evaluated.
-            return Ok(unsafe { (*module).last_result.clone() }.unwrap_or(JsValue::Undefined));
+            return Ok(ModuleBodyOutcome::Completed(
+                unsafe { (*module).last_result.clone() }.unwrap_or(JsValue::Undefined),
+            ));
         }
         StatorModuleStatus::StatorModuleStatusErrored => {
             return Err(stator_jse::error::StatorError::Internal(
@@ -7363,6 +7432,19 @@ unsafe fn evaluate_module_graph(
         StatorModuleStatus::StatorModuleStatusLinking => {
             return Err(stator_jse::error::StatorError::Internal(
                 "module is already linking".to_string(),
+            ));
+        }
+        StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation => {
+            // The root caller re-enters with a parked module by calling
+            // `stator_module_resume_evaluation` directly; reaching this
+            // arm from a graph walk means a dependency is suspended on a
+            // pending top-level await. Cross-module async TLA scheduling
+            // is not yet implemented, so fail closed rather than expose
+            // partial exports.
+            return Err(stator_jse::error::StatorError::TypeError(
+                "module dependency is still suspended on a pending top-level await; \
+                 cross-module async evaluation scheduling is not yet implemented"
+                    .to_string(),
             ));
         }
         StatorModuleStatus::StatorModuleStatusUnlinked
@@ -7389,7 +7471,7 @@ unsafe fn evaluate_module_graph(
         module_ref.last_result = Some(json_default.clone());
         module_ref.error = None;
         module_ref.error_kind = StatorMessageKind::StatorMessageKindUnknown;
-        return Ok(json_default);
+        return Ok(ModuleBodyOutcome::Completed(json_default));
     }
 
     // SAFETY: `module` is valid and uniquely driven by this evaluation call.
@@ -7421,7 +7503,14 @@ unsafe fn evaluate_module_graph(
                     ));
                 }
                 // SAFETY: dependency pointers are supplied by successful graph instantiation.
-                unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+                let dep_outcome = unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+                if matches!(dep_outcome, ModuleBodyOutcome::PendingTla) {
+                    return Err(stator_jse::error::StatorError::TypeError(
+                        "module dependency is still suspended on a pending top-level await; \
+                         cross-module async evaluation scheduling is not yet implemented"
+                            .to_string(),
+                    ));
+                }
                 // SAFETY: request index is in bounds and module is valid.
                 let request = unsafe { &(&(*module).module_requests)[request_idx] };
                 publish_module_namespace(request, global_env);
@@ -7440,7 +7529,7 @@ unsafe fn evaluate_module_graph(
                 module_ref.last_result = Some(result.clone());
                 module_ref.error = None;
                 module_ref.error_kind = StatorMessageKind::StatorMessageKindUnknown;
-                return Ok(result);
+                return Ok(ModuleBodyOutcome::Completed(result));
             }
             Err(error) => {
                 // SAFETY: `module` is valid and uniquely driven by this evaluation call.
@@ -7490,7 +7579,14 @@ unsafe fn evaluate_module_graph(
                 ));
             }
             // SAFETY: dependency pointers are supplied by successful graph instantiation.
-            unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+            let dep_outcome = unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+            if matches!(dep_outcome, ModuleBodyOutcome::PendingTla) {
+                return Err(stator_jse::error::StatorError::TypeError(
+                    "module dependency is still suspended on a pending top-level await; \
+                     cross-module async evaluation scheduling is not yet implemented"
+                        .to_string(),
+                ));
+            }
             // SAFETY: request index is in bounds and module is valid.
             let request = unsafe { &(&(*module).module_requests)[request_idx] };
             sync_module_request_bindings(request, global_env)?;
@@ -7508,14 +7604,20 @@ unsafe fn evaluate_module_graph(
 
     active.remove(&module);
     match result {
-        Ok(result) => {
+        Ok(ModuleBodyOutcome::Completed(value)) => {
             // SAFETY: `module` is valid and uniquely driven by this evaluation call.
             let module_ref = unsafe { &mut *module };
             module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluated;
-            module_ref.last_result = Some(result.clone());
+            module_ref.last_result = Some(value.clone());
             module_ref.error = None;
             module_ref.error_kind = StatorMessageKind::StatorMessageKindUnknown;
-            Ok(result)
+            Ok(ModuleBodyOutcome::Completed(value))
+        }
+        Ok(ModuleBodyOutcome::PendingTla) => {
+            // `run_module_bytecodes` has already stashed the continuation
+            // on the module and transitioned status to
+            // `PendingAsyncEvaluation`. Just propagate the marker.
+            Ok(ModuleBodyOutcome::PendingTla)
         }
         Err(error) => {
             // SAFETY: `module` is valid and uniquely driven by this evaluation call.
@@ -7573,6 +7675,16 @@ pub unsafe extern "C" fn stator_module_evaluate(
             unsafe { set_module_error(module_ref, ctx, &error) };
             return std::ptr::null_mut();
         }
+        StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation => {
+            // The module is suspended on a top-level await. The embedder
+            // must drive evaluation forward by calling
+            // `stator_module_pending_evaluation_fulfill` /
+            // `_reject` (to settle the awaited promise) and then
+            // `stator_module_resume_evaluation`. Re-entering this
+            // function is a no-op that returns null without recording an
+            // error so the embedder can poll status.
+            return std::ptr::null_mut();
+        }
         StatorModuleStatus::StatorModuleStatusUnlinked
         | StatorModuleStatus::StatorModuleStatusLinked => {}
     }
@@ -7599,13 +7711,27 @@ pub unsafe extern "C" fn stator_module_evaluate(
 
     let mut active = HashSet::new();
     match unsafe { evaluate_module_graph(ctx, module, global_env, &mut active) } {
-        Ok(result) => {
+        Ok(ModuleBodyOutcome::Completed(result)) => {
             if !ctx.is_null() {
                 // SAFETY: `ctx` is valid and owns a stable isolate pointer.
                 unsafe { discard_pending_exception((*ctx)._isolate) };
             }
             // SAFETY: `ctx` is valid when non-null and `result` is live.
             unsafe { module_result_to_value(ctx, &result) }
+        }
+        Ok(ModuleBodyOutcome::PendingTla) => {
+            // The root module parked on a top-level await. The
+            // continuation, awaited promise and microtask queue live on
+            // `module.pending_eval`; status is
+            // `StatorModuleStatusPendingAsyncEvaluation`. The embedder
+            // drives evaluation forward via the
+            // `stator_module_pending_evaluation_*` API. Return null with
+            // no error recorded.
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is valid and owns a stable isolate pointer.
+                unsafe { discard_pending_exception((*ctx)._isolate) };
+            }
+            std::ptr::null_mut()
         }
         Err(error) => {
             // SAFETY: caller guarantees `module` is valid.
@@ -7629,6 +7755,245 @@ pub unsafe extern "C" fn stator_module_free(module: *mut StatorModule) {
         // `stator_module_compile`.
         drop(unsafe { Box::from_raw(module) });
     }
+}
+
+/// Returns `true` if `module` is currently parked on an unresolved
+/// top-level `await`, i.e. its status is
+/// [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+///
+/// This is a pure status query and does not advance evaluation.
+///
+/// # Safety
+/// `module` must be a non-null pointer returned by [`stator_module_compile`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_evaluation_is_pending(module: *mut StatorModule) -> bool {
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    matches!(
+        unsafe { (*module).status },
+        StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+    )
+}
+
+/// Apply `op` to the continuation parked on `module` and convert the
+/// returned [`ModuleTopLevelStep`] back into FFI module state.
+///
+/// On success returns a fresh [`StatorValue`] (caller must free it) when
+/// the body completed, or null when the body parked again (status remains
+/// `PendingAsyncEvaluation`) or when an error was recorded. On error this
+/// also sets `module.error` and a pending exception on `ctx`.
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by [`stator_module_compile`]
+///   with status `PendingAsyncEvaluation` and a stored continuation.
+/// - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+unsafe fn drive_parked_module<F>(
+    module: *mut StatorModule,
+    ctx: *mut StatorContext,
+    op: F,
+) -> *mut StatorValue
+where
+    F: FnOnce(
+        stator_jse::interpreter::ModuleTopLevelContinuation,
+    ) -> stator_jse::error::StatorResult<stator_jse::interpreter::ModuleTopLevelStep>,
+{
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: caller guarantees `module` is valid.
+    let status = unsafe { (*module).status };
+    if !matches!(
+        status,
+        StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+    ) {
+        let error = stator_jse::error::StatorError::Internal(
+            "module is not parked on a pending top-level await".to_string(),
+        );
+        // SAFETY: caller guarantees `module` is valid.
+        let module_ref = unsafe { &mut *module };
+        // SAFETY: `module_ref` and `ctx` are valid for this call.
+        unsafe { set_module_error(module_ref, ctx, &error) };
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: caller guarantees `module` is valid.
+    let module_ref = unsafe { &mut *module };
+    let continuation = match module_ref.pending_eval.take() {
+        Some(cont) => cont,
+        None => {
+            let error = stator_jse::error::StatorError::Internal(
+                "module is in PendingAsyncEvaluation state but has no parked continuation"
+                    .to_string(),
+            );
+            // SAFETY: `module_ref` and `ctx` are valid for this call.
+            unsafe { set_module_error(module_ref, ctx, &error) };
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Re-install the same HostScope that `run_module_bytecodes` set up so
+    // that any dynamic import or `import.meta.url` evaluated inside the
+    // resumed body keeps observing the right loader and referrer URL.
+    let module_url = module_ref
+        .resource_name
+        .as_ref()
+        .map(|cs| cs.to_string_lossy().into_owned())
+        .unwrap_or_else(|| module_runtime_key(module));
+    let host_loader = if ctx.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `ctx` is valid when non-null.
+        let has_resolver = unsafe { (*ctx).module_resolver.is_some() };
+        has_resolver.then(|| {
+            Rc::new(FfiHostModuleLoader {
+                ctx,
+                referrer: module,
+            }) as Rc<dyn HostModuleLoader>
+        })
+    };
+    let _host_scope = stator_jse::host::HostScope::install(host_loader, Some(&module_url));
+    let _interrupt_scope = InterruptFlagScope::new(ctx);
+
+    match op(continuation).and_then(|step| match step {
+        stator_jse::interpreter::ModuleTopLevelStep::Completed(value) => {
+            module_evaluation_completion(value).map(ModuleBodyOutcome::Completed)
+        }
+        stator_jse::interpreter::ModuleTopLevelStep::Pending(cont) => {
+            // SAFETY: `module` is still valid for this call.
+            let module_ref = unsafe { &mut *module };
+            module_ref.pending_eval = Some(cont);
+            module_ref.status = StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation;
+            module_ref.last_result = None;
+            Ok(ModuleBodyOutcome::PendingTla)
+        }
+    }) {
+        Ok(ModuleBodyOutcome::Completed(value)) => {
+            // SAFETY: caller guarantees `module` is valid.
+            let module_ref = unsafe { &mut *module };
+            module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluated;
+            module_ref.last_result = Some(value.clone());
+            module_ref.error = None;
+            module_ref.error_kind = StatorMessageKind::StatorMessageKindUnknown;
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is valid and owns a stable isolate pointer.
+                unsafe { discard_pending_exception((*ctx)._isolate) };
+            }
+            // SAFETY: `ctx` is valid when non-null and `value` is live.
+            unsafe { module_result_to_value(ctx, &value) }
+        }
+        Ok(ModuleBodyOutcome::PendingTla) => {
+            if !ctx.is_null() {
+                // SAFETY: `ctx` is valid and owns a stable isolate pointer.
+                unsafe { discard_pending_exception((*ctx)._isolate) };
+            }
+            std::ptr::null_mut()
+        }
+        Err(error) => {
+            // SAFETY: caller guarantees `module` is valid.
+            let module_ref = unsafe { &mut *module };
+            // SAFETY: `module_ref` and `ctx` are valid for this call.
+            unsafe { set_module_error(module_ref, ctx, &error) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Drive a parked top-level-await module forward without changing the
+/// settlement state of its awaited promise. Use this after the embedder
+/// has settled the awaited promise via some external mechanism (e.g. a
+/// chained `then`/`resolve` performed through ordinary script execution),
+/// or simply to allow queued microtasks to drain and re-check the parked
+/// promise.
+///
+/// Returns:
+/// - a fresh [`StatorValue`] (caller must free with [`stator_value_free`])
+///   when the module body completes;
+/// - null when the body parks again on another await (module status stays
+///   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`]) or
+///   when evaluation fails (in which case the module's `error` is set and
+///   a pending exception is published on `ctx`).
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by
+///   [`stator_module_compile`] whose status is
+///   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+/// - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_resume_evaluation(
+    module: *mut StatorModule,
+    ctx: *mut StatorContext,
+) -> *mut StatorValue {
+    // SAFETY: forwarded contracts from the public function above.
+    unsafe { drive_parked_module(module, ctx, |cont| cont.resume()) }
+}
+
+/// Fulfil the promise the module body is awaiting with `value` and then
+/// drive evaluation forward.
+///
+/// `value` may be null, which is treated as `undefined`. The value is
+/// copied into the engine; ownership of `value` is retained by the caller.
+///
+/// Return value and status transitions mirror
+/// [`stator_module_resume_evaluation`].
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by
+///   [`stator_module_compile`] whose status is
+///   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+/// - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+/// - `value` may be null or a pointer returned by any `stator_value_*`
+///   constructor; it remains owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_pending_evaluation_fulfill(
+    module: *mut StatorModule,
+    ctx: *mut StatorContext,
+    value: *mut StatorValue,
+) -> *mut StatorValue {
+    let js_value = if value.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `value` is a valid `StatorValue`.
+        stator_value_inner_to_jsvalue(unsafe { &(*value).inner })
+    };
+    // SAFETY: forwarded contracts from the public function above.
+    unsafe { drive_parked_module(module, ctx, move |cont| cont.fulfill_and_resume(js_value)) }
+}
+
+/// Reject the promise the module body is awaiting with `reason` and then
+/// drive evaluation forward. The rejection is thrown back into the module
+/// body where a surrounding `try { await … } catch { … }` may observe it;
+/// an uncaught rejection completes evaluation as `Errored`.
+///
+/// `reason` may be null, which is treated as `undefined`. The value is
+/// copied into the engine; ownership of `reason` is retained by the caller.
+///
+/// Return value and status transitions mirror
+/// [`stator_module_resume_evaluation`].
+///
+/// # Safety
+/// - `module` must be a non-null pointer returned by
+///   [`stator_module_compile`] whose status is
+///   [`StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation`].
+/// - `ctx` may be null; when non-null it must be a live [`StatorContext`].
+/// - `reason` may be null or a pointer returned by any `stator_value_*`
+///   constructor; it remains owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_pending_evaluation_reject(
+    module: *mut StatorModule,
+    ctx: *mut StatorContext,
+    reason: *mut StatorValue,
+) -> *mut StatorValue {
+    let js_reason = if reason.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `reason` is a valid `StatorValue`.
+        stator_value_inner_to_jsvalue(unsafe { &(*reason).inner })
+    };
+    // SAFETY: forwarded contracts from the public function above.
+    unsafe { drive_parked_module(module, ctx, move |cont| cont.reject_and_resume(js_reason)) }
 }
 
 // ── Script execution (Phase 3) ────────────────────────────────────────────────
@@ -15401,10 +15766,11 @@ mod tests {
     }
 
     #[test]
-    fn test_module_evaluate_top_level_await_pending_fails_closed() {
-        // A never-settling await must not pretend success: the FFI fails
-        // closed with a clear classification rather than silently observing
-        // `undefined` for the bound name.
+    fn test_module_evaluate_top_level_await_pending_parks_module() {
+        // A never-settling await must NOT pretend success: instead of
+        // publishing bogus `undefined` exports the module is parked in
+        // `PendingAsyncEvaluation` state so the embedder can decide what
+        // to do (resume later, abandon the module by freeing it, etc.).
         let module = compile_module_src("const x = await new Promise(() => {}); export { x };");
         assert!(!module.is_null());
         // SAFETY: `module` is non-null and live.
@@ -15412,19 +15778,155 @@ mod tests {
             let result = stator_module_evaluate(module, std::ptr::null_mut());
             assert!(
                 result.is_null(),
-                "pending TLA must fail closed instead of silently succeeding"
+                "pending TLA must not publish a result before completion"
             );
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+            );
+            assert!(stator_module_evaluation_is_pending(module));
+            assert!(
+                stator_module_get_error(module).is_null(),
+                "parked TLA must not be in an errored state"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_pending_evaluation_fulfill_completes_and_publishes_exports() {
+        // The embedder fulfils the awaited promise and drives evaluation
+        // forward; the module reaches `Evaluated` and exports become
+        // observable to subsequent imports.
+        let iso = IsolateGuard::new();
+        let module =
+            compile_module_src("const value = await new Promise(() => {}); export { value };");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let first = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(first.is_null());
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+            );
+
+            let provided = stator_value_new_number(iso.as_ptr(), 123.0);
+            let result =
+                stator_module_pending_evaluation_fulfill(module, std::ptr::null_mut(), provided);
+            assert!(!result.is_null(), "fulfilled TLA must complete evaluation");
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+            assert!(!stator_module_evaluation_is_pending(module));
+            stator_value_destroy(provided);
+            stator_value_destroy(result);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_pending_evaluation_reject_marks_module_errored() {
+        // A reject of the awaited promise that the body does not catch
+        // must abort evaluation cleanly: status becomes `Errored` and the
+        // error string is populated.
+        let iso = IsolateGuard::new();
+        let module = compile_module_src("await new Promise(() => {}); export const x = 1;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let first = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(first.is_null());
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+            );
+
+            let reason_bytes = b"nope\0";
+            let reason =
+                stator_value_new_string(iso.as_ptr(), reason_bytes.as_ptr() as *const c_char, 4);
+            let result =
+                stator_module_pending_evaluation_reject(module, std::ptr::null_mut(), reason);
+            assert!(result.is_null());
             assert_eq!(
                 stator_module_get_status(module),
                 StatorModuleStatus::StatorModuleStatusErrored
             );
-            let err = CStr::from_ptr(stator_module_get_error(module))
-                .to_string_lossy()
-                .into_owned();
-            assert!(
-                err.contains("top-level await"),
-                "error message should mention top-level await; got: {err}"
+            assert!(!stator_module_get_error(module).is_null());
+            stator_value_destroy(reason);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_pending_evaluation_resume_without_settlement_stays_pending() {
+        // Calling `resume` on a still-pending promise without fulfilling
+        // it must keep the module parked, not silently complete it.
+        let module = compile_module_src("await new Promise(() => {}); export const x = 1;");
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let first = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(first.is_null());
+
+            let result = stator_module_resume_evaluation(module, std::ptr::null_mut());
+            assert!(result.is_null(), "still-pending TLA must not complete");
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
             );
+            assert!(stator_module_evaluation_is_pending(module));
+            assert!(stator_module_get_error(module).is_null());
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_pending_evaluation_chained_awaits_park_each_step() {
+        // Two sequential awaits must each park independently: fulfilling
+        // the first promise re-parks on the second; fulfilling the second
+        // completes evaluation.
+        let iso = IsolateGuard::new();
+        let module = compile_module_src(
+            "const a = await new Promise(() => {}); \
+             const b = await new Promise(() => {}); \
+             export const sum = a + b;",
+        );
+        assert!(!module.is_null());
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            let first = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(first.is_null());
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+            );
+
+            let v_a = stator_value_new_number(iso.as_ptr(), 2.0);
+            let after_first =
+                stator_module_pending_evaluation_fulfill(module, std::ptr::null_mut(), v_a);
+            assert!(
+                after_first.is_null(),
+                "should re-park on the second await rather than complete"
+            );
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusPendingAsyncEvaluation
+            );
+
+            let v_b = stator_value_new_number(iso.as_ptr(), 3.0);
+            let final_result =
+                stator_module_pending_evaluation_fulfill(module, std::ptr::null_mut(), v_b);
+            assert!(!final_result.is_null());
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusEvaluated
+            );
+
+            stator_value_destroy(v_a);
+            stator_value_destroy(v_b);
+            stator_value_destroy(final_result);
             stator_module_free(module);
         }
     }

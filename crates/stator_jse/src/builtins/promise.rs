@@ -429,7 +429,7 @@ impl JsPromise {
     /// Transitions state from `Pending` to `Fulfilled(value)` and schedules
     /// all pending fulfillment reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
-    fn resolve(&self, value: JsValue, queue: &MicrotaskQueue) {
+    pub(crate) fn resolve(&self, value: JsValue, queue: &MicrotaskQueue) {
         if let JsValue::Promise(other) = &value {
             if Rc::ptr_eq(&self.0, &other.0) {
                 self.reject(
@@ -530,7 +530,7 @@ impl JsPromise {
     /// Transitions state from `Pending` to `Rejected(reason)` and schedules
     /// all pending rejection reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
-    fn reject(&self, reason: JsValue, queue: &MicrotaskQueue) {
+    pub(crate) fn reject(&self, reason: JsValue, queue: &MicrotaskQueue) {
         let (promise_id, should_report_unhandled, reactions) = {
             let mut inner = self.0.borrow_mut();
             if !matches!(inner.state, PromiseStateInner::Pending { .. }) {
