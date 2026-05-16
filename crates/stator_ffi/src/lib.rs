@@ -3329,15 +3329,28 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
 ///
 /// Version 2 added the trailing payload (module requests, direct exports, and
-/// serialized bytecode) so that cache hits can skip parsing and bytecode
-/// generation.
-const MODULE_CACHE_FORMAT_VERSION: u32 = 2;
+/// serialized bytecode) so that JavaScript cache hits can skip parsing and
+/// bytecode generation. Version 3 added a parallel JSON-module payload variant
+/// (the parsed default-export value, restricted to the JSON-compatible JsValue
+/// subset) so JSON cache hits can skip JSON re-parsing.
+const MODULE_CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
 const REQUESTED_EXPORT_TAG_NAMED: u8 = 1;
 const REQUESTED_EXPORT_TAG_NAMESPACE: u8 = 2;
 const REQUESTED_EXPORT_TAG_STAR: u8 = 3;
+
+/// Tag bytes for the narrow JSON-compatible JsValue subset stored in a JSON
+/// module cache payload. These tags are persisted on disk; do not reorder.
+const JSON_VALUE_TAG_NULL: u8 = 0;
+const JSON_VALUE_TAG_FALSE: u8 = 1;
+const JSON_VALUE_TAG_TRUE: u8 = 2;
+const JSON_VALUE_TAG_SMI: u8 = 3;
+const JSON_VALUE_TAG_DOUBLE: u8 = 4;
+const JSON_VALUE_TAG_STRING: u8 = 5;
+const JSON_VALUE_TAG_ARRAY: u8 = 6;
+const JSON_VALUE_TAG_OBJECT: u8 = 7;
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -3436,12 +3449,27 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
 
 /// Serialized module structure that lets [`stator_module_compile_cached`] skip
 /// parsing and bytecode generation on a cache hit. Stored in the cache blob
-/// after the validation record.
-struct ModuleCachePayload {
+/// after the validation record. The layout depends on the module's source
+/// type: JavaScript modules carry compiled bytecode and import/export shape,
+/// JSON modules carry the parsed default-export value.
+enum ModuleCachePayload {
+    /// JavaScript module payload: compiled bytecode and static module shape.
+    JavaScript(JsModulePayload),
+    /// JSON module payload: serialized default-export value.
+    Json(JsonModulePayload),
+}
+
+struct JsModulePayload {
     has_dependencies: bool,
     module_requests: Vec<SerializedModuleRequest>,
     direct_exports: Vec<Vec<u8>>,
     bytecode: Vec<u8>,
+}
+
+struct JsonModulePayload {
+    /// Tagged binary encoding of the parsed JSON value (null/bool/number/
+    /// string/array/object). Restored without re-running the JSON parser.
+    value: Vec<u8>,
 }
 
 struct SerializedModuleRequest {
@@ -3451,6 +3479,13 @@ struct SerializedModuleRequest {
 }
 
 fn serialize_module_cache_payload(payload: &ModuleCachePayload, out: &mut Vec<u8>) -> bool {
+    match payload {
+        ModuleCachePayload::JavaScript(js) => serialize_js_module_payload(js, out),
+        ModuleCachePayload::Json(json) => push_bytes(out, &json.value),
+    }
+}
+
+fn serialize_js_module_payload(payload: &JsModulePayload, out: &mut Vec<u8>) -> bool {
     push_u8(out, u8::from(payload.has_dependencies));
 
     let Ok(req_count) = u32::try_from(payload.module_requests.len()) else {
@@ -3505,7 +3540,25 @@ fn serialize_module_cache_payload(payload: &ModuleCachePayload, out: &mut Vec<u8
     true
 }
 
-fn parse_module_cache_payload(reader: &mut CacheReader<'_>) -> Option<ModuleCachePayload> {
+fn parse_module_cache_payload(
+    reader: &mut CacheReader<'_>,
+    source_type: StatorModuleType,
+) -> Option<ModuleCachePayload> {
+    match source_type {
+        StatorModuleType::StatorModuleTypeJavaScript => {
+            parse_js_module_payload(reader).map(ModuleCachePayload::JavaScript)
+        }
+        StatorModuleType::StatorModuleTypeJson => {
+            let value = reader.read_bytes()?;
+            Some(ModuleCachePayload::Json(JsonModulePayload { value }))
+        }
+        // WebAssembly and CSS module bodies are not executable yet, so they
+        // never reach the cache reader; reject defensively.
+        _ => None,
+    }
+}
+
+fn parse_js_module_payload(reader: &mut CacheReader<'_>) -> Option<JsModulePayload> {
     let has_dependencies = reader.read_u8()? != 0;
 
     let req_count = reader.read_u32()? as usize;
@@ -3550,12 +3603,147 @@ fn parse_module_cache_payload(reader: &mut CacheReader<'_>) -> Option<ModuleCach
 
     let bytecode = reader.read_bytes()?;
 
-    Some(ModuleCachePayload {
+    Some(JsModulePayload {
         has_dependencies,
         module_requests,
         direct_exports,
         bytecode,
     })
+}
+
+/// Serialize the JSON-compatible subset of [`JsValue`] used by JSON modules.
+///
+/// Returns `false` when `value` contains a variant that is not produced by the
+/// JSON parser (functions, generators, native objects, BigInt, Symbol, etc.),
+/// in which case the caller refuses to produce a cache blob and a fresh parse
+/// is required. Recursion depth is bounded to avoid stack blowups on
+/// pathological cache producers.
+fn serialize_json_value(value: &JsValue, out: &mut Vec<u8>, depth: u32) -> bool {
+    if depth > 256 {
+        return false;
+    }
+    match value {
+        JsValue::Null => {
+            push_u8(out, JSON_VALUE_TAG_NULL);
+            true
+        }
+        JsValue::Boolean(false) => {
+            push_u8(out, JSON_VALUE_TAG_FALSE);
+            true
+        }
+        JsValue::Boolean(true) => {
+            push_u8(out, JSON_VALUE_TAG_TRUE);
+            true
+        }
+        JsValue::Smi(value) => {
+            push_u8(out, JSON_VALUE_TAG_SMI);
+            push_i32(out, *value);
+            true
+        }
+        JsValue::HeapNumber(value) => {
+            push_u8(out, JSON_VALUE_TAG_DOUBLE);
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+            true
+        }
+        JsValue::String(value) => {
+            push_u8(out, JSON_VALUE_TAG_STRING);
+            push_bytes(out, value.as_bytes())
+        }
+        JsValue::Array(items) => {
+            let items = items.borrow();
+            let Ok(count) = u32::try_from(items.len()) else {
+                return false;
+            };
+            push_u8(out, JSON_VALUE_TAG_ARRAY);
+            push_u32(out, count);
+            for item in items.iter() {
+                if !serialize_json_value(item, out, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        JsValue::PlainObject(map) => {
+            let map = map.borrow();
+            let mut entries: Vec<(&str, &JsValue)> =
+                map.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+            // Iteration order on PropertyMap is insertion order for JSON
+            // parser output, but sort by key for fully deterministic blob
+            // bytes regardless of underlying property storage layout.
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let Ok(count) = u32::try_from(entries.len()) else {
+                return false;
+            };
+            push_u8(out, JSON_VALUE_TAG_OBJECT);
+            push_u32(out, count);
+            for (key, value) in entries {
+                if !push_bytes(out, key.as_bytes()) {
+                    return false;
+                }
+                if !serialize_json_value(value, out, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        // Any other JsValue variant (Undefined, TheHole, Object pointer,
+        // BigInt, Symbol, Function, etc.) is not produced by the JSON parser.
+        // Refuse to cache so we never confuse a cache hit with a non-JSON
+        // value.
+        _ => false,
+    }
+}
+
+fn deserialize_json_value(reader: &mut CacheReader<'_>, depth: u32) -> Option<JsValue> {
+    if depth > 256 {
+        return None;
+    }
+    let tag = reader.read_u8()?;
+    match tag {
+        JSON_VALUE_TAG_NULL => Some(JsValue::Null),
+        JSON_VALUE_TAG_FALSE => Some(JsValue::Boolean(false)),
+        JSON_VALUE_TAG_TRUE => Some(JsValue::Boolean(true)),
+        JSON_VALUE_TAG_SMI => Some(JsValue::Smi(reader.read_i32()?)),
+        JSON_VALUE_TAG_DOUBLE => {
+            let bits: [u8; 8] = reader.take(8)?.try_into().ok()?;
+            Some(JsValue::HeapNumber(f64::from_bits(u64::from_le_bytes(
+                bits,
+            ))))
+        }
+        JSON_VALUE_TAG_STRING => {
+            let bytes = reader.read_bytes()?;
+            let s = String::from_utf8(bytes).ok()?;
+            Some(JsValue::String(Rc::from(s.as_str())))
+        }
+        JSON_VALUE_TAG_ARRAY => {
+            let count = reader.read_u32()? as usize;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(deserialize_json_value(reader, depth + 1)?);
+            }
+            Some(JsValue::new_array(items))
+        }
+        JSON_VALUE_TAG_OBJECT => {
+            let count = reader.read_u32()? as usize;
+            let mut map = PropertyMap::new();
+            for _ in 0..count {
+                let key_bytes = reader.read_bytes()?;
+                let key = String::from_utf8(key_bytes).ok()?;
+                let value = deserialize_json_value(reader, depth + 1)?;
+                map.insert(key, value);
+            }
+            Some(JsValue::PlainObject(Rc::new(RefCell::new(map))))
+        }
+        _ => None,
+    }
+}
+
+fn serialize_json_value_bytes(value: &JsValue) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    if !serialize_json_value(value, &mut out, 0) {
+        return None;
+    }
+    Some(out)
 }
 
 fn parse_module_cache_blob(bytes: &[u8]) -> Option<(ModuleCacheRecord, ModuleCachePayload)> {
@@ -3580,7 +3768,7 @@ fn parse_module_cache_blob(bytes: &[u8]) -> Option<(ModuleCacheRecord, ModuleCac
     let resource_name = reader.read_bytes()?;
     let base_url = reader.read_bytes()?;
     let integrity_metadata = reader.read_bytes()?;
-    let payload = parse_module_cache_payload(&mut reader)?;
+    let payload = parse_module_cache_payload(&mut reader, source_type)?;
     if !reader.is_finished() {
         return None;
     }
@@ -3608,39 +3796,51 @@ fn parse_module_cache_record(bytes: &[u8]) -> Option<ModuleCacheRecord> {
 }
 
 fn module_cache_payload_from_module(module: &StatorModule) -> Option<ModuleCachePayload> {
-    let bytecodes = module.bytecodes.as_ref()?;
-    let mut module_requests = Vec::with_capacity(module.module_requests.len());
-    for request in &module.module_requests {
-        let attributes = request
-            ._attributes_storage
-            .iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_bytes().to_vec(),
-                    attribute.value.as_bytes().to_vec(),
-                )
-            })
-            .collect();
-        module_requests.push(SerializedModuleRequest {
-            specifier: request.specifier.as_bytes().to_vec(),
-            attributes,
-            imports: request.imports.clone(),
-        });
+    match module.source_type {
+        StatorModuleType::StatorModuleTypeJavaScript => {
+            let bytecodes = module.bytecodes.as_ref()?;
+            let mut module_requests = Vec::with_capacity(module.module_requests.len());
+            for request in &module.module_requests {
+                let attributes = request
+                    ._attributes_storage
+                    .iter()
+                    .map(|attribute| {
+                        (
+                            attribute.key.as_bytes().to_vec(),
+                            attribute.value.as_bytes().to_vec(),
+                        )
+                    })
+                    .collect();
+                module_requests.push(SerializedModuleRequest {
+                    specifier: request.specifier.as_bytes().to_vec(),
+                    attributes,
+                    imports: request.imports.clone(),
+                });
+            }
+            // Sort exports for deterministic byte output across runs (the
+            // underlying `HashSet` has no guaranteed iteration order).
+            let mut direct_exports: Vec<Vec<u8>> = module
+                .direct_exports
+                .iter()
+                .map(|name| name.as_bytes().to_vec())
+                .collect();
+            direct_exports.sort();
+            Some(ModuleCachePayload::JavaScript(JsModulePayload {
+                has_dependencies: module.has_dependencies,
+                module_requests,
+                direct_exports,
+                bytecode: serialize_bytecode_array(bytecodes),
+            }))
+        }
+        StatorModuleType::StatorModuleTypeJson => {
+            let value = module.json_default.as_ref()?;
+            let bytes = serialize_json_value_bytes(value)?;
+            Some(ModuleCachePayload::Json(JsonModulePayload { value: bytes }))
+        }
+        // WebAssembly and CSS module bodies are not executable yet; refuse
+        // to produce a cache blob.
+        _ => None,
     }
-    // Sort exports for deterministic byte output across runs (the underlying
-    // `HashSet` has no guaranteed iteration order).
-    let mut direct_exports: Vec<Vec<u8>> = module
-        .direct_exports
-        .iter()
-        .map(|name| name.as_bytes().to_vec())
-        .collect();
-    direct_exports.sort();
-    Some(ModuleCachePayload {
-        has_dependencies: module.has_dependencies,
-        module_requests,
-        direct_exports,
-        bytecode: serialize_bytecode_array(bytecodes),
-    })
 }
 
 fn rebuild_module_request(serialized: SerializedModuleRequest) -> Option<StatorModuleRequest> {
@@ -3673,6 +3873,23 @@ fn module_from_cache_payload(
     payload: ModuleCachePayload,
     source_type: StatorModuleType,
 ) -> Option<Box<StatorModule>> {
+    match (payload, source_type) {
+        (ModuleCachePayload::JavaScript(payload), StatorModuleType::StatorModuleTypeJavaScript) => {
+            module_from_js_cache_payload(payload, source_type)
+        }
+        (ModuleCachePayload::Json(payload), StatorModuleType::StatorModuleTypeJson) => {
+            module_from_json_cache_payload(payload)
+        }
+        // Mismatched payload/source_type combinations should never reach here
+        // (the validator rejects them), but reject defensively.
+        _ => None,
+    }
+}
+
+fn module_from_js_cache_payload(
+    payload: JsModulePayload,
+    source_type: StatorModuleType,
+) -> Option<Box<StatorModule>> {
     let mut cursor = 0usize;
     let bytecode = deserialize_bytecode_array(&payload.bytecode, &mut cursor).ok()?;
     if cursor != payload.bytecode.len() {
@@ -3692,6 +3909,37 @@ fn module_from_cache_payload(
         source_type,
         has_dependencies: payload.has_dependencies,
         module_requests,
+        direct_exports,
+        status: StatorModuleStatus::StatorModuleStatusUnlinked,
+        last_result: None,
+        error: None,
+        error_kind: StatorMessageKind::StatorMessageKindUnknown,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+        base_url: None,
+        integrity_metadata: None,
+        credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+        referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+        parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        namespace: None,
+    }))
+}
+
+fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<StatorModule>> {
+    let mut reader = CacheReader::new(&payload.value);
+    let value = deserialize_json_value(&mut reader, 0)?;
+    if !reader.is_finished() {
+        return None;
+    }
+    let mut direct_exports = HashSet::new();
+    direct_exports.insert("default".to_string());
+    Some(Box::new(StatorModule {
+        bytecodes: None,
+        json_default: Some(value),
+        source_type: StatorModuleType::StatorModuleTypeJson,
+        has_dependencies: false,
+        module_requests: Vec::new(),
         direct_exports,
         status: StatorModuleStatus::StatorModuleStatusUnlinked,
         last_result: None,
@@ -4152,14 +4400,21 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
     }
     // SAFETY: caller guarantees `module` is valid.
     let module_ref = unsafe { &*module };
-    if module_ref.source_type != StatorModuleType::StatorModuleTypeJavaScript {
+    if module_ref.source_type != StatorModuleType::StatorModuleTypeJavaScript
+        && module_ref.source_type != StatorModuleType::StatorModuleTypeJson
+    {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported };
         }
         return std::ptr::null_mut();
     }
-    if module_ref.bytecodes.is_none() || module_ref.error.is_some() {
+    if module_ref.error.is_some()
+        || (module_ref.source_type == StatorModuleType::StatorModuleTypeJavaScript
+            && module_ref.bytecodes.is_none())
+        || (module_ref.source_type == StatorModuleType::StatorModuleTypeJson
+            && module_ref.json_default.is_none())
+    {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusCompileError };
@@ -4238,7 +4493,9 @@ pub unsafe extern "C" fn stator_module_compile_cached(
     let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
         return module_cache_rejection_record(source_type, "invalid module source pointer");
     };
-    if source_type != StatorModuleType::StatorModuleTypeJavaScript {
+    if source_type != StatorModuleType::StatorModuleTypeJavaScript
+        && source_type != StatorModuleType::StatorModuleTypeJson
+    {
         if !out_status.is_null() {
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported };
@@ -16738,18 +16995,325 @@ mod tests {
     }
 
     #[test]
-    fn test_json_module_code_cache_is_explicitly_unsupported() {
-        let source = r#"{"answer":42}"#;
-        let module = compile_typed_module_src(source, StatorModuleType::StatorModuleTypeJson);
+    fn test_json_module_code_cache_roundtrip_restores_default_export() {
+        let source = r#"{"answer":42,"deep":{"items":[1,true,null,"x",3.5]}}"#;
+        let bytes = source.as_bytes();
+        let resource = b"https://edge.example.test/data.json";
+        let base_url = b"https://edge.example.test/";
+        let integrity = b"sha384-json";
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            resource_name: resource.as_ptr() as *const c_char,
+            resource_name_len: resource.len(),
+            line_offset: 3,
+            column_offset: 5,
+            base_url: base_url.as_ptr() as *const c_char,
+            base_url_len: base_url.len(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+            integrity_metadata: integrity.as_ptr() as *const c_char,
+            integrity_metadata_len: integrity.len(),
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyOrigin,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataParserInserted,
+        };
+        // SAFETY: pointers are valid for the duration of this test.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        assert!(!module.is_null());
         let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
-        // SAFETY: pointers are valid and module is live.
+        // SAFETY: module/source/status pointers are valid.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        // SAFETY: cache and source/options pointers are valid.
+        let cached = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored
+        );
+        // SAFETY: cached module is live.
         unsafe {
-            let cache = stator_module_create_code_cache(
+            assert!(stator_module_get_error(cached).is_null());
+            assert_eq!(
+                stator_module_get_type(cached),
+                StatorModuleType::StatorModuleTypeJson
+            );
+            assert_eq!(
+                stator_module_get_status(cached),
+                StatorModuleStatus::StatorModuleStatusUnlinked
+            );
+            let got_resource = CStr::from_ptr(stator_module_get_resource_name(cached))
+                .to_str()
+                .unwrap();
+            assert_eq!(got_resource.as_bytes(), resource);
+
+            let result = stator_module_evaluate(cached, std::ptr::null_mut());
+            assert!(!result.is_null());
+            // The default export is the parsed JSON object, which coerces to
+            // NaN; verify by exporting via a graph below.
+            stator_value_destroy(result);
+            stator_string_free(cache);
+            stator_module_free(cached);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_json_module_code_cache_restored_namespace_default_import() {
+        let source = r#"{"answer":7}"#;
+        let bytes = source.as_bytes();
+        let json_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        // SAFETY: source pointer is valid for the call.
+        let dep = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &json_options,
+            )
+        };
+        assert!(!dep.is_null());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: dep and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                dep,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+        // SAFETY: dep was created above.
+        unsafe { stator_module_free(dep) };
+
+        // Restore from cache only and use it as the dependency in a graph.
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &json_options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored
+        );
+
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import * as ns from './data.json' with { type: 'json' }; ns.default.answer;",
+        );
+        let mut modules = HashMap::new();
+        modules.insert("./data.json".to_string(), restored);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 7.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_json_module_code_cache_rejects_stale_source() {
+        let source = r#"{"answer":1}"#;
+        let stale = r#"{"answer":2}"#;
+        let json_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        // SAFETY: pointers are valid.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                &json_options,
+            )
+        };
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
                 module,
                 source.as_ptr() as *const c_char,
                 source.len(),
                 &mut status,
-            );
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: pointers are live.
+        let cached = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                stale.as_ptr() as *const c_char,
+                stale.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &json_options,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(!stator_module_get_error(cached).is_null());
+            stator_module_free(cached);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_json_module_code_cache_rejects_invalid_bytes() {
+        let source = r#"{"answer":42}"#;
+        let json_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        let garbage = b"not a real cache blob";
+        // SAFETY: pointers are valid for the call.
+        let cached = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                garbage.as_ptr() as *const c_char,
+                garbage.len(),
+                &json_options,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: pointers are live.
+        unsafe {
+            assert!(!stator_module_get_error(cached).is_null());
+            stator_module_free(cached);
+        }
+    }
+
+    #[test]
+    fn test_wasm_and_css_module_code_cache_remain_unsupported() {
+        for source_type in [
+            StatorModuleType::StatorModuleTypeWebAssembly,
+            StatorModuleType::StatorModuleTypeCss,
+        ] {
+            let module = compile_typed_module_src("", source_type);
+            assert!(!module.is_null());
+            let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+            let source = b"";
+            // SAFETY: pointers are valid for the call.
+            let cache = unsafe {
+                stator_module_create_code_cache(
+                    module,
+                    source.as_ptr() as *const c_char,
+                    source.len(),
+                    &mut status,
+                )
+            };
             assert!(cache.is_null());
             assert_eq!(
                 status,
@@ -16757,7 +17321,7 @@ mod tests {
             );
 
             let options = StatorModuleCompileOptions {
-                source_type: StatorModuleType::StatorModuleTypeJson,
+                source_type,
                 resource_name: std::ptr::null(),
                 resource_name_len: 0,
                 line_offset: 0,
@@ -16770,24 +17334,29 @@ mod tests {
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             };
-            status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
-            let cached = stator_module_compile_cached(
-                std::ptr::null_mut(),
-                source.as_ptr() as *const c_char,
-                source.len(),
-                b"cache".as_ptr() as *const c_char,
-                5,
-                &options,
-                &mut status,
-            );
+            // SAFETY: pointers are valid for the call.
+            let cached = unsafe {
+                stator_module_compile_cached(
+                    std::ptr::null_mut(),
+                    source.as_ptr() as *const c_char,
+                    source.len(),
+                    b"x".as_ptr() as *const c_char,
+                    1,
+                    &options,
+                    &mut status,
+                )
+            };
             assert!(!cached.is_null());
             assert_eq!(
                 status,
                 StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported
             );
-            assert!(!stator_module_get_error(cached).is_null());
-            stator_module_free(cached);
-            stator_module_free(module);
+            // SAFETY: pointers are live.
+            unsafe {
+                assert!(!stator_module_get_error(cached).is_null());
+                stator_module_free(cached);
+                stator_module_free(module);
+            }
         }
     }
 
