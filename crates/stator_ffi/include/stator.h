@@ -125,9 +125,8 @@ typedef enum StatorParserMetadata {
 /**
  * Host-visible source kind for a compiled module record.
  *
- * JavaScript modules are parsed and compiled by Stator today. Other source
- * kinds are recorded as metadata so embedders can compare import attributes
- * against host policy while execution support lands separately.
+ * JavaScript and JSON modules are executable by Stator today. Other source
+ * kinds are recorded as metadata and fail closed until safe evaluators land.
  */
 typedef enum StatorModuleType {
   /**
@@ -2650,10 +2649,11 @@ struct StatorModule *stator_module_compile(struct StatorContext *ctx,
 /**
  * Compile `source` as a module with host-provided source kind metadata.
  *
- * JavaScript modules are parsed and compiled normally. JSON, WebAssembly, and
- * CSS module source kinds are recorded on the returned module handle but
- * currently produce an unsupported compile error because their module
- * evaluators are not implemented in Stator yet.
+ * JavaScript modules are parsed and compiled normally. JSON modules are parsed
+ * and expose a `default` export. WebAssembly and CSS module source kinds are
+ * recorded on the returned module handle but currently produce an unsupported
+ * compile error because their module evaluators are not implemented in Stator
+ * yet.
  *
  * # Safety
  * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
