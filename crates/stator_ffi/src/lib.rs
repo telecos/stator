@@ -45,6 +45,7 @@ use stator_jse::parser::ast::{
 use stator_jse::snapshot::{deserialize_bytecode_array, serialize_bytecode_array};
 use stator_jse::wasm::{
     HostFunc, HostFuncCallback, HostVal, HostValKind, WasmEngine, WasmInstance, WasmModule,
+    host_val_to_js_value, js_value_to_host_val,
 };
 
 /// An opaque isolate handle.
@@ -2458,6 +2459,14 @@ pub struct StatorModule {
     wasm_module: Option<WasmModule>,
     /// Lazily-created WebAssembly instance shared by exported function closures.
     wasm_instance: Option<Rc<RefCell<WasmInstance>>>,
+    /// Function imports declared by this WebAssembly module, in source order.
+    ///
+    /// Each entry records a `(module, name)` pair plus the import's
+    /// declared parameter / result kinds. The link-time module graph maps
+    /// each unique `module` namespace to a [`StatorModuleRequest`] flagged
+    /// `from_wasm_imports`; the evaluator then materialises a [`HostFunc`]
+    /// per entry from the resolved dependency's named exports.
+    wasm_func_imports: Vec<WasmFuncImport>,
     /// Host-visible source kind supplied at compile time.
     source_type: StatorModuleType,
     /// Whether this module needs host import resolution before evaluation.
@@ -2514,6 +2523,29 @@ struct StatorModuleRequest {
     /// Module pointer returned by the host resolver during link, or null
     /// before the request has been resolved. Borrowed (not owned).
     resolved: Cell<*mut StatorModule>,
+    /// `true` when this request was synthesised from a WebAssembly module's
+    /// `(module, name)` import descriptors (rather than from a JavaScript
+    /// `import`/`export` declaration). Wasm-introduced requests carry no
+    /// import attributes by spec, so the JS-style "non-JS modules require a
+    /// `type` attribute" rule does not apply to them.
+    from_wasm_imports: bool,
+}
+
+/// Declared signature and target name of a single WebAssembly function import.
+///
+/// Stored on [`StatorModule`] for executable Wasm bodies; used at evaluation
+/// time to look up the matching value from a resolved dependency module's
+/// namespace and to construct a [`HostFunc`] with the correct typed shape.
+#[derive(Debug, Clone)]
+struct WasmFuncImport {
+    /// Wasm import module namespace (e.g. `"env"`).
+    module: String,
+    /// Wasm import field name (e.g. `"add"`).
+    name: String,
+    /// Declared parameter kinds, in order.
+    params: Vec<HostValKind>,
+    /// Declared result kinds, in order.
+    results: Vec<HostValKind>,
 }
 
 /// A single binding requested from a dependency module.
@@ -2910,6 +2942,7 @@ fn module_request_for(
         attributes,
         imports,
         resolved: Cell::new(std::ptr::null_mut()),
+        from_wasm_imports: false,
     })
 }
 
@@ -3082,6 +3115,7 @@ fn module_error_record(
         wasm_engine: None,
         wasm_module: None,
         wasm_instance: None,
+        wasm_func_imports: Vec::new(),
         source_type,
         has_dependencies: false,
         module_requests: Vec::new(),
@@ -3148,6 +3182,7 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 wasm_engine: None,
                 wasm_module: None,
                 wasm_instance: None,
+                wasm_func_imports: Vec::new(),
                 source_type: StatorModuleType::StatorModuleTypeJson,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -3188,15 +3223,27 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
     match WasmModule::from_bytes(&engine, bytes) {
         Ok(module) => {
             let direct_exports = wasm_module_function_exports(&module);
+            let (wasm_func_imports, module_requests) = match collect_wasm_module_imports(&module) {
+                Ok(value) => value,
+                Err(error) => {
+                    return module_error_record(
+                        StatorModuleType::StatorModuleTypeWebAssembly,
+                        &error,
+                        StatorMessageKind::StatorMessageKindWasm,
+                    );
+                }
+            };
+            let has_dependencies = !module_requests.is_empty();
             Box::new(StatorModule {
                 bytecodes: None,
                 json_default: None,
                 wasm_engine: Some(engine),
                 wasm_module: Some(module),
                 wasm_instance: None,
+                wasm_func_imports,
                 source_type: StatorModuleType::StatorModuleTypeWebAssembly,
-                has_dependencies: false,
-                module_requests: Vec::new(),
+                has_dependencies,
+                module_requests,
                 direct_exports,
                 status: StatorModuleStatus::StatorModuleStatusUnlinked,
                 last_result: None,
@@ -3227,6 +3274,99 @@ fn wasm_module_function_exports(module: &WasmModule) -> HashSet<String> {
         .exports()
         .filter_map(|export| export.ty().func().map(|_| export.name().to_string()))
         .collect()
+}
+
+/// Inspect a compiled WebAssembly module's import descriptors and synthesise
+/// the matching [`StatorModuleRequest`] entries plus the typed
+/// [`WasmFuncImport`] list used at evaluation time.
+///
+/// Only function imports are supported in this slice. Each unique import
+/// `module` namespace becomes a single request whose `imports` list collects
+/// the import names from that namespace (`RequestedExport::Named`). Globals,
+/// tables and memories fail closed at compile time so the module record never
+/// reaches a state where it would silently bind a missing primitive.
+fn collect_wasm_module_imports(
+    module: &WasmModule,
+) -> Result<(Vec<WasmFuncImport>, Vec<StatorModuleRequest>), String> {
+    let mut func_imports: Vec<WasmFuncImport> = Vec::new();
+    let mut requests: Vec<StatorModuleRequest> = Vec::new();
+    let mut request_index: HashMap<String, usize> = HashMap::new();
+    for descriptor in module.imports() {
+        let stator_jse::wasm::WasmImportDescriptor {
+            module: module_name,
+            name: field_name,
+            kind,
+        } = descriptor;
+        let (params, results) = match kind {
+            stator_jse::wasm::WasmExternKind::Func { params, results } => {
+                let params = params
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        format!("WebAssembly module import '{module_name}.{field_name}' uses {e}")
+                    })?;
+                let results = results
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        format!("WebAssembly module import '{module_name}.{field_name}' uses {e}")
+                    })?;
+                (params, results)
+            }
+            other => {
+                let kind_name = match other {
+                    stator_jse::wasm::WasmExternKind::Global => "global",
+                    stator_jse::wasm::WasmExternKind::Memory => "memory",
+                    stator_jse::wasm::WasmExternKind::Table => "table",
+                    stator_jse::wasm::WasmExternKind::Other => "unsupported",
+                    stator_jse::wasm::WasmExternKind::Func { .. } => unreachable!(),
+                };
+                return Err(format!(
+                    "WebAssembly module import '{module_name}.{field_name}' has unsupported \
+                     kind '{kind_name}'; only function imports are supported"
+                ));
+            }
+        };
+
+        let idx = match request_index.get(&module_name) {
+            Some(idx) => *idx,
+            None => {
+                let specifier = CString::new(module_name.as_bytes()).map_err(|_| {
+                    format!(
+                        "WebAssembly module import namespace '{module_name}' \
+                         contains an embedded NUL byte"
+                    )
+                })?;
+                let idx = requests.len();
+                requests.push(StatorModuleRequest {
+                    specifier,
+                    _attributes_storage: Vec::new(),
+                    attributes: Vec::new(),
+                    imports: Vec::new(),
+                    resolved: Cell::new(std::ptr::null_mut()),
+                    from_wasm_imports: true,
+                });
+                request_index.insert(module_name.clone(), idx);
+                idx
+            }
+        };
+        if !requests[idx]
+            .imports
+            .iter()
+            .any(|imp| matches!(imp, RequestedExport::Named(name) if name == &field_name))
+        {
+            requests[idx]
+                .imports
+                .push(RequestedExport::Named(field_name.clone()));
+        }
+        func_imports.push(WasmFuncImport {
+            module: module_name,
+            name: field_name,
+            params,
+            results,
+        });
+    }
+    Ok((func_imports, requests))
 }
 
 fn module_type_to_u32(source_type: StatorModuleType) -> u32 {
@@ -3933,6 +4073,7 @@ fn rebuild_module_request(serialized: SerializedModuleRequest) -> Option<StatorM
         attributes,
         imports: serialized.imports,
         resolved: Cell::new(std::ptr::null_mut()),
+        from_wasm_imports: false,
     })
 }
 
@@ -3976,6 +4117,7 @@ fn module_from_js_cache_payload(
         wasm_engine: None,
         wasm_module: None,
         wasm_instance: None,
+        wasm_func_imports: Vec::new(),
         source_type,
         has_dependencies: payload.has_dependencies,
         module_requests,
@@ -4010,6 +4152,7 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         wasm_engine: None,
         wasm_module: None,
         wasm_instance: None,
+        wasm_func_imports: Vec::new(),
         source_type: StatorModuleType::StatorModuleTypeJson,
         has_dependencies: false,
         module_requests: Vec::new(),
@@ -4212,6 +4355,7 @@ unsafe fn compile_module_source(
             wasm_engine: None,
             wasm_module: None,
             wasm_instance: None,
+            wasm_func_imports: Vec::new(),
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
@@ -4248,6 +4392,7 @@ unsafe fn compile_module_source(
                 wasm_engine: None,
                 wasm_module: None,
                 wasm_instance: None,
+                wasm_func_imports: Vec::new(),
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -4282,6 +4427,7 @@ unsafe fn compile_module_source(
             wasm_engine: None,
             wasm_module: None,
             wasm_instance: None,
+            wasm_func_imports: Vec::new(),
             source_type,
             has_dependencies: false,
             module_requests: Vec::new(),
@@ -4321,6 +4467,7 @@ unsafe fn compile_module_source(
                 wasm_engine: None,
                 wasm_module: None,
                 wasm_instance: None,
+                wasm_func_imports: Vec::new(),
                 source_type,
                 has_dependencies,
                 module_requests,
@@ -4349,6 +4496,7 @@ unsafe fn compile_module_source(
                 wasm_engine: None,
                 wasm_module: None,
                 wasm_instance: None,
+                wasm_func_imports: Vec::new(),
                 source_type,
                 has_dependencies: false,
                 module_requests: Vec::new(),
@@ -6080,6 +6228,12 @@ unsafe fn validate_resolved_module_type(
     if resolved.is_null() {
         return Ok(());
     }
+    if request.from_wasm_imports {
+        // WebAssembly `(module, name)` imports carry no JS-side import
+        // attributes; the `(module, name)` pair is resolved opaquely and the
+        // import value's shape is validated kind-by-kind at evaluation time.
+        return Ok(());
+    }
     // SAFETY: resolver returned a live module pointer by contract.
     let actual_type = unsafe { (*resolved).source_type };
     match module_type_attribute(request) {
@@ -6375,7 +6529,13 @@ unsafe fn evaluate_wasm_module_graph(
         let instance = match &module_ref.wasm_instance {
             Some(instance) => Rc::clone(instance),
             None => {
-                let instance = Rc::new(RefCell::new(WasmInstance::new(&engine, &wasm_module)?));
+                // SAFETY: `module` is borrowed exclusively for this evaluation call.
+                let host_imports = unsafe { build_wasm_host_imports(module)? };
+                let instance = Rc::new(RefCell::new(WasmInstance::new_with_imports(
+                    &engine,
+                    &wasm_module,
+                    host_imports,
+                )?));
                 module_ref.wasm_instance = Some(Rc::clone(&instance));
                 instance
             }
@@ -6421,6 +6581,246 @@ unsafe fn evaluate_wasm_module_graph(
     let namespace = JsValue::PlainObject(Rc::new(RefCell::new(namespace)));
     module_ref.namespace = Some(namespace.cheap_clone());
     Ok(namespace)
+}
+
+/// Look up a named function export on a resolved dependency module and return
+/// it as a directly-callable [`JsValue::NativeFunction`].
+///
+/// JavaScript bytecode-backed functions cannot be invoked safely from outside
+/// the interpreter without a re-entry primitive that does not yet exist on
+/// the FFI surface, so they are reported as an unsupported import value
+/// rather than silently called.
+///
+/// # Safety
+/// `dep` must be a live, fully-evaluated module pointer.
+unsafe fn lookup_wasm_import_value(
+    dep: *mut StatorModule,
+    name: &str,
+) -> stator_jse::error::StatorResult<JsValue> {
+    if dep.is_null() {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import '{name}' has no resolved dependency module",
+        )));
+    }
+    // SAFETY: `dep` is a live module pointer and the namespace is read-only.
+    let module_ref = unsafe { &*dep };
+    let Some(namespace) = module_ref.namespace.as_ref() else {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import dependency for '{name}' has no namespace; \
+             evaluation order invariant broken",
+        )));
+    };
+    let JsValue::PlainObject(map) = namespace else {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import dependency for '{name}' has a non-object namespace",
+        )));
+    };
+    let raw = map.borrow().get(name).cloned().ok_or_else(|| {
+        stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import '{name}' is not exported by the resolved dependency",
+        ))
+    })?;
+    // ModuleBinding cells in the namespace forward through `global_env`.
+    let resolved = match raw {
+        JsValue::ModuleBinding(cell) => cell
+            .global_env
+            .borrow()
+            .get(cell.key.as_ref())
+            .cloned()
+            .ok_or_else(|| {
+                stator_jse::error::StatorError::WasmError(format!(
+                    "WebAssembly import '{name}' resolved to an uninitialised binding",
+                ))
+            })?,
+        other => other,
+    };
+    Ok(resolved)
+}
+
+/// Build the [`HostFunc`] list used to instantiate a WebAssembly module, by
+/// pairing each declared [`WasmFuncImport`] with the matching named export of
+/// the appropriate resolved dependency module.
+///
+/// All non-function values, missing exports, and bytecode-backed JS function
+/// values fail closed with a precise [`StatorError::WasmError`] before the
+/// underlying Wasm linker would reject instantiation. This guarantees that a
+/// successfully instantiated module observes only typed, callable host
+/// imports of the declared shape.
+///
+/// # Safety
+/// `module` must be a live WebAssembly module pointer whose graph has been
+/// fully linked (every `module_requests[i].resolved` populated).
+unsafe fn build_wasm_host_imports(
+    module: *mut StatorModule,
+) -> stator_jse::error::StatorResult<Vec<HostFunc>> {
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &*module };
+    if module_ref.wasm_func_imports.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Map import-module-namespace → resolved dependency module pointer.
+    let mut dep_by_namespace: HashMap<String, *mut StatorModule> = HashMap::new();
+    for request in &module_ref.module_requests {
+        if !request.from_wasm_imports {
+            continue;
+        }
+        dep_by_namespace.insert(
+            request.specifier.to_string_lossy().into_owned(),
+            request.resolved.get(),
+        );
+    }
+
+    let mut out = Vec::with_capacity(module_ref.wasm_func_imports.len());
+    for import in &module_ref.wasm_func_imports {
+        let dep = dep_by_namespace
+            .get(&import.module)
+            .copied()
+            .ok_or_else(|| {
+                stator_jse::error::StatorError::WasmError(format!(
+                    "WebAssembly import '{}.{}' has no resolved dependency module",
+                    import.module, import.name
+                ))
+            })?;
+        // SAFETY: `dep` was returned by the resolver and recorded on the
+        // module's request slot, so it is either a live module pointer or
+        // null (handled inside `lookup_wasm_import_value`).
+        let value = unsafe { lookup_wasm_import_value(dep, &import.name) }.map_err(|e| {
+            // Wrap with the qualified import name for better diagnostics.
+            match e {
+                stator_jse::error::StatorError::WasmError(msg) => {
+                    stator_jse::error::StatorError::WasmError(format!(
+                        "WebAssembly import '{}.{}': {msg}",
+                        import.module, import.name
+                    ))
+                }
+                other => other,
+            }
+        })?;
+        let callback = wrap_js_function_for_wasm_import(
+            value,
+            import.module.clone(),
+            import.name.clone(),
+            import.results.clone(),
+        )?;
+
+        // If the dependency is itself a Wasm module exporting a function, we
+        // can validate its declared signature against the importer's expected
+        // signature and fail closed early instead of relying on the underlying
+        // wasmtime linker (which in this design wraps the call in a
+        // signature-shaped shim and cannot detect the mismatch on its own).
+        if !dep.is_null() {
+            // SAFETY: `dep` is live by construction and only read here.
+            unsafe {
+                validate_wasm_to_wasm_signature_match(dep, import)?;
+            }
+        }
+
+        out.push(HostFunc {
+            module: import.module.clone(),
+            name: import.name.clone(),
+            params: import.params.clone(),
+            results: import.results.clone(),
+            callback,
+        });
+    }
+    Ok(out)
+}
+
+unsafe fn validate_wasm_to_wasm_signature_match(
+    dep: *mut StatorModule,
+    import: &WasmFuncImport,
+) -> stator_jse::error::StatorResult<()> {
+    // SAFETY: caller guarantees `dep` is a live module pointer.
+    let dep_ref = unsafe { &*dep };
+    let Some(dep_wasm) = dep_ref.wasm_module.as_ref() else {
+        return Ok(());
+    };
+    let Some((dep_params, dep_results)) = dep_wasm.exported_function_signature(&import.name) else {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import '{}.{}' is not exported as a function by the resolved Wasm dependency",
+            import.module, import.name
+        )));
+    };
+    if dep_params != import.params || dep_results != import.results {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly import '{}.{}' signature mismatch with resolved dependency export",
+            import.module, import.name
+        )));
+    }
+    Ok(())
+}
+
+/// Single-thread shim that lets a [`Rc`]-backed JS native function be stored
+/// inside the Wasmtime linker (which requires `Send + Sync`).
+///
+/// Wasmtime invokes the registered import callback only on the thread that
+/// drives the calling [`WasmInstance::call`]. Stator isolates are not
+/// thread-safe and a [`StatorModule`]'s `wasm_instance` cannot migrate
+/// between threads without external synchronisation, so the JS native
+/// function captured here is never observed by another thread.
+struct LocalWasmImportFn(stator_jse::objects::value::NativeFn);
+// SAFETY: see `LocalWasmImportFn` doc comment.
+unsafe impl Send for LocalWasmImportFn {}
+// SAFETY: see `LocalWasmImportFn` doc comment.
+unsafe impl Sync for LocalWasmImportFn {}
+
+impl LocalWasmImportFn {
+    fn call(&self, args: Vec<JsValue>) -> stator_jse::error::StatorResult<JsValue> {
+        (self.0)(args)
+    }
+}
+
+fn wrap_js_function_for_wasm_import(
+    value: JsValue,
+    module_name: String,
+    field_name: String,
+    results: Vec<HostValKind>,
+) -> stator_jse::error::StatorResult<HostFuncCallback> {
+    let native = match value {
+        JsValue::NativeFunction(f) => f,
+        JsValue::Function(_) => {
+            return Err(stator_jse::error::StatorError::WasmError(format!(
+                "WebAssembly import '{module_name}.{field_name}' refers to a JavaScript \
+                 bytecode function; only native function exports are supported as Wasm imports",
+            )));
+        }
+        _ => {
+            return Err(stator_jse::error::StatorError::WasmError(format!(
+                "WebAssembly import '{module_name}.{field_name}' is not callable",
+            )));
+        }
+    };
+
+    let local = LocalWasmImportFn(native);
+    let qualified = format!("{module_name}.{field_name}");
+    let callback: HostFuncCallback = std::sync::Arc::new(move |args, out_results| {
+        let js_args: Vec<JsValue> = args.iter().copied().map(host_val_to_js_value).collect();
+        let result = match local.call(js_args) {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!("Wasm import '{qualified}' threw; trapping calling Wasm");
+                return false;
+            }
+        };
+        if results.is_empty() {
+            return true;
+        }
+        if results.len() != 1 {
+            log::warn!(
+                "Wasm import '{qualified}' declared {} results; multi-value imports unsupported",
+                results.len()
+            );
+            return false;
+        }
+        let host = match js_value_to_host_val(&result, results[0]) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        out_results[0] = host;
+        true
+    });
+    Ok(callback)
 }
 
 unsafe fn run_module_bytecodes(
@@ -6553,8 +6953,41 @@ unsafe fn evaluate_module_graph(
     if unsafe { (*module).wasm_module.is_some() } {
         // SAFETY: `module` is valid and uniquely driven by this evaluation call.
         let module_ref = unsafe { &mut *module };
+        if module_ref.has_dependencies
+            && matches!(
+                module_ref.status,
+                StatorModuleStatus::StatorModuleStatusUnlinked
+            )
+        {
+            active.remove(&module);
+            return Err(stator_jse::error::StatorError::Internal(
+                "module evaluation requires host import resolution".to_string(),
+            ));
+        }
         module_ref.status = StatorModuleStatus::StatorModuleStatusEvaluating;
-        let result = unsafe { evaluate_wasm_module_graph(module, global_env) };
+
+        let dep_result = (|| -> stator_jse::error::StatorResult<()> {
+            // SAFETY: `module` remains valid throughout evaluation.
+            let request_len = unsafe { (*module).module_requests.len() };
+            for request_idx in 0..request_len {
+                // SAFETY: request index is in bounds and module is valid.
+                let dep = unsafe { (&(*module).module_requests)[request_idx].resolved.get() };
+                if dep.is_null() {
+                    return Err(stator_jse::error::StatorError::Internal(
+                        "module evaluation requires host import resolution".to_string(),
+                    ));
+                }
+                // SAFETY: dependency pointers are supplied by successful graph instantiation.
+                unsafe { evaluate_module_graph(ctx, dep, global_env, active)? };
+                // SAFETY: request index is in bounds and module is valid.
+                let request = unsafe { &(&(*module).module_requests)[request_idx] };
+                publish_module_namespace(request, global_env);
+            }
+            Ok(())
+        })();
+
+        let result =
+            dep_result.and_then(|()| unsafe { evaluate_wasm_module_graph(module, global_env) });
         active.remove(&module);
         match result {
             Ok(result) => {
@@ -16980,6 +17413,31 @@ mod tests {
     const WASM_INVALID_BINARY: &[u8] =
         &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff, 0x00];
 
+    // Exports `add(f64, f64) -> f64`. Used to exercise Wasm-to-Wasm import
+    // signature mismatch detection (the consumer expects `(i32, i32) -> i32`).
+    const WASM_ADD_F64: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7c, 0x7c,
+        0x01, 0x7c, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b,
+    ];
+
+    // Imports a memory `env.mem` (no other sections). Used to assert
+    // compile-time fail-closed for unsupported (non-function) Wasm imports.
+    const WASM_IMPORT_MEMORY: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0c, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x03, 0x6d, 0x65, 0x6d, 0x02, 0x00, 0x01,
+    ];
+
+    // Imports `env.add: (i32,i32)->i32` and exports `run: () -> i32` whose
+    // body is `i32.const 1; i32.const 2; call $env.add`. Used to exercise
+    // Wasm-to-Wasm function imports with a callable JS entry point.
+    const WASM_IMPORT_ADD_RUN: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f,
+        0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x61,
+        0x64, 0x64, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6e,
+        0x00, 0x01, 0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x01, 0x41, 0x02, 0x10, 0x00, 0x0b,
+    ];
+
     #[test]
     fn test_module_wasm_named_import_calls_function_export() {
         let iso = IsolateGuard::new();
@@ -17184,15 +17642,170 @@ mod tests {
 
     #[test]
     fn test_module_wasm_missing_import_fails_evaluation() {
+        // The Wasm module imports `env.add` but the resolver reports the `env`
+        // namespace as not found. Instantiation must fail closed with a
+        // diagnostic that mentions the missing specifier.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
         let module = compile_typed_module_bytes(
             WASM_IMPORT_ADD,
             StatorModuleType::StatorModuleTypeWebAssembly,
         );
-        // SAFETY: `module` is non-null and live; null context is permitted.
+        let mut data = TestGraphResolverData {
+            modules: HashMap::new(),
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+        // SAFETY: pointers are non-null and live.
         unsafe {
-            assert!(stator_module_instantiate(std::ptr::null_mut(), module));
-            let result = stator_module_evaluate(module, std::ptr::null_mut());
+            assert!(!stator_module_instantiate(ctx, module));
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("env"), "error did not mention 'env': {err}");
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_to_wasm_function_import_calls_dependency_export() {
+        // Root JS module imports `run` from a Wasm module that itself imports
+        // `env.add` (i32, i32 -> i32). The resolver maps `env` to a Wasm
+        // module that exports a matching `add`. The call should produce 3.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { run } from './importer.wasm' with { type: 'webassembly' }; run();",
+        );
+        let importer = compile_typed_module_bytes(
+            WASM_IMPORT_ADD_RUN,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep =
+            compile_typed_module_bytes(WASM_ADD, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 3.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_to_wasm_signature_mismatch_fails() {
+        // Root JS module imports `run` from a Wasm module that imports
+        // `env.add` as `(i32,i32)->i32`. The resolver maps `env` to a Wasm
+        // module that exports `add` as `(f64,f64)->f64`. Instantiation must
+        // fail closed with a signature-mismatch diagnostic.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { run } from './importer.wasm' with { type: 'webassembly' }; run();",
+        );
+        let importer = compile_typed_module_bytes(
+            WASM_IMPORT_ADD_RUN,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep =
+            compile_typed_module_bytes(WASM_ADD_F64, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
             assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(importer),
+                StatorMessageKind::StatorMessageKindWasm
+            );
+            let err = CStr::from_ptr(stator_module_get_error(importer))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("signature mismatch"),
+                "error did not mention 'signature mismatch': {err}"
+            );
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_import_kind_fails_compilation() {
+        // A Wasm module that imports a memory must fail closed at compile
+        // time; only function imports are supported in this slice.
+        let module = compile_typed_module_bytes(
+            WASM_IMPORT_MEMORY,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
             assert_eq!(
                 stator_module_error_kind(module),
                 StatorMessageKind::StatorMessageKindWasm
@@ -17200,7 +17813,10 @@ mod tests {
             let err = CStr::from_ptr(stator_module_get_error(module))
                 .to_str()
                 .unwrap();
-            assert!(err.contains("env") || err.contains("import"));
+            assert!(
+                err.contains("unsupported") && err.contains("memory"),
+                "expected unsupported memory diagnostic, got: {err}"
+            );
             stator_module_free(module);
         }
     }

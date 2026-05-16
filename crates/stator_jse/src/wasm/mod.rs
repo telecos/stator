@@ -213,6 +213,107 @@ impl WasmModule {
     pub fn inner(&self) -> &Module {
         &self.inner
     }
+
+    /// Enumerate this module's import descriptors as a list of
+    /// [`WasmImportDescriptor`] values.
+    ///
+    /// Iteration order matches the import section of the Wasm module.
+    pub fn imports(&self) -> Vec<WasmImportDescriptor> {
+        self.inner
+            .imports()
+            .map(|import| {
+                let kind = match import.ty() {
+                    wasmtime::ExternType::Func(ft) => WasmExternKind::Func {
+                        params: ft.params().map(value_type_to_host_kind).collect(),
+                        results: ft.results().map(value_type_to_host_kind).collect(),
+                    },
+                    wasmtime::ExternType::Global(_) => WasmExternKind::Global,
+                    wasmtime::ExternType::Memory(_) => WasmExternKind::Memory,
+                    wasmtime::ExternType::Table(_) => WasmExternKind::Table,
+                    _ => WasmExternKind::Other,
+                };
+                WasmImportDescriptor {
+                    module: import.module().to_string(),
+                    name: import.name().to_string(),
+                    kind,
+                }
+            })
+            .collect()
+    }
+
+    /// Look up the kind of a named function export.
+    ///
+    /// Returns `None` when the export does not exist or is not a function, or
+    /// when the function uses Wasm value types that have no [`HostValKind`]
+    /// representation (`v128`, references).
+    pub fn exported_function_signature(
+        &self,
+        name: &str,
+    ) -> Option<(Vec<HostValKind>, Vec<HostValKind>)> {
+        let export = self.inner.exports().find(|e| e.name() == name)?;
+        let func_ty = export.ty().func()?.clone();
+        let params = func_ty
+            .params()
+            .map(value_type_to_host_kind)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let results = func_ty
+            .results()
+            .map(value_type_to_host_kind)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some((params, results))
+    }
+}
+
+fn value_type_to_host_kind(ty: wasmtime::ValType) -> Result<HostValKind, String> {
+    Ok(match ty {
+        wasmtime::ValType::I32 => HostValKind::I32,
+        wasmtime::ValType::I64 => HostValKind::I64,
+        wasmtime::ValType::F32 => HostValKind::F32,
+        wasmtime::ValType::F64 => HostValKind::F64,
+        other => return Err(format!("unsupported Wasm value type {other}")),
+    })
+}
+
+/// Description of a single Wasm import descriptor used for module-graph
+/// integration. Mirrors the structure of `wasmtime::ImportType` in a form
+/// that does not leak `wasmtime` types across the [`stator_jse`] boundary.
+#[derive(Debug, Clone)]
+pub struct WasmImportDescriptor {
+    /// Wasm import module namespace (e.g. `"env"`).
+    pub module: String,
+    /// Wasm import field name (e.g. `"add"`).
+    pub name: String,
+    /// Kind and (for functions) declared signature.
+    pub kind: WasmExternKind,
+}
+
+/// The kind of a Wasm import or export, with declared signature for
+/// functions. Globals, memories and tables are reported by kind only because
+/// the module graph integration in this slice only bridges function imports;
+/// callers fail closed on the other kinds with a precise diagnostic.
+#[derive(Debug, Clone)]
+pub enum WasmExternKind {
+    /// A function with the declared parameter and result kinds.
+    ///
+    /// Each parameter / result is itself a `Result<HostValKind, String>` to
+    /// surface unsupported value types (`v128`, references) without requiring
+    /// the caller to depend on `wasmtime` directly.
+    Func {
+        /// Parameter kinds, in order.
+        params: Vec<Result<HostValKind, String>>,
+        /// Result kinds, in order.
+        results: Vec<Result<HostValKind, String>>,
+    },
+    /// A global value.
+    Global,
+    /// A linear memory.
+    Memory,
+    /// A table.
+    Table,
+    /// Any other extern kind not bridged by this slice (e.g. tag/event types).
+    Other,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -612,6 +713,53 @@ pub fn wasm_val_to_js_value(val: &Val) -> StatorResult<JsValue> {
             other
         ))),
     }
+}
+
+/// Convert a [`HostVal`] to a [`JsValue`].
+///
+/// This is the typed-host-import counterpart to [`wasm_val_to_js_value`] used
+/// when the embedder works in [`HostVal`] without ever materialising a
+/// [`wasmtime::Val`].
+pub fn host_val_to_js_value(val: HostVal) -> JsValue {
+    match val {
+        HostVal::I32(n) => JsValue::Smi(n),
+        HostVal::I64(n) => JsValue::HeapNumber(n as f64),
+        HostVal::F32(f) => JsValue::HeapNumber(f64::from(f)),
+        HostVal::F64(f) => JsValue::HeapNumber(f),
+    }
+}
+
+/// Convert a [`JsValue`] into a [`HostVal`] of the requested kind.
+///
+/// Numeric coercion follows the same rules as
+/// [`js_value_to_wasm_val`]: booleans and `undefined` / `null` map to zero of
+/// the requested kind, and numbers truncate / convert as required.
+///
+/// # Errors
+///
+/// Returns [`StatorError::WasmError`] when the value cannot be represented as
+/// the requested [`HostValKind`] (e.g. an object).
+pub fn js_value_to_host_val(value: &JsValue, kind: HostValKind) -> StatorResult<HostVal> {
+    let n = match value {
+        JsValue::Smi(n) => Some(f64::from(*n)),
+        JsValue::HeapNumber(f) => Some(*f),
+        JsValue::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
+        JsValue::Undefined | JsValue::Null => Some(0.0),
+        _ => None,
+    };
+    let Some(n) = n else {
+        return Err(StatorError::WasmError(format!(
+            "cannot convert JsValue::{:?} to a Wasm value of kind {:?}",
+            std::mem::discriminant(value),
+            kind
+        )));
+    };
+    Ok(match kind {
+        HostValKind::I32 => HostVal::I32(n as i32),
+        HostValKind::I64 => HostVal::I64(n as i64),
+        HostValKind::F32 => HostVal::F32(n as f32),
+        HostValKind::F64 => HostVal::F64(n),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
