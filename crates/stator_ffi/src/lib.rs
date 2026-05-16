@@ -2591,10 +2591,18 @@ struct WasmFuncImport {
 /// Declared type and target name of a single WebAssembly global import.
 ///
 /// Stored on [`StatorModule`] for executable Wasm bodies. Globals are only
-/// recorded for shapes Stator can bind at runtime today (immutable globals
-/// whose value type is one of i32 / i64 / f32 / f64); unsupported shapes
-/// (mutable globals, v128 / reference value types, memory and table imports)
-/// continue to fail closed at compile time with their declared type metadata.
+/// recorded for shapes Stator can bind at runtime today (i32 / i64 / f32 /
+/// f64 globals — both immutable and mutable). v128 / reference-typed
+/// globals, memory imports, and table imports continue to fail closed at
+/// compile time with their declared type metadata because no Stator
+/// runtime/FFI primitive can safely materialise them yet.
+///
+/// For `mutable: true` imports the resolved JS dependency value is used as
+/// the *initial* value of the bound `wasmtime::Global`; subsequent writes
+/// performed by the running Wasm module mutate that store-owned global only
+/// and are not propagated back to the JS dependency export. This matches
+/// the host-side ownership contract documented on
+/// [`stator_jse::wasm::HostGlobal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WasmGlobalImport {
     /// Wasm import module namespace (e.g. `"env"`).
@@ -2603,9 +2611,10 @@ struct WasmGlobalImport {
     name: String,
     /// Declared global value kind.
     value_type: HostValKind,
-    /// Whether the import requires a mutable (`var`) global. The current
-    /// slice only records immutable globals here; if this is ever `true` the
-    /// module compile path returned a fail-closed diagnostic instead.
+    /// Whether the import requires a mutable (`var`) global. Both `false`
+    /// (const) and `true` (mut) are supported; the corresponding host
+    /// global is created with matching mutability and Wasmtime fails
+    /// instantiation on any mismatch.
     mutable: bool,
 }
 
@@ -3442,6 +3451,7 @@ fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImpor
             },
             Global {
                 value_type: HostValKind,
+                mutable: bool,
             },
         }
 
@@ -3463,15 +3473,18 @@ fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImpor
             }
             stator_jse::wasm::WasmExternKind::Global {
                 value_type: Ok(value_type),
-                mutable: false,
-            } => AcceptedImport::Global { value_type },
+                mutable,
+            } => AcceptedImport::Global {
+                value_type,
+                mutable,
+            },
             other => {
                 return Err(format!(
                     "WebAssembly module import '{module_name}.{field_name}' has unsupported {}; \
-                     Stator can only bind function imports and immutable i32/i64/f32/f64 global \
-                     imports because no runtime/FFI primitive safely exposes mutable globals, \
-                     v128/reference globals, WebAssembly memories, or WebAssembly tables as \
-                     imports yet",
+                     Stator can only bind function imports and i32/i64/f32/f64 global imports \
+                     (const or mut) because no runtime/FFI primitive safely exposes \
+                     v128/reference-typed globals, WebAssembly memories, or WebAssembly tables \
+                     as imports yet",
                     describe_unsupported_wasm_import_kind(other)
                 ));
             }
@@ -3517,12 +3530,15 @@ fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImpor
                     results,
                 });
             }
-            AcceptedImport::Global { value_type } => {
+            AcceptedImport::Global {
+                value_type,
+                mutable,
+            } => {
                 global_imports.push(WasmGlobalImport {
                     module: module_name,
                     name: field_name,
                     value_type,
-                    mutable: false,
+                    mutable,
                 });
             }
         }
@@ -19258,9 +19274,6 @@ mod tests {
         0x03, 0x74, 0x61, 0x62, 0x01, 0x70, 0x00, 0x01,
     ];
 
-    // Imports `env.add: (i32,i32)->i32` and exports `run: () -> i32` whose
-    // body is `i32.const 1; i32.const 2; call $env.add`. Used to exercise
-    // Wasm-to-Wasm function imports with a callable JS entry point.
     // Imports `env.g: i32 (const)` and exports `get: () -> i32` whose body
     // is `global.get 0`. Used to exercise immutable global imports resolved
     // from a JS dependency module.
@@ -19275,6 +19288,42 @@ mod tests {
         0x07, 0x07, 0x01, 0x03, 0x67, 0x65, 0x74, 0x00, 0x00,
         // code section: global.get 0; end
         0x0a, 0x06, 0x01, 0x04, 0x00, 0x23, 0x00, 0x0b,
+    ];
+
+    // Imports `env.g: i32 (mut)` and exports `get: () -> i32` and
+    // `set: (i32) -> ()` operating on it. Used to exercise mutable global
+    // imports through the module graph: `get` reports the initial value
+    // observed from the JS dependency export, and `set`/`get` together
+    // confirm that wasm-side writes to the bound store-owned global are
+    // observable inside the importer.
+    const WASM_IMPORT_MUT_GLOBAL_GET_SET: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 2 types `() -> i32` and `(i32) -> ()`
+        0x01, 0x09, 0x02, 0x60, 0x00, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x00,
+        // import section: env.g (global i32 mut)
+        0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x01, 0x67, 0x03, 0x7f, 0x01,
+        // function section: 2 funcs of types 0,1
+        0x03, 0x03, 0x02, 0x00, 0x01, // export section: "get" func 0, "set" func 1
+        0x07, 0x0d, 0x02, 0x03, 0x67, 0x65, 0x74, 0x00, 0x00, 0x03, 0x73, 0x65, 0x74, 0x00, 0x01,
+        // code section: 2 funcs
+        // func 0 (get): locals=0, global.get 0, end (body len 4)
+        // func 1 (set): locals=0, local.get 0, global.set 0, end (body len 6)
+        0x0a, 0x0d, 0x02, 0x04, 0x00, 0x23, 0x00, 0x0b, 0x06, 0x00, 0x20, 0x00, 0x24, 0x00, 0x0b,
+    ];
+
+    // Imports a v128 global `env.g` (no other sections). v128 globals are
+    // not representable through `HostValKind` and remain fail-closed.
+    const WASM_IMPORT_V128_GLOBAL: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x01, 0x67, 0x03, 0x7b, 0x00,
+    ];
+
+    // Imports an externref global `env.g` (no other sections). Reference
+    // globals are not representable through `HostValKind` and remain
+    // fail-closed.
+    const WASM_IMPORT_EXTERNREF_GLOBAL: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x01, 0x67, 0x03, 0x6f, 0x00,
     ];
 
     const WASM_IMPORT_ADD_RUN: &[u8] = &[
@@ -19801,10 +19850,95 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_unsupported_mutable_global_import_fails_compilation() {
-        assert_wasm_unsupported_import_kind_fails_compilation(
+    fn test_module_wasm_mutable_global_import_compiles_successfully() {
+        // Mutable i32/i64/f32/f64 global imports are bound at evaluation
+        // time from the resolved dependency's namespace; compilation
+        // succeeds and the module reaches the unlinked state.
+        let module = compile_typed_module_bytes(
             WASM_IMPORT_MUT_GLOBAL,
-            &["env.g", "global", "mutable", "I32"],
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusUnlinked
+            );
+            assert!(stator_module_get_error(module).is_null());
+            stator_module_free(module);
+        }
+    }
+
+    /// A Wasm module importing `env.g` as `(mut i32)` links against a JS
+    /// dependency that `export const g = N` and then mutates the bound
+    /// store-owned global. The initial value is observable via `get`, and
+    /// after `set(99)` a subsequent `get()` reports the updated value.
+    /// The JS-side export is intentionally not written back: this matches
+    /// the documented host-global ownership contract.
+    #[test]
+    fn test_module_wasm_mutable_global_import_binds_initial_and_supports_writes() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { get, set } from './importer.wasm' with { type: 'webassembly' };\
+             const before = get();\
+             set(99);\
+             const after = get();\
+             before * 1000 + after;",
+        );
+        let importer = compile_typed_module_bytes(
+            WASM_IMPORT_MUT_GLOBAL_GET_SET,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep = compile_module_src("export const g = 7;");
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 7099.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_v128_global_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_V128_GLOBAL,
+            &["env.g", "global", "v128"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_externref_global_import_fails_compilation() {
+        assert_wasm_unsupported_import_kind_fails_compilation(
+            WASM_IMPORT_EXTERNREF_GLOBAL,
+            &["env.g", "global", "ref null extern"],
         );
     }
 
@@ -20067,11 +20201,67 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_code_cache_rejects_unsupported_mutable_global_import_kind() {
-        // Mutable globals remain unsupported and so still reach the
-        // cache-rejection path; the immutable counterpart is exercised by the
-        // round-trip test that follows.
-        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_MUT_GLOBAL);
+    fn test_module_wasm_code_cache_with_mutable_global_import_roundtrip() {
+        // Mutable globals are now a supported import shape and serialise
+        // through the cache the same way function and immutable global
+        // imports do; the cached payload validates and recompiles cleanly.
+        let module = compile_typed_module_bytes(
+            WASM_IMPORT_MUT_GLOBAL_GET_SET,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                WASM_IMPORT_MUT_GLOBAL_GET_SET.as_ptr() as *const c_char,
+                WASM_IMPORT_MUT_GLOBAL_GET_SET.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                WASM_IMPORT_MUT_GLOBAL_GET_SET.as_ptr() as *const c_char,
+                WASM_IMPORT_MUT_GLOBAL_GET_SET.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        );
+        // SAFETY: restored is live.
+        unsafe {
+            assert!(stator_module_get_error(restored).is_null());
+            assert_eq!(stator_module_get_request_count(restored), 1);
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_v128_global_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_V128_GLOBAL);
+    }
+
+    #[test]
+    fn test_module_wasm_code_cache_rejects_unsupported_externref_global_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_EXTERNREF_GLOBAL);
     }
 
     #[test]
