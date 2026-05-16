@@ -15625,6 +15625,318 @@ mod tests {
     }
 
     #[test]
+    fn test_module_compile_compound_assignment_to_imported_binding_fails_closed() {
+        let module = compile_module_src("import { value } from './dep.js'; value += 1;");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'value'"),
+                "expected compound-assign rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_postfix_update_on_imported_binding_fails_closed() {
+        let module = compile_module_src("import { value } from './dep.js'; value++;");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'value'"),
+                "expected post-increment rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_prefix_update_on_imported_binding_fails_closed() {
+        let module = compile_module_src("import { value } from './dep.js'; --value;");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'value'"),
+                "expected pre-decrement rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_object_destructuring_assignment_to_imported_fails_closed() {
+        let module =
+            compile_module_src("import { value } from './dep.js'; ({ value } = { value: 1 });");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'value'"),
+                "expected destructuring rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_array_destructuring_assignment_to_imported_fails_closed() {
+        let module = compile_module_src("import { value } from './dep.js'; [value] = [9];");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'value'"),
+                "expected array-destructuring rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_compile_assignment_to_namespace_import_fails_closed() {
+        let module = compile_module_src("import * as ns from './dep.js'; ns = { x: 1 };");
+        // SAFETY: `module` is a non-null module pointer returned by compile.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("Assignment to constant variable 'ns'"),
+                "expected namespace-binding rejection, got: {err}"
+            );
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_aliased_export_propagates_local_writes_through_alias_cell() {
+        // ECMAScript Module Environment Records: `export { x as y }` and
+        // `export let x` create separate exported names that observe the
+        // same live binding cell. A subsequent assignment to `x` must be
+        // visible to `import { y }` importers as well.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { y } from './dep.js'; y;");
+        let dep = compile_module_src("export let x = 1; export { x as y }; x = 42;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_aliased_export_namespace_observes_alias_cell() {
+        // `import * as ns` should observe the alias cell `y`, even after
+        // the local `x` is mutated; the namespace's read-through binding
+        // must resolve to the same cell that `export { x as y }` populates.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import * as ns from './dep.js'; ns.y;");
+        let dep = compile_module_src("export let x = 0; export { x as y }; x = 7;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 7.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_multiple_aliases_share_local_writes() {
+        // `export { x, x as y, x as z }` must publish every later mutation
+        // of `x` to all three exported alias cells, not just the one whose
+        // name happens to match the local.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { x, y, z } from './dep.js'; x + y + z;");
+        let dep = compile_module_src("export let x = 1; export { x as y, x as z }; x = 5;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 15.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_aliased_export_write_from_inner_function_propagates() {
+        // Closure write-through: a function inside the exporting module
+        // mutates the local backing `export { x as y }`. The next read of
+        // the alias must observe that update through the live cell.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { y } from './dep.js'; y;");
+        let dep = compile_module_src(
+            "export let x = 0; export { x as y }; (function inner() { x = 99; })();",
+        );
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            if result.is_null() {
+                let err = CStr::from_ptr(stator_module_get_error(root))
+                    .to_str()
+                    .unwrap();
+                panic!("module evaluation failed: {err}");
+            }
+            assert_eq!(stator_value_to_number(result), 99.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_module_evaluate_namespace_import_exposes_named_and_default_exports() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.

@@ -185,6 +185,10 @@ struct FunctionCompileOptions {
     is_module: bool,
     module_variables: HashMap<String, (u32, i32)>,
     exported_module_bindings: HashSet<String>,
+    /// Local-name → exported-alias map propagated to inner function bodies so
+    /// stores into a captured module-exported binding write through to every
+    /// alias cell. See [`FunctionCompiler::local_export_aliases`].
+    local_export_aliases: HashMap<String, Vec<String>>,
 }
 
 const CLASS_STATIC_INITIALIZER_SLOT_NAME: &str = "__class_static_initializer__";
@@ -276,6 +280,9 @@ struct FunctionCompiler {
     /// Assignments to these names write through to the corresponding module
     /// cell so later import binding snapshots observe the final exported value.
     exported_module_bindings: HashSet<String>,
+    /// Maps each local binding name to every exported alias it backs. See
+    /// [`FunctionCompileOptions::local_export_aliases`] for the semantics.
+    local_export_aliases: HashMap<String, Vec<String>>,
     /// `true` when the expression currently being compiled is in tail
     /// position (i.e. its value is immediately returned).  Set by
     /// [`compile_return`] and consumed by [`compile_call`] /
@@ -360,6 +367,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             exported_module_bindings: HashSet::new(),
+            local_export_aliases: HashMap::new(),
             in_tail_position: false,
             is_strict: false,
             using_vars: vec![Vec::new()],
@@ -1776,6 +1784,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
+                local_export_aliases: self.local_export_aliases.clone(),
             },
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
@@ -2510,6 +2519,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             exported_module_bindings: HashSet::new(),
+            local_export_aliases: HashMap::new(),
             in_tail_position: false,
             is_strict: true,
             using_vars: vec![Vec::new()],
@@ -3658,14 +3668,27 @@ impl FunctionCompiler {
     }
 
     fn emit_exported_module_write_through(&mut self, name: &str) {
-        if !self.is_module || !self.exported_module_bindings.contains(name) {
+        if !self.is_module {
             return;
         }
-        let (req_idx, cell) = self.get_or_create_module_variable("", name);
-        self.emit(Instruction::new_unchecked(
-            Opcode::StaModuleVariable,
-            vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
-        ));
+        // Collect aliases up front so we don't borrow `self` while emitting.
+        let aliases: Vec<String> = match self.local_export_aliases.get(name) {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => {
+                if self.exported_module_bindings.contains(name) {
+                    vec![name.to_string()]
+                } else {
+                    return;
+                }
+            }
+        };
+        for alias in aliases {
+            let (req_idx, cell) = self.get_or_create_module_variable("", &alias);
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaModuleVariable,
+                vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+            ));
+        }
     }
 
     /// Compile a unary expression.
@@ -5134,6 +5157,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
+                local_export_aliases: self.local_export_aliases.clone(),
             },
         )?;
         let func_array = if let Some(name) = self_name {
@@ -5181,6 +5205,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
+                local_export_aliases: self.local_export_aliases.clone(),
             },
         )?
         .with_function_name(name);
@@ -5233,6 +5258,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
+                local_export_aliases: self.local_export_aliases.clone(),
             },
         )?
         .with_arrow_flag(true)
@@ -5317,6 +5343,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
+                local_export_aliases: self.local_export_aliases.clone(),
             },
         )?
         .with_arrow_flag(true);
@@ -7063,8 +7090,23 @@ impl FunctionCompiler {
         }
     }
 
-    fn local_export_names(program: &Program) -> HashSet<String> {
-        let mut names = HashSet::new();
+    /// Build the local-name → exported-alias map for `program` (a module).
+    ///
+    /// `export let x` and `export function f(){}` produce `x -> [x]` /
+    /// `f -> [f]`. `export { x as y }` produces `x -> [y]`. Multiple
+    /// specifiers re-aliasing the same local accumulate (`x -> [x, y, z]`).
+    /// Indirect re-exports `export { x } from "dep"` are skipped here — the
+    /// importing module has no local `x` to write through to; that path is
+    /// handled by [`compile_export_named`] which directly emits a
+    /// `StaModuleVariable` at evaluation time.
+    fn local_export_aliases(program: &Program) -> HashMap<String, Vec<String>> {
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let add = |local: String, exported: String, aliases: &mut HashMap<String, Vec<String>>| {
+            let entry = aliases.entry(local).or_default();
+            if !entry.contains(&exported) {
+                entry.push(exported);
+            }
+        };
         for item in &program.body {
             let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) = item else {
                 continue;
@@ -7073,15 +7115,22 @@ impl FunctionCompiler {
                 continue;
             }
             for spec in &decl.specifiers {
-                if let ModuleExportName::Ident(id) = &spec.local {
-                    names.insert(id.name.clone());
-                }
+                let ModuleExportName::Ident(local_id) = &spec.local else {
+                    continue;
+                };
+                let exported_name = match &spec.exported {
+                    ModuleExportName::Ident(id) => id.name.clone(),
+                    ModuleExportName::Str(s) => s.value.clone(),
+                };
+                add(local_id.name.clone(), exported_name, &mut aliases);
             }
             if let Some(stmt) = &decl.declaration {
-                names.extend(Self::declared_names(stmt));
+                for name in Self::declared_names(stmt) {
+                    add(name.clone(), name, &mut aliases);
+                }
             }
         }
-        names
+        aliases
     }
 
     // ── Finalization ─────────────────────────────────────────────────────────
@@ -7260,6 +7309,7 @@ fn compile_function_with_private_names(
             is_module: false,
             module_variables: HashMap::new(),
             exported_module_bindings: HashSet::new(),
+            local_export_aliases: HashMap::new(),
         },
     )
 }
@@ -8252,6 +8302,7 @@ fn compile_function_inner(
         is_module,
         module_variables,
         exported_module_bindings,
+        local_export_aliases,
     } = options;
     compiler.private_names = private_names;
     compiler.source_text = source_text;
@@ -8260,6 +8311,7 @@ fn compile_function_inner(
     let _ = module_variables;
     compiler.module_variables = HashMap::new();
     compiler.exported_module_bindings = exported_module_bindings;
+    compiler.local_export_aliases = local_export_aliases;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,
@@ -8452,7 +8504,9 @@ impl BytecodeGenerator {
         let is_module = program.source_type == SourceType::Module;
         compiler.is_module = is_module;
         if is_module {
-            compiler.exported_module_bindings = FunctionCompiler::local_export_names(program);
+            compiler.local_export_aliases = FunctionCompiler::local_export_aliases(program);
+            compiler.exported_module_bindings =
+                compiler.local_export_aliases.keys().cloned().collect();
         }
         // Modules are always strict; scripts inherit the AST flag.
         compiler.is_strict = program.is_strict || is_module;
