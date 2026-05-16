@@ -239,13 +239,41 @@ impl std::fmt::Debug for ModuleBindingCell {
 }
 
 impl ModuleBindingCell {
-    /// Read the current value from the backing module binding.
+    /// Read the current value from the backing module binding, transparently
+    /// following indirect re-export chains so callers always see the
+    /// dependency's live value rather than another forwarding cell.
+    ///
+    /// The follow-through is bounded (16 hops) and breaks on key-cycles so a
+    /// pathological re-export cycle resolves to `undefined` instead of
+    /// looping forever.
     pub fn read(&self) -> JsValue {
-        self.global_env
-            .borrow()
-            .get(&self.key)
-            .cloned()
-            .unwrap_or(JsValue::Undefined)
+        let mut current_env: Rc<RefCell<crate::interpreter::GlobalEnv>> =
+            Rc::clone(&self.global_env);
+        let mut current_key: Rc<str> = Rc::clone(&self.key);
+        let mut visited: smallvec::SmallVec<[(usize, String); 4]> = smallvec::SmallVec::new();
+        for _ in 0..16 {
+            let env_ptr = Rc::as_ptr(&current_env) as usize;
+            if visited
+                .iter()
+                .any(|(env, key)| *env == env_ptr && key.as_str() == current_key.as_ref())
+            {
+                return JsValue::Undefined;
+            }
+            visited.push((env_ptr, current_key.as_ref().to_string()));
+            let value = current_env
+                .borrow()
+                .get(current_key.as_ref())
+                .cloned()
+                .unwrap_or(JsValue::Undefined);
+            match value {
+                JsValue::ModuleBinding(next) => {
+                    current_env = Rc::clone(&next.global_env);
+                    current_key = Rc::clone(&next.key);
+                }
+                other => return other,
+            }
+        }
+        JsValue::Undefined
     }
 }
 

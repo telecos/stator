@@ -2510,6 +2510,26 @@ pub struct StatorModule {
     /// `import * as b from "same-mod"` evaluate to the same `a === b` object
     /// whichever importer publishes it first.
     namespace: Option<JsValue>,
+    /// Indirect re-exports (`export { local as exported } from "src"` and
+    /// `export { default as exported } from "src"`).  Each entry records
+    /// the exported alias visible on this module, the source specifier (a
+    /// key into [`Self::module_requests`]), and the local name to forward
+    /// from. The runtime installs forwarding [`ModuleBindingCell`]s so that
+    /// reads of the re-exported binding observe live mutations of the
+    /// original cell rather than a value snapshot at link/evaluate time.
+    indirect_reexports: Vec<IndirectReExport>,
+}
+
+/// A single `export { local as exported } from "src"` indirect re-export.
+#[derive(Debug, Clone)]
+struct IndirectReExport {
+    /// The name visible to importers of this module.
+    exported_name: String,
+    /// The source-module specifier (matches a [`StatorModuleRequest::specifier`]).
+    source_specifier: String,
+    /// The binding name to forward from the source module (`"default"`
+    /// for `export { default as ... } from "src"`).
+    local_name: String,
 }
 
 struct StatorModuleRequest {
@@ -3016,9 +3036,16 @@ fn collect_decl_export_names(stmt: &Stmt, exports: &mut HashSet<String>) {
     }
 }
 
-fn collect_module_requests(program: &Program) -> (Vec<StatorModuleRequest>, HashSet<String>) {
+fn collect_module_requests(
+    program: &Program,
+) -> (
+    Vec<StatorModuleRequest>,
+    HashSet<String>,
+    Vec<IndirectReExport>,
+) {
     let mut requests = Vec::new();
     let mut exports: HashSet<String> = HashSet::new();
+    let mut indirect_reexports: Vec<IndirectReExport> = Vec::new();
     for item in &program.body {
         match item {
             ProgramItem::ModuleDecl(ModuleDecl::Import(decl)) => {
@@ -3053,15 +3080,22 @@ fn collect_module_requests(program: &Program) -> (Vec<StatorModuleRequest>, Hash
             ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) => {
                 if let Some(source) = &decl.source {
                     let mut imports = Vec::new();
+                    let source_specifier =
+                        module_request_specifier_value(&source.value).to_string();
                     for spec in &decl.specifiers {
                         let local = module_export_name_str(&spec.local).to_string();
                         let exported = module_export_name_str(&spec.exported).to_string();
                         imports.push(if local == "default" {
                             RequestedExport::Default
                         } else {
-                            RequestedExport::Named(local)
+                            RequestedExport::Named(local.clone())
                         });
-                        exports.insert(exported);
+                        exports.insert(exported.clone());
+                        indirect_reexports.push(IndirectReExport {
+                            exported_name: exported,
+                            source_specifier: source_specifier.clone(),
+                            local_name: local,
+                        });
                     }
                     if let Some(req) = module_request_for(&source.value, &decl.attributes, imports)
                     {
@@ -3082,7 +3116,7 @@ fn collect_module_requests(program: &Program) -> (Vec<StatorModuleRequest>, Hash
             ProgramItem::Stmt(_) => {}
         }
     }
-    (requests, exports)
+    (requests, exports, indirect_reexports)
 }
 
 fn module_rejection_to_error(reason: JsValue) -> stator_jse::error::StatorError {
@@ -3148,6 +3182,7 @@ fn module_error_record(
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
+        indirect_reexports: Vec::new(),
     })
 }
 
@@ -3215,6 +3250,7 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
+                indirect_reexports: Vec::new(),
             })
         }
         Err(error) => module_error_record(
@@ -3288,6 +3324,7 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
+                indirect_reexports: Vec::new(),
             })
         }
         Err(error) => module_error_record(
@@ -3573,7 +3610,7 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// WebAssembly payload variant containing original Wasm bytes plus import/export
 /// metadata; hits validate the payload and then recompile the Wasm bytes because
 /// no safe untrusted compiled-artifact restore primitive is available.
-const MODULE_CACHE_FORMAT_VERSION: u32 = 4;
+const MODULE_CACHE_FORMAT_VERSION: u32 = 5;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
@@ -3706,7 +3743,15 @@ struct JsModulePayload {
     has_dependencies: bool,
     module_requests: Vec<SerializedModuleRequest>,
     direct_exports: Vec<Vec<u8>>,
+    indirect_reexports: Vec<SerializedIndirectReExport>,
     bytecode: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SerializedIndirectReExport {
+    exported_name: Vec<u8>,
+    source_specifier: Vec<u8>,
+    local_name: Vec<u8>,
 }
 
 struct JsonModulePayload {
@@ -3788,6 +3833,19 @@ fn serialize_js_module_payload(payload: &JsModulePayload, out: &mut Vec<u8>) -> 
     push_u32(out, export_count);
     for name in &payload.direct_exports {
         if !push_bytes(out, name) {
+            return false;
+        }
+    }
+
+    let Ok(indirect_count) = u32::try_from(payload.indirect_reexports.len()) else {
+        return false;
+    };
+    push_u32(out, indirect_count);
+    for entry in &payload.indirect_reexports {
+        if !push_bytes(out, &entry.exported_name)
+            || !push_bytes(out, &entry.source_specifier)
+            || !push_bytes(out, &entry.local_name)
+        {
             return false;
         }
     }
@@ -3903,12 +3961,26 @@ fn parse_js_module_payload(reader: &mut CacheReader<'_>) -> Option<JsModulePaylo
         direct_exports.push(reader.read_bytes()?);
     }
 
+    let indirect_count = reader.read_u32()? as usize;
+    let mut indirect_reexports = Vec::with_capacity(indirect_count);
+    for _ in 0..indirect_count {
+        let exported_name = reader.read_bytes()?;
+        let source_specifier = reader.read_bytes()?;
+        let local_name = reader.read_bytes()?;
+        indirect_reexports.push(SerializedIndirectReExport {
+            exported_name,
+            source_specifier,
+            local_name,
+        });
+    }
+
     let bytecode = reader.read_bytes()?;
 
     Some(JsModulePayload {
         has_dependencies,
         module_requests,
         direct_exports,
+        indirect_reexports,
         bytecode,
     })
 }
@@ -4170,10 +4242,27 @@ fn module_cache_payload_from_module(
                 .map(|name| name.as_bytes().to_vec())
                 .collect();
             direct_exports.sort();
+            let mut indirect_reexports: Vec<SerializedIndirectReExport> = module
+                .indirect_reexports
+                .iter()
+                .map(|entry| SerializedIndirectReExport {
+                    exported_name: entry.exported_name.as_bytes().to_vec(),
+                    source_specifier: entry.source_specifier.as_bytes().to_vec(),
+                    local_name: entry.local_name.as_bytes().to_vec(),
+                })
+                .collect();
+            indirect_reexports.sort_by(|a, b| {
+                a.exported_name.cmp(&b.exported_name).then_with(|| {
+                    a.source_specifier
+                        .cmp(&b.source_specifier)
+                        .then(a.local_name.cmp(&b.local_name))
+                })
+            });
             Some(ModuleCachePayload::JavaScript(JsModulePayload {
                 has_dependencies: module.has_dependencies,
                 module_requests,
                 direct_exports,
+                indirect_reexports,
                 bytecode: serialize_bytecode_array(bytecodes),
             }))
         }
@@ -4276,6 +4365,14 @@ fn module_from_js_cache_payload(
     for name in payload.direct_exports {
         direct_exports.insert(String::from_utf8(name).ok()?);
     }
+    let mut indirect_reexports = Vec::with_capacity(payload.indirect_reexports.len());
+    for entry in payload.indirect_reexports {
+        indirect_reexports.push(IndirectReExport {
+            exported_name: String::from_utf8(entry.exported_name).ok()?,
+            source_specifier: String::from_utf8(entry.source_specifier).ok()?,
+            local_name: String::from_utf8(entry.local_name).ok()?,
+        });
+    }
     Some(Box::new(StatorModule {
         bytecodes: Some(Rc::new(bytecode)),
         json_default: None,
@@ -4300,6 +4397,7 @@ fn module_from_js_cache_payload(
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
+        indirect_reexports,
     }))
 }
 
@@ -4335,6 +4433,7 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
         namespace: None,
+        indirect_reexports: Vec::new(),
     }))
 }
 
@@ -4586,6 +4685,7 @@ unsafe fn compile_module_source(
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             namespace: None,
+            indirect_reexports: Vec::new(),
         });
         return Box::into_raw(module);
     }
@@ -4623,6 +4723,7 @@ unsafe fn compile_module_source(
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
+                indirect_reexports: Vec::new(),
             });
             return Box::into_raw(module);
         }
@@ -4665,19 +4766,28 @@ unsafe fn compile_module_source(
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
             namespace: None,
+            indirect_reexports: Vec::new(),
         });
         return Box::into_raw(module);
     }
 
     let result = parser::parse_module(src).and_then(|program| {
         let has_dependencies = program_has_module_dependencies(&program);
-        let (module_requests, direct_exports) = collect_module_requests(&program);
-        BytecodeGenerator::compile_program(&program)
-            .map(|bytecodes| (bytecodes, has_dependencies, module_requests, direct_exports))
+        let (module_requests, direct_exports, indirect_reexports) =
+            collect_module_requests(&program);
+        BytecodeGenerator::compile_program(&program).map(|bytecodes| {
+            (
+                bytecodes,
+                has_dependencies,
+                module_requests,
+                direct_exports,
+                indirect_reexports,
+            )
+        })
     });
 
     let module = match result {
-        Ok((bytecodes, has_dependencies, module_requests, direct_exports)) => {
+        Ok((bytecodes, has_dependencies, module_requests, direct_exports, indirect_reexports)) => {
             Box::new(StatorModule {
                 bytecodes: Some(Rc::new(bytecodes)),
                 json_default: None,
@@ -4702,6 +4812,7 @@ unsafe fn compile_module_source(
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
+                indirect_reexports,
             })
         }
         Err(e) => {
@@ -4731,6 +4842,7 @@ unsafe fn compile_module_source(
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
                 namespace: None,
+                indirect_reexports: Vec::new(),
             })
         }
     };
@@ -6527,6 +6639,62 @@ fn sync_module_request_bindings(
     Ok(())
 }
 
+/// Install live forwarding cells for every `export { local as exported } from
+/// "src"` indirect re-export declared by `module`.
+///
+/// Each indirect re-export is published into the shared module global
+/// environment as a [`ModuleBindingCell`] keyed at
+/// `__mod:{module}:hash(exported)` whose backing key is
+/// `__mod:{src_module}:hash(local)`. Reads through any importer (named
+/// import, namespace property access, or downstream re-export) therefore
+/// observe live mutations of the original binding rather than a snapshot
+/// taken at link/evaluate time. Chains of re-exports collapse via the
+/// recursive read in [`ModuleBindingCell::read`].
+///
+/// Must be invoked after every dependency referenced by an indirect
+/// re-export has been linked; the installed forwarding cells point at
+/// dependency-side keys that may still be uninitialised at that moment, but
+/// any subsequent read goes through `ModuleBindingCell::read` which
+/// gracefully resolves to `undefined` until the dependency populates the
+/// cell. The runtime evaluator drives dependencies depth-first before
+/// running the importing module's body, so by the time importers observe
+/// these cells the dependency values are present.
+///
+/// # Safety
+/// `module` must be a non-null pointer to a live, linked module record.
+unsafe fn install_indirect_reexports(
+    module: *mut StatorModule,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) {
+    if module.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `module` is a live, linked module pointer.
+    let module_ref = unsafe { &*module };
+    if module_ref.indirect_reexports.is_empty() {
+        return;
+    }
+    let owner_key = module_runtime_key(module);
+    for entry in &module_ref.indirect_reexports {
+        let dep = module_ref
+            .module_requests
+            .iter()
+            .find(|req| req.specifier.to_string_lossy() == entry.source_specifier.as_str())
+            .map(|req| req.resolved.get())
+            .unwrap_or(std::ptr::null_mut());
+        if dep.is_null() {
+            continue;
+        }
+        let target_key = module_export_cell_key(dep, &entry.local_name);
+        let import_key = module_cell_key(&owner_key, &entry.exported_name);
+        let value = JsValue::ModuleBinding(Rc::new(ModuleBindingCell {
+            global_env: Rc::clone(global_env),
+            key: target_key.into(),
+        }));
+        global_env.borrow_mut().insert(import_key, value);
+    }
+}
+
 /// Collect names exposed by a module for namespace publication. Direct exports
 /// take precedence; ambiguous names reachable only through star re-exports are
 /// omitted so namespace imports fail closed instead of choosing a provider.
@@ -7289,6 +7457,12 @@ unsafe fn evaluate_module_graph(
             sync_module_request_bindings(request, global_env)?;
             publish_module_namespace(request, global_env);
         }
+        // Install live forwarding cells for every `export { x } from "src"`
+        // indirect re-export so importers and namespace reads observe live
+        // mutations of the source module's binding rather than a snapshot
+        // taken when this module's body executed.
+        // SAFETY: `module` is a live, linked module pointer for this evaluation.
+        unsafe { install_indirect_reexports(module, global_env) };
         // SAFETY: bytecode and module are valid for this evaluation.
         unsafe { run_module_bytecodes(ctx, module, bytecodes, global_env) }
     })();
@@ -15996,6 +16170,205 @@ mod tests {
             stator_module_free(dep);
             stator_context_destroy(ctx);
         }
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_reexport_observes_live_update_through_function() {
+        // ECMAScript Module Environment Records: `export { x as y } from "dep"`
+        // must forward the importer's view of `y` to dep's live cell `x` —
+        // a function in dep that mutates `x` after evaluation must be
+        // observed through the re-export. This is the canonical failure
+        // mode of the previous Lda+Sta snapshotting implementation.
+        let result = evaluate_module_graph_number(
+            "import { y, bump } from './mid.js'; bump(); y;",
+            &[
+                (
+                    "./dep.js",
+                    "export let x = 1; export function bump() { x = 2; }",
+                ),
+                ("./mid.js", "export { x as y, bump } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(
+            result, 2.0,
+            "indirect re-export must forward live mutations from dep.x"
+        );
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_reexport_namespace_read_through() {
+        // Namespace property access on a module that re-exports a binding
+        // (`export { x as y } from "dep"`) must read the dependency's
+        // live cell rather than a snapshot taken when the re-exporter ran.
+        let result = evaluate_module_graph_number(
+            "import * as ns from './mid.js'; ns.bump(); ns.y;",
+            &[
+                (
+                    "./dep.js",
+                    "export let x = 5; export function bump() { x = 11; }",
+                ),
+                ("./mid.js", "export { x as y, bump } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(
+            result, 11.0,
+            "namespace property must read through indirect re-export"
+        );
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_reexport_chain_multi_hop_lives() {
+        // Three-level indirect re-export chain: a → b → c. Importer of c
+        // must observe live mutations of a's binding through both hops.
+        let result = evaluate_module_graph_number(
+            "import { z, bump } from './c.js'; bump(); z;",
+            &[
+                (
+                    "./a.js",
+                    "export let x = 0; export function bump() { x = 7; }",
+                ),
+                ("./b.js", "export { x as y, bump } from './a.js';"),
+                ("./c.js", "export { y as z, bump } from './b.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 7.0, "multi-hop re-export chain must stay live");
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_default_reexport_renamed_lives() {
+        // `export { default as renamed } from "dep"` participates in the
+        // same forwarding mechanism. Mutating the local backing through a
+        // post-evaluation function must be observed through the alias.
+        let result = evaluate_module_graph_number(
+            "import { renamed } from './mid.js'; renamed;",
+            &[
+                ("./dep.js", "export default 41;"),
+                ("./mid.js", "export { default as renamed } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 41.0, "default re-export alias must read live");
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_reexport_function_callable_through_chain() {
+        // Callable bindings re-exported through an alias chain must remain
+        // invocable; the forwarded cell carries the function value through
+        // every hop without losing call semantics.
+        let result = evaluate_module_graph_number(
+            "import { call } from './mid.js'; call();",
+            &[
+                ("./dep.js", "export function answer() { return 42; }"),
+                ("./mid.js", "export { answer as call } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(result, 42.0, "re-exported function must remain callable");
+    }
+
+    #[test]
+    fn test_module_evaluate_multiple_reexporters_share_live_dep_binding() {
+        // Two distinct re-exporting modules (`mid_a`, `mid_b`) both forward
+        // the same dep binding under different aliases. After dep mutates
+        // the original cell, both alias paths must observe the new value.
+        let result = evaluate_module_graph_number(
+            "import { ya } from './mid_a.js'; \
+             import { yb, bump } from './mid_b.js'; \
+             bump(); ya + yb;",
+            &[
+                (
+                    "./dep.js",
+                    "export let x = 1; export function bump() { x = 4; }",
+                ),
+                ("./mid_a.js", "export { x as ya } from './dep.js';"),
+                ("./mid_b.js", "export { x as yb, bump } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(
+            result, 8.0,
+            "all re-exporters must converge on the same live dep cell"
+        );
+    }
+
+    #[test]
+    fn test_module_instantiate_indirect_reexport_missing_local_still_syntax_error() {
+        // Regression: removing the snapshotting Lda+Sta emission must not
+        // weaken the link-time validator. `export { missing as alias } from
+        // "dep"` where dep does not export `missing` is still a SyntaxError.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { alias } from './mid.js'; alias;");
+        let mid = compile_module_src("export { missing as alias } from './dep.js';");
+        let dep = compile_module_src("export const present = 1;");
+        let mut modules = HashMap::new();
+        modules.insert("./mid.js".to_string(), mid);
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(
+                !stator_module_instantiate(ctx, root),
+                "missing indirect re-export must fail link"
+            );
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                err.contains("no export named 'missing'"),
+                "expected SyntaxError for missing source export, got: {err}"
+            );
+            stator_module_free(root);
+            for module in data.modules.into_values() {
+                stator_module_free(module);
+            }
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_module_evaluate_indirect_reexport_does_not_snapshot_at_evaluation() {
+        // Distinct re-exporter modules must observe the same post-evaluation
+        // mutation through the aliasing chain — confirming no snapshot is
+        // taken when the re-exporter's body runs (the bytecode emits no
+        // store for indirect re-exports under the new wiring).
+        let result = evaluate_module_graph_number(
+            "import { y } from './mid.js'; \
+             import { x, mutate } from './dep.js'; \
+             mutate(); y - x;",
+            &[
+                (
+                    "./dep.js",
+                    "export let x = 100; export function mutate() { x = 200; }",
+                ),
+                ("./mid.js", "export { x as y } from './dep.js';"),
+            ],
+        )
+        .unwrap_or_else(|err| panic!("module evaluation failed: {err}"));
+        assert_eq!(
+            result, 0.0,
+            "alias and direct import must observe the same live cell value"
+        );
     }
 
     #[test]

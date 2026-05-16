@@ -6977,34 +6977,16 @@ impl FunctionCompiler {
             return Ok(());
         }
 
-        // Re-export with source: `export { x } from "mod"`
-        if let Some(ref source) = decl.source {
-            for spec in &decl.specifiers {
-                let imported_name = match &spec.local {
-                    ModuleExportName::Ident(id) => id.name.as_str(),
-                    ModuleExportName::Str(s) => s.value.as_str(),
-                };
-                let (req_idx, cell) = self.get_or_create_module_variable(
-                    Self::module_specifier_value(&source.value),
-                    imported_name,
-                );
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaModuleVariable,
-                    vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
-                ));
-                let exported_name = match &spec.exported {
-                    ModuleExportName::Ident(id) => id.name.as_str(),
-                    ModuleExportName::Str(s) => s.value.as_str(),
-                };
-                let (out_req, out_cell) = self.get_or_create_module_variable("", exported_name);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::StaModuleVariable,
-                    vec![
-                        Operand::ConstantPoolIdx(out_req),
-                        Operand::Immediate(out_cell),
-                    ],
-                ));
-            }
+        // Re-export with source: `export { x } from "mod"`.
+        //
+        // Indirect re-exports are wired by the runtime as forwarding
+        // [`ModuleBindingCell`]s pointing at the source module's cell, so
+        // importers always observe live mutations of the original binding.
+        // We deliberately emit no `LdaModuleVariable`/`StaModuleVariable`
+        // pair here — doing so would snapshot the value at evaluation time
+        // and break live re-export semantics (see
+        // `stator_ffi::install_indirect_reexports`).
+        if decl.source.is_some() {
             return Ok(());
         }
 
@@ -11570,6 +11552,11 @@ mod tests {
     #[test]
     fn test_re_export_named_from_source() {
         use crate::parser::ast::{ExportNamedDecl, ExportSpecifier, ModuleDecl, ModuleExportName};
+        // `export { x as y } from "./mod.js"` is a pure indirect re-export.
+        // The bytecode generator emits no module-cell load/store for it —
+        // the runtime installs a forwarding ModuleBindingCell at link time
+        // so importers observe live mutations of the source binding rather
+        // than a snapshot taken at evaluation time.
         let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(
             ExportNamedDecl {
                 loc: span(),
@@ -11586,12 +11573,12 @@ mod tests {
         let ba = BytecodeGenerator::compile_program(&prog).unwrap();
         let instrs = decode(&ba.bytecodes()).unwrap();
         assert!(
-            instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
-            "re-export should load from source via LdaModuleVariable"
+            !instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
+            "indirect re-export must not emit LdaModuleVariable (would snapshot)"
         );
         assert!(
-            instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
-            "re-export should store via StaModuleVariable"
+            !instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
+            "indirect re-export must not emit StaModuleVariable (would snapshot)"
         );
     }
 
