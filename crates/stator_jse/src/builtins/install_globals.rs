@@ -55382,7 +55382,6 @@ mod tests {
 
     /// Custom Symbol.iterator: for-of consumes all values.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_custom_symbol_iterator_for_of() {
         let r = global_eval(
             r#"
@@ -55406,7 +55405,6 @@ mod tests {
 
     /// Iterator .return() is called on break in for-of.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix iterator return protocol on break
     fn e2e_iter_return_called_on_break() {
         let r = global_eval(
             r#"
@@ -55465,7 +55463,6 @@ mod tests {
 
     /// Iterator .return() called when returning from function inside for-of.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix iterator return-on-function-return
     fn e2e_iter_return_called_on_function_return() {
         let r = global_eval(
             r#"
@@ -55499,7 +55496,6 @@ mod tests {
 
     /// Spread in array literal uses custom iterator protocol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_spread_array_uses_custom_iterator() {
         let r = global_eval(
             r#"
@@ -55524,7 +55520,6 @@ mod tests {
 
     /// Spread custom iterator in function call arguments.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_spread_custom_in_call() {
         let r = global_eval(
             r#"
@@ -55549,7 +55544,6 @@ mod tests {
 
     /// Array destructuring uses iterator protocol with custom Symbol.iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_destructuring_uses_custom_iterator() {
         let r = global_eval(
             r#"
@@ -55574,7 +55568,6 @@ mod tests {
 
     /// Array destructuring with rest uses custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_destructuring_rest_custom_iterator() {
         let r = global_eval(
             r#"
@@ -55659,7 +55652,6 @@ mod tests {
 
     /// Iterator result with done: 0 (falsy) continues iteration.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_done_zero_is_falsy() {
         let r = global_eval(
             r#"
@@ -55702,7 +55694,6 @@ mod tests {
 
     /// Iterator result with done: null (falsy) continues.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_done_null_is_falsy() {
         let r = global_eval(
             r#"
@@ -55781,7 +55772,6 @@ mod tests {
 
     /// for-of with let binding and custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_for_of_let_binding() {
         let r = global_eval(
             r#"
@@ -55807,7 +55797,6 @@ mod tests {
 
     /// for-of with const binding and custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_for_of_const_binding() {
         let r = global_eval(
             r#"
@@ -55833,7 +55822,6 @@ mod tests {
 
     /// Custom iterator yielding objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_yields_objects() {
         let r = global_eval(
             r#"
@@ -55859,7 +55847,6 @@ mod tests {
 
     /// Stateful iterator: each for-of creates a fresh iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_fresh_iterator_each_loop() {
         let r = global_eval(
             r#"
@@ -55885,7 +55872,6 @@ mod tests {
 
     /// for-of continue does NOT call .return().
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_continue_does_not_call_return() {
         let r = global_eval(
             r#"
@@ -55916,7 +55902,6 @@ mod tests {
 
     /// Destructuring with default values and custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_destructuring_defaults_custom() {
         let r = global_eval(
             r#"
@@ -55941,7 +55926,6 @@ mod tests {
 
     /// Spread of empty custom iterator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_spread_empty_custom() {
         let r = global_eval(
             r#"
@@ -55961,7 +55945,6 @@ mod tests {
 
     /// for-of with throw in body calls .return() on iterator.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix iterator return-on-throw
     fn e2e_iter_return_called_on_throw() {
         let r = global_eval(
             r#"
@@ -56035,7 +56018,6 @@ mod tests {
 
     /// for-of with object destructuring and custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_for_of_object_destructuring_custom() {
         let r = global_eval(
             r#"
@@ -56061,7 +56043,6 @@ mod tests {
 
     /// new Set() with custom iterable.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_set_from_custom_iterable() {
         let r = global_eval(
             r#"
@@ -56111,7 +56092,6 @@ mod tests {
 
     /// Array.from with custom iterable.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_array_from_custom_iterable() {
         let r = global_eval(
             r#"
@@ -56162,7 +56142,6 @@ mod tests {
 
     /// Spread string produces individual characters.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_spread_string_chars() {
         let r = global_eval("[...'abc'].join('-')").unwrap();
         assert_eq!(r, JsValue::String("a-b-c".into()));
@@ -56177,7 +56156,6 @@ mod tests {
 
     /// Iterator without .return() method — break still works.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix for-of break with custom iterator
     fn e2e_iter_break_without_return_method() {
         let r = global_eval(
             r#"
@@ -56217,7 +56195,6 @@ mod tests {
 
     /// Spread generator into array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iter_spread_generator_into_array() {
         let r = global_eval(
             r#"
@@ -56232,7 +56209,6 @@ mod tests {
 
     /// Destructuring assignment (not declaration) with custom iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_destructuring_assignment_custom() {
         let r = global_eval(
             r#"
@@ -56258,7 +56234,6 @@ mod tests {
 
     /// Multiple spreads of same iterable create independent iterators.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_multiple_spread_independent() {
         let r = global_eval(
             r#"
