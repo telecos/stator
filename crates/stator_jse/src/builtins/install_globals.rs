@@ -42629,7 +42629,6 @@ mod tests {
 
     /// Setting prototype to self must throw TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_prototype_of_self() {
         let result = global_eval("var a = {}; Object.setPrototypeOf(a, a)");
         assert!(
@@ -43373,7 +43372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_prototype_of_null_removes_object_prototype_methods() {
         let result =
             global_eval("var o = {}; Object.setPrototypeOf(o, null); typeof o.toString").unwrap();

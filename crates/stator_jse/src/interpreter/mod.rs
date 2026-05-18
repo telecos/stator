@@ -724,8 +724,41 @@ pub(crate) fn ordinary_set_prototype_of(obj: &JsValue, proto: JsValue) -> Stator
         ));
     }
 
-    let current_proto = get_object_prototype(obj).unwrap_or(JsValue::Null);
-    if current_proto.same_value(&proto) {
+    // Spec §10.1.2.1 step 8: reject if the new prototype contains `obj` in
+    // its own prototype chain, including the case where the new prototype
+    // *is* `obj` itself (self-cycle). `has_prototype_in_chain` walks the
+    // parent chain starting from `proto.[[Prototype]]` and would miss the
+    // self-cycle case, so check `proto === obj` explicitly first.
+    if !matches!(proto, JsValue::Null)
+        && (proto.same_value(obj) || has_prototype_in_chain(&proto, obj))
+    {
+        return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
+    }
+
+    // Compute the *effective* current prototype. PlainObjects with no
+    // explicit `__proto__` slot have Object.prototype as their implicit
+    // prototype (every property lookup falls through to the built-in
+    // methods). Comparing against `JsValue::Null` here would make
+    // `Object.setPrototypeOf({}, null)` a silent no-op — the explicit-null
+    // marker would never be stored and subsequent property lookups would
+    // still dispatch against Object.prototype.
+    let effective_current_proto = match get_object_prototype(obj) {
+        Some(p) => p,
+        None => match obj {
+            JsValue::PlainObject(_) => {
+                global_constructor_prototype("Object").unwrap_or(JsValue::Null)
+            }
+            JsValue::Error(e) => {
+                global_constructor_prototype(e.kind.as_name()).unwrap_or(JsValue::Null)
+            }
+            _ => JsValue::Null,
+        },
+    };
+    if effective_current_proto.same_value(&proto) {
+        // No effective change. For extensible objects this is a true no-op;
+        // for non-extensible objects the spec requires success when the new
+        // prototype equals the current one (see e.g. the module-namespace
+        // `setPrototypeOf(ns, null)` test).
         return Ok(());
     }
 
@@ -735,9 +768,6 @@ pub(crate) fn ordinary_set_prototype_of(obj: &JsValue, proto: JsValue) -> Stator
                 return Err(StatorError::TypeError(
                     "Cannot set prototype of a non-extensible object".to_string(),
                 ));
-            }
-            if !matches!(proto, JsValue::Null) && has_prototype_in_chain(&proto, obj) {
-                return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
             }
             let mut m = map.borrow_mut();
             // Remove legacy "__proto__" key if present so it doesn't
@@ -750,9 +780,6 @@ pub(crate) fn ordinary_set_prototype_of(obj: &JsValue, proto: JsValue) -> Stator
                 return Err(StatorError::TypeError(
                     "Cannot set prototype of a non-extensible object".to_string(),
                 ));
-            }
-            if !matches!(proto, JsValue::Null) && has_prototype_in_chain(&proto, obj) {
-                return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
             }
             e.props
                 .borrow_mut()
