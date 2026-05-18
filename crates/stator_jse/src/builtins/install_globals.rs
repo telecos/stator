@@ -6396,10 +6396,11 @@ fn make_object() -> JsValue {
 
         // Object.prototype.toString()
         // ECMAScript §20.1.3.6 — returns "[object X]" classification.
+        // Called via `.call(value)` (or method-dispatch with the legacy
+        // receiver convention), so `args[0]` is the value to classify.
         obj_proto.insert(
             "toString".into(),
             builtin_fn("toString", 0, |args| {
-                // When called via .call(value), args[0] is the value.
                 if let Some(value) = args.first() {
                     return Ok(JsValue::String(value.obj_to_string_tag().into()));
                 }
@@ -18946,7 +18947,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(undefined)` → "[object Undefined]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_undefined() {
         let result = global_eval("Object.prototype.toString.call(undefined)").unwrap();
         assert_eq!(result, JsValue::String("[object Undefined]".into()));
@@ -18954,7 +18954,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(null)` → "[object Null]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_null() {
         let result = global_eval("Object.prototype.toString.call(null)").unwrap();
         assert_eq!(result, JsValue::String("[object Null]".into()));
@@ -18962,7 +18961,6 @@ mod tests {
 
     /// `Object.prototype.toString.call([])` → "[object Array]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_array() {
         let result = global_eval("Object.prototype.toString.call([])").unwrap();
         assert_eq!(result, JsValue::String("[object Array]".into()));
@@ -18970,7 +18968,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(true)` → "[object Boolean]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_boolean() {
         let result = global_eval("Object.prototype.toString.call(true)").unwrap();
         assert_eq!(result, JsValue::String("[object Boolean]".into()));
@@ -18978,7 +18975,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(42)` → "[object Number]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_number() {
         let result = global_eval("Object.prototype.toString.call(42)").unwrap();
         assert_eq!(result, JsValue::String("[object Number]".into()));
@@ -18986,7 +18982,6 @@ mod tests {
 
     /// `Object.prototype.toString.call("hi")` → "[object String]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_string() {
         let result = global_eval(r#"Object.prototype.toString.call("hi")"#).unwrap();
         assert_eq!(result, JsValue::String("[object String]".into()));
@@ -18994,7 +18989,6 @@ mod tests {
 
     /// `Object.prototype.toString.call({})` → "[object Object]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_object() {
         let result = global_eval("Object.prototype.toString.call({})").unwrap();
         assert_eq!(result, JsValue::String("[object Object]".into()));
@@ -19009,7 +19003,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(function(){})` → "[object Function]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_function() {
         let result = global_eval("Object.prototype.toString.call(function(){})").unwrap();
         assert_eq!(result, JsValue::String("[object Function]".into()));
@@ -19017,7 +19010,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(new Error())` → "[object Error]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_error() {
         let result = global_eval("Object.prototype.toString.call(new Error())").unwrap();
         assert_eq!(result, JsValue::String("[object Error]".into()));
@@ -19025,10 +19017,46 @@ mod tests {
 
     /// `Object.prototype.toString.call(new Date())` → "[object Date]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_date() {
         let result = global_eval("Object.prototype.toString.call(new Date())").unwrap();
         assert_eq!(result, JsValue::String("[object Date]".into()));
+    }
+
+    /// `Math.sin.call(null, x)` routes through Function.prototype.call on
+    /// a `builtin_fn`-backed PlainObject. The receiver must be ignored and
+    /// the argument forwarded in its natural position.
+    #[test]
+    fn e2e_builtin_fn_call_math_sin() {
+        let result = global_eval("Math.sin.call(null, 0)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Math.max.apply(null, [a, b, c])` exercises Function.prototype.apply
+    /// on a `builtin_fn`-backed PlainObject with an array argument list.
+    #[test]
+    fn e2e_builtin_fn_apply_math_max() {
+        let result = global_eval("Math.max.apply(null, [1, 7, 3])").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// `Math.pow.bind(Math, 2)` partially applies via Function.prototype.bind
+    /// on a `builtin_fn`-backed PlainObject; the bound argument is supplied
+    /// as the first parameter and the call-time argument as the second.
+    #[test]
+    fn e2e_builtin_fn_bind_math_pow() {
+        // Math.pow ignores thisArg; bound first arg = 2, call arg = 8 → 2**8.
+        let result = global_eval("Math.pow.bind(Math, 2)(8)").unwrap();
+        assert_eq!(result, JsValue::Smi(256));
+    }
+
+    /// `Array.prototype.push.call(arr, ...)` exercises `.call` on a
+    /// `builtin_fn`-backed PlainObject with the receiver convention used by
+    /// stator's array prototype natives.
+    #[test]
+    fn e2e_builtin_fn_call_array_push() {
+        let result =
+            global_eval("var a = [1, 2]; Array.prototype.push.call(a, 3, 4); a.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3,4".into()));
     }
 
     /// `typeof Symbol.match` → "symbol"
@@ -19807,7 +19835,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(Symbol("x"))` → "[object Symbol]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_symbol() {
         let result = global_eval(r#"Object.prototype.toString.call(Symbol("x"))"#).unwrap();
         assert_eq!(result, JsValue::String("[object Symbol]".into()));
@@ -19815,7 +19842,6 @@ mod tests {
 
     /// `Object.prototype.toString.call(Symbol.iterator)` → "[object Symbol]"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_obj_tostring_call_well_known_symbol() {
         let result = global_eval("Object.prototype.toString.call(Symbol.iterator)").unwrap();
         assert_eq!(result, JsValue::String("[object Symbol]".into()));
@@ -21473,7 +21499,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: requires Function.prototype.call on NativeFunctions
     fn e2e_map_to_string_tag() {
         let r = global_eval(
             r#"
@@ -21660,7 +21685,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: requires Function.prototype.call on NativeFunctions
     fn e2e_set_to_string_tag() {
         let r = global_eval(
             r#"
@@ -35032,37 +35056,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_string_primitive() {
         assert_eval_true("Object.prototype.toString.call('x') === '[object String]'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_number_primitive() {
         assert_eval_true("Object.prototype.toString.call(42) === '[object Number]'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_boolean_primitive() {
         assert_eval_true("Object.prototype.toString.call(true) === '[object Boolean]'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_string_wrapper() {
         assert_eval_true("Object.prototype.toString.call(new String('x')) === '[object String]'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_number_wrapper() {
         assert_eval_true("Object.prototype.toString.call(new Number(42)) === '[object Number]'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_to_string_tags_boolean_wrapper() {
         assert_eval_true(
             "Object.prototype.toString.call(new Boolean(false)) === '[object Boolean]'",

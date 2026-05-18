@@ -14699,6 +14699,169 @@ fn cached_object_constructor() -> JsValue {
     })
 }
 
+/// If `obj` is a callable `PlainObject` (i.e. exposes a `__call__` slot, as
+/// produced by `builtin_fn`, `make_fast_array_method`, or `bind`-result
+/// objects), return a Function.prototype method wrapper for `key` when `key`
+/// is one of `"call"`, `"apply"`, or `"bind"`.
+///
+/// The wrappers follow stator's legacy receiver convention for
+/// `NativeFunction`-based builtins reached through `Function.prototype.call`
+/// /`apply`/`bind`: `thisArg` is prepended into the argument list as
+/// `args[0]`. This matches `function_call`/`function_apply`/`function_bind`
+/// in `crate::builtins::function` and the receiver-resolution pattern used
+/// by Map/Set prototype natives (`resolve_branded_receiver`, see commit
+/// `d1ba8529`), so `Object.prototype.toString.call(map)`,
+/// `Array.prototype.push.call(arr, x)`, and similar idioms continue to read
+/// the receiver from `args[0]` as their implementations expect.
+fn callable_plain_object_function_method(obj: &JsValue, key: &str) -> Option<JsValue> {
+    let JsValue::PlainObject(map) = obj else {
+        return None;
+    };
+    let has_call_slot = matches!(
+        map.borrow().get("__call__"),
+        Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
+    );
+    if !has_call_slot {
+        return None;
+    }
+    // `make_fast_array_method` produces PlainObjects whose `__call__` is
+    // pre-bound to a captured `target`, so they ignore the dispatch-level
+    // receiver. For `.call`/`.apply`/`.bind` to route the receiver
+    // correctly, route fast-array-method callables through
+    // `dispatch_fast_array_method` directly with the caller-supplied
+    // `thisArg` as the target.
+    fn require_object_coercible(v: &JsValue) -> StatorResult<()> {
+        match v {
+            JsValue::Undefined | JsValue::Null => Err(StatorError::TypeError(
+                "Cannot convert undefined or null to object".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+    let fast_array_method = fast_array_method_name(obj);
+    match key {
+        "call" => {
+            if let Some(method_name) = fast_array_method.clone() {
+                return Some(JsValue::NativeFunction(Rc::new(move |args| {
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    require_object_coercible(&this_arg)?;
+                    let rest: Vec<JsValue> = if args.len() > 1 {
+                        args[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    dispatch_fast_array_method(&this_arg, method_name.as_ref(), &rest)?.ok_or_else(
+                        || {
+                            StatorError::TypeError(format!(
+                                "{} called on incompatible receiver",
+                                method_name.as_ref()
+                            ))
+                        },
+                    )
+                })));
+            }
+            let callee = obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                // args == [thisArg, ...userArgs]; pass through unchanged so
+                // the underlying native sees thisArg as args[0].
+                let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                dispatch_call_with_this(&callee, this_arg, args)
+            })))
+        }
+        "apply" => {
+            let callee = obj.clone();
+            let fast = fast_array_method;
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let user_args: Vec<JsValue> = match args.get(1) {
+                    Some(JsValue::Array(arr)) => arr.borrow().clone(),
+                    Some(JsValue::PlainObject(m)) => {
+                        let b = m.borrow();
+                        let len = match b.get("length") {
+                            Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+                            Some(JsValue::HeapNumber(n)) => (*n).max(0.0) as usize,
+                            _ => 0,
+                        };
+                        (0..len)
+                            .map(|i| b.get(&i.to_string()).cloned().unwrap_or(JsValue::Undefined))
+                            .collect()
+                    }
+                    Some(JsValue::Null) | Some(JsValue::Undefined) | None => Vec::new(),
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "CreateListFromArrayLike called on non-object".into(),
+                        ));
+                    }
+                };
+                if let Some(method_name) = fast.clone() {
+                    require_object_coercible(&this_arg)?;
+                    return dispatch_fast_array_method(
+                        &this_arg,
+                        method_name.as_ref(),
+                        &user_args,
+                    )?
+                    .ok_or_else(|| {
+                        StatorError::TypeError(format!(
+                            "{} called on incompatible receiver",
+                            method_name.as_ref()
+                        ))
+                    });
+                }
+                let mut all = Vec::with_capacity(user_args.len() + 1);
+                all.push(this_arg.clone());
+                all.extend(user_args);
+                dispatch_call_with_this(&callee, this_arg, all)
+            })))
+        }
+        "bind" => {
+            let callee = obj.clone();
+            let fast = fast_array_method;
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let bound_args: Vec<JsValue> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let callee_inner = callee.clone();
+                let fast_inner = fast.clone();
+                let mut props = PropertyMap::new();
+                props.insert(
+                    "__call__".into(),
+                    JsValue::NativeFunction(Rc::new(move |call_args| {
+                        // Matches `function_bind` in `crate::builtins::function`:
+                        // pass `boundArgs ++ callArgs` to the underlying native
+                        // and route the bound `thisArg` through the dispatch
+                        // layer so branded/receiver-aware builtins still see
+                        // it.
+                        let mut all = Vec::with_capacity(bound_args.len() + call_args.len());
+                        all.extend(bound_args.iter().cloned());
+                        all.extend(call_args);
+                        if let Some(method_name) = fast_inner.clone() {
+                            require_object_coercible(&this_arg)?;
+                            return dispatch_fast_array_method(
+                                &this_arg,
+                                method_name.as_ref(),
+                                &all,
+                            )?
+                            .ok_or_else(|| {
+                                StatorError::TypeError(format!(
+                                    "{} called on incompatible receiver",
+                                    method_name.as_ref()
+                                ))
+                            });
+                        }
+                        dispatch_call_with_this(&callee_inner, this_arg.clone(), all)
+                    })),
+                );
+                props.make_all_non_enumerable();
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+            })))
+        }
+        _ => None,
+    }
+}
+
 fn object_prototype_builtin(this_obj: &JsValue, key: &str) -> Option<JsValue> {
     match key {
         "hasOwnProperty" => {
@@ -14998,7 +15161,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Walk __proto__ chain.
         if let Some(proto) = explicit_proto {
             drop(borrow);
-            let result = proto_lookup_chain(&proto, key, obj);
+            let mut result = proto_lookup_chain(&proto, key, obj);
+            if matches!(result, JsValue::Undefined)
+                && let Some(fn_method) = callable_plain_object_function_method(obj, key)
+            {
+                result = fn_method;
+            }
             let depth = if matches!(result, JsValue::Undefined) {
                 0
             } else if let Some(depth) = proto_lookup_chain_depth(&proto, key) {
@@ -15012,6 +15180,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             return result;
         }
         drop(borrow);
+        if let Some(fn_method) = callable_plain_object_function_method(obj, key) {
+            // Do not cache: the wrapper closes over `obj` and would otherwise
+            // be served stale if the underlying object is later mutated.
+            return fn_method;
+        }
         proto_cache_store(map, key, proto_generation, &JsValue::Undefined, 0);
         return JsValue::Undefined;
     }
@@ -17649,6 +17822,9 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
     if let Some(builtin) = object_prototype_builtin(this_obj, key) {
         return builtin;
     }
+    if let Some(fn_method) = callable_plain_object_function_method(this_obj, key) {
+        return fn_method;
+    }
     JsValue::Undefined
 }
 
@@ -17688,6 +17864,9 @@ fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -
     }
     if let Some(builtin) = object_prototype_builtin(this_obj, key_str) {
         return builtin;
+    }
+    if let Some(fn_method) = callable_plain_object_function_method(this_obj, key_str) {
+        return fn_method;
     }
     JsValue::Undefined
 }
@@ -17872,7 +18051,12 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
         }
         if let Some(proto) = explicit_proto {
             drop(borrow);
-            let result = proto_lookup_chain_rc(&proto, key, obj);
+            let mut result = proto_lookup_chain_rc(&proto, key, obj);
+            if matches!(result, JsValue::Undefined)
+                && let Some(fn_method) = callable_plain_object_function_method(obj, key_str)
+            {
+                result = fn_method;
+            }
             let depth = if matches!(result, JsValue::Undefined) {
                 0
             } else if let Some(depth) = proto_lookup_chain_depth(&proto, key_str) {
@@ -17886,6 +18070,9 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
             return result;
         }
         drop(borrow);
+        if let Some(fn_method) = callable_plain_object_function_method(obj, key_str) {
+            return fn_method;
+        }
         proto_cache_store(map, key_str, proto_generation, &JsValue::Undefined, 0);
         return JsValue::Undefined;
     }
