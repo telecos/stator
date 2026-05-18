@@ -68,6 +68,19 @@ fn to_reg_op(reg: Register) -> Operand {
     Operand::Register(reg.0 as u32)
 }
 
+/// Decode the value of a [`crate::parser::ast::StringLit`] used as an object
+/// or class property name.
+///
+/// The scanner stores string literals in their *raw* source form (with the
+/// surrounding quotes and unprocessed escape sequences). Property names must
+/// be the *decoded* string — for example, the literal `{"0": 1}` has the
+/// property name `0`, not `"0"`. This helper delegates to
+/// [`crate::interpreter::decode_string_constant`] so the parser-side raw form
+/// stays consistent with the runtime string-constant decoder.
+fn prop_key_name_from_str_lit(s: &crate::parser::ast::StringLit) -> String {
+    crate::interpreter::decode_string_constant(&s.value)
+}
+
 /// Minimum number of bytes required to encode `op` as a single operand field.
 fn operand_bytes_needed(op: Operand) -> usize {
     match op {
@@ -588,10 +601,11 @@ impl FunctionCompiler {
                                     ));
                                 }
                                 crate::parser::ast::PropKey::Str(s) => {
+                                    let name = prop_key_name_from_str_lit(s);
                                     if has_rest {
-                                        excluded_static_keys.push(s.value.clone());
+                                        excluded_static_keys.push(name.clone());
                                     }
-                                    let name_idx = self.add_string(&s.value);
+                                    let name_idx = self.add_string(&name);
                                     let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                                     self.emit(Instruction::new_unchecked(
                                         Opcode::LdaNamedProperty,
@@ -2119,7 +2133,7 @@ impl FunctionCompiler {
 
         let key_name: Option<String> = match &method.key {
             PropKey::Ident(id) => Some(id.name.clone()),
-            PropKey::Str(s) => Some(s.value.clone()),
+            PropKey::Str(s) => Some(prop_key_name_from_str_lit(s)),
             PropKey::Num(n) => {
                 if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
                     Some(format!("{}", n.value as u64))
@@ -2295,7 +2309,7 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Str(s) => {
-                let name_idx = self.add_string(&s.value);
+                let name_idx = self.add_string(&prop_key_name_from_str_lit(s));
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::DefineNamedOwnProperty,
@@ -2587,7 +2601,7 @@ impl FunctionCompiler {
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
-                    let name_idx = ic.add_string(&s.value);
+                    let name_idx = ic.add_string(&prop_key_name_from_str_lit(s));
                     let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
                     ic.emit(Instruction::new_unchecked(
                         Opcode::DefineNamedOwnProperty,
@@ -5595,7 +5609,7 @@ impl FunctionCompiler {
         // Get the key string (for static keys).
         let key_name: Option<String> = match &p.key {
             PropKey::Ident(id) => Some(id.name.clone()),
-            PropKey::Str(s) => Some(s.value.clone()),
+            PropKey::Str(s) => Some(prop_key_name_from_str_lit(s)),
             PropKey::Num(n) => {
                 // Use JS-compatible number-to-string for integer keys.
                 let v = n.value;
@@ -5612,9 +5626,7 @@ impl FunctionCompiler {
             && !p.is_computed
             && match &p.key {
                 PropKey::Ident(id) => id.name == "__proto__",
-                PropKey::Str(s) => {
-                    s.value == "\"__proto__\"" || s.value == "'__proto__'" || s.value == "__proto__"
-                }
+                PropKey::Str(s) => prop_key_name_from_str_lit(s) == "__proto__",
                 _ => false,
             };
 

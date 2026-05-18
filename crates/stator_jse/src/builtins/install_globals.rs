@@ -38922,7 +38922,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_coerces_numeric_entries() {
         let result =
             global_eval(r#"JSON.stringify({ "0": "zero", "1": "one", x: 3 }, [1, "x"])"#).unwrap();
@@ -39260,7 +39259,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_can_include_empty_string_key() {
         let result = global_eval(r#"JSON.stringify({ "": 1, a: 2 }, [""])"#).unwrap();
         assert_eq!(result, JsValue::String(r#"{"":1}"#.into()));
