@@ -5147,13 +5147,16 @@ fn handle_resume_generator(
         let msg = error_message_from_value(&val);
         return Err(StatorError::JsException(msg));
     }
-    if return_val.is_some() {
+    if let Some(val) = return_val {
         // Force a "return" abrupt completion.  By throwing a sentinel
         // through the handler table, any enclosing `finally` block will
-        // execute before the generator completes.
-        let sentinel = JsValue::String(super::GENERATOR_RETURN_SENTINEL.into());
-        ctx.frame.accumulator = sentinel.clone();
-        set_pending_exception(sentinel);
+        // execute before the generator completes.  We use the PlainObject
+        // completion marker (rather than a bare string) so that the
+        // requested return value survives propagation through the handler
+        // table and is recovered by `run_generator_step`.
+        let completion = super::make_generator_return_completion(val);
+        ctx.frame.accumulator = completion.clone();
+        set_pending_exception(completion);
         return Err(StatorError::JsException(
             super::GENERATOR_RETURN_SENTINEL.into(),
         ));

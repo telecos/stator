@@ -56114,7 +56114,6 @@ mod tests {
 
     /// for-of generator: .return() terminates generator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_generator_return_on_break() {
         let r = global_eval(
             r#"
