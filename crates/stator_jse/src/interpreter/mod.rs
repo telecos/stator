@@ -542,14 +542,32 @@ pub fn dispatch_set_property_value(
 }
 
 /// Return the immediate prototype of an object-like value.
+///
+/// For `PlainObject` values, an explicit prototype slot
+/// (`INTERNAL_PROTO_PROPERTY_KEY` or the legacy `"__proto__"` key) takes
+/// precedence — including when it stores `JsValue::Null` to mark an
+/// explicit null prototype (e.g. `Object.create(null)` or
+/// `Object.setPrototypeOf(o, null)`). Slot-less plain objects inherit from
+/// `Object.prototype` per §10.1 ordinary object semantics, so we fall back
+/// to the current realm's `Object.prototype` when no slot is present.
 pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
     match obj {
         JsValue::PlainObject(map) => {
             let borrow = map.borrow();
-            borrow
+            if let Some(explicit) = borrow
                 .get(INTERNAL_PROTO_PROPERTY_KEY)
                 .or_else(|| borrow.get("__proto__"))
-                .cloned()
+            {
+                return Some(explicit.clone());
+            }
+            drop(borrow);
+            // Slot-less plain object: implicit prototype is Object.prototype.
+            // Returning `None` here would make `Object.getPrototypeOf({})`
+            // report `null`, which violates ordinary object semantics. We
+            // intentionally do *not* fall back when the slot is present —
+            // an explicit `null` slot must surface as `null` to preserve
+            // `Object.setPrototypeOf(o, null)` behavior.
+            global_constructor_prototype("Object")
         }
         JsValue::Promise(promise) => promise.prototype().or_else(|| {
             let ctor = lookup_global_constructor("Promise");

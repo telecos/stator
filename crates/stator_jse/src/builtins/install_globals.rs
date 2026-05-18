@@ -20380,7 +20380,6 @@ mod tests {
 
     /// `Object.getPrototypeOf` returns `Object.prototype` for plain objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_get_prototype_of_null() {
         let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -20398,6 +20397,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// After `Object.setPrototypeOf(o, null)`, the implicit
+    /// `Object.prototype` fallback must not surface — getPrototypeOf
+    /// reports `null` and inherited methods are no longer reachable.
+    #[test]
+    fn e2e_object_set_prototype_of_null_reports_null() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.setPrototypeOf(obj, null);
+            Object.getPrototypeOf(obj) === null
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// After `Object.setPrototypeOf(o, p)` with an explicit object proto,
+    /// `Object.getPrototypeOf` reports that proto (not Object.prototype).
+    #[test]
+    fn e2e_object_set_prototype_of_explicit_reports_explicit() {
+        let result = global_eval(
+            r#"
+            var p = { tag: 1 };
+            var o = {};
+            Object.setPrototypeOf(o, p);
+            Object.getPrototypeOf(o) === p
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Reflect.getPrototypeOf({})` reports `Object.prototype` for
+    /// slot-less plain objects, mirroring `Object.getPrototypeOf`.
+    #[test]
+    fn e2e_reflect_get_prototype_of_plain_object() {
+        let result = global_eval("Reflect.getPrototypeOf({}) === Object.prototype").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     /// `Object.preventExtensions` returns the object.
@@ -31962,7 +32001,6 @@ mod tests {
 
     /// `Object.getPrototypeOf` returns `Object.prototype` for plain objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_get_prototype_of() {
         let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -33723,7 +33761,6 @@ mod tests {
 
     /// `Object.getPrototypeOf({})` returns `Object.prototype`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_get_prototype_of() {
         let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -40524,7 +40561,6 @@ mod tests {
 
     /// `Object.getPrototypeOf` returns `Object.prototype` for ordinary objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_get_prototype_of_plain_object() {
         let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -44484,7 +44520,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_get_prototype_of_plain_object_returns_object_prototype() {
         let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -46195,7 +46230,6 @@ mod tests {
 
     /// Reflect.getPrototypeOf returns `Object.prototype` for plain objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_get_prototype_of() {
         let r = global_eval("Reflect.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -46526,7 +46560,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_get_prototype_of_object_prototype() {
         let r = global_eval("Reflect.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
