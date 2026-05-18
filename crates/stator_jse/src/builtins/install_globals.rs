@@ -192,6 +192,34 @@ fn weak_collection_key(val: &JsValue) -> Option<usize> {
     }
 }
 
+/// Resolve the receiver for a branded prototype wrapper (e.g. `Map.prototype.get`).
+///
+/// Stator has two coexisting calling conventions for `NativeFunction` prototype
+/// methods:
+///
+/// * `Function.prototype.call`/`apply`/`bind` for native targets *prepend*
+///   `this` as `args[0]` (see `function_call`/`function_apply`).
+/// * The bytecode method-dispatch path (`dispatch_native_method`) and
+///   `invoke_native_with_this` publish the receiver on the current global
+///   environment and pass only user arguments.
+///
+/// To support both, branded wrappers should prefer `args[0]` when it carries
+/// the expected brand (the `.call/.apply/.bind` path) and otherwise fall back
+/// to the receiver published on the current global environment (the
+/// method-dispatch path).
+fn resolve_branded_receiver(args: &[JsValue], marker: &str) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(marker), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
 fn get_hidden_method(
     receiver: &JsValue,
     marker: &str,
@@ -8561,10 +8589,9 @@ fn make_map_builtin() -> JsValue {
                 proto.insert(
                     name.clone(),
                     native(move |args| {
-                        let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                        let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                        let (receiver, rest) = resolve_branded_receiver(&args, "__is_map__");
                         let method = get_hidden_method(
-                            receiver,
+                            &receiver,
                             "__is_map__",
                             &hidden,
                             &format!("Map.prototype.{name}"),
@@ -8574,9 +8601,9 @@ fn make_map_builtin() -> JsValue {
                 );
             }
             let entries_fn = native(|args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let (receiver, _rest) = resolve_branded_receiver(&args, "__is_map__");
                 let method = get_hidden_method(
-                    receiver,
+                    &receiver,
                     "__is_map__",
                     "__map_entries__",
                     "Map.prototype.entries",
@@ -8588,9 +8615,9 @@ fn make_map_builtin() -> JsValue {
             proto.insert_with_attrs(
                 "__get_size__".into(),
                 native(|args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let (receiver, _rest) = resolve_branded_receiver(&args, "__is_map__");
                     let getter = get_hidden_method(
-                        receiver,
+                        &receiver,
                         "__is_map__",
                         "__get_size__",
                         "get Map.prototype.size",
@@ -8685,10 +8712,9 @@ fn make_set_builtin() -> JsValue {
                 proto.insert(
                     name.clone(),
                     native(move |args| {
-                        let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                        let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                        let (receiver, rest) = resolve_branded_receiver(&args, "__is_set__");
                         let method = get_hidden_method(
-                            receiver,
+                            &receiver,
                             "__is_set__",
                             &hidden,
                             &format!("Set.prototype.{name}"),
@@ -8698,9 +8724,9 @@ fn make_set_builtin() -> JsValue {
                 );
             }
             let values_fn = native(|args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let (receiver, _rest) = resolve_branded_receiver(&args, "__is_set__");
                 let method = get_hidden_method(
-                    receiver,
+                    &receiver,
                     "__is_set__",
                     "__set_values__",
                     "Set.prototype.values",
@@ -8713,9 +8739,9 @@ fn make_set_builtin() -> JsValue {
             proto.insert_with_attrs(
                 "__get_size__".into(),
                 native(|args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let (receiver, _rest) = resolve_branded_receiver(&args, "__is_set__");
                     let getter = get_hidden_method(
-                        receiver,
+                        &receiver,
                         "__is_set__",
                         "__get_size__",
                         "get Set.prototype.size",
@@ -21145,7 +21171,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_iterator_methods_return_working_iterators() {
         let result = global_eval(
             r#"
@@ -21169,7 +21194,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_iterator_methods_return_working_iterators() {
         let result = global_eval(
             r#"
@@ -21194,7 +21218,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_and_set_for_each_and_size_getter_conformance() {
         let result = global_eval(
             r#"
@@ -21225,7 +21248,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_and_set_iteration_preserve_insertion_order() {
         let result = global_eval(
             r#"
@@ -21270,7 +21292,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_constructor_with_pairs() {
         let r = global_eval(
             r#"
@@ -21283,21 +21304,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_get_missing_returns_undefined() {
         let r = global_eval("var m = new Map(); m.get('x') === undefined").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_set_returns_map_for_chaining() {
         let r = global_eval("var m = new Map(); m.set(1, 'a').set(2, 'b'); m.size === 2").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_has_true_and_false() {
         let r = global_eval("var m = new Map([[1, 'a']]); m.has(1) === true && m.has(2) === false")
             .unwrap();
@@ -21305,7 +21323,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_delete_returns_boolean() {
         let r = global_eval(
             r#"
@@ -21320,7 +21337,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_clear_empties() {
         let r = global_eval("var m = new Map([[1,1],[2,2]]); m.clear(); m.size === 0").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -21340,7 +21356,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_foreach_callback_signature() {
         let r = global_eval(
             r#"
@@ -21357,7 +21372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_keys_iterator() {
         let r = global_eval(
             r#"
@@ -21371,7 +21385,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_values_iterator() {
         let r = global_eval(
             r#"
@@ -21385,7 +21398,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_entries_iterator() {
         let r = global_eval(
             r#"
@@ -21400,7 +21412,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_symbol_iterator_is_entries() {
         let r = global_eval(
             r#"
@@ -21415,7 +21426,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_nan_key_equality() {
         let r = global_eval(
             r#"
@@ -21429,7 +21439,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_nan_key_dedup() {
         let r = global_eval(
             r#"
@@ -21444,7 +21453,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_negative_zero_normalization() {
         let r = global_eval(
             r#"
@@ -21471,7 +21479,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_insertion_order() {
         let r = global_eval(
             r#"
@@ -21487,7 +21494,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_set_overwrites_preserves_order() {
         let r = global_eval(
             r#"
@@ -21516,14 +21522,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_add_returns_set_for_chaining() {
         let r = global_eval("var s = new Set(); s.add(1).add(2).add(3); s.size === 3").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_has_true_and_false() {
         let r = global_eval("var s = new Set([10, 20]); s.has(10) === true && s.has(30) === false")
             .unwrap();
@@ -21531,7 +21535,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_delete_returns_boolean() {
         let r = global_eval(
             r#"
@@ -21546,7 +21549,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_clear_empties() {
         let r = global_eval("var s = new Set([1, 2, 3]); s.clear(); s.size === 0").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -21566,7 +21568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_foreach_callback_signature() {
         let r = global_eval(
             r#"
@@ -21583,7 +21584,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_values_iterator() {
         let r = global_eval(
             r#"
@@ -21597,7 +21597,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_keys_same_as_values() {
         let r = global_eval(
             r#"
@@ -21612,7 +21611,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_entries_value_value_pairs() {
         let r = global_eval(
             r#"
@@ -21626,7 +21624,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symbol_iterator_is_values() {
         let r = global_eval(
             r#"
@@ -21640,7 +21637,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_nan_dedup() {
         let r =
             global_eval("var s = new Set(); s.add(NaN); s.add(NaN); s.size === 1 && s.has(NaN)")
@@ -21649,7 +21645,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_negative_zero_normalization() {
         let r =
             global_eval("var s = new Set(); s.add(-0); s.has(0) === true && s.size === 1").unwrap();
@@ -21670,7 +21665,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_insertion_order() {
         let r = global_eval(
             r#"
@@ -21686,7 +21680,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_re_add_after_delete_goes_to_end() {
         let r = global_eval(
             r#"
@@ -22466,7 +22459,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_constructor_from_another_map() {
         let r = global_eval(
             r#"
@@ -22480,7 +22472,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_constructor_from_string() {
         let r = global_eval(
             r#"
@@ -22493,7 +22484,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_undefined_and_null_keys() {
         let r = global_eval(
             r#"
@@ -22508,7 +22498,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_mixed_types() {
         let r = global_eval(
             r#"
@@ -31752,7 +31741,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_set_returns_this() {
         let result =
             crate::builtins::global::global_eval("var m = new Map(); m.set('a', 1) === m").unwrap();
@@ -31760,7 +31748,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_set_chaining() {
         let result = crate::builtins::global::global_eval(
             "var m = new Map(); m.set('a', 1).set('b', 2); m.get('b')",
@@ -31770,7 +31757,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_add_returns_this() {
         let result =
             crate::builtins::global::global_eval("var s = new Set(); s.add(1) === s").unwrap();
@@ -31778,7 +31764,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_add_chaining() {
         let result = crate::builtins::global::global_eval(
             "var s = new Set(); s.add(1).add(2).add(3); s.has(3)",
@@ -35299,7 +35284,6 @@ mod tests {
     /// We verify the third argument is the map by checking it has a `get`
     /// method (i.e., it is the Map instance).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_foreach_three_args() {
         // The callback checks that three arguments are received.
         let result = global_eval(
@@ -35312,7 +35296,6 @@ mod tests {
 
     /// `Map.prototype.forEach` calls with correct (value, key) order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_foreach_value_key_order() {
         let result = global_eval(
             "var out = ''; var m = new Map([['x', 42]]); \
@@ -35328,7 +35311,6 @@ mod tests {
     /// We verify the third argument is the set by checking it has an `add`
     /// method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_foreach_three_args() {
         let result = global_eval(
             "var count = 0; var s = new Set([10]); \
@@ -35340,7 +35322,6 @@ mod tests {
 
     /// `Set.prototype.forEach` passes (value, value) as first two args.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_foreach_value_value() {
         let result = global_eval(
             "var ok = true; var s = new Set([5]); \
@@ -43482,7 +43463,6 @@ mod tests {
 
     /// `Map.groupBy` returns a Map-like object with `get`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_basic() {
         let result = global_eval(
             r#"
@@ -43513,7 +43493,6 @@ mod tests {
 
     /// `Map.groupBy` has() works for existing key.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_has() {
         let result = global_eval(
             r#"
@@ -43527,7 +43506,6 @@ mod tests {
 
     /// `Map.groupBy` has() returns false for missing key.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_has_missing() {
         let result = global_eval(
             r#"
@@ -43802,7 +43780,6 @@ mod tests {
 
     /// Map.groupBy: single group gathers all items.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_single_group() {
         let result = global_eval(
             r#"
@@ -43816,7 +43793,6 @@ mod tests {
 
     /// Map.groupBy: result groups are real arrays.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_result_groups_are_arrays() {
         let result = global_eval(
             r#"
@@ -43830,7 +43806,6 @@ mod tests {
 
     /// Map.groupBy: preserves insertion order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_preserves_order() {
         let result = global_eval(
             r#"
@@ -43846,7 +43821,6 @@ mod tests {
 
     /// Map.groupBy: string iterable input.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_string_input() {
         let result = global_eval(
             r#"
@@ -43860,7 +43834,6 @@ mod tests {
 
     /// Map.groupBy: even group has correct elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_even_elements() {
         let result = global_eval(
             r#"
@@ -53581,7 +53554,6 @@ mod tests {
     // ΓöÇΓöÇ Map/Set/WeakMap/WeakSet deep conformance tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_negative_zero_key_normalized() {
         let result = global_eval(
             "var m = new Map(); m.set(-0, 'a'); \
@@ -53593,7 +53565,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_negative_zero_and_positive_zero_same_key() {
         let result = global_eval(
             "var m = new Map(); m.set(-0, 'neg'); m.set(0, 'pos'); m.size === 1 && m.get(0) === 'pos'",
@@ -53603,7 +53574,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_nan_key_identity() {
         let result = global_eval(
             "var m = new Map(); m.set(NaN, 'val'); m.has(NaN) && m.get(NaN) === 'val' && m.size === 1",
@@ -53613,7 +53583,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_nan_key_deduplicates() {
         let result = global_eval(
             "var m = new Map(); m.set(NaN, 1); m.set(NaN, 2); m.size === 1 && m.get(NaN) === 2",
@@ -53623,7 +53592,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_constructor_from_another_map_v2() {
         let result = global_eval(
             "var a = new Map([['x', 1], ['y', 2]]); var b = new Map(a); \
@@ -53634,7 +53602,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_constructor_iterable_deduplicates_last_wins() {
         let result =
             global_eval("var m = new Map([['a', 1], ['a', 2]]); m.size === 1 && m.get('a') === 2")
@@ -53643,7 +53610,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_set_chaining_multiple() {
         let result = global_eval(
             "var m = new Map(); var r = m.set('a', 1).set('b', 2).set('c', 3); \
@@ -53654,7 +53620,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_delete_returns_boolean_v2() {
         let result = global_eval(
             "var m = new Map([['a', 1]]); var r1 = m.delete('a'); var r2 = m.delete('a'); \
@@ -53665,7 +53630,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_clear_empties_map() {
         let result = global_eval(
             "var m = new Map([['a', 1], ['b', 2]]); m.clear(); m.size === 0 && !m.has('a')",
@@ -53681,7 +53645,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_negative_zero_value_normalized() {
         let result = global_eval(
             "var s = new Set(); s.add(-0); \
@@ -53693,14 +53656,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_negative_zero_and_positive_zero_same_value() {
         let result = global_eval("var s = new Set(); s.add(-0); s.add(0); s.size === 1").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_nan_deduplicates() {
         let result =
             global_eval("var s = new Set(); s.add(NaN); s.add(NaN); s.size === 1 && s.has(NaN)")
@@ -53709,7 +53670,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_constructor_deduplicates() {
         let result = global_eval(
             "var s = new Set([1, 2, 2, 3, 3, 3]); s.size === 3 && s.has(1) && s.has(2) && s.has(3)",
@@ -53719,7 +53679,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_delete_returns_boolean_v2() {
         let result = global_eval(
             "var s = new Set([1, 2]); var r1 = s.delete(1); var r2 = s.delete(1); \
@@ -53730,7 +53689,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_clear_empties_set() {
         let result =
             global_eval("var s = new Set([1, 2, 3]); s.clear(); s.size === 0 && !s.has(1)")
@@ -53858,7 +53816,6 @@ mod tests {
     // ── Set composition methods (ES2025) ────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_basic() {
         assert_eval_true(
             "var r = new Set([1, 2]).union(new Set([2, 3])); r.size === 3 && r.has(1) && r.has(2) && r.has(3)",
@@ -53866,7 +53823,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_preserves_insertion_order() {
         assert_eval_true(
             "var out = []; new Set([3, 1]).union(new Set([1, 2])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1,2'",
@@ -53874,7 +53830,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_returns_new_set_without_mutating_receiver() {
         assert_eval_true(
             "var a = new Set([1, 2]); var r = a.union(new Set([2, 3])); r !== a && a.size === 2 && !a.has(3) && r.size === 3 && r.has(3)",
@@ -53882,7 +53837,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_accepts_map_keys() {
         assert_eval_true(
             "var r = new Set(['a']).union(new Map([['b', 1], ['a', 2]])); r.size === 2 && r.has('a') && r.has('b')",
@@ -53890,7 +53844,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_accepts_custom_set_like() {
         assert_eval_true(
             r#"
@@ -53914,7 +53867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_union_uses_keys_iterator() {
         assert_eval_true(
             r#"
@@ -53937,7 +53889,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_intersection_basic() {
         assert_eval_true(
             "var r = new Set([1, 2, 3]).intersection(new Set([2, 4, 3])); r.size === 2 && r.has(2) && r.has(3)",
@@ -53945,7 +53896,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_intersection_preserves_receiver_order() {
         assert_eval_true(
             "var out = []; new Set([3, 1, 2]).intersection(new Set([2, 3])).forEach(function(v) { out.push(v); }); out.join(',') === '3,2'",
@@ -53953,7 +53903,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_intersection_accepts_map_keys() {
         assert_eval_true(
             "var r = new Set(['x', 'y', 'z']).intersection(new Map([['y', 1], ['x', 2]])); r.size === 2 && r.has('x') && r.has('y') && !r.has('z')",
@@ -53961,7 +53910,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_intersection_accepts_custom_set_like() {
         assert_eval_true(
             r#"
@@ -53983,7 +53931,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_difference_basic() {
         assert_eval_true(
             "var r = new Set([1, 2, 3]).difference(new Set([2, 4])); r.size === 2 && r.has(1) && r.has(3) && !r.has(2)",
@@ -53991,7 +53938,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_difference_preserves_receiver_order() {
         assert_eval_true(
             "var out = []; new Set([3, 1, 2]).difference(new Set([2])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1'",
@@ -53999,7 +53945,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_difference_accepts_map_keys() {
         assert_eval_true(
             "var r = new Set(['a', 'b', 'c']).difference(new Map([['b', 1], ['x', 2]])); r.size === 2 && r.has('a') && r.has('c') && !r.has('b')",
@@ -54007,7 +53952,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_difference_accepts_custom_set_like() {
         assert_eval_true(
             r#"
@@ -54023,7 +53967,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_difference_does_not_mutate_receiver() {
         assert_eval_true(
             "var a = new Set([1, 2, 3]); var r = a.difference(new Set([2])); a.size === 3 && a.has(2) && r.size === 2 && !r.has(2)",
@@ -54031,7 +53974,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_basic() {
         assert_eval_true(
             "var r = new Set([1, 2, 3]).symmetricDifference(new Set([2, 4])); r.size === 3 && r.has(1) && r.has(3) && r.has(4) && !r.has(2)",
@@ -54039,7 +53981,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_preserves_expected_order() {
         assert_eval_true(
             "var out = []; new Set([3, 1, 2]).symmetricDifference(new Set([2, 4, 5])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1,4,5'",
@@ -54047,7 +53988,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_accepts_map_keys() {
         assert_eval_true(
             "var r = new Set(['a', 'b']).symmetricDifference(new Map([['b', 1], ['c', 2]])); r.size === 2 && r.has('a') && r.has('c') && !r.has('b')",
@@ -54055,7 +53995,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_accepts_custom_set_like() {
         assert_eval_true(
             r#"
@@ -54079,7 +54018,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_does_not_mutate_receiver() {
         assert_eval_true(
             "var a = new Set([1, 2]); var r = a.symmetricDifference(new Set([2, 3])); a.size === 2 && a.has(2) && r.size === 2 && r.has(1) && r.has(3)",
@@ -54087,7 +54025,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_symmetric_difference_deduplicates_other_iterator_values() {
         assert_eval_true(
             r#"
@@ -54110,19 +54047,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_subset_of_true() {
         assert_eval_true("new Set([1, 2]).isSubsetOf(new Set([1, 2, 3])) === true");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_subset_of_false() {
         assert_eval_true("new Set([1, 4]).isSubsetOf(new Set([1, 2, 3])) === false");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_subset_of_accepts_map_keys() {
         assert_eval_true(
             "new Set(['a', 'b']).isSubsetOf(new Map([['a', 1], ['b', 2], ['c', 3]])) === true",
@@ -54159,19 +54093,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_superset_of_true() {
         assert_eval_true("new Set([1, 2, 3]).isSupersetOf(new Set([1, 3])) === true");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_superset_of_false() {
         assert_eval_true("new Set([1, 2]).isSupersetOf(new Set([1, 3])) === false");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_superset_of_accepts_map_keys() {
         assert_eval_true(
             "new Set(['a', 'b', 'c']).isSupersetOf(new Map([['a', 1], ['c', 2]])) === true",
@@ -54179,7 +54110,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_superset_of_accepts_custom_set_like() {
         assert_eval_true(
             r#"
@@ -54217,19 +54147,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_disjoint_from_true() {
         assert_eval_true("new Set([1, 2]).isDisjointFrom(new Set([3, 4])) === true");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_disjoint_from_false() {
         assert_eval_true("new Set([1, 2]).isDisjointFrom(new Set([2, 4])) === false");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_is_disjoint_from_accepts_map_keys() {
         assert_eval_true(
             "new Set(['a', 'b']).isDisjointFrom(new Map([['c', 1], ['d', 2]])) === true",
@@ -56065,7 +55992,6 @@ mod tests {
 
     /// new Map() with custom iterable of [key, value] pairs.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_map_from_custom_iterable() {
         let r = global_eval(
             r#"
@@ -61941,7 +61867,6 @@ mod tests {
 
     /// `Map.groupBy` all elements in same group.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_group_by_single_group_v2() {
         let result = global_eval(
             r#"
