@@ -3376,12 +3376,17 @@ fn json_stringify_indent(space: Option<&JsValue>) -> String {
 }
 
 /// Collect the property allow-list from a replacer array.
-fn json_stringify_property_list(replacer: Option<&JsValue>) -> StatorResult<Vec<String>> {
+///
+/// Returns `None` when `replacer` is not an array (so no filtering applies),
+/// and `Some(list)` when it is — preserving the distinction between
+/// "no array replacer" and "empty array replacer". Per ECMAScript
+/// §25.5.2 step 4.b, an empty `PropertyList` yields `{}` for objects.
+fn json_stringify_property_list(replacer: Option<&JsValue>) -> StatorResult<Option<Vec<String>>> {
     let Some(replacer) = replacer else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if !is_js_array(replacer)? {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let (elements, _) = to_array_like_elements(replacer);
@@ -3399,7 +3404,7 @@ fn json_stringify_property_list(replacer: Option<&JsValue>) -> StatorResult<Vec<
             properties.push(property);
         }
     }
-    Ok(properties)
+    Ok(Some(properties))
 }
 
 /// Read a JSON-visible property from `holder`.
@@ -3694,8 +3699,7 @@ fn json_stringify_runtime(
 ) -> StatorResult<Option<String>> {
     let replacer_fn = replacer.filter(|candidate| is_callable(candidate));
     let property_list_storage = json_stringify_property_list(replacer)?;
-    let property_list =
-        (!property_list_storage.is_empty()).then_some(property_list_storage.as_slice());
+    let property_list = property_list_storage.as_deref();
     let indent = json_stringify_indent(space);
 
     let mut wrapper = PropertyMap::new();
@@ -38926,7 +38930,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_does_not_filter_array_elements() {
         let result = global_eval(r#"JSON.stringify([1, 2, 3], ["0"])"#).unwrap();
         assert_eq!(result, JsValue::String("[1,2,3]".into()));
@@ -38955,14 +38958,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_array_undefined_and_function_become_null() {
         let result = global_eval("JSON.stringify([1, undefined, function() {}, 4])").unwrap();
         assert_eq!(result, JsValue::String("[1,null,null,4]".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_nested_nan_and_infinity_become_null() {
         let result = global_eval("JSON.stringify({ a: NaN, b: [Infinity, -Infinity] })").unwrap();
         assert_eq!(
@@ -39266,7 +39267,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_reads_inherited_property_values() {
         let result = global_eval(
             r#"
@@ -39302,7 +39302,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_to_json_inherited_from_prototype() {
         let result = global_eval(
             r#"
@@ -39321,7 +39320,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_to_json_on_proxy() {
         let result = global_eval(
             r#"
@@ -39375,14 +39373,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_symbol_in_array_becomes_null() {
         let result = global_eval(r#"JSON.stringify([1, Symbol("x"), 3])"#).unwrap();
         assert_eq!(result, JsValue::String("[1,null,3]".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_undefined_function_and_symbol_in_array_become_null() {
         let result =
             global_eval(r#"JSON.stringify([undefined, function() {}, Symbol("x")])"#).unwrap();
@@ -39441,7 +39437,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_on_proxy_reads_property_values() {
         let result = global_eval(
             r#"
@@ -39676,7 +39671,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_function_can_null_array_element() {
         let result = global_eval(
             r#"
@@ -39690,7 +39684,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_function_can_replace_object_with_array() {
         let result = global_eval(
             r#"
@@ -39730,7 +39723,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_function_symbol_nulls_array_element() {
         let result = global_eval(
             r#"
@@ -39757,7 +39749,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_function_function_nulls_array_element() {
         let result = global_eval(
             r#"
@@ -39808,7 +39799,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_to_json_on_array_element_receives_index_key() {
         let result = global_eval(
             r#"
@@ -39851,7 +39841,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_to_json_returning_undefined_nulls_array_element() {
         let result = global_eval(
             r#"
@@ -39877,7 +39866,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_replacer_array_empty_list_yields_empty_object() {
         let result = global_eval(r#"JSON.stringify({ a: 1, b: 2 }, [])"#).unwrap();
         assert_eq!(result, JsValue::String("{}".into()));
@@ -39914,7 +39902,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_space_applies_to_arrays() {
         let result = global_eval("JSON.stringify([1, { a: 2 }], null, 2)").unwrap();
         assert_eq!(
@@ -50946,7 +50933,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_sparse_array_uses_null_for_hole() {
         assert_eval_true("JSON.stringify([1, , 3]) === '[1,null,3]'");
     }
@@ -53192,7 +53178,6 @@ mod tests {
 
     // 16. JSON.stringify special values — undefined becomes null in arrays
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_undefined_in_array() {
         let result = global_eval(r#"JSON.stringify([1, undefined, 3])"#).unwrap();
         assert_eq!(result, JsValue::String("[1,null,3]".into()));
@@ -53294,7 +53279,6 @@ mod tests {
 
     // 27. JSON.stringify — empty object and array
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_empty_containers() {
         let result = global_eval(r#"JSON.stringify({}) + "|" + JSON.stringify([])"#).unwrap();
         assert_eq!(result, JsValue::String("{}|[]".into()));
