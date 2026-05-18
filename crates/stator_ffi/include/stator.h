@@ -290,6 +290,25 @@ typedef enum StatorMessageKind {
    * A sandbox bounds-check violation.
    */
   StatorMessageKindSandboxViolation = 11,
+  /**
+   * The module's [`StatorModuleType`] is recognised but not executable by
+   * Stator itself and requires host integration before it can be compiled,
+   * evaluated, or restored from a code cache.
+   *
+   * Currently emitted for CSS module bodies (see
+   * [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+   * and no `CSSStyleSheet` representation, so the engine fails closed and
+   * tags the error with this stable kind so embedders like the Edge host
+   * can detect "unsupported module type, route through host integration"
+   * purely by enum value without text-matching the diagnostic.
+   *
+   * Always paired with an errored [`StatorModule`] whose
+   * [`stator_module_get_error`] message names the missing host primitive,
+   * and — when a typed import resolves to such a module — propagates to
+   * the importer's link-time error so the same enum value surfaces on the
+   * graph root.
+   */
+  StatorMessageKindUnsupportedModuleType = 12,
 } StatorMessageKind;
 
 /**
@@ -2954,6 +2973,32 @@ const char *stator_module_get_error(const struct StatorModule *module);
  * `module` must be either null or a valid pointer to a live [`StatorModule`].
  */
 enum StatorMessageKind stator_module_error_kind(const struct StatorModule *module);
+
+/**
+ * Report whether Stator can compile and evaluate modules of `source_type`
+ * itself without host integration.
+ *
+ * Returns `true` for [`StatorModuleType::StatorModuleTypeJavaScript`],
+ * [`StatorModuleType::StatorModuleTypeJson`], and
+ * [`StatorModuleType::StatorModuleTypeWebAssembly`].
+ *
+ * Returns `false` for typed module kinds that Stator recognises but cannot
+ * execute on its own — currently only [`StatorModuleType::StatorModuleTypeCss`],
+ * which has no engine-side parser or `CSSStyleSheet` representation.
+ * Attempting to compile, evaluate, or restore from a code cache for such a
+ * type always fails closed: [`stator_module_compile`] returns an errored
+ * module whose [`stator_module_error_kind`] is
+ * [`StatorMessageKind::StatorMessageKindUnsupportedModuleType`], and
+ * [`stator_module_compile_cached`] additionally sets the cache status to
+ * [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`].
+ *
+ * Embedders like the Edge host can call this before compiling to route an
+ * import through host integration (e.g. a `CSSStyleSheet` provider) instead
+ * of asking the engine to compile something it cannot execute.
+ *
+ * Unknown / future values of `source_type` are treated as not executable.
+ */
+bool stator_module_type_is_executable(enum StatorModuleType source_type);
 
 /**
  * Attach origin metadata (resource name and offsets) to `module`.

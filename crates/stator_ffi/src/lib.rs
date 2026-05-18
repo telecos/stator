@@ -3394,7 +3394,7 @@ fn compile_css_module_source() -> Box<StatorModule> {
          or CSSStyleSheet representation; embedders must provide host \
          CSSStyleSheet integration before CSS modules can be compiled, \
          evaluated, or restored from a code cache",
-        StatorMessageKind::StatorMessageKindInternal,
+        StatorMessageKind::StatorMessageKindUnsupportedModuleType,
     )
 }
 
@@ -5244,7 +5244,7 @@ unsafe fn compile_module_source(
                 CString::new(format!("{type_name} module source is not executable yet"))
                     .unwrap_or_else(|_| c"typed module source is not executable yet".into()),
             ),
-            error_kind: StatorMessageKind::StatorMessageKindInternal,
+            error_kind: StatorMessageKind::StatorMessageKindUnsupportedModuleType,
             resource_name: None,
             resource_line_offset: 0,
             resource_column_offset: 0,
@@ -5576,13 +5576,14 @@ pub unsafe extern "C" fn stator_module_compile_cached(
             // SAFETY: caller guarantees `out_status` is valid when non-null.
             unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported };
         }
-        return module_cache_rejection_record(
+        return Box::into_raw(module_error_record(
             source_type,
             &format!(
                 "module code cache is unsupported for {} module source",
                 module_type_name(source_type)
             ),
-        );
+            StatorMessageKind::StatorMessageKindUnsupportedModuleType,
+        ));
     }
     // SAFETY: validates caller-provided source and cache pointer/length pairs.
     let Some(cache_bytes) = (unsafe { ffi_bytes(cache_data, cache_len) }) else {
@@ -6060,6 +6061,38 @@ pub unsafe extern "C" fn stator_module_error_kind(
     }
     // SAFETY: caller guarantees `module` is valid.
     unsafe { (*module).error_kind }
+}
+
+/// Report whether Stator can compile and evaluate modules of `source_type`
+/// itself without host integration.
+///
+/// Returns `true` for [`StatorModuleType::StatorModuleTypeJavaScript`],
+/// [`StatorModuleType::StatorModuleTypeJson`], and
+/// [`StatorModuleType::StatorModuleTypeWebAssembly`].
+///
+/// Returns `false` for typed module kinds that Stator recognises but cannot
+/// execute on its own — currently only [`StatorModuleType::StatorModuleTypeCss`],
+/// which has no engine-side parser or `CSSStyleSheet` representation.
+/// Attempting to compile, evaluate, or restore from a code cache for such a
+/// type always fails closed: [`stator_module_compile`] returns an errored
+/// module whose [`stator_module_error_kind`] is
+/// [`StatorMessageKind::StatorMessageKindUnsupportedModuleType`], and
+/// [`stator_module_compile_cached`] additionally sets the cache status to
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`].
+///
+/// Embedders like the Edge host can call this before compiling to route an
+/// import through host integration (e.g. a `CSSStyleSheet` provider) instead
+/// of asking the engine to compile something it cannot execute.
+///
+/// Unknown / future values of `source_type` are treated as not executable.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_module_type_is_executable(source_type: StatorModuleType) -> bool {
+    matches!(
+        source_type,
+        StatorModuleType::StatorModuleTypeJavaScript
+            | StatorModuleType::StatorModuleTypeJson
+            | StatorModuleType::StatorModuleTypeWebAssembly,
+    )
 }
 
 /// Attach origin metadata (resource name and offsets) to `module`.
@@ -6541,9 +6574,23 @@ unsafe fn set_module_error(
     ctx: *mut StatorContext,
     error: &stator_jse::error::StatorError,
 ) {
+    // Preserve a typed unsupported-module-type kind that the link-time graph
+    // walker already propagated from a CSS-style dep. Without this guard the
+    // outer `stator_module_instantiate` would overwrite that enum back to
+    // `Internal` (because `StatorError` collapses Unsupported→Internal),
+    // hiding the Edge-consumable signal that the failure is a host-integration
+    // gap rather than a generic engine error.
+    let preserve_unsupported = matches!(
+        module.error_kind,
+        StatorMessageKind::StatorMessageKindUnsupportedModuleType
+    );
     let message = error.to_string();
     let terminating = unsafe { context_is_execution_terminating(ctx) };
-    let kind = message_kind_for_error(error, terminating);
+    let kind = if preserve_unsupported {
+        StatorMessageKind::StatorMessageKindUnsupportedModuleType
+    } else {
+        message_kind_for_error(error, terminating)
+    };
     module.status = StatorModuleStatus::StatorModuleStatusErrored;
     module.last_result = None;
     module.error = Some(CString::new(message.clone()).unwrap_or_else(|_| c"module error".into()));
@@ -6778,6 +6825,7 @@ fn module_stored_error(module: &StatorModule) -> stator_jse::error::StatorError 
         | StatorMessageKind::StatorMessageKindJsException
         | StatorMessageKind::StatorMessageKindOutOfMemory
         | StatorMessageKind::StatorMessageKindSandboxViolation
+        | StatorMessageKind::StatorMessageKindUnsupportedModuleType
         | StatorMessageKind::StatorMessageKindUnknown => {
             stator_jse::error::StatorError::Internal(message)
         }
@@ -6904,6 +6952,15 @@ unsafe fn instantiate_module_graph(
         if let Err(error) = unsafe { instantiate_module_graph(ctx, out_module, visiting) } {
             visiting.remove(&module);
             set_module_link_error(module_ref, &error);
+            // SAFETY: `out_module` is a live module pointer returned by the
+            // resolver and just-instantiated above.
+            let dep_kind = unsafe { (*out_module).error_kind };
+            // Preserve the dep's typed unsupported-module-type kind on the
+            // importer so Edge can detect a CSS-style host-integration gap
+            // by enum value from the graph root, not only by message text.
+            if dep_kind == StatorMessageKind::StatorMessageKindUnsupportedModuleType {
+                module_ref.error_kind = dep_kind;
+            }
             return Err(error);
         }
         request.resolved.set(out_module);
@@ -11543,6 +11600,23 @@ pub enum StatorMessageKind {
     StatorMessageKindOutOfMemory = 10,
     /// A sandbox bounds-check violation.
     StatorMessageKindSandboxViolation = 11,
+    /// The module's [`StatorModuleType`] is recognised but not executable by
+    /// Stator itself and requires host integration before it can be compiled,
+    /// evaluated, or restored from a code cache.
+    ///
+    /// Currently emitted for CSS module bodies (see
+    /// [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+    /// and no `CSSStyleSheet` representation, so the engine fails closed and
+    /// tags the error with this stable kind so embedders like the Edge host
+    /// can detect "unsupported module type, route through host integration"
+    /// purely by enum value without text-matching the diagnostic.
+    ///
+    /// Always paired with an errored [`StatorModule`] whose
+    /// [`stator_module_get_error`] message names the missing host primitive,
+    /// and — when a typed import resolves to such a module — propagates to
+    /// the importer's link-time error so the same enum value surfaces on the
+    /// graph root.
+    StatorMessageKindUnsupportedModuleType = 12,
 }
 
 /// An opaque structured message describing an engine error.
@@ -22044,7 +22118,7 @@ mod tests {
             assert!(!stator_module_get_error(css).is_null());
             assert_eq!(
                 stator_module_error_kind(css),
-                StatorMessageKind::StatorMessageKindInternal
+                StatorMessageKind::StatorMessageKindUnsupportedModuleType
             );
             let css_err = CStr::from_ptr(stator_module_get_error(css))
                 .to_str()
@@ -22134,6 +22208,15 @@ mod tests {
                 stator_module_get_status(root),
                 StatorModuleStatus::StatorModuleStatusErrored
             );
+            // The importer's typed error_kind must carry the same
+            // `UnsupportedModuleType` enum the CSS dep was tagged with, so
+            // Edge can detect a host-integration gap by enum value at the
+            // graph root and route the import through host integration
+            // without parsing the diagnostic string.
+            assert_eq!(
+                stator_module_error_kind(root),
+                StatorMessageKind::StatorMessageKindUnsupportedModuleType
+            );
             // Evaluating the root after a fail-closed instantiate must remain
             // null and never silently succeed against an unsupported type.
             assert!(stator_module_evaluate(root, ctx).is_null());
@@ -22216,10 +22299,33 @@ mod tests {
                 stator_module_get_type(restored),
                 StatorModuleType::StatorModuleTypeCss
             );
+            assert_eq!(
+                stator_module_error_kind(restored),
+                StatorMessageKind::StatorMessageKindUnsupportedModuleType
+            );
             stator_module_free(restored);
             stator_string_free(json_cache);
             stator_module_free(json_module);
         }
+    }
+
+    #[test]
+    fn test_stator_module_type_is_executable_classifies_known_types() {
+        // Edge-consumable predicate: JS/JSON/Wasm are executable in-engine,
+        // CSS is not and requires host integration. Embedders can branch on
+        // this without parsing diagnostic strings.
+        assert!(stator_module_type_is_executable(
+            StatorModuleType::StatorModuleTypeJavaScript
+        ));
+        assert!(stator_module_type_is_executable(
+            StatorModuleType::StatorModuleTypeJson
+        ));
+        assert!(stator_module_type_is_executable(
+            StatorModuleType::StatorModuleTypeWebAssembly
+        ));
+        assert!(!stator_module_type_is_executable(
+            StatorModuleType::StatorModuleTypeCss
+        ));
     }
 
     #[test]
