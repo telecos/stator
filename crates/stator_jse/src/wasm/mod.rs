@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use wasmtime::{
     Config, Engine, FuncType, Global, GlobalType, Instance, Linker, Module, Mutability, Store,
-    UpdateDeadline, Val, ValType,
+    UpdateDeadline, V128, Val, ValType,
 };
 pub use wasmtime::{MemoryType, SharedMemory};
 
@@ -298,7 +298,8 @@ impl WasmModule {
     ///
     /// Returns `None` when the export does not exist, is not a global, or
     /// uses a Wasm value type that has no [`HostValKind`] representation
-    /// (`v128`, references).
+    /// (reference types). `v128` globals are represented by
+    /// [`HostValKind::V128`].
     pub fn exported_global_type(&self, name: &str) -> Option<(HostValKind, bool)> {
         let export = self.inner.exports().find(|e| e.name() == name)?;
         let gt = export.ty().global()?.clone();
@@ -390,6 +391,7 @@ fn value_type_to_host_kind(ty: wasmtime::ValType) -> Result<HostValKind, String>
         wasmtime::ValType::I64 => HostValKind::I64,
         wasmtime::ValType::F32 => HostValKind::F32,
         wasmtime::ValType::F64 => HostValKind::F64,
+        wasmtime::ValType::V128 => HostValKind::V128,
         other => return Err(format!("unsupported Wasm value type {other}")),
     })
 }
@@ -490,6 +492,10 @@ pub enum HostValKind {
     F32 = 2,
     /// Wasm `f64`.
     F64 = 3,
+    /// Wasm `v128`. Reserved for Wasm-to-Wasm host-global imports; there is
+    /// no JS-side representation, so any JS↔Wasm boundary conversion that
+    /// encounters this kind fails closed.
+    V128 = 4,
 }
 
 impl HostValKind {
@@ -499,6 +505,7 @@ impl HostValKind {
             HostValKind::I64 => ValType::I64,
             HostValKind::F32 => ValType::F32,
             HostValKind::F64 => ValType::F64,
+            HostValKind::V128 => ValType::V128,
         }
     }
 }
@@ -514,6 +521,10 @@ pub enum HostVal {
     F32(f32),
     /// Wasm `f64`.
     F64(f64),
+    /// Wasm `v128` carried as raw 128-bit bits in little-endian-lane order.
+    /// Only used by the Wasm-to-Wasm global-import bridge; this value never
+    /// participates in any JS↔Wasm conversion.
+    V128(u128),
 }
 
 impl HostVal {
@@ -524,6 +535,7 @@ impl HostVal {
             HostVal::I64(_) => HostValKind::I64,
             HostVal::F32(_) => HostValKind::F32,
             HostVal::F64(_) => HostValKind::F64,
+            HostVal::V128(_) => HostValKind::V128,
         }
     }
 
@@ -534,6 +546,7 @@ impl HostVal {
             HostValKind::I64 => HostVal::I64(0),
             HostValKind::F32 => HostVal::F32(0.0),
             HostValKind::F64 => HostVal::F64(0.0),
+            HostValKind::V128 => HostVal::V128(0),
         }
     }
 
@@ -543,6 +556,7 @@ impl HostVal {
             Val::I64(n) => Some(HostVal::I64(*n)),
             Val::F32(b) => Some(HostVal::F32(f32::from_bits(*b))),
             Val::F64(b) => Some(HostVal::F64(f64::from_bits(*b))),
+            Val::V128(v) => Some(HostVal::V128(v.as_u128())),
             _ => None,
         }
     }
@@ -553,6 +567,7 @@ impl HostVal {
             HostVal::I64(n) => Val::I64(n),
             HostVal::F32(f) => Val::F32(f.to_bits()),
             HostVal::F64(f) => Val::F64(f.to_bits()),
+            HostVal::V128(bits) => Val::V128(V128::from(bits)),
         }
     }
 }
@@ -906,6 +921,30 @@ impl WasmInstance {
             .into_shared_memory()
     }
 
+    /// Read the current 128-bit value of a named `v128` global export on
+    /// this instance.
+    ///
+    /// Returns `None` when the export does not exist, is not a global, or
+    /// is not of type `v128`. The value is returned as raw bits in the
+    /// little-endian-lane order used by [`wasmtime::V128::as_u128`].
+    ///
+    /// Stator's module-graph integration uses this accessor to copy an
+    /// immutable `v128` global value from a Wasm dependency's store into a
+    /// fresh per-importer-store [`Global`]. Because the source global is
+    /// declared immutable, this single-shot snapshot is semantically
+    /// equivalent to sharing the same global instance across stores.
+    pub fn exported_v128_global(&mut self, name: &str) -> Option<u128> {
+        let export = self.inner.get_export(&mut self.store, name)?;
+        let global = export.into_global()?;
+        if !matches!(global.ty(&self.store).content(), ValType::V128) {
+            return None;
+        }
+        match global.get(&mut self.store) {
+            Val::V128(v) => Some(v.as_u128()),
+            _ => None,
+        }
+    }
+
     /// Call an exported function by name using [`JsValue`] arguments.
     ///
     /// This is a convenience wrapper around [`WasmInstance::call`] that
@@ -1009,13 +1048,25 @@ pub fn wasm_val_to_js_value(val: &Val) -> StatorResult<JsValue> {
 /// This is the typed-host-import counterpart to [`wasm_val_to_js_value`] used
 /// when the embedder works in [`HostVal`] without ever materialising a
 /// [`wasmtime::Val`].
-pub fn host_val_to_js_value(val: HostVal) -> JsValue {
-    match val {
+///
+/// # Errors
+///
+/// Returns [`StatorError::WasmError`] for [`HostVal::V128`], which has no
+/// JS-side representation. Stator's module-graph integration routes `v128`
+/// values directly between Wasm stores without ever passing through
+/// [`JsValue`], so this is fail-closed by construction.
+pub fn host_val_to_js_value(val: HostVal) -> StatorResult<JsValue> {
+    Ok(match val {
         HostVal::I32(n) => JsValue::Smi(n),
         HostVal::I64(n) => JsValue::HeapNumber(n as f64),
         HostVal::F32(f) => JsValue::HeapNumber(f64::from(f)),
         HostVal::F64(f) => JsValue::HeapNumber(f),
-    }
+        HostVal::V128(_) => {
+            return Err(StatorError::WasmError(
+                "cannot convert Wasm v128 value to a JsValue".to_string(),
+            ));
+        }
+    })
 }
 
 /// Convert a [`JsValue`] into a [`HostVal`] of the requested kind.
@@ -1027,8 +1078,16 @@ pub fn host_val_to_js_value(val: HostVal) -> JsValue {
 /// # Errors
 ///
 /// Returns [`StatorError::WasmError`] when the value cannot be represented as
-/// the requested [`HostValKind`] (e.g. an object).
+/// the requested [`HostValKind`] (e.g. an object), and unconditionally for
+/// [`HostValKind::V128`] because no [`JsValue`] can carry 128 bits without
+/// loss; Wasm-to-Wasm v128 globals are bound through
+/// [`WasmInstance::exported_v128_global`] instead of the JS namespace path.
 pub fn js_value_to_host_val(value: &JsValue, kind: HostValKind) -> StatorResult<HostVal> {
+    if matches!(kind, HostValKind::V128) {
+        return Err(StatorError::WasmError(
+            "cannot convert a JsValue to a Wasm v128 value".to_string(),
+        ));
+    }
     let n = match value {
         JsValue::Smi(n) => Some(f64::from(*n)),
         JsValue::HeapNumber(f) => Some(*f),
@@ -1048,6 +1107,7 @@ pub fn js_value_to_host_val(value: &JsValue, kind: HostValKind) -> StatorResult<
         HostValKind::I64 => HostVal::I64(n as i64),
         HostValKind::F32 => HostVal::F32(n as f32),
         HostValKind::F64 => HostVal::F64(n),
+        HostValKind::V128 => unreachable!("guarded above"),
     })
 }
 
@@ -1755,6 +1815,7 @@ mod tests {
             (module
                 (global (export "g") (mut f32) (f32.const 1.5))
                 (global (export "h") i64 (i64.const 9))
+                (global (export "v") v128 (v128.const i64x2 0x1 0x2))
                 (func (export "f")))
         "#;
         let engine = WasmEngine::new();
@@ -1767,8 +1828,60 @@ mod tests {
             module.exported_global_type("h"),
             Some((HostValKind::I64, false))
         );
+        assert_eq!(
+            module.exported_global_type("v"),
+            Some((HostValKind::V128, false))
+        );
         assert_eq!(module.exported_global_type("f"), None);
         assert_eq!(module.exported_global_type("missing"), None);
+    }
+
+    /// Snapshotting a Wasm instance's exported `v128` global returns the
+    /// declared constant bits in the lane order documented on
+    /// [`WasmInstance::exported_v128_global`]; non-v128 globals and
+    /// missing names return `None`.
+    #[test]
+    fn test_wasm_instance_exported_v128_global_round_trips_bits() {
+        let wat = r#"
+            (module
+                (global (export "v") v128
+                    (v128.const i64x2 0x1122334455667788 0x99aabbccddeeff00))
+                (global (export "n") i32 (i32.const 42))
+                (func (export "f")))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let mut instance = WasmInstance::new(&engine, &module).unwrap();
+        let expected: u128 = ((0x99aabbccddeeff00_u128) << 64) | (0x1122334455667788_u128);
+        assert_eq!(instance.exported_v128_global("v"), Some(expected));
+        assert_eq!(instance.exported_v128_global("n"), None);
+        assert_eq!(instance.exported_v128_global("f"), None);
+        assert_eq!(instance.exported_v128_global("missing"), None);
+    }
+
+    /// Binding an immutable v128 host global through the typed host-import
+    /// path materialises a per-store global whose value matches the
+    /// supplied [`HostVal::V128`] bits, observable by reading the global
+    /// back from the freshly instantiated instance.
+    #[test]
+    fn test_wasm_host_global_import_v128_immutable_round_trip() {
+        let wat = r#"
+            (module
+                (import "env" "g" (global v128))
+                (global (export "out") v128 (global.get 0)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let bits: u128 = 0xdeadbeef_cafef00d_0123456789abcdef;
+        let globals = vec![HostGlobal {
+            module: "env".to_string(),
+            name: "g".to_string(),
+            value: HostVal::V128(bits),
+            mutable: false,
+        }];
+        let mut instance =
+            WasmInstance::new_with_extern_imports(&engine, &module, Vec::new(), globals).unwrap();
+        assert_eq!(instance.exported_v128_global("out"), Some(bits));
     }
 
     // ── Host shared-memory imports ──────────────────────────────────────────

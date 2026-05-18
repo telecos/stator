@@ -3537,10 +3537,27 @@ fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImpor
             stator_jse::wasm::WasmExternKind::Global {
                 value_type: Ok(value_type),
                 mutable,
-            } => AcceptedImport::Global {
-                value_type,
-                mutable,
-            },
+            } => {
+                // v128 globals are routed only when immutable. The
+                // module-graph binding for `v128` copies the dependency's
+                // current value into a fresh per-importer store global,
+                // which is semantically equivalent to sharing the same
+                // global instance only when the source is declared
+                // immutable (no observable divergence under mutation).
+                if matches!(value_type, HostValKind::V128) && mutable {
+                    return Err(format!(
+                        "WebAssembly module import '{module_name}.{field_name}' is a mutable \
+                         v128 global; Stator can only bind immutable v128 global imports \
+                         through the module graph because each importer instance owns its \
+                         own Wasmtime store and Wasmtime has no SharedGlobal primitive that \
+                         could route mutations of a v128 value across stores"
+                    ));
+                }
+                AcceptedImport::Global {
+                    value_type,
+                    mutable,
+                }
+            }
             stator_jse::wasm::WasmExternKind::Memory {
                 minimum,
                 maximum: Some(maximum),
@@ -4267,6 +4284,7 @@ fn parse_host_val_kind(tag: u8) -> Option<HostValKind> {
         1 => Some(HostValKind::I64),
         2 => Some(HostValKind::F32),
         3 => Some(HostValKind::F64),
+        4 => Some(HostValKind::V128),
         _ => None,
     }
 }
@@ -7531,27 +7549,47 @@ unsafe fn build_wasm_host_imports(
                     import.module, import.name
                 ))
             })?;
-        // SAFETY: `dep` was returned by the resolver and recorded on the
-        // module's request slot.
-        let value =
-            unsafe { lookup_wasm_import_value(dep, &import.name) }.map_err(|e| match e {
-                stator_jse::error::StatorError::WasmError(msg) => {
-                    stator_jse::error::StatorError::WasmError(format!(
-                        "WebAssembly import '{}.{}': {msg}",
-                        import.module, import.name
-                    ))
-                }
-                other => other,
-            })?;
-        let host_val = match js_value_to_host_val(&value, import.value_type) {
-            Ok(v) => v,
-            Err(e) => {
+        let host_val = if matches!(import.value_type, HostValKind::V128) {
+            // v128 globals bypass the JsValue namespace path entirely:
+            // there is no JS-side representation for a 128-bit Wasm value,
+            // so we read the dependency's exported v128 global directly
+            // from its own Wasmtime store and snapshot the bits into the
+            // importer's per-store global. This is only accepted for
+            // immutable v128 globals (enforced at compile time and
+            // re-checked below).
+            if dep.is_null() {
                 return Err(stator_jse::error::StatorError::WasmError(format!(
-                    "WebAssembly global import '{}.{}' cannot be initialised: {}",
-                    import.module,
-                    import.name,
-                    error_to_string(&e),
+                    "WebAssembly v128 global import '{}.{}' has no resolved dependency module",
+                    import.module, import.name
                 )));
+            }
+            // SAFETY: `dep` was returned by the resolver and is live until
+            // the graph is torn down; we only borrow it through &mut here.
+            let bits = unsafe { resolve_wasm_v128_global_dependency(dep, import) }?;
+            HostVal::V128(bits)
+        } else {
+            // SAFETY: `dep` was returned by the resolver and recorded on
+            // the module's request slot.
+            let value =
+                unsafe { lookup_wasm_import_value(dep, &import.name) }.map_err(|e| match e {
+                    stator_jse::error::StatorError::WasmError(msg) => {
+                        stator_jse::error::StatorError::WasmError(format!(
+                            "WebAssembly import '{}.{}': {msg}",
+                            import.module, import.name
+                        ))
+                    }
+                    other => other,
+                })?;
+            match js_value_to_host_val(&value, import.value_type) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(stator_jse::error::StatorError::WasmError(format!(
+                        "WebAssembly global import '{}.{}' cannot be initialised: {}",
+                        import.module,
+                        import.name,
+                        error_to_string(&e),
+                    )));
+                }
             }
         };
         if !dep.is_null() {
@@ -7596,6 +7634,69 @@ unsafe fn build_wasm_host_imports(
     }
 
     Ok((funcs, globals, memories))
+}
+
+/// Resolve an immutable `v128` global import against its resolved dependency
+/// module by reading the dependency's exported global on its own Wasmtime
+/// store and snapshotting the 128-bit value.
+///
+/// Stator only routes v128 global imports through Wasm-to-Wasm dependency
+/// edges, and only when the import is declared immutable; the compile path
+/// in [`collect_wasm_module_imports`] enforces both invariants before this
+/// runtime helper is reached. The dependency-side global is also verified
+/// to be `v128` (and immutable) here so a graph that was relinked against a
+/// non-matching dependency fails closed instead of producing a corrupt
+/// initial value. JavaScript dependencies fail closed because no JS value
+/// can losslessly carry 128 bits.
+///
+/// # Safety
+/// `dep` must be a live, fully-evaluated module pointer.
+unsafe fn resolve_wasm_v128_global_dependency(
+    dep: *mut StatorModule,
+    import: &WasmGlobalImport,
+) -> stator_jse::error::StatorResult<u128> {
+    // SAFETY: caller guarantees `dep` is a live module pointer.
+    let dep_ref = unsafe { &mut *dep };
+    let Some(dep_wasm) = dep_ref.wasm_module.as_ref().cloned() else {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly v128 global import '{}.{}' resolves to a non-WebAssembly dependency; \
+             Stator can only bind v128 global imports through a Wasm dependency module that \
+             exports a matching immutable v128 global",
+            import.module, import.name
+        )));
+    };
+    let Some((dep_kind, dep_mut)) = dep_wasm.exported_global_type(&import.name) else {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly v128 global import '{}.{}' is not exported as a global by the \
+             resolved Wasm dependency",
+            import.module, import.name
+        )));
+    };
+    if dep_kind != HostValKind::V128 || dep_mut {
+        return Err(stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly v128 global import '{}.{}' type mismatch with resolved Wasm \
+             dependency export (importer expected immutable v128; dependency exports \
+             kind={:?} mutable={})",
+            import.module, import.name, dep_kind, dep_mut,
+        )));
+    }
+    let dep_instance = dep_ref.wasm_instance.clone().ok_or_else(|| {
+        stator_jse::error::StatorError::WasmError(format!(
+            "WebAssembly v128 global import '{}.{}' resolves to a Wasm dependency that \
+             has not been evaluated yet; module-graph evaluation order invariant broken",
+            import.module, import.name
+        ))
+    })?;
+    dep_instance
+        .borrow_mut()
+        .exported_v128_global(&import.name)
+        .ok_or_else(|| {
+            stator_jse::error::StatorError::WasmError(format!(
+                "WebAssembly v128 global import '{}.{}' resolved Wasm dependency declares \
+                 the export as v128 but did not materialise it as a v128 global at runtime",
+                import.module, import.name
+            ))
+        })
 }
 
 /// Resolve a [`WasmMemoryImport`] against its resolved dependency module by
@@ -7776,7 +7877,21 @@ fn wrap_js_function_for_wasm_import(
     let local = LocalWasmImportFn(native);
     let qualified = format!("{module_name}.{field_name}");
     let callback: HostFuncCallback = std::sync::Arc::new(move |args, out_results| {
-        let js_args: Vec<JsValue> = args.iter().copied().map(host_val_to_js_value).collect();
+        let js_args: Vec<JsValue> = match args
+            .iter()
+            .copied()
+            .map(host_val_to_js_value)
+            .collect::<stator_jse::error::StatorResult<Vec<_>>>()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                log::warn!(
+                    "Wasm import '{qualified}' received an argument with no JsValue \
+                     representation (e.g. v128); trapping calling Wasm"
+                );
+                return false;
+            }
+        };
         let result = match local.call(js_args) {
             Ok(value) => value,
             Err(_) => {
@@ -12364,6 +12479,16 @@ fn host_kind_to_stator(k: HostValKind) -> StatorWasmValueKind {
         HostValKind::I64 => StatorWasmValueKind::StatorWasmValueKindI64,
         HostValKind::F32 => StatorWasmValueKind::StatorWasmValueKindF32,
         HostValKind::F64 => StatorWasmValueKind::StatorWasmValueKindF64,
+        // V128 cannot reach the C-ABI host-callback path: the public
+        // C ABI cannot declare a v128 param/result (no
+        // `StatorWasmValueKind` variant carries it), so no
+        // [`HostFuncCallback`] built from C ever has V128 in its
+        // signature. The only V128 producer in Stator is the
+        // Wasm-to-Wasm v128 global-import bridge, which never
+        // constructs a [`HostFunc`].
+        HostValKind::V128 => {
+            unreachable!("v128 host functions are not representable in the C ABI")
+        }
     }
 }
 
@@ -12385,6 +12510,10 @@ fn host_val_to_stator(v: &HostVal) -> StatorWasmValue {
             kind: StatorWasmValueKind::StatorWasmValueKindF64,
             value: StatorWasmValuePayload { f64_: f },
         },
+        // See `host_kind_to_stator` for why this case is unreachable.
+        HostVal::V128(_) => {
+            unreachable!("v128 host functions are not representable in the C ABI")
+        }
     }
 }
 
@@ -19578,11 +19707,15 @@ mod tests {
         0x0a, 0x0d, 0x02, 0x04, 0x00, 0x23, 0x00, 0x0b, 0x06, 0x00, 0x20, 0x00, 0x24, 0x00, 0x0b,
     ];
 
-    // Imports a v128 global `env.g` (no other sections). v128 globals are
-    // not representable through `HostValKind` and remain fail-closed.
-    const WASM_IMPORT_V128_GLOBAL: &[u8] = &[
+    // Imports a *mutable* v128 global `env.g` (no other sections). Stator
+    // only binds *immutable* v128 globals through the module graph
+    // (because each importer owns its own Wasmtime store and there is no
+    // SharedGlobal primitive that could route mutations), so mutable v128
+    // globals continue to fail closed at compile time with a precise
+    // diagnostic.
+    const WASM_IMPORT_MUT_V128_GLOBAL: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76,
-        0x01, 0x67, 0x03, 0x7b, 0x00,
+        0x01, 0x67, 0x03, 0x7b, 0x01,
     ];
 
     // Imports an externref global `env.g` (no other sections). Reference
@@ -20193,12 +20326,203 @@ mod tests {
         }
     }
 
+    /// Mutable v128 global imports are rejected at compile time because
+    /// Stator's per-store model cannot route mutations across instances
+    /// without a SharedGlobal primitive; the diagnostic must mention the
+    /// import name, that it is a mutable v128, and the store-isolation
+    /// reason so embedders can distinguish this from the supported
+    /// immutable v128 case.
     #[test]
-    fn test_module_wasm_unsupported_v128_global_import_fails_compilation() {
-        assert_wasm_unsupported_import_kind_fails_compilation(
-            WASM_IMPORT_V128_GLOBAL,
-            &["env.g", "global", "v128"],
+    fn test_module_wasm_unsupported_mutable_v128_global_import_fails_compilation() {
+        let module = compile_typed_module_bytes(
+            WASM_IMPORT_MUT_V128_GLOBAL,
+            StatorModuleType::StatorModuleTypeWebAssembly,
         );
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusErrored
+            );
+            assert_eq!(
+                stator_module_error_kind(module),
+                StatorMessageKind::StatorMessageKindWasm
+            );
+            let err = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            for term in &["env.g", "mutable", "v128", "immutable", "SharedGlobal"] {
+                assert!(err.contains(term), "missing '{term}' in: {err}");
+            }
+            stator_module_free(module);
+        }
+    }
+
+    /// Immutable v128 global imports compile because Stator can route a
+    /// constant v128 value through the module graph using a Wasm
+    /// dependency's exported `v128` global (snapshot-copied between
+    /// stores). Compilation reaches the unlinked state with a single
+    /// synthesised request for the import namespace.
+    #[test]
+    fn test_module_wasm_immutable_v128_global_import_compiles_successfully() {
+        let bytes = wat::parse_str(
+            r#"(module (import "env" "g" (global v128))
+                       (func (export "lo") (result i64)
+                         (i64x2.extract_lane 0 (global.get 0))))"#,
+        )
+        .unwrap();
+        let module =
+            compile_typed_module_bytes(&bytes, StatorModuleType::StatorModuleTypeWebAssembly);
+        // SAFETY: `module` is non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_module_get_status(module),
+                StatorModuleStatus::StatorModuleStatusUnlinked
+            );
+            assert!(stator_module_get_error(module).is_null());
+            assert_eq!(stator_module_get_request_count(module), 1);
+            stator_module_free(module);
+        }
+    }
+
+    /// A Wasm module importing `env.g` as an immutable `v128` global links
+    /// against a Wasm dependency that exports a matching `(global v128
+    /// const ...)`. The importer extracts each 64-bit lane via an
+    /// exported function and a root JS module verifies that the snapshot
+    /// matches the dependency's v128 constant bit-for-bit (both lanes are
+    /// chosen to fit precisely in `f64` so JS observation is lossless).
+    #[test]
+    fn test_module_wasm_immutable_v128_global_import_binds_wasm_dep_export() {
+        let importer_bytes = wat::parse_str(
+            r#"(module (import "env" "g" (global v128))
+                       (func (export "lo") (result i64)
+                         (i64x2.extract_lane 0 (global.get 0)))
+                       (func (export "hi") (result i64)
+                         (i64x2.extract_lane 1 (global.get 0))))"#,
+        )
+        .unwrap();
+        // i64x2 lanes chosen to be < 2^53 so they round-trip losslessly
+        // through `f64` when handed to JS.
+        let dep_bytes = wat::parse_str(
+            r#"(module (global (export "g") v128
+                         (v128.const i64x2 0x12345678 0x789abcde)))"#,
+        )
+        .unwrap();
+
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { lo, hi } from './importer.wasm' with { type: 'webassembly' };\
+             const want_lo = 0x12345678;\
+             const want_hi = 0x789abcde;\
+             (lo() === want_lo && hi() === want_hi) ? 1 : 0;",
+        );
+        let importer = compile_typed_module_bytes(
+            &importer_bytes,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep =
+            compile_typed_module_bytes(&dep_bytes, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 1.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    /// Resolving an immutable v128 global import against a JS dependency
+    /// fails closed at evaluation: there is no JS-side representation that
+    /// can losslessly carry 128 bits, so Stator never silently produces a
+    /// zero v128. The diagnostic must name the import and the
+    /// non-WebAssembly-dependency reason.
+    #[test]
+    fn test_module_wasm_immutable_v128_global_import_js_dep_fails_evaluation() {
+        let importer_bytes = wat::parse_str(
+            r#"(module (import "env" "g" (global v128))
+                       (func (export "lo") (result i64)
+                         (i64x2.extract_lane 0 (global.get 0))))"#,
+        )
+        .unwrap();
+
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src(
+            "import { lo } from './importer.wasm' with { type: 'webassembly' }; lo();",
+        );
+        let importer = compile_typed_module_bytes(
+            &importer_bytes,
+            StatorModuleType::StatorModuleTypeWebAssembly,
+        );
+        let env_dep = compile_module_src("export const g = 0;");
+        let mut modules = HashMap::new();
+        modules.insert("./importer.wasm".to_string(), importer);
+        modules.insert("env".to_string(), env_dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            assert_eq!(
+                stator_module_error_kind(importer),
+                StatorMessageKind::StatorMessageKindWasm
+            );
+            let err = CStr::from_ptr(stator_module_get_error(importer))
+                .to_str()
+                .unwrap();
+            for term in &["env.g", "v128", "non-WebAssembly"] {
+                assert!(err.contains(term), "missing '{term}' in: {err}");
+            }
+            stator_module_free(root);
+            stator_module_free(importer);
+            stator_module_free(env_dep);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
@@ -20812,8 +21136,68 @@ mod tests {
     }
 
     #[test]
-    fn test_module_wasm_code_cache_rejects_unsupported_v128_global_import_kind() {
-        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_V128_GLOBAL);
+    fn test_module_wasm_code_cache_rejects_unsupported_mutable_v128_global_import_kind() {
+        assert_wasm_code_cache_rejects_unsupported_import_kind(WASM_IMPORT_MUT_V128_GLOBAL);
+    }
+
+    /// Immutable v128 global imports are a supported import shape and
+    /// must serialise through the code cache with the new HostValKind tag
+    /// for `v128` (=4); the cached payload validates and recompiles
+    /// cleanly, preserving the synthesised request for the import
+    /// namespace.
+    #[test]
+    fn test_module_wasm_code_cache_with_immutable_v128_global_import_roundtrip() {
+        let bytes = wat::parse_str(
+            r#"(module (import "env" "g" (global v128))
+                       (func (export "lo") (result i64)
+                         (i64x2.extract_lane 0 (global.get 0))))"#,
+        )
+        .unwrap();
+        let module =
+            compile_typed_module_bytes(&bytes, StatorModuleType::StatorModuleTypeWebAssembly);
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        let options = typed_module_compile_options(StatorModuleType::StatorModuleTypeWebAssembly);
+        status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument;
+        // SAFETY: pointers are live.
+        let restored = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled
+        );
+        // SAFETY: restored is live.
+        unsafe {
+            assert!(stator_module_get_error(restored).is_null());
+            assert_eq!(stator_module_get_request_count(restored), 1);
+            stator_module_free(restored);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
     }
 
     #[test]
