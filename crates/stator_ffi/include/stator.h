@@ -206,6 +206,24 @@ typedef enum StatorModuleCacheStatus {
    * generation.
    */
   StatorModuleCacheStatusAcceptedBytecodeRestored = 6,
+  /**
+   * Cache blob's magic, format version, and source/options metadata were
+   * well-formed and matched the expected record, but its integrity
+   * checksum failed to verify. The bytes after the format-version field
+   * are corrupt, truncated, or were tampered with after production. The
+   * blob is fail-closed rejected. This status is distinct from
+   * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`], which
+   * covers source/options/metadata mismatches; embedders can use the
+   * distinction to decide whether to evict the blob from disk versus
+   * recompile under the new options.
+   *
+   * The checksum is a fast non-cryptographic
+   * digest (FNV-1a 64) intended only for accidental corruption detection;
+   * it does not authenticate the producer. Embedders that need
+   * authenticity should wrap the cache blob in their own signed or
+   * HMAC'd envelope.
+   */
+  StatorModuleCacheStatusCorruptPayload = 7,
 } StatorModuleCacheStatus;
 
 /**

@@ -2851,6 +2851,22 @@ pub enum StatorModuleCacheStatus {
     /// import/export shape directly from it, skipping parsing and bytecode
     /// generation.
     StatorModuleCacheStatusAcceptedBytecodeRestored = 6,
+    /// Cache blob's magic, format version, and source/options metadata were
+    /// well-formed and matched the expected record, but its integrity
+    /// checksum failed to verify. The bytes after the format-version field
+    /// are corrupt, truncated, or were tampered with after production. The
+    /// blob is fail-closed rejected. This status is distinct from
+    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`], which
+    /// covers source/options/metadata mismatches; embedders can use the
+    /// distinction to decide whether to evict the blob from disk versus
+    /// recompile under the new options.
+    ///
+    /// The checksum is a fast non-cryptographic
+    /// digest (FNV-1a 64) intended only for accidental corruption detection;
+    /// it does not authenticate the producer. Embedders that need
+    /// authenticity should wrap the cache blob in their own signed or
+    /// HMAC'd envelope.
+    StatorModuleCacheStatusCorruptPayload = 7,
 }
 
 /// Read-only view of the browser policy/origin metadata associated with a
@@ -3860,8 +3876,27 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// subset) so JSON cache hits can skip JSON re-parsing. Version 4 added a
 /// WebAssembly payload variant containing original Wasm bytes plus import/export
 /// metadata; hits validate the payload and then recompile the Wasm bytes because
-/// no safe untrusted compiled-artifact restore primitive is available.
-const MODULE_CACHE_FORMAT_VERSION: u32 = 5;
+/// no safe untrusted compiled-artifact restore primitive is available. Version 6
+/// introduced a [`fnv1a64`] integrity checksum stored immediately after the
+/// format version and covering every byte that follows it (header fields and
+/// payload). The checksum is a corruption-detection digest only — it is not a
+/// cryptographic MAC and provides no protection against an adversary that can
+/// recompute it. Embedders that need authenticity must wrap the cache blob in
+/// their own signed or HMAC'd envelope. The checksum lets the engine detect
+/// bit-flips, truncations, and accidental tampering of the payload bytes and
+/// surface them as the explicit
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload`] status,
+/// distinct from metadata/source/options mismatches which keep using
+/// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
+const MODULE_CACHE_FORMAT_VERSION: u32 = 6;
+
+/// Byte offset, inside a serialized cache blob, at which the corruption
+/// checksum is written. Immediately follows the magic and format version
+/// fields. The checksum covers every byte from `MODULE_CACHE_CHECKSUM_END`
+/// onward.
+const MODULE_CACHE_CHECKSUM_OFFSET: usize = MODULE_CACHE_MAGIC.len() + 4;
+/// Byte offset of the first byte covered by the integrity checksum.
+const MODULE_CACHE_CHECKSUM_END: usize = MODULE_CACHE_CHECKSUM_OFFSET + 8;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
@@ -3955,6 +3990,14 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
     let mut out = Vec::new();
     out.extend_from_slice(MODULE_CACHE_MAGIC);
     push_u32(&mut out, MODULE_CACHE_FORMAT_VERSION);
+    // Reserve space for the corruption-detection checksum. It is patched in
+    // by `finalize_module_cache_blob` once the full header + payload bytes
+    // are known. Zero is never a valid checksum here because the data covered
+    // is non-empty (the header alone contains the engine version string and
+    // multiple required fields), so a forgotten finalize would reliably fail
+    // the checksum verification on the read side.
+    push_u64(&mut out, 0);
+    debug_assert_eq!(out.len(), MODULE_CACHE_CHECKSUM_END);
     if !push_bytes(&mut out, env!("CARGO_PKG_VERSION").as_bytes()) {
         return None;
     }
@@ -3973,6 +4016,18 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
         return None;
     }
     Some(out)
+}
+
+/// Compute and write the corruption-detection checksum trailer for a fully
+/// assembled cache blob. Must be called exactly once after both the record
+/// header and the payload bytes have been appended. The checksum covers every
+/// byte from `MODULE_CACHE_CHECKSUM_END` to the end of `bytes`, which is the
+/// complete header (after the placeholder) plus the serialized payload.
+fn finalize_module_cache_blob(bytes: &mut [u8]) {
+    debug_assert!(bytes.len() >= MODULE_CACHE_CHECKSUM_END);
+    let checksum = fnv1a64(&bytes[MODULE_CACHE_CHECKSUM_END..]);
+    bytes[MODULE_CACHE_CHECKSUM_OFFSET..MODULE_CACHE_CHECKSUM_END]
+        .copy_from_slice(&checksum.to_le_bytes());
 }
 
 /// Serialized module structure that lets [`stator_module_compile_cached`] skip
@@ -4492,33 +4547,91 @@ fn serialize_json_value_bytes(value: &JsValue) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn parse_module_cache_blob(bytes: &[u8]) -> Option<(ModuleCacheRecord, ModuleCachePayload)> {
+/// Reason a cache blob was rejected by [`parse_module_cache_blob`].
+///
+/// Separated from a successful parse so that the caller can map blob-level
+/// failures to distinct FFI status codes. Source/options mismatch is *not*
+/// reported here — it is detected after a successful parse by comparing the
+/// parsed [`ModuleCacheRecord`] to the expected one derived from the caller's
+/// source bytes and compile options.
+enum ModuleCacheParseError {
+    /// Magic, version, framing, or structural decoding of the header/payload
+    /// failed. Includes malformed length prefixes, unknown tag bytes, and
+    /// trailing unconsumed bytes after the payload.
+    Malformed,
+    /// Header and payload structure decoded cleanly, but the corruption
+    /// checksum stored in the blob did not match the recomputed value over
+    /// the bytes it covers. Indicates accidental bit-rot, truncation that
+    /// happens to land on a structurally-valid boundary, or post-production
+    /// tampering. Always fail-closed — never restore from a blob whose
+    /// checksum does not verify.
+    ChecksumMismatch,
+}
+
+fn parse_module_cache_blob(
+    bytes: &[u8],
+) -> Result<(ModuleCacheRecord, ModuleCachePayload), ModuleCacheParseError> {
     let mut reader = CacheReader::new(bytes);
-    if reader.take(MODULE_CACHE_MAGIC.len())? != MODULE_CACHE_MAGIC {
-        return None;
+    if reader
+        .take(MODULE_CACHE_MAGIC.len())
+        .ok_or(ModuleCacheParseError::Malformed)?
+        != MODULE_CACHE_MAGIC
+    {
+        return Err(ModuleCacheParseError::Malformed);
     }
-    if reader.read_u32()? != MODULE_CACHE_FORMAT_VERSION {
-        return None;
+    if reader.read_u32().ok_or(ModuleCacheParseError::Malformed)? != MODULE_CACHE_FORMAT_VERSION {
+        return Err(ModuleCacheParseError::Malformed);
     }
-    if reader.read_bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
-        return None;
+    let stored_checksum = reader.read_u64().ok_or(ModuleCacheParseError::Malformed)?;
+    debug_assert_eq!(reader.offset, MODULE_CACHE_CHECKSUM_END);
+    // Verify the corruption checksum BEFORE running any structural decoding
+    // on the rest of the blob. Catches bit-flips, truncations, and casual
+    // tampering anywhere in the header or payload bytes. This is a
+    // non-cryptographic FNV-1a 64 digest — corruption detection only, not a
+    // tamper-proof MAC.
+    if bytes.len() < MODULE_CACHE_CHECKSUM_END {
+        return Err(ModuleCacheParseError::Malformed);
     }
-    let source_hash = reader.read_u64()?;
-    let source_len = reader.read_u64()?;
-    let source_type = module_type_from_u32(reader.read_u32()?)?;
-    let line_offset = reader.read_i32()?;
-    let column_offset = reader.read_i32()?;
-    let credentials_mode = credentials_mode_from_u32(reader.read_u32()?)?;
-    let referrer_policy = referrer_policy_from_u32(reader.read_u32()?)?;
-    let parser_metadata = parser_metadata_from_u32(reader.read_u32()?)?;
-    let resource_name = reader.read_bytes()?;
-    let base_url = reader.read_bytes()?;
-    let integrity_metadata = reader.read_bytes()?;
-    let payload = parse_module_cache_payload(&mut reader, source_type)?;
+    if fnv1a64(&bytes[MODULE_CACHE_CHECKSUM_END..]) != stored_checksum {
+        return Err(ModuleCacheParseError::ChecksumMismatch);
+    }
+    let engine_version = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    if engine_version != env!("CARGO_PKG_VERSION").as_bytes() {
+        return Err(ModuleCacheParseError::Malformed);
+    }
+    let source_hash = reader.read_u64().ok_or(ModuleCacheParseError::Malformed)?;
+    let source_len = reader.read_u64().ok_or(ModuleCacheParseError::Malformed)?;
+    let source_type =
+        module_type_from_u32(reader.read_u32().ok_or(ModuleCacheParseError::Malformed)?)
+            .ok_or(ModuleCacheParseError::Malformed)?;
+    let line_offset = reader.read_i32().ok_or(ModuleCacheParseError::Malformed)?;
+    let column_offset = reader.read_i32().ok_or(ModuleCacheParseError::Malformed)?;
+    let credentials_mode =
+        credentials_mode_from_u32(reader.read_u32().ok_or(ModuleCacheParseError::Malformed)?)
+            .ok_or(ModuleCacheParseError::Malformed)?;
+    let referrer_policy =
+        referrer_policy_from_u32(reader.read_u32().ok_or(ModuleCacheParseError::Malformed)?)
+            .ok_or(ModuleCacheParseError::Malformed)?;
+    let parser_metadata =
+        parser_metadata_from_u32(reader.read_u32().ok_or(ModuleCacheParseError::Malformed)?)
+            .ok_or(ModuleCacheParseError::Malformed)?;
+    let resource_name = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let base_url = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let integrity_metadata = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let payload = parse_module_cache_payload(&mut reader, source_type)
+        .ok_or(ModuleCacheParseError::Malformed)?;
     if !reader.is_finished() {
-        return None;
+        return Err(ModuleCacheParseError::Malformed);
     }
-    Some((
+    Ok((
         ModuleCacheRecord {
             source_hash,
             source_len,
@@ -5405,6 +5518,7 @@ pub unsafe extern "C" fn stator_module_create_code_cache(
         }
         return std::ptr::null_mut();
     }
+    finalize_module_cache_blob(&mut bytes);
     if !out_status.is_null() {
         // SAFETY: caller guarantees `out_status` is valid when non-null.
         unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata };
@@ -5479,12 +5593,31 @@ pub unsafe extern "C" fn stator_module_compile_cached(
     else {
         return module_cache_rejection_record(source_type, "invalid module compile options");
     };
-    let Some((actual, payload)) = parse_module_cache_blob(cache_bytes) else {
-        if !out_status.is_null() {
-            // SAFETY: caller guarantees `out_status` is valid when non-null.
-            unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusRejected };
+    let (actual, payload) = match parse_module_cache_blob(cache_bytes) {
+        Ok(parsed) => parsed,
+        Err(ModuleCacheParseError::Malformed) => {
+            if !out_status.is_null() {
+                // SAFETY: caller guarantees `out_status` is valid when non-null.
+                unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusRejected };
+            }
+            return module_cache_rejection_record(
+                source_type,
+                "module cache rejected: malformed blob",
+            );
         }
-        return module_cache_rejection_record(source_type, "module cache rejected: malformed blob");
+        Err(ModuleCacheParseError::ChecksumMismatch) => {
+            if !out_status.is_null() {
+                // SAFETY: caller guarantees `out_status` is valid when non-null.
+                unsafe {
+                    *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+                };
+            }
+            return module_cache_rejection_record(
+                source_type,
+                "module cache rejected: corruption checksum mismatch (FNV-1a 64; \
+                 corruption-detection only, not a cryptographic MAC)",
+            );
+        }
     };
     if actual != expected {
         if !out_status.is_null() {
@@ -21048,7 +21181,7 @@ mod tests {
         assert!(!restored.is_null());
         assert_eq!(
             status,
-            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
         );
         // SAFETY: pointers are live.
         unsafe {
@@ -23035,7 +23168,10 @@ mod tests {
         assert!(!cache.is_null());
 
         // Lop off the trailing bytecode bytes so metadata still validates but
-        // the bytecode/payload deserializer fails. The cache must be rejected.
+        // the bytecode/payload deserializer fails. With the v6 integrity
+        // checksum in place the truncation flips the checksum verification
+        // first, so the blob must surface as CorruptPayload (an integrity
+        // failure) rather than the generic metadata-level Rejected.
         // SAFETY: cache pointer is live.
         let truncated: Vec<u8> = unsafe {
             let data = stator_string_data(cache);
@@ -23057,7 +23193,7 @@ mod tests {
         assert!(!rejected.is_null());
         assert_eq!(
             status,
-            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
         );
         // SAFETY: rejected handle is live and errored.
         unsafe {
@@ -23074,8 +23210,8 @@ mod tests {
     #[test]
     fn test_module_code_cache_v1_blob_rejected() {
         // Construct a minimal v1 blob (version field == 1) that satisfies
-        // every other format check. The current build only accepts version 2,
-        // so this must fail closed.
+        // every other format check. The current build only accepts the
+        // current version (>= 6), so this must fail closed.
         let mut v1 = Vec::new();
         v1.extend_from_slice(MODULE_CACHE_MAGIC);
         v1.extend_from_slice(&1u32.to_le_bytes());
@@ -23110,6 +23246,367 @@ mod tests {
                 stator_module_get_status(rejected),
                 StatorModuleStatus::StatorModuleStatusErrored
             );
+            stator_module_free(rejected);
+        }
+    }
+
+    /// Helper: produce a valid v6 cache blob for a small JS module.
+    fn produce_js_cache_blob(
+        source: &str,
+        resource: &[u8],
+    ) -> (Vec<u8>, StatorModuleCompileOptions) {
+        let options = module_compile_options(resource, b"https://edge.example.test/app/", b"");
+        let bytes = source.as_bytes();
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        assert!(!module.is_null());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache pointer is live until stator_string_free below.
+        let blob: Vec<u8> = unsafe {
+            let data = stator_string_data(cache);
+            let len = stator_string_len(cache);
+            std::slice::from_raw_parts(data as *const u8, len).to_vec()
+        };
+        // SAFETY: cache/module pointers are live.
+        unsafe {
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+        (blob, options)
+    }
+
+    #[test]
+    fn test_module_code_cache_integrity_checksum_is_finalized_on_produce() {
+        // Producer-side smoke test: a freshly produced blob must contain a
+        // non-zero corruption checksum at the documented offset that matches
+        // FNV-1a 64 over the bytes it covers.
+        let (blob, _options) =
+            produce_js_cache_blob("export const v = 1;", b"https://edge.example.test/ck.mjs");
+        assert!(blob.len() >= MODULE_CACHE_CHECKSUM_END);
+        let stored = u64::from_le_bytes(
+            blob[MODULE_CACHE_CHECKSUM_OFFSET..MODULE_CACHE_CHECKSUM_END]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(stored, 0, "checksum placeholder was not finalized");
+        let expected = fnv1a64(&blob[MODULE_CACHE_CHECKSUM_END..]);
+        assert_eq!(stored, expected, "stored checksum does not cover the blob");
+    }
+
+    #[test]
+    fn test_module_code_cache_tampered_payload_byte_surfaces_corrupt_payload_status() {
+        // Flip a single bit inside the payload region (after the header)
+        // and confirm the consumer surfaces the explicit CorruptPayload
+        // status, distinct from the metadata-mismatch Rejected.
+        let source = "export const v = 2;";
+        let (mut blob, options) =
+            produce_js_cache_blob(source, b"https://edge.example.test/tamper.mjs");
+        let tamper_offset = blob.len() - 4;
+        blob[tamper_offset] ^= 0x40;
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        let bytes = source.as_bytes();
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
+            assert!(!stator_module_get_error(rejected).is_null());
+            stator_module_free(rejected);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_tampered_header_byte_surfaces_corrupt_payload_status() {
+        // Flip a bit inside the header (between checksum and payload) and
+        // confirm the checksum catches it. Distinguishes integrity coverage
+        // from metadata-level validation, which would otherwise let some
+        // bit flips slip through to a structural decode failure.
+        let source = "export const v = 3;";
+        let (mut blob, options) =
+            produce_js_cache_blob(source, b"https://edge.example.test/hdr.mjs");
+        // Flip a bit a few bytes past the checksum end (inside the engine
+        // version length-prefix region).
+        blob[MODULE_CACHE_CHECKSUM_END + 1] ^= 0x01;
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        let bytes = source.as_bytes();
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
+            stator_module_free(rejected);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_zeroed_checksum_field_is_rejected() {
+        // Zero out the stored checksum (e.g. a producer that forgot to
+        // finalize). The consumer must reject as CorruptPayload — never
+        // accept a blob whose integrity field has not been populated.
+        let source = "export const v = 4;";
+        let (mut blob, options) =
+            produce_js_cache_blob(source, b"https://edge.example.test/zero.mjs");
+        blob[MODULE_CACHE_CHECKSUM_OFFSET..MODULE_CACHE_CHECKSUM_END]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        let bytes = source.as_bytes();
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
+            stator_module_free(rejected);
+        }
+    }
+
+    #[test]
+    fn test_module_code_cache_stale_source_keeps_metadata_rejected_status() {
+        // Sanity check that a clean integrity blob whose *source* changed
+        // still surfaces the metadata-level Rejected status, not the new
+        // CorruptPayload — the two statuses must remain distinct so hosts
+        // can tell evict-and-recompile from recompile-under-new-options.
+        let original = "export const v = 5;";
+        let stale = "export const v = 6;";
+        let (blob, options) =
+            produce_js_cache_blob(original, b"https://edge.example.test/stale.mjs");
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        let bytes = stale.as_bytes();
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
+            stator_module_free(rejected);
+        }
+    }
+
+    #[test]
+    fn test_json_module_code_cache_tampered_payload_surfaces_corrupt_payload_status() {
+        // Same integrity guarantee for JSON modules: a bit-flip inside the
+        // serialized JSON value must be caught by the checksum.
+        let source = r#"{"answer":42,"label":"alpha"}"#;
+        let json_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let bytes = source.as_bytes();
+        // SAFETY: source/options pointers are live.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &json_options,
+            )
+        };
+        assert!(!module.is_null());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache is live until stator_string_free below.
+        let mut blob: Vec<u8> = unsafe {
+            let data = stator_string_data(cache);
+            let len = stator_string_len(cache);
+            std::slice::from_raw_parts(data as *const u8, len).to_vec()
+        };
+        // SAFETY: cache/module pointers are live.
+        unsafe {
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+        let tamper_offset = blob.len() - 2;
+        blob[tamper_offset] ^= 0x20;
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &json_options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
+            stator_module_free(rejected);
+        }
+    }
+
+    #[test]
+    fn test_wasm_module_code_cache_tampered_payload_surfaces_corrupt_payload_status() {
+        // Wasm cache hits already revalidate the wasm-bytes hash, but the
+        // upstream corruption checksum must catch tampering before the
+        // payload is even decoded.
+        let wat = "(module (func (export \"answer\") (result i32) i32.const 42))";
+        let Ok(wasm_bytes) = wat::parse_str(wat) else {
+            return;
+        };
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                wasm_bytes.as_ptr() as *const c_char,
+                wasm_bytes.len(),
+                &options,
+            )
+        };
+        assert!(!module.is_null());
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                wasm_bytes.as_ptr() as *const c_char,
+                wasm_bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        // SAFETY: cache is live until stator_string_free below.
+        let mut blob: Vec<u8> = unsafe {
+            let data = stator_string_data(cache);
+            let len = stator_string_len(cache);
+            std::slice::from_raw_parts(data as *const u8, len).to_vec()
+        };
+        // SAFETY: cache/module pointers are live.
+        unsafe {
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+        // Flip a byte well inside the payload region (past the header).
+        let tamper_offset = blob.len() / 2;
+        blob[tamper_offset] ^= 0xff;
+        // SAFETY: source/options/cache buffers are live.
+        let rejected = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                wasm_bytes.as_ptr() as *const c_char,
+                wasm_bytes.len(),
+                blob.as_ptr() as *const c_char,
+                blob.len(),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload
+        );
+        // SAFETY: rejected handle is live.
+        unsafe {
             stator_module_free(rejected);
         }
     }
