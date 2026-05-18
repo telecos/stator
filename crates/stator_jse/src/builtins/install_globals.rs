@@ -24869,7 +24869,6 @@ mod tests {
 
     // -- 2. Promise.reject wraps any value
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_reject_wraps_value() {
         let _result = eval_with_microtasks(
             r#"
@@ -24886,7 +24885,6 @@ mod tests {
 
     // -- 3. Promise.prototype.then chains fulfilled values
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_chain_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -24905,7 +24903,6 @@ mod tests {
 
     // -- 4. Promise.prototype.catch is alias for .then(undefined, onRejected)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_alias() {
         let _result = eval_with_microtasks(
             r#"
@@ -24923,7 +24920,6 @@ mod tests {
 
     // -- 5. Microtask ordering: then callbacks run in FIFO order
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_microtask_fifo_order() {
         let _result = eval_with_microtasks(
             r#"
@@ -24942,7 +24938,6 @@ mod tests {
 
     // -- 6. Constructor: executor throw rejects the promise
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_throw_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -24961,7 +24956,6 @@ mod tests {
 
     // -- 7. Promise.all with non-iterable rejects with TypeError-like reason
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_non_iterable_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -24984,7 +24978,6 @@ mod tests {
 
     // -- 8. Promise.allSettled produces correct status fields
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_status_fields() {
         let _result = eval_with_microtasks(
             r#"
@@ -25005,7 +24998,6 @@ mod tests {
 
     // -- 9. Promise.allSettled includes value and reason
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_value_and_reason() {
         let _result = eval_with_microtasks(
             r#"
@@ -25026,7 +25018,6 @@ mod tests {
 
     // -- 10. Promise.race resolves with the first settled
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_first_wins() {
         let _result = eval_with_microtasks(
             r#"
@@ -25045,7 +25036,6 @@ mod tests {
 
     // -- 11. Promise.any resolves with first fulfilled
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_first_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -25065,7 +25055,6 @@ mod tests {
 
     // -- 12. Promise.any rejects with AggregateError when all reject
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_all_reject() {
         let _result = eval_with_microtasks(
             r#"
@@ -25085,7 +25074,6 @@ mod tests {
 
     // -- 13. Promise.all resolves with ordered results
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_ordered_results() {
         let _result = eval_with_microtasks(
             r#"
@@ -25105,7 +25093,6 @@ mod tests {
 
     // -- 14. Promise.all rejects on first rejection
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_first_rejection() {
         let _result = eval_with_microtasks(
             r#"
@@ -25125,7 +25112,6 @@ mod tests {
 
     // -- 15. Promise.all with empty array resolves immediately
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_empty() {
         let _result = eval_with_microtasks(
             r#"
@@ -25141,7 +25127,6 @@ mod tests {
 
     // -- 16. then handler returning a promise chains through
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_returns_promise() {
         let _result = eval_with_microtasks(
             r#"
@@ -25180,7 +25165,6 @@ mod tests {
 
     // -- 18. Thenable assimilation: object with .then method is treated as promise
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_assimilation() {
         let _result = eval_with_microtasks(
             r#"
@@ -25197,7 +25181,6 @@ mod tests {
 
     // -- 19. Thenable rejection
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_rejection() {
         let _result = eval_with_microtasks(
             r#"
@@ -25214,7 +25197,6 @@ mod tests {
 
     // -- 20. Thenable: only first call to resolve/reject takes effect
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_first_call_wins() {
         let _result = eval_with_microtasks(
             r#"
@@ -25231,7 +25213,6 @@ mod tests {
 
     // -- 21. Promise.finally runs on fulfillment and passes value through
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_on_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -25252,7 +25233,6 @@ mod tests {
 
     // -- 22. Promise.finally runs on rejection and passes reason through
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_on_rejected() {
         let _result = eval_with_microtasks(
             r#"
@@ -25273,7 +25253,6 @@ mod tests {
 
     // -- 23. Chained catch recovers and allows subsequent then
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_recovery_chain() {
         let _result = eval_with_microtasks(
             r#"
@@ -25291,7 +25270,6 @@ mod tests {
 
     // -- 24. then with no onFulfilled passes value through
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_passthrough_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -25309,7 +25287,6 @@ mod tests {
 
     // -- 25. then with no onRejected passes rejection through
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_passthrough_rejected() {
         let _result = eval_with_microtasks(
             r#"
@@ -25327,7 +25304,6 @@ mod tests {
 
     // -- 26. Promise.allSettled with non-iterable rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_non_iterable_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -25347,7 +25323,6 @@ mod tests {
 
     // -- 27. Promise.any with non-iterable rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_non_iterable_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -25367,7 +25342,6 @@ mod tests {
 
     // -- 28. Promise.race with non-iterable rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_non_iterable_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -25387,7 +25361,6 @@ mod tests {
 
     // -- 29. Microtask ordering across multiple promises
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_microtask_interleaved_order() {
         let _result = eval_with_microtasks(
             r#"
@@ -25408,7 +25381,6 @@ mod tests {
 
     // -- 30. Promise.resolve with non-thenable plain object
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_non_thenable_object() {
         let _result = eval_with_microtasks(
             r#"
@@ -25425,7 +25397,6 @@ mod tests {
 
     // -- 31. Constructor with synchronous resolve
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_sync_resolve() {
         let _result = eval_with_microtasks(
             r#"
@@ -25442,7 +25413,6 @@ mod tests {
 
     // -- 32. Constructor with synchronous reject
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_sync_reject() {
         let _result = eval_with_microtasks(
             r#"
@@ -25459,7 +25429,6 @@ mod tests {
 
     // -- 33. Long then chain
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_long_then_chain() {
         let _result = eval_with_microtasks(
             r#"
@@ -25480,7 +25449,6 @@ mod tests {
 
     // -- 34. Promise.allSettled with empty array
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_empty() {
         let _result = eval_with_microtasks(
             r#"
@@ -25496,7 +25464,6 @@ mod tests {
 
     // -- 35. Promise.withResolvers resolve/reject work end-to-end
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_resolve() {
         let _result = eval_with_microtasks(
             r#"
@@ -25514,7 +25481,6 @@ mod tests {
 
     // -- 36. Thenable assimilation in then handler return
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_returns_thenable() {
         let _result = eval_with_microtasks(
             r#"
@@ -25534,7 +25500,6 @@ mod tests {
 
     // -- 37. Promise.all wraps non-promise values
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_wraps_non_promises() {
         let _result = eval_with_microtasks(
             r#"
@@ -25552,7 +25517,6 @@ mod tests {
 
     // -- 38. Promise.resolve with undefined
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_undefined() {
         let _result = eval_with_microtasks(
             r#"
@@ -25568,7 +25532,6 @@ mod tests {
 
     // -- 39. Promise.resolve with null
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_null() {
         let _result = eval_with_microtasks(
             r#"
@@ -25584,7 +25547,6 @@ mod tests {
 
     // -- 40. Promise.reject with undefined
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_reject_undefined() {
         let _result = eval_with_microtasks(
             r#"
@@ -25600,7 +25562,6 @@ mod tests {
 
     // -- 41. Constructor: resolve is idempotent (second call ignored)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_resolve_idempotent() {
         let _result = eval_with_microtasks(
             r#"
@@ -25617,7 +25578,6 @@ mod tests {
 
     // -- 42. Constructor: reject is idempotent
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_reject_idempotent() {
         let _result = eval_with_microtasks(
             r#"
@@ -25634,7 +25594,6 @@ mod tests {
 
     // -- 43. Constructor: resolve then reject — resolve wins
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_resolve_then_reject() {
         let _result = eval_with_microtasks(
             r#"
@@ -25654,7 +25613,6 @@ mod tests {
 
     // -- 44. Promise.all with single element
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_single_element() {
         let _result = eval_with_microtasks(
             r#"
@@ -25670,7 +25628,6 @@ mod tests {
 
     // -- 45. Promise.all result is array with correct length
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_result_length() {
         let _result = eval_with_microtasks(
             r#"
@@ -25686,7 +25643,6 @@ mod tests {
 
     // -- 46. Promise.race with first rejection wins over later fulfillments
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_rejection_wins() {
         let _result = eval_with_microtasks(
             r#"
@@ -25715,7 +25671,6 @@ mod tests {
 
     // -- 48. Promise.any with empty array rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_empty_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -25738,7 +25693,6 @@ mod tests {
 
     // -- 49. Promise.any with single fulfillment
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_single_fulfillment() {
         let _result = eval_with_microtasks(
             r#"
@@ -25754,7 +25708,6 @@ mod tests {
 
     // -- 50. Promise.allSettled preserves order
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_preserves_order() {
         let _result = eval_with_microtasks(
             r#"
@@ -25781,7 +25734,6 @@ mod tests {
 
     // -- 51. Promise.allSettled with all fulfilled
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_all_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -25802,7 +25754,6 @@ mod tests {
 
     // -- 52. Promise.allSettled with all rejected
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_all_rejected() {
         let _result = eval_with_microtasks(
             r#"
@@ -25823,7 +25774,6 @@ mod tests {
 
     // -- 53. then handler throw rejects downstream
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_throw_rejects() {
         let _result = eval_with_microtasks(
             r#"
@@ -25854,7 +25804,6 @@ mod tests {
 
     // -- 55. Promise.reject does NOT unwrap — rejected with a promise value
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_reject_does_not_unwrap() {
         let _result = eval_with_microtasks(
             r#"
@@ -25873,7 +25822,6 @@ mod tests {
 
     // -- 56. Multiple .then on same resolved promise
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_multiple_then_on_same() {
         let _result = eval_with_microtasks(
             r#"
@@ -25892,7 +25840,6 @@ mod tests {
 
     // -- 57. Promise.all rejects only once (first rejection only)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_rejects_only_once() {
         let _result = eval_with_microtasks(
             r#"
@@ -25912,7 +25859,6 @@ mod tests {
 
     // -- 58. Promise.race with single element
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_single_element() {
         let _result = eval_with_microtasks(
             r#"
@@ -25928,7 +25874,6 @@ mod tests {
 
     // -- 59. Promise.finally preserves fulfillment value through chain
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_preserves_value_chain() {
         let _result = eval_with_microtasks(
             r#"
@@ -25947,7 +25892,6 @@ mod tests {
 
     // -- 60. Promise.finally preserves rejection through chain
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_preserves_rejection_chain() {
         let _result = eval_with_microtasks(
             r#"
@@ -25965,7 +25909,6 @@ mod tests {
 
     // -- 61. Thenable assimilation in Promise.all
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_with_thenable() {
         let _result = eval_with_microtasks(
             r#"
@@ -25984,7 +25927,6 @@ mod tests {
 
     // -- 62. Chained promise resolution: then returning rejected promise
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_returns_rejected_promise() {
         let _result = eval_with_microtasks(
             r#"
@@ -26100,7 +26042,6 @@ mod tests {
 
     // -- 67. Promise.withResolvers reject end-to-end
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_reject_e2e() {
         let _result = eval_with_microtasks(
             r#"
@@ -26118,7 +26059,6 @@ mod tests {
 
     // -- 68. Promise.all with mixed promises and values
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_mixed_types() {
         let _result = eval_with_microtasks(
             r#"
@@ -26135,7 +26075,6 @@ mod tests {
 
     // -- 69. Promise.race with mixed values
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_with_plain_value() {
         let _result = eval_with_microtasks(
             r#"
@@ -26151,7 +26090,6 @@ mod tests {
 
     // -- 70. Deep then chain with alternating success/failure
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_deep_chain_alternating() {
         let _result = eval_with_microtasks(
             r#"
@@ -26171,7 +26109,6 @@ mod tests {
 
     // -- 71. Promise.allSettled single element fulfilled
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_single_fulfilled() {
         let _result = eval_with_microtasks(
             r#"
@@ -26189,7 +26126,6 @@ mod tests {
 
     // -- 72. Promise.allSettled single element rejected
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_single_rejected() {
         let _result = eval_with_microtasks(
             r#"
@@ -26207,7 +26143,6 @@ mod tests {
 
     // -- 73. Promise.any with last promise fulfilling
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_last_fulfills() {
         let _result = eval_with_microtasks(
             r#"
@@ -26227,7 +26162,6 @@ mod tests {
 
     // -- 74. Promise.resolve with boolean
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_boolean() {
         let _result = eval_with_microtasks(
             r#"
@@ -26243,7 +26177,6 @@ mod tests {
 
     // -- 75. Catch handler can re-throw to propagate rejection
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_rethrow() {
         let _result = eval_with_microtasks(
             r#"
@@ -26346,7 +26279,6 @@ mod tests {
 
     // -- 80. Microtask queue is FIFO across interleaved enqueues
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_microtask_deep_interleave() {
         let _result = eval_with_microtasks(
             r#"
@@ -26372,7 +26304,6 @@ mod tests {
 
     // -- 81. Promise.try resolves synchronous return values
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_try_resolves_return_value() {
         let _ = eval_with_microtasks(
             r#"
@@ -26391,7 +26322,6 @@ mod tests {
 
     // -- 82. Promise.try rejects synchronous throws
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_try_rejects_thrown_value() {
         let _ = eval_with_microtasks(
             r#"
@@ -26409,7 +26339,6 @@ mod tests {
 
     // -- 83. Promise.try assimilates returned thenables
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_try_assimilates_thenable() {
         let _ = eval_with_microtasks(
             r#"
@@ -26431,7 +26360,6 @@ mod tests {
 
     // -- 84. then skips non-callable fulfillment handlers
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_skips_non_callable_fulfillment_handler() {
         let _ = eval_with_microtasks(
             r#"
@@ -26447,7 +26375,6 @@ mod tests {
 
     // -- 85. then skips non-callable rejection handlers
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_skips_non_callable_rejection_handler() {
         let _ = eval_with_microtasks(
             r#"
@@ -26463,7 +26390,6 @@ mod tests {
 
     // -- 86. catch skips non-callable handlers like then(undefined, handler)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_skips_non_callable_handler() {
         let _ = eval_with_microtasks(
             r#"
@@ -26479,7 +26405,6 @@ mod tests {
 
     // -- 87. finally callback receives no arguments
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_receives_no_arguments() {
         let _ = eval_with_microtasks(
             r#"
@@ -26528,7 +26453,6 @@ mod tests {
 
     // -- 89. finally preserves rejection after returned promise fulfills
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_preserves_rejection_after_returned_promise() {
         let _ = eval_with_microtasks(
             r#"
@@ -26553,7 +26477,6 @@ mod tests {
 
     // -- 90. finally rejects with returned thenable rejection
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_rejects_with_returned_thenable_reason() {
         let _ = eval_with_microtasks(
             r#"
@@ -26579,7 +26502,6 @@ mod tests {
     // -- 91+. Promise microtask ordering and async edge cases
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_microtask_order_same_promise_callbacks_async,
         "var __promise_mt_order_1 = []; var __promise_mt_source_1 = Promise.resolve('value'); \
          __promise_mt_source_1.then(function() { __promise_mt_order_1.push('first'); }); \
@@ -26590,7 +26512,6 @@ mod tests {
         JsValue::String(r#"["first","second","third"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_microtask_order_multiple_resolved_promises_async,
         "var __promise_mt_order_2 = []; \
          Promise.resolve().then(function() { __promise_mt_order_2.push('a'); }); \
@@ -26601,7 +26522,6 @@ mod tests {
         JsValue::String(r#"["a","b","c"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_microtask_order_nested_enqueues_fifo,
         "var __promise_mt_order_3 = []; \
          Promise.resolve().then(function() { \
@@ -26615,7 +26535,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_chain_runs_handlers_in_order,
         "var __promise_chain_order_1 = ''; \
          Promise.resolve(1) \
@@ -26627,7 +26546,6 @@ mod tests {
         JsValue::String("1,2,3".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_chain_with_returned_promises_runs_in_order,
         "var __promise_chain_order_2 = ''; \
          Promise.resolve(1) \
@@ -26639,7 +26557,6 @@ mod tests {
         JsValue::String("2,4,4".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_chain_rejection_recovery_keeps_sequence,
         "var __promise_chain_order_3 = ''; \
          Promise.reject('boom') \
@@ -26652,7 +26569,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_preserves_input_order_for_resolved_promises,
         "var __promise_all_order_1 = ''; \
          Promise.all([Promise.resolve('a'), Promise.resolve('b'), Promise.resolve('c')]) \
@@ -26662,7 +26578,6 @@ mod tests {
         JsValue::String("a|b|c".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_preserves_input_order_for_mixed_values,
         "var __promise_all_order_2 = ''; \
          Promise.all([1, Promise.resolve(2), 3]).then(function(values) { \
@@ -26673,7 +26588,6 @@ mod tests {
         JsValue::String("1|2|3".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_preserves_input_order_with_thenables,
         "var __promise_all_order_3 = ''; \
          Promise.all([{ then: function(resolve) { resolve('first'); } }, Promise.resolve('second')]) \
@@ -26683,7 +26597,6 @@ mod tests {
         JsValue::String("first|second".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_uses_first_input_when_all_are_already_resolved,
         "var __promise_race_order_1 = ''; \
          Promise.race([Promise.resolve('left'), Promise.resolve('right')]) \
@@ -26693,7 +26606,6 @@ mod tests {
         JsValue::String("left".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_plain_value_before_later_promise_wins,
         "var __promise_race_order_2 = 0; \
          Promise.race([7, Promise.resolve(8)]).then(function(value) { __promise_race_order_2 = value; });",
@@ -26702,7 +26614,6 @@ mod tests {
         JsValue::Smi(7)
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_uses_first_input_when_all_are_already_resolved,
         "var __promise_any_order_1 = ''; \
          Promise.any([Promise.resolve('first'), Promise.resolve('second')]) \
@@ -26712,7 +26623,6 @@ mod tests {
         JsValue::String("first".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_plain_value_before_later_promise_wins,
         "var __promise_any_order_2 = 0; \
          Promise.any([11, Promise.resolve(12)]).then(function(value) { __promise_any_order_2 = value; });",
@@ -26722,7 +26632,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_thenable_calls_then_asynchronously,
         "var __promise_thenable_async_1 = []; \
          var __promise_thenable_value_1 = { \
@@ -26738,7 +26647,6 @@ mod tests {
         JsValue::String(r#"["sync","then"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_thenable_settles_after_async_then_call,
         "var __promise_thenable_async_2 = []; \
          var __promise_thenable_value_2 = { \
@@ -26754,7 +26662,6 @@ mod tests {
         JsValue::String(r#"["sync","then","value"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_nested_thenables_resolve_recursively,
         "var __promise_thenable_async_3 = []; \
          var __promise_thenable_inner_3 = { \
@@ -26776,7 +26683,6 @@ mod tests {
         JsValue::String(r#"["sync","outer","inner","done"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_thenable_rejection_happens_asynchronously,
         "var __promise_thenable_async_4 = []; \
          var __promise_thenable_value_4 = { \
@@ -26795,7 +26701,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_constructor_executor_runs_synchronously,
         "var __promise_executor_sync_1 = []; \
          new Promise(function(resolve) { __promise_executor_sync_1.push('executor'); resolve(); }); \
@@ -26805,7 +26710,6 @@ mod tests {
         JsValue::String(r#"["executor","after"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_constructor_executor_finishes_before_then_callback,
         "var __promise_executor_sync_2 = []; \
          new Promise(function(resolve) { __promise_executor_sync_2.push('executor'); resolve('ok'); }) \
@@ -26816,7 +26720,6 @@ mod tests {
         JsValue::String(r#"["executor","after","ok"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_constructor_throw_rejects_after_executor_returns,
         "var __promise_executor_sync_3 = []; \
          new Promise(function(resolve, reject) { \
@@ -26830,7 +26733,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_then_on_resolved_promise_runs_async,
         "var __promise_resolved_async_1 = []; \
          var __promise_resolved_value_1 = Promise.resolve('done'); \
@@ -26841,7 +26743,6 @@ mod tests {
         JsValue::String(r#"["sync","done"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_catch_on_rejected_promise_runs_async,
         "var __promise_resolved_async_2 = []; \
          var __promise_resolved_value_2 = Promise.reject('boom'); \
@@ -26852,7 +26753,6 @@ mod tests {
         JsValue::String(r#"["sync","boom"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_on_resolved_promise_runs_async,
         "var __promise_resolved_async_3 = []; \
          Promise.resolve('value').finally(function() { __promise_resolved_async_3.push('finally'); }); \
@@ -26863,7 +26763,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_multiple_then_handlers_keep_registration_order,
         "var __promise_multi_then_1 = []; \
          var __promise_multi_value_1 = Promise.resolve('value'); \
@@ -26875,7 +26774,6 @@ mod tests {
         JsValue::String(r#"["first","second","third"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_multiple_catch_handlers_keep_registration_order,
         "var __promise_multi_then_2 = []; \
          var __promise_multi_value_2 = Promise.reject('boom'); \
@@ -26887,7 +26785,6 @@ mod tests {
         JsValue::String(r#"["first","second","third"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_multiple_then_handlers_can_observe_same_value_in_order,
         "var __promise_multi_then_3 = []; \
          var __promise_multi_value_3 = Promise.resolve(5); \
@@ -26899,7 +26796,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_nested_resolution_runs_inner_before_outer_then,
         "var __promise_nested_1 = []; \
          Promise.resolve('start') \
@@ -26913,7 +26809,6 @@ mod tests {
         JsValue::String(r#"["sync","inner","outer"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_nested_thenable_resolution_runs_inner_before_outer_then,
         "var __promise_nested_2 = []; \
          Promise.resolve('start') \
@@ -26927,7 +26822,6 @@ mod tests {
         JsValue::String(r#"["sync","inner","outer"]"#.into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_nested_promise_resolution_preserves_fifo_observation,
         "var __promise_nested_3 = []; \
          Promise.resolve() \
@@ -26942,7 +26836,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_recursively_resolves_nested_thenables_to_value,
         "var __promise_recursive_1 = 0; \
          var __promise_recursive_inner_1 = { then: function(resolve) { resolve(99); } }; \
@@ -26953,7 +26846,6 @@ mod tests {
         JsValue::Smi(99)
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_recursively_propagates_nested_thenable_rejection,
         "var __promise_recursive_2 = ''; \
          var __promise_recursive_inner_2 = { then: function(resolve, reject) { reject('boom'); } }; \
@@ -26964,7 +26856,6 @@ mod tests {
         JsValue::String("boom".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_resolve_recursively_observes_each_thenable_once_in_order,
         "var __promise_recursive_3 = []; \
          var __promise_recursive_inner_3 = { then: function(resolve) { __promise_recursive_3.push('inner'); resolve('done'); } }; \
@@ -26985,7 +26876,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_returns_same_subclass_promise_for_same_constructor() {
         assert_eval_true_after_microtasks(
             "class __PromiseIdentitySub extends Promise {} \
@@ -26996,7 +26886,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_matches_then_undefined_on_reject() {
         assert_eval_true_after_microtasks(
             "var __promise_catch_alias_1 = ''; \
@@ -27008,7 +26897,6 @@ mod tests {
     }
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_catch_without_handler_matches_then_passthrough,
         "var __promise_catch_alias_3 = ''; \
          Promise.reject('x').catch(undefined).catch(function(reason) { __promise_catch_alias_3 = reason; });",
@@ -27017,7 +26905,6 @@ mod tests {
         JsValue::String("x".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_catch_and_then_undefined_observe_same_registration_order,
         "var __promise_catch_alias_4 = []; \
          var __promise_catch_alias_4_source = Promise.reject('boom'); \
@@ -27029,7 +26916,6 @@ mod tests {
     );
 
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_runs_on_fulfill_and_preserves_value,
         "var __promise_finally_1 = ''; \
          Promise.resolve('value') \
@@ -27040,7 +26926,6 @@ mod tests {
         JsValue::String("cleanup|value".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_runs_on_reject_and_preserves_reason,
         "var __promise_finally_2 = ''; \
          Promise.reject('reason') \
@@ -27073,7 +26958,6 @@ mod tests {
         JsValue::String("override".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_returned_rejection_overrides_fulfillment,
         "var __promise_finally_5 = ''; \
          Promise.resolve('value') \
@@ -27084,7 +26968,6 @@ mod tests {
         JsValue::String("cleanup-failed".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_thenable_cleanup_preserves_original_value,
         "var __promise_finally_6 = ''; \
          Promise.resolve('value') \
@@ -35846,7 +35729,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_empty_remains_pending() {
         assert_eval_true(
             "var settled = false; \
@@ -35973,7 +35855,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_subclass_instance_uses_subclass_prototype() {
         assert_eval_true(
             "class SubPromise extends Promise {} \
@@ -36279,7 +36160,6 @@ mod tests {
          var out = ''; Promise.race(iterable).then(function(value) { out = value; }); out === 'one'"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_empty_custom_iterable_pending,
         "var iterable = { [Symbol.iterator]: function() { return { next: function() { return { done: true }; } }; } }; \
          var settled = false; Promise.race(iterable).then(function() { settled = true; }, function() { settled = true; }); settled === false"
