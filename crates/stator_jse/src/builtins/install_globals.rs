@@ -26420,7 +26420,6 @@ mod tests {
 
     // -- 88. finally waits for returned promise before continuing
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_waits_for_returned_promise() {
         let _ = eval_with_microtasks(
             r#"
@@ -26437,17 +26436,21 @@ mod tests {
             steps.push("after-finally");
             "#,
         );
+        // The finally callback runs as a microtask after the synchronous
+        // `steps.push("after-finally")` has executed, so "after-finally" must
+        // appear first.  The chain then awaits `cleanup.promise`, which is
+        // still pending, so "value" is not pushed until later.
         let before = global_eval("JSON.stringify(steps)").unwrap();
         assert_eq!(
             before,
-            JsValue::String(r#"["cleanup","after-finally"]"#.into())
+            JsValue::String(r#"["after-finally","cleanup"]"#.into())
         );
 
         let _ = eval_with_microtasks("cleanup.resolve();");
         let after = global_eval("JSON.stringify(steps)").unwrap();
         assert_eq!(
             after,
-            JsValue::String(r#"["cleanup","after-finally","value"]"#.into())
+            JsValue::String(r#"["after-finally","cleanup","value"]"#.into())
         );
     }
 
@@ -35338,212 +35341,145 @@ mod tests {
 
     /// `Promise.any` resolves with the first fulfilled value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_first_fulfilled_v2() {
-        let result = global_eval(
-            r#"
-            var result;
-            Promise.any([
-                Promise.reject(0),
-                Promise.resolve(42),
-                Promise.resolve(99)
-            ]).then(function(v) { result = v; });
-            result
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(42));
+        assert_eval_true_after_microtasks(
+            "var result;
+             Promise.any([Promise.reject(0), Promise.resolve(42), Promise.resolve(99)])
+                .then(function(v) { result = v; });",
+            "result === 42",
+        );
     }
 
     /// `Promise.any` rejects with AggregateError when all reject.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_all_reject_v2() {
-        let result = global_eval(
-            r#"
-            var name;
-            Promise.any([
-                Promise.reject(1),
-                Promise.reject(2)
-            ]).catch(function(e) { name = e.name; });
-            name
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".into()));
+        assert_eval_true_after_microtasks(
+            "var name;
+             Promise.any([Promise.reject(1), Promise.reject(2)])
+                .catch(function(e) { name = e.name; });",
+            "name === 'AggregateError'",
+        );
     }
 
     /// `Promise.any` with empty array rejects with AggregateError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_empty_rejects_v2() {
-        let result = global_eval(
-            r#"
-            var name;
-            Promise.any([]).catch(function(e) { name = e.name; });
-            name
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".into()));
+        assert_eval_true_after_microtasks(
+            "var name;
+             Promise.any([]).catch(function(e) { name = e.name; });",
+            "name === 'AggregateError'",
+        );
     }
 
     /// `Promise.any` AggregateError has correct message.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_aggregate_error_message() {
-        let result = global_eval(
-            r#"
-            var msg;
-            Promise.any([Promise.reject(1)]).catch(function(e) { msg = e.message; });
-            msg
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("All promises were rejected".into()));
+        assert_eval_true_after_microtasks(
+            "var msg;
+             Promise.any([Promise.reject(1)]).catch(function(e) { msg = e.message; });",
+            "msg === 'All promises were rejected'",
+        );
     }
 
     // ── Promise.race conformance ────────────────────────────────────────
 
     /// `Promise.race` resolves with the first settled (fulfilled).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_first_fulfilled() {
-        let result = global_eval(
-            r#"
-            var result;
-            Promise.race([
-                Promise.resolve(10),
-                Promise.resolve(20)
-            ]).then(function(v) { result = v; });
-            result
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(10));
+        assert_eval_true_after_microtasks(
+            "var result;
+             Promise.race([Promise.resolve(10), Promise.resolve(20)])
+                .then(function(v) { result = v; });",
+            "result === 10",
+        );
     }
 
     /// `Promise.race` rejects with first rejection when it settles first.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_first_rejected() {
-        let result = global_eval(
-            r#"
-            var reason;
-            Promise.race([
-                Promise.reject("err"),
-                Promise.resolve(1)
-            ]).catch(function(r) { reason = r; });
-            reason
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("err".into()));
+        assert_eval_true_after_microtasks(
+            "var reason;
+             Promise.race([Promise.reject('err'), Promise.resolve(1)])
+                .catch(function(r) { reason = r; });",
+            "reason === 'err'",
+        );
     }
 
     // ── Promise.all edge cases ──────────────────────────────────────────
 
     /// `Promise.all` with non-promise values treats them as resolved.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_non_promise_values() {
-        let result = global_eval(
-            r#"
-            var result;
-            Promise.all([1, 2, 3]).then(function(arr) { result = arr.length; });
-            result
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        assert_eval_true_after_microtasks(
+            "var result;
+             Promise.all([1, 2, 3]).then(function(arr) { result = arr.length; });",
+            "result === 3",
+        );
     }
 
     /// `Promise.all` with empty array resolves with empty array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_empty_resolves() {
-        let result = global_eval(
-            r#"
-            var result;
-            Promise.all([]).then(function(arr) { result = arr.length; });
-            result
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(0));
+        assert_eval_true_after_microtasks(
+            "var result;
+             Promise.all([]).then(function(arr) { result = arr.length; });",
+            "result === 0",
+        );
     }
 
     // ── Promise.prototype.finally conformance ───────────────────────────
 
     /// `Promise.prototype.finally` runs on resolve and passes through value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_resolve_passthrough() {
-        let result = global_eval(
-            r#"
-            var finallyRan = false;
-            var result;
-            Promise.resolve(42).finally(function() { finallyRan = true; }).then(function(v) { result = v; });
-            finallyRan && result === 42
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eval_true_after_microtasks(
+            "var finallyRan = false;
+             var result;
+             Promise.resolve(42).finally(function() { finallyRan = true; })
+                .then(function(v) { result = v; });",
+            "finallyRan && result === 42",
+        );
     }
 
     /// `Promise.prototype.finally` runs on reject and passes through reason.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_reject_passthrough() {
-        let result = global_eval(
-            r#"
-            var finallyRan = false;
-            var reason;
-            Promise.reject("err").finally(function() { finallyRan = true; }).catch(function(r) { reason = r; });
-            finallyRan && reason === "err"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eval_true_after_microtasks(
+            "var finallyRan = false;
+             var reason;
+             Promise.reject('err').finally(function() { finallyRan = true; })
+                .catch(function(r) { reason = r; });",
+            "finallyRan && reason === 'err'",
+        );
     }
 
     // ── Promise constructor edge cases ──────────────────────────────────
 
     /// Calling resolve multiple times: only first counts.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_resolve_once() {
-        let result = global_eval(
-            r#"
-            var result;
-            new Promise(function(resolve, reject) {
+        assert_eval_true_after_microtasks(
+            "var result;
+             new Promise(function(resolve, reject) {
                 resolve(1);
                 resolve(2);
-            }).then(function(v) { result = v; });
-            result
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(1));
+             }).then(function(v) { result = v; });",
+            "result === 1",
+        );
     }
 
     /// Calling resolve then reject: only first (resolve) counts.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_constructor_resolve_then_reject_v2() {
-        let result = global_eval(
-            r#"
-            var result;
-            var caught = false;
-            new Promise(function(resolve, reject) {
+        assert_eval_true_after_microtasks(
+            "var result;
+             var caught = false;
+             new Promise(function(resolve, reject) {
                 resolve(1);
-                reject("err");
-            }).then(function(v) { result = v; }).catch(function() { caught = true; });
-            result === 1 && !caught
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+                reject('err');
+             }).then(function(v) { result = v; }).catch(function() { caught = true; });",
+            "result === 1 && !caught",
+        );
     }
 
     // ── Promise edge-case regression tests ───────────────────────────────
@@ -35559,13 +35495,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: Object.getPrototypeOf does not yet return Promise.prototype for Promise instances
     fn e2e_promise_resolved_prototype_is_promise_prototype() {
         assert_eval_true("Object.getPrototypeOf(Promise.resolve(1)) === Promise.prototype");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: Object.getPrototypeOf does not yet return Promise.prototype for withResolvers().promise
     fn e2e_promise_with_resolvers_promise_has_default_prototype() {
         assert_eval_true(
             "Object.getPrototypeOf(Promise.withResolvers().promise) === Promise.prototype",
@@ -35573,48 +35509,44 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_resolve_fulfills_chain() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = 0; var wr = Promise.withResolvers(); \
              wr.promise.then(function(v) { out = v; }); \
-             wr.resolve(7); \
-             out === 7",
+             wr.resolve(7);",
+            "out === 7",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_reject_rejects_chain() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; var wr = Promise.withResolvers(); \
              wr.promise.catch(function(r) { out = r; }); \
-             wr.reject('boom'); \
-             out === 'boom'",
+             wr.reject('boom');",
+            "out === 'boom'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_first_call_wins() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; var wr = Promise.withResolvers(); \
              wr.promise.then(function(v) { out = 'ok:' + v; }, function(r) { out = 'err:' + r; }); \
              wr.resolve(1); \
              wr.reject('late'); \
-             wr.resolve(2); \
-             out === 'ok:1'",
+             wr.resolve(2);",
+            "out === 'ok:1'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_with_resolvers_resolve_assimilates_thenable() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = 0; var wr = Promise.withResolvers(); \
              wr.promise.then(function(v) { out = v; }); \
-             wr.resolve({ then: function(resolve) { resolve(11); } }); \
-             out === 11",
+             wr.resolve({ then: function(resolve) { resolve(11); } });",
+            "out === 11",
         );
     }
 
@@ -35627,104 +35559,97 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_empty_errors_array() {
-        assert_eval_true(
-            "var len = -1; Promise.any([]).catch(function(e) { len = e.errors.length; }); len === 0",
+        assert_eval_true_after_microtasks(
+            "var len = -1; Promise.any([]).catch(function(e) { len = e.errors.length; });",
+            "len === 0",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_all_rejected_errors_order() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              Promise.any([Promise.reject('a'), Promise.reject('b'), Promise.reject('c')])\
-               .catch(function(e) { out = e.errors.join(','); }); \
-             out === 'a,b,c'",
+               .catch(function(e) { out = e.errors.join(','); });",
+            "out === 'a,b,c'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_all_rejected_retains_values() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              Promise.any([Promise.reject(1), Promise.reject(false), Promise.reject('x')])\
-               .catch(function(e) { out = String(e.errors[0]) + '|' + String(e.errors[1]) + '|' + e.errors[2]; }); \
-             out === '1|false|x'",
+               .catch(function(e) { out = String(e.errors[0]) + '|' + String(e.errors[1]) + '|' + e.errors[2]; });",
+            "out === '1|false|x'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_non_promise_value_fulfills() {
-        assert_eval_true(
-            "var out = 0; Promise.any([Promise.reject('no'), 9]).then(function(v) { out = v; }); out === 9",
+        assert_eval_true_after_microtasks(
+            "var out = 0; Promise.any([Promise.reject('no'), 9]).then(function(v) { out = v; });",
+            "out === 9",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_any_first_fulfillment_wins_over_later_rejections() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              Promise.any([Promise.reject('a'), Promise.resolve('win'), Promise.reject('b')])\
-               .then(function(v) { out = v; }, function() { out = 'lose'; }); \
-             out === 'win'",
+               .then(function(v) { out = v; }, function() { out = 'lose'; });",
+            "out === 'win'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_mixed_result_shape() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var ok = false; \
              Promise.allSettled([Promise.resolve(1), Promise.reject('x')]).then(function(results) { \
                ok = results[0].status === 'fulfilled' && results[0].value === 1 && !('reason' in results[0]) && \
                     results[1].status === 'rejected' && results[1].reason === 'x' && !('value' in results[1]); \
-             }); \
-             ok",
+             });",
+            "ok",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_fulfilled_result_has_no_reason() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var ok = false; \
-             Promise.allSettled([Promise.resolve(2)]).then(function(results) { ok = !('reason' in results[0]); }); \
-             ok",
+             Promise.allSettled([Promise.resolve(2)]).then(function(results) { ok = !('reason' in results[0]); });",
+            "ok",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_rejected_result_has_no_value() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var ok = false; \
-             Promise.allSettled([Promise.reject('no')]).then(function(results) { ok = !('value' in results[0]); }); \
-             ok",
+             Promise.allSettled([Promise.reject('no')]).then(function(results) { ok = !('value' in results[0]); });",
+            "ok",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_wraps_non_promises() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var ok = false; \
              Promise.allSettled([1, Promise.reject('x'), true]).then(function(results) { \
                ok = results[0].value === 1 && results[1].reason === 'x' && results[2].value === true; \
-             }); \
-             ok",
+             });",
+            "ok",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_settled_empty_resolves_array() {
-        assert_eval_true(
-            "var len = -1; Promise.allSettled([]).then(function(results) { len = results.length; }); len === 0",
+        assert_eval_true_after_microtasks(
+            "var len = -1; Promise.allSettled([]).then(function(results) { len = results.length; });",
+            "len === 0",
         );
     }
 
@@ -35738,89 +35663,84 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_first_rejection_wins() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
-             Promise.race([Promise.reject('boom'), Promise.resolve(1)]).catch(function(r) { out = r; }); \
-             out === 'boom'",
+             Promise.race([Promise.reject('boom'), Promise.resolve(1)]).catch(function(r) { out = r; });",
+            "out === 'boom'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_plain_value_wins() {
-        assert_eval_true(
-            "var out = 0; Promise.race([5, Promise.resolve(9)]).then(function(v) { out = v; }); out === 5",
+        assert_eval_true_after_microtasks(
+            "var out = 0; Promise.race([5, Promise.resolve(9)]).then(function(v) { out = v; });",
+            "out === 5",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_race_deferred_first_settlement_wins() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              var a = Promise.withResolvers(); \
              var b = Promise.withResolvers(); \
              Promise.race([a.promise, b.promise]).then(function(v) { out = v; }, function(r) { out = r; }); \
              b.resolve('second'); \
-             a.resolve('first'); \
-             out === 'second'",
+             a.resolve('first');",
+            "out === 'second'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_empty_resolves_array_value() {
-        assert_eval_true(
-            "var ok = false; Promise.all([]).then(function(results) { ok = Array.isArray(results) && results.length === 0; }); ok",
+        assert_eval_true_after_microtasks(
+            "var ok = false; Promise.all([]).then(function(results) { ok = Array.isArray(results) && results.length === 0; });",
+            "ok",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_wraps_non_promises_exact_values() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
-             Promise.all([1, 'two', false]).then(function(results) { out = results.join('|'); }); \
-             out === '1|two|false'",
+             Promise.all([1, 'two', false]).then(function(results) { out = results.join('|'); });",
+            "out === '1|two|false'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_assimilates_thenable_values() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = 0; \
              Promise.all([{ then: function(resolve) { resolve(4); } }, Promise.resolve(5)])\
-               .then(function(results) { out = results[0] + results[1]; }); \
-             out === 9",
+               .then(function(results) { out = results[0] + results[1]; });",
+            "out === 9",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_all_rejects_on_first_rejection_even_with_plain_values() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
-             Promise.all([1, Promise.reject('bad'), 3]).catch(function(reason) { out = reason; }); \
-             out === 'bad'",
+             Promise.all([1, Promise.reject('bad'), 3]).catch(function(reason) { out = reason; });",
+            "out === 'bad'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_thenable_fulfills_value() {
-        assert_eval_true(
-            "var out = 0; Promise.resolve({ then: function(resolve) { resolve(12); } }).then(function(v) { out = v; }); out === 12",
+        assert_eval_true_after_microtasks(
+            "var out = 0; Promise.resolve({ then: function(resolve) { resolve(12); } }).then(function(v) { out = v; });",
+            "out === 12",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_thenable_rejects_reason() {
-        assert_eval_true(
-            "var out = ''; Promise.resolve({ then: function(resolve, reject) { reject('no'); } }).catch(function(r) { out = r; }); out === 'no'",
+        assert_eval_true_after_microtasks(
+            "var out = ''; Promise.resolve({ then: function(resolve, reject) { reject('no'); } }).catch(function(r) { out = r; });",
+            "out === 'no'",
         );
     }
 
