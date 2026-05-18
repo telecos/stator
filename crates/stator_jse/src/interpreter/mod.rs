@@ -15020,6 +15020,19 @@ fn object_prototype_builtin(this_obj: &JsValue, key: &str) -> Option<JsValue> {
         "toString" => {
             let this = this_obj.clone();
             Some(JsValue::NativeFunction(Rc::new(move |args| {
+                // Callable PlainObjects (builtin_fn-backed values such as
+                // `Math.sin`, bound functions, fast-array-method callables)
+                // resolve `toString` through Function.prototype.toString —
+                // they must produce the native-form `function NAME() { [native code] }`
+                // string instead of the generic `[object Function]` tag.
+                if let JsValue::PlainObject(ref map) = this
+                    && matches!(
+                        map.borrow().get("__call__"),
+                        Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
+                    )
+                {
+                    return Ok(JsValue::String(function_to_string_value(&this).into()));
+                }
                 if let Some(value) = args.first() {
                     return Ok(JsValue::String(value.obj_to_string_tag().into()));
                 }

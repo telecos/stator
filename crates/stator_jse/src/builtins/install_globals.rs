@@ -28011,9 +28011,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_uses_native_form_for_math_sin() {
         assert_eval_true("Math.sin.toString() === 'function sin() { [native code] }'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_native_form_for_callable_plain_object_builtins() {
+        // Any builtin produced via `builtin_fn` is installed as a callable
+        // PlainObject with a `name` property. `Function.prototype.toString`
+        // (routed through Object.prototype.toString for the no-explicit-proto
+        // case) must produce the spec `function NAME() { [native code] }`
+        // form, not the generic `[object Object]`/`[object Function]` tag.
+        assert_eval_true("Math.cos.toString() === 'function cos() { [native code] }'");
+        assert_eval_true("Array.isArray.toString() === 'function isArray() { [native code] }'");
+        assert_eval_true("Object.keys.toString() === 'function keys() { [native code] }'");
     }
 
     #[test]
@@ -28039,7 +28050,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_uses_anonymous_native_form_for_bound_native_function() {
         assert_eval_true("Math.sin.bind(null).toString() === 'function () { [native code] }'");
     }
