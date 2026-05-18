@@ -84,7 +84,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_size_is_prototype_getter() {
         assert_eval_true(
             "var desc = Object.getOwnPropertyDescriptor(Map.prototype, 'size'); typeof desc.get === 'function' && desc.value === undefined && new Map([[1, 2]]).hasOwnProperty('size') === false",
@@ -160,7 +159,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_map_to_string_tag() {
         assert_eval_true("Map.prototype[Symbol.toStringTag] === 'Map'");
     }
@@ -242,7 +240,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_size_is_prototype_getter() {
         assert_eval_true(
             "var desc = Object.getOwnPropertyDescriptor(Set.prototype, 'size'); typeof desc.get === 'function' && desc.value === undefined && new Set([1]).hasOwnProperty('size') === false",
@@ -318,7 +315,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_set_to_string_tag() {
         assert_eval_true("Set.prototype[Symbol.toStringTag] === 'Set'");
     }

@@ -1441,10 +1441,32 @@ impl JsValue {
             Self::TypedArray(ta) => format!("[object {}]", ta.borrow().kind.name()),
             Self::DataView(_) => "[object DataView]".to_string(),
             Self::PlainObject(map) => {
-                let borrow = map.borrow();
-                if let Some(Self::String(tag)) = borrow.get("@@toStringTag").cloned() {
-                    return format!("[object {tag}]");
+                // Walk the prototype chain looking for @@toStringTag — per
+                // §20.1.3.6 the lookup is `Get(O, @@toStringTag)`, not an
+                // own-property check.  Built-in tags (Map, Set, …) live on
+                // the prototype, so an own-only check would miss them.
+                let mut current = Some(Rc::clone(map));
+                let mut depth: usize = 0;
+                while let Some(rc) = current {
+                    if depth > 256 {
+                        break;
+                    }
+                    let borrow = rc.borrow();
+                    if let Some(Self::String(tag)) = borrow.get("@@toStringTag").cloned() {
+                        return format!("[object {tag}]");
+                    }
+                    let next = match borrow
+                        .get(crate::objects::property_map::INTERNAL_PROTO_PROPERTY_KEY)
+                        .or_else(|| borrow.get("__proto__"))
+                    {
+                        Some(Self::PlainObject(parent)) => Some(Rc::clone(parent)),
+                        _ => None,
+                    };
+                    drop(borrow);
+                    current = next;
+                    depth += 1;
                 }
+                let borrow = map.borrow();
                 if matches!(borrow.get("__is_array__"), Some(Self::Boolean(true))) {
                     return "[object Array]".to_string();
                 }

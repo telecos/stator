@@ -1704,11 +1704,13 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
             PropertyAttributes::empty(),
         );
         {
+            // Stored as a hidden plain method (not an accessor) so that
+            // `hasOwnProperty('size')` on an instance reports false — the
+            // public `size` accessor lives on `Map.prototype`.
             let inner = Rc::clone(&inner);
-            obj.insert_with_attrs(
-                "__get_size__".into(),
+            obj.insert(
+                "__map_size_impl__".into(),
                 native(move |_| Ok(JsValue::Smi(map_size(&inner.borrow()) as i32))),
-                PropertyAttributes::CONFIGURABLE,
             );
         }
         {
@@ -1883,11 +1885,13 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             PropertyAttributes::empty(),
         );
         {
+            // Stored as a hidden plain method (not an accessor) so that
+            // `hasOwnProperty('size')` on an instance reports false — the
+            // public `size` accessor lives on `Set.prototype`.
             let inner = Rc::clone(&inner);
-            obj.insert_with_attrs(
-                "__get_size__".into(),
+            obj.insert(
+                "__set_size_impl__".into(),
                 native(move |_| Ok(JsValue::Smi(set_size(&inner.borrow()) as i32))),
-                PropertyAttributes::CONFIGURABLE,
             );
         }
         {
@@ -8619,7 +8623,7 @@ fn make_map_builtin() -> JsValue {
                     let getter = get_hidden_method(
                         &receiver,
                         "__is_map__",
-                        "__get_size__",
+                        "__map_size_impl__",
                         "get Map.prototype.size",
                     )?;
                     dispatch_call_value(&getter, vec![])
@@ -8743,7 +8747,7 @@ fn make_set_builtin() -> JsValue {
                     let getter = get_hidden_method(
                         &receiver,
                         "__is_set__",
-                        "__get_size__",
+                        "__set_size_impl__",
                         "get Set.prototype.size",
                     )?;
                     dispatch_call_value(&getter, vec![])
@@ -21227,8 +21231,10 @@ mod tests {
             var setArgs = [];
             map.forEach(function(value, key, self) { mapArgs = [value, key, self === map]; });
             set.forEach(function(value, key, self) { setArgs = [value, key, self === set]; });
-            var mapDesc = Object.getOwnPropertyDescriptor(map, "size");
-            var setDesc = Object.getOwnPropertyDescriptor(set, "size");
+            // §24.1.3.10 / §24.2.3.10: `size` is a getter on the prototype,
+            // not an own property of the instance.
+            var mapDesc = Object.getOwnPropertyDescriptor(Map.prototype, "size");
+            var setDesc = Object.getOwnPropertyDescriptor(Set.prototype, "size");
             mapArgs[0] === "one" &&
             mapArgs[1] === 1 &&
             mapArgs[2] === true &&
@@ -21347,7 +21353,8 @@ mod tests {
         let r = global_eval(
             r#"
             var m = new Map([["a", 1]]);
-            var desc = Object.getOwnPropertyDescriptor(m, "size");
+            // §24.1.3.10: `size` is a getter on Map.prototype, not the instance.
+            var desc = Object.getOwnPropertyDescriptor(Map.prototype, "size");
             typeof desc.get === "function" && m.size === 1
             "#,
         )
@@ -21466,7 +21473,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: requires Function.prototype.call on NativeFunctions
     fn e2e_map_to_string_tag() {
         let r = global_eval(
             r#"
@@ -21559,7 +21566,8 @@ mod tests {
         let r = global_eval(
             r#"
             var s = new Set([1, 2]);
-            var desc = Object.getOwnPropertyDescriptor(s, "size");
+            // §24.2.3.10: `size` is a getter on Set.prototype, not the instance.
+            var desc = Object.getOwnPropertyDescriptor(Set.prototype, "size");
             typeof desc.get === "function" && s.size === 2
             "#,
         )
@@ -21652,7 +21660,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: requires Function.prototype.call on NativeFunctions
     fn e2e_set_to_string_tag() {
         let r = global_eval(
             r#"
