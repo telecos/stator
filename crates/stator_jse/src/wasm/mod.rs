@@ -324,6 +324,26 @@ impl WasmModule {
             page_size_log2: mt.page_size_log2(),
         })
     }
+
+    /// Look up the declared type of a named table export.
+    ///
+    /// Returns `None` when the export does not exist or is not a table.
+    /// The returned [`WasmTableTypeInfo`] mirrors the shape of
+    /// [`WasmExternKind::Table`] so the FFI layer can structurally compare
+    /// a dependency module's exported table type against an importer's
+    /// expected table type (element reference type, min, max, table64) at
+    /// compile/link time even though Stator cannot yet bind a table import
+    /// at runtime.
+    pub fn exported_table_type(&self, name: &str) -> Option<WasmTableTypeInfo> {
+        let export = self.inner.exports().find(|e| e.name() == name)?;
+        let tt = export.ty().table()?.clone();
+        Some(WasmTableTypeInfo {
+            element: tt.element().to_string(),
+            minimum: tt.minimum(),
+            maximum: tt.maximum(),
+            table64: tt.is_64(),
+        })
+    }
 }
 
 /// Structural type information for a Wasm memory import or export, matching
@@ -343,6 +363,25 @@ pub struct WasmMemoryTypeInfo {
     pub shared: bool,
     /// Log2 of the page size in bytes (16 ⇒ 64 KiB pages by default).
     pub page_size_log2: u8,
+}
+
+/// Structural type information for a Wasm table import or export, matching
+/// the metadata fields of [`WasmExternKind::Table`]. Used by the FFI layer
+/// to surface a precise type mismatch in the typed fail-closed diagnostic
+/// emitted when a Wasm-to-Wasm table import cannot be bound because
+/// Wasmtime tables are [`Store`]-bound and there is no `SharedTable`
+/// primitive that can route a table across independent stores yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmTableTypeInfo {
+    /// Wasmtime display string for the table element reference type
+    /// (e.g. `"funcref"`).
+    pub element: String,
+    /// Minimum element count.
+    pub minimum: u64,
+    /// Optional maximum element count.
+    pub maximum: Option<u64>,
+    /// Whether this is a 64-bit table import/export.
+    pub table64: bool,
 }
 
 fn value_type_to_host_kind(ty: wasmtime::ValType) -> Result<HostValKind, String> {
@@ -1828,6 +1867,37 @@ mod tests {
         assert_eq!(info.page_size_log2, 16);
         assert_eq!(module.exported_memory_type("f"), None);
         assert_eq!(module.exported_memory_type("missing"), None);
+    }
+
+    /// `exported_table_type` returns structural type information for
+    /// declared table exports and `None` for missing or non-table exports.
+    /// The accessor is in place so that a future Wasm-to-Wasm table
+    /// import implementation can validate dependency/importer table types
+    /// structurally; today such imports still fail closed because
+    /// Wasmtime tables are [`Store`]-bound and there is no `SharedTable`
+    /// primitive that can route a table across independent stores.
+    #[test]
+    fn test_wasm_module_exported_table_type_reports_metadata() {
+        let wat = r#"
+            (module
+                (table (export "tab") 2 5 funcref)
+                (func (export "f")))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let info = module
+            .exported_table_type("tab")
+            .expect("table export must be reported");
+        assert!(
+            info.element.contains("func"),
+            "unexpected element: {}",
+            info.element
+        );
+        assert_eq!(info.minimum, 2);
+        assert_eq!(info.maximum, Some(5));
+        assert!(!info.table64);
+        assert_eq!(module.exported_table_type("f"), None);
+        assert_eq!(module.exported_table_type("missing"), None);
     }
 
     /// A shared memory exported by one Wasm instance can be observed

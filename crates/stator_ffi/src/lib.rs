@@ -3555,7 +3555,9 @@ fn collect_wasm_module_imports(module: &WasmModule) -> Result<CollectedWasmImpor
                      (const or mut), and 32-bit shared memory imports with a declared maximum \
                      and the default 64 KiB page size, because no runtime/FFI primitive safely \
                      exposes v128/reference-typed globals, non-shared / memory64 / custom \
-                     page-size memories, or WebAssembly tables as imports yet",
+                     page-size memories, or WebAssembly tables as imports yet (Wasmtime tables \
+                     are store-bound and there is no SharedTable primitive that can route a \
+                     table across independent stores)",
                     describe_unsupported_wasm_import_kind(other)
                 ));
             }
@@ -20501,7 +20503,15 @@ mod tests {
     fn test_module_wasm_unsupported_table_import_fails_compilation() {
         assert_wasm_unsupported_import_kind_fails_compilation(
             WASM_IMPORT_TABLE,
-            &["env.tab", "table", "element", "min=1", "table64=false"],
+            &[
+                "env.tab",
+                "table",
+                "element",
+                "min=1",
+                "table64=false",
+                "SharedTable",
+                "store-bound",
+            ],
         );
     }
 
