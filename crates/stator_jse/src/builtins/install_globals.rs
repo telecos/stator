@@ -6306,9 +6306,21 @@ fn make_object() -> JsValue {
         let mut obj_proto = PropertyMap::new();
 
         // Object.prototype.hasOwnProperty(key)
+        //
+        // Wrapped via `builtin_fn` so that `.name` is carried for
+        // `Function.prototype.toString` (producing the native-form
+        // `function hasOwnProperty() { [native code] }`).  The interpreter
+        // intercepts `obj.hasOwnProperty(...)` for receiver-aware fast paths
+        // (see `object_prototype_builtin`); this wrapper is used when callers
+        // grab `Object.prototype.hasOwnProperty` directly (e.g. via `.call`).
+        //
+        // Callable PlainObjects routed through `Function.prototype.call`
+        // pass `args == [thisArg, ...userArgs]` to `__call__` (see
+        // `callable_plain_object_function_method`), so the closure preserves
+        // the legacy `args[0] == thisArg`, `args[1] == key` convention.
         obj_proto.insert(
             "hasOwnProperty".into(),
-            native(|args| {
+            builtin_fn("hasOwnProperty", 1, |args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
@@ -6325,7 +6337,7 @@ fn make_object() -> JsValue {
         // Object.prototype.isPrototypeOf(obj)
         obj_proto.insert(
             "isPrototypeOf".into(),
-            native(|args| {
+            builtin_fn("isPrototypeOf", 1, |args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let target = args.get(1).unwrap_or(&JsValue::Undefined);
                 if let JsValue::PlainObject(_) = this
@@ -6340,7 +6352,7 @@ fn make_object() -> JsValue {
         // Object.prototype.propertyIsEnumerable(key)
         obj_proto.insert(
             "propertyIsEnumerable".into(),
-            native(|args| {
+            builtin_fn("propertyIsEnumerable", 1, |args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
@@ -28028,10 +28040,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_uses_native_form_for_object_has_own_property() {
         assert_eval_true(
             "Object.prototype.hasOwnProperty.toString() === 'function hasOwnProperty() { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_native_form_for_object_is_prototype_of() {
+        assert_eval_true(
+            "Object.prototype.isPrototypeOf.toString() === 'function isPrototypeOf() { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_native_form_for_object_property_is_enumerable() {
+        assert_eval_true(
+            "Object.prototype.propertyIsEnumerable.toString() === 'function propertyIsEnumerable() { [native code] }'",
         );
     }
 
