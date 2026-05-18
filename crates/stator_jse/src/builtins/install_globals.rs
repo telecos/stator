@@ -57918,49 +57918,41 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_rounds_exact_half_up() {
         assert_eval_true("(1.25).toExponential(1) === '1.3e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_rounds_negative_exact_half_up() {
         assert_eval_true("(-1.25).toExponential(1) === '-1.3e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_rounding_carries_into_exponent() {
         assert_eval_true("(99.5).toExponential(1) === '1.0e+2'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_zero_fraction_digits() {
         assert_eval_true("(0).toExponential(0) === '0e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_negative_zero_has_no_sign() {
         assert_eval_true("(-0).toExponential(2) === '0.00e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_coerces_string_digits() {
         assert_eval_true("(1).toExponential('2') === '1.00e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_truncates_fractional_digits_toward_zero() {
         assert_eval_true("(1).toExponential(-0.9) === '1e+0'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_rejects_infinite_digits() {
         assert_eval_true(
             "try { (1).toExponential(Infinity); false } catch (e) { e instanceof RangeError }",
@@ -57973,49 +57965,41 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_shortest_form_no_arg() {
         assert_eval_true("(123.456).toExponential() === '1.23456e+2'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_uses_exponential_below_negative_six_exponent() {
         assert_eval_true("(1e-7).toPrecision(1) === '1e-7'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_uses_fixed_at_negative_six_exponent() {
         assert_eval_true("(1e-6).toPrecision(1) === '0.000001'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_small_fraction_keeps_significant_digits() {
         assert_eval_true("(0.000123).toPrecision(2) === '0.00012'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_rounds_exact_half_up() {
         assert_eval_true("(12.5).toPrecision(2) === '13'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_rounding_carries_into_exponent() {
         assert_eval_true("(99.5).toPrecision(2) === '1.0e+2'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_single_digit_hundred() {
         assert_eval_true("(100).toPrecision(1) === '1e+2'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_preserves_trailing_zeroes() {
         assert_eval_true("(100).toPrecision(3) === '100'");
     }

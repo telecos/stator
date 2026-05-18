@@ -532,6 +532,67 @@ pub fn dispatch_get_property_value(obj: &JsValue, key: JsValue) -> StatorResult<
     keyed_load(obj, &key)
 }
 
+/// Shared implementation of `Number.prototype.toExponential(fractionDigits)`
+/// for the primitive-receiver fast path.  Performs the ES §21.1.3.2
+/// `ToIntegerOrInfinity` coercion on `arg`, rejects out-of-range or infinite
+/// digit counts with `RangeError`, and routes the result through
+/// [`crate::builtins::number::number_to_exponential`] for ECMAScript-conformant
+/// rounding (half-up) and `e+/-N` formatting.
+fn number_proto_to_exponential(n: f64, arg: Option<&JsValue>) -> StatorResult<JsValue> {
+    match arg {
+        None | Some(JsValue::Undefined) => {
+            if n.is_nan() {
+                return Ok(JsValue::String("NaN".into()));
+            }
+            if n.is_infinite() {
+                return Ok(JsValue::String(
+                    if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+                ));
+            }
+            let raw = format!("{n:e}");
+            Ok(JsValue::String(
+                crate::builtins::number::number_reformat_exponential(&raw).into(),
+            ))
+        }
+        Some(v) => {
+            let digits = v.to_integer_or_infinity()?;
+            if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
+                return Err(StatorError::RangeError(
+                    "toExponential() fractionDigits must be between 0 and 100".to_string(),
+                ));
+            }
+            Ok(JsValue::String(
+                crate::builtins::number::number_to_exponential(n, digits as u32)?.into(),
+            ))
+        }
+    }
+}
+
+/// Shared implementation of `Number.prototype.toPrecision(precision)` for the
+/// primitive-receiver fast path.  When `arg` is absent or undefined this
+/// returns `ToString(n)`; otherwise the precision is coerced via
+/// `ToIntegerOrInfinity`, validated to lie in `[1, 100]`, and the result is
+/// produced by [`crate::builtins::number::number_to_precision`] which
+/// implements §21.1.3.5 rounding and decimal/exponential thresholding.
+fn number_proto_to_precision(n: f64, arg: Option<&JsValue>) -> StatorResult<JsValue> {
+    match arg {
+        None | Some(JsValue::Undefined) => Ok(JsValue::String(
+            JsValue::HeapNumber(n).to_js_string()?.into(),
+        )),
+        Some(v) => {
+            let precision = v.to_integer_or_infinity()?;
+            if !precision.is_finite() || !(1.0..=100.0).contains(&precision) {
+                return Err(StatorError::RangeError(
+                    "toPrecision() argument must be between 1 and 100".to_string(),
+                ));
+            }
+            Ok(JsValue::String(
+                crate::builtins::number::number_to_precision(n, precision as u32)?.into(),
+            ))
+        }
+    }
+}
+
 /// Write a property using the interpreter's ordinary `[[Set]]` semantics.
 pub fn dispatch_set_property_value(
     obj: &JsValue,
@@ -15283,35 +15344,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toExponential" => {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as usize),
-                        Some(JsValue::HeapNumber(d)) => {
-                            Some(crate::builtins::util::clamped_f64_to_usize(*d).min(100))
-                        }
-                        Some(JsValue::Undefined) | None => None,
-                        _ => None,
-                    };
-                    match digits {
-                        Some(d) => Ok(JsValue::String(format!("{n:.d$e}").into())),
-                        None => Ok(JsValue::String(format!("{n:e}").into())),
-                    }
+                    number_proto_to_exponential(n, args.first())
                 }));
             }
             "toPrecision" => {
                 let n = *n as f64;
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    None | Some(JsValue::Undefined) => Ok(JsValue::String(format!("{n}").into())),
-                    Some(v) => {
-                        let p = v.to_number()? as usize;
-                        if p == 0 || p > 100 {
-                            return Err(StatorError::RangeError(
-                                "toPrecision() argument must be between 1 and 100".to_string(),
-                            ));
-                        }
-                        Ok(JsValue::String(
-                            format!("{n:.prec$}", prec = p.saturating_sub(1)).into(),
-                        ))
-                    }
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    number_proto_to_precision(n, args.first())
                 }));
             }
             "constructor" => {
@@ -15391,35 +15430,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toExponential" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as usize),
-                        Some(JsValue::HeapNumber(d)) => {
-                            Some(crate::builtins::util::clamped_f64_to_usize(*d).min(100))
-                        }
-                        Some(JsValue::Undefined) | None => None,
-                        _ => None,
-                    };
-                    match digits {
-                        Some(d) => Ok(JsValue::String(format!("{n:.d$e}").into())),
-                        None => Ok(JsValue::String(format!("{n:e}").into())),
-                    }
+                    number_proto_to_exponential(n, args.first())
                 }));
             }
             "toPrecision" => {
                 let n = *n;
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    None | Some(JsValue::Undefined) => Ok(JsValue::String(format!("{n}").into())),
-                    Some(v) => {
-                        let p = v.to_number()? as usize;
-                        if p == 0 || p > 100 {
-                            return Err(StatorError::RangeError(
-                                "toPrecision() argument must be between 1 and 100".to_string(),
-                            ));
-                        }
-                        Ok(JsValue::String(
-                            format!("{n:.prec$}", prec = p.saturating_sub(1)).into(),
-                        ))
-                    }
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    number_proto_to_precision(n, args.first())
                 }));
             }
             "constructor" => {
