@@ -471,7 +471,9 @@ fn constructor_prototype(name: &str) -> Option<JsValue> {
 
 fn get_prototype_of_value(value: &JsValue) -> Option<JsValue> {
     match value {
-        JsValue::PlainObject(_) | JsValue::Error(_) => get_object_prototype(value),
+        JsValue::PlainObject(_) | JsValue::Error(_) | JsValue::Promise(_) => {
+            get_object_prototype(value)
+        }
         JsValue::Array(_) => constructor_prototype("Array"),
         JsValue::Function(_) | JsValue::NativeFunction(_) => constructor_prototype("Function"),
         JsValue::Boolean(_) => constructor_prototype("Boolean"),
@@ -35495,13 +35497,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Object.getPrototypeOf does not yet return Promise.prototype for Promise instances
     fn e2e_promise_resolved_prototype_is_promise_prototype() {
         assert_eval_true("Object.getPrototypeOf(Promise.resolve(1)) === Promise.prototype");
     }
 
     #[test]
-    #[ignore] // TODO: Object.getPrototypeOf does not yet return Promise.prototype for withResolvers().promise
     fn e2e_promise_with_resolvers_promise_has_default_prototype() {
         assert_eval_true(
             "Object.getPrototypeOf(Promise.withResolvers().promise) === Promise.prototype",
