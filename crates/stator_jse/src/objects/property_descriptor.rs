@@ -345,6 +345,109 @@ impl FullPropertyDescriptor {
     }
 }
 
+/// ECMAScript §6.2.6 Property Descriptor — *partial* form used when parsing a
+/// descriptor object passed to `Object.defineProperty` /
+/// `Object.defineProperties`.
+///
+/// Unlike [`FullPropertyDescriptor`] (which always carries fully resolved
+/// attribute booleans for its `Data`/`Accessor` variants), this record mirrors
+/// the specification's PropertyDescriptor exactly: every field is independently
+/// *present* (`Some(_)`) or *absent* (`None`).  This distinction is essential
+/// for the §10.1.6.3 *ValidateAndApplyPropertyDescriptor* algorithm, where
+/// absent fields preserve the corresponding attribute of an existing property
+/// (e.g. `Object.defineProperty(frozenObj, "x", { value: same })` must succeed
+/// without resetting `[[Enumerable]]` to `false`).
+#[derive(Debug, Clone, Default)]
+pub struct InputPropertyDescriptor {
+    /// `[[Value]]` if explicitly specified.
+    pub value: Option<JsValue>,
+    /// `[[Writable]]` if explicitly specified.
+    pub writable: Option<bool>,
+    /// `[[Get]]` if explicitly specified.
+    pub get: Option<JsValue>,
+    /// `[[Set]]` if explicitly specified.
+    pub set: Option<JsValue>,
+    /// `[[Enumerable]]` if explicitly specified.
+    pub enumerable: Option<bool>,
+    /// `[[Configurable]]` if explicitly specified.
+    pub configurable: Option<bool>,
+}
+
+impl InputPropertyDescriptor {
+    /// `true` iff the descriptor specifies any data-only field
+    /// (`value` or `writable`).
+    pub fn is_data(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    /// `true` iff the descriptor specifies any accessor-only field
+    /// (`get` or `set`).
+    pub fn is_accessor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    /// `true` iff the descriptor specifies neither data nor accessor fields
+    /// (only `enumerable` and/or `configurable`, or completely empty).
+    pub fn is_generic(&self) -> bool {
+        !self.is_data() && !self.is_accessor()
+    }
+
+    /// `true` iff every field is absent.
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
+            && self.writable.is_none()
+            && self.get.is_none()
+            && self.set.is_none()
+            && self.enumerable.is_none()
+            && self.configurable.is_none()
+    }
+
+    /// Implements ECMAScript §6.2.6.1 *ToPropertyDescriptor* — converts a
+    /// plain JS object into an [`InputPropertyDescriptor`].
+    ///
+    /// Returns `TypeError` if the descriptor mixes data and accessor fields.
+    pub fn from_object(obj: &JsValue) -> StatorResult<Self> {
+        let lookup = |key: &str| -> Option<JsValue> {
+            match obj {
+                JsValue::PlainObject(map) => map.borrow().get(key).cloned(),
+                _ => None,
+            }
+        };
+
+        let mut out = Self::default();
+        if let Some(v) = lookup("enumerable") {
+            out.enumerable = Some(v.to_boolean());
+        }
+        if let Some(v) = lookup("configurable") {
+            out.configurable = Some(v.to_boolean());
+        }
+        if let Some(v) = lookup("value") {
+            out.value = Some(v);
+        }
+        if let Some(v) = lookup("writable") {
+            out.writable = Some(v.to_boolean());
+        }
+        if let Some(v) = lookup("get") {
+            out.get = Some(v);
+        }
+        if let Some(v) = lookup("set") {
+            out.set = Some(v);
+        }
+
+        if (out.get.is_some() || out.set.is_some())
+            && (out.value.is_some() || out.writable.is_some())
+        {
+            return Err(StatorError::TypeError(
+                "Invalid property descriptor. Cannot both specify accessors \
+                 and a value or writable attribute"
+                    .to_string(),
+            ));
+        }
+
+        Ok(out)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
