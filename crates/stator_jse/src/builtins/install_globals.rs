@@ -34010,7 +34010,6 @@ mod tests {
 
     /// `indexOf` with negative fromIndex counts from end.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_indexof_negative_from_index() {
         let result = global_eval("[1, 2, 1, 3].indexOf(1, -2)").unwrap();
         assert_eq!(result, JsValue::Smi(2));
@@ -34024,7 +34023,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_indexof_skips_sparse_holes() {
         let result =
             global_eval("var a = []; a[1] = undefined; a.length = 3; a.indexOf(undefined)")
@@ -34056,7 +34054,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_lastindexof_negative_from_index_and_holes() {
         let result = global_eval(
             "var a = []; a[1] = undefined; a[3] = undefined; a.length = 4; \
@@ -51064,7 +51061,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_indexof_undefined_ignores_hole() {
         assert_eval_true("[1, , 3].indexOf(undefined) === -1");
     }
@@ -51127,7 +51123,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_delete_hole_skips_indexof_undefined() {
         assert_eval_true("var a = [1, 2, 3]; delete a[1]; a.indexOf(undefined) === -1");
     }
@@ -62128,7 +62123,6 @@ mod tests {
 
     /// `indexOf` with positive fromIndex skips earlier elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_indexof_from_index() {
         let r = global_eval("[1, 2, 3, 2, 1].indexOf(2, 2)").unwrap();
         assert_eq!(r, JsValue::Smi(3));
@@ -62136,7 +62130,6 @@ mod tests {
 
     /// `indexOf` with negative fromIndex.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_indexof_negative_from() {
         let r = global_eval("[1, 2, 3, 2, 1].indexOf(2, -2)").unwrap();
         assert_eq!(r, JsValue::Smi(3));

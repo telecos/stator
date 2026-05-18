@@ -2280,7 +2280,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance — requires partial-descriptor representation
+    // (FullPropertyDescriptor::Data uses explicit bool fields and cannot
+    // distinguish absent from explicit-false; un-ignoring would require
+    // changing the descriptor shape to Option<bool> and threading it through
+    // all callers — large refactor, deferred.)
     fn test_e2e_frozen_object_allows_same_value_define() {
         let mut obj = JsObject::new();
         obj.set_property("x", JsValue::Smi(1)).unwrap();
