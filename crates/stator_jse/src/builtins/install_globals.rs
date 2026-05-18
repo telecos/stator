@@ -145,10 +145,10 @@ use crate::builtins::weak_ref::{
 };
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
-    current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_construct_call,
-    dispatch_get_property_value, dispatch_set_property_value, function_display_name,
-    function_length_value, function_to_string_value, get_object_prototype, has_prototype_in_chain,
-    ordinary_set_prototype_of, plain_object_has_own_property,
+    current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
+    dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
+    function_display_name, function_length_value, function_to_string_value, get_object_prototype,
+    has_prototype_in_chain, ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -9536,7 +9536,7 @@ fn make_finalization_registry_builtin() -> JsValue {
 
 // ── Function constructor (ES2025 §20.2) ──────────────────────────────────────
 
-fn function_prototype_value() -> Option<JsValue> {
+pub(crate) fn function_prototype_value() -> Option<JsValue> {
     current_global_env().and_then(|globals| match globals.borrow().get("Function").cloned() {
         Some(JsValue::PlainObject(map)) => map.borrow().get("prototype").cloned(),
         _ => None,
@@ -9694,7 +9694,13 @@ fn make_function() -> JsValue {
         proto.insert(
             "toString".into(),
             native(|args| {
-                let func = args.first().cloned().unwrap_or(JsValue::Undefined);
+                // Receiver may arrive via explicit `.call(thisArg)` (args[0])
+                // or via method-dispatch (`func.toString()`), where it is
+                // recorded as the current `this`.
+                let func = match args.first().cloned() {
+                    Some(JsValue::Undefined) | None => current_this().unwrap_or(JsValue::Undefined),
+                    Some(other) => other,
+                };
                 Ok(JsValue::String(function_to_string_value(&func).into()))
             }),
         );
@@ -27876,13 +27882,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_class_declaration_source() {
         assert_eval_true("class Foo {} Foo.toString() === 'class Foo {}'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_class_expression_source() {
         assert_eval_true("(class Foo {}).toString() === 'class Foo {}'");
     }

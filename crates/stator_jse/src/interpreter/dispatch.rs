@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::builtins::install_globals::function_prototype_value;
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc};
@@ -3102,7 +3103,15 @@ fn construct_class_from_plain_object(
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
     // 3. Expose parent constructor as "super" for `super()` calls.
-    let is_derived = if let Some(parent) = class_map.borrow().get("__proto__").cloned()
+    // A class is "derived" only when it has an `extends` clause; we mark
+    // it explicitly because every class now has a `__proto__` (set to
+    // `%Function.prototype%` for non-derived classes).
+    let is_derived_class = matches!(
+        class_map.borrow().get(".class_derived"),
+        Some(JsValue::Boolean(true))
+    );
+    let is_derived = if is_derived_class
+        && let Some(parent) = class_map.borrow().get("__proto__").cloned()
         && !matches!(parent, JsValue::Undefined | JsValue::Null)
     {
         callee_frame
@@ -7827,6 +7836,13 @@ fn handle_create_class(
     class_obj
         .borrow_mut()
         .insert(".class_constructor".to_string(), JsValue::Boolean(true));
+    // Preserve original class source text for `Function.prototype.toString`.
+    if let Some(source) = ctor_ba_rc.source_text() {
+        class_obj.borrow_mut().insert(
+            "source".to_string(),
+            JsValue::String(source.to_string().into()),
+        );
+    }
 
     // 4. Create the prototype object.
     let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -7845,6 +7861,16 @@ fn handle_create_class(
         class_obj
             .borrow_mut()
             .insert("__proto__".to_string(), super_val);
+        // Mark as derived so the constructor enforces super() before this.
+        class_obj
+            .borrow_mut()
+            .insert(".class_derived".to_string(), JsValue::Boolean(true));
+    } else if let Some(function_proto) = function_prototype_value() {
+        // Non-derived class: class.[[Prototype]] = %Function.prototype%
+        // so `Foo.toString()` resolves to `Function.prototype.toString`.
+        class_obj
+            .borrow_mut()
+            .insert("__proto__".to_string(), function_proto);
     }
 
     // 6. Wire constructor ↔ prototype.

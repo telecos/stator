@@ -17596,6 +17596,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     props.insert("__call__".to_string(), call_fn);
                     props.insert("name".to_string(), JsValue::String(bound_name.into()));
                     props.insert("length".to_string(), JsValue::Smi(result_len));
+                    props.insert(
+                        "source".to_string(),
+                        JsValue::String(function_to_string("").into()),
+                    );
                     if let Some(function_proto) = global_constructor_prototype("Function") {
                         props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), function_proto);
                     }
@@ -17751,6 +17755,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         JsValue::String(function_bound_name("").into()),
                     );
                     props.insert("length".to_string(), JsValue::Smi(0));
+                    props.insert(
+                        "source".to_string(),
+                        JsValue::String(function_to_string("").into()),
+                    );
                     if let Some(function_proto) = global_constructor_prototype("Function") {
                         props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), function_proto);
                     }
