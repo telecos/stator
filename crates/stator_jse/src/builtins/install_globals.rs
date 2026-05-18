@@ -13572,6 +13572,54 @@ fn incompatible_receiver(display_name: &str) -> StatorError {
     StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
 }
 
+/// Resolve the `DataView` receiver for a prototype method invocation.
+///
+/// Stator's two calling conventions for native prototype methods are:
+///
+/// * Method dispatch (`v.getInt8(0)`) — `this` is published on the current
+///   global environment and `args` contains only user-supplied arguments.
+/// * `Function.prototype.call/apply/bind` — `args[0]` is the receiver and
+///   `args[1..]` are user arguments.
+///
+/// Returns the inner `JsDataView` plus the index of the first user argument
+/// within `args`.
+fn resolve_dataview_receiver(
+    args: &[JsValue],
+    display_name: &str,
+) -> StatorResult<(Rc<RefCell<crate::builtins::typed_array::JsDataView>>, usize)> {
+    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && let Some(inner) = extract_dataview(&this)
+    {
+        return Ok((inner, 0));
+    }
+    if let Some(first) = args.first()
+        && let Some(inner) = extract_dataview(first)
+    {
+        return Ok((inner, 1));
+    }
+    Err(incompatible_receiver(display_name))
+}
+
+/// Resolve the `ArrayBuffer`/`SharedArrayBuffer` receiver for a prototype
+/// method invocation.  See [`resolve_dataview_receiver`] for the calling
+/// conventions handled.
+fn resolve_arraybuffer_receiver(
+    args: &[JsValue],
+    display_name: &str,
+) -> StatorResult<(Rc<RefCell<JsArrayBuffer>>, usize)> {
+    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && let Some(inner) = extract_arraybuffer(&this)
+    {
+        return Ok((inner, 0));
+    }
+    if let Some(first) = args.first()
+        && let Some(inner) = extract_arraybuffer(first)
+    {
+        return Ok((inner, 1));
+    }
+    Err(incompatible_receiver(display_name))
+}
+
 fn dataview_bigint_argument(value: &JsValue) -> StatorResult<i128> {
     match value.to_numeric()? {
         JsValue::BigInt(n) => Ok(*n),
@@ -13674,14 +13722,12 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "grow".into(),
             builtin_fn("grow", 1, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
-                    return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
-                };
+                let (buf_rc, base) =
+                    resolve_arraybuffer_receiver(&args, "SharedArrayBuffer.prototype.grow")?;
                 if !buf_rc.borrow().shared {
                     return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.get(base) {
                     Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                     None => 0,
                 };
@@ -13734,14 +13780,12 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "resize".into(),
             builtin_fn("resize", 1, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
-                    return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
-                };
+                let (buf_rc, base) =
+                    resolve_arraybuffer_receiver(&args, "ArrayBuffer.prototype.resize")?;
                 if buf_rc.borrow().shared {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.get(base) {
                     Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                     None => 0,
                 };
@@ -13752,14 +13796,12 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "transfer".into(),
             builtin_fn("transfer", 0, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
-                    return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
-                };
+                let (buf_rc, base) =
+                    resolve_arraybuffer_receiver(&args, "ArrayBuffer.prototype.transfer")?;
                 if buf_rc.borrow().shared {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.get(base) {
                     Some(v) if !v.is_undefined() => {
                         Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
                     }
@@ -13774,18 +13816,16 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "transferToFixedLength".into(),
             builtin_fn("transferToFixedLength", 0, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
-                    return Err(incompatible_receiver(
-                        "ArrayBuffer.prototype.transferToFixedLength",
-                    ));
-                };
+                let (buf_rc, base) = resolve_arraybuffer_receiver(
+                    &args,
+                    "ArrayBuffer.prototype.transferToFixedLength",
+                )?;
                 if buf_rc.borrow().shared {
                     return Err(incompatible_receiver(
                         "ArrayBuffer.prototype.transferToFixedLength",
                     ));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.get(base) {
                     Some(v) if !v.is_undefined() => {
                         Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
                     }
@@ -13801,25 +13841,19 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
     proto.insert(
         "slice".into(),
         builtin_fn("slice", 2, move |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(buf_rc) = extract_arraybuffer(receiver) else {
-                return Err(incompatible_receiver(&format!(
-                    "{display_name}.prototype.slice"
-                )));
-            };
+            let display = format!("{display_name}.prototype.slice");
+            let (buf_rc, base) = resolve_arraybuffer_receiver(&args, &display)?;
             if buf_rc.borrow().shared != shared {
-                return Err(incompatible_receiver(&format!(
-                    "{display_name}.prototype.slice"
-                )));
+                return Err(incompatible_receiver(&display));
             }
             let buffer = buf_rc.borrow();
             let len = buffer.data.len();
             let begin =
-                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(1), 0.0)?)
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(base), 0.0)?)
                     as i64;
             let end = clamp_relative_integer_index(
                 len,
-                to_integer_or_infinity_arg(args.get(2), len as f64)?,
+                to_integer_or_infinity_arg(args.get(base + 1), len as f64)?,
             ) as i64;
             let sliced = arraybuffer_slice(&buffer, begin, end);
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
@@ -13995,15 +14029,13 @@ fn make_dataview() -> JsValue {
             prototype.insert(
                 $name.into(),
                 builtin_fn($name, $length, move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let Some(inner) = extract_dataview(receiver) else {
-                        return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
-                    };
-                    let offset = match args.get(1) {
+                    let display = concat!("DataView.prototype.", $name);
+                    let (inner, base) = resolve_dataview_receiver(&args, display)?;
+                    let offset = match args.get(base) {
                         Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                         None => 0,
                     };
-                    let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+                    let little_endian = args.get(base + 1).is_some_and(JsValue::to_boolean);
                     let value = $fn_get(&inner.borrow(), offset, little_endian)?;
                     Ok(num_value(value))
                 }),
@@ -14016,16 +14048,14 @@ fn make_dataview() -> JsValue {
             prototype.insert(
                 $name.into(),
                 builtin_fn($name, $length, move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let Some(inner) = extract_dataview(receiver) else {
-                        return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
-                    };
-                    let offset = match args.get(1) {
+                    let display = concat!("DataView.prototype.", $name);
+                    let (inner, base) = resolve_dataview_receiver(&args, display)?;
+                    let offset = match args.get(base) {
                         Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                         None => 0,
                     };
-                    let value = $conv(args.get(2).unwrap_or(&JsValue::Undefined))?;
-                    let little_endian = args.get(3).is_some_and(JsValue::to_boolean);
+                    let value = $conv(args.get(base + 1).unwrap_or(&JsValue::Undefined))?;
+                    let little_endian = args.get(base + 2).is_some_and(JsValue::to_boolean);
                     $fn_set(&inner.borrow(), offset, value, little_endian)?;
                     Ok(JsValue::Undefined)
                 }),
@@ -14044,15 +14074,12 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "getBigInt64".into(),
         builtin_fn("getBigInt64", 1, |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
-                return Err(incompatible_receiver("DataView.prototype.getBigInt64"));
-            };
-            let offset = match args.get(1) {
+            let (inner, base) = resolve_dataview_receiver(&args, "DataView.prototype.getBigInt64")?;
+            let offset = match args.get(base) {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let little_endian = args.get(base + 1).is_some_and(JsValue::to_boolean);
             let value = dataview_get_bigint64(&inner.borrow(), offset, little_endian)?;
             Ok(JsValue::BigInt(Box::new(i128::from(value))))
         }),
@@ -14060,15 +14087,13 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "getBigUint64".into(),
         builtin_fn("getBigUint64", 1, |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
-                return Err(incompatible_receiver("DataView.prototype.getBigUint64"));
-            };
-            let offset = match args.get(1) {
+            let (inner, base) =
+                resolve_dataview_receiver(&args, "DataView.prototype.getBigUint64")?;
+            let offset = match args.get(base) {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let little_endian = args.get(base + 1).is_some_and(JsValue::to_boolean);
             let value = dataview_get_biguint64(&inner.borrow(), offset, little_endian)?;
             Ok(JsValue::BigInt(Box::new(i128::from(value))))
         }),
@@ -40820,7 +40845,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_slice_copies_requested_range() {
         assert_eval_true(
             "var bytes = new Uint8Array([10,20,30,40]); var sliced = bytes.buffer.slice(1, 3); new Uint8Array(sliced).join(',') === '20,30'",
@@ -40828,7 +40852,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_slice_supports_negative_indices() {
         assert_eval_true(
             "var bytes = new Uint8Array([10,20,30,40]); new Uint8Array(bytes.buffer.slice(-2)).join(',') === '30,40'",
@@ -40884,7 +40907,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_object_to_string_uses_arraybuffer_tag() {
         assert_eval_true(
             "Object.prototype.toString.call(new ArrayBuffer(1)) === '[object ArrayBuffer]'",
@@ -40965,7 +40987,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_resize_rejects_growing_past_max() {
         assert_eval_true(
             "try { new ArrayBuffer(4, { maxByteLength: 6 }).resize(7); false; } catch (e) { e instanceof RangeError; }",
@@ -40973,7 +40994,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_detaches_source() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transfer(); buf.detached === true && buf.byteLength === 0 && moved.byteLength === 4 && moved.detached === false",
@@ -40997,7 +41017,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_preserves_max_byte_length() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transfer(6); moved.maxByteLength === 8 && moved.resizable === true",
@@ -41005,7 +41024,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_to_fixed_length_returns_fixed_buffer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transferToFixedLength(); moved.resizable === false && moved.maxByteLength === 4 && moved.byteLength === 4",
@@ -41013,7 +41031,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_to_fixed_length_with_new_length() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transferToFixedLength(6); moved.resizable === false && moved.maxByteLength === 6 && moved.byteLength === 6",
@@ -41021,7 +41038,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_rejects_length_past_max() {
         assert_eval_true(
             "try { new ArrayBuffer(4, { maxByteLength: 6 }).transfer(7); false; } catch (e) { e instanceof RangeError; }",
@@ -41029,7 +41045,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_rejects_detached_source() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); buf.transfer(); try { buf.transfer(); false; } catch (e) { e instanceof TypeError; }",
@@ -41163,7 +41178,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_object_to_string_uses_shared_arraybuffer_tag() {
         assert_eval_true(
             "Object.prototype.toString.call(new SharedArrayBuffer(1)) === '[object SharedArrayBuffer]'",
@@ -41218,7 +41232,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_grow_increases_byte_length() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); sab.grow(6); sab.byteLength === 6",
@@ -41241,7 +41254,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_grow_rejects_shrinking() {
         assert_eval_true(
             "try { new SharedArrayBuffer(4, { maxByteLength: 8 }).grow(3); false; } catch (e) { e instanceof RangeError; }",
@@ -41249,7 +41261,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_grow_rejects_length_past_max() {
         assert_eval_true(
             "try { new SharedArrayBuffer(4, { maxByteLength: 6 }).grow(7); false; } catch (e) { e instanceof RangeError; }",
@@ -41354,7 +41365,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_object_to_string_uses_dataview_tag() {
         assert_eval_true(
             "Object.prototype.toString.call(new DataView(new ArrayBuffer(1))) === '[object DataView]'",
@@ -41362,7 +41372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_int8_and_uint8() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setInt8(0, -1); v.getInt8(0) === -1 && v.getUint8(0) === 255",
@@ -41370,7 +41379,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_uint16_big_endian_by_default() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setUint16(0, 0x1234); v.getUint16(0) === 0x1234",
@@ -41378,7 +41386,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_uint16_little_endian() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setUint16(0, 0x1234, true); v.getUint16(0, true) === 0x1234 && v.getUint8(0) === 0x34 && v.getUint8(1) === 0x12",
@@ -41386,7 +41393,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_int16_little_endian() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setInt16(0, -2, true); v.getInt16(0, true) === -2",
@@ -41394,7 +41400,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_uint32_little_endian() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setUint32(0, 0x01020304, true); v.getUint32(0, true) === 0x01020304 && v.getUint8(0) === 4 && v.getUint8(3) === 1",
@@ -41402,7 +41407,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_int32_big_endian() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setInt32(0, -1234567); v.getInt32(0) === -1234567",
@@ -41410,7 +41414,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_float32() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setFloat32(0, 1.5, true); v.getFloat32(0, true) === 1.5",
@@ -41418,7 +41421,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_and_set_float64() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 12.25, true); v.getFloat64(0, true) === 12.25",
@@ -41426,7 +41428,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_prototype_methods_use_receiver() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(1)); v.setUint8(0, 99); DataView.prototype.getUint8.call(v, 0) === 99",
@@ -41441,7 +41442,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_getters_reject_negative_offsets() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(4)).getUint8(-1); false; } catch (e) { e instanceof RangeError; }",
@@ -41449,7 +41449,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_setters_reject_negative_offsets() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(4)).setUint8(-1, 1); false; } catch (e) { e instanceof RangeError; }",
@@ -41457,7 +41456,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_getters_reject_out_of_bounds_reads() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(2)).getUint32(0); false; } catch (e) { e instanceof RangeError; }",
@@ -41465,7 +41463,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_setters_reject_out_of_bounds_writes() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(2)).setUint32(0, 1); false; } catch (e) { e instanceof RangeError; }",
@@ -41473,7 +41470,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_int16_big_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setUint8(0, 0x12); v.setUint8(1, 0x34); v.getInt16(0) === 0x1234",
@@ -41481,7 +41477,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_uint16_big_endian_respects_view_offset() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4), 1, 2); v.setUint8(0, 0xaa); v.setUint8(1, 0xbb); v.getUint16(0) === 0xaabb",
@@ -41489,7 +41484,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_int32_big_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setUint8(0, 1); v.setUint8(1, 2); v.setUint8(2, 3); v.setUint8(3, 4); v.getInt32(0) === 0x01020304",
@@ -41497,7 +41491,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_float32_big_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setUint8(0, 0x3f); v.setUint8(1, 0x80); v.setUint8(2, 0x00); v.setUint8(3, 0x00); v.getFloat32(0) === 1",
@@ -41505,7 +41498,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_float64_big_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0x3f); v.setUint8(1, 0xf0); v.setUint8(2, 0x00); v.setUint8(3, 0x00); v.setUint8(4, 0x00); v.setUint8(5, 0x00); v.setUint8(6, 0x00); v.setUint8(7, 0x00); v.getFloat64(0) === 1",
@@ -41513,7 +41505,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_bigint64_big_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0xff); v.setUint8(1, 0xff); v.setUint8(2, 0xff); v.setUint8(3, 0xff); v.setUint8(4, 0xff); v.setUint8(5, 0xff); v.setUint8(6, 0xff); v.setUint8(7, 0xfe); v.getBigInt64(0) === -2n",
@@ -41521,7 +41512,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_get_biguint64_little_endian_interprets_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0x08); v.setUint8(1, 0x07); v.setUint8(2, 0x06); v.setUint8(3, 0x05); v.setUint8(4, 0x04); v.setUint8(5, 0x03); v.setUint8(6, 0x02); v.setUint8(7, 0x01); v.getBigUint64(0, true) === BigInt('72623859790382856')",
@@ -41529,7 +41519,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_bigint64_little_endian_round_trips_and_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, -2n, true); v.getBigInt64(0, true) === -2n && v.getUint8(0) === 0xfe && v.getUint8(7) === 0xff",
@@ -41537,7 +41526,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_biguint64_big_endian_round_trips_and_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setBigUint64(0, BigInt('0x0102030405060708')); v.getBigUint64(0) === BigInt('0x0102030405060708') && v.getUint8(0) === 0x01 && v.getUint8(7) === 0x08",
@@ -41545,7 +41533,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_int16_big_endian_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(2)); v.setInt16(0, 0x1234); v.getUint8(0) === 0x12 && v.getUint8(1) === 0x34",
@@ -41553,7 +41540,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_int32_big_endian_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setInt32(0, 0x01020304); v.getUint8(0) === 0x01 && v.getUint8(1) === 0x02 && v.getUint8(2) === 0x03 && v.getUint8(3) === 0x04",
@@ -41561,7 +41547,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_float32_big_endian_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(4)); v.setFloat32(0, 1); v.getUint8(0) === 0x3f && v.getUint8(1) === 0x80 && v.getUint8(2) === 0x00 && v.getUint8(3) === 0x00",
@@ -41569,7 +41554,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_set_float64_big_endian_writes_bytes() {
         assert_eval_true(
             "var v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 1); v.getUint8(0) === 0x3f && v.getUint8(1) === 0xf0 && v.getUint8(2) === 0x00 && v.getUint8(3) === 0x00 && v.getUint8(4) === 0x00 && v.getUint8(5) === 0x00 && v.getUint8(6) === 0x00 && v.getUint8(7) === 0x00",
@@ -41577,7 +41561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_getters_reject_detached_buffer_after_transfer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.getUint8(0); false; } catch (e) { e instanceof TypeError; }",
@@ -41585,7 +41568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_setters_reject_detached_buffer_after_transfer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.setUint8(0, 1); false; } catch (e) { e instanceof TypeError; }",
@@ -41593,7 +41575,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_byte_length_getter_rejects_detached_buffer_after_transfer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.byteLength; false; } catch (e) { e instanceof TypeError; }",
@@ -41601,7 +41582,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_byte_offset_getter_rejects_detached_buffer_after_transfer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf, 2, 4); buf.transfer(); try { view.byteOffset; false; } catch (e) { e instanceof TypeError; }",
@@ -41609,7 +41589,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_constructor_rejects_detached_buffer() {
         assert_eval_true(
             "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); buf.transfer(); try { new DataView(buf); false; } catch (e) { e instanceof TypeError; }",
@@ -41631,7 +41610,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_shared_arraybuffer_round_trips() {
         assert_eval_true(
             "var buf = new SharedArrayBuffer(8); var view = new DataView(buf); view.setUint32(0, 0x01020304, true); view.getUint32(0, true) === 0x01020304 && view.buffer === buf",
@@ -41639,7 +41617,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_bounds_check_uses_view_length_not_buffer_length() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(8), 2, 2).getUint32(0); false; } catch (e) { e instanceof RangeError; }",
@@ -41647,7 +41624,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_dataview_bounds_check_allows_last_byte_within_view() {
         assert_eval_true(
             "var view = new DataView(new ArrayBuffer(4), 1, 2); view.setUint8(1, 7); view.getUint8(1) === 7",
