@@ -4869,6 +4869,18 @@ impl<'src> Parser<'src> {
     }
 
     fn merge_spans(a: Span, b: Span) -> SourceLocation {
+        // Treat a span as "empty" only when *both* its start and end offsets
+        // are at the sentinel zero — a real span starting at offset 0 (e.g.
+        // a top-level `function` declaration) must be preserved so that
+        // `Function.prototype.toString` can return the full source text.
+        let a_empty = a.start.offset == 0 && a.end.offset == 0;
+        let b_empty = b.start.offset == 0 && b.end.offset == 0;
+        if a_empty {
+            return b;
+        }
+        if b_empty {
+            return a;
+        }
         let start = if a.start.offset <= b.start.offset {
             a.start
         } else {
@@ -4879,16 +4891,7 @@ impl<'src> Parser<'src> {
         } else {
             b.end
         };
-        // If a or b are empty (offset == 0 sentinel), prefer the other.
-        let start = if a.start.offset == 0 && b.start.offset != 0 {
-            b.start
-        } else {
-            start
-        };
-        Span {
-            start,
-            end: if end.offset == 0 { start } else { end },
-        }
+        Span { start, end }
     }
 }
 

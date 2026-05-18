@@ -27815,7 +27815,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_function_declaration_source() {
         assert_eval_true(
             "function foo(a, b) { return a + b; } foo.toString() === 'function foo(a, b) { return a + b; }'",
@@ -27862,19 +27861,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_async_function_source() {
         assert_eval_true("async function f() {} f.toString() === 'async function f() {}'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_generator_function_source() {
         assert_eval_true("function* g() {} g.toString() === 'function* g() {}'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_async_generator_function_source() {
         assert_eval_true("async function* ag() {} ag.toString() === 'async function* ag() {}'");
     }
