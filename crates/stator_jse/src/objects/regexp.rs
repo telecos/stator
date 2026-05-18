@@ -391,7 +391,12 @@ impl JsRegExp {
             }
             Some(mat) => {
                 if is_stateful {
-                    self.last_index.set(mat.end());
+                    // For zero-width matches in global/sticky mode, advance
+                    // `lastIndex` past the current position so the next call
+                    // makes progress and we don't loop forever on patterns
+                    // like /(?:)/g or /^/gm (ECMA-262 §22.2.7.2 RegExpBuiltinExec).
+                    self.last_index
+                        .set(advance_after_match(input, mat.start(), mat.end()));
                 }
                 Some(build_match(
                     input,

@@ -1036,7 +1036,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_last_index_zero_width_match_advances() {
         let re = regexp_construct(&[JsValue::String("(?:)".into()), JsValue::String("g".into())])
             .unwrap();
@@ -1045,6 +1044,45 @@ mod tests {
             if let JsValue::NativeFunction(f) = exec_fn {
                 let _ = f(vec![JsValue::String("ab".into())]).unwrap();
                 assert_eq!(get_smi(&re, "lastIndex"), Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_last_index_zero_width_sticky_advances() {
+        let re = regexp_construct(&[JsValue::String("(?:)".into()), JsValue::String("y".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let _ = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert_eq!(get_smi(&re, "lastIndex"), Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_last_index_zero_width_repeated_exec_terminates() {
+        // /(?:)/g on "ab" must yield matches at 0,1,2 and then null,
+        // never looping forever.
+        let re = regexp_construct(&[JsValue::String("(?:)".into()), JsValue::String("g".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let r1 = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert!(matches!(r1, JsValue::PlainObject(_)));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(1));
+                let r2 = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert!(matches!(r2, JsValue::PlainObject(_)));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(2));
+                let r3 = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert!(matches!(r3, JsValue::PlainObject(_)));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(3));
+                // Past end -> null and reset to 0.
+                let r4 = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert!(matches!(r4, JsValue::Null));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(0));
             }
         }
     }
