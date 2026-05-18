@@ -7946,6 +7946,237 @@ fn collect_switch_lexical_decl_names(cases: &[crate::parser::ast::SwitchCase]) -
     names
 }
 
+/// Collect every free reference that appears inside any nested
+/// function / arrow / method body found within `stmts`.
+///
+/// Used by the function prologue to decide which inherited closure
+/// captures need to be *forwarded* into this function's own context so
+/// that grand-children closures can resolve them via the standard
+/// `LdaCurrentContextSlot` path.
+fn collect_inner_function_free_refs_in_block(body: &BlockStmt) -> HashSet<String> {
+    let mut out = HashSet::new();
+    walk_block_for_inner_refs(&body.body, &mut out);
+    out
+}
+
+fn walk_block_for_inner_refs(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        walk_stmt_for_inner_refs(stmt, out);
+    }
+}
+
+fn walk_stmt_for_inner_refs(stmt: &Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Expr(es) => walk_expr_for_inner_refs(&es.expr, out),
+        Stmt::Return(r) => {
+            if let Some(e) = &r.argument {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Stmt::Block(b) => walk_block_for_inner_refs(&b.body, out),
+        Stmt::If(i) => {
+            walk_expr_for_inner_refs(&i.test, out);
+            walk_stmt_for_inner_refs(&i.consequent, out);
+            if let Some(alt) = &i.alternate {
+                walk_stmt_for_inner_refs(alt, out);
+            }
+        }
+        Stmt::While(w) => {
+            walk_expr_for_inner_refs(&w.test, out);
+            walk_stmt_for_inner_refs(&w.body, out);
+        }
+        Stmt::DoWhile(d) => {
+            walk_stmt_for_inner_refs(&d.body, out);
+            walk_expr_for_inner_refs(&d.test, out);
+        }
+        Stmt::For(f) => {
+            if let Some(init) = &f.init {
+                match init {
+                    ForInit::Expr(e) => walk_expr_for_inner_refs(e, out),
+                    ForInit::VarDecl(v) => {
+                        for d in &v.declarators {
+                            if let Some(i) = &d.init {
+                                walk_expr_for_inner_refs(i, out);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(test) = &f.test {
+                walk_expr_for_inner_refs(test, out);
+            }
+            if let Some(u) = &f.update {
+                walk_expr_for_inner_refs(u, out);
+            }
+            walk_stmt_for_inner_refs(&f.body, out);
+        }
+        Stmt::ForIn(fi) => {
+            walk_expr_for_inner_refs(&fi.right, out);
+            walk_stmt_for_inner_refs(&fi.body, out);
+        }
+        Stmt::ForOf(fo) => {
+            walk_expr_for_inner_refs(&fo.right, out);
+            walk_stmt_for_inner_refs(&fo.body, out);
+        }
+        Stmt::VarDecl(v) => {
+            for d in &v.declarators {
+                if let Some(i) = &d.init {
+                    walk_expr_for_inner_refs(i, out);
+                }
+            }
+        }
+        Stmt::Switch(s) => {
+            walk_expr_for_inner_refs(&s.discriminant, out);
+            for case in &s.cases {
+                if let Some(t) = &case.test {
+                    walk_expr_for_inner_refs(t, out);
+                }
+                for st in &case.consequent {
+                    walk_stmt_for_inner_refs(st, out);
+                }
+            }
+        }
+        Stmt::Throw(t) => walk_expr_for_inner_refs(&t.argument, out),
+        Stmt::Try(t) => {
+            walk_block_for_inner_refs(&t.block.body, out);
+            if let Some(h) = &t.handler {
+                walk_block_for_inner_refs(&h.body.body, out);
+            }
+            if let Some(f) = &t.finalizer {
+                walk_block_for_inner_refs(&f.body, out);
+            }
+        }
+        Stmt::Labeled(l) => walk_stmt_for_inner_refs(&l.body, out),
+        Stmt::With(w) => {
+            walk_expr_for_inner_refs(&w.object, out);
+            walk_stmt_for_inner_refs(&w.body, out);
+        }
+        Stmt::FnDecl(f) => {
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            for n in collect_function_free_refs(&f.params, &f.body.body, self_name) {
+                out.insert(n);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_expr_for_inner_refs(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Fn(f) => {
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            for n in collect_function_free_refs(&f.params, &f.body.body, self_name) {
+                out.insert(n);
+            }
+        }
+        Expr::Arrow(a) => {
+            for n in collect_arrow_free_refs(a) {
+                out.insert(n);
+            }
+        }
+        Expr::Class(_) => {}
+        Expr::Unary(u) => walk_expr_for_inner_refs(&u.argument, out),
+        Expr::Update(u) => walk_expr_for_inner_refs(&u.argument, out),
+        Expr::Binary(b) => {
+            walk_expr_for_inner_refs(&b.left, out);
+            walk_expr_for_inner_refs(&b.right, out);
+        }
+        Expr::Logical(l) => {
+            walk_expr_for_inner_refs(&l.left, out);
+            walk_expr_for_inner_refs(&l.right, out);
+        }
+        Expr::Assign(a) => {
+            walk_expr_for_inner_refs(&a.right, out);
+        }
+        Expr::Conditional(c) => {
+            walk_expr_for_inner_refs(&c.test, out);
+            walk_expr_for_inner_refs(&c.consequent, out);
+            walk_expr_for_inner_refs(&c.alternate, out);
+        }
+        Expr::Call(c) => {
+            walk_expr_for_inner_refs(&c.callee, out);
+            for a in &c.arguments {
+                walk_expr_for_inner_refs(a, out);
+            }
+        }
+        Expr::New(n) => {
+            walk_expr_for_inner_refs(&n.callee, out);
+            for a in &n.arguments {
+                walk_expr_for_inner_refs(a, out);
+            }
+        }
+        Expr::Member(m) => {
+            walk_expr_for_inner_refs(&m.object, out);
+            if let MemberProp::Computed(e) = &m.property {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::OptionalMember(m) => {
+            walk_expr_for_inner_refs(&m.object, out);
+            if let MemberProp::Computed(e) = &m.property {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::OptionalCall(c) => {
+            walk_expr_for_inner_refs(&c.callee, out);
+            for a in &c.arguments {
+                walk_expr_for_inner_refs(a, out);
+            }
+        }
+        Expr::Sequence(s) => {
+            for e in &s.expressions {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::Array(a) => {
+            for e in a.elements.iter().flatten() {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::Object(o) => {
+            for prop in &o.properties {
+                match prop {
+                    ObjectProp::Prop(p) => {
+                        if let PropKey::Computed(e) = &p.key {
+                            walk_expr_for_inner_refs(e, out);
+                        }
+                        match &p.value {
+                            PropValue::Value(e) => walk_expr_for_inner_refs(e, out),
+                            PropValue::Get(f) | PropValue::Set(f) | PropValue::Method(f) => {
+                                let sn = f.id.as_ref().map(|i| i.name.as_str());
+                                for n in collect_function_free_refs(&f.params, &f.body.body, sn) {
+                                    out.insert(n);
+                                }
+                            }
+                            PropValue::Shorthand => {}
+                        }
+                    }
+                    ObjectProp::Spread(s) => walk_expr_for_inner_refs(&s.argument, out),
+                }
+            }
+        }
+        Expr::Spread(s) => walk_expr_for_inner_refs(&s.argument, out),
+        Expr::Template(t) => {
+            for e in &t.expressions {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::TaggedTemplate(t) => {
+            walk_expr_for_inner_refs(&t.tag, out);
+            for e in &t.quasi.expressions {
+                walk_expr_for_inner_refs(e, out);
+            }
+        }
+        Expr::Yield(y) => {
+            if let Some(a) = &y.argument {
+                walk_expr_for_inner_refs(a, out);
+            }
+        }
+        Expr::Await(a) => walk_expr_for_inner_refs(&a.argument, out),
+        _ => {}
+    }
+}
+
 /// Find all captured variables: locals referenced by nested functions.
 fn find_captured_vars(outer_params: &[Param], body: &BlockStmt) -> HashSet<String> {
     let function_scope = collect_function_scope_names(outer_params, &body.body, None);
@@ -8389,16 +8620,56 @@ fn compile_function_inner(
     // expressions.  Captured variables are stored in a JsContext instead of
     // registers so that inner closures can read and write them via context
     // slot operations.
+    //
+    // In addition, whenever this function pushes its own context (because it
+    // has *any* own captures or because an inner function needs to see a
+    // forwarded ancestor binding), every name inherited from this function's
+    // closure scope (`closure_captures`) must be re-anchored so that loads
+    // continue to read from the *parent* context, not the freshly pushed one.
+    // We achieve that by *forwarding* every inherited capture into a fresh
+    // slot in this function's own context (copying the value once at entry).
+    // Without this, a 3-level closure where the middle function does not
+    // itself reference the variable would silently fail to propagate it
+    // (the inner function would see `undefined`), and any sibling inherited
+    // binding could be mis-resolved to a freshly allocated slot.
     let captured = find_captured_vars(params, body);
-    if !captured.is_empty() {
+    let inner_free_refs = collect_inner_function_free_refs_in_block(body);
+    let needs_forward = compiler
+        .closure_captures
+        .keys()
+        .any(|n| !captured.contains(n) && inner_free_refs.contains(n));
+    let must_push_context = !captured.is_empty() || needs_forward;
+
+    if must_push_context {
         let mut slot_idx = 0u32;
-        // Sort for deterministic slot assignment.
-        let mut sorted: Vec<_> = captured.into_iter().collect();
-        sorted.sort();
-        for name in sorted {
-            compiler.context_bindings.insert(name, slot_idx);
+        // Sort own captured names for deterministic slot assignment.
+        let mut owned: Vec<_> = captured.into_iter().collect();
+        owned.sort();
+        for name in &owned {
+            compiler.context_bindings.insert(name.clone(), slot_idx);
             slot_idx += 1;
         }
+        // Forward *every* inherited capture into this function's context.
+        // We must do this for all of them (not just those needed by inner
+        // functions) because pushing a new context changes which context
+        // `LdaCurrentContextSlot` resolves against, so any remaining
+        // closure_captures entry would silently read the wrong slot.
+        let mut forwarded_with_parent: Vec<(String, u32)> = compiler
+            .closure_captures
+            .iter()
+            .filter(|(n, _)| !compiler.context_bindings.contains_key(*n))
+            .map(|(n, s)| (n.clone(), *s))
+            .collect();
+        forwarded_with_parent.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, _) in &forwarded_with_parent {
+            compiler.context_bindings.insert(name.clone(), slot_idx);
+            slot_idx += 1;
+        }
+        // After moving inherited names into context_bindings, drop the
+        // closure_captures map: every previously-inherited name now resolves
+        // via the standard context_bindings path against this function's
+        // own context.
+        compiler.closure_captures.clear();
         compiler.context_slot_count = slot_idx;
 
         // Emit CreateFunctionContext + PushContext prologue.
@@ -8416,10 +8687,11 @@ fn compile_function_inner(
             vec![to_reg_op(saved_ctx_reg)],
         ));
 
-        // Copy parameter values that are captured from their registers into
-        // the newly created context slots.
-        for (name, &slot) in &compiler.context_bindings.clone() {
+        // Copy own parameter values that are captured from their registers
+        // into the newly created context slots.
+        for name in &owned {
             if let Some(binding) = compiler.scopes[0].get(name) {
+                let slot = compiler.context_bindings[name];
                 compiler.emit_ldar(binding.reg);
                 compiler.emit(Instruction::new_unchecked(
                     Opcode::StaCurrentContextSlot,
@@ -8427,7 +8699,30 @@ fn compile_function_inner(
                 ));
             }
         }
+        // Forward inherited captures from the parent context (held in
+        // `saved_ctx_reg`) into this function's fresh context.  We use
+        // `LdaContextSlot` with depth 0 so that no chain walking occurs;
+        // we simply read slot `parent_slot` from the saved parent context.
+        for (name, parent_slot) in &forwarded_with_parent {
+            let new_slot = compiler.context_bindings[name];
+            compiler.emit(Instruction::new_unchecked(
+                Opcode::LdaContextSlot,
+                vec![
+                    to_reg_op(saved_ctx_reg),
+                    Operand::ConstantPoolIdx(*parent_slot),
+                    Operand::Immediate(0),
+                ],
+            ));
+            compiler.emit(Instruction::new_unchecked(
+                Opcode::StaCurrentContextSlot,
+                vec![Operand::ConstantPoolIdx(new_slot)],
+            ));
+        }
     }
+    // If we do NOT push a context, the inherited `closure_captures` map is
+    // left in place.  Each `LdaCurrentContextSlot(slot)` then reads from the
+    // parent's context (which is still the current context for this frame),
+    // so the original slot indices remain valid.
 
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {

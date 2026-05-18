@@ -55740,7 +55740,6 @@ mod tests {
 
     /// Nested for-of with custom iterators.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_nested_custom_iterators() {
         let r = global_eval(
             r#"
@@ -55977,7 +55976,6 @@ mod tests {
 
     /// Nested for-of break only closes inner iterator.
     #[test]
-    #[ignore] // TODO: custom iterator support needed
     fn e2e_iter_nested_break_closes_inner_only() {
         let r = global_eval(
             r#"
@@ -56191,6 +56189,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("a1,b2,c3".into()));
+    }
+
+    /// Three-level closure: middle function does not reference the
+    /// captured variable but the inner function does.  Verifies that the
+    /// bytecode generator forwards inherited closure captures through
+    /// intermediate scopes so deeper closures can resolve them at
+    /// depth 0.  Regression test for nested custom iterators.
+    #[test]
+    fn e2e_closure_three_level_forwarded_capture() {
+        let r = global_eval(
+            r#"
+            function outer(items) {
+                return function middle() {
+                    return function inner() {
+                        return items.length;
+                    };
+                };
+            }
+            outer([1, 2, 3, 4])()()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    /// Three-level closure where the middle function pushes its own
+    /// context (because it has its own captured local) AND a sibling
+    /// inherited binding flows through.  Ensures that pushing a new
+    /// context in the middle frame does not mis-resolve unforwarded
+    /// inherited captures against the freshly pushed context.
+    #[test]
+    fn e2e_closure_three_level_mixed_captures() {
+        let r = global_eval(
+            r#"
+            function outer(items) {
+                var x = 99;
+                function middle() {
+                    var y = x + 1; // middle uses x
+                    return function inner() {
+                        return items.length + "/" + y;
+                    };
+                }
+                return middle()();
+            }
+            outer([1, 2, 3, 4])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("4/100".into()));
     }
 
     /// Spread generator into array.
