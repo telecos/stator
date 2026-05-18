@@ -3412,6 +3412,36 @@ fn json_get_property(holder: &JsValue, key: &str) -> StatorResult<JsValue> {
     dispatch_get_property_value(holder, JsValue::String(key.to_string().into()))
 }
 
+/// Return `Array.prototype` as a holder value, but only when the prototype
+/// has any own property whose key matches `index` after `ToString`.  The
+/// returned holder is used by `json_serialize_value` to resolve sparse array
+/// holes via `[[Get]]` so user-supplied entries on `Array.prototype` (or
+/// further up the chain) are serialised instead of `null` (§25.5.2.4).
+fn json_array_prototype_index(index: usize) -> StatorResult<Option<JsValue>> {
+    let Some(globals) = crate::interpreter::current_global_env() else {
+        return Ok(None);
+    };
+    let proto = {
+        let g = globals.borrow();
+        let Some(ctor) = g.get("Array").cloned() else {
+            return Ok(None);
+        };
+        let JsValue::PlainObject(map) = ctor else {
+            return Ok(None);
+        };
+        let m = map.borrow();
+        match m.get("prototype").cloned() {
+            Some(p) => p,
+            None => return Ok(None),
+        }
+    };
+    let key = index.to_string();
+    if !crate::interpreter::has_property_in_chain(&proto, &key) {
+        return Ok(None);
+    }
+    Ok(Some(proto))
+}
+
 /// Return a stable identity key for circular JSON detection.
 fn json_identity_key(value: &JsValue) -> Option<usize> {
     match value {
@@ -3604,16 +3634,37 @@ fn json_serialize_value(
                 let mut parts = Vec::with_capacity(len);
 
                 for index in 0..len {
-                    let item = json_serialize_property(
-                        &holder,
-                        &index.to_string(),
-                        replacer_fn,
-                        property_list,
-                        indent,
-                        depth + 1,
-                        in_progress,
-                    )?;
-                    parts.push(item.unwrap_or_else(|| "null".to_string()));
+                    // §25.5.2.4 SerializeJSONArray uses the abstract `[[Get]]`,
+                    // which walks the prototype chain.  For holes, route the
+                    // lookup through `Array.prototype` so user-supplied
+                    // prototype properties materialise as values instead of
+                    // serialising to `null`.
+                    let is_hole = items.borrow().get(index).is_some_and(JsValue::is_the_hole);
+                    let serialized = if is_hole {
+                        match json_array_prototype_index(index)? {
+                            Some(proto_holder) => json_serialize_property(
+                                &proto_holder,
+                                &index.to_string(),
+                                replacer_fn,
+                                property_list,
+                                indent,
+                                depth + 1,
+                                in_progress,
+                            )?,
+                            None => None,
+                        }
+                    } else {
+                        json_serialize_property(
+                            &holder,
+                            &index.to_string(),
+                            replacer_fn,
+                            property_list,
+                            indent,
+                            depth + 1,
+                            in_progress,
+                        )?
+                    };
+                    parts.push(serialized.unwrap_or_else(|| "null".to_string()));
                 }
 
                 if use_indent {
@@ -39422,7 +39473,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_array_hole_uses_prototype_value() {
         assert_eval_true(
             r#"
