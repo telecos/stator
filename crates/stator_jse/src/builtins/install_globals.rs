@@ -3804,13 +3804,31 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
 
 /// Create a Date prototype method that delegates to the instance's own method.
 ///
-/// When `Date.prototype.<method>.call(dateInstance, ...)` is invoked, the
-/// generated closure locates the same-named `NativeFunction` on the Date
-/// instance and forwards the remaining arguments.
+/// Stator's native calling convention historically expects `this` as the
+/// first positional argument (used by `Function.prototype.call` /
+/// `Function.prototype.apply` and the interpreter's method dispatch when
+/// they prepend the receiver to `args`).  When that prepended `this` is
+/// missing (for example, when the bytecode dispatcher publishes the
+/// receiver on the current global environment instead), the delegate falls
+/// back to the environment-recorded `this` so that ordinary
+/// `dateInstance.toJSON()` invocations resolve their receiver correctly.
+///
+/// For `toJSON` the §21.4.4.43 algorithm is implemented: when the receiver
+/// converts to a non-finite number primitive return `null`; otherwise invoke
+/// the receiver's own (potentially overridden) `toISOString`.
 fn date_proto_delegate(name: &str) -> JsValue {
     let name = name.to_string();
     native(move |args| {
-        let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+        let (this, forwarded_args) = match args.first().cloned() {
+            Some(JsValue::Undefined) | None => {
+                let env_this = current_global_env()
+                    .and_then(|env| env.borrow().get_this().cloned())
+                    .unwrap_or(JsValue::Undefined);
+                (env_this, args.get(1..).unwrap_or(&[]).to_vec())
+            }
+            Some(value) => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+        };
+
         if name == "toJSON" {
             let primitive = this.to_primitive(ToPrimitiveHint::Number)?;
             if matches!(primitive, JsValue::HeapNumber(n) if !n.is_finite()) {
@@ -3829,8 +3847,7 @@ fn date_proto_delegate(name: &str) -> JsValue {
         if let JsValue::PlainObject(map) = &this
             && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
         {
-            let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
-            return f(rest);
+            return f(forwarded_args);
         }
         Err(StatorError::TypeError(
             "this is not a Date object".to_string(),
@@ -37378,7 +37395,6 @@ mod tests {
 
     /// `new Date(0).toJSON()` returns the same as `toISOString()`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_to_json_matches_iso() {
         let result = global_eval(
             r#"
@@ -37804,7 +37820,6 @@ mod tests {
 
     /// `toJSON()` returns the ISO string for valid dates.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_to_json_returns_iso_string_for_valid_date() {
         let result = global_eval("new Date(0).toJSON()").unwrap();
         assert_eq!(result, JsValue::String("1970-01-01T00:00:00.000Z".into()));
@@ -37930,7 +37945,6 @@ mod tests {
 
     /// Instance `toJSON()` uses an overridden own `toISOString` method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_to_json_uses_overridden_instance_to_iso_string() {
         let result = global_eval(
             r#"
@@ -38731,7 +38745,6 @@ mod tests {
 
     /// `toJSON()` returns the same as `toISOString()` for valid dates.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_json_matches_to_iso_string() {
         let result = global_eval(
             r#"
@@ -38745,7 +38758,6 @@ mod tests {
 
     /// `toJSON()` returns `null` for invalid dates.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_json_null_on_invalid() {
         let result = global_eval("new Date('invalid').toJSON()").unwrap();
         assert_eq!(result, JsValue::Null);
@@ -38753,9 +38765,30 @@ mod tests {
 
     /// `toJSON()` returns `null` for `NaN` timestamp.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_json_null_on_nan_timestamp() {
         let result = global_eval("new Date(NaN).toJSON()").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// Per §21.4.4.43 `Date.prototype.toJSON.call(thisArg)` forwards `this`
+    /// to the receiver-resolved `toISOString` when invoked via `Function.call`.
+    #[test]
+    fn test_to_json_call_with_explicit_this_uses_receiver_to_iso_string() {
+        let result = global_eval(
+            r#"
+            var d = new Date(0);
+            Date.prototype.toJSON.call(d) === d.toISOString()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype.toJSON.call(nanDate)` returns `null` for non-finite
+    /// receivers when invoked via `Function.call`.
+    #[test]
+    fn test_to_json_call_with_explicit_this_nan_returns_null() {
+        let result = global_eval("Date.prototype.toJSON.call(new Date(NaN))").unwrap();
         assert_eq!(result, JsValue::Null);
     }
 
