@@ -1706,6 +1706,7 @@ dependencies = [
  "log",
  "serde_json",
  "stator_jse",
+ "wat",
 ]
 
 [[package]]

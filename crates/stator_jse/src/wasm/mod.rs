@@ -51,6 +51,7 @@ use wasmtime::{
     Config, Engine, FuncType, Global, GlobalType, Instance, Linker, Module, Mutability, Store,
     UpdateDeadline, Val, ValType,
 };
+pub use wasmtime::{MemoryType, SharedMemory};
 
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{SCRIPT_TERMINATED_MESSAGE, check_interrupt_flag};
@@ -148,8 +149,20 @@ impl WasmEngine {
     pub fn new() -> Self {
         let mut config = Config::new();
         config.epoch_interruption(true);
+        // Enable the threads proposal so importer modules can declare
+        // `(memory ... shared)` imports and Stator can bind a
+        // [`SharedMemory`] across stores. Shared memory is the only memory
+        // primitive that can be safely passed between independent
+        // [`wasmtime::Store`]s, so this is required by the module-graph
+        // memory import contract documented on [`HostMemory`].
+        config.wasm_threads(true);
+        // Allow externally-created `SharedMemory` handles. Required to
+        // route a Wasm-dependency module's exported shared memory through
+        // the linker as an import to a separate Wasm instance.
+        config.shared_memory(true);
         // `Engine::new` only fails for invalid `Config`s; the defaults plus
-        // `epoch_interruption(true)` are always valid.
+        // `epoch_interruption(true)` and `wasm_threads(true)` are always
+        // valid.
         let inner = Engine::new(&config).expect("default wasmtime Config should be valid");
         register_engine(&inner);
         Self { inner }
@@ -292,6 +305,44 @@ impl WasmModule {
         let kind = value_type_to_host_kind(gt.content().clone()).ok()?;
         Some((kind, gt.mutability().is_var()))
     }
+
+    /// Look up the declared type of a named memory export.
+    ///
+    /// Returns `None` when the export does not exist or is not a memory.
+    /// The returned [`WasmMemoryTypeInfo`] mirrors the shape of
+    /// [`WasmExternKind::Memory`] so import/export compatibility can be
+    /// validated structurally (minimum/maximum pages, memory64 flag, shared
+    /// flag, page-size log2).
+    pub fn exported_memory_type(&self, name: &str) -> Option<WasmMemoryTypeInfo> {
+        let export = self.inner.exports().find(|e| e.name() == name)?;
+        let mt = export.ty().memory()?.clone();
+        Some(WasmMemoryTypeInfo {
+            minimum: mt.minimum(),
+            maximum: mt.maximum(),
+            memory64: mt.is_64(),
+            shared: mt.is_shared(),
+            page_size_log2: mt.page_size_log2(),
+        })
+    }
+}
+
+/// Structural type information for a Wasm memory import or export, matching
+/// the metadata fields of [`WasmExternKind::Memory`]. Used by the FFI layer
+/// to validate that a dependency module's exported memory is compatible
+/// with the importer's expected memory type before sharing a
+/// [`SharedMemory`] across instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmMemoryTypeInfo {
+    /// Minimum page count.
+    pub minimum: u64,
+    /// Optional maximum page count.
+    pub maximum: Option<u64>,
+    /// Whether this is a memory64 import/export.
+    pub memory64: bool,
+    /// Whether this is a shared-memory import/export.
+    pub shared: bool,
+    /// Log2 of the page size in bytes (16 ⇒ 64 KiB pages by default).
+    pub page_size_log2: u8,
 }
 
 fn value_type_to_host_kind(ty: wasmtime::ValType) -> Result<HostValKind, String> {
@@ -519,6 +570,33 @@ pub struct HostGlobal {
     pub mutable: bool,
 }
 
+/// A single host shared-memory import bound into a Wasm module's import
+/// namespace.
+///
+/// `module` and `name` form the fully-qualified Wasm import name (e.g.
+/// `env` and `mem`). `memory` is a [`SharedMemory`] whose declared type is
+/// matched structurally by the Wasmtime linker against the module's
+/// expected memory type at instantiate time (any mismatch fails
+/// instantiation).
+///
+/// Sharing semantics: a [`SharedMemory`] is a thread-safe linear memory
+/// that lives outside any single [`Store`], so the same `SharedMemory`
+/// handle can be supplied as an import to multiple instances in different
+/// stores. Writes performed by one importer are immediately observable by
+/// every other importer (and by the dependency module that originally
+/// allocated or owns it). This is the only Wasm memory primitive Stator
+/// can safely route through the ES module graph today; unshared memories
+/// cannot be passed across stores in Wasmtime, so non-shared memory
+/// imports continue to fail closed.
+pub struct HostMemory {
+    /// Wasm import module name (e.g. `"env"`).
+    pub module: String,
+    /// Wasm import field name (e.g. `"mem"`).
+    pub name: String,
+    /// Externally-owned shared memory bound under `(module, name)`.
+    pub memory: SharedMemory,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmInstance
 // ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +668,32 @@ impl WasmInstance {
         module: &WasmModule,
         funcs: Vec<HostFunc>,
         globals: Vec<HostGlobal>,
+    ) -> StatorResult<Self> {
+        Self::new_with_extern_imports_full(engine, module, funcs, globals, Vec::new())
+    }
+
+    /// Instantiate a [`WasmModule`] binding the given host-function,
+    /// host-global, and host-memory imports.
+    ///
+    /// Behaves identically to [`WasmInstance::new_with_extern_imports`] for
+    /// functions and globals, and additionally registers each
+    /// [`HostMemory`] under its `(module, name)` pair using its
+    /// [`SharedMemory`] handle. The Wasmtime linker then performs the
+    /// structural import-type match (minimum/maximum pages, memory64,
+    /// shared, page-size log2) against the module's expected memory type
+    /// and fails instantiation on any mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::WasmError`] if linker registration fails
+    /// (e.g. duplicate import names, conflicting `(module, name)` entries)
+    /// or if instantiation fails.
+    pub fn new_with_extern_imports_full(
+        engine: &WasmEngine,
+        module: &WasmModule,
+        funcs: Vec<HostFunc>,
+        globals: Vec<HostGlobal>,
+        memories: Vec<HostMemory>,
     ) -> StatorResult<Self> {
         let mut store: Store<()> = Store::new(engine.inner(), ());
         // Configure the store so that every epoch advance reaches a callback
@@ -678,6 +782,17 @@ impl WasmInstance {
                 .map_err(|e| StatorError::WasmError(e.to_string()))?;
         }
 
+        for HostMemory {
+            module: m_name,
+            name: mem_name,
+            memory,
+        } in memories
+        {
+            linker
+                .define(&store, &m_name, &mem_name, memory)
+                .map_err(|e| StatorError::WasmError(e.to_string()))?;
+        }
+
         let instance = linker
             .instantiate(&mut store, module.inner())
             .map_err(|e| StatorError::WasmError(e.to_string()))?;
@@ -736,6 +851,20 @@ impl WasmInstance {
             .exports(&mut self.store)
             .map(|e| e.name().to_owned())
             .collect()
+    }
+
+    /// Look up a named shared-memory export on this instance.
+    ///
+    /// Returns `None` when the export does not exist or is not a shared
+    /// memory. Stator only exposes shared memories across the module-graph
+    /// import boundary because they are the only Wasm memory primitive
+    /// safely shareable between independent [`Store`]s; callers that need
+    /// to bind a memory import from a Wasm dependency module use this
+    /// accessor to obtain the dependency-owned [`SharedMemory`] handle.
+    pub fn exported_shared_memory(&mut self, name: &str) -> Option<SharedMemory> {
+        self.inner
+            .get_export(&mut self.store, name)?
+            .into_shared_memory()
     }
 
     /// Call an exported function by name using [`JsValue`] arguments.
@@ -1601,6 +1730,166 @@ mod tests {
         );
         assert_eq!(module.exported_global_type("f"), None);
         assert_eq!(module.exported_global_type("missing"), None);
+    }
+
+    // ── Host shared-memory imports ──────────────────────────────────────────
+
+    /// Importing a shared memory binds the supplied [`SharedMemory`] handle;
+    /// writes performed by the importer Wasm are observable through the
+    /// same handle from outside the instance because both observe the same
+    /// underlying linear memory.
+    #[test]
+    fn test_wasm_host_shared_memory_import_roundtrips_through_handle() {
+        let wat = r#"
+            (module
+                (import "env" "mem" (memory 1 1 shared))
+                (func (export "store") (param i32 i32)
+                    (local.get 0) (local.get 1) (i32.store)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let memory = SharedMemory::new(engine.inner(), MemoryType::shared(1, 1)).unwrap();
+        let memories = vec![HostMemory {
+            module: "env".to_string(),
+            name: "mem".to_string(),
+            memory: memory.clone(),
+        }];
+        let mut instance = WasmInstance::new_with_extern_imports_full(
+            &engine,
+            &module,
+            Vec::new(),
+            Vec::new(),
+            memories,
+        )
+        .unwrap();
+        instance
+            .call("store", &[Val::I32(0), Val::I32(0x12345678)])
+            .unwrap();
+        // SAFETY: SharedMemory::data returns a slice of UnsafeCell<u8>; we
+        // only read the bytes we just wrote and never alias them mutably.
+        let observed = unsafe {
+            let slice = memory.data();
+            let mut bytes = [0u8; 4];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = *slice[i].get();
+            }
+            u32::from_le_bytes(bytes)
+        };
+        assert_eq!(observed, 0x12345678);
+    }
+
+    /// Supplying a shared memory whose declared maximum exceeds the
+    /// importer's expected maximum fails instantiation rather than silently
+    /// substituting a wider memory.
+    #[test]
+    fn test_wasm_host_shared_memory_import_max_mismatch_fails() {
+        let wat = r#"
+            (module (import "env" "mem" (memory 1 1 shared)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let memory = SharedMemory::new(engine.inner(), MemoryType::shared(1, 4)).unwrap();
+        let memories = vec![HostMemory {
+            module: "env".to_string(),
+            name: "mem".to_string(),
+            memory,
+        }];
+        let err = match WasmInstance::new_with_extern_imports_full(
+            &engine,
+            &module,
+            Vec::new(),
+            Vec::new(),
+            memories,
+        ) {
+            Ok(_) => panic!("instantiation should fail with memory max mismatch"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StatorError::WasmError(_)), "{err:?}");
+    }
+
+    /// `exported_memory_type` returns structural type information for
+    /// declared memory exports and `None` for missing or non-memory exports.
+    #[test]
+    fn test_wasm_module_exported_memory_type_reports_metadata() {
+        let wat = r#"
+            (module
+                (memory (export "m") 2 5 shared)
+                (func (export "f")))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let info = module
+            .exported_memory_type("m")
+            .expect("memory export must be reported");
+        assert_eq!(info.minimum, 2);
+        assert_eq!(info.maximum, Some(5));
+        assert!(!info.memory64);
+        assert!(info.shared);
+        assert_eq!(info.page_size_log2, 16);
+        assert_eq!(module.exported_memory_type("f"), None);
+        assert_eq!(module.exported_memory_type("missing"), None);
+    }
+
+    /// A shared memory exported by one Wasm instance can be observed
+    /// through `exported_shared_memory` and used as the import for a
+    /// second, independently-instantiated Wasm module. Writes by either
+    /// importer are visible to the dependency instance through the same
+    /// underlying memory.
+    #[test]
+    fn test_wasm_shared_memory_routes_across_two_instances() {
+        let dep_wat = r#"
+            (module (memory (export "mem") 1 1 shared))
+        "#;
+        let importer_wat = r#"
+            (module
+                (import "env" "mem" (memory 1 1 shared))
+                (func (export "store") (param i32 i32)
+                    (local.get 0) (local.get 1) (i32.store))
+                (func (export "load") (param i32) (result i32)
+                    (local.get 0) (i32.load)))
+        "#;
+        let engine = WasmEngine::new();
+        let dep_module = WasmModule::from_wat(&engine, dep_wat).unwrap();
+        let importer_module = WasmModule::from_wat(&engine, importer_wat).unwrap();
+
+        let mut dep_instance = WasmInstance::new(&engine, &dep_module).unwrap();
+        let dep_mem = dep_instance
+            .exported_shared_memory("mem")
+            .expect("dep must export shared memory");
+
+        let mut importer_instance = WasmInstance::new_with_extern_imports_full(
+            &engine,
+            &importer_module,
+            Vec::new(),
+            Vec::new(),
+            vec![HostMemory {
+                module: "env".to_string(),
+                name: "mem".to_string(),
+                memory: dep_mem,
+            }],
+        )
+        .unwrap();
+
+        importer_instance
+            .call("store", &[Val::I32(16), Val::I32(0xfeedface_u32 as i32)])
+            .unwrap();
+        let read_back = importer_instance.call("load", &[Val::I32(16)]).unwrap();
+        assert_eq!(read_back[0].unwrap_i32() as u32, 0xfeedface);
+
+        // The dep also sees the same memory: its exported handle observes
+        // the importer's write.
+        let dep_view = dep_instance.exported_shared_memory("mem").unwrap();
+        // SAFETY: bytes 16..20 were just written by the importer; we only
+        // read them here and never alias mutably.
+        let observed = unsafe {
+            let slice = dep_view.data();
+            let mut bytes = [0u8; 4];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = *slice[16 + i].get();
+            }
+            u32::from_le_bytes(bytes)
+        };
+        assert_eq!(observed, 0xfeedface);
     }
 
     // ── Value conversion ────────────────────────────────────────────────────
