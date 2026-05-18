@@ -302,7 +302,25 @@ impl JsProxy {
                 .get("__proto__")
                 .cloned()
                 .unwrap_or(JsValue::Null),
-            _ => JsValue::Null,
+            // No PlainObject/Error wrapper present: consult the underlying
+            // `JsObject` prototype directly so that proxies wrapping plain
+            // `JsObject`s with a prototype agree with
+            // `reflect_get_prototype_of_value` instead of returning `Null`.
+            // ECMAScript §10.5.1 default `[[GetPrototypeOf]]` falls through to
+            // the target's actual `[[Prototype]]`.
+            _ => match self.target.prototype() {
+                Some(proto) => {
+                    let borrowed = proto.borrow();
+                    let mut map = PropertyMap::new();
+                    for key in borrowed.own_property_keys() {
+                        if let Some(val) = borrowed.get_own_property(&key) {
+                            map.insert(key, val);
+                        }
+                    }
+                    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+                }
+                None => JsValue::Null,
+            },
         }
     }
 

@@ -299,7 +299,6 @@ fn test_roundtrip_get_prototype_of_null() {
 }
 
 #[test]
-#[ignore] // TODO: conformance — not yet passing
 fn test_roundtrip_get_prototype_of_with_prototype() {
     let proto = Rc::new(RefCell::new(JsObject::new()));
     proto
@@ -313,6 +312,29 @@ fn test_roundtrip_get_prototype_of_with_prototype() {
     // Both must return an object-like value (not Null).
     assert!(proxy_proto.is_object_like());
     assert!(reflect_proto.is_object_like());
+}
+
+#[test]
+fn test_default_get_prototype_of_reads_target_prototype_tag() {
+    // Regression for §10.5.1 default behaviour: proxy without a
+    // `getPrototypeOf` trap must surface the underlying target's
+    // `[[Prototype]]` rather than always returning `Null` when the target
+    // is a plain `JsObject` with a real prototype.
+    let proto = Rc::new(RefCell::new(JsObject::new()));
+    proto
+        .borrow_mut()
+        .set_property("kind", JsValue::String("proto".into()))
+        .unwrap();
+    let proxy = proxy_new(JsObject::with_prototype(proto), ProxyHandler::default());
+    match proxy_get_prototype_of(&proxy).unwrap() {
+        JsValue::PlainObject(map) => {
+            assert_eq!(
+                map.borrow().get("kind").cloned(),
+                Some(JsValue::String("proto".into()))
+            );
+        }
+        other => panic!("expected PlainObject prototype, got {other:?}"),
+    }
 }
 
 #[test]
