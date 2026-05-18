@@ -16519,6 +16519,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let items = a.borrow().clone();
                         let mut results = Vec::with_capacity(items.len());
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.20: HasProperty check skips holes,
+                            // but preserve them in the output array.
+                            if item.is_the_hole() {
+                                results.push(JsValue::TheHole);
+                                continue;
+                            }
                             let val = dispatch_call_value(
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
@@ -16536,6 +16542,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let items = a.borrow().clone();
                         let mut results = Vec::new();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.8: holes are skipped entirely.
+                            if item.is_the_hole() {
+                                continue;
+                            }
                             let val = dispatch_call_value(
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
@@ -16554,6 +16564,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.12: holes are skipped.
+                            if item.is_the_hole() {
+                                continue;
+                            }
                             dispatch_call_value(
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
@@ -16568,15 +16582,36 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
-                        let mut acc = args.get(1).cloned().unwrap_or_else(|| {
-                            items.first().cloned().unwrap_or(JsValue::Undefined)
-                        });
-                        let start = if args.get(1).is_some() { 0 } else { 1 };
-                        for (i, item) in items.iter().enumerate().skip(start) {
-                            acc = dispatch_call_value(
-                                &callback,
-                                vec![acc, item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
-                            )?;
+                        // §23.1.3.24: holes are skipped; if no initial value,
+                        // seed accumulator from the first non-hole element.
+                        let (mut acc, mut start) = if args.len() > 1 {
+                            (args[1].clone(), 0usize)
+                        } else {
+                            let mut idx = 0usize;
+                            while idx < items.len() && items[idx].is_the_hole() {
+                                idx += 1;
+                            }
+                            if idx >= items.len() {
+                                return Err(StatorError::TypeError(
+                                    "Reduce of empty array with no initial value".into(),
+                                ));
+                            }
+                            (items[idx].clone(), idx + 1)
+                        };
+                        while start < items.len() {
+                            let item = &items[start];
+                            if !item.is_the_hole() {
+                                acc = dispatch_call_value(
+                                    &callback,
+                                    vec![
+                                        acc,
+                                        item.clone(),
+                                        JsValue::Smi(start as i32),
+                                        arr_val.clone(),
+                                    ],
+                                )?;
+                            }
+                            start += 1;
                         }
                         Ok(acc)
                     }));
@@ -16587,29 +16622,45 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
                         let items = a.borrow().clone();
                         let arr_val = JsValue::Array(Rc::clone(&a));
-                        if items.is_empty() && args.len() < 2 {
-                            return Err(StatorError::TypeError(
-                                "Reduce of empty array with no initial value".into(),
-                            ));
-                        }
-                        let (mut acc, start_idx) = if args.len() > 1 {
-                            (args[1].clone(), items.len())
+                        // §23.1.3.25: holes are skipped; if no initial value,
+                        // seed accumulator from the last non-hole element.
+                        let (mut acc, mut next_idx_opt) = if args.len() > 1 {
+                            let next = if items.is_empty() {
+                                None
+                            } else {
+                                Some(items.len() - 1)
+                            };
+                            (args[1].clone(), next)
                         } else {
-                            (
-                                items.last().cloned().unwrap_or(JsValue::Undefined),
-                                items.len().saturating_sub(1),
-                            )
+                            let mut idx = items.len();
+                            loop {
+                                if idx == 0 {
+                                    return Err(StatorError::TypeError(
+                                        "Reduce of empty array with no initial value".into(),
+                                    ));
+                                }
+                                idx -= 1;
+                                if !items[idx].is_the_hole() {
+                                    break;
+                                }
+                            }
+                            let next = if idx == 0 { None } else { Some(idx - 1) };
+                            (items[idx].clone(), next)
                         };
-                        for i in (0..start_idx).rev() {
-                            acc = dispatch_call_value(
-                                &callback,
-                                vec![
-                                    acc,
-                                    items[i].clone(),
-                                    JsValue::Smi(i as i32),
-                                    arr_val.clone(),
-                                ],
-                            )?;
+                        while let Some(i) = next_idx_opt {
+                            let item = &items[i];
+                            if !item.is_the_hole() {
+                                acc = dispatch_call_value(
+                                    &callback,
+                                    vec![
+                                        acc,
+                                        item.clone(),
+                                        JsValue::Smi(i as i32),
+                                        arr_val.clone(),
+                                    ],
+                                )?;
+                            }
+                            next_idx_opt = if i == 0 { None } else { Some(i - 1) };
                         }
                         Ok(acc)
                     }));
@@ -16621,12 +16672,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.10: find visits holes as undefined.
+                            let v = if item.is_the_hole() {
+                                JsValue::Undefined
+                            } else {
+                                item.clone()
+                            };
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                                vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
-                                return Ok(item.clone());
+                                return Ok(v);
                             }
                         }
                         Ok(JsValue::Undefined)
@@ -16639,9 +16696,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.11: findIndex visits holes as undefined.
+                            let v = if item.is_the_hole() {
+                                JsValue::Undefined
+                            } else {
+                                item.clone()
+                            };
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                                vec![v, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
                                 return Ok(JsValue::Smi(i as i32));
@@ -16657,6 +16720,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.6: holes are skipped.
+                            if item.is_the_hole() {
+                                continue;
+                            }
                             let val = dispatch_call_value(
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
@@ -16675,6 +16742,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
+                            // §23.1.3.27: holes are skipped.
+                            if item.is_the_hole() {
+                                continue;
+                            }
                             let val = dispatch_call_value(
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],

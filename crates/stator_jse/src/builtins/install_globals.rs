@@ -50753,7 +50753,6 @@ mod tests {
     // ── Sparse array holes conformance ───────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_map_preserves_hole() {
         assert_eval_true(
             "var r = [1, , 3].map(function(x) { return x * 2; }); r.length === 3 && r[0] === 2 && r[2] === 6 && !Object.hasOwn(r, '1')",
@@ -50761,7 +50760,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_map_skips_hole_callback() {
         assert_eval_true(
             "var seen = []; [1, , 3].map(function(x, i) { seen.push(i + ':' + x); return x * 2; }); seen.join('|') === '0:1|2:3'",
@@ -50769,7 +50767,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_map_passes_original_array() {
         assert_eval_true(
             "var arr = [1, , 3]; var ok = true; arr.map(function(_x, i, a) { ok = ok && a === arr && (i === 0 || i === 2); return i; }); ok",
@@ -50777,7 +50774,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_filter_skips_hole_and_compacts() {
         assert_eval_true(
             "var r = [1, , 3].filter(function() { return true; }); r.length === 2 && r[0] === 1 && r[1] === 3",
@@ -50785,7 +50781,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_filter_skips_hole_callback() {
         assert_eval_true(
             "var seen = []; [1, , 3].filter(function(x, i) { seen.push(i + ':' + x); return true; }); seen.join('|') === '0:1|2:3'",
@@ -50793,7 +50788,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_for_each_skips_hole() {
         assert_eval_true(
             "var seen = []; [1, , 3].forEach(function(x, i) { seen.push(i + ':' + x); }); seen.join('|') === '0:1|2:3'",
@@ -50801,7 +50795,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_for_each_passes_original_array() {
         assert_eval_true(
             "var arr = [1, , 3]; var ok = true; arr.forEach(function(_x, _i, a) { ok = ok && a === arr; }); ok",
@@ -50809,7 +50802,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_every_skips_hole() {
         assert_eval_true(
             "var seen = []; var ok = [1, , 3].every(function(x, i) { seen.push(i + ':' + x); return x > 0; }); ok && seen.join('|') === '0:1|2:3'",
@@ -50817,7 +50809,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_every_all_holes_never_calls_callback() {
         assert_eval_true(
             "var count = 0; Array(3).every(function() { count++; return false; }) && count === 0",
@@ -50825,7 +50816,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_some_skips_hole() {
         assert_eval_true(
             "var seen = []; var ok = [1, , 3].some(function(x, i) { seen.push(i + ':' + x); return x === 3; }); ok && seen.join('|') === '0:1|2:3'",
@@ -50833,7 +50823,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_some_all_holes_never_calls_callback() {
         assert_eval_true(
             "var count = 0; !Array(2).some(function() { count++; return true; }) && count === 0",
@@ -50841,19 +50830,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_reduce_skips_hole_with_initial() {
         assert_eval_true("[1, , 3].reduce(function(acc, x) { return acc + x; }, 0) === 4");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_reduce_skips_leading_hole_without_initial() {
         assert_eval_true("[, 2, 3].reduce(function(acc, x) { return acc + x; }) === 5");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_reduce_all_holes_without_initial_throws() {
         assert_eval_true(
             "try { Array(3).reduce(function(acc, x) { return acc + x; }); false; } catch (e) { e instanceof TypeError; }",
@@ -50871,7 +50857,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_sparse_array_includes_undefined_ignores_hole() {
         assert_eval_true("[1, , 3].includes(undefined) === false");
     }
