@@ -16269,6 +16269,145 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── Web Components / Shadow DOM / DOM collections (fail-closed) ────
+        //
+        // Edge page scripts routinely feature-detect Web Components
+        // (`CustomElementRegistry`, `ElementInternals`, `ShadowRoot`,
+        // `HTMLSlotElement`, `HTMLTemplateElement`, `HTMLUnknownElement`),
+        // DOM tree types (`DocumentFragment`, `DocumentType`, `Attr`), and
+        // DOM collection / token-set types (`DOMTokenList`, `NamedNodeMap`,
+        // `HTMLCollection`, `NodeList`, `DOMStringMap`).
+        //
+        // Real behavior for these requires a live DOM tree, custom-element
+        // definition/upgrade lifecycle, shadow-root attachment and slotting,
+        // attribute/token identity tied to a host element, and document
+        // ownership — none of which exist in the standalone engine. Exposing
+        // success-shaped stubs would invite product code to silently rely on
+        // a fake registry, fake shadow tree, fake collections, or fake
+        // token/attribute identity, so every constructor is exposed (because
+        // probes like `typeof ShadowRoot === 'function'` are common) but
+        // both calling and `new` throw a clear `TypeError` and every
+        // prototype method also throws. The host (e.g. Blink in Edge)
+        // installs the real bindings in page contexts and the engine does
+        // not shadow them.
+        //
+        // The `customElements` global is intentionally left absent. A stub
+        // registry would either fake `define`/`get`/`whenDefined`/`upgrade`
+        // semantics or shadow a real Blink registry; both are worse than
+        // `customElements` being undefined. Until a host wires a real
+        // registry into the engine, absence is asserted by
+        // `e2e_custom_elements_global_remains_absent`.
+        for (name, methods, constants) in [
+            (
+                "CustomElementRegistry",
+                &[
+                    ("define", 3),
+                    ("get", 1),
+                    ("getName", 1),
+                    ("whenDefined", 1),
+                    ("upgrade", 1),
+                ][..],
+                &[][..],
+            ),
+            (
+                "ElementInternals",
+                &[
+                    ("setFormValue", 2),
+                    ("setValidity", 3),
+                    ("checkValidity", 0),
+                    ("reportValidity", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "ShadowRoot",
+                &[
+                    ("getElementById", 1),
+                    ("getSelection", 0),
+                    ("elementFromPoint", 2),
+                    ("elementsFromPoint", 2),
+                ][..],
+                &[][..],
+            ),
+            (
+                "DocumentFragment",
+                &[
+                    ("getElementById", 1),
+                    ("querySelector", 1),
+                    ("querySelectorAll", 1),
+                    ("append", 1),
+                    ("prepend", 1),
+                    ("replaceChildren", 1),
+                ][..],
+                &[][..],
+            ),
+            ("DocumentType", &[("remove", 0)][..], &[][..]),
+            (
+                "DOMTokenList",
+                &[
+                    ("item", 1),
+                    ("contains", 1),
+                    ("add", 1),
+                    ("remove", 1),
+                    ("toggle", 1),
+                    ("replace", 2),
+                    ("supports", 1),
+                    ("toString", 0),
+                    ("forEach", 1),
+                    ("entries", 0),
+                    ("keys", 0),
+                    ("values", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "NamedNodeMap",
+                &[
+                    ("item", 1),
+                    ("getNamedItem", 1),
+                    ("getNamedItemNS", 2),
+                    ("setNamedItem", 1),
+                    ("setNamedItemNS", 1),
+                    ("removeNamedItem", 1),
+                    ("removeNamedItemNS", 2),
+                ][..],
+                &[][..],
+            ),
+            ("Attr", &[][..], &[][..]),
+            (
+                "HTMLCollection",
+                &[("item", 1), ("namedItem", 1)][..],
+                &[][..],
+            ),
+            (
+                "NodeList",
+                &[
+                    ("item", 1),
+                    ("forEach", 1),
+                    ("entries", 0),
+                    ("keys", 0),
+                    ("values", 0),
+                ][..],
+                &[][..],
+            ),
+            ("DOMStringMap", &[][..], &[][..]),
+            (
+                "HTMLSlotElement",
+                &[("assignedNodes", 1), ("assignedElements", 1), ("assign", 1)][..],
+                &[][..],
+            ),
+            ("HTMLTemplateElement", &[][..], &[][..]),
+            ("HTMLUnknownElement", &[][..], &[][..]),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, constants),
+                    name,
+                ),
+            );
+        }
+
         // ── Fetch / network and body APIs (fail-closed) ─────────────────────
         //
         // Fetch, XHR, streams, and request/response body wrappers require host
@@ -17539,6 +17678,21 @@ mod tests {
         assert!(globals.contains_key("XPathResult"));
         assert!(globals.contains_key("XSLTProcessor"));
         assert!(globals.contains_key("URLPattern"));
+        assert!(globals.contains_key("CustomElementRegistry"));
+        assert!(globals.contains_key("ElementInternals"));
+        assert!(globals.contains_key("ShadowRoot"));
+        assert!(globals.contains_key("DocumentFragment"));
+        assert!(globals.contains_key("DocumentType"));
+        assert!(globals.contains_key("DOMTokenList"));
+        assert!(globals.contains_key("NamedNodeMap"));
+        assert!(globals.contains_key("Attr"));
+        assert!(globals.contains_key("HTMLCollection"));
+        assert!(globals.contains_key("NodeList"));
+        assert!(globals.contains_key("DOMStringMap"));
+        assert!(globals.contains_key("HTMLSlotElement"));
+        assert!(globals.contains_key("HTMLTemplateElement"));
+        assert!(globals.contains_key("HTMLUnknownElement"));
+        assert!(!globals.contains_key("customElements"));
         assert!(globals.contains_key("fetch"));
         assert!(globals.contains_key("Request"));
         assert!(globals.contains_key("Response"));
@@ -17886,6 +18040,119 @@ mod tests {
         assert_eval_type_error("new URLPattern({ pathname: '/:id' })");
         assert_eval_type_error("URLPattern.prototype.test.call({}, 'https://example.test/1')");
         assert_eval_type_error("URLPattern.prototype.exec.call({}, 'https://example.test/1')");
+    }
+
+    #[test]
+    fn e2e_web_component_constructors_exist_but_fail_closed() {
+        for name in [
+            "CustomElementRegistry",
+            "ElementInternals",
+            "ShadowRoot",
+            "DocumentFragment",
+            "DocumentType",
+            "DOMTokenList",
+            "NamedNodeMap",
+            "Attr",
+            "HTMLCollection",
+            "NodeList",
+            "DOMStringMap",
+            "HTMLSlotElement",
+            "HTMLTemplateElement",
+            "HTMLUnknownElement",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_true(&format!("typeof {name}.prototype === 'object'"));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        // CustomElementRegistry: registry-shaped methods must all reject.
+        assert_eval_true("typeof CustomElementRegistry.prototype.define === 'function'");
+        assert_eval_true("typeof CustomElementRegistry.prototype.get === 'function'");
+        assert_eval_true("typeof CustomElementRegistry.prototype.getName === 'function'");
+        assert_eval_true("typeof CustomElementRegistry.prototype.whenDefined === 'function'");
+        assert_eval_true("typeof CustomElementRegistry.prototype.upgrade === 'function'");
+        assert_eval_type_error(
+            "CustomElementRegistry.prototype.define.call({}, 'x-el', function () {})",
+        );
+        assert_eval_type_error("CustomElementRegistry.prototype.get.call({}, 'x-el')");
+        assert_eval_type_error("CustomElementRegistry.prototype.getName.call({}, function () {})");
+        assert_eval_type_error("CustomElementRegistry.prototype.whenDefined.call({}, 'x-el')");
+        assert_eval_type_error("CustomElementRegistry.prototype.upgrade.call({}, {})");
+
+        // ElementInternals: form-association lifecycle is host-owned.
+        assert_eval_true("typeof ElementInternals.prototype.setFormValue === 'function'");
+        assert_eval_true("typeof ElementInternals.prototype.setValidity === 'function'");
+        assert_eval_true("typeof ElementInternals.prototype.checkValidity === 'function'");
+        assert_eval_true("typeof ElementInternals.prototype.reportValidity === 'function'");
+        assert_eval_type_error("ElementInternals.prototype.setFormValue.call({}, 'v')");
+        assert_eval_type_error("ElementInternals.prototype.checkValidity.call({})");
+
+        // ShadowRoot and DocumentFragment expose tree-query/manipulation
+        // methods that require real DOM ownership; they must all reject.
+        assert_eval_true("typeof ShadowRoot.prototype.getElementById === 'function'");
+        assert_eval_true("typeof ShadowRoot.prototype.elementFromPoint === 'function'");
+        assert_eval_type_error("ShadowRoot.prototype.getElementById.call({}, 'id')");
+        assert_eval_type_error("ShadowRoot.prototype.elementFromPoint.call({}, 0, 0)");
+        assert_eval_true("typeof DocumentFragment.prototype.querySelector === 'function'");
+        assert_eval_true("typeof DocumentFragment.prototype.append === 'function'");
+        assert_eval_type_error("DocumentFragment.prototype.querySelector.call({}, 'div')");
+        assert_eval_type_error("DocumentFragment.prototype.append.call({}, 'x')");
+
+        // DOMTokenList: classList-like identity must not be fakeable.
+        assert_eval_true("typeof DOMTokenList.prototype.add === 'function'");
+        assert_eval_true("typeof DOMTokenList.prototype.toggle === 'function'");
+        assert_eval_true("typeof DOMTokenList.prototype.contains === 'function'");
+        assert_eval_true("typeof DOMTokenList.prototype.replace === 'function'");
+        assert_eval_type_error("DOMTokenList.prototype.add.call({}, 'a')");
+        assert_eval_type_error("DOMTokenList.prototype.toggle.call({}, 'a')");
+        assert_eval_type_error("DOMTokenList.prototype.contains.call({}, 'a')");
+
+        // NamedNodeMap / Attr: attribute identity is element-bound.
+        assert_eval_true("typeof NamedNodeMap.prototype.getNamedItem === 'function'");
+        assert_eval_true("typeof NamedNodeMap.prototype.setNamedItem === 'function'");
+        assert_eval_type_error("NamedNodeMap.prototype.getNamedItem.call({}, 'id')");
+        assert_eval_type_error("NamedNodeMap.prototype.setNamedItem.call({}, {})");
+
+        // HTMLCollection / NodeList: live collection identity is DOM-bound.
+        assert_eval_true("typeof HTMLCollection.prototype.item === 'function'");
+        assert_eval_true("typeof HTMLCollection.prototype.namedItem === 'function'");
+        assert_eval_true("typeof NodeList.prototype.item === 'function'");
+        assert_eval_true("typeof NodeList.prototype.forEach === 'function'");
+        assert_eval_type_error("HTMLCollection.prototype.item.call({}, 0)");
+        assert_eval_type_error("HTMLCollection.prototype.namedItem.call({}, 'x')");
+        assert_eval_type_error("NodeList.prototype.item.call({}, 0)");
+        assert_eval_type_error("NodeList.prototype.forEach.call({}, function () {})");
+
+        // HTMLSlotElement: slotting requires shadow-root attachment.
+        assert_eval_true("typeof HTMLSlotElement.prototype.assignedNodes === 'function'");
+        assert_eval_true("typeof HTMLSlotElement.prototype.assignedElements === 'function'");
+        assert_eval_true("typeof HTMLSlotElement.prototype.assign === 'function'");
+        assert_eval_type_error("HTMLSlotElement.prototype.assignedNodes.call({})");
+        assert_eval_type_error("HTMLSlotElement.prototype.assignedElements.call({})");
+        assert_eval_type_error("HTMLSlotElement.prototype.assign.call({})");
+    }
+
+    /// `customElements` (the registry instance) is intentionally absent.
+    /// Exposing a stub would invite product code to call
+    /// `customElements.define(...)`, `customElements.get(...)`,
+    /// `customElements.whenDefined(...)` and silently rely on a fake
+    /// registry that never actually upgrades elements; that is worse than
+    /// the global being undefined. The `CustomElementRegistry` constructor
+    /// itself is exposed (fail-closed) so feature probes like
+    /// `typeof CustomElementRegistry === 'function'` succeed without
+    /// fabricating a registry instance.
+    #[test]
+    fn e2e_custom_elements_global_remains_absent() {
+        assert_eval_true("typeof customElements === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof Node === 'undefined'");
+        assert_eval_true("typeof Document === 'undefined'");
+        assert_eval_true("typeof Element === 'undefined'");
+        assert_eval_true("typeof HTMLElement === 'undefined'");
     }
 
     #[test]
