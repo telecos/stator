@@ -16990,6 +16990,51 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Media / canvas / imaging (fail-closed) ──────────────────────────
+        //
+        // Media element constructors (`Image`, `Audio`), the Media Capture and
+        // Streams API (`MediaStream`, `MediaStreamTrack`), Media Source
+        // Extensions (`MediaSource`, `SourceBuffer`), the MediaStream Recording
+        // API (`MediaRecorder`), and the off-screen Canvas / imaging surface
+        // (`OffscreenCanvas`, `CanvasRenderingContext2D`,
+        // `OffscreenCanvasRenderingContext2D`, `ImageBitmap`, `ImageData`,
+        // `Path2D`, `createImageBitmap`) all require host integration with a
+        // graphics pipeline, audio/video decoder, capture device, or DOM
+        // element. The standalone engine has none of that, so product code
+        // that probes these globals sees a real constructor / function (so
+        // `typeof === 'function'` succeeds) but every construction or
+        // invocation fails closed with a `TypeError` rather than returning a
+        // fake media/canvas object that would silently misbehave.
+        for name in [
+            "Image",
+            "Audio",
+            "HTMLImageElement",
+            "HTMLAudioElement",
+            "HTMLMediaElement",
+            "HTMLVideoElement",
+            "HTMLCanvasElement",
+            "MediaSource",
+            "SourceBuffer",
+            "MediaStream",
+            "MediaStreamTrack",
+            "MediaRecorder",
+            "OffscreenCanvas",
+            "CanvasRenderingContext2D",
+            "OffscreenCanvasRenderingContext2D",
+            "ImageBitmap",
+            "ImageData",
+            "Path2D",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+        globals.insert(
+            "createImageBitmap".into(),
+            make_unsupported_web_function("createImageBitmap", 1),
+        );
+
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
 
@@ -17691,6 +17736,64 @@ mod tests {
         assert_eval_true("typeof AbortSignal === 'function' && AbortSignal.name === 'AbortSignal'");
         assert_eval_type_error("AbortSignal()");
         assert_eval_type_error("new AbortSignal()");
+    }
+
+    #[test]
+    fn e2e_media_canvas_imaging_constructors_exist_but_fail_closed() {
+        for name in [
+            "Image",
+            "Audio",
+            "HTMLImageElement",
+            "HTMLAudioElement",
+            "HTMLMediaElement",
+            "HTMLVideoElement",
+            "HTMLCanvasElement",
+            "MediaSource",
+            "SourceBuffer",
+            "MediaStream",
+            "MediaStreamTrack",
+            "MediaRecorder",
+            "OffscreenCanvas",
+            "CanvasRenderingContext2D",
+            "OffscreenCanvasRenderingContext2D",
+            "ImageBitmap",
+            "ImageData",
+            "Path2D",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new Image()");
+        assert_eval_type_error("new Image(16, 16)");
+        assert_eval_type_error("new Audio()");
+        assert_eval_type_error("new Audio('song.mp3')");
+        assert_eval_type_error("new MediaSource()");
+        assert_eval_type_error("new MediaStream()");
+        assert_eval_type_error("new MediaRecorder({})");
+        assert_eval_type_error("new OffscreenCanvas(64, 64)");
+        assert_eval_type_error("new ImageData(8, 8)");
+        assert_eval_type_error("new Path2D()");
+    }
+
+    #[test]
+    fn e2e_create_image_bitmap_exists_but_fails_closed() {
+        assert_eval_true(
+            "typeof createImageBitmap === 'function' && createImageBitmap.name === 'createImageBitmap'",
+        );
+        assert_eval_type_error("createImageBitmap({})");
+    }
+
+    /// `navigator.mediaDevices` and friends remain absent because `navigator`
+    /// itself is intentionally not preinstalled by the standalone engine
+    /// (see `e2e_browser_self_reference_globals_are_absent`). Document that
+    /// here so a future addition of `navigator` does not accidentally expose
+    /// a fake `mediaDevices` object alongside it.
+    #[test]
+    fn e2e_navigator_media_devices_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
     }
 
     #[test]
