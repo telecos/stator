@@ -17073,6 +17073,86 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── Platform service APIs (fail-closed) ─────────────────────────────
+        //
+        // Payment Request, Credential Management / WebAuthn, File System
+        // Access, Web Locks, Navigation API, Wake Lock, Idle Detection,
+        // Contacts, EyeDropper, and Launch Handler all require user activation,
+        // secure contexts, permission prompts, OS services, authenticators,
+        // file pickers, lock scheduling, navigation-controller state, or host
+        // lifetime integration. Expose only the global constructors/functions
+        // that Chromium page scripts commonly probe, and reject every operation
+        // rather than fabricating a payment, credential, file handle, lock,
+        // navigation entry, wake-lock sentinel, idle signal, contact selection,
+        // sampled color, or launch payload. Navigator-only entry points such as
+        // `navigator.credentials`, `navigator.locks`, `navigator.share`,
+        // `navigator.contacts`, and `navigator.wakeLock` remain absent because
+        // the standalone engine does not preinstall `navigator`.
+        for name in [
+            "PaymentRequest",
+            "PaymentResponse",
+            "PaymentMethodChangeEvent",
+            "PaymentRequestUpdateEvent",
+            "Credential",
+            "CredentialsContainer",
+            "PasswordCredential",
+            "FederatedCredential",
+            "PublicKeyCredential",
+            "AuthenticatorResponse",
+            "AuthenticatorAttestationResponse",
+            "AuthenticatorAssertionResponse",
+            "FileSystemHandle",
+            "FileSystemFileHandle",
+            "FileSystemDirectoryHandle",
+            "FileSystemWritableFileStream",
+            "FileSystemSyncAccessHandle",
+            "Lock",
+            "LockManager",
+            "Navigation",
+            "NavigationHistoryEntry",
+            "NavigationTransition",
+            "NavigateEvent",
+            "NavigationCurrentEntryChangeEvent",
+            "WakeLock",
+            "WakeLockSentinel",
+            "IdleDetector",
+            "ContactsManager",
+            "EyeDropper",
+            "LaunchQueue",
+            "LaunchParams",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+        for name in [
+            "showOpenFilePicker",
+            "showSaveFilePicker",
+            "showDirectoryPicker",
+        ] {
+            globals.insert(name.into(), make_unsupported_web_function(name, 0));
+        }
+        globals.insert(
+            "navigation".into(),
+            make_unsupported_web_object(
+                "navigation",
+                &[
+                    ("entries", 0),
+                    ("navigate", 1),
+                    ("reload", 0),
+                    ("traverseTo", 1),
+                    ("back", 0),
+                    ("forward", 0),
+                    ("updateCurrentEntry", 1),
+                ],
+            ),
+        );
+        globals.insert(
+            "launchQueue".into(),
+            make_unsupported_web_object("launchQueue", &[("setConsumer", 1)]),
+        );
+
         // ── Media / canvas / imaging (fail-closed) ──────────────────────────
         //
         // Media element constructors (`Image`, `Audio`), the Media Capture and
@@ -17634,6 +17714,42 @@ mod tests {
         assert!(globals.contains_key("PresentationRequest"));
         assert!(globals.contains_key("PresentationConnection"));
         assert!(globals.contains_key("PresentationAvailability"));
+        assert!(globals.contains_key("PaymentRequest"));
+        assert!(globals.contains_key("PaymentResponse"));
+        assert!(globals.contains_key("PaymentMethodChangeEvent"));
+        assert!(globals.contains_key("PaymentRequestUpdateEvent"));
+        assert!(globals.contains_key("Credential"));
+        assert!(globals.contains_key("CredentialsContainer"));
+        assert!(globals.contains_key("PasswordCredential"));
+        assert!(globals.contains_key("FederatedCredential"));
+        assert!(globals.contains_key("PublicKeyCredential"));
+        assert!(globals.contains_key("AuthenticatorResponse"));
+        assert!(globals.contains_key("AuthenticatorAttestationResponse"));
+        assert!(globals.contains_key("AuthenticatorAssertionResponse"));
+        assert!(globals.contains_key("FileSystemHandle"));
+        assert!(globals.contains_key("FileSystemFileHandle"));
+        assert!(globals.contains_key("FileSystemDirectoryHandle"));
+        assert!(globals.contains_key("FileSystemWritableFileStream"));
+        assert!(globals.contains_key("FileSystemSyncAccessHandle"));
+        assert!(globals.contains_key("showOpenFilePicker"));
+        assert!(globals.contains_key("showSaveFilePicker"));
+        assert!(globals.contains_key("showDirectoryPicker"));
+        assert!(globals.contains_key("Lock"));
+        assert!(globals.contains_key("LockManager"));
+        assert!(globals.contains_key("Navigation"));
+        assert!(globals.contains_key("NavigationHistoryEntry"));
+        assert!(globals.contains_key("NavigationTransition"));
+        assert!(globals.contains_key("NavigateEvent"));
+        assert!(globals.contains_key("NavigationCurrentEntryChangeEvent"));
+        assert!(globals.contains_key("navigation"));
+        assert!(globals.contains_key("WakeLock"));
+        assert!(globals.contains_key("WakeLockSentinel"));
+        assert!(globals.contains_key("IdleDetector"));
+        assert!(globals.contains_key("ContactsManager"));
+        assert!(globals.contains_key("EyeDropper"));
+        assert!(globals.contains_key("LaunchQueue"));
+        assert!(globals.contains_key("LaunchParams"));
+        assert!(globals.contains_key("launchQueue"));
         assert!(globals.contains_key("Location"));
         assert!(globals.contains_key("History"));
         assert!(globals.contains_key("location"));
@@ -17986,6 +18102,115 @@ mod tests {
     /// host/Blink binding and create fake registration success paths.
     #[test]
     fn e2e_navigator_service_worker_remains_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_platform_service_constructors_exist_but_fail_closed() {
+        for name in [
+            "PaymentRequest",
+            "PaymentResponse",
+            "PaymentMethodChangeEvent",
+            "PaymentRequestUpdateEvent",
+            "Credential",
+            "CredentialsContainer",
+            "PasswordCredential",
+            "FederatedCredential",
+            "PublicKeyCredential",
+            "AuthenticatorResponse",
+            "AuthenticatorAttestationResponse",
+            "AuthenticatorAssertionResponse",
+            "FileSystemHandle",
+            "FileSystemFileHandle",
+            "FileSystemDirectoryHandle",
+            "FileSystemWritableFileStream",
+            "FileSystemSyncAccessHandle",
+            "Lock",
+            "LockManager",
+            "Navigation",
+            "NavigationHistoryEntry",
+            "NavigationTransition",
+            "NavigateEvent",
+            "NavigationCurrentEntryChangeEvent",
+            "WakeLock",
+            "WakeLockSentinel",
+            "IdleDetector",
+            "ContactsManager",
+            "EyeDropper",
+            "LaunchQueue",
+            "LaunchParams",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error(
+            "new PaymentRequest([{ supportedMethods: 'basic-card' }], { total: { label: 'T', amount: { currency: 'USD', value: '1.00' } } })",
+        );
+        assert_eval_type_error("new PaymentResponse()");
+        assert_eval_type_error("new PaymentMethodChangeEvent('paymentmethodchange')");
+        assert_eval_type_error("new PaymentRequestUpdateEvent('shippingaddresschange')");
+        assert_eval_type_error("new PasswordCredential({ id: 'u', password: 'p' })");
+        assert_eval_type_error(
+            "new FederatedCredential({ id: 'u', provider: 'https://example.test' })",
+        );
+        assert_eval_type_error("new PublicKeyCredential()");
+        assert_eval_type_error("new AuthenticatorResponse()");
+        assert_eval_type_error("new AuthenticatorAttestationResponse()");
+        assert_eval_type_error("new AuthenticatorAssertionResponse()");
+        assert_eval_type_error("new FileSystemFileHandle()");
+        assert_eval_type_error("new FileSystemDirectoryHandle()");
+        assert_eval_type_error("new FileSystemWritableFileStream()");
+        assert_eval_type_error("new FileSystemSyncAccessHandle()");
+        assert_eval_type_error("new Lock()");
+        assert_eval_type_error("new LockManager()");
+        assert_eval_type_error("new Navigation()");
+        assert_eval_type_error("new NavigateEvent('navigate')");
+        assert_eval_type_error("new NavigationCurrentEntryChangeEvent('currententrychange')");
+        assert_eval_type_error("new WakeLockSentinel()");
+        assert_eval_type_error("new IdleDetector()");
+        assert_eval_type_error("new ContactsManager()");
+        assert_eval_type_error("new EyeDropper()");
+        assert_eval_type_error("new LaunchQueue()");
+        assert_eval_type_error("new LaunchParams()");
+    }
+
+    #[test]
+    fn e2e_platform_service_global_functions_and_objects_fail_closed() {
+        for name in [
+            "showOpenFilePicker",
+            "showSaveFilePicker",
+            "showDirectoryPicker",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+        }
+
+        assert_eval_type_error("showOpenFilePicker()");
+        assert_eval_type_error("showSaveFilePicker()");
+        assert_eval_type_error("showDirectoryPicker()");
+
+        assert_eval_true("typeof navigation === 'object' && navigation !== null");
+        assert_eval_type_error("navigation.entries()");
+        assert_eval_type_error("navigation.navigate('/next')");
+        assert_eval_type_error("navigation.reload()");
+        assert_eval_type_error("navigation.traverseTo('key')");
+        assert_eval_type_error("navigation.back()");
+        assert_eval_type_error("navigation.forward()");
+        assert_eval_type_error("navigation.updateCurrentEntry({ state: {} })");
+
+        assert_eval_true("typeof launchQueue === 'object' && launchQueue !== null");
+        assert_eval_type_error("launchQueue.setConsumer(function () {})");
+    }
+
+    /// `navigator` itself is intentionally not preinstalled, so platform
+    /// service APIs whose standard entry points are navigator-only remain
+    /// absent rather than being exposed through fake `navigator.*` objects.
+    #[test]
+    fn e2e_navigator_only_platform_services_remain_absent() {
         assert_eval_true("typeof navigator === 'undefined'");
     }
 
