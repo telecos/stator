@@ -13769,9 +13769,43 @@ fn resolve_arraybuffer_receiver(
     Err(incompatible_receiver(display_name))
 }
 
+/// ECMAScript §7.1.13 **ToBigInt**.
+///
+/// Performs the abstract operation used by `DataView.prototype.setBigInt64` and
+/// `setBigUint64` to coerce a value to a BigInt before storing it.  Booleans
+/// coerce to `0n`/`1n` and strings are parsed using the same grammar as
+/// `BigInt(string)`; numbers, `undefined`, `null`, and symbols throw
+/// `TypeError`.
 fn dataview_bigint_argument(value: &JsValue) -> StatorResult<i128> {
-    match value.to_numeric()? {
+    let prim = value.to_primitive(ToPrimitiveHint::Number)?;
+    match prim {
         JsValue::BigInt(n) => Ok(*n),
+        JsValue::Boolean(b) => Ok(if b { 1 } else { 0 }),
+        JsValue::String(ref s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(0);
+            }
+            let parsed = if let Some(hex) = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                i128::from_str_radix(hex, 16)
+            } else if let Some(oct) = trimmed
+                .strip_prefix("0o")
+                .or_else(|| trimmed.strip_prefix("0O"))
+            {
+                i128::from_str_radix(oct, 8)
+            } else if let Some(bin) = trimmed
+                .strip_prefix("0b")
+                .or_else(|| trimmed.strip_prefix("0B"))
+            {
+                i128::from_str_radix(bin, 2)
+            } else {
+                trimmed.parse::<i128>()
+            };
+            parsed.map_err(|_| StatorError::SyntaxError(format!("Cannot convert {s} to a BigInt")))
+        }
         _ => Err(StatorError::TypeError(
             "Cannot convert a non-BigInt value to a BigInt".to_string(),
         )),
@@ -41633,6 +41667,127 @@ mod tests {
     fn e2e_dataview_biguint_setters_reject_number_values() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(8)).setBigUint64(0, 1); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_accepts_boolean_value() {
+        // ToBigInt(true) === 1n, ToBigInt(false) === 0n.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, true); v.getBigInt64(0) === 1n && (v.setBigInt64(0, false), v.getBigInt64(0) === 0n)",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_biguint_setter_accepts_string_value() {
+        // ToBigInt("42") parses the decimal literal per StringToBigInt.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigUint64(0, '42'); v.getBigUint64(0) === 42n",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_accepts_hex_string_value() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, '0xff'); v.getBigInt64(0) === 255n",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_empty_string_writes_zero() {
+        // StringToBigInt("") returns 0n per the spec.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, 1n); v.setBigInt64(0, ''); v.getBigInt64(0) === 0n",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_invalid_string_throws_syntax_error() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8)).setBigInt64(0, 'abc'); false; } catch (e) { e instanceof SyntaxError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_rejects_undefined_value() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8)).setBigInt64(0, undefined); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setter_rejects_symbol_value() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8)).setBigInt64(0, Symbol()); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_undefined_offset_equals_zero() {
+        // ToIndex(undefined) === 0.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint8(0, 0xab); v.getUint8(undefined) === 0xab",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_truncates_fractional_offset_toward_zero() {
+        // ToIntegerOrInfinity(1.9) === 1 (truncate toward zero).
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint8(1, 0xcd); v.getUint8(1.9) === 0xcd",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_accepts_negative_fractional_offset() {
+        // ToIntegerOrInfinity(-0.5) === 0, so the read should succeed at index 0.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint8(0, 0x77); v.getUint8(-0.5) === 0x77",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_rejects_infinite_offset() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(4)).getUint8(Infinity); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_rejects_symbol_offset() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(4)).getUint8(Symbol()); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_setter_converts_offset_before_value() {
+        // Spec order: ToIndex(byteOffset) must run before ToNumber/ToBigInt(value),
+        // so a bad offset should surface its error first.
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(4)).setUint8(Symbol(), Symbol()); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_little_endian_truthy_value_treated_as_true() {
+        // The isLittleEndian flag is converted via ToBoolean; the string "false" is truthy.
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint16(0, 0x1234, 'false'); v.getUint8(0) === 0x34 && v.getUint8(1) === 0x12",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getter_call_with_incompatible_receiver_throws() {
+        assert_eval_true(
+            "try { DataView.prototype.getUint8.call(new ArrayBuffer(4), 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_getter_call_dispatch_uses_explicit_receiver() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, -2n); DataView.prototype.getBigInt64.call(v, 0) === -2n",
         );
     }
 

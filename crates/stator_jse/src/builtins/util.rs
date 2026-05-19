@@ -55,16 +55,22 @@ pub(crate) fn checked_f64_to_length(n: f64) -> StatorResult<usize> {
 
 /// Convert an `f64` to a `usize` using ECMAScript's `ToIndex`-style rules.
 ///
-/// `NaN` is treated as `0`, finite non-negative values are truncated toward
-/// zero, and negative or infinite values throw a `RangeError`.
+/// Follows §7.1.22 (`ToIndex`) by first applying `ToIntegerOrInfinity`
+/// (truncate toward zero, mapping `NaN` and `±0` to `0`), then enforcing
+/// `0 ≤ integer ≤ 2**53 - 1`.  Fractional values whose truncated integer is
+/// non-negative (such as `-0.5`, `0.9`, or `5.25`) are accepted; raw values
+/// like `-1` or `±Infinity` are rejected with `RangeError`.
 pub(crate) fn checked_f64_to_index(n: f64) -> StatorResult<usize> {
     if n.is_nan() {
         return Ok(0);
     }
-    if n.is_infinite() || n < 0.0 {
+    if n.is_infinite() {
         return Err(StatorError::RangeError("Invalid index".to_string()));
     }
-    let truncated = n.floor();
+    let truncated = n.trunc();
+    if truncated < 0.0 {
+        return Err(StatorError::RangeError("Invalid index".to_string()));
+    }
     if truncated > MAX_ALLOCATION_LENGTH as f64 {
         return Err(StatorError::RangeError("Invalid index".to_string()));
     }
@@ -225,5 +231,29 @@ mod tests {
         assert!(checked_f64_to_length(f64::INFINITY).is_err());
         assert!(checked_f64_to_length(-1.0).is_err());
         assert!(checked_f64_to_length(5_000_000_000_000.0).is_err());
+    }
+
+    // ── checked_f64_to_index ──────────────────────────────────────────────
+
+    #[test]
+    fn test_checked_f64_to_index_truncates_toward_zero() {
+        // ToIntegerOrInfinity truncates toward zero, so fractional values whose
+        // integer part is non-negative are accepted.
+        assert_eq!(checked_f64_to_index(0.0).unwrap(), 0);
+        assert_eq!(checked_f64_to_index(-0.0).unwrap(), 0);
+        assert_eq!(checked_f64_to_index(-0.5).unwrap(), 0);
+        assert_eq!(checked_f64_to_index(-0.9).unwrap(), 0);
+        assert_eq!(checked_f64_to_index(1.9).unwrap(), 1);
+        assert_eq!(checked_f64_to_index(7.25).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_checked_f64_to_index_rejects_bad_values() {
+        assert_eq!(checked_f64_to_index(f64::NAN).unwrap(), 0);
+        assert!(checked_f64_to_index(f64::INFINITY).is_err());
+        assert!(checked_f64_to_index(f64::NEG_INFINITY).is_err());
+        assert!(checked_f64_to_index(-1.0).is_err());
+        assert!(checked_f64_to_index(-1.5).is_err());
+        assert!(checked_f64_to_index(5_000_000_000_000.0).is_err());
     }
 }
