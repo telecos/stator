@@ -18,6 +18,28 @@
 //! | `new WebAssembly.Table({element, …})`    | [`wasm_table_ctor`]      |
 //! | `new WebAssembly.Global({value, …}, v?)` | [`wasm_global_ctor`]     |
 //!
+//! # Fail-closed surface
+//!
+//! A few additional names from the modern WebAssembly JS API are exposed on
+//! the `WebAssembly` namespace so feature-detection code finds them, but they
+//! intentionally throw `TypeError` instead of returning fake objects, because
+//! Stator does not implement the underlying semantics:
+//!
+//! | JavaScript                          | Reason                                  |
+//! |-------------------------------------|-----------------------------------------|
+//! | `WebAssembly.compileStreaming`      | Requires `Response`/`fetch` integration |
+//! | `WebAssembly.instantiateStreaming`  | Requires `Response`/`fetch` integration |
+//! | `new WebAssembly.Tag(...)`          | Wasm exception-handling not implemented |
+//! | `new WebAssembly.Exception(...)`    | Wasm exception-handling not implemented |
+//! | `new WebAssembly.CompileError(...)` | Real Error subclassing not available    |
+//! | `new WebAssembly.LinkError(...)`    | Real Error subclassing not available    |
+//! | `new WebAssembly.RuntimeError(...)` | Real Error subclassing not available    |
+//!
+//! These names exist as own properties of `WebAssembly` so `"compileStreaming"
+//! in WebAssembly` is `true`, but invoking any of them throws
+//! `TypeError: <name>: not implemented`.  No partial Error subclass hierarchy
+//! is fabricated.
+//!
 //! # Byte input format
 //!
 //! Per the WebAssembly JS API, Wasm entry points accept a `BufferSource`
@@ -852,41 +874,80 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// let wasm_obj = make_webassembly_object();
 /// assert!(matches!(wasm_obj, JsValue::PlainObject(_)));
 /// ```
+/// Build a fail-closed native function that always throws `TypeError`.
+///
+/// Used for entries on the `WebAssembly` namespace whose underlying semantics
+/// (streaming compile/instantiate, wasm exception handling, real Error
+/// subclassing) are not implemented.  The function is exposed so
+/// feature-detection succeeds, but calling or constructing it never returns a
+/// plausible-looking fake object.
+fn make_wasm_unsupported(name: &'static str) -> JsValue {
+    let f: NativeFn = Rc::new(move |_args: Vec<JsValue>| {
+        Err(StatorError::TypeError(format!("{name}: not implemented")))
+    });
+    JsValue::NativeFunction(f)
+}
+
+/// Build the `WebAssembly` namespace object.
+///
+/// Real implementations are wired for `validate`, `compile`, `instantiate`,
+/// and the `Module`/`Instance`/`Memory`/`Table`/`Global` constructors.  The
+/// remaining modern-browser surface (`compileStreaming`,
+/// `instantiateStreaming`, `Tag`, `Exception`, `CompileError`, `LinkError`,
+/// `RuntimeError`) is exposed as fail-closed entries that throw `TypeError`
+/// because Stator does not implement the underlying semantics; see the module
+/// docs.
 pub fn make_webassembly_object() -> JsValue {
     let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
-    map.borrow_mut().insert(
-        "validate".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_validate)),
-    );
-    map.borrow_mut().insert(
-        "compile".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_compile)),
-    );
-    map.borrow_mut().insert(
-        "instantiate".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_instantiate)),
-    );
-    map.borrow_mut().insert(
-        "Module".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_module_ctor)),
-    );
-    map.borrow_mut().insert(
-        "Instance".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_instance_ctor)),
-    );
-    map.borrow_mut().insert(
-        "Memory".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_memory_ctor)),
-    );
-    map.borrow_mut().insert(
-        "Table".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_table_ctor)),
-    );
-    map.borrow_mut().insert(
-        "Global".to_string(),
-        JsValue::NativeFunction(Rc::new(wasm_global_ctor)),
-    );
+    {
+        let mut m = map.borrow_mut();
+        m.insert(
+            "validate".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_validate)),
+        );
+        m.insert(
+            "compile".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_compile)),
+        );
+        m.insert(
+            "instantiate".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_instantiate)),
+        );
+        m.insert(
+            "Module".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_module_ctor)),
+        );
+        m.insert(
+            "Instance".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_instance_ctor)),
+        );
+        m.insert(
+            "Memory".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_memory_ctor)),
+        );
+        m.insert(
+            "Table".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_table_ctor)),
+        );
+        m.insert(
+            "Global".to_string(),
+            JsValue::NativeFunction(Rc::new(wasm_global_ctor)),
+        );
+
+        // Fail-closed entries: see module-level docs.
+        for name in [
+            "compileStreaming",
+            "instantiateStreaming",
+            "Tag",
+            "Exception",
+            "CompileError",
+            "LinkError",
+            "RuntimeError",
+        ] {
+            m.insert(name.to_string(), make_wasm_unsupported(name));
+        }
+    }
 
     JsValue::PlainObject(map)
 }
@@ -1765,6 +1826,122 @@ mod tests {
             }
         }
         panic!("full instantiate from bytes failed");
+    }
+
+    // ── fail-closed surface ──────────────────────────────────────────────────
+
+    const UNSUPPORTED_NAMES: &[&str] = &[
+        "compileStreaming",
+        "instantiateStreaming",
+        "Tag",
+        "Exception",
+        "CompileError",
+        "LinkError",
+        "RuntimeError",
+    ];
+
+    #[test]
+    fn test_make_wasm_unsupported_returns_type_error() {
+        let f = make_wasm_unsupported("compileStreaming");
+        let JsValue::NativeFunction(callable) = f else {
+            panic!("expected NativeFunction");
+        };
+        let err = callable(vec![]).unwrap_err();
+        match err {
+            StatorError::TypeError(msg) => {
+                assert!(msg.contains("compileStreaming"));
+                assert!(msg.contains("not implemented"));
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_webassembly_exposes_failclosed_keys() {
+        let wasm = make_webassembly_object();
+        let JsValue::PlainObject(map) = wasm else {
+            panic!("expected PlainObject");
+        };
+        for key in UNSUPPORTED_NAMES {
+            assert!(
+                map.borrow().contains_key(*key),
+                "missing fail-closed key: WebAssembly.{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_webassembly_failclosed_keys_throw_typeerror() {
+        let wasm = make_webassembly_object();
+        let JsValue::PlainObject(map) = wasm else {
+            panic!("expected PlainObject");
+        };
+        for key in UNSUPPORTED_NAMES {
+            let val = map.borrow().get(*key).cloned();
+            let Some(JsValue::NativeFunction(callable)) = val else {
+                panic!("WebAssembly.{key} is not a NativeFunction");
+            };
+            let err = callable(vec![]).unwrap_err();
+            match err {
+                StatorError::TypeError(msg) => {
+                    assert!(
+                        msg.contains(key),
+                        "TypeError for WebAssembly.{key} did not mention name: {msg}"
+                    );
+                    assert!(
+                        msg.contains("not implemented"),
+                        "TypeError for WebAssembly.{key} did not mention 'not implemented': {msg}"
+                    );
+                }
+                other => panic!("WebAssembly.{key} expected TypeError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_webassembly_failclosed_does_not_shadow_real_apis() {
+        // Adding the fail-closed entries must not remove or replace any of the
+        // real APIs that already work.
+        let wasm = make_webassembly_object();
+        let JsValue::PlainObject(map) = wasm else {
+            panic!("expected PlainObject");
+        };
+        for key in [
+            "validate",
+            "compile",
+            "instantiate",
+            "Module",
+            "Instance",
+            "Memory",
+            "Table",
+            "Global",
+        ] {
+            assert!(map.borrow().contains_key(key), "lost real API key: {key}");
+        }
+        // Spot-check that the real APIs still actually work.
+        let v = wasm_validate(vec![wat_val(EMPTY_WAT)]).unwrap();
+        assert_eq!(v, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_webassembly_no_streaming_fake_promise_returned() {
+        // compileStreaming / instantiateStreaming must NOT return a Promise or
+        // any object; they must throw synchronously so callers cannot mistake
+        // the fail-closed shape for a working implementation.
+        let wasm = make_webassembly_object();
+        let JsValue::PlainObject(map) = wasm else {
+            panic!("expected PlainObject");
+        };
+        for key in ["compileStreaming", "instantiateStreaming"] {
+            let Some(JsValue::NativeFunction(callable)) = map.borrow().get(key).cloned() else {
+                panic!("missing {key}");
+            };
+            let result = callable(vec![JsValue::Undefined]);
+            assert!(
+                matches!(result, Err(StatorError::TypeError(_))),
+                "WebAssembly.{key} should throw TypeError, got {result:?}"
+            );
+        }
     }
 
     #[test]
