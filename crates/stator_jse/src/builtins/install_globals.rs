@@ -142,7 +142,7 @@ use crate::interpreter::{
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::value::{JsValue, NativeIterator, ToPrimitiveHint, number_to_string};
 use std::collections::HashSet;
 
@@ -3689,23 +3689,6 @@ fn make_unsupported_idb_key_range_constructor() -> JsValue {
     ctor
 }
 
-fn make_unsupported_url_constructor() -> JsValue {
-    let ctor = make_unsupported_web_constructor("URL");
-    if let JsValue::PlainObject(ref rc) = ctor {
-        let mut props = rc.borrow_mut();
-        props.insert(
-            "createObjectURL".into(),
-            make_unsupported_web_function("URL.createObjectURL", 1),
-        );
-        props.insert(
-            "revokeObjectURL".into(),
-            make_unsupported_web_function("URL.revokeObjectURL", 1),
-        );
-        props.make_all_non_enumerable();
-    }
-    ctor
-}
-
 fn make_unsupported_storage_object(name: &'static str) -> JsValue {
     make_unsupported_web_object(
         name,
@@ -3717,6 +3700,947 @@ fn make_unsupported_storage_object(name: &'static str) -> JsValue {
             ("key", 1),
         ],
     )
+}
+
+// ── Real URL / URLSearchParams ────────────────────────────────────────────
+//
+// These constructors expose a focused subset of the WHATWG URL Standard
+// (see `crate::builtins::url` for the supported scope and parser).  All
+// parsing errors surface as JavaScript `TypeError`.  Host-integrated
+// helpers (`URL.createObjectURL` / `URL.revokeObjectURL`) remain
+// fail-closed because object-URL lifetime is owned by the browser host.
+//
+// Per WHATWG, `new URL(url, base?)` returns a new object whose
+// component getters/setters are accessor properties living on
+// `URL.prototype`.  We store the parsed `UrlData` inside an internal
+// `RefCell` slot on the instance keyed by `__url_state__`.
+
+use crate::builtins::url::{
+    QueryPairs, UrlData, UrlParseError, form_urlencoded_decode, parse_query_pairs, parse_url,
+    serialize_query_pairs,
+};
+
+/// Hidden brand placed on every `URL` instance for receiver checks.
+const URL_BRAND: &str = "__is_url__";
+/// Hidden brand placed on every standalone `URLSearchParams` instance.
+const URLSP_BRAND: &str = "__is_urlsp__";
+
+fn url_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn url_parse_error_to_js(e: UrlParseError) -> StatorError {
+    url_type_error(format!("URL: {e}"))
+}
+
+thread_local! {
+    static URL_STATES: RefCell<HashMap<usize, Rc<RefCell<UrlData>>>> =
+        RefCell::new(HashMap::new());
+    static URLSP_STATES: RefCell<HashMap<usize, Rc<RefCell<QueryPairs>>>> =
+        RefCell::new(HashMap::new());
+    static URL_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> = const { RefCell::new(None) };
+    static URLSP_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> = const { RefCell::new(None) };
+}
+
+fn install_url_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<UrlData>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    URL_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_url_state(value: &JsValue) -> StatorResult<Rc<RefCell<UrlData>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(url_type_error("URL method called on non-URL receiver"));
+    };
+    if !matches!(map.borrow().get(URL_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(url_type_error("URL method called on non-URL receiver"));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    URL_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| url_type_error("URL: internal state missing"))
+}
+
+fn install_urlsp_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<QueryPairs>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    URLSP_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_urlsp_state(value: &JsValue) -> StatorResult<Rc<RefCell<QueryPairs>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(url_type_error(
+            "URLSearchParams method called on non-URLSearchParams receiver",
+        ));
+    };
+    if !matches!(map.borrow().get(URLSP_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(url_type_error(
+            "URLSearchParams method called on non-URLSearchParams receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    URLSP_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| url_type_error("URLSearchParams: internal state missing"))
+}
+
+/// Drain a JS value into a `Vec<(String, String)>` for
+/// `URLSearchParams` construction. Accepts: undefined/null (empty),
+/// a string (parsed as query string with optional `?` prefix), a JS
+/// array of `[k, v]` pair arrays, or a plain object (record).
+fn url_sp_init_from_value(value: &JsValue) -> StatorResult<QueryPairs> {
+    match value {
+        JsValue::Undefined | JsValue::Null => Ok(Vec::new()),
+        JsValue::String(s) => {
+            let s = s.as_ref();
+            let s = s.strip_prefix('?').unwrap_or(s);
+            Ok(parse_query_pairs(s))
+        }
+        JsValue::Array(arr) => {
+            let mut out = Vec::new();
+            for item in arr.borrow().iter() {
+                let JsValue::Array(pair) = item else {
+                    return Err(url_type_error(
+                        "URLSearchParams: sequence element is not a pair",
+                    ));
+                };
+                let pair = pair.borrow();
+                if pair.len() != 2 {
+                    return Err(url_type_error(
+                        "URLSearchParams: sequence pair must have length 2",
+                    ));
+                }
+                out.push((pair[0].to_js_string()?, pair[1].to_js_string()?));
+            }
+            Ok(out)
+        }
+        JsValue::PlainObject(map) => {
+            let mut out = Vec::new();
+            for (k, v, attrs) in map.borrow().iter_with_attrs() {
+                if !attrs.contains(PropertyAttributes::ENUMERABLE) {
+                    continue;
+                }
+                if k.starts_with("__") && k.ends_with("__") {
+                    continue;
+                }
+                out.push((k.to_string(), v.to_js_string()?));
+            }
+            Ok(out)
+        }
+        _ => Err(url_type_error(
+            "URLSearchParams: init must be a string, sequence, or record",
+        )),
+    }
+}
+
+/// Build a fresh `URL` instance from parsed state.
+fn build_url_instance(state: UrlData) -> StatorResult<JsValue> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            URL_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = URL_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_url_state(&inst, Rc::new(RefCell::new(state)));
+    Ok(JsValue::PlainObject(inst))
+}
+
+/// Build a fresh standalone `URLSearchParams` instance.
+fn build_urlsp_instance(pairs: QueryPairs) -> StatorResult<JsValue> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            URLSP_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = URLSP_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_urlsp_state(&inst, Rc::new(RefCell::new(pairs)));
+    Ok(JsValue::PlainObject(inst))
+}
+
+/// Resolve the receiver for branded URL prototype methods/accessors,
+/// supporting both `.call/.apply/.bind` and method-dispatch calling
+/// conventions (mirrors `resolve_branded_receiver`).
+fn resolve_url_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(URL_BRAND), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+fn resolve_urlsp_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(URLSP_BRAND), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+/// Build the real `URL` constructor.
+#[inline(never)]
+fn make_url_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    // ── Constructor ─────────────────────────────────────────────────────
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let url_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(url_arg, JsValue::Undefined) {
+                return Err(url_type_error("URL constructor: url argument is required"));
+            }
+            let url_str = url_arg.to_js_string()?;
+            let base_arg = args.get(1).cloned();
+            let base_state = match base_arg {
+                Some(JsValue::Undefined) | None => None,
+                Some(JsValue::String(s)) => {
+                    Some(parse_url(s.as_ref(), None).map_err(url_parse_error_to_js)?)
+                }
+                Some(other) => {
+                    // Accept another URL instance as base.
+                    if let Ok(state_rc) = lookup_url_state(&other) {
+                        Some(state_rc.borrow().clone())
+                    } else {
+                        let s = other.to_js_string()?;
+                        Some(parse_url(&s, None).map_err(url_parse_error_to_js)?)
+                    }
+                }
+            };
+            let parsed = parse_url(&url_str, base_state.as_ref()).map_err(url_parse_error_to_js)?;
+            build_url_instance(parsed)
+        }),
+    );
+
+    // URL.parse(url, base?) — returns null instead of throwing on failure.
+    props.insert(
+        "parse".into(),
+        builtin_fn("parse", 1, |args| {
+            let url_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(url_arg, JsValue::Undefined) {
+                return Ok(JsValue::Null);
+            }
+            let url_str = match url_arg.to_js_string() {
+                Ok(s) => s,
+                Err(_) => return Ok(JsValue::Null),
+            };
+            let base_state = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(JsValue::String(s)) => match parse_url(s.as_ref(), None) {
+                    Ok(s) => Some(s),
+                    Err(_) => return Ok(JsValue::Null),
+                },
+                Some(other) => {
+                    if let Ok(state_rc) = lookup_url_state(other) {
+                        Some(state_rc.borrow().clone())
+                    } else {
+                        match other
+                            .to_js_string()
+                            .and_then(|s| parse_url(&s, None).map_err(url_parse_error_to_js))
+                        {
+                            Ok(s) => Some(s),
+                            Err(_) => return Ok(JsValue::Null),
+                        }
+                    }
+                }
+            };
+            match parse_url(&url_str, base_state.as_ref()) {
+                Ok(parsed) => build_url_instance(parsed),
+                Err(_) => Ok(JsValue::Null),
+            }
+        }),
+    );
+
+    // URL.canParse(url, base?) — boolean predicate.
+    props.insert(
+        "canParse".into(),
+        builtin_fn("canParse", 1, |args| {
+            let url_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(url_arg, JsValue::Undefined) {
+                return Ok(JsValue::Boolean(false));
+            }
+            let Ok(url_str) = url_arg.to_js_string() else {
+                return Ok(JsValue::Boolean(false));
+            };
+            let base_state = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(JsValue::String(s)) => match parse_url(s.as_ref(), None) {
+                    Ok(s) => Some(s),
+                    Err(_) => return Ok(JsValue::Boolean(false)),
+                },
+                Some(other) => {
+                    if let Ok(state_rc) = lookup_url_state(other) {
+                        Some(state_rc.borrow().clone())
+                    } else {
+                        match other.to_js_string() {
+                            Ok(s) => match parse_url(&s, None) {
+                                Ok(p) => Some(p),
+                                Err(_) => return Ok(JsValue::Boolean(false)),
+                            },
+                            Err(_) => return Ok(JsValue::Boolean(false)),
+                        }
+                    }
+                }
+            };
+            Ok(JsValue::Boolean(
+                parse_url(&url_str, base_state.as_ref()).is_ok(),
+            ))
+        }),
+    );
+
+    // Host-integrated object-URL helpers stay fail-closed.
+    props.insert(
+        "createObjectURL".into(),
+        make_unsupported_web_function("URL.createObjectURL", 1),
+    );
+    props.insert(
+        "revokeObjectURL".into(),
+        make_unsupported_web_function("URL.revokeObjectURL", 1),
+    );
+
+    // ── Prototype ───────────────────────────────────────────────────────
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        // Helper to register a string getter/setter pair on the prototype.
+        fn register_accessor(
+            proto: &mut PropertyMap,
+            name: &str,
+            getter: JsValue,
+            setter: Option<JsValue>,
+        ) {
+            proto.insert_with_attrs(
+                format!("__get_{name}__"),
+                getter,
+                PropertyAttributes::CONFIGURABLE,
+            );
+            if let Some(setter) = setter {
+                proto.insert_with_attrs(
+                    format!("__set_{name}__"),
+                    setter,
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+        }
+
+        // href: get + set (set reparses as absolute).
+        register_accessor(
+            &mut proto,
+            "href",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().href().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let parsed = parse_url(&input, None).map_err(url_parse_error_to_js)?;
+                *state.borrow_mut() = parsed;
+                Ok(JsValue::Undefined)
+            })),
+        );
+
+        // origin: read-only.
+        register_accessor(
+            &mut proto,
+            "origin",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().origin().into()))
+            }),
+            None,
+        );
+
+        // protocol: get + set.
+        register_accessor(
+            &mut proto,
+            "protocol",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(
+                    format!("{}:", state.borrow().scheme).into(),
+                ))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let _ = state.borrow_mut().set_protocol(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+
+        // username / password / host / hostname / port / pathname / search / hash.
+        register_accessor(
+            &mut proto,
+            "username",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().username.clone().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                state.borrow_mut().set_username(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "password",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().password.clone().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                state.borrow_mut().set_password(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "host",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().host_with_port().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let _ = state.borrow_mut().set_host(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "hostname",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().host.clone().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let _ = state.borrow_mut().set_hostname(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "port",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(
+                    match state.borrow().port {
+                        Some(p) => p.to_string(),
+                        None => String::new(),
+                    }
+                    .into(),
+                ))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let _ = state.borrow_mut().set_port(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "pathname",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().path.clone().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let _ = state.borrow_mut().set_pathname(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "search",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().search_string().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                state.borrow_mut().set_search(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+        register_accessor(
+            &mut proto,
+            "hash",
+            native(|args| {
+                let (recv, _) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                Ok(JsValue::String(state.borrow().hash_string().into()))
+            }),
+            Some(native(|args| {
+                let (recv, rest) = resolve_url_receiver(&args);
+                let state = lookup_url_state(&recv)?;
+                let input = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                state.borrow_mut().set_hash(&input);
+                Ok(JsValue::Undefined)
+            })),
+        );
+
+        // toString() / toJSON() — both return href.
+        let to_string_fn = native(|args| {
+            let (recv, _) = resolve_url_receiver(&args);
+            let state = lookup_url_state(&recv)?;
+            Ok(JsValue::String(state.borrow().href().into()))
+        });
+        proto.insert("toString".into(), to_string_fn.clone());
+        proto.insert("toJSON".into(), to_string_fn);
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("URL".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        URL_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the real `URLSearchParams` constructor.
+#[inline(never)]
+fn make_url_search_params_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let init = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let pairs = url_sp_init_from_value(&init)?;
+            build_urlsp_instance(pairs)
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        // append(name, value)
+        proto.insert(
+            "append".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let value = rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                pairs.borrow_mut().push((name, value));
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // delete(name, value?)
+        proto.insert(
+            "delete".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let value_opt = match rest.get(1) {
+                    Some(JsValue::Undefined) | None => None,
+                    Some(v) => Some(v.clone().to_js_string()?),
+                };
+                pairs.borrow_mut().retain(|(k, v)| {
+                    if k != &name {
+                        return true;
+                    }
+                    match &value_opt {
+                        Some(target) => v != target,
+                        None => false,
+                    }
+                });
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // get(name) -> first matching value or null
+        proto.insert(
+            "get".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                Ok(pairs
+                    .borrow()
+                    .iter()
+                    .find(|(k, _)| k == &name)
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .unwrap_or(JsValue::Null))
+            }),
+        );
+
+        // getAll(name) -> array of values
+        proto.insert(
+            "getAll".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let values: Vec<JsValue> = pairs
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| k == &name)
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .collect();
+                Ok(JsValue::new_array(values))
+            }),
+        );
+
+        // has(name, value?)
+        proto.insert(
+            "has".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let value_opt = match rest.get(1) {
+                    Some(JsValue::Undefined) | None => None,
+                    Some(v) => Some(v.clone().to_js_string()?),
+                };
+                let found = pairs
+                    .borrow()
+                    .iter()
+                    .any(|(k, v)| k == &name && value_opt.as_ref().map(|t| t == v).unwrap_or(true));
+                Ok(JsValue::Boolean(found))
+            }),
+        );
+
+        // set(name, value) — overwrites first occurrence, removes other duplicates.
+        proto.insert(
+            "set".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs_rc = lookup_urlsp_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let value = rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let mut pairs = pairs_rc.borrow_mut();
+                let mut found = false;
+                pairs.retain_mut(|(k, v)| {
+                    if k != &name {
+                        return true;
+                    }
+                    if !found {
+                        *v = value.clone();
+                        found = true;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !found {
+                    pairs.push((name, value));
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // sort() — stable sort by name (UTF-8 codepoint order).
+        proto.insert(
+            "sort".into(),
+            native(|args| {
+                let (recv, _) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                pairs.borrow_mut().sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // toString() — application/x-www-form-urlencoded serialization.
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let (recv, _) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                Ok(JsValue::String(
+                    serialize_query_pairs(&pairs.borrow()).into(),
+                ))
+            }),
+        );
+
+        // forEach(cb, thisArg?)
+        proto.insert(
+            "forEach".into(),
+            native(|args| {
+                let (recv, rest) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let cb = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let this_arg = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                // Snapshot to allow callback to mutate the underlying list.
+                let snapshot: QueryPairs = pairs.borrow().clone();
+                for (k, v) in snapshot {
+                    dispatch_call_with_this(
+                        &cb,
+                        this_arg.clone(),
+                        vec![
+                            JsValue::String(v.into()),
+                            JsValue::String(k.into()),
+                            recv.clone(),
+                        ],
+                    )?;
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // size accessor
+        proto.insert_with_attrs(
+            "__get_size__".into(),
+            native(|args| {
+                let (recv, _) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                Ok(JsValue::Smi(pairs.borrow().len() as i32))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        // entries() / keys() / values() / @@iterator
+        fn make_iterator(values: Vec<JsValue>) -> JsValue {
+            let inner = Rc::new(RefCell::new(values.into_iter()));
+            let mut it_obj = PropertyMap::new();
+            let inner_for_next = Rc::clone(&inner);
+            it_obj.insert(
+                "next".into(),
+                native(move |_| {
+                    let next = inner_for_next.borrow_mut().next();
+                    let mut result = PropertyMap::new();
+                    match next {
+                        Some(v) => {
+                            result.insert("value".into(), v);
+                            result.insert("done".into(), JsValue::Boolean(false));
+                        }
+                        None => {
+                            result.insert("value".into(), JsValue::Undefined);
+                            result.insert("done".into(), JsValue::Boolean(true));
+                        }
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                }),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(it_obj)))
+        }
+
+        let entries_fn = native(|args| {
+            let (recv, _) = resolve_urlsp_receiver(&args);
+            let pairs = lookup_urlsp_state(&recv)?;
+            let values: Vec<JsValue> = pairs
+                .borrow()
+                .iter()
+                .map(|(k, v)| {
+                    JsValue::new_array(vec![
+                        JsValue::String(k.clone().into()),
+                        JsValue::String(v.clone().into()),
+                    ])
+                })
+                .collect();
+            Ok(make_iterator(values))
+        });
+        proto.insert("entries".into(), entries_fn.clone());
+        proto.insert("@@iterator".into(), entries_fn);
+
+        proto.insert(
+            "keys".into(),
+            native(|args| {
+                let (recv, _) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let values: Vec<JsValue> = pairs
+                    .borrow()
+                    .iter()
+                    .map(|(k, _)| JsValue::String(k.clone().into()))
+                    .collect();
+                Ok(make_iterator(values))
+            }),
+        );
+        proto.insert(
+            "values".into(),
+            native(|args| {
+                let (recv, _) = resolve_urlsp_receiver(&args);
+                let pairs = lookup_urlsp_state(&recv)?;
+                let values: Vec<JsValue> = pairs
+                    .borrow()
+                    .iter()
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .collect();
+                Ok(make_iterator(values))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("URLSearchParams".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        URLSP_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+// Silence dead-code lint for legacy helpers retained for potential reuse.
+#[allow(dead_code)]
+fn _url_legacy_unused() {
+    let _ = form_urlencoded_decode as fn(&str) -> String;
 }
 
 /// Build a fail-closed host-integrated web object that exposes the given
@@ -16256,16 +17180,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "ShadowRealm".into(),
             finalize_ctor(make_shadow_realm(), "ShadowRealm"),
         );
-        globals.insert(
-            "URL".into(),
-            finalize_ctor(make_unsupported_url_constructor(), "URL"),
-        );
+        globals.insert("URL".into(), finalize_ctor(make_url_builtin(), "URL"));
         globals.insert(
             "URLSearchParams".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("URLSearchParams"),
-                "URLSearchParams",
-            ),
+            finalize_ctor(make_url_search_params_builtin(), "URLSearchParams"),
         );
 
         // ── DOM parsing / serialization and URL patterns (fail-closed) ──────
@@ -18127,7 +19045,11 @@ mod tests {
     use super::*;
 
     fn assert_eval_true(script: &str) {
-        assert_eq!(global_eval(script).unwrap(), JsValue::Boolean(true));
+        match global_eval(script) {
+            Ok(JsValue::Boolean(true)) => {}
+            Ok(other) => panic!("expected true for {script:?}, got {other:?}"),
+            Err(e) => panic!("expected true for {script:?}, got error {e:?}"),
+        }
     }
 
     fn assert_eval_type_error(script: &str) {
@@ -18589,23 +19511,171 @@ mod tests {
     }
 
     #[test]
-    fn e2e_url_constructor_exists_but_fails_closed() {
+    fn e2e_url_constructor_real_basic() {
         assert_eval_true("typeof URL === 'function' && URL.name === 'URL'");
         assert_eval_true("typeof URL.createObjectURL === 'function'");
         assert_eval_true("typeof URL.revokeObjectURL === 'function'");
-        assert_eval_type_error("URL('https://example.test/path?x=1')");
-        assert_eval_type_error("new URL('https://example.test/path?x=1')");
+        // Object-URL helpers are host-integrated and remain fail-closed.
         assert_eval_type_error("URL.createObjectURL({})");
         assert_eval_type_error("URL.revokeObjectURL('blob:https://example.test/id')");
+
+        // Calling without `new` still constructs (Stator's __call__ slot
+        // is invoked uniformly), and invalid input throws TypeError.
+        assert_eval_type_error("new URL('not a url')");
+        assert_eval_type_error("new URL('http://exämple.test/')");
+        assert_eval_type_error("new URL('../x')");
+
+        // Absolute parse + component getters.
+        assert_eval_true(
+            "(new URL('https://u:p@a.test:8443/x/y?q=1&r=2#h')).href === 'https://u:p@a.test:8443/x/y?q=1&r=2#h'",
+        );
+        assert_eval_true("(new URL('https://u:p@a.test:8443/x?q=1#h')).protocol === 'https:'");
+        assert_eval_true("(new URL('https://u:p@a.test:8443/x?q=1#h')).hostname === 'a.test'");
+        assert_eval_true("(new URL('https://a.test:8443/x')).host === 'a.test:8443'");
+        assert_eval_true("(new URL('https://a.test/x')).host === 'a.test'");
+        assert_eval_true("(new URL('https://a.test:443/x')).port === ''");
+        assert_eval_true("(new URL('http://a.test:80/x')).port === ''");
+        assert_eval_true("(new URL('http://a.test:8080/x')).port === '8080'");
+        assert_eval_true("(new URL('https://a.test/x?q=1#h')).pathname === '/x'");
+        assert_eval_true("(new URL('https://a.test/x?q=1#h')).search === '?q=1'");
+        assert_eval_true("(new URL('https://a.test/x?q=1#h')).hash === '#h'");
+        assert_eval_true("(new URL('https://u:p@a.test/x')).username === 'u'");
+        assert_eval_true("(new URL('https://u:p@a.test/x')).password === 'p'");
+        assert_eval_true("(new URL('https://a.test:8443/x')).origin === 'https://a.test:8443'");
+
+        // Default-port collapse on serialization.
+        assert_eval_true("(new URL('http://a.test:80/x')).href === 'http://a.test/x'");
+
+        // Dot-segment removal for special schemes.
+        assert_eval_true("(new URL('https://a.test/x/./y/../z')).pathname === '/x/z'");
+
+        // Relative resolution against a base.
+        assert_eval_true("(new URL('../z', 'https://a.test/x/y/')).href === 'https://a.test/x/z'");
+        assert_eval_true("(new URL('/abs', 'https://a.test/x/y')).href === 'https://a.test/abs'");
+        assert_eval_true(
+            "(new URL('#frag', 'https://a.test/p?q=1')).href === 'https://a.test/p?q=1#frag'",
+        );
+        // Base can be another URL instance.
+        assert_eval_true(
+            "(new URL('rel', new URL('https://a.test/x/'))).href === 'https://a.test/x/rel'",
+        );
+
+        // Opaque-scheme URL (mailto, data, etc.).
+        assert_eval_true("(new URL('mailto:foo@bar')).protocol === 'mailto:'");
+        assert_eval_true("(new URL('mailto:foo@bar')).pathname === 'foo@bar'");
+        assert_eval_true("(new URL('mailto:foo@bar')).origin === 'null'");
+
+        // IPv6 host.
+        assert_eval_true("(new URL('https://[::1]:8443/x')).hostname === '[::1]'");
+        assert_eval_true("(new URL('https://[::1]:8443/x')).href === 'https://[::1]:8443/x'");
+
+        // toString / toJSON.
+        assert_eval_true("(new URL('https://a.test/x')).toString() === 'https://a.test/x'");
+        assert_eval_true("(new URL('https://a.test/x')).toJSON() === 'https://a.test/x'");
+
+        // Setters.
+        assert_eval_true("var u = new URL('https://a.test/x'); u.hash = 'y'; u.hash === '#y'");
+        assert_eval_true(
+            "var u = new URL('https://a.test/x?old=1'); u.search = 'new=2'; u.search === '?new=2'",
+        );
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.pathname = '/y/./z'; u.pathname === '/y/z'",
+        );
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.port = '8080'; u.host === 'a.test:8080'",
+        );
+        assert_eval_true(
+            "var u = new URL('https://a.test:8080/x'); u.port = ''; u.host === 'a.test'",
+        );
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.hostname = 'b.test'; u.hostname === 'b.test'",
+        );
+        // Cross-class protocol change is a no-op (spec behavior).
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.protocol = 'mailto'; u.protocol === 'https:'",
+        );
+        // Same-class protocol change succeeds.
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.protocol = 'http'; u.protocol === 'http:'",
+        );
+        // href setter re-parses.
+        assert_eval_true(
+            "var u = new URL('https://a.test/x'); u.href = 'http://b.test/y'; u.host === 'b.test' && u.protocol === 'http:'",
+        );
+
+        // URL.canParse / URL.parse.
+        assert_eval_true("URL.canParse('https://a.test/x') === true");
+        assert_eval_true("URL.canParse('not a url') === false");
+        assert_eval_true("URL.canParse('rel', 'https://a.test/') === true");
+        assert_eval_true("URL.parse('not a url') === null");
+        assert_eval_true("URL.parse('https://a.test/x').href === 'https://a.test/x'");
+
+        // Live `url.searchParams` is intentionally absent (host-integrated
+        // identity semantics are not implemented).
+        assert_eval_true("typeof (new URL('https://a.test/x?q=1')).searchParams === 'undefined'");
     }
 
     #[test]
-    fn e2e_url_search_params_constructor_exists_but_fails_closed() {
+    fn e2e_url_search_params_real_basic() {
         assert_eval_true(
             "typeof URLSearchParams === 'function' && URLSearchParams.name === 'URLSearchParams'",
         );
-        assert_eval_type_error("URLSearchParams('x=1')");
-        assert_eval_type_error("new URLSearchParams('x=1')");
+
+        // Construction.
+        assert_eval_true("new URLSearchParams().toString() === ''");
+        assert_eval_true("new URLSearchParams('a=1&b=2').toString() === 'a=1&b=2'");
+        assert_eval_true("new URLSearchParams('?a=1&b=2').toString() === 'a=1&b=2'");
+        assert_eval_true("new URLSearchParams([['a','1'],['b','2']]).toString() === 'a=1&b=2'");
+        assert_eval_true("new URLSearchParams({a:'1', b:'2'}).toString() === 'a=1&b=2'");
+
+        // Encoding: space -> '+', reserved chars percent-encoded.
+        assert_eval_true("new URLSearchParams([['a b','1+2']]).toString() === 'a+b=1%2B2'");
+
+        // get / getAll / has / size.
+        assert_eval_true("(new URLSearchParams('a=1&a=2&b=3')).get('a') === '1'");
+        assert_eval_true(
+            "JSON.stringify((new URLSearchParams('a=1&a=2&b=3')).getAll('a')) === '[\"1\",\"2\"]'",
+        );
+        assert_eval_true("(new URLSearchParams('a=1&b=2')).has('a') === true");
+        assert_eval_true("(new URLSearchParams('a=1&b=2')).has('c') === false");
+        assert_eval_true("(new URLSearchParams('a=1&b=2&a=3')).size === 3");
+        // has(name, value) for the two-arg form.
+        assert_eval_true("(new URLSearchParams('a=1&a=2')).has('a','2') === true");
+        assert_eval_true("(new URLSearchParams('a=1&a=2')).has('a','9') === false");
+
+        // append / set / delete.
+        assert_eval_true(
+            "var p = new URLSearchParams('a=1'); p.append('a','2'); p.toString() === 'a=1&a=2'",
+        );
+        assert_eval_true(
+            "var p = new URLSearchParams('a=1&a=2&b=3'); p.set('a','9'); p.toString() === 'a=9&b=3'",
+        );
+        assert_eval_true(
+            "var p = new URLSearchParams('a=1&b=2&a=3'); p.delete('a'); p.toString() === 'b=2'",
+        );
+        // delete(name, value) two-arg.
+        assert_eval_true(
+            "var p = new URLSearchParams('a=1&a=2&a=3'); p.delete('a','2'); p.toString() === 'a=1&a=3'",
+        );
+
+        // sort (stable by name).
+        assert_eval_true(
+            "var p = new URLSearchParams('c=1&a=2&b=3&a=4'); p.sort(); p.toString() === 'a=2&a=4&b=3&c=1'",
+        );
+
+        // get returns null for missing.
+        assert_eval_true("(new URLSearchParams('a=1')).get('z') === null");
+    }
+
+    #[test]
+    fn e2e_url_branded_methods_reject_foreign_receiver() {
+        // Brand check on prototype methods.
+        assert_eval_type_error("URL.prototype.toString.call({})");
+        assert_eval_type_error("URLSearchParams.prototype.append.call({}, 'a', 'b')");
+        // Branded receivers via .call work.
+        assert_eval_true(
+            "URL.prototype.toString.call(new URL('https://a.test/')) === 'https://a.test/'",
+        );
     }
 
     #[test]

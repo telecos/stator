@@ -4269,7 +4269,12 @@ fn handle_sta_named_property(
             }
             // Walk the prototype chain for inherited setters/getters.
             {
-                let mut proto = map.borrow().get("__proto__").cloned();
+                let mut proto = {
+                    let pm = map.borrow();
+                    pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                        .or_else(|| pm.get("__proto__"))
+                        .cloned()
+                };
                 for _ in 0..256 {
                     match proto.take() {
                         Some(JsValue::PlainObject(p)) => {
@@ -4290,7 +4295,10 @@ fn handle_sta_named_property(
                                     return Ok(DispatchAction::Continue);
                                 }
                             }
-                            proto = pb.get("__proto__").cloned();
+                            proto = pb
+                                .get(INTERNAL_PROTO_PROPERTY_KEY)
+                                .or_else(|| pb.get("__proto__"))
+                                .cloned();
                         }
                         _ => break,
                     }
@@ -4645,7 +4653,12 @@ fn handle_sta_keyed_property(
         }
         // Walk prototype chain for inherited setters/getters.
         {
-            let mut proto = map.borrow().get("__proto__").cloned();
+            let mut proto = {
+                let pm = map.borrow();
+                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| pm.get("__proto__"))
+                    .cloned()
+            };
             for _ in 0..256 {
                 match proto.take() {
                     Some(JsValue::PlainObject(p)) => {
@@ -4666,7 +4679,10 @@ fn handle_sta_keyed_property(
                                 return Ok(DispatchAction::Continue);
                             }
                         }
-                        proto = pb.get("__proto__").cloned();
+                        proto = pb
+                            .get(INTERNAL_PROTO_PROPERTY_KEY)
+                            .or_else(|| pb.get("__proto__"))
+                            .cloned();
                     }
                     _ => break,
                 }

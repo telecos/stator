@@ -18303,7 +18303,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
             Ok(())
         }
         JsValue::NativeFunction(f) => {
-            f(vec![val])?;
+            f(vec![this.clone(), val])?;
             Ok(())
         }
         _ => Ok(()),
@@ -23299,7 +23299,9 @@ mod tests {
         let stored_clone = Rc::clone(&stored);
         if let JsValue::PlainObject(ref map) = obj {
             let setter = JsValue::NativeFunction(Rc::new(move |args| {
-                *stored_clone.borrow_mut() = args.first().cloned().unwrap_or(JsValue::Undefined);
+                // Native setter accessors receive [this, value]; the value
+                // is at index 1 (index 0 is the receiver).
+                *stored_clone.borrow_mut() = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 Ok(JsValue::Undefined)
             }));
             map.borrow_mut().insert("__set_x__".to_string(), setter);

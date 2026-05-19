@@ -65,6 +65,8 @@ pub mod symbol;
 pub mod temporal;
 /// ECMAScript §23.2 TypedArray, §25.1 ArrayBuffer, and §25.3 DataView built-ins.
 pub mod typed_array;
+/// WHATWG `URL` parser and `URLSearchParams` data model.
+pub mod url;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
 pub(crate) mod util;
 /// WebAssembly JavaScript API built-ins:

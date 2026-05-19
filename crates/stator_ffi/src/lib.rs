@@ -10771,7 +10771,7 @@ fn dom_object_wrap_plain_object(
                     if wrap.is_null() {
                         return Ok(JsValue::Undefined);
                     }
-                    let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                     // SAFETY: the embedder must keep the wrapper alive until
                     // the owning context is destroyed.
                     unsafe {
