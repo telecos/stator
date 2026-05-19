@@ -3083,6 +3083,27 @@ fn make_crypto() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+fn make_unsupported_web_constructor(name: &'static str) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(move |_args| {
+            Err(StatorError::TypeError(format!(
+                "{name}: URL parsing is not implemented"
+            )))
+        }),
+    );
+
+    let mut proto = PropertyMap::new();
+    proto.make_all_non_enumerable();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Format 16 bytes as a lowercase RFC 4122 / 9562 UUID string
 /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Caller is responsible
 /// for setting the version and variant bits in `bytes`.
@@ -16159,6 +16180,17 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "ShadowRealm".into(),
             finalize_ctor(make_shadow_realm(), "ShadowRealm"),
         );
+        globals.insert(
+            "URL".into(),
+            finalize_ctor(make_unsupported_web_constructor("URL"), "URL"),
+        );
+        globals.insert(
+            "URLSearchParams".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("URLSearchParams"),
+                "URLSearchParams",
+            ),
+        );
 
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
@@ -16661,6 +16693,24 @@ mod tests {
         assert!(globals.contains_key("setTimeout"));
         assert!(globals.contains_key("clearTimeout"));
         assert!(globals.contains_key("crypto"));
+        assert!(globals.contains_key("URL"));
+        assert!(globals.contains_key("URLSearchParams"));
+    }
+
+    #[test]
+    fn e2e_url_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof URL === 'function' && URL.name === 'URL'");
+        assert_eval_type_error("URL('https://example.test/path?x=1')");
+        assert_eval_type_error("new URL('https://example.test/path?x=1')");
+    }
+
+    #[test]
+    fn e2e_url_search_params_constructor_exists_but_fails_closed() {
+        assert_eval_true(
+            "typeof URLSearchParams === 'function' && URLSearchParams.name === 'URLSearchParams'",
+        );
+        assert_eval_type_error("URLSearchParams('x=1')");
+        assert_eval_type_error("new URLSearchParams('x=1')");
     }
 
     #[test]
