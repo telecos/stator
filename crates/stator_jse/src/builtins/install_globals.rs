@@ -17127,6 +17127,98 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── WebCodecs / WebGPU / WebGL / WebXR / WebNN (fail-closed) ────────
+        //
+        // These interface constructors are exposed on `window` in modern
+        // Chromium/Edge so page scripts can do `instanceof` and feature
+        // detection, but every real instance is vended through a host
+        // surface the engine deliberately does not provide:
+        //
+        //   * WebCodecs (`VideoFrame`, `AudioData`, encoded chunks, encoders,
+        //     decoders, `ImageDecoder`, image tracks) require platform media
+        //     codecs, color-space conversion, demuxers, and event-loop
+        //     integration.
+        //   * WebGPU (`GPU`, adapters, devices, buffers, textures, queues,
+        //     pipelines, bind groups, samplers, shader modules, compilation
+        //     info, error objects, uncaptured-error events) requires a real
+        //     GPU adapter, driver, command submission queue, and async error
+        //     scopes; instances are vended via `navigator.gpu`.
+        //   * `WebGLRenderingContext` / `WebGL2RenderingContext` require a
+        //     `<canvas>` host element and a live GL context.
+        //   * WebXR (`XRSystem`, sessions, frames, reference spaces, views,
+        //     rigid transforms, WebGL layers, anchors, hit-test sources)
+        //     requires an XR runtime, head-tracked frame loop, and host
+        //     session lifetime; instances are vended via `navigator.xr`.
+        //   * WebNN (`ML`, `MLContext`, `MLGraph`, `MLGraphBuilder`,
+        //     `MLOperand`) requires a real ML accelerator backend and graph
+        //     compiler; instances are vended via `navigator.ml`.
+        //
+        // Expose the constructor names so feature detection succeeds, but
+        // refuse construction/invocation rather than returning fake frames,
+        // chunks, devices, contexts, sessions, or graphs. The host entry
+        // points (`navigator`, `navigator.gpu`, `navigator.xr`,
+        // `navigator.ml`, `document`, canvas context creation) deliberately
+        // remain absent — see `e2e_codec_graphics_host_entry_points_remain_absent`.
+        for name in [
+            // WebCodecs
+            "VideoFrame",
+            "AudioData",
+            "EncodedVideoChunk",
+            "EncodedAudioChunk",
+            "VideoEncoder",
+            "VideoDecoder",
+            "AudioEncoder",
+            "AudioDecoder",
+            "ImageDecoder",
+            "ImageTrack",
+            "ImageTrackList",
+            // WebGPU
+            "GPU",
+            "GPUAdapter",
+            "GPUDevice",
+            "GPUBuffer",
+            "GPUTexture",
+            "GPUTextureView",
+            "GPUCommandEncoder",
+            "GPUCommandBuffer",
+            "GPUQueue",
+            "GPURenderPipeline",
+            "GPUComputePipeline",
+            "GPUBindGroup",
+            "GPUSampler",
+            "GPUShaderModule",
+            "GPUCompilationInfo",
+            "GPUCompilationMessage",
+            "GPUError",
+            "GPUValidationError",
+            "GPUOutOfMemoryError",
+            "GPUInternalError",
+            "GPUUncapturedErrorEvent",
+            // WebGL / WebXR
+            "WebGLRenderingContext",
+            "WebGL2RenderingContext",
+            "XRSystem",
+            "XRSession",
+            "XRFrame",
+            "XRReferenceSpace",
+            "XRView",
+            "XRRigidTransform",
+            "XRWebGLLayer",
+            "XRAnchor",
+            "XRHitTestSource",
+            // WebNN
+            "ML",
+            "MLContext",
+            "MLGraph",
+            "MLGraphBuilder",
+            "MLOperand",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+
         // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
         globals.insert(
             "TextEncoder".into(),
@@ -18001,6 +18093,58 @@ mod tests {
         assert!(globals.contains_key("MediaQueryListEvent"));
         assert!(globals.contains_key("Screen"));
         assert!(globals.contains_key("ScreenOrientation"));
+        for name in [
+            "VideoFrame",
+            "AudioData",
+            "EncodedVideoChunk",
+            "EncodedAudioChunk",
+            "VideoEncoder",
+            "VideoDecoder",
+            "AudioEncoder",
+            "AudioDecoder",
+            "ImageDecoder",
+            "ImageTrack",
+            "ImageTrackList",
+            "GPU",
+            "GPUAdapter",
+            "GPUDevice",
+            "GPUBuffer",
+            "GPUTexture",
+            "GPUTextureView",
+            "GPUCommandEncoder",
+            "GPUCommandBuffer",
+            "GPUQueue",
+            "GPURenderPipeline",
+            "GPUComputePipeline",
+            "GPUBindGroup",
+            "GPUSampler",
+            "GPUShaderModule",
+            "GPUCompilationInfo",
+            "GPUCompilationMessage",
+            "GPUError",
+            "GPUValidationError",
+            "GPUOutOfMemoryError",
+            "GPUInternalError",
+            "GPUUncapturedErrorEvent",
+            "WebGLRenderingContext",
+            "WebGL2RenderingContext",
+            "XRSystem",
+            "XRSession",
+            "XRFrame",
+            "XRReferenceSpace",
+            "XRView",
+            "XRRigidTransform",
+            "XRWebGLLayer",
+            "XRAnchor",
+            "XRHitTestSource",
+            "ML",
+            "MLContext",
+            "MLGraph",
+            "MLGraphBuilder",
+            "MLOperand",
+        ] {
+            assert!(globals.contains_key(name), "missing global: {name}");
+        }
     }
 
     #[test]
@@ -18267,6 +18411,175 @@ mod tests {
         assert_eval_type_error("new FontFace('EdgeStator', 'url(font.woff2)')");
         assert_eval_type_error("new MediaQueryListEvent('change', { matches: true })");
         assert_eval_type_error("new ScreenOrientation()");
+    }
+
+    /// WebCodecs interface constructors (`VideoFrame`, `AudioData`, encoded
+    /// chunks, encoders, decoders, `ImageDecoder`, image tracks) are exposed
+    /// so feature detection succeeds, but construction fails closed because
+    /// the engine has no media codecs, color-space conversion, demuxer, or
+    /// event-loop integration to produce real frames or chunks.
+    #[test]
+    fn e2e_webcodecs_constructors_exist_but_fail_closed() {
+        for name in [
+            "VideoFrame",
+            "AudioData",
+            "EncodedVideoChunk",
+            "EncodedAudioChunk",
+            "VideoEncoder",
+            "VideoDecoder",
+            "AudioEncoder",
+            "AudioDecoder",
+            "ImageDecoder",
+            "ImageTrack",
+            "ImageTrackList",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error(
+            "new VideoEncoder({ output: function () {}, error: function () {} })",
+        );
+        assert_eval_type_error(
+            "new VideoDecoder({ output: function () {}, error: function () {} })",
+        );
+        assert_eval_type_error(
+            "new AudioEncoder({ output: function () {}, error: function () {} })",
+        );
+        assert_eval_type_error(
+            "new AudioDecoder({ output: function () {}, error: function () {} })",
+        );
+        assert_eval_type_error(
+            "new EncodedVideoChunk({ type: 'key', timestamp: 0, data: new Uint8Array(0) })",
+        );
+        assert_eval_type_error(
+            "new EncodedAudioChunk({ type: 'key', timestamp: 0, data: new Uint8Array(0) })",
+        );
+    }
+
+    /// WebGPU interface constructors (`GPU`, adapter/device/queue/buffer/
+    /// texture/pipeline/bind-group/sampler/shader/compilation/error types,
+    /// `GPUUncapturedErrorEvent`) are exposed so feature detection and
+    /// `instanceof` checks succeed, but construction fails closed because
+    /// the engine has no real GPU adapter, driver, command-submission queue,
+    /// or async error scopes. Real instances are vended through
+    /// `navigator.gpu`, which deliberately remains absent.
+    #[test]
+    fn e2e_webgpu_constructors_exist_but_fail_closed() {
+        for name in [
+            "GPU",
+            "GPUAdapter",
+            "GPUDevice",
+            "GPUBuffer",
+            "GPUTexture",
+            "GPUTextureView",
+            "GPUCommandEncoder",
+            "GPUCommandBuffer",
+            "GPUQueue",
+            "GPURenderPipeline",
+            "GPUComputePipeline",
+            "GPUBindGroup",
+            "GPUSampler",
+            "GPUShaderModule",
+            "GPUCompilationInfo",
+            "GPUCompilationMessage",
+            "GPUError",
+            "GPUValidationError",
+            "GPUOutOfMemoryError",
+            "GPUInternalError",
+            "GPUUncapturedErrorEvent",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new GPUValidationError('bad shader')");
+        assert_eval_type_error("new GPUOutOfMemoryError('oom')");
+        assert_eval_type_error("new GPUInternalError('internal')");
+        assert_eval_type_error("new GPUUncapturedErrorEvent('uncapturederror', { error: null })");
+    }
+
+    /// WebGL context interface constructors are exposed so page scripts can
+    /// run `instanceof` checks against context objects, but construction
+    /// fails closed because the engine has no `<canvas>` host element or GL
+    /// driver to back a real rendering context.
+    #[test]
+    fn e2e_webgl_context_constructors_exist_but_fail_closed() {
+        for name in ["WebGLRenderingContext", "WebGL2RenderingContext"] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+    }
+
+    /// WebXR interface constructors (`XRSystem`, sessions, frames, reference
+    /// spaces, views, rigid transforms, WebGL layers, anchors, hit-test
+    /// sources) are exposed so feature detection succeeds, but construction
+    /// fails closed because the engine has no XR runtime, head-tracked frame
+    /// loop, or host session lifetime. Real sessions are vended through
+    /// `navigator.xr`, which deliberately remains absent.
+    #[test]
+    fn e2e_webxr_constructors_exist_but_fail_closed() {
+        for name in [
+            "XRSystem",
+            "XRSession",
+            "XRFrame",
+            "XRReferenceSpace",
+            "XRView",
+            "XRRigidTransform",
+            "XRWebGLLayer",
+            "XRAnchor",
+            "XRHitTestSource",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error(
+            "new XRRigidTransform({ x: 0, y: 0, z: 0, w: 1 }, { x: 0, y: 0, z: 0, w: 1 })",
+        );
+    }
+
+    /// WebNN interface constructors (`ML`, `MLContext`, `MLGraph`,
+    /// `MLGraphBuilder`, `MLOperand`) are exposed so feature detection
+    /// succeeds, but construction fails closed because the engine has no
+    /// ML accelerator backend or graph compiler. Real contexts are vended
+    /// through `navigator.ml`, which deliberately remains absent.
+    #[test]
+    fn e2e_webnn_constructors_exist_but_fail_closed() {
+        for name in ["ML", "MLContext", "MLGraph", "MLGraphBuilder", "MLOperand"] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+    }
+
+    /// Entry points that would vend fake codec, GPU, WebGL, XR or ML host
+    /// objects remain absent. Real instances of the WebCodecs/WebGPU/WebGL/
+    /// WebXR/WebNN interfaces are only reachable through `navigator.gpu`,
+    /// `navigator.xr`, `navigator.ml`, `document` or canvas context creation
+    /// — none of which the engine fakes. The interface constructors above
+    /// only fail closed for feature detection and `instanceof` checks.
+    /// (`HTMLCanvasElement`, `OffscreenCanvas` and `createImageBitmap` are
+    /// covered by the canvas/imaging lane: they exist as constructors but
+    /// also fail closed.)
+    #[test]
+    fn e2e_codec_graphics_host_entry_points_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
     }
 
     /// Entry points that would vend fake document/window/screen/media-query
