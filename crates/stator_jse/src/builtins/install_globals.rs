@@ -15577,15 +15577,9 @@ fn make_atomics() -> JsValue {
         builtin_fn("add", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
-            let next = if atomics_kind_is_bigint(kind) {
-                JsValue::BigInt(Box::new(
-                    atomics_extract_bigint(&old)? + atomics_extract_bigint(&operand)?,
-                ))
-            } else {
-                JsValue::HeapNumber(old.to_number()? + operand.to_number()?)
-            };
+            let old = atomics_read(&ta.borrow(), index);
+            let next = atomics_apply_binary_number(kind, &old, &operand, |lhs, rhs| lhs + rhs)?;
             atomics_write(&ta.borrow(), index, &next)?;
             Ok(old)
         }),
@@ -15597,15 +15591,9 @@ fn make_atomics() -> JsValue {
         builtin_fn("sub", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
-            let next = if atomics_kind_is_bigint(kind) {
-                JsValue::BigInt(Box::new(
-                    atomics_extract_bigint(&old)? - atomics_extract_bigint(&operand)?,
-                ))
-            } else {
-                JsValue::HeapNumber(old.to_number()? - operand.to_number()?)
-            };
+            let old = atomics_read(&ta.borrow(), index);
+            let next = atomics_apply_binary_number(kind, &old, &operand, |lhs, rhs| lhs - rhs)?;
             atomics_write(&ta.borrow(), index, &next)?;
             Ok(old)
         }),
@@ -15617,8 +15605,8 @@ fn make_atomics() -> JsValue {
         builtin_fn("and", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let old = atomics_read(&ta.borrow(), index);
             let next = atomics_apply_binary_number(kind, &old, &operand, |lhs, rhs| lhs & rhs)?;
             atomics_write(&ta.borrow(), index, &next)?;
             Ok(old)
@@ -15631,8 +15619,8 @@ fn make_atomics() -> JsValue {
         builtin_fn("or", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let old = atomics_read(&ta.borrow(), index);
             let next = atomics_apply_binary_number(kind, &old, &operand, |lhs, rhs| lhs | rhs)?;
             atomics_write(&ta.borrow(), index, &next)?;
             Ok(old)
@@ -15645,8 +15633,8 @@ fn make_atomics() -> JsValue {
         builtin_fn("xor", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let old = atomics_read(&ta.borrow(), index);
             let next = atomics_apply_binary_number(kind, &old, &operand, |lhs, rhs| lhs ^ rhs)?;
             atomics_write(&ta.borrow(), index, &next)?;
             Ok(old)
@@ -15659,8 +15647,8 @@ fn make_atomics() -> JsValue {
         builtin_fn("exchange", 3, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let value = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let old = atomics_read(&ta.borrow(), index);
             atomics_write(&ta.borrow(), index, &value)?;
             Ok(old)
         }),
@@ -15672,10 +15660,10 @@ fn make_atomics() -> JsValue {
         builtin_fn("compareExchange", 4, |args| {
             let (ta, index) = atomics_extract_ta(&args)?;
             let kind = ta.borrow().kind;
-            let old = atomics_read(&ta.borrow(), index);
             let expected = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
             let replacement =
                 atomics_coerce_value(kind, args.get(3).unwrap_or(&JsValue::Undefined))?;
+            let old = atomics_read(&ta.borrow(), index);
             if atomics_value_equals(&old, &expected) {
                 atomics_write(&ta.borrow(), index, &replacement)?;
             }
@@ -15687,11 +15675,11 @@ fn make_atomics() -> JsValue {
     props.insert(
         "isLockFree".into(),
         builtin_fn("isLockFree", 1, |args| {
-            let size = args
-                .first()
-                .map(|v| crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0)))
-                .unwrap_or(0);
-            Ok(JsValue::Boolean(matches!(size, 1 | 2 | 4 | 8)))
+            let size = match args.first() {
+                Some(value) => value.to_integer_or_infinity()?,
+                None => 0.0,
+            };
+            Ok(JsValue::Boolean(matches!(size, 1.0 | 2.0 | 4.0 | 8.0)))
         }),
     );
 
@@ -42759,7 +42747,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_load_reads_shared_typed_array_value() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 42; Atomics.load(ta, 0) === 42",
@@ -42767,7 +42754,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_store_writes_shared_typed_array_value() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(ta, 0, 7) === 7 && ta[0] === 7",
@@ -42775,7 +42761,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_store_returns_coerced_integer_value() {
         assert_eval_true(
             "var ta = new Int8Array(new SharedArrayBuffer(1)); Atomics.store(ta, 0, 129) === -127 && ta[0] === -127",
@@ -42783,7 +42768,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_add_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 5; Atomics.add(ta, 0, 3) === 5 && ta[0] === 8",
@@ -42791,7 +42775,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_sub_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 5; Atomics.sub(ta, 0, 2) === 5 && ta[0] === 3",
@@ -42799,7 +42782,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_and_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 7; Atomics.and(ta, 0, 3) === 7 && ta[0] === 3",
@@ -42807,7 +42789,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_or_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 4; Atomics.or(ta, 0, 3) === 4 && ta[0] === 7",
@@ -42815,7 +42796,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_xor_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 6; Atomics.xor(ta, 0, 3) === 6 && ta[0] === 5",
@@ -42823,7 +42803,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_exchange_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 6; Atomics.exchange(ta, 0, 9) === 6 && ta[0] === 9",
@@ -42859,7 +42838,42 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn e2e_atomics_read_modify_write_converts_value_before_reading_number_slot() {
+        assert_eval_true(
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); \
+             var ok = true; \
+             function valueThatStores(n, r) { return { valueOf: function() { ta[0] = n; return r; } }; } \
+             ta[0] = 5; ok = ok && Atomics.add(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 11; \
+             ta[0] = 5; ok = ok && Atomics.sub(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 9; \
+             ta[0] = 5; ok = ok && Atomics.and(ta, 0, valueThatStores(10, 3)) === 10 && ta[0] === 2; \
+             ta[0] = 5; ok = ok && Atomics.or(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 11; \
+             ta[0] = 5; ok = ok && Atomics.xor(ta, 0, valueThatStores(10, 3)) === 10 && ta[0] === 9; \
+             ta[0] = 5; ok = ok && Atomics.exchange(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 1; \
+             ok",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_read_modify_write_converts_value_before_reading_bigint_slot() {
+        assert_eval_true(
+            "var ta = new BigInt64Array(new SharedArrayBuffer(8)); \
+             var v = { valueOf: function() { ta[0] = 10n; return 1n; } }; \
+             ta[0] = 5n; Atomics.add(ta, 0, v) === 10n && ta[0] === 11n",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_compare_exchange_converts_values_before_reading_slot() {
+        assert_eval_true(
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); \
+             ta[0] = 5; \
+             var expected = { valueOf: function() { ta[0] = 10; return 10; } }; \
+             var replacement = { valueOf: function() { ta[0] = 11; return 12; } }; \
+             Atomics.compareExchange(ta, 0, expected, replacement) === 11 && ta[0] === 11",
+        );
+    }
+
+    #[test]
     fn e2e_atomics_uint32_operations_preserve_unsigned_results() {
         assert_eval_true(
             "var ta = new Uint32Array(new SharedArrayBuffer(4)); ta[0] = 4294967295; Atomics.or(ta, 0, 0) === 4294967295 && Atomics.store(ta, 0, 4294967295) === 4294967295 && ta[0] === 4294967295",
@@ -42874,7 +42888,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_bigint_add_returns_old_value_and_updates_slot() {
         assert_eval_true(
             "var ta = new BigInt64Array(new SharedArrayBuffer(8)); ta[0] = 5n; Atomics.add(ta, 0, 3n) === 5n && ta[0] === 8n",
@@ -42882,7 +42895,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_bigint_compare_exchange_works() {
         assert_eval_true(
             "var ta = new BigUint64Array(new SharedArrayBuffer(8)); ta[0] = 5n; Atomics.compareExchange(ta, 0, 5n, 9n) === 5n && ta[0] === 9n",
@@ -42964,6 +42976,26 @@ mod tests {
     fn e2e_atomics_reject_out_of_range_indices() {
         assert_eval_true(
             "try { Atomics.load(new Int32Array(new SharedArrayBuffer(4)), 1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_reject_out_of_range_indices_before_value_conversion() {
+        assert_eval_true(
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); \
+             var converted = false; \
+             var value = { valueOf: function() { converted = true; return 1; } }; \
+             try { Atomics.add(ta, 1, value); false; } catch (e) { e instanceof RangeError && !converted; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_is_lock_free_rejects_non_number_numeric_values() {
+        assert_eval_true(
+            "var symbolThrows = false; var bigintThrows = false; \
+             try { Atomics.isLockFree(Symbol()); } catch (e) { symbolThrows = e instanceof TypeError; } \
+             try { Atomics.isLockFree(1n); } catch (e) { bigintThrows = e instanceof TypeError; } \
+             symbolThrows && bigintThrows && Atomics.isLockFree(4.9) && !Atomics.isLockFree(Infinity)",
         );
     }
 
