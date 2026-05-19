@@ -12297,6 +12297,7 @@ impl Interpreter {
     pub(crate) fn js_error_to_rejection_reason(e: &StatorError) -> Option<JsValue> {
         match e {
             StatorError::JsException(msg) => Some(JsValue::String(msg.clone().into())),
+            StatorError::Error(msg) => Some(JsValue::String(format!("Error: {msg}").into())),
             StatorError::TypeError(msg) => {
                 Some(JsValue::String(format!("TypeError: {msg}").into()))
             }
@@ -14732,7 +14733,7 @@ pub(super) fn error_message_from_value(value: &JsValue) -> String {
 }
 
 /// Convert a [`StatorError`] into a [`JsValue::Error`] if it represents a
-/// catchable JavaScript error (TypeError, RangeError, ReferenceError,
+/// catchable JavaScript error (Error, TypeError, RangeError, ReferenceError,
 /// SyntaxError, URIError).
 ///
 /// Returns `None` for internal engine errors and other non-JS error variants
@@ -14744,6 +14745,7 @@ pub(super) fn stator_error_to_js_value(err: &StatorError) -> Option<JsValue> {
     use crate::builtins::error::{ErrorKind, JsError};
 
     let (kind, msg) = match err {
+        StatorError::Error(msg) => (ErrorKind::Error, msg.clone()),
         StatorError::TypeError(msg) => (ErrorKind::TypeError, msg.clone()),
         StatorError::RangeError(msg) => (ErrorKind::RangeError, msg.clone()),
         StatorError::ReferenceError(msg) => (ErrorKind::ReferenceError, msg.clone()),

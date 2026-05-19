@@ -20,7 +20,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
@@ -2953,21 +2952,12 @@ fn structured_clone(val: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
-fn pseudo_random_bytes(len: usize) -> Vec<u8> {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
-        ^ ((len as u64).wrapping_mul(0xA076_1D64_78BD_642F));
-    let mut state = seed | 1;
-    let mut bytes = Vec::with_capacity(len);
-    for index in 0..len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        bytes.push(((state as u8) & 0xFE) ^ ((index as u8).wrapping_add(1)));
-    }
-    bytes
+fn fill_crypto_random_bytes(bytes: &mut [u8]) -> StatorResult<()> {
+    getrandom::fill(bytes).map_err(|err| {
+        StatorError::Error(format!(
+            "crypto.getRandomValues: secure random source failed: {err}"
+        ))
+    })
 }
 
 /// Maximum byte length accepted by `crypto.getRandomValues`.
@@ -3065,7 +3055,8 @@ fn make_crypto() -> JsValue {
             };
 
             if byte_len > 0 {
-                let random_bytes = pseudo_random_bytes(byte_len);
+                let mut random_bytes = vec![0; byte_len];
+                fill_crypto_random_bytes(&mut random_bytes)?;
                 let ta = typed_array_rc.borrow();
                 let mut buf = ta.buffer.borrow_mut();
                 buf.data[byte_offset..byte_offset + byte_len].copy_from_slice(&random_bytes);
@@ -37476,7 +37467,10 @@ mod tests {
     #[test]
     fn e2e_crypto_get_random_values_mutates_typed_array() {
         assert_eval_true(
-            "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes); bytes[0] !== 0 || bytes[1] !== 0 || bytes[2] !== 0 || bytes[3] !== 0",
+            "var bytes = new Uint8Array(64); crypto.getRandomValues(bytes); \
+             var anyNonZero = false; \
+             for (var i = 0; i < bytes.length; i++) if (bytes[i] !== 0) anyNonZero = true; \
+             anyNonZero",
         );
     }
 
@@ -37539,10 +37533,10 @@ mod tests {
 
     #[test]
     fn e2e_crypto_get_random_values_fills_multibyte_elements() {
-        // For a Uint32Array of length 4 (16 bytes), at least one element should be
-        // outside the 0..256 range when bytes are written across the full element width.
+        // For a Uint32Array, at least one element should be outside the 0..256 range
+        // when bytes are written across the full element width.
         assert_eval_true(
-            "var b = new Uint32Array(4); crypto.getRandomValues(b); \
+            "var b = new Uint32Array(32); crypto.getRandomValues(b); \
              var anyAboveByte = false; \
              for (var i = 0; i < b.length; i++) if (b[i] > 255) anyAboveByte = true; \
              anyAboveByte",

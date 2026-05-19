@@ -11672,6 +11672,7 @@ fn message_kind_for_error(
     }
     match error {
         E::OutOfMemory => StatorMessageKind::StatorMessageKindOutOfMemory,
+        E::Error(_) => StatorMessageKind::StatorMessageKindJsException,
         E::TypeError(_) => StatorMessageKind::StatorMessageKindType,
         E::SyntaxError(_) => StatorMessageKind::StatorMessageKindSyntax,
         E::ReferenceError(_) => StatorMessageKind::StatorMessageKindReference,

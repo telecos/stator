@@ -9,6 +9,9 @@ pub enum StatorError {
     #[error("out of memory")]
     OutOfMemory,
 
+    /// A JavaScript Error was raised.
+    #[error("Error: {0}")]
+    Error(String),
     /// A JavaScript TypeError was raised.
     #[error("TypeError: {0}")]
     TypeError(String),
