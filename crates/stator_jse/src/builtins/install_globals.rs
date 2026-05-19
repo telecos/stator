@@ -63235,7 +63235,6 @@ mod tests {
 
     /// TypedArray: element access by index.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_typed_array_index_access() {
         assert_e2e_true("var ta = new Uint8Array([10, 20, 30]); ta[0] === 10 && ta[2] === 30");
     }
@@ -63248,7 +63247,6 @@ mod tests {
 
     /// TypedArray: setting out-of-bounds index is silently ignored.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_typed_array_oob_set_ignored() {
         assert_e2e_true(
             "var ta = new Uint8Array(2); ta[5] = 99; ta.length === 2 && ta[5] === undefined",
@@ -63257,12 +63255,51 @@ mod tests {
 
     /// TypedArray: numeric index doesn't go to prototype.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_typed_array_no_proto_index() {
         assert_e2e_true(
             "var proto = Uint8Array.prototype; Object.defineProperty(proto, '0', { value: 777, configurable: true }); \
              var ta = new Uint8Array(1); var result = ta[0] === 0; \
              delete proto['0']; result",
+        );
+    }
+
+    /// TypedArray: multiple views over the same `ArrayBuffer` share bytes.
+    #[test]
+    fn e2e_w21f_typed_array_views_share_buffer() {
+        assert_e2e_true(
+            "var buf = new ArrayBuffer(8); var a = new Uint8Array(buf); var b = new Uint8Array(buf); \
+             a[0] = 0xAA; a[1] = 0xBB; \
+             b[0] === 0xAA && b[1] === 0xBB && a.buffer === buf && b.buffer === buf",
+        );
+    }
+
+    /// TypedArray: byteOffset / length view writes propagate through the buffer.
+    #[test]
+    fn e2e_w21f_typed_array_offset_view_shares_buffer() {
+        assert_e2e_true(
+            "var buf = new ArrayBuffer(8); var a = new Uint8Array(buf); var c = new Uint8Array(buf, 2, 4); \
+             c.byteOffset === 2 && c.length === 4 && c.byteLength === 4 && \
+             (c[0] = 0xCC, a[2] === 0xCC)",
+        );
+    }
+
+    /// TypedArray: writes through a wider element type are visible byte-wise.
+    #[test]
+    fn e2e_w21f_typed_array_uint16_view_shares_buffer() {
+        assert_e2e_true(
+            "var buf = new ArrayBuffer(4); var bytes = new Uint8Array(buf); var words = new Uint16Array(buf); \
+             words[0] = 0x1234; \
+             (bytes[0] === 0x34 && bytes[1] === 0x12) || (bytes[0] === 0x12 && bytes[1] === 0x34)",
+        );
+    }
+
+    /// TypedArray: DataView writes are observable through a TypedArray view.
+    #[test]
+    fn e2e_w21f_typed_array_dataview_shares_buffer() {
+        assert_e2e_true(
+            "var buf = new ArrayBuffer(4); var dv = new DataView(buf); var a = new Uint8Array(buf); \
+             dv.setUint8(0, 99); a[1] = 77; \
+             a[0] === 99 && dv.getUint8(1) === 77",
         );
     }
 

@@ -186,6 +186,7 @@ use crate::builtins::error::{
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
+use crate::builtins::typed_array::{typed_array_get, typed_array_set};
 #[cfg(any(
     stator_maglev_jit_x86_64,
     all(target_arch = "x86_64", any(unix, windows))
@@ -18667,7 +18668,20 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             let prop_name = to_property_key(key)?;
             try_proto_lookup(obj, &prop_name)
         }
-        JsValue::PlainObject(_map) => {
+        JsValue::PlainObject(map) => {
+            // TypedArray indexed access: route integer indices through the
+            // shared `ArrayBuffer` so multiple views over the same buffer
+            // observe each other's writes (ECMAScript §10.4.5
+            // IntegerIndexedElementGet).
+            if let Some(idx) = to_array_index(key) {
+                let inner_opt = match map.borrow().get("__typed_array__") {
+                    Some(JsValue::TypedArray(inner)) => Some(Rc::clone(inner)),
+                    _ => None,
+                };
+                if let Some(inner) = inner_opt {
+                    return Ok(typed_array_get(&inner.borrow(), idx));
+                }
+            }
             let prop_name = to_property_key(key)?;
             try_proto_lookup(obj, &prop_name)
         }
@@ -18740,6 +18754,23 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             let _ = proxy_set_with_receiver(&mut p.borrow_mut(), &prop_name, value, obj)?;
         }
         JsValue::PlainObject(map) => {
+            // TypedArray indexed access: route integer indices through the
+            // shared `ArrayBuffer` (ECMAScript §10.4.5
+            // IntegerIndexedElementSet). Out-of-bounds writes are silently
+            // ignored to match spec semantics for fixed-length views.
+            if let Some(idx) = to_array_index(key) {
+                let inner_opt = match map.borrow().get("__typed_array__") {
+                    Some(JsValue::TypedArray(inner)) => Some(Rc::clone(inner)),
+                    _ => None,
+                };
+                if let Some(inner) = inner_opt {
+                    let in_bounds = idx < inner.borrow().effective_length();
+                    if in_bounds {
+                        typed_array_set(&inner.borrow(), idx, &value)?;
+                    }
+                    return Ok(());
+                }
+            }
             let prop_name = to_property_key(key)?;
             if prop_name == "__proto__" && !plain_object_has_own_property(&map.borrow(), &prop_name)
             {

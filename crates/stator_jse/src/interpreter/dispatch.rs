@@ -4453,12 +4453,17 @@ fn handle_lda_keyed_property(
             return Ok(DispatchAction::Continue);
         } else if let JsValue::PlainObject(map) = obj {
             let borrow = map.borrow();
-            let key_str = itoa_stack(idx_val as u32);
-            if let Some(val) = borrow.get(key_str.as_str()) {
-                let result = val.resolve_live_binding();
-                drop(borrow);
-                ctx.frame.accumulator = result;
-                return Ok(DispatchAction::Continue);
+            // TypedArray: skip the fast path so integer indices hit the
+            // shared backing buffer via keyed_load, not a stale own
+            // property on the wrapper.
+            if borrow.get("__typed_array__").is_none() {
+                let key_str = itoa_stack(idx_val as u32);
+                if let Some(val) = borrow.get(key_str.as_str()) {
+                    let result = val.resolve_live_binding();
+                    drop(borrow);
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
+                }
             }
             // Fall through for missing elements (prototype chain)
         }
@@ -4521,18 +4526,25 @@ fn handle_sta_keyed_property(
         } else if let JsValue::PlainObject(map) = obj_ref {
             // SAFETY: single-threaded interpreter; no concurrent borrows.
             let m = unsafe { &mut *map.as_ptr() };
-            let key_str = itoa_stack(idx_val as u32);
-            m.insert(key_str.as_str().to_owned(), val);
-            // Update length if needed for array-like objects.
-            let i = idx_val as usize;
-            let cur_len = match m.get("length") {
-                Some(JsValue::Smi(n)) => *n as usize,
-                _ => 0,
-            };
-            if i >= cur_len {
-                m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+            // TypedArray: skip the fast path so integer indices reach the
+            // shared backing buffer via keyed_store, not a wrapper own
+            // property that would shadow the buffer.
+            if m.get("__typed_array__").is_some() {
+                // Fall through to general path.
+            } else {
+                let key_str = itoa_stack(idx_val as u32);
+                m.insert(key_str.as_str().to_owned(), val);
+                // Update length if needed for array-like objects.
+                let i = idx_val as usize;
+                let cur_len = match m.get("length") {
+                    Some(JsValue::Smi(n)) => *n as usize,
+                    _ => 0,
+                };
+                if i >= cur_len {
+                    m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+                }
+                return Ok(DispatchAction::Continue);
             }
-            return Ok(DispatchAction::Continue);
         }
     }
     // ── General path ─────────────────────────────────────────────────
