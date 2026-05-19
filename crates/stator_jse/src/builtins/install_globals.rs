@@ -3605,6 +3605,21 @@ fn make_unsupported_web_function(name: &'static str, length: i32) -> JsValue {
     })
 }
 
+fn make_unsupported_storage_object(name: &'static str) -> JsValue {
+    let mut props = PropertyMap::new();
+    for (method, length) in [
+        ("getItem", 1),
+        ("setItem", 2),
+        ("removeItem", 1),
+        ("clear", 0),
+        ("key", 1),
+    ] {
+        props.insert(method.into(), make_unsupported_web_function(name, length));
+    }
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Format 16 bytes as a lowercase RFC 4122 / 9562 UUID string
 /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Caller is responsible
 /// for setting the version and variant bits in `bytes`.
@@ -16693,6 +16708,23 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Web Storage (fail-closed) ───────────────────────────────────────
+        // Storage is host-integrated and this standalone engine has no backing
+        // origin, persistence, quota, or lifetime model. Expose the probed
+        // globals, but fail every operation instead of pretending to store data.
+        globals.insert(
+            "Storage".into(),
+            finalize_ctor(make_unsupported_web_constructor("Storage"), "Storage"),
+        );
+        globals.insert(
+            "localStorage".into(),
+            make_unsupported_storage_object("localStorage"),
+        );
+        globals.insert(
+            "sessionStorage".into(),
+            make_unsupported_storage_object("sessionStorage"),
+        );
+
         // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
         globals.insert(
             "TextEncoder".into(),
@@ -17189,6 +17221,9 @@ mod tests {
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
         assert!(globals.contains_key("URLSearchParams"));
+        assert!(globals.contains_key("Storage"));
+        assert!(globals.contains_key("localStorage"));
+        assert!(globals.contains_key("sessionStorage"));
         assert!(globals.contains_key("TextEncoder"));
         assert!(globals.contains_key("TextDecoder"));
         assert!(globals.contains_key("Event"));
@@ -17212,6 +17247,30 @@ mod tests {
         );
         assert_eval_type_error("URLSearchParams('x=1')");
         assert_eval_type_error("new URLSearchParams('x=1')");
+    }
+
+    #[test]
+    fn e2e_storage_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof Storage === 'function' && Storage.name === 'Storage'");
+        assert_eval_type_error("Storage()");
+        assert_eval_type_error("new Storage()");
+    }
+
+    #[test]
+    fn e2e_web_storage_globals_exist_but_operations_fail_closed() {
+        assert_eval_true("typeof localStorage === 'object' && localStorage !== null");
+        assert_eval_true("typeof sessionStorage === 'object' && sessionStorage !== null");
+        assert_eval_true("localStorage !== sessionStorage");
+        assert_eval_type_error("localStorage.getItem('edge-stator')");
+        assert_eval_type_error("localStorage.setItem('edge-stator', 'value')");
+        assert_eval_type_error("localStorage.removeItem('edge-stator')");
+        assert_eval_type_error("localStorage.clear()");
+        assert_eval_type_error("localStorage.key(0)");
+        assert_eval_type_error("sessionStorage.getItem('edge-stator')");
+        assert_eval_type_error("sessionStorage.setItem('edge-stator', 'value')");
+        assert_eval_type_error("sessionStorage.removeItem('edge-stator')");
+        assert_eval_type_error("sessionStorage.clear()");
+        assert_eval_type_error("sessionStorage.key(0)");
     }
 
     #[test]
