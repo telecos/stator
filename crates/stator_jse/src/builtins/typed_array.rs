@@ -753,62 +753,9 @@ pub fn typed_array_set(ta: &JsTypedArray, index: usize, value: &JsValue) -> Stat
     }
     let bpe = ta.kind.bytes_per_element();
     let abs = ta.byte_offset + index * bpe;
+    let bytes = typed_array_element_bytes(ta.kind, value)?;
     let mut buf = ta.buffer.borrow_mut();
-    let d = &mut buf.data;
-    match ta.kind {
-        TypedArrayKind::Int8 => {
-            let n = value.to_int32()? as i8;
-            d[abs] = n as u8;
-        }
-        TypedArrayKind::Uint8 => {
-            let n = value.to_int32()? as u8;
-            d[abs] = n;
-        }
-        TypedArrayKind::Uint8Clamped => {
-            let n = value.to_number()?;
-            d[abs] = clamp_u8(n);
-        }
-        TypedArrayKind::Int16 => {
-            let n = value.to_int32()? as i16;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 2].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::Uint16 => {
-            let n = value.to_int32()? as u16;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 2].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::Int32 => {
-            let n = value.to_int32()?;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 4].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::Uint32 => {
-            let n = value.to_uint32()?;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 4].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::Float32 => {
-            let n = value.to_number()? as f32;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 4].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::Float64 => {
-            let n = value.to_number()?;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 8].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::BigInt64 => {
-            let n = value_to_bigint64(value)?;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 8].copy_from_slice(&bytes);
-        }
-        TypedArrayKind::BigUint64 => {
-            let n = value_to_biguint64(value)?;
-            let bytes = n.to_ne_bytes();
-            d[abs..abs + 8].copy_from_slice(&bytes);
-        }
-    }
+    buf.data[abs..abs + bpe].copy_from_slice(&bytes);
     Ok(())
 }
 
@@ -834,8 +781,12 @@ pub fn typed_array_fill(
     let len = ta.effective_length() as i64;
     let s = clamp_index(start, len) as usize;
     let e = clamp_index(end, len) as usize;
+    let bytes = typed_array_element_bytes(ta.kind, value)?;
+    let bpe = ta.kind.bytes_per_element();
+    let mut buf = ta.buffer.borrow_mut();
     for i in s..e {
-        typed_array_set(ta, i, value)?;
+        let abs = ta.byte_offset + i * bpe;
+        buf.data[abs..abs + bpe].copy_from_slice(&bytes);
     }
     Ok(())
 }
@@ -1442,12 +1393,32 @@ fn clamp_index(idx: i64, len: i64) -> i64 {
     }
 }
 
+fn typed_array_element_bytes(kind: TypedArrayKind, value: &JsValue) -> StatorResult<Vec<u8>> {
+    let bytes = match kind {
+        TypedArrayKind::Int8 => vec![(value.to_int32()? as i8) as u8],
+        TypedArrayKind::Uint8 => vec![value.to_int32()? as u8],
+        TypedArrayKind::Uint8Clamped => vec![clamp_u8(value.to_number()?)],
+        TypedArrayKind::Int16 => (value.to_int32()? as i16).to_ne_bytes().to_vec(),
+        TypedArrayKind::Uint16 => (value.to_int32()? as u16).to_ne_bytes().to_vec(),
+        TypedArrayKind::Int32 => value.to_int32()?.to_ne_bytes().to_vec(),
+        TypedArrayKind::Uint32 => value.to_uint32()?.to_ne_bytes().to_vec(),
+        TypedArrayKind::Float32 => (value.to_number()? as f32).to_ne_bytes().to_vec(),
+        TypedArrayKind::Float64 => value.to_number()?.to_ne_bytes().to_vec(),
+        TypedArrayKind::BigInt64 => value_to_bigint64(value)?.to_ne_bytes().to_vec(),
+        TypedArrayKind::BigUint64 => value_to_biguint64(value)?.to_ne_bytes().to_vec(),
+    };
+    Ok(bytes)
+}
+
 /// Clamp a float to a `u8` for `Uint8ClampedArray`.
 fn clamp_u8(n: f64) -> u8 {
     if n.is_nan() || n <= 0.0 {
         0
     } else if n >= 255.0 {
         255
+    } else if n.fract() == 0.5 {
+        let lower = n.floor() as u8;
+        lower + (lower % 2)
     } else {
         n.round() as u8
     }
@@ -1576,9 +1547,7 @@ mod tests {
         typed_array_set(&ta, 2, &JsValue::HeapNumber(128.5)).unwrap();
         assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(255));
         assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(0));
-        // Round-half-to-even: 128.5 → 128 (banker's rounding in Rust's f64::round rounds to 129)
-        // Actually Rust rounds to 129 for 128.5. The spec says round but we use f64::round().
-        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(129));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(128));
     }
 
     #[test]

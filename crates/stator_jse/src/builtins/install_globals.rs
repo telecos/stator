@@ -41860,7 +41860,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_fill_whole() {
         assert_eval_true(
             "var a = new Uint8Array(4); a.fill(7); a[0] === 7 && a[1] === 7 && a[2] === 7 && a[3] === 7",
@@ -41868,7 +41867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_fill_negative_start() {
         assert_eval_true(
             "var a = new Uint8Array(4); a.fill(9, -2); a[0] === 0 && a[1] === 0 && a[2] === 9 && a[3] === 9",
@@ -41876,7 +41874,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_fill_with_range() {
         assert_eval_true(
             "var a = new Int32Array(5); a.fill(42, 1, 3); a[0] === 0 && a[1] === 42 && a[2] === 42 && a[3] === 0",
@@ -41884,7 +41881,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn e2e_typed_array_fill_converts_value_once() {
+        assert_eval_true(
+            "var calls = 0; var value = { valueOf: function() { calls = calls + 1; return 7; } }; var a = new Uint8Array(3); a.fill(value); calls === 1 && a.join(',') === '7,7,7'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_converts_empty_range_value() {
+        assert_eval_true(
+            "try { new Uint8Array([1]).fill(Symbol(), 1, 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_uint8_clamped_ties_even() {
+        assert_eval_true(
+            "var a = new Uint8ClampedArray(2); a.fill(2.5, 0, 1); a.fill(3.5, 1); a[0] === 2 && a[1] === 4",
+        );
+    }
+
+    #[test]
     fn e2e_typed_array_copy_within_basic() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3,4,5]); a.copyWithin(0, 3); a[0] === 4 && a[1] === 5 && a[2] === 3",
@@ -41892,10 +41909,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_copy_within_negative() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3,4,5]); a.copyWithin(-2, 0, 2); a[3] === 1 && a[4] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_copy_within_shared_backing_view() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(24); var full = new Int32Array(buf); full.set([1,2,3,4,5,6]); var view = new Int32Array(buf, 4, 4); view.copyWithin(1, 0, 3); full.join(',') === '1,2,2,3,4,6'",
         );
     }
 
