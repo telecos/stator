@@ -16703,6 +16703,46 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_text_decoder(), "TextDecoder"),
         );
 
+        // ── DOM Events / AbortController (fail-closed) ─────────────────────
+        //
+        // The engine does not model event dispatch, listener registration or
+        // callback scheduling. We expose the standard constructors so feature
+        // detection (`typeof Event === 'function'`) succeeds, but any actual
+        // construction or invocation fails closed with a `TypeError` so that
+        // product code never relies on a fake event/abort surface.
+        globals.insert(
+            "Event".into(),
+            finalize_ctor(make_unsupported_web_constructor("Event"), "Event"),
+        );
+        globals.insert(
+            "CustomEvent".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("CustomEvent"),
+                "CustomEvent",
+            ),
+        );
+        globals.insert(
+            "EventTarget".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("EventTarget"),
+                "EventTarget",
+            ),
+        );
+        globals.insert(
+            "AbortController".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("AbortController"),
+                "AbortController",
+            ),
+        );
+        globals.insert(
+            "AbortSignal".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("AbortSignal"),
+                "AbortSignal",
+            ),
+        );
+
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
 
@@ -17151,6 +17191,11 @@ mod tests {
         assert!(globals.contains_key("URLSearchParams"));
         assert!(globals.contains_key("TextEncoder"));
         assert!(globals.contains_key("TextDecoder"));
+        assert!(globals.contains_key("Event"));
+        assert!(globals.contains_key("CustomEvent"));
+        assert!(globals.contains_key("EventTarget"));
+        assert!(globals.contains_key("AbortController"));
+        assert!(globals.contains_key("AbortSignal"));
     }
 
     #[test]
@@ -17167,6 +17212,43 @@ mod tests {
         );
         assert_eval_type_error("URLSearchParams('x=1')");
         assert_eval_type_error("new URLSearchParams('x=1')");
+    }
+
+    #[test]
+    fn e2e_event_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof Event === 'function' && Event.name === 'Event'");
+        assert_eval_type_error("Event('click')");
+        assert_eval_type_error("new Event('click')");
+    }
+
+    #[test]
+    fn e2e_custom_event_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'");
+        assert_eval_type_error("CustomEvent('x')");
+        assert_eval_type_error("new CustomEvent('x', { detail: 1 })");
+    }
+
+    #[test]
+    fn e2e_event_target_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof EventTarget === 'function' && EventTarget.name === 'EventTarget'");
+        assert_eval_type_error("EventTarget()");
+        assert_eval_type_error("new EventTarget()");
+    }
+
+    #[test]
+    fn e2e_abort_controller_constructor_exists_but_fails_closed() {
+        assert_eval_true(
+            "typeof AbortController === 'function' && AbortController.name === 'AbortController'",
+        );
+        assert_eval_type_error("AbortController()");
+        assert_eval_type_error("new AbortController()");
+    }
+
+    #[test]
+    fn e2e_abort_signal_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof AbortSignal === 'function' && AbortSignal.name === 'AbortSignal'");
+        assert_eval_type_error("AbortSignal()");
+        assert_eval_type_error("new AbortSignal()");
     }
 
     #[test]
