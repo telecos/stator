@@ -3597,6 +3597,14 @@ fn make_unsupported_web_constructor(name: &'static str) -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+fn make_unsupported_web_function(name: &'static str, length: i32) -> JsValue {
+    builtin_fn(name, length, move |_args| {
+        Err(StatorError::TypeError(format!(
+            "{name}: web platform feature is not implemented"
+        )))
+    })
+}
+
 /// Format 16 bytes as a lowercase RFC 4122 / 9562 UUID string
 /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Caller is responsible
 /// for setting the version and variant bits in `bytes`.
@@ -16957,11 +16965,19 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
         globals.insert(
             "setTimeout".into(),
-            builtin_fn("setTimeout", 1, |_args| Ok(JsValue::Smi(1))),
+            make_unsupported_web_function("setTimeout", 1),
         );
         globals.insert(
             "clearTimeout".into(),
-            builtin_fn("clearTimeout", 1, |_args| Ok(JsValue::Undefined)),
+            make_unsupported_web_function("clearTimeout", 1),
+        );
+        globals.insert(
+            "setInterval".into(),
+            make_unsupported_web_function("setInterval", 1),
+        );
+        globals.insert(
+            "clearInterval".into(),
+            make_unsupported_web_function("clearInterval", 1),
         );
         globals.insert("crypto".into(), make_crypto());
 
@@ -17128,6 +17144,8 @@ mod tests {
         assert!(globals.contains_key("queueMicrotask"));
         assert!(globals.contains_key("setTimeout"));
         assert!(globals.contains_key("clearTimeout"));
+        assert!(globals.contains_key("setInterval"));
+        assert!(globals.contains_key("clearInterval"));
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
         assert!(globals.contains_key("URLSearchParams"));
@@ -38137,14 +38155,42 @@ mod tests {
     }
 
     #[test]
-    fn e2e_set_timeout_stub_returns_number() {
-        assert_eval_true("typeof setTimeout(function () {}, 0) === 'number'");
+    fn e2e_set_interval_exists() {
+        assert_eval_true("typeof setInterval === 'function'");
     }
 
     #[test]
-    fn e2e_clear_timeout_stub_does_not_throw() {
+    fn e2e_clear_interval_exists() {
+        assert_eval_true("typeof clearInterval === 'function'");
+    }
+
+    #[test]
+    fn e2e_set_timeout_fails_closed() {
+        assert_eval_type_error("setTimeout(function () {}, 0)");
+    }
+
+    #[test]
+    fn e2e_clear_timeout_fails_closed() {
+        assert_eval_type_error("clearTimeout(1)");
+    }
+
+    #[test]
+    fn e2e_set_interval_fails_closed() {
+        assert_eval_type_error("setInterval(function () {}, 0)");
+    }
+
+    #[test]
+    fn e2e_clear_interval_fails_closed() {
+        assert_eval_type_error("clearInterval(1)");
+    }
+
+    #[test]
+    fn e2e_timer_globals_do_not_run_callbacks_without_event_loop_integration() {
         assert_eval_true(
-            "try { clearTimeout(setTimeout(function () {}, 0)); true; } catch (e) { false; }",
+            "var ran = false; try { setTimeout(function () { ran = true; }, 0); } catch (e) {} ran === false",
+        );
+        assert_eval_true(
+            "var intervalRan = false; try { setInterval(function () { intervalRan = true; }, 0); } catch (e) {} intervalRan === false",
         );
     }
 
