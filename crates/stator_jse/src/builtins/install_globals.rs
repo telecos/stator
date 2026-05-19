@@ -17404,6 +17404,77 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── Reporting / push / background delivery APIs (fail-closed) ───────
+        //
+        // Reporting observers and report bodies require browser policy state,
+        // a document/worker reporting pipeline, and host delivery to endpoints.
+        // Push, background sync, and background fetch require service-worker
+        // registration, permissions, subscriptions, network queues, and host
+        // lifecycle integration. Expose Chromium-compatible constructors and
+        // prototype methods that page scripts commonly feature-detect, but
+        // reject every operation instead of fabricating delivery, permission,
+        // subscription, or background-task success.
+        for (name, methods) in [
+            (
+                "ReportingObserver",
+                &[("observe", 0), ("disconnect", 0), ("takeRecords", 0)][..],
+            ),
+            ("Report", &[("toJSON", 0)][..]),
+            ("ReportBody", &[("toJSON", 0)][..]),
+            ("DeprecationReportBody", &[("toJSON", 0)][..]),
+            ("InterventionReportBody", &[("toJSON", 0)][..]),
+            ("CrashReportBody", &[("toJSON", 0)][..]),
+            ("CSPViolationReportBody", &[("toJSON", 0)][..]),
+            ("DocumentPolicyViolationReportBody", &[("toJSON", 0)][..]),
+            ("PermissionsPolicyViolationReportBody", &[("toJSON", 0)][..]),
+            (
+                "PushManager",
+                &[
+                    ("subscribe", 1),
+                    ("getSubscription", 0),
+                    ("permissionState", 1),
+                ][..],
+            ),
+            ("PushSubscription", &[("unsubscribe", 0), ("toJSON", 0)][..]),
+            ("PushSubscriptionOptions", &[][..]),
+            ("PushEvent", &[][..]),
+            (
+                "PushMessageData",
+                &[
+                    ("arrayBuffer", 0),
+                    ("blob", 0),
+                    ("bytes", 0),
+                    ("json", 0),
+                    ("text", 0),
+                ][..],
+            ),
+            ("NotificationEvent", &[][..]),
+            ("SyncManager", &[("register", 1), ("getTags", 0)][..]),
+            (
+                "PeriodicSyncManager",
+                &[("register", 2), ("getTags", 0), ("unregister", 1)][..],
+            ),
+            (
+                "BackgroundFetchManager",
+                &[("fetch", 3), ("get", 1), ("getIds", 0)][..],
+            ),
+            (
+                "BackgroundFetchRegistration",
+                &[("abort", 0), ("match", 2), ("matchAll", 1), ("updateUI", 1)][..],
+            ),
+            ("BackgroundFetchRecord", &[][..]),
+            ("BackgroundFetchEvent", &[][..]),
+            ("BackgroundFetchUpdateUIEvent", &[][..]),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, &[][..]),
+                    name,
+                ),
+            );
+        }
+
         // ── Device / permission / platform host-integrated APIs (fail-closed)
         //
         // Notifications, Permissions, Clipboard events, Device sensors,
@@ -18145,6 +18216,28 @@ mod tests {
         assert!(globals.contains_key("MessageChannel"));
         assert!(globals.contains_key("MessagePort"));
         assert!(globals.contains_key("BroadcastChannel"));
+        assert!(globals.contains_key("ReportingObserver"));
+        assert!(globals.contains_key("Report"));
+        assert!(globals.contains_key("ReportBody"));
+        assert!(globals.contains_key("DeprecationReportBody"));
+        assert!(globals.contains_key("InterventionReportBody"));
+        assert!(globals.contains_key("CrashReportBody"));
+        assert!(globals.contains_key("CSPViolationReportBody"));
+        assert!(globals.contains_key("DocumentPolicyViolationReportBody"));
+        assert!(globals.contains_key("PermissionsPolicyViolationReportBody"));
+        assert!(globals.contains_key("PushManager"));
+        assert!(globals.contains_key("PushSubscription"));
+        assert!(globals.contains_key("PushSubscriptionOptions"));
+        assert!(globals.contains_key("PushEvent"));
+        assert!(globals.contains_key("PushMessageData"));
+        assert!(globals.contains_key("NotificationEvent"));
+        assert!(globals.contains_key("SyncManager"));
+        assert!(globals.contains_key("PeriodicSyncManager"));
+        assert!(globals.contains_key("BackgroundFetchManager"));
+        assert!(globals.contains_key("BackgroundFetchRegistration"));
+        assert!(globals.contains_key("BackgroundFetchRecord"));
+        assert!(globals.contains_key("BackgroundFetchEvent"));
+        assert!(globals.contains_key("BackgroundFetchUpdateUIEvent"));
         assert!(globals.contains_key("Notification"));
         assert!(globals.contains_key("Permissions"));
         assert!(globals.contains_key("PermissionStatus"));
@@ -19303,6 +19396,155 @@ mod tests {
         assert_eval_type_error("new MessageChannel()");
         assert_eval_type_error("new MessagePort()");
         assert_eval_type_error("new BroadcastChannel('edge-stator')");
+    }
+
+    #[test]
+    fn e2e_reporting_background_delivery_constructors_exist_but_fail_closed() {
+        for name in [
+            "ReportingObserver",
+            "Report",
+            "ReportBody",
+            "DeprecationReportBody",
+            "InterventionReportBody",
+            "CrashReportBody",
+            "CSPViolationReportBody",
+            "DocumentPolicyViolationReportBody",
+            "PermissionsPolicyViolationReportBody",
+            "PushManager",
+            "PushSubscription",
+            "PushSubscriptionOptions",
+            "PushEvent",
+            "PushMessageData",
+            "NotificationEvent",
+            "SyncManager",
+            "PeriodicSyncManager",
+            "BackgroundFetchManager",
+            "BackgroundFetchRegistration",
+            "BackgroundFetchRecord",
+            "BackgroundFetchEvent",
+            "BackgroundFetchUpdateUIEvent",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new ReportingObserver(function () {})");
+        assert_eval_type_error("new Report()");
+        assert_eval_type_error("new ReportBody()");
+        assert_eval_type_error("new DeprecationReportBody()");
+        assert_eval_type_error("new InterventionReportBody()");
+        assert_eval_type_error("new CrashReportBody()");
+        assert_eval_type_error("new CSPViolationReportBody()");
+        assert_eval_type_error("new DocumentPolicyViolationReportBody()");
+        assert_eval_type_error("new PermissionsPolicyViolationReportBody()");
+        assert_eval_type_error("new PushManager()");
+        assert_eval_type_error("new PushSubscription()");
+        assert_eval_type_error("new PushSubscriptionOptions()");
+        assert_eval_type_error("new PushEvent('push')");
+        assert_eval_type_error("new PushMessageData()");
+        assert_eval_type_error("new NotificationEvent('notificationclick')");
+        assert_eval_type_error("new SyncManager()");
+        assert_eval_type_error("new PeriodicSyncManager()");
+        assert_eval_type_error("new BackgroundFetchManager()");
+        assert_eval_type_error("new BackgroundFetchRegistration()");
+        assert_eval_type_error("new BackgroundFetchRecord()");
+        assert_eval_type_error("new BackgroundFetchEvent('backgroundfetchsuccess')");
+        assert_eval_type_error("new BackgroundFetchUpdateUIEvent('backgroundfetchsuccess')");
+    }
+
+    #[test]
+    fn e2e_reporting_background_delivery_methods_fail_closed() {
+        assert_eval_true("typeof ReportingObserver.prototype.observe === 'function'");
+        assert_eval_true("typeof ReportingObserver.prototype.disconnect === 'function'");
+        assert_eval_true("typeof ReportingObserver.prototype.takeRecords === 'function'");
+        assert_eval_type_error("ReportingObserver.prototype.observe.call({})");
+        assert_eval_type_error("ReportingObserver.prototype.disconnect.call({})");
+        assert_eval_type_error("ReportingObserver.prototype.takeRecords.call({})");
+
+        assert_eval_true("typeof Report.prototype.toJSON === 'function'");
+        assert_eval_true("typeof ReportBody.prototype.toJSON === 'function'");
+        assert_eval_true("typeof DeprecationReportBody.prototype.toJSON === 'function'");
+        assert_eval_true("typeof InterventionReportBody.prototype.toJSON === 'function'");
+        assert_eval_true("typeof CrashReportBody.prototype.toJSON === 'function'");
+        assert_eval_true("typeof CSPViolationReportBody.prototype.toJSON === 'function'");
+        assert_eval_true(
+            "typeof DocumentPolicyViolationReportBody.prototype.toJSON === 'function'",
+        );
+        assert_eval_true(
+            "typeof PermissionsPolicyViolationReportBody.prototype.toJSON === 'function'",
+        );
+        assert_eval_type_error("Report.prototype.toJSON.call({})");
+        assert_eval_type_error("ReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("DeprecationReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("InterventionReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("CrashReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("CSPViolationReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("DocumentPolicyViolationReportBody.prototype.toJSON.call({})");
+        assert_eval_type_error("PermissionsPolicyViolationReportBody.prototype.toJSON.call({})");
+
+        assert_eval_true("typeof PushManager.prototype.subscribe === 'function'");
+        assert_eval_true("typeof PushManager.prototype.getSubscription === 'function'");
+        assert_eval_true("typeof PushManager.prototype.permissionState === 'function'");
+        assert_eval_type_error("PushManager.prototype.subscribe.call({}, {})");
+        assert_eval_type_error("PushManager.prototype.getSubscription.call({})");
+        assert_eval_type_error("PushManager.prototype.permissionState.call({}, {})");
+
+        assert_eval_true("typeof PushSubscription.prototype.unsubscribe === 'function'");
+        assert_eval_true("typeof PushSubscription.prototype.toJSON === 'function'");
+        assert_eval_type_error("PushSubscription.prototype.unsubscribe.call({})");
+        assert_eval_type_error("PushSubscription.prototype.toJSON.call({})");
+
+        assert_eval_true("typeof PushMessageData.prototype.arrayBuffer === 'function'");
+        assert_eval_true("typeof PushMessageData.prototype.blob === 'function'");
+        assert_eval_true("typeof PushMessageData.prototype.bytes === 'function'");
+        assert_eval_true("typeof PushMessageData.prototype.json === 'function'");
+        assert_eval_true("typeof PushMessageData.prototype.text === 'function'");
+        assert_eval_type_error("PushMessageData.prototype.arrayBuffer.call({})");
+        assert_eval_type_error("PushMessageData.prototype.blob.call({})");
+        assert_eval_type_error("PushMessageData.prototype.bytes.call({})");
+        assert_eval_type_error("PushMessageData.prototype.json.call({})");
+        assert_eval_type_error("PushMessageData.prototype.text.call({})");
+
+        assert_eval_true("typeof SyncManager.prototype.register === 'function'");
+        assert_eval_true("typeof SyncManager.prototype.getTags === 'function'");
+        assert_eval_type_error("SyncManager.prototype.register.call({}, 'sync-tag')");
+        assert_eval_type_error("SyncManager.prototype.getTags.call({})");
+
+        assert_eval_true("typeof PeriodicSyncManager.prototype.register === 'function'");
+        assert_eval_true("typeof PeriodicSyncManager.prototype.getTags === 'function'");
+        assert_eval_true("typeof PeriodicSyncManager.prototype.unregister === 'function'");
+        assert_eval_type_error("PeriodicSyncManager.prototype.register.call({}, 'sync-tag', {})");
+        assert_eval_type_error("PeriodicSyncManager.prototype.getTags.call({})");
+        assert_eval_type_error("PeriodicSyncManager.prototype.unregister.call({}, 'sync-tag')");
+
+        assert_eval_true("typeof BackgroundFetchManager.prototype.fetch === 'function'");
+        assert_eval_true("typeof BackgroundFetchManager.prototype.get === 'function'");
+        assert_eval_true("typeof BackgroundFetchManager.prototype.getIds === 'function'");
+        assert_eval_type_error("BackgroundFetchManager.prototype.fetch.call({}, 'job', ['/a'])");
+        assert_eval_type_error("BackgroundFetchManager.prototype.get.call({}, 'job')");
+        assert_eval_type_error("BackgroundFetchManager.prototype.getIds.call({})");
+
+        assert_eval_true("typeof BackgroundFetchRegistration.prototype.abort === 'function'");
+        assert_eval_true("typeof BackgroundFetchRegistration.prototype.match === 'function'");
+        assert_eval_true("typeof BackgroundFetchRegistration.prototype.matchAll === 'function'");
+        assert_eval_true("typeof BackgroundFetchRegistration.prototype.updateUI === 'function'");
+        assert_eval_type_error("BackgroundFetchRegistration.prototype.abort.call({})");
+        assert_eval_type_error("BackgroundFetchRegistration.prototype.match.call({}, '/a')");
+        assert_eval_type_error("BackgroundFetchRegistration.prototype.matchAll.call({})");
+        assert_eval_type_error("BackgroundFetchRegistration.prototype.updateUI.call({}, {})");
+    }
+
+    /// `navigator.sendBeacon`, `navigator.serviceWorker`, and registration-
+    /// vended managers (`pushManager`, `sync`, `periodicSync`,
+    /// `backgroundFetch`) remain absent because the standalone engine does not
+    /// preinstall `navigator` or service-worker registration objects.
+    #[test]
+    fn e2e_beacon_and_background_entry_points_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
+        assert_eval_true("typeof serviceWorkerRegistration === 'undefined'");
+        assert_eval_true("typeof Beacon === 'undefined'");
     }
 
     /// DOM UI / input / pointer / drag / touch / lifecycle event constructor
