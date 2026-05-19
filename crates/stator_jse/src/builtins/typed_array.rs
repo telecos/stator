@@ -367,8 +367,17 @@ pub struct JsDataView {
     pub buffer: Rc<RefCell<JsArrayBuffer>>,
     /// Byte offset into the buffer.
     pub byte_offset: usize,
-    /// The length in bytes of the view.
+    /// The length in bytes of the view, ignored when [`auto_length`] is true.
+    ///
+    /// [`auto_length`]: Self::auto_length
     pub byte_length: usize,
+    /// Whether this view auto-tracks the underlying buffer's length.
+    ///
+    /// Set when the `DataView` constructor is invoked with an omitted
+    /// `byteLength` over a resizable or growable buffer (ECMAScript §25.3.2.1
+    /// step 11.b). The view's effective byte length is then
+    /// `buffer.byteLength − byteOffset`, recomputed on every observation.
+    pub auto_length: bool,
 }
 
 /// ECMAScript §25.3.2.1 `new DataView(buffer, byteOffset?, byteLength?)`.
@@ -381,26 +390,36 @@ pub fn dataview_new(
     byte_offset: usize,
     byte_length: Option<usize>,
 ) -> StatorResult<JsDataView> {
-    let buf_len = {
+    let (buf_len, is_resizable_or_growable) = {
         let buffer_ref = buffer.borrow();
         if buffer_ref.detached {
             return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
         }
-        buffer_ref.data.len()
+        (buffer_ref.data.len(), buffer_ref.max_byte_length.is_some())
     };
     if byte_offset > buf_len {
         return Err(StatorError::RangeError(
             "Start offset is outside the bounds of the buffer".into(),
         ));
     }
-    let len = byte_length.unwrap_or(buf_len - byte_offset);
-    if byte_offset + len > buf_len {
-        return Err(StatorError::RangeError("Invalid DataView length".into()));
-    }
+    // Per ECMAScript §25.3.2.1 step 11, an omitted `byteLength` over a
+    // resizable/growable buffer yields an auto-tracking view; otherwise the
+    // length is captured at construction.
+    let (len, auto_length) = match byte_length {
+        Some(explicit) => {
+            if byte_offset + explicit > buf_len {
+                return Err(StatorError::RangeError("Invalid DataView length".into()));
+            }
+            (explicit, false)
+        }
+        None if is_resizable_or_growable => (0, true),
+        None => (buf_len - byte_offset, false),
+    };
     Ok(JsDataView {
         buffer,
         byte_offset,
         byte_length: len,
+        auto_length,
     })
 }
 
@@ -412,7 +431,12 @@ pub fn dataview_buffer(dv: &JsDataView) -> Rc<RefCell<JsArrayBuffer>> {
 /// `DataView.prototype.byteLength` getter.
 pub fn dataview_byte_length(dv: &JsDataView) -> StatorResult<usize> {
     dataview_validate_view(dv)?;
-    Ok(dv.byte_length)
+    if dv.auto_length {
+        let buf_len = dv.buffer.borrow().data.len();
+        Ok(buf_len - dv.byte_offset)
+    } else {
+        Ok(dv.byte_length)
+    }
 }
 
 /// `DataView.prototype.byteOffset` getter.
@@ -426,11 +450,16 @@ fn dataview_validate_view(dv: &JsDataView) -> StatorResult<()> {
     if buf.detached {
         return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
     }
-    let Some(view_end) = dv.byte_offset.checked_add(dv.byte_length) else {
+    if dv.byte_offset > buf.data.len() {
         return Err(StatorError::TypeError("DataView is out of bounds".into()));
-    };
-    if view_end > buf.data.len() {
-        return Err(StatorError::TypeError("DataView is out of bounds".into()));
+    }
+    if !dv.auto_length {
+        let Some(view_end) = dv.byte_offset.checked_add(dv.byte_length) else {
+            return Err(StatorError::TypeError("DataView is out of bounds".into()));
+        };
+        if view_end > buf.data.len() {
+            return Err(StatorError::TypeError("DataView is out of bounds".into()));
+        }
     }
     Ok(())
 }
@@ -442,7 +471,12 @@ fn dataview_resolve_range(dv: &JsDataView, byte_offset: usize, size: usize) -> S
             "Offset is outside the bounds of the DataView".into(),
         ));
     };
-    if end > dv.byte_length {
+    let effective_len = if dv.auto_length {
+        dv.buffer.borrow().data.len() - dv.byte_offset
+    } else {
+        dv.byte_length
+    };
+    if end > effective_len {
         return Err(StatorError::RangeError(
             "Offset is outside the bounds of the DataView".into(),
         ));

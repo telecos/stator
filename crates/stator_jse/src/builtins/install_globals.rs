@@ -41164,6 +41164,69 @@ mod tests {
     }
 
     #[test]
+    fn e2e_dataview_auto_length_tracks_buffer_growth() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var dv = new DataView(buf); buf.resize(6); dv.byteLength === 6 && dv.byteOffset === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_auto_length_tracks_buffer_shrink() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(6, { maxByteLength: 8 }); var dv = new DataView(buf, 2); buf.resize(4); dv.byteLength === 2 && dv.byteOffset === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_explicit_length_does_not_auto_track() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var dv = new DataView(buf, 0, 4); buf.resize(6); dv.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_auto_length_get_uses_live_buffer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(2, { maxByteLength: 8 }); var dv = new DataView(buf); buf.resize(4); dv.setUint8(3, 0xAB); dv.getUint8(3) === 0xAB",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_auto_length_get_before_growth_is_oob() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(2, { maxByteLength: 8 }); var dv = new DataView(buf); try { dv.getUint8(2); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_explicit_length_becomes_oob_on_shrink() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var dv = new DataView(buf, 0, 8); buf.resize(4); try { dv.byteLength; false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_offset_becomes_oob_when_shrunk_below_offset() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var dv = new DataView(buf, 6); buf.resize(4); try { dv.byteOffset; false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_auto_length_over_fixed_buffer_is_snapshot() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4); var dv = new DataView(buf); dv.byteLength === 4 && dv.byteOffset === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_auto_length_on_growable_shared_buffer() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var dv = new DataView(sab); sab.grow(8); dv.byteLength === 8",
+        );
+    }
+
+    #[test]
     fn e2e_shared_arraybuffer_constructor_allocates_length() {
         assert_eval_true("new SharedArrayBuffer(6).byteLength === 6");
     }
