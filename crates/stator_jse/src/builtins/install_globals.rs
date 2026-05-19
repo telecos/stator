@@ -3665,6 +3665,30 @@ fn make_unsupported_node_filter_constructor() -> JsValue {
     ctor
 }
 
+fn make_unsupported_idb_key_range_constructor() -> JsValue {
+    let ctor = make_unsupported_web_constructor_with_prototype(
+        "IDBKeyRange",
+        &[("includes", 1)][..],
+        &[][..],
+    );
+    if let JsValue::PlainObject(ref rc) = ctor {
+        let mut props = rc.borrow_mut();
+        for (method, length) in [
+            ("only", 1),
+            ("lowerBound", 2),
+            ("upperBound", 2),
+            ("bound", 4),
+        ] {
+            props.insert(
+                method.into(),
+                make_unsupported_web_function("IDBKeyRange", length),
+            );
+        }
+        props.make_all_non_enumerable();
+    }
+    ctor
+}
+
 fn make_unsupported_url_constructor() -> JsValue {
     let ctor = make_unsupported_web_constructor("URL");
     if let JsValue::PlainObject(ref rc) = ctor {
@@ -16657,6 +16681,199 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             make_unsupported_storage_object("sessionStorage"),
         );
 
+        // ── Storage / database / cache / cookies (fail-closed) ──────────────
+        //
+        // IndexedDB, the Cache API, the Cookie Store, and the Storage / quota
+        // / bucket APIs are host-integrated. Real behavior requires an
+        // origin, a backing key-value/blob store, durable on-disk persistence,
+        // quota and bucket bookkeeping, transaction lifetimes, request/event
+        // dispatch, an HTTP cache layer with `Request`/`Response` integration,
+        // and a cookie jar with same-site/secure semantics. This standalone
+        // engine has none of those, so expose the Chromium-style
+        // constructor/prototype names that page scripts feature-detect and
+        // reject every operation rather than pretending data was stored.
+        // Navigator-only entry points (`navigator.storage`,
+        // `navigator.cookieStore`, `navigator.storageBuckets`) remain absent
+        // because the standalone engine does not preinstall `navigator`.
+        for (name, methods, constants) in [
+            (
+                "IDBFactory",
+                &[
+                    ("open", 2),
+                    ("deleteDatabase", 1),
+                    ("databases", 0),
+                    ("cmp", 2),
+                ][..],
+                &[][..],
+            ),
+            ("IDBRequest", &[][..], &[][..]),
+            ("IDBOpenDBRequest", &[][..], &[][..]),
+            (
+                "IDBDatabase",
+                &[
+                    ("close", 0),
+                    ("createObjectStore", 2),
+                    ("deleteObjectStore", 1),
+                    ("transaction", 3),
+                ][..],
+                &[][..],
+            ),
+            (
+                "IDBTransaction",
+                &[("abort", 0), ("commit", 0), ("objectStore", 1)][..],
+                &[][..],
+            ),
+            (
+                "IDBObjectStore",
+                &[
+                    ("add", 2),
+                    ("put", 2),
+                    ("get", 1),
+                    ("getKey", 1),
+                    ("getAll", 2),
+                    ("getAllKeys", 2),
+                    ("delete", 1),
+                    ("clear", 0),
+                    ("count", 1),
+                    ("createIndex", 3),
+                    ("deleteIndex", 1),
+                    ("index", 1),
+                    ("openCursor", 2),
+                    ("openKeyCursor", 2),
+                ][..],
+                &[][..],
+            ),
+            (
+                "IDBIndex",
+                &[
+                    ("get", 1),
+                    ("getKey", 1),
+                    ("getAll", 2),
+                    ("getAllKeys", 2),
+                    ("count", 1),
+                    ("openCursor", 2),
+                    ("openKeyCursor", 2),
+                ][..],
+                &[][..],
+            ),
+            (
+                "IDBCursor",
+                &[
+                    ("advance", 1),
+                    ("continue", 1),
+                    ("continuePrimaryKey", 2),
+                    ("update", 1),
+                    ("delete", 0),
+                ][..],
+                &[][..],
+            ),
+            ("IDBCursorWithValue", &[][..], &[][..]),
+            ("IDBVersionChangeEvent", &[][..], &[][..]),
+            (
+                "CacheStorage",
+                &[
+                    ("open", 1),
+                    ("match", 2),
+                    ("has", 1),
+                    ("delete", 1),
+                    ("keys", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "Cache",
+                &[
+                    ("match", 2),
+                    ("matchAll", 2),
+                    ("add", 1),
+                    ("addAll", 1),
+                    ("put", 2),
+                    ("delete", 2),
+                    ("keys", 2),
+                ][..],
+                &[][..],
+            ),
+            (
+                "CookieStore",
+                &[("get", 1), ("getAll", 1), ("set", 2), ("delete", 1)][..],
+                &[][..],
+            ),
+            ("CookieChangeEvent", &[][..], &[][..]),
+            (
+                "CookieStoreManager",
+                &[
+                    ("subscribe", 1),
+                    ("getSubscriptions", 0),
+                    ("unsubscribe", 1),
+                ][..],
+                &[][..],
+            ),
+            (
+                "StorageManager",
+                &[
+                    ("persist", 0),
+                    ("persisted", 0),
+                    ("estimate", 0),
+                    ("getDirectory", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "StorageBucket",
+                &[
+                    ("persist", 0),
+                    ("persisted", 0),
+                    ("estimate", 0),
+                    ("setExpires", 1),
+                    ("expires", 0),
+                    ("getDirectory", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "StorageBucketManager",
+                &[("open", 2), ("keys", 0), ("delete", 1)][..],
+                &[][..],
+            ),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, constants),
+                    name,
+                ),
+            );
+        }
+        globals.insert(
+            "IDBKeyRange".into(),
+            finalize_ctor(make_unsupported_idb_key_range_constructor(), "IDBKeyRange"),
+        );
+        globals.insert(
+            "indexedDB".into(),
+            make_unsupported_web_object(
+                "indexedDB",
+                &[
+                    ("open", 2),
+                    ("deleteDatabase", 1),
+                    ("databases", 0),
+                    ("cmp", 2),
+                ],
+            ),
+        );
+        globals.insert(
+            "caches".into(),
+            make_unsupported_web_object(
+                "caches",
+                &[
+                    ("open", 1),
+                    ("match", 2),
+                    ("has", 1),
+                    ("delete", 1),
+                    ("keys", 0),
+                ],
+            ),
+        );
+
         // ── Navigation (location / history, fail-closed) ────────────────────
         // `location` and `history` are host-integrated browser globals that
         // mutate the navigation state of a hosting document. This standalone
@@ -17865,6 +18082,27 @@ mod tests {
         assert!(globals.contains_key("Storage"));
         assert!(globals.contains_key("localStorage"));
         assert!(globals.contains_key("sessionStorage"));
+        assert!(globals.contains_key("IDBFactory"));
+        assert!(globals.contains_key("IDBRequest"));
+        assert!(globals.contains_key("IDBOpenDBRequest"));
+        assert!(globals.contains_key("IDBDatabase"));
+        assert!(globals.contains_key("IDBTransaction"));
+        assert!(globals.contains_key("IDBObjectStore"));
+        assert!(globals.contains_key("IDBIndex"));
+        assert!(globals.contains_key("IDBCursor"));
+        assert!(globals.contains_key("IDBCursorWithValue"));
+        assert!(globals.contains_key("IDBKeyRange"));
+        assert!(globals.contains_key("IDBVersionChangeEvent"));
+        assert!(globals.contains_key("indexedDB"));
+        assert!(globals.contains_key("CacheStorage"));
+        assert!(globals.contains_key("Cache"));
+        assert!(globals.contains_key("caches"));
+        assert!(globals.contains_key("CookieStore"));
+        assert!(globals.contains_key("CookieChangeEvent"));
+        assert!(globals.contains_key("CookieStoreManager"));
+        assert!(globals.contains_key("StorageManager"));
+        assert!(globals.contains_key("StorageBucket"));
+        assert!(globals.contains_key("StorageBucketManager"));
         assert!(globals.contains_key("TextEncoder"));
         assert!(globals.contains_key("TextDecoder"));
         assert!(globals.contains_key("Event"));
@@ -18457,6 +18695,115 @@ mod tests {
         assert_eval_type_error("sessionStorage.removeItem('edge-stator')");
         assert_eval_type_error("sessionStorage.clear()");
         assert_eval_type_error("sessionStorage.key(0)");
+    }
+
+    #[test]
+    fn e2e_database_storage_constructors_exist_but_fail_closed() {
+        for name in [
+            "IDBFactory",
+            "IDBRequest",
+            "IDBOpenDBRequest",
+            "IDBDatabase",
+            "IDBTransaction",
+            "IDBObjectStore",
+            "IDBIndex",
+            "IDBCursor",
+            "IDBCursorWithValue",
+            "IDBKeyRange",
+            "IDBVersionChangeEvent",
+            "CacheStorage",
+            "Cache",
+            "CookieStore",
+            "CookieChangeEvent",
+            "CookieStoreManager",
+            "StorageManager",
+            "StorageBucket",
+            "StorageBucketManager",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_true(&format!("typeof {name}.prototype === 'object'"));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_true("typeof IDBFactory.prototype.open === 'function'");
+        assert_eval_true("typeof IDBFactory.prototype.deleteDatabase === 'function'");
+        assert_eval_true("typeof IDBFactory.prototype.databases === 'function'");
+        assert_eval_true("typeof IDBFactory.prototype.cmp === 'function'");
+        assert_eval_true("typeof IDBDatabase.prototype.transaction === 'function'");
+        assert_eval_true("typeof IDBDatabase.prototype.createObjectStore === 'function'");
+        assert_eval_true("typeof IDBTransaction.prototype.objectStore === 'function'");
+        assert_eval_true("typeof IDBObjectStore.prototype.put === 'function'");
+        assert_eval_true("typeof IDBObjectStore.prototype.openCursor === 'function'");
+        assert_eval_true("typeof IDBIndex.prototype.getAll === 'function'");
+        assert_eval_true("typeof IDBCursor.prototype.continue === 'function'");
+        assert_eval_true("typeof IDBKeyRange.prototype.includes === 'function'");
+        assert_eval_true("typeof IDBKeyRange.only === 'function'");
+        assert_eval_true("typeof IDBKeyRange.lowerBound === 'function'");
+        assert_eval_true("typeof IDBKeyRange.upperBound === 'function'");
+        assert_eval_true("typeof IDBKeyRange.bound === 'function'");
+        assert_eval_true("typeof CacheStorage.prototype.open === 'function'");
+        assert_eval_true("typeof Cache.prototype.match === 'function'");
+        assert_eval_true("typeof Cache.prototype.put === 'function'");
+        assert_eval_true("typeof CookieStore.prototype.get === 'function'");
+        assert_eval_true("typeof CookieStoreManager.prototype.subscribe === 'function'");
+        assert_eval_true("typeof StorageManager.prototype.estimate === 'function'");
+        assert_eval_true("typeof StorageManager.prototype.getDirectory === 'function'");
+        assert_eval_true("typeof StorageBucket.prototype.persist === 'function'");
+        assert_eval_true("typeof StorageBucketManager.prototype.open === 'function'");
+
+        assert_eval_type_error("IDBFactory.prototype.open.call({}, 'db', 1)");
+        assert_eval_type_error("IDBFactory.prototype.deleteDatabase.call({}, 'db')");
+        assert_eval_type_error("IDBFactory.prototype.databases.call({})");
+        assert_eval_type_error("IDBFactory.prototype.cmp.call({}, 1, 2)");
+        assert_eval_type_error("IDBDatabase.prototype.transaction.call({}, 'store')");
+        assert_eval_type_error("IDBDatabase.prototype.createObjectStore.call({}, 'store')");
+        assert_eval_type_error("IDBTransaction.prototype.objectStore.call({}, 'store')");
+        assert_eval_type_error("IDBObjectStore.prototype.put.call({}, { id: 1 })");
+        assert_eval_type_error("IDBObjectStore.prototype.openCursor.call({})");
+        assert_eval_type_error("IDBIndex.prototype.getAll.call({})");
+        assert_eval_type_error("IDBCursor.prototype.continue.call({})");
+        assert_eval_type_error("IDBKeyRange.prototype.includes.call({}, 1)");
+        assert_eval_type_error("IDBKeyRange.only(1)");
+        assert_eval_type_error("IDBKeyRange.lowerBound(1)");
+        assert_eval_type_error("IDBKeyRange.upperBound(1)");
+        assert_eval_type_error("IDBKeyRange.bound(1, 2)");
+        assert_eval_type_error("CacheStorage.prototype.open.call({}, 'v1')");
+        assert_eval_type_error("Cache.prototype.match.call({}, 'https://example.test/')");
+        assert_eval_type_error("Cache.prototype.put.call({}, 'https://example.test/', {})");
+        assert_eval_type_error("CookieStore.prototype.get.call({}, 'sid')");
+        assert_eval_type_error("CookieStoreManager.prototype.subscribe.call({}, [])");
+        assert_eval_type_error("StorageManager.prototype.estimate.call({})");
+        assert_eval_type_error("StorageManager.prototype.getDirectory.call({})");
+        assert_eval_type_error("StorageBucket.prototype.persist.call({})");
+        assert_eval_type_error("StorageBucketManager.prototype.open.call({}, 'b')");
+    }
+
+    #[test]
+    fn e2e_database_storage_singletons_exist_but_fail_closed() {
+        assert_eval_true("typeof indexedDB === 'object' && indexedDB !== null");
+        assert_eval_true("typeof caches === 'object' && caches !== null");
+        assert_eval_true("indexedDB !== caches");
+        assert_eval_type_error("indexedDB.open('edge-stator', 1)");
+        assert_eval_type_error("indexedDB.deleteDatabase('edge-stator')");
+        assert_eval_type_error("indexedDB.databases()");
+        assert_eval_type_error("indexedDB.cmp(1, 2)");
+        assert_eval_type_error("caches.open('edge-stator-v1')");
+        assert_eval_type_error("caches.match('https://example.test/')");
+        assert_eval_type_error("caches.has('edge-stator-v1')");
+        assert_eval_type_error("caches.delete('edge-stator-v1')");
+        assert_eval_type_error("caches.keys()");
+    }
+
+    /// `navigator` itself is intentionally not preinstalled by the standalone
+    /// engine, so `navigator.storage`, `navigator.cookieStore`, and
+    /// `navigator.storageBuckets` all remain absent. Exposing fake navigator
+    /// accessors would shadow real bindings supplied by a hosting browser.
+    #[test]
+    fn e2e_navigator_database_storage_entry_points_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
     }
 
     #[test]
