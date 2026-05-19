@@ -276,7 +276,16 @@ pub fn arraybuffer_transfer(
 
     let old_len = buf.data.len();
     let target_len = new_byte_length.unwrap_or(old_len);
-    if let Some(max_byte_length) = buf.max_byte_length
+    // ECMA-262 §25.1.3.4 ArrayBufferCopyAndDetach + §25.1.3.1 AllocateArrayBuffer:
+    // only when the new buffer preserves resizability (transfer, not
+    // transferToFixedLength) does the source's maxByteLength bound the new
+    // byte length. A fixed-length transfer may grow past the source's max.
+    let new_max_byte_length = if to_fixed_length {
+        None
+    } else {
+        buf.max_byte_length
+    };
+    if let Some(max_byte_length) = new_max_byte_length
         && target_len > max_byte_length
     {
         return Err(StatorError::RangeError(
@@ -290,11 +299,7 @@ pub fn arraybuffer_transfer(
 
     let transferred = JsArrayBuffer {
         shared: false,
-        max_byte_length: if to_fixed_length {
-            None
-        } else {
-            buf.max_byte_length
-        },
+        max_byte_length: new_max_byte_length,
         detached: false,
         data,
     };

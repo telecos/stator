@@ -41036,7 +41036,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_resize_grows_in_place() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; buf.resize(6); buf.byteLength === 6 && bytes.length === 6 && bytes[0] === 1 && bytes[5] === 0",
@@ -41044,7 +41043,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_resize_shrinks_in_place() {
         assert_eval_true(
             "var buf = new ArrayBuffer(6, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; bytes[1] = 2; buf.resize(2); buf.byteLength === 2 && bytes.length === 2 && bytes.join(',') === '1,2'",
@@ -41073,7 +41071,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_copies_bytes() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 10; bytes[1] = 20; bytes[2] = 30; bytes[3] = 40; var moved = buf.transfer(); new Uint8Array(moved).join(',') === '10,20,30,40'",
@@ -41081,7 +41078,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_transfer_can_change_length() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; bytes[1] = 2; var moved = buf.transfer(6); moved.byteLength === 6 && moved.resizable === true && new Uint8Array(moved).join(',') === '1,2,0,0,0,0'",
@@ -41113,6 +41109,23 @@ mod tests {
     fn e2e_arraybuffer_transfer_rejects_length_past_max() {
         assert_eval_true(
             "try { new ArrayBuffer(4, { maxByteLength: 6 }).transfer(7); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_to_fixed_length_allows_growth_past_source_max() {
+        // ECMA-262 §25.1.3.4 step 6/7: when preserveResizability is
+        // fixed-length the new buffer's [[ArrayBufferMaxByteLength]] is
+        // empty, so AllocateArrayBuffer skips the byteLength > max check.
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 6 }); var moved = buf.transferToFixedLength(10); moved.byteLength === 10 && moved.maxByteLength === 10 && moved.resizable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_to_fixed_length_allows_growth_from_non_resizable() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4); var moved = buf.transferToFixedLength(10); moved.byteLength === 10 && moved.maxByteLength === 10 && moved.resizable === false && buf.detached === true",
         );
     }
 
@@ -41293,7 +41306,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_slice_copies_requested_range() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4); var bytes = new Uint8Array(sab); bytes[0] = 10; bytes[1] = 20; bytes[2] = 30; bytes[3] = 40; var sliced = sab.slice(1, 3); Object.prototype.toString.call(sliced) === '[object SharedArrayBuffer]' && new Uint8Array(sliced).join(',') === '20,30'",
@@ -41301,7 +41313,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_slice_supports_negative_indices() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4); var bytes = new Uint8Array(sab); bytes[0] = 10; bytes[1] = 20; bytes[2] = 30; bytes[3] = 40; new Uint8Array(sab.slice(-2)).join(',') === '30,40'",
@@ -41309,7 +41320,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_slice_returns_independent_copy() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(3); var bytes = new Uint8Array(sab); bytes[0] = 1; bytes[1] = 2; bytes[2] = 3; var sliced = sab.slice(0); bytes[0] = 9; new Uint8Array(sliced)[0] === 1",
@@ -41390,7 +41400,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_arraybuffer_grow_preserves_existing_bytes() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(sab); ta[0] = 7; sab.grow(6); ta.length === 6 && ta[0] === 7 && ta[5] === 0",
