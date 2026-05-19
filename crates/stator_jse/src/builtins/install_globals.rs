@@ -15651,9 +15651,9 @@ fn make_atomics() -> JsValue {
             let kind = ta.borrow().kind;
             let old = atomics_read(&ta.borrow(), index);
             let expected = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let replacement =
+                atomics_coerce_value(kind, args.get(3).unwrap_or(&JsValue::Undefined))?;
             if atomics_value_equals(&old, &expected) {
-                let replacement =
-                    atomics_coerce_value(kind, args.get(3).unwrap_or(&JsValue::Undefined))?;
                 atomics_write(&ta.borrow(), index, &replacement)?;
             }
             Ok(old)
@@ -42808,7 +42808,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_compare_exchange_updates_when_expected_matches() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 6; Atomics.compareExchange(ta, 0, 6, 9) === 6 && ta[0] === 9",
@@ -42816,10 +42815,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_compare_exchange_leaves_value_when_expected_misses() {
         assert_eval_true(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 6; Atomics.compareExchange(ta, 0, 1, 9) === 6 && ta[0] === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_compare_exchange_coerces_number_replacement_before_compare() {
+        assert_eval_true(
+            "try { var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 6; Atomics.compareExchange(ta, 0, 1, 1n); false; } catch (e) { e instanceof TypeError && ta[0] === 6; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_compare_exchange_coerces_bigint_replacement_before_compare() {
+        assert_eval_true(
+            "try { var ta = new BigInt64Array(new SharedArrayBuffer(8)); ta[0] = 6n; Atomics.compareExchange(ta, 0, 1n, 1); false; } catch (e) { e instanceof TypeError && ta[0] === 6n; }",
         );
     }
 
