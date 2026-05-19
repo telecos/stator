@@ -17016,6 +17016,63 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── Device / permission / platform host-integrated APIs (fail-closed)
+        //
+        // Notifications, Permissions, Clipboard events, Device sensors,
+        // Geolocation, WebRTC, WebUSB, Web Bluetooth, WebHID, Web Serial, and
+        // the Presentation API all require an OS-level permission prompt,
+        // sensor / radio / network stack, or host lifetime integration that
+        // the standalone engine does not provide. Edge page scripts probe
+        // these globals via `typeof X === 'function'` for feature detection;
+        // expose the constructors so detection works, but reject construction
+        // / invocation with a clear `TypeError` so product code never receives
+        // a fake permission grant, fake peer connection, fake device handle,
+        // or fake sensor reading.
+        for name in [
+            "Notification",
+            "Permissions",
+            "PermissionStatus",
+            "Clipboard",
+            "ClipboardEvent",
+            "ClipboardItem",
+            "DeviceMotionEvent",
+            "DeviceOrientationEvent",
+            "Geolocation",
+            "GeolocationPosition",
+            "GeolocationCoordinates",
+            "GeolocationPositionError",
+            "RTCPeerConnection",
+            "RTCSessionDescription",
+            "RTCIceCandidate",
+            "RTCDataChannel",
+            "RTCDataChannelEvent",
+            "RTCPeerConnectionIceEvent",
+            "RTCRtpSender",
+            "RTCRtpReceiver",
+            "RTCRtpTransceiver",
+            "RTCTrackEvent",
+            "USB",
+            "USBDevice",
+            "USBConnectionEvent",
+            "Bluetooth",
+            "BluetoothDevice",
+            "BluetoothRemoteGATTServer",
+            "HID",
+            "HIDDevice",
+            "HIDConnectionEvent",
+            "Serial",
+            "SerialPort",
+            "Presentation",
+            "PresentationRequest",
+            "PresentationConnection",
+            "PresentationAvailability",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+
         // ── Media / canvas / imaging (fail-closed) ──────────────────────────
         //
         // Media element constructors (`Image`, `Audio`), the Media Capture and
@@ -17540,6 +17597,43 @@ mod tests {
         assert!(globals.contains_key("MessageChannel"));
         assert!(globals.contains_key("MessagePort"));
         assert!(globals.contains_key("BroadcastChannel"));
+        assert!(globals.contains_key("Notification"));
+        assert!(globals.contains_key("Permissions"));
+        assert!(globals.contains_key("PermissionStatus"));
+        assert!(globals.contains_key("Clipboard"));
+        assert!(globals.contains_key("ClipboardEvent"));
+        assert!(globals.contains_key("ClipboardItem"));
+        assert!(globals.contains_key("DeviceMotionEvent"));
+        assert!(globals.contains_key("DeviceOrientationEvent"));
+        assert!(globals.contains_key("Geolocation"));
+        assert!(globals.contains_key("GeolocationPosition"));
+        assert!(globals.contains_key("GeolocationCoordinates"));
+        assert!(globals.contains_key("GeolocationPositionError"));
+        assert!(globals.contains_key("RTCPeerConnection"));
+        assert!(globals.contains_key("RTCSessionDescription"));
+        assert!(globals.contains_key("RTCIceCandidate"));
+        assert!(globals.contains_key("RTCDataChannel"));
+        assert!(globals.contains_key("RTCDataChannelEvent"));
+        assert!(globals.contains_key("RTCPeerConnectionIceEvent"));
+        assert!(globals.contains_key("RTCRtpSender"));
+        assert!(globals.contains_key("RTCRtpReceiver"));
+        assert!(globals.contains_key("RTCRtpTransceiver"));
+        assert!(globals.contains_key("RTCTrackEvent"));
+        assert!(globals.contains_key("USB"));
+        assert!(globals.contains_key("USBDevice"));
+        assert!(globals.contains_key("USBConnectionEvent"));
+        assert!(globals.contains_key("Bluetooth"));
+        assert!(globals.contains_key("BluetoothDevice"));
+        assert!(globals.contains_key("BluetoothRemoteGATTServer"));
+        assert!(globals.contains_key("HID"));
+        assert!(globals.contains_key("HIDDevice"));
+        assert!(globals.contains_key("HIDConnectionEvent"));
+        assert!(globals.contains_key("Serial"));
+        assert!(globals.contains_key("SerialPort"));
+        assert!(globals.contains_key("Presentation"));
+        assert!(globals.contains_key("PresentationRequest"));
+        assert!(globals.contains_key("PresentationConnection"));
+        assert!(globals.contains_key("PresentationAvailability"));
         assert!(globals.contains_key("Location"));
         assert!(globals.contains_key("History"));
         assert!(globals.contains_key("location"));
@@ -17804,6 +17898,86 @@ mod tests {
         assert_eval_type_error("new MessageChannel()");
         assert_eval_type_error("new MessagePort()");
         assert_eval_type_error("new BroadcastChannel('edge-stator')");
+    }
+
+    #[test]
+    fn e2e_device_permission_platform_constructors_exist_but_fail_closed() {
+        for name in [
+            "Notification",
+            "Permissions",
+            "PermissionStatus",
+            "Clipboard",
+            "ClipboardEvent",
+            "ClipboardItem",
+            "DeviceMotionEvent",
+            "DeviceOrientationEvent",
+            "Geolocation",
+            "GeolocationPosition",
+            "GeolocationCoordinates",
+            "GeolocationPositionError",
+            "RTCPeerConnection",
+            "RTCSessionDescription",
+            "RTCIceCandidate",
+            "RTCDataChannel",
+            "RTCDataChannelEvent",
+            "RTCPeerConnectionIceEvent",
+            "RTCRtpSender",
+            "RTCRtpReceiver",
+            "RTCRtpTransceiver",
+            "RTCTrackEvent",
+            "USB",
+            "USBDevice",
+            "USBConnectionEvent",
+            "Bluetooth",
+            "BluetoothDevice",
+            "BluetoothRemoteGATTServer",
+            "HID",
+            "HIDDevice",
+            "HIDConnectionEvent",
+            "Serial",
+            "SerialPort",
+            "Presentation",
+            "PresentationRequest",
+            "PresentationConnection",
+            "PresentationAvailability",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new Notification('hi')");
+        assert_eval_type_error("new PermissionStatus()");
+        assert_eval_type_error("new ClipboardEvent('copy')");
+        assert_eval_type_error("new ClipboardItem({})");
+        assert_eval_type_error("new DeviceMotionEvent('devicemotion')");
+        assert_eval_type_error("new DeviceOrientationEvent('deviceorientation')");
+        assert_eval_type_error("new GeolocationPosition()");
+        assert_eval_type_error("new GeolocationCoordinates()");
+        assert_eval_type_error("new GeolocationPositionError()");
+        assert_eval_type_error("new RTCPeerConnection()");
+        assert_eval_type_error("new RTCSessionDescription({type:'offer',sdp:''})");
+        assert_eval_type_error("new RTCIceCandidate({})");
+        assert_eval_type_error("new USBDevice()");
+        assert_eval_type_error("new BluetoothDevice()");
+        assert_eval_type_error("new HIDDevice()");
+        assert_eval_type_error("new SerialPort()");
+        assert_eval_type_error("new PresentationRequest('/p')");
+    }
+
+    /// `navigator` itself is intentionally not preinstalled by the standalone
+    /// engine, so `navigator.permissions`, `navigator.clipboard`,
+    /// `navigator.geolocation`, `navigator.usb`, `navigator.bluetooth`,
+    /// `navigator.hid`, `navigator.serial`, and `navigator.presentation`
+    /// all remain absent. Exposing fake navigator accessors would shadow
+    /// real host/Blink bindings and create fake permission / device
+    /// success paths. The constructor globals (`Permissions`, `USB`, ...)
+    /// remain installed so feature-detection via `typeof X === 'function'`
+    /// still works, but they fail closed when invoked.
+    #[test]
+    fn e2e_navigator_device_permission_entry_points_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
     }
 
     /// Service worker registration entry points remain absent because
