@@ -597,24 +597,47 @@ pub struct JsTypedArray {
 }
 
 impl JsTypedArray {
+    fn is_out_of_bounds_with_len(&self, buf_len: usize) -> bool {
+        if self.byte_offset > buf_len {
+            return true;
+        }
+        if self.auto_length {
+            return false;
+        }
+        let bpe = self.kind.bytes_per_element();
+        self.length
+            .checked_mul(bpe)
+            .and_then(|byte_length| self.byte_offset.checked_add(byte_length))
+            .is_none_or(|view_end| view_end > buf_len)
+    }
+
     /// The view length after accounting for detached or resized backing stores.
     pub fn effective_length(&self) -> usize {
         let buf = self.buffer.borrow();
-        if buf.detached || self.byte_offset > buf.data.len() {
+        if buf.detached || self.is_out_of_bounds_with_len(buf.data.len()) {
             return 0;
         }
-        let available = buf.data.len() - self.byte_offset;
-        let available_len = available / self.kind.bytes_per_element();
         if self.auto_length {
-            available_len
+            let available = buf.data.len() - self.byte_offset;
+            available / self.kind.bytes_per_element()
         } else {
-            cmp::min(self.length, available_len)
+            self.length
         }
     }
 
     /// The current byte length of the view.
     pub fn effective_byte_length(&self) -> usize {
         self.effective_length() * self.kind.bytes_per_element()
+    }
+
+    /// The current byte offset of the view.
+    pub fn effective_byte_offset(&self) -> usize {
+        let buf = self.buffer.borrow();
+        if buf.detached || self.is_out_of_bounds_with_len(buf.data.len()) {
+            0
+        } else {
+            self.byte_offset
+        }
     }
 }
 
@@ -658,22 +681,35 @@ pub fn typed_array_new_from_buffer(
             "Start offset is not a multiple of the element size".into(),
         ));
     }
-    let buf_len = buffer.borrow().data.len();
+    let (buf_len, is_resizable_or_growable) = {
+        let buffer_ref = buffer.borrow();
+        if buffer_ref.detached {
+            return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+        }
+        (buffer_ref.data.len(), buffer_ref.max_byte_length.is_some())
+    };
     if byte_offset > buf_len {
         return Err(StatorError::RangeError(
             "Start offset is outside the bounds of the buffer".into(),
         ));
     }
+    let auto_length = length.is_none() && is_resizable_or_growable;
     let len = match length {
         Some(l) => {
-            if byte_offset + l * bpe > buf_len {
+            let Some(byte_len) = l.checked_mul(bpe) else {
+                return Err(StatorError::RangeError("Invalid typed array length".into()));
+            };
+            if byte_offset
+                .checked_add(byte_len)
+                .is_none_or(|view_end| view_end > buf_len)
+            {
                 return Err(StatorError::RangeError("Invalid typed array length".into()));
             }
             l
         }
         None => {
             let remaining = buf_len - byte_offset;
-            if !remaining.is_multiple_of(bpe) {
+            if !auto_length && !remaining.is_multiple_of(bpe) {
                 return Err(StatorError::RangeError(
                     "Byte length of buffer minus offset is not a multiple of element size".into(),
                 ));
@@ -686,7 +722,7 @@ pub fn typed_array_new_from_buffer(
         kind,
         byte_offset,
         length: len,
-        auto_length: length.is_none(),
+        auto_length,
     })
 }
 
@@ -716,7 +752,7 @@ pub fn typed_array_byte_length(ta: &JsTypedArray) -> usize {
 
 /// `%TypedArray%.prototype.byteOffset` getter.
 pub fn typed_array_byte_offset(ta: &JsTypedArray) -> usize {
-    ta.byte_offset
+    ta.effective_byte_offset()
 }
 
 /// `%TypedArray%.prototype.buffer` getter.

@@ -13703,7 +13703,7 @@ fn extract_dataview(v: &JsValue) -> Option<Rc<RefCell<crate::builtins::typed_arr
 fn collect_typed_array_source_values(source: &JsValue) -> StatorResult<Vec<JsValue>> {
     if let Some(inner) = extract_typed_array(source) {
         let typed_array = inner.borrow();
-        return Ok((0..typed_array.length)
+        return Ok((0..typed_array.effective_length())
             .map(|index| typed_array_get(&typed_array, index))
             .collect());
     }
@@ -14596,7 +14596,7 @@ fn make_typed_array_instance(
             let inner = Rc::clone(&inner);
             obj.insert(
                 "__get_byteOffset__".into(),
-                native(move |_| Ok(JsValue::Smi(inner.borrow().byte_offset as i32))),
+                native(move |_| Ok(JsValue::Smi(inner.borrow().effective_byte_offset() as i32))),
             );
         }
         obj.insert(
@@ -41124,7 +41124,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_auto_length_tracks_resizable_growth() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(6); ta.length === 6 && ta.byteLength === 6",
@@ -41132,7 +41131,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_auto_length_tracks_resizable_shrink() {
         assert_eval_true(
             "var buf = new ArrayBuffer(6, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(2); ta.length === 2 && ta.byteLength === 2",
@@ -41140,7 +41138,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_auto_length_join_tracks_resize() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); ta[0] = 1; ta[1] = 2; buf.resize(2); ta.join(',') === '1,2'",
@@ -41148,7 +41145,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_buffer_identity_survives_resize() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(6); ta.buffer === buf",
@@ -41156,10 +41152,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_fixed_length_view_stays_fixed_on_growth() {
         assert_eval_true(
             "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint16Array(buf, 0, 2); buf.resize(8); ta.length === 2 && ta.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fixed_length_view_becomes_oob_on_partial_shrink() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var ta = new Uint16Array(buf, 0, 4); buf.resize(6); ta.length === 0 && ta.byteLength === 0 && ta.byteOffset === 0 && ta[0] === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_auto_length_offset_becomes_oob_on_shrink() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var ta = new Uint8Array(buf, 6); buf.resize(4); ta.length === 0 && ta.byteLength === 0 && ta.byteOffset === 0 && ta[0] === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_auto_length_allows_unaligned_resizable_tail() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(5, { maxByteLength: 8 }); var ta = new Uint16Array(buf); ta.length === 2 && ta.byteLength === 4",
         );
     }
 
@@ -41403,7 +41419,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_typed_array_auto_length_tracks_growth() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(sab); sab.grow(6); ta.length === 6 && ta.byteLength === 6",
@@ -41411,7 +41426,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_shared_typed_array_fixed_length_view_stays_fixed_on_growth() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint16Array(sab, 0, 2); sab.grow(8); ta.length === 2 && ta.byteLength === 4",
