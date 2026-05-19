@@ -2145,6 +2145,21 @@ impl FunctionCompiler {
             PropKey::Computed(_) => None,
         };
 
+        // For computed keys, evaluate and stash the key BEFORE compiling
+        // the function body — otherwise compiling the function leaves the
+        // closure in the accumulator and the subsequent key evaluation
+        // would clobber it, leaving the wrong value for the
+        // `DefineClassKeyed*` instruction.
+        let key_reg = if key_name.is_none() {
+            if let PropKey::Computed(key_expr) = &method.key {
+                Some(self.compile_computed_property_key(key_expr)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         match method.kind {
             MethodKind::Get if key_name.is_some() => {
                 self.compile_fn_expr_named_with_source(
@@ -2185,8 +2200,7 @@ impl FunctionCompiler {
                             slot,
                         ],
                     ));
-                } else if let PropKey::Computed(key_expr) = &method.key {
-                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                } else if let Some(key_reg) = key_reg {
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineClassKeyedOwnProperty,
@@ -2214,8 +2228,7 @@ impl FunctionCompiler {
                             slot,
                         ],
                     ));
-                } else if let PropKey::Computed(key_expr) = &method.key {
-                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                } else if let Some(key_reg) = key_reg {
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineClassKeyedGetterProperty,
@@ -2238,8 +2251,7 @@ impl FunctionCompiler {
                             slot,
                         ],
                     ));
-                } else if let PropKey::Computed(key_expr) = &method.key {
-                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                } else if let Some(key_reg) = key_reg {
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineClassKeyedSetterProperty,

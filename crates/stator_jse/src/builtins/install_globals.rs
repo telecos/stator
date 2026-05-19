@@ -27985,7 +27985,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_class_computed_symbol_method_source() {
         assert_eval_true(
             "class Foo { [Symbol.iterator]() {} } Foo.prototype[Symbol.iterator].toString() === '[Symbol.iterator]() {}'",
@@ -27993,10 +27992,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_class_computed_string_method_source() {
         assert_eval_true(
             "class Foo { ['foo']() {} } Foo.prototype.foo.toString() === \"['foo']() {}\"",
+        );
+    }
+
+    #[test]
+    fn e2e_class_computed_string_method_is_callable() {
+        // Regression: a computed-string class method must install the
+        // compiled function (not the key value) under the computed name.
+        assert_eval_true("class Foo { ['foo']() { return 42; } } new Foo().foo() === 42");
+    }
+
+    #[test]
+    fn e2e_class_computed_symbol_method_is_callable() {
+        assert_eval_true(
+            "class Foo { [Symbol.iterator]() { return 7; } } new Foo()[Symbol.iterator]() === 7",
         );
     }
 
