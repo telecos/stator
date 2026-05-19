@@ -13996,14 +13996,25 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
                 return Err(incompatible_receiver(&display));
             }
             let buffer = buf_rc.borrow();
+            if buffer.detached {
+                return Err(StatorError::TypeError(format!(
+                    "{display} called on detached buffer"
+                )));
+            }
             let len = buffer.data.len();
             let begin =
                 clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(base), 0.0)?)
                     as i64;
-            let end = clamp_relative_integer_index(
-                len,
-                to_integer_or_infinity_arg(args.get(base + 1), len as f64)?,
-            ) as i64;
+            // Per ECMA-262 §25.1.5.3 step 6: if `end` is undefined (missing OR
+            // explicitly Undefined), relativeEnd = len. Filter Undefined so the
+            // default len value is used; otherwise ToIntegerOrInfinity(undefined)
+            // would be 0 and produce an empty slice for `buf.slice(start, undefined)`.
+            let end_arg = args
+                .get(base + 1)
+                .filter(|v| !matches!(v, JsValue::Undefined));
+            let end =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(end_arg, len as f64)?)
+                    as i64;
             let sliced = arraybuffer_slice(&buffer, begin, end);
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
         }),
@@ -40834,10 +40845,44 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_slice_returns_independent_copy() {
         assert_eval_true(
             "var bytes = new Uint8Array([1,2,3]); var sliced = bytes.buffer.slice(0); bytes[0] = 9; new Uint8Array(sliced)[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_explicit_undefined_end_uses_length() {
+        // Per ECMA-262 §25.1.5.3 step 6, an explicit `undefined` end
+        // argument must default to the buffer byteLength, like a missing
+        // argument. Previously this slice yielded an empty result because
+        // ToIntegerOrInfinity(undefined) is 0.
+        assert_eval_true(
+            "var b = new ArrayBuffer(4); var u = new Uint8Array(b); u[0]=10;u[1]=20;u[2]=30;u[3]=40; new Uint8Array(b.slice(1, undefined)).join(',') === '20,30,40'",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_slice_explicit_undefined_end_uses_length() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4); var u = new Uint8Array(sab); u[0]=10;u[1]=20;u[2]=30;u[3]=40; new Uint8Array(sab.slice(1, undefined)).join(',') === '20,30,40'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_dataview_reads_match_underlying_bytes() {
+        // Slicing must produce a byte-for-byte copy that DataView reads
+        // independently from the source, with no aliasing back to it.
+        assert_eval_true(
+            "var src = new ArrayBuffer(8); var dv = new DataView(src); dv.setInt32(0, 0x01020304); dv.setInt32(4, 0x0a0b0c0d); var copy = src.slice(2, 6); var dv2 = new DataView(copy); copy.byteLength === 4 && dv2.getUint8(0) === 0x03 && dv2.getUint8(1) === 0x04 && dv2.getUint8(2) === 0x0a && dv2.getUint8(3) === 0x0b && (dv.setInt32(0, 0), dv2.getUint8(0) === 0x03)",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_on_detached_throws_typeerror() {
+        // §25.1.5.3 step 3: slicing a detached buffer must throw TypeError.
+        assert_eval_true(
+            "var b = new ArrayBuffer(4, { maxByteLength: 8 }); var t = b.transfer(); var threw = false; try { b.slice(0); } catch (e) { threw = (e instanceof TypeError); } threw",
         );
     }
 
