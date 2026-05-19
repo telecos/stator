@@ -18529,8 +18529,14 @@ pub fn dispatch_construct_call(
             construct_builtin_result(f(args.into_vec())?, &ctor_proto)
         }
         JsValue::PlainObject(map) => {
-            let call_fn = map.borrow().get("__call__").cloned();
-            if let Some(f) = call_fn {
+            let construct_fn = {
+                let borrow = map.borrow();
+                borrow
+                    .get("__construct__")
+                    .or_else(|| borrow.get("__call__"))
+                    .cloned()
+            };
+            if let Some(f) = construct_fn {
                 dispatch_construct_call(&f, this_val, args, new_target)
             } else {
                 Err(StatorError::TypeError("object is not a function".into()))

@@ -3303,8 +3303,14 @@ fn handle_construct(
                 ));
             }
             let ctor_proto = proto_lookup(&ctor, "prototype");
-            let call_val = map.borrow().get("__call__").cloned();
-            match call_val {
+            let construct_val = {
+                let borrow = map.borrow();
+                borrow
+                    .get("__construct__")
+                    .or_else(|| borrow.get("__call__"))
+                    .cloned()
+            };
+            match construct_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                     let val = f(args.into_vec())?;
@@ -3400,8 +3406,14 @@ fn handle_construct_with_spread(
                 ));
             }
             let ctor_proto = proto_lookup(&ctor, "prototype");
-            let call_val = map.borrow().get("__call__").cloned();
-            match call_val {
+            let construct_val = {
+                let borrow = map.borrow();
+                borrow
+                    .get("__construct__")
+                    .or_else(|| borrow.get("__call__"))
+                    .cloned()
+            };
+            match construct_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
@@ -7608,8 +7620,14 @@ fn handle_construct_forward_all_args(
                 ));
             }
             let ctor_proto = proto_lookup(&ctor, "prototype");
-            let call_val = map.borrow().get("__call__").cloned();
-            match call_val {
+            let construct_val = {
+                let borrow = map.borrow();
+                borrow
+                    .get("__construct__")
+                    .or_else(|| borrow.get("__call__"))
+                    .cloned()
+            };
+            match construct_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();

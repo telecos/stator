@@ -2875,6 +2875,166 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     );
 }
 
+const DOM_EXCEPTION_CONSTANTS: &[(&str, &str, i32)] = &[
+    ("INDEX_SIZE_ERR", "IndexSizeError", 1),
+    ("DOMSTRING_SIZE_ERR", "DOMStringSizeError", 2),
+    ("HIERARCHY_REQUEST_ERR", "HierarchyRequestError", 3),
+    ("WRONG_DOCUMENT_ERR", "WrongDocumentError", 4),
+    ("INVALID_CHARACTER_ERR", "InvalidCharacterError", 5),
+    ("NO_DATA_ALLOWED_ERR", "NoDataAllowedError", 6),
+    (
+        "NO_MODIFICATION_ALLOWED_ERR",
+        "NoModificationAllowedError",
+        7,
+    ),
+    ("NOT_FOUND_ERR", "NotFoundError", 8),
+    ("NOT_SUPPORTED_ERR", "NotSupportedError", 9),
+    ("INUSE_ATTRIBUTE_ERR", "InUseAttributeError", 10),
+    ("INVALID_STATE_ERR", "InvalidStateError", 11),
+    ("SYNTAX_ERR", "SyntaxError", 12),
+    ("INVALID_MODIFICATION_ERR", "InvalidModificationError", 13),
+    ("NAMESPACE_ERR", "NamespaceError", 14),
+    ("INVALID_ACCESS_ERR", "InvalidAccessError", 15),
+    ("VALIDATION_ERR", "ValidationError", 16),
+    ("TYPE_MISMATCH_ERR", "TypeMismatchError", 17),
+    ("SECURITY_ERR", "SecurityError", 18),
+    ("NETWORK_ERR", "NetworkError", 19),
+    ("ABORT_ERR", "AbortError", 20),
+    ("URL_MISMATCH_ERR", "URLMismatchError", 21),
+    ("QUOTA_EXCEEDED_ERR", "QuotaExceededError", 22),
+    ("TIMEOUT_ERR", "TimeoutError", 23),
+    ("INVALID_NODE_TYPE_ERR", "InvalidNodeTypeError", 24),
+    ("DATA_CLONE_ERR", "DataCloneError", 25),
+];
+
+fn dom_exception_code_for_name(name: &str) -> i32 {
+    DOM_EXCEPTION_CONSTANTS
+        .iter()
+        .find_map(|(_, exception_name, code)| (*exception_name == name).then_some(*code))
+        .unwrap_or(0)
+}
+
+fn dom_exception_get_slot(this: &JsValue, slot: &str) -> StatorResult<JsValue> {
+    let JsValue::PlainObject(map) = this else {
+        return Err(StatorError::TypeError(
+            "Value of 'this' must be of DOMException".into(),
+        ));
+    };
+    let borrow = map.borrow();
+    if !matches!(borrow.get("#dom_exception"), Some(JsValue::Boolean(true))) {
+        return Err(StatorError::TypeError(
+            "Value of 'this' must be of DOMException".into(),
+        ));
+    }
+    Ok(borrow.get(slot).cloned().unwrap_or(JsValue::Undefined))
+}
+
+fn make_dom_exception_instance(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let message = match args.first() {
+        Some(JsValue::Undefined) | None => String::new(),
+        Some(value) => value.to_js_string()?,
+    };
+    let name = match args.get(1) {
+        Some(JsValue::Undefined) | None => "Error".to_string(),
+        Some(value) => value.to_js_string()?,
+    };
+    let code = dom_exception_code_for_name(&name);
+
+    let mut props = PropertyMap::new();
+    props.insert("#dom_exception".into(), JsValue::Boolean(true));
+    props.insert(
+        "#dom_exception_message".into(),
+        JsValue::String(message.into()),
+    );
+    props.insert("#dom_exception_name".into(), JsValue::String(name.into()));
+    props.insert("#dom_exception_code".into(), JsValue::Smi(code));
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+}
+
+fn make_dom_exception_constructor() -> JsValue {
+    let message_getter = native(|args| {
+        let this = args.first().unwrap_or(&JsValue::Undefined);
+        dom_exception_get_slot(this, "#dom_exception_message")
+    });
+    let name_getter = native(|args| {
+        let this = args.first().unwrap_or(&JsValue::Undefined);
+        dom_exception_get_slot(this, "#dom_exception_name")
+    });
+    let code_getter = native(|args| {
+        let this = args.first().unwrap_or(&JsValue::Undefined);
+        dom_exception_get_slot(this, "#dom_exception_code")
+    });
+
+    let mut proto = PropertyMap::new();
+    let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
+    proto.insert_with_attrs("__get_message__".into(), message_getter, accessor_attrs);
+    proto.insert_with_attrs("__get_name__".into(), name_getter, accessor_attrs);
+    proto.insert_with_attrs("__get_code__".into(), code_getter, accessor_attrs);
+    proto.insert_with_attrs(
+        "toString".into(),
+        builtin_fn("toString", 0, |args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let name = dom_exception_get_slot(this, "#dom_exception_name")?.to_js_string()?;
+            let message = dom_exception_get_slot(this, "#dom_exception_message")?.to_js_string()?;
+            if name.is_empty() {
+                Ok(JsValue::String(message.into()))
+            } else if message.is_empty() {
+                Ok(JsValue::String(name.into()))
+            } else {
+                Ok(JsValue::String(format!("{name}: {message}").into()))
+            }
+        }),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("DOMException".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    for (constant, _, value) in DOM_EXCEPTION_CONSTANTS {
+        proto.insert_with_attrs(
+            (*constant).into(),
+            JsValue::Smi(*value),
+            PropertyAttributes::ENUMERABLE,
+        );
+    }
+    let proto_rc = Rc::new(RefCell::new(proto));
+    let proto_val = JsValue::PlainObject(proto_rc);
+
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_| {
+            Err(StatorError::TypeError(
+                "Class constructor DOMException cannot be invoked without 'new'".into(),
+            ))
+        }),
+    );
+    props.insert("__construct__".into(), native(make_dom_exception_instance));
+    props.insert_with_attrs(
+        "length".into(),
+        JsValue::Smi(0),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    props.insert("prototype".into(), proto_val);
+    for (constant, _, value) in DOM_EXCEPTION_CONSTANTS {
+        props.insert_with_attrs(
+            (*constant).into(),
+            JsValue::Smi(*value),
+            PropertyAttributes::ENUMERABLE,
+        );
+    }
+    props.make_all_non_enumerable();
+    for (constant, _, value) in DOM_EXCEPTION_CONSTANTS {
+        props.insert_with_attrs(
+            (*constant).into(),
+            JsValue::Smi(*value),
+            PropertyAttributes::ENUMERABLE,
+        );
+    }
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Convert an `f64` to the most compact `JsValue` representation.
 ///
 /// Returns `Smi` for values that are exact integers in the `i32` range,
@@ -2955,8 +3115,8 @@ fn fill_crypto_random_bytes(bytes: &mut [u8]) -> StatorResult<()> {
 /// Maximum byte length accepted by `crypto.getRandomValues`.
 ///
 /// Per the Web Crypto specification this is 65,536 bytes; requests
-/// exceeding this fail closed with a `QuotaExceededError` (modelled
-/// here as a `RangeError` since we do not implement `DOMException`).
+/// exceeding this fail closed with a `QuotaExceededError` (currently
+/// modelled here as a `RangeError` rather than a host-thrown `DOMException`).
 const CRYPTO_GET_RANDOM_VALUES_QUOTA: usize = 65_536;
 
 /// Returns `true` for the integer TypedArray kinds accepted by
@@ -17182,6 +17342,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert("URL".into(), finalize_ctor(make_url_builtin(), "URL"));
         globals.insert(
+            "DOMException".into(),
+            finalize_ctor(make_dom_exception_constructor(), "DOMException"),
+        );
+        globals.insert(
             "URLSearchParams".into(),
             finalize_ctor(make_url_search_params_builtin(), "URLSearchParams"),
         );
@@ -19173,6 +19337,7 @@ mod tests {
         assert!(globals.contains_key("clearInterval"));
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
+        assert!(globals.contains_key("DOMException"));
         assert!(globals.contains_key("URLSearchParams"));
         assert!(globals.contains_key("DOMParser"));
         assert!(globals.contains_key("XMLSerializer"));
@@ -19508,6 +19673,56 @@ mod tests {
         ] {
             assert!(globals.contains_key(name), "missing global: {name}");
         }
+    }
+
+    #[test]
+    fn e2e_dom_exception_constructor_shape() {
+        assert_eval_true("typeof DOMException === 'function'");
+        assert_eval_true("DOMException.name === 'DOMException' && DOMException.length === 0");
+        assert_eval_true(
+            "var e = new DOMException(); e.name === 'Error' && e.message === '' && e.code === 0",
+        );
+        assert_eval_true(
+            "var e = new DOMException('nope', 'SyntaxError'); e.name === 'SyntaxError' && e.message === 'nope' && e.code === 12",
+        );
+        assert_eval_true(
+            "var e = new DOMException('x', 'NotAStandardName'); e.name === 'NotAStandardName' && e.code === 0",
+        );
+        assert_eval_true("new DOMException('x', 'AbortError') instanceof DOMException");
+        assert_eval_true(
+            "Object.prototype.toString.call(new DOMException('x')) === '[object DOMException]'",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_exception_properties_and_constants() {
+        assert_eval_true("Object.keys(new DOMException('x', 'SyntaxError')).length === 0");
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(new DOMException('x'), 'name') === undefined",
+        );
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(DOMException.prototype, 'name'); typeof d.get === 'function' && d.set === undefined && d.enumerable === true && d.configurable === true",
+        );
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(DOMException.prototype, 'code'); typeof d.get === 'function' && d.enumerable === true && d.configurable === true",
+        );
+        assert_eval_true(
+            "DOMException.SYNTAX_ERR === 12 && DOMException.prototype.SYNTAX_ERR === 12 && DOMException.DATA_CLONE_ERR === 25",
+        );
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(DOMException, 'SYNTAX_ERR'); d.value === 12 && d.writable === false && d.enumerable === true && d.configurable === false",
+        );
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(DOMException.prototype, 'DATA_CLONE_ERR'); d.value === 25 && d.writable === false && d.enumerable === true && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_exception_callable_behavior_and_to_string() {
+        assert_eval_type_error("DOMException('x', 'SyntaxError')");
+        assert_eval_true("String(new DOMException('', 'SyntaxError')) === 'SyntaxError'");
+        assert_eval_true("String(new DOMException('bad', 'SyntaxError')) === 'SyntaxError: bad'");
+        assert_eval_type_error("DOMException.prototype.toString.call({})");
     }
 
     #[test]

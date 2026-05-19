@@ -454,9 +454,7 @@ fn parse_absolute(
     let rest = &normalized[2..];
 
     // Split rest into authority + path-query-fragment.
-    let auth_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     let tail = &rest[auth_end..];
 
