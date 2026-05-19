@@ -3597,6 +3597,37 @@ fn make_unsupported_web_function(name: &'static str, length: i32) -> JsValue {
     })
 }
 
+fn make_unsupported_web_constructor_with_prototype(
+    name: &'static str,
+    prototype_methods: &[(&'static str, i32)],
+    prototype_constants: &[(&'static str, i32)],
+) -> JsValue {
+    let ctor = make_unsupported_web_constructor(name);
+    if let JsValue::PlainObject(ref rc) = ctor {
+        {
+            let mut props = rc.borrow_mut();
+            for (constant, value) in prototype_constants {
+                props.insert((*constant).into(), JsValue::Smi(*value));
+            }
+            props.make_all_non_enumerable();
+        }
+        if let Some(JsValue::PlainObject(proto_rc)) = rc.borrow().get("prototype").cloned() {
+            let mut proto = proto_rc.borrow_mut();
+            for (method, length) in prototype_methods {
+                proto.insert(
+                    (*method).into(),
+                    make_unsupported_web_function(method, *length),
+                );
+            }
+            for (constant, value) in prototype_constants {
+                proto.insert((*constant).into(), JsValue::Smi(*value));
+            }
+            proto.make_all_non_enumerable();
+        }
+    }
+    ctor
+}
+
 fn make_unsupported_url_constructor() -> JsValue {
     let ctor = make_unsupported_web_constructor("URL");
     if let JsValue::PlainObject(ref rc) = ctor {
@@ -16176,6 +16207,68 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── DOM parsing / serialization and URL patterns (fail-closed) ──────
+        //
+        // DOMParser, XMLSerializer, XPath, XSLT, and URLPattern are commonly
+        // feature-detected by Edge page scripts, but real behavior requires an
+        // HTML/XML parser, DOM Document/Node ownership, XPath/XSLT engines, or
+        // URLPattern matching semantics. Expose only the constructor/prototype
+        // surface and reject all operations instead of fabricating documents,
+        // nodes, serialized XML, XPath results, transforms, or URL matches.
+        for (name, methods, constants) in [
+            ("DOMParser", &[("parseFromString", 2)][..], &[][..]),
+            ("XMLSerializer", &[("serializeToString", 1)][..], &[][..]),
+            (
+                "XPathEvaluator",
+                &[
+                    ("createExpression", 2),
+                    ("createNSResolver", 1),
+                    ("evaluate", 5),
+                ][..],
+                &[][..],
+            ),
+            ("XPathExpression", &[("evaluate", 4)][..], &[][..]),
+            (
+                "XPathResult",
+                &[][..],
+                &[
+                    ("ANY_TYPE", 0),
+                    ("NUMBER_TYPE", 1),
+                    ("STRING_TYPE", 2),
+                    ("BOOLEAN_TYPE", 3),
+                    ("UNORDERED_NODE_ITERATOR_TYPE", 4),
+                    ("ORDERED_NODE_ITERATOR_TYPE", 5),
+                    ("UNORDERED_NODE_SNAPSHOT_TYPE", 6),
+                    ("ORDERED_NODE_SNAPSHOT_TYPE", 7),
+                    ("ANY_UNORDERED_NODE_TYPE", 8),
+                    ("FIRST_ORDERED_NODE_TYPE", 9),
+                ][..],
+            ),
+            (
+                "XSLTProcessor",
+                &[
+                    ("importStylesheet", 1),
+                    ("transformToFragment", 2),
+                    ("transformToDocument", 1),
+                    ("setParameter", 3),
+                    ("getParameter", 2),
+                    ("removeParameter", 2),
+                    ("clearParameters", 0),
+                    ("reset", 0),
+                ][..],
+                &[][..],
+            ),
+            ("URLPattern", &[("test", 1), ("exec", 1)][..], &[][..]),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, constants),
+                    name,
+                ),
+            );
+        }
+
         // ── Fetch / network and body APIs (fail-closed) ─────────────────────
         //
         // Fetch, XHR, streams, and request/response body wrappers require host
@@ -17439,6 +17532,13 @@ mod tests {
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
         assert!(globals.contains_key("URLSearchParams"));
+        assert!(globals.contains_key("DOMParser"));
+        assert!(globals.contains_key("XMLSerializer"));
+        assert!(globals.contains_key("XPathEvaluator"));
+        assert!(globals.contains_key("XPathExpression"));
+        assert!(globals.contains_key("XPathResult"));
+        assert!(globals.contains_key("XSLTProcessor"));
+        assert!(globals.contains_key("URLPattern"));
         assert!(globals.contains_key("fetch"));
         assert!(globals.contains_key("Request"));
         assert!(globals.contains_key("Response"));
@@ -17718,6 +17818,74 @@ mod tests {
         );
         assert_eval_type_error("URLSearchParams('x=1')");
         assert_eval_type_error("new URLSearchParams('x=1')");
+    }
+
+    #[test]
+    fn e2e_dom_parser_serialization_constructors_exist_but_fail_closed() {
+        for name in ["DOMParser", "XMLSerializer"] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_true("typeof DOMParser.prototype.parseFromString === 'function'");
+        assert_eval_true("typeof XMLSerializer.prototype.serializeToString === 'function'");
+        assert_eval_type_error(
+            "DOMParser.prototype.parseFromString.call({}, '<p>x</p>', 'text/html')",
+        );
+        assert_eval_type_error("XMLSerializer.prototype.serializeToString.call({}, {})");
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof Node === 'undefined'");
+        assert_eval_true("typeof Document === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_xpath_xslt_constructors_exist_but_fail_closed() {
+        for name in [
+            "XPathEvaluator",
+            "XPathExpression",
+            "XPathResult",
+            "XSLTProcessor",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_true("typeof XPathEvaluator.prototype.evaluate === 'function'");
+        assert_eval_true("typeof XPathEvaluator.prototype.createExpression === 'function'");
+        assert_eval_true("typeof XPathEvaluator.prototype.createNSResolver === 'function'");
+        assert_eval_true("typeof XPathExpression.prototype.evaluate === 'function'");
+        assert_eval_true("XPathResult.ANY_TYPE === 0");
+        assert_eval_true("XPathResult.ORDERED_NODE_SNAPSHOT_TYPE === 7");
+        assert_eval_true("XPathResult.prototype.FIRST_ORDERED_NODE_TYPE === 9");
+        assert_eval_true("typeof XSLTProcessor.prototype.importStylesheet === 'function'");
+        assert_eval_true("typeof XSLTProcessor.prototype.transformToDocument === 'function'");
+        assert_eval_true("typeof XSLTProcessor.prototype.transformToFragment === 'function'");
+        assert_eval_true("typeof XSLTProcessor.prototype.setParameter === 'function'");
+        assert_eval_true("typeof XSLTProcessor.prototype.reset === 'function'");
+        assert_eval_type_error(
+            "XPathEvaluator.prototype.evaluate.call({}, '//*', {}, null, 0, null)",
+        );
+        assert_eval_type_error("XPathExpression.prototype.evaluate.call({}, {}, 0, null)");
+        assert_eval_type_error("XSLTProcessor.prototype.importStylesheet.call({}, {})");
+        assert_eval_type_error("XSLTProcessor.prototype.transformToDocument.call({}, {})");
+    }
+
+    #[test]
+    fn e2e_url_pattern_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof URLPattern === 'function' && URLPattern.name === 'URLPattern'");
+        assert_eval_true("typeof URLPattern.prototype.test === 'function'");
+        assert_eval_true("typeof URLPattern.prototype.exec === 'function'");
+        assert_eval_type_error("URLPattern({ pathname: '/:id' })");
+        assert_eval_type_error("new URLPattern({ pathname: '/:id' })");
+        assert_eval_type_error("URLPattern.prototype.test.call({}, 'https://example.test/1')");
+        assert_eval_type_error("URLPattern.prototype.exec.call({}, 'https://example.test/1')");
     }
 
     #[test]
