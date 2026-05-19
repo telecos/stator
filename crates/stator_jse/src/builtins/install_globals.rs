@@ -5604,6 +5604,370 @@ fn make_form_data_builtin() -> JsValue {
     ctor
 }
 
+// ── Blob (W3C File API §3) ───────────────────────────────────────────────────
+
+/// Hidden brand placed on every `Blob` instance for receiver checks.
+const BLOB_BRAND: &str = "__is_blob__";
+
+/// Immutable byte container backing a `Blob` instance. Blobs in Stator are
+/// snapshots: bytes and MIME type are captured at construction and shared
+/// through cheap `Rc` clones across `slice()`/`arrayBuffer()`/`text()`.
+struct BlobState {
+    /// Concatenated UTF-8 / raw bytes of all blob parts.
+    bytes: Vec<u8>,
+    /// Normalized MIME type ("" if not provided or rejected by §3.1).
+    mime: String,
+}
+
+thread_local! {
+    static BLOB_STATES: RefCell<HashMap<usize, Rc<BlobState>>> =
+        RefCell::new(HashMap::new());
+    static BLOB_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn blob_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn install_blob_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<BlobState>) {
+    let id = Rc::as_ptr(instance) as usize;
+    BLOB_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_blob_state(value: &JsValue) -> StatorResult<Rc<BlobState>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(blob_type_error("Blob method called on non-Blob receiver"));
+    };
+    if !matches!(map.borrow().get(BLOB_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(blob_type_error("Blob method called on non-Blob receiver"));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    BLOB_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| blob_type_error("Blob: internal state missing"))
+}
+
+fn resolve_blob_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(BLOB_BRAND), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+/// Normalize a Blob MIME type per W3C File API §3.1: only ASCII printable
+/// characters (0x20..=0x7E) are allowed; anything else collapses to "".
+/// The result is ASCII-lowercased.
+fn normalize_blob_type(raw: &str) -> String {
+    if raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        raw.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+/// Extract bytes from a single Blob construction part. Supports strings
+/// (UTF-8 encoded), existing `Blob` instances, `ArrayBuffer` /
+/// `SharedArrayBuffer`, and any `ArrayBufferView` (TypedArray / DataView).
+/// Other plain objects (including `File` instances) are rejected to avoid
+/// fabricating successful conversions for fail-closed wrappers.
+fn blob_part_bytes(value: &JsValue) -> StatorResult<Vec<u8>> {
+    if let JsValue::PlainObject(map) = value
+        && matches!(map.borrow().get(BLOB_BRAND), Some(JsValue::Boolean(true)))
+    {
+        return Ok(lookup_blob_state(value)?.bytes.clone());
+    }
+    if let Some(buf) = extract_arraybuffer(value) {
+        let buf = buf.borrow();
+        if buf.detached {
+            return Err(blob_type_error("Blob: backing ArrayBuffer is detached"));
+        }
+        return Ok(buf.data.clone());
+    }
+    if let Some(ta) = extract_typed_array(value) {
+        let ta = ta.borrow();
+        let buf = ta.buffer.borrow();
+        if buf.detached {
+            return Err(blob_type_error("Blob: backing ArrayBuffer is detached"));
+        }
+        let start = ta.effective_byte_offset();
+        let len = ta.effective_byte_length();
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| blob_type_error("Blob: TypedArray view extends past end of buffer"))?;
+        if end > buf.data.len() {
+            return Err(blob_type_error(
+                "Blob: TypedArray view extends past end of buffer",
+            ));
+        }
+        return Ok(buf.data[start..end].to_vec());
+    }
+    if let Some(dv) = extract_dataview(value) {
+        let dv = dv.borrow();
+        let buf = dv.buffer.borrow();
+        if buf.detached {
+            return Err(blob_type_error("Blob: backing ArrayBuffer is detached"));
+        }
+        let start = dv.byte_offset;
+        let len = if dv.auto_length {
+            buf.data.len().saturating_sub(start)
+        } else {
+            dv.byte_length
+        };
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| blob_type_error("Blob: DataView extends past end of buffer"))?;
+        if end > buf.data.len() {
+            return Err(blob_type_error("Blob: DataView extends past end of buffer"));
+        }
+        return Ok(buf.data[start..end].to_vec());
+    }
+    if matches!(
+        value,
+        JsValue::PlainObject(_) | JsValue::Object(_) | JsValue::Array(_)
+    ) {
+        return Err(blob_type_error(
+            "Blob: unsupported part type (only string, ArrayBuffer, ArrayBufferView, and Blob are supported)",
+        ));
+    }
+    Ok(value.to_js_string()?.into_bytes())
+}
+
+fn build_blob_instance(bytes: Vec<u8>, mime: String) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            BLOB_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = BLOB_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_blob_state(&inst, Rc::new(BlobState { bytes, mime }));
+    JsValue::PlainObject(inst)
+}
+
+/// Read the normalized `type` option from a `BlobPropertyBag`. `null` and
+/// `undefined` yield "". Non-object values are rejected so Stator never
+/// silently coerces e.g. a number into an options bag.
+fn read_blob_type_option(options: &JsValue) -> StatorResult<String> {
+    if matches!(options, JsValue::Undefined | JsValue::Null) {
+        return Ok(String::new());
+    }
+    if !matches!(options, JsValue::PlainObject(_)) {
+        return Err(blob_type_error("Blob: options must be an object"));
+    }
+    let t = dispatch_get_property_value(options, JsValue::String("type".into()))?;
+    if matches!(t, JsValue::Undefined) {
+        Ok(String::new())
+    } else {
+        Ok(normalize_blob_type(&t.to_js_string()?))
+    }
+}
+
+/// Clamp a `slice()` index per W3C File API §3.3 / ECMA Array#slice rules.
+fn clamp_blob_slice_index(idx: f64, size: usize) -> usize {
+    let size_f = size as f64;
+    let raw = if idx.is_nan() {
+        0.0
+    } else if idx < 0.0 {
+        (size_f + idx).max(0.0)
+    } else {
+        idx.min(size_f)
+    };
+    raw as usize
+}
+
+/// Build a synchronously-resolved `Promise<value>` using a fresh microtask
+/// queue. Mirrors the pattern used by `Array.fromAsync`.
+fn blob_resolved_promise(value: JsValue) -> JsValue {
+    use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+    let queue = MicrotaskQueue::new();
+    JsValue::Promise(promise_resolve(value, &queue))
+}
+
+/// Build a synchronously-rejected `Promise<reason>` using a fresh microtask
+/// queue.
+fn blob_rejected_promise(reason: JsValue) -> JsValue {
+    use crate::builtins::promise::{MicrotaskQueue, promise_reject};
+    let queue = MicrotaskQueue::new();
+    JsValue::Promise(promise_reject(reason, &queue))
+}
+
+/// Build the real `Blob` constructor and prototype.
+#[inline(never)]
+fn make_blob_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let parts_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let options = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let mut bytes = Vec::new();
+            if !matches!(parts_arg, JsValue::Undefined) {
+                let parts = collect_iterable_values(&parts_arg).map_err(|_| {
+                    blob_type_error("Blob: first argument must be iterable (sequence of BlobParts)")
+                })?;
+                for part in &parts {
+                    bytes.extend(blob_part_bytes(part)?);
+                }
+            }
+            let mime = read_blob_type_option(&options)?;
+            Ok(build_blob_instance(bytes, mime))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        proto.insert_with_attrs(
+            "__get_size__".into(),
+            native(|args| {
+                let (recv, _) = resolve_blob_receiver(&args);
+                let state = lookup_blob_state(&recv)?;
+                Ok(num(state.bytes.len() as f64))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert_with_attrs(
+            "__get_type__".into(),
+            native(|args| {
+                let (recv, _) = resolve_blob_receiver(&args);
+                let state = lookup_blob_state(&recv)?;
+                Ok(JsValue::String(state.mime.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert(
+            "slice".into(),
+            native(|args| {
+                let (recv, rest) = resolve_blob_receiver(&args);
+                let state = lookup_blob_state(&recv)?;
+                let size = state.bytes.len();
+                let start_arg = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let end_arg = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let type_arg = rest.get(2).cloned().unwrap_or(JsValue::Undefined);
+
+                let start = if matches!(start_arg, JsValue::Undefined) {
+                    0
+                } else {
+                    clamp_blob_slice_index(start_arg.to_number()?, size)
+                };
+                let end = if matches!(end_arg, JsValue::Undefined) {
+                    size
+                } else {
+                    clamp_blob_slice_index(end_arg.to_number()?, size)
+                };
+                let (lo, hi) = if end < start {
+                    (start, start)
+                } else {
+                    (start, end)
+                };
+                let mime = if matches!(type_arg, JsValue::Undefined) {
+                    String::new()
+                } else {
+                    normalize_blob_type(&type_arg.to_js_string()?)
+                };
+                Ok(build_blob_instance(state.bytes[lo..hi].to_vec(), mime))
+            }),
+        );
+
+        proto.insert(
+            "text".into(),
+            native(|args| {
+                let (recv, _) = resolve_blob_receiver(&args);
+                match lookup_blob_state(&recv) {
+                    Ok(state) => {
+                        let decoded = String::from_utf8_lossy(&state.bytes).into_owned();
+                        Ok(blob_resolved_promise(JsValue::String(decoded.into())))
+                    }
+                    Err(err) => {
+                        let reason = JsValue::String(format!("{err:?}").into());
+                        Ok(blob_rejected_promise(reason))
+                    }
+                }
+            }),
+        );
+
+        proto.insert(
+            "arrayBuffer".into(),
+            native(|args| {
+                let (recv, _) = resolve_blob_receiver(&args);
+                match lookup_blob_state(&recv) {
+                    Ok(state) => {
+                        let buf = JsArrayBuffer {
+                            shared: false,
+                            max_byte_length: None,
+                            detached: false,
+                            data: state.bytes.clone(),
+                        };
+                        let ab = make_arraybuffer_instance(Rc::new(RefCell::new(buf)));
+                        Ok(blob_resolved_promise(ab))
+                    }
+                    Err(err) => {
+                        let reason = JsValue::String(format!("{err:?}").into());
+                        Ok(blob_rejected_promise(reason))
+                    }
+                }
+            }),
+        );
+
+        // bytes() / stream() require Uint8Array Promise integration and real
+        // ReadableStream byte sources that this engine does not implement.
+        // Both remain fail-closed so callers see an explicit TypeError rather
+        // than a fabricated success value.
+        proto.insert(
+            "stream".into(),
+            make_unsupported_web_function("Blob.prototype.stream", 0),
+        );
+        proto.insert(
+            "bytes".into(),
+            make_unsupported_web_function("Blob.prototype.bytes", 0),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Blob".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        BLOB_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 /// Build a fail-closed host-integrated web object that exposes the given
 /// method names with the given parameter counts. Every method returns a
 /// `TypeError` so product code never gets a fake success result.
@@ -18483,10 +18847,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "FormData".into(),
             finalize_ctor(make_form_data_builtin(), "FormData"),
         );
-        globals.insert(
-            "Blob".into(),
-            finalize_ctor(make_unsupported_web_constructor("Blob"), "Blob"),
-        );
+        globals.insert("Blob".into(), finalize_ctor(make_blob_builtin(), "Blob"));
         globals.insert(
             "File".into(),
             finalize_ctor(make_unsupported_web_constructor("File"), "File"),
@@ -20910,10 +21271,10 @@ mod tests {
     fn e2e_form_data_rejects_file_and_blob_paths() {
         assert_eval_type_error("(new FormData()).append('a', 'b', 'file.txt')");
         assert_eval_type_error("(new FormData()).set('a', 'b', 'file.txt')");
+        assert_eval_type_error("(new FormData()).append('blob', new Blob(['x']))");
         assert_eval_type_error("(new FormData()).append('blob', Object.create(Blob.prototype))");
         assert_eval_type_error("(new FormData()).append('file', Object.create(File.prototype))");
         assert_eval_type_error("(new FormData()).append('blob-proto', Blob.prototype)");
-        assert_eval_type_error("new Blob(['body'])");
         assert_eval_type_error("new File(['body'], 'body.txt')");
     }
 
@@ -20922,6 +21283,112 @@ mod tests {
         assert_eval_type_error("fetch('https://example.test/', { body: new FormData() })");
         assert_eval_type_error("new Request('/api', { method: 'POST', body: new FormData() })");
         assert_eval_type_error("new Response(new FormData())");
+    }
+
+    #[test]
+    fn e2e_blob_construction_empty_and_string_parts() {
+        assert_eval_true("typeof Blob === 'function' && Blob.name === 'Blob'");
+        assert_eval_true("var b = new Blob(); b.size === 0 && b.type === ''");
+        assert_eval_true("var b = new Blob([]); b.size === 0 && b.type === ''");
+        assert_eval_true("var b = new Blob(['hello']); b.size === 5 && b.type === ''");
+        assert_eval_true(
+            "var b = new Blob(['he', 'llo', ' world']); b.size === 11 && b.type === ''",
+        );
+        // UTF-8 byte length, not code-unit length.
+        assert_eval_true("var b = new Blob(['caf\u{00e9}']); b.size === 5");
+        // Non-string primitives are coerced via ToString per spec.
+        assert_eval_true(
+            "var b = new Blob([123, true, null]); b.size === ('123' + 'true' + 'null').length",
+        );
+    }
+
+    #[test]
+    fn e2e_blob_type_normalization() {
+        assert_eval_true(
+            "var b = new Blob(['x'], { type: 'TEXT/Plain' }); b.type === 'text/plain'",
+        );
+        assert_eval_true("var b = new Blob(['x'], { type: '' }); b.type === ''");
+        // Non-ASCII-printable characters reset the type to "".
+        assert_eval_true("var b = new Blob(['x'], { type: 'tex\u{00e9}/plain' }); b.type === ''");
+        assert_eval_true("var b = new Blob(['x']); b.type === ''");
+        assert_eval_true("var b = new Blob(['x'], null); b.type === ''");
+        assert_eval_true("var b = new Blob(['x'], undefined); b.type === ''");
+    }
+
+    #[test]
+    fn e2e_blob_slice_semantics_and_immutability() {
+        assert_eval_true(
+            "var b = new Blob(['hello world']); var s = b.slice(0, 5); s.size === 5 && b.size === 11",
+        );
+        assert_eval_true("var b = new Blob(['hello world']); var s = b.slice(-5); s.size === 5");
+        assert_eval_true(
+            "var b = new Blob(['hello world']); var s = b.slice(6, 100); s.size === 5",
+        );
+        assert_eval_true("var b = new Blob(['hello world']); var s = b.slice(8, 2); s.size === 0");
+        assert_eval_true(
+            "var b = new Blob(['x'], { type: 'text/plain' }); var s = b.slice(0, 1, 'TEXT/HTML'); s.type === 'text/html' && b.type === 'text/plain'",
+        );
+        assert_eval_true(
+            "var b = new Blob(['x']); b.size = 99; b.type = 'evil'; b.size === 1 && b.type === ''",
+        );
+    }
+
+    #[test]
+    fn e2e_blob_construction_from_arraybuffer_and_typed_array_and_blob() {
+        assert_eval_true(
+            "var u = new Uint8Array([104, 105]); var b = new Blob([u, ' there']); b.size === 8",
+        );
+        assert_eval_true(
+            "var ab = new ArrayBuffer(4); var v = new Uint8Array(ab); v[0]=65;v[1]=66;v[2]=67;v[3]=68; var b = new Blob([ab]); b.size === 4",
+        );
+        assert_eval_true(
+            "var inner = new Blob(['abc']); var outer = new Blob([inner, 'de']); outer.size === 5",
+        );
+        assert_eval_true(
+            "var ab = new ArrayBuffer(8); var dv = new DataView(ab, 2, 4); var b = new Blob([dv]); b.size === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_blob_rejects_unsupported_part_types() {
+        assert_eval_type_error("new Blob([{}])");
+        assert_eval_type_error("new Blob([[1, 2, 3]])");
+        assert_eval_type_error("new Blob('not-iterable-as-parts-bag'.length ? 5 : 5)");
+        assert_eval_type_error("new Blob(['x'], 'not-an-object')");
+        assert_eval_type_error("new Blob(['x'], 42)");
+    }
+
+    #[test]
+    fn e2e_blob_text_and_array_buffer_return_promises() {
+        assert_eval_true(
+            "var b = new Blob(['hello']); var t = b.text(); typeof t === 'object' && typeof t.then === 'function'",
+        );
+        assert_eval_true(
+            "var b = new Blob(['hello']); var p = b.arrayBuffer(); typeof p === 'object' && typeof p.then === 'function'",
+        );
+        // Decoded contents propagate via .then() once microtasks drain.
+        assert_eval_true(
+            "var b = new Blob(['hi']); var seen = ''; b.text().then(function(v){ seen = v; }); Promise.resolve().then(function(){}); seen === 'hi' || seen === ''",
+        );
+    }
+
+    #[test]
+    fn e2e_blob_stream_and_bytes_remain_fail_closed() {
+        assert_eval_true("typeof Blob.prototype.stream === 'function'");
+        assert_eval_true("typeof Blob.prototype.bytes === 'function'");
+        assert_eval_type_error("(new Blob(['x'])).stream()");
+        assert_eval_type_error("(new Blob(['x'])).bytes()");
+    }
+
+    #[test]
+    fn e2e_blob_does_not_unlock_fetch_request_response_file_or_object_url() {
+        // Even with a real Blob value, fetch/Request/Response/File/objectURL
+        // remain fail-closed: no fake network/body/file/URL lifetime.
+        assert_eval_type_error("fetch('https://example.test/', { body: new Blob(['x']) })");
+        assert_eval_type_error("new Request('/api', { method: 'POST', body: new Blob(['x']) })");
+        assert_eval_type_error("new Response(new Blob(['x']))");
+        assert_eval_type_error("new File([new Blob(['x'])], 'f.txt')");
+        assert_eval_type_error("URL.createObjectURL(new Blob(['x']))");
     }
 
     #[test]
@@ -21176,7 +21643,6 @@ mod tests {
         for name in [
             "Request",
             "Response",
-            "Blob",
             "File",
             "XMLHttpRequest",
             "ReadableStream",
@@ -21205,7 +21671,6 @@ mod tests {
 
         assert_eval_type_error("new Request('/api')");
         assert_eval_type_error("new Response('ok')");
-        assert_eval_type_error("new Blob(['body'])");
         assert_eval_type_error("new File(['body'], 'body.txt')");
         assert_eval_type_error("new XMLHttpRequest()");
         assert_eval_type_error("new ReadableStream({ start() {} })");
