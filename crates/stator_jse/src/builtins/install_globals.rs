@@ -133,11 +133,10 @@ use crate::builtins::typed_array::{
     dataview_set_int8, dataview_set_int16, dataview_set_int32, dataview_set_uint8,
     dataview_set_uint16, dataview_set_uint32, shared_arraybuffer_grow, shared_arraybuffer_growable,
     shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_byte_length,
-    typed_array_copy_within, typed_array_entries, typed_array_fill, typed_array_from_values,
-    typed_array_get, typed_array_includes, typed_array_index_of, typed_array_join,
-    typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
-    typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
-    typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
+    typed_array_copy_within, typed_array_fill, typed_array_from_values, typed_array_get,
+    typed_array_includes, typed_array_index_of, typed_array_join, typed_array_last_index_of,
+    typed_array_new_from_buffer, typed_array_new_from_length, typed_array_reverse, typed_array_set,
+    typed_array_set_from, typed_array_slice, typed_array_sort, typed_array_subarray,
 };
 use crate::builtins::wasm::make_webassembly_object;
 use crate::builtins::weak_ref::{
@@ -881,6 +880,41 @@ fn build_set_iterator_object(
             Some(value) => crate::interpreter::make_iterator_result(value, false),
             None => crate::interpreter::make_iterator_result(JsValue::Undefined, true),
         })
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum TypedArrayIteratorKind {
+    Key,
+    Value,
+    KeyAndValue,
+}
+
+fn build_typed_array_iterator_object(
+    inner: Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
+    kind: TypedArrayIteratorKind,
+) -> JsValue {
+    let cursor = Rc::new(RefCell::new(0usize));
+    make_self_iterating_object(native(move |_| {
+        let mut cursor = cursor.borrow_mut();
+        let ta = inner.borrow();
+        if *cursor >= ta.effective_length() {
+            return Ok(crate::interpreter::make_iterator_result(
+                JsValue::Undefined,
+                true,
+            ));
+        }
+        let index = *cursor;
+        *cursor += 1;
+        let value = match kind {
+            TypedArrayIteratorKind::Key => JsValue::Smi(index as i32),
+            TypedArrayIteratorKind::Value => typed_array_get(&ta, index),
+            TypedArrayIteratorKind::KeyAndValue => JsValue::new_array(vec![
+                JsValue::Smi(index as i32),
+                typed_array_get(&ta, index),
+            ]),
+        };
+        Ok(crate::interpreter::make_iterator_result(value, false))
     }))
 }
 
@@ -14539,8 +14573,10 @@ fn make_typed_array_instance(
             obj.insert(
                 "entries".into(),
                 native(move |_| {
-                    let items = typed_array_entries(&inner.borrow());
-                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    Ok(build_typed_array_iterator_object(
+                        Rc::clone(&inner),
+                        TypedArrayIteratorKind::KeyAndValue,
+                    ))
                 }),
             );
         }
@@ -14831,8 +14867,10 @@ fn make_typed_array_instance(
             obj.insert(
                 "keys".into(),
                 native(move |_| {
-                    let items = typed_array_keys(&inner.borrow());
-                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    Ok(build_typed_array_iterator_object(
+                        Rc::clone(&inner),
+                        TypedArrayIteratorKind::Key,
+                    ))
                 }),
             );
         }
@@ -15124,8 +15162,10 @@ fn make_typed_array_instance(
             obj.insert(
                 "values".into(),
                 native(move |_| {
-                    let items = typed_array_values(&inner.borrow());
-                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    Ok(build_typed_array_iterator_object(
+                        Rc::clone(&inner),
+                        TypedArrayIteratorKind::Value,
+                    ))
                 }),
             );
         }
@@ -15134,8 +15174,10 @@ fn make_typed_array_instance(
             obj.insert(
                 "@@iterator".into(),
                 native(move |_| {
-                    let items = typed_array_values(&inner.borrow());
-                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    Ok(build_typed_array_iterator_object(
+                        Rc::clone(&inner),
+                        TypedArrayIteratorKind::Value,
+                    ))
                 }),
             );
         }
@@ -42146,6 +42188,48 @@ mod tests {
     fn e2e_typed_array_entries_iterator() {
         assert_eval_true(
             "var e = new Uint8Array([10,20]).entries(); var a = e.next(); a.value[0] === 0 && a.value[1] === 10",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_values_iterator_tracks_growable_shared_buffer() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(2, { maxByteLength: 4 }); \
+             var ta = new Uint8Array(sab); ta[0] = 10; ta[1] = 20; \
+             var it = ta.values(); sab.grow(4); ta[2] = 30; ta[3] = 40; \
+             var a = it.next(), b = it.next(), c = it.next(), d = it.next(), e = it.next(); \
+             a.value === 10 && b.value === 20 && c.value === 30 && d.value === 40 && e.done",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_keys_entries_track_growable_shared_buffer() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(2, { maxByteLength: 4 }); \
+             var ta = new Uint8Array(sab); ta[0] = 5; ta[1] = 6; \
+             var keys = ta.keys(); var entries = ta.entries(); sab.grow(4); ta[2] = 7; ta[3] = 8; \
+             keys.next().value === 0 && keys.next().value === 1 && keys.next().value === 2 && \
+             entries.next().value[1] === 5 && entries.next().value[1] === 6 && entries.next().value[0] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_for_of_tracks_growable_shared_buffer() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(2, { maxByteLength: 4 }); \
+             var ta = new Uint8Array(sab); ta[0] = 1; ta[1] = 2; \
+             var seen = []; \
+             for (var v of ta) { seen.push(v); if (seen.length === 1) { sab.grow(4); ta[2] = 3; ta[3] = 4; } } \
+             seen.join(',') === '1,2,3,4'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_spread_shared_buffer_values() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(3); \
+             var ta = new Uint8Array(sab); ta[0] = 3; ta[1] = 4; ta[2] = 5; \
+             [...ta].join(',') === '3,4,5'",
         );
     }
 
