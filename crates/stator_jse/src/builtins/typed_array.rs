@@ -966,18 +966,36 @@ pub fn typed_array_slice(ta: &JsTypedArray, start: i64, end: i64) -> StatorResul
 /// `%TypedArray%.prototype.subarray(begin?, end?)`.
 ///
 /// Returns a new TypedArray that shares the same buffer.
-pub fn typed_array_subarray(ta: &JsTypedArray, begin: i64, end: i64) -> JsTypedArray {
+///
+/// Per ECMA-262 23.2.3.28, when `end` is omitted (`None`) and the source view
+/// is auto-length (tracks its backing buffer), the resulting view is also
+/// auto-length. When `end` is supplied explicitly — even if it equals the
+/// current length — the result is a fixed-length view of that range, matching
+/// `TypedArraySpeciesCreate(O, «buffer, beginByteOffset, newLength»)`.
+pub fn typed_array_subarray(ta: &JsTypedArray, begin: i64, end: Option<i64>) -> JsTypedArray {
     let len = ta.effective_length() as i64;
     let s = clamp_index(begin, len) as usize;
-    let e = clamp_index(end, len) as usize;
-    let count = e.saturating_sub(s);
     let bpe = ta.kind.bytes_per_element();
-    JsTypedArray {
-        buffer: Rc::clone(&ta.buffer),
-        kind: ta.kind,
-        byte_offset: ta.byte_offset + s * bpe,
-        length: count,
-        auto_length: ta.auto_length && e == len as usize,
+    let byte_offset = ta.byte_offset + s * bpe;
+    match end {
+        None if ta.auto_length => JsTypedArray {
+            buffer: Rc::clone(&ta.buffer),
+            kind: ta.kind,
+            byte_offset,
+            length: 0,
+            auto_length: true,
+        },
+        _ => {
+            let e = clamp_index(end.unwrap_or(len), len) as usize;
+            let count = e.saturating_sub(s);
+            JsTypedArray {
+                buffer: Rc::clone(&ta.buffer),
+                kind: ta.kind,
+                byte_offset,
+                length: count,
+                auto_length: false,
+            }
+        }
     }
 }
 
@@ -1673,7 +1691,7 @@ mod tests {
             &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
         )
         .unwrap();
-        let sub = typed_array_subarray(&ta, 1, 3);
+        let sub = typed_array_subarray(&ta, 1, Some(3));
         // Mutation through subarray is visible in original.
         typed_array_set(&sub, 0, &JsValue::Smi(99)).unwrap();
         assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(99));
@@ -2017,7 +2035,7 @@ mod tests {
             &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
         )
         .unwrap();
-        let sub = typed_array_subarray(&ta, -2, 3);
+        let sub = typed_array_subarray(&ta, -2, Some(3));
         assert_eq!(typed_array_length(&sub), 2);
         assert_eq!(typed_array_get(&sub, 0), JsValue::Smi(2));
     }
@@ -2220,7 +2238,7 @@ mod tests {
             &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
         )
         .unwrap();
-        let sub = typed_array_subarray(&ta, 1, 2);
+        let sub = typed_array_subarray(&ta, 1, Some(2));
         typed_array_set(&sub, 0, &JsValue::Smi(99)).unwrap();
         assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(99));
     }
@@ -2603,7 +2621,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let sub = typed_array_subarray(&ta, 2, 4);
+        let sub = typed_array_subarray(&ta, 2, Some(4));
         assert_eq!(typed_array_length(&sub), 2);
         assert_eq!(typed_array_get(&sub, 0), JsValue::Smi(3));
         assert_eq!(typed_array_get(&sub, 1), JsValue::Smi(4));

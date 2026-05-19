@@ -15077,10 +15077,16 @@ fn make_typed_array_instance(
                         len,
                         to_integer_or_infinity_arg(a.first(), 0.0)?,
                     ) as i64;
-                    let end = clamp_relative_integer_index(
-                        len,
-                        to_integer_or_infinity_arg(a.get(1), len as f64)?,
-                    ) as i64;
+                    let end_arg = a.get(1);
+                    let end_is_undefined = matches!(end_arg, None | Some(JsValue::Undefined));
+                    let end = if end_is_undefined {
+                        None
+                    } else {
+                        Some(clamp_relative_integer_index(
+                            len,
+                            to_integer_or_infinity_arg(end_arg, len as f64)?,
+                        ) as i64)
+                    };
                     let sub = typed_array_subarray(&ta, begin, end);
                     let sub_inner = Rc::new(RefCell::new(sub));
                     Ok(make_typed_array_instance(
@@ -41847,7 +41853,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_subarray_basic() {
         assert_eval_true(
             "var a = new Int32Array([10,20,30]); var s = a.subarray(1, 3); s.length === 2 && s[0] === 20 && s[1] === 30",
@@ -41855,7 +41860,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_subarray_negative() {
         assert_eval_true(
             "var a = new Uint8Array([1,2,3,4]); var s = a.subarray(-2); s.length === 2 && s[0] === 3 && s[1] === 4",
@@ -41863,7 +41867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_subarray_shared_buffer() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3]); var s = a.subarray(1, 3); s[0] = 99; a[1] === 99",
@@ -41871,7 +41874,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_slice_copies() {
         assert_eval_true(
             "var a = new Int32Array([10,20,30]); var s = a.slice(1); s.length === 2 && s[0] === 20 && s[1] === 30",
@@ -41879,7 +41881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_slice_negative() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3,4]); var s = a.slice(-2); s.length === 2 && s[0] === 3 && s[1] === 4",
@@ -41887,10 +41888,37 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_slice_does_not_share() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3]); var s = a.slice(0); s[0] = 99; a[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_auto_length_inherits_when_end_undefined() {
+        // Auto-length view of a resizable buffer; subarray() with no end argument
+        // returns another auto-length view that tracks subsequent resizes.
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); var s = ta.subarray(1); buf.resize(6); s.length === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_explicit_end_is_fixed_length() {
+        // When end is supplied explicitly — even if it equals the current length —
+        // the resulting view is fixed-length and must NOT grow when the buffer
+        // resizes.
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); var s = ta.subarray(1, 4); buf.resize(6); s.length === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_explicit_undefined_end_inherits_auto_length() {
+        // `undefined` for end is spec-equivalent to omitting the argument and
+        // should still propagate auto-length semantics.
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); var s = ta.subarray(0, undefined); buf.resize(6); s.length === 6",
         );
     }
 
