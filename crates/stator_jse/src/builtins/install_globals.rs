@@ -15050,9 +15050,14 @@ fn make_typed_array_instance(
                         len,
                         to_integer_or_infinity_arg(a.first(), 0.0)?,
                     ) as i64;
+                    // Per ECMA-262 §23.2.3.27 step 8: if `end` is undefined
+                    // (missing OR explicitly Undefined), relativeEnd = len.
+                    // Only call ToIntegerOrInfinity for non-undefined values
+                    // so `a.slice(0, undefined)` matches `a.slice(0)`.
+                    let end_arg = a.get(1).filter(|v| !matches!(v, JsValue::Undefined));
                     let end = clamp_relative_integer_index(
                         len,
-                        to_integer_or_infinity_arg(a.get(1), len as f64)?,
+                        to_integer_or_infinity_arg(end_arg, len as f64)?,
                     ) as i64;
                     let result = typed_array_slice(&ta, start, end)?;
                     let inner = Rc::new(RefCell::new(result));
@@ -41933,6 +41938,50 @@ mod tests {
     fn e2e_typed_array_slice_does_not_share() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3]); var s = a.slice(0); s[0] = 99; a[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_explicit_undefined_end_uses_length() {
+        // Per ECMA-262 §23.2.3.27 step 8, an explicit `undefined` `end`
+        // argument must default to the receiver length, just like a missing
+        // argument. Previously this slice yielded an empty result because
+        // ToIntegerOrInfinity(undefined) is 0.
+        assert_eval_true(
+            "var a = new Int32Array([10,20,30,40]); var s = a.slice(1, undefined); s.length === 3 && s[0] === 20 && s[2] === 40",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_from_shared_buffer_is_independent() {
+        // Slicing a view backed by a SharedArrayBuffer must produce a
+        // TypedArray over a fresh, non-shared ArrayBuffer with no aliasing
+        // back to the source backing store.
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4); var src = new Uint8Array(sab); src[0]=1; src[1]=2; src[2]=3; src[3]=4; var s = src.slice(1, 3); var ok = (s.length===2) && (s[0]===2) && (s[1]===3) && (Object.prototype.toString.call(s.buffer) === '[object ArrayBuffer]'); src[1] = 99; ok && (s[0] === 2)",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_start_greater_than_end_is_empty() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3,4]); var s = a.slice(3, 1); s.length === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_clamps_oversized_indices() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3,4]); var s = a.slice(-100, 100); s.length === 4 && s[0] === 1 && s[3] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_preserves_kind_and_offset_independence() {
+        // The returned array must be of the same kind, contain copied values,
+        // and start at byteOffset 0 regardless of the source view's offset.
+        assert_eval_true(
+            "var buf = new ArrayBuffer(16); var src = new Int32Array(buf, 4, 3); src[0]=7; src[1]=8; src[2]=9; var s = src.slice(); s.byteOffset === 0 && s.length === 3 && s[0]===7 && s[2]===9 && (s instanceof Int32Array)",
         );
     }
 
