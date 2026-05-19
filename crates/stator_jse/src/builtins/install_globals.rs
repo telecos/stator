@@ -17475,6 +17475,155 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── Speech / gamepad / MIDI / hardware-input APIs (fail-closed) ─────
+        //
+        // The Web Speech API (synthesis + recognition), Gamepad API, and Web
+        // MIDI API all require host integration with an OS speech engine,
+        // microphone / audio output device, gamepad polling loop with haptic
+        // actuators, or MIDI driver stack, plus permission prompts and host
+        // event delivery. Expose the Chromium/Edge-compatible constructors
+        // (including the legacy `webkit`-prefixed speech-recognition aliases
+        // that Edge still ships) so page scripts can `typeof`/`instanceof`-
+        // probe them, but reject every construction or method call instead of
+        // fabricating utterances, voices, recognition results, gamepad
+        // snapshots, haptic effects, MIDI ports, or message dispatches. The
+        // singleton entry points `speechSynthesis`, `navigator.getGamepads`,
+        // `navigator.requestMIDIAccess`, and `navigator.vibrate` remain absent
+        // because the standalone engine does not preinstall `navigator` or a
+        // speech-synthesis singleton, and we do not synthesize one here.
+        for (name, methods) in [
+            (
+                "SpeechSynthesis",
+                &[
+                    ("speak", 1),
+                    ("cancel", 0),
+                    ("pause", 0),
+                    ("resume", 0),
+                    ("getVoices", 0),
+                ][..],
+            ),
+            (
+                "SpeechSynthesisUtterance",
+                &[("addEventListener", 2), ("removeEventListener", 2)][..],
+            ),
+            ("SpeechSynthesisVoice", &[][..]),
+            (
+                "SpeechRecognition",
+                &[
+                    ("start", 0),
+                    ("stop", 0),
+                    ("abort", 0),
+                    ("addEventListener", 2),
+                    ("removeEventListener", 2),
+                ][..],
+            ),
+            (
+                "webkitSpeechRecognition",
+                &[
+                    ("start", 0),
+                    ("stop", 0),
+                    ("abort", 0),
+                    ("addEventListener", 2),
+                    ("removeEventListener", 2),
+                ][..],
+            ),
+            ("SpeechGrammar", &[][..]),
+            (
+                "SpeechGrammarList",
+                &[("addFromString", 2), ("addFromURI", 2), ("item", 1)][..],
+            ),
+            (
+                "webkitSpeechGrammarList",
+                &[("addFromString", 2), ("addFromURI", 2), ("item", 1)][..],
+            ),
+            ("SpeechRecognitionResult", &[("item", 1)][..]),
+            ("SpeechRecognitionResultList", &[("item", 1)][..]),
+            ("SpeechRecognitionAlternative", &[][..]),
+            ("Gamepad", &[][..]),
+            ("GamepadButton", &[][..]),
+            (
+                "GamepadHapticActuator",
+                &[("playEffect", 2), ("reset", 0), ("pulse", 2)][..],
+            ),
+            (
+                "MIDIAccess",
+                &[("addEventListener", 2), ("removeEventListener", 2)][..],
+            ),
+            (
+                "MIDIPort",
+                &[
+                    ("open", 0),
+                    ("close", 0),
+                    ("addEventListener", 2),
+                    ("removeEventListener", 2),
+                ][..],
+            ),
+            (
+                "MIDIInput",
+                &[
+                    ("open", 0),
+                    ("close", 0),
+                    ("addEventListener", 2),
+                    ("removeEventListener", 2),
+                ][..],
+            ),
+            (
+                "MIDIOutput",
+                &[
+                    ("open", 0),
+                    ("close", 0),
+                    ("send", 2),
+                    ("clear", 0),
+                    ("addEventListener", 2),
+                    ("removeEventListener", 2),
+                ][..],
+            ),
+            (
+                "MIDIInputMap",
+                &[
+                    ("entries", 0),
+                    ("forEach", 1),
+                    ("get", 1),
+                    ("has", 1),
+                    ("keys", 0),
+                    ("values", 0),
+                ][..],
+            ),
+            (
+                "MIDIOutputMap",
+                &[
+                    ("entries", 0),
+                    ("forEach", 1),
+                    ("get", 1),
+                    ("has", 1),
+                    ("keys", 0),
+                    ("values", 0),
+                ][..],
+            ),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, &[][..]),
+                    name,
+                ),
+            );
+        }
+        for name in [
+            "SpeechSynthesisEvent",
+            "SpeechSynthesisErrorEvent",
+            "SpeechRecognitionEvent",
+            "SpeechRecognitionErrorEvent",
+            "GamepadEvent",
+            "MIDIConnectionEvent",
+            "MIDIMessageEvent",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+
         // ── Device / permission / platform host-integrated APIs (fail-closed)
         //
         // Notifications, Permissions, Clipboard events, Device sensors,
@@ -19545,6 +19694,148 @@ mod tests {
         assert_eval_true("typeof navigator === 'undefined'");
         assert_eval_true("typeof serviceWorkerRegistration === 'undefined'");
         assert_eval_true("typeof Beacon === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_speech_gamepad_midi_constructors_exist_but_fail_closed() {
+        for name in [
+            "SpeechSynthesis",
+            "SpeechSynthesisUtterance",
+            "SpeechSynthesisVoice",
+            "SpeechSynthesisEvent",
+            "SpeechSynthesisErrorEvent",
+            "SpeechRecognition",
+            "webkitSpeechRecognition",
+            "SpeechRecognitionEvent",
+            "SpeechRecognitionErrorEvent",
+            "SpeechGrammar",
+            "SpeechGrammarList",
+            "webkitSpeechGrammarList",
+            "SpeechRecognitionResult",
+            "SpeechRecognitionResultList",
+            "SpeechRecognitionAlternative",
+            "Gamepad",
+            "GamepadButton",
+            "GamepadEvent",
+            "GamepadHapticActuator",
+            "MIDIAccess",
+            "MIDIPort",
+            "MIDIInput",
+            "MIDIOutput",
+            "MIDIInputMap",
+            "MIDIOutputMap",
+            "MIDIConnectionEvent",
+            "MIDIMessageEvent",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new SpeechSynthesis()");
+        assert_eval_type_error("new SpeechSynthesisUtterance('hello')");
+        assert_eval_type_error("new SpeechSynthesisVoice()");
+        assert_eval_type_error("new SpeechSynthesisEvent('end')");
+        assert_eval_type_error("new SpeechSynthesisErrorEvent('error')");
+        assert_eval_type_error("new SpeechRecognition()");
+        assert_eval_type_error("new webkitSpeechRecognition()");
+        assert_eval_type_error("new SpeechRecognitionEvent('result')");
+        assert_eval_type_error("new SpeechRecognitionErrorEvent('error')");
+        assert_eval_type_error("new SpeechGrammar()");
+        assert_eval_type_error("new SpeechGrammarList()");
+        assert_eval_type_error("new webkitSpeechGrammarList()");
+        assert_eval_type_error("new Gamepad()");
+        assert_eval_type_error("new GamepadButton()");
+        assert_eval_type_error("new GamepadEvent('gamepadconnected')");
+        assert_eval_type_error("new GamepadHapticActuator()");
+        assert_eval_type_error("new MIDIAccess()");
+        assert_eval_type_error("new MIDIPort()");
+        assert_eval_type_error("new MIDIInput()");
+        assert_eval_type_error("new MIDIOutput()");
+        assert_eval_type_error("new MIDIInputMap()");
+        assert_eval_type_error("new MIDIOutputMap()");
+        assert_eval_type_error("new MIDIConnectionEvent('statechange')");
+        assert_eval_type_error("new MIDIMessageEvent('midimessage')");
+    }
+
+    #[test]
+    fn e2e_speech_gamepad_midi_methods_fail_closed() {
+        assert_eval_true("typeof SpeechSynthesis.prototype.speak === 'function'");
+        assert_eval_true("typeof SpeechSynthesis.prototype.cancel === 'function'");
+        assert_eval_true("typeof SpeechSynthesis.prototype.pause === 'function'");
+        assert_eval_true("typeof SpeechSynthesis.prototype.resume === 'function'");
+        assert_eval_true("typeof SpeechSynthesis.prototype.getVoices === 'function'");
+        assert_eval_type_error("SpeechSynthesis.prototype.speak.call({}, {})");
+        assert_eval_type_error("SpeechSynthesis.prototype.cancel.call({})");
+        assert_eval_type_error("SpeechSynthesis.prototype.pause.call({})");
+        assert_eval_type_error("SpeechSynthesis.prototype.resume.call({})");
+        assert_eval_type_error("SpeechSynthesis.prototype.getVoices.call({})");
+
+        assert_eval_true("typeof SpeechRecognition.prototype.start === 'function'");
+        assert_eval_true("typeof SpeechRecognition.prototype.stop === 'function'");
+        assert_eval_true("typeof SpeechRecognition.prototype.abort === 'function'");
+        assert_eval_type_error("SpeechRecognition.prototype.start.call({})");
+        assert_eval_type_error("SpeechRecognition.prototype.stop.call({})");
+        assert_eval_type_error("SpeechRecognition.prototype.abort.call({})");
+
+        assert_eval_true("typeof webkitSpeechRecognition.prototype.start === 'function'");
+        assert_eval_type_error("webkitSpeechRecognition.prototype.start.call({})");
+
+        assert_eval_true("typeof SpeechGrammarList.prototype.addFromString === 'function'");
+        assert_eval_true("typeof SpeechGrammarList.prototype.addFromURI === 'function'");
+        assert_eval_true("typeof SpeechGrammarList.prototype.item === 'function'");
+        assert_eval_type_error("SpeechGrammarList.prototype.addFromString.call({}, 'g', 1)");
+        assert_eval_type_error("SpeechGrammarList.prototype.addFromURI.call({}, '/g', 1)");
+        assert_eval_type_error("SpeechGrammarList.prototype.item.call({}, 0)");
+
+        assert_eval_true("typeof GamepadHapticActuator.prototype.playEffect === 'function'");
+        assert_eval_true("typeof GamepadHapticActuator.prototype.reset === 'function'");
+        assert_eval_true("typeof GamepadHapticActuator.prototype.pulse === 'function'");
+        assert_eval_type_error(
+            "GamepadHapticActuator.prototype.playEffect.call({}, 'dual-rumble', {})",
+        );
+        assert_eval_type_error("GamepadHapticActuator.prototype.reset.call({})");
+        assert_eval_type_error("GamepadHapticActuator.prototype.pulse.call({}, 1, 100)");
+
+        assert_eval_true("typeof MIDIPort.prototype.open === 'function'");
+        assert_eval_true("typeof MIDIPort.prototype.close === 'function'");
+        assert_eval_type_error("MIDIPort.prototype.open.call({})");
+        assert_eval_type_error("MIDIPort.prototype.close.call({})");
+
+        assert_eval_true("typeof MIDIInput.prototype.open === 'function'");
+        assert_eval_type_error("MIDIInput.prototype.open.call({})");
+
+        assert_eval_true("typeof MIDIOutput.prototype.send === 'function'");
+        assert_eval_true("typeof MIDIOutput.prototype.clear === 'function'");
+        assert_eval_type_error("MIDIOutput.prototype.send.call({}, [0x90, 60, 0x7f])");
+        assert_eval_type_error("MIDIOutput.prototype.clear.call({})");
+
+        assert_eval_true("typeof MIDIInputMap.prototype.get === 'function'");
+        assert_eval_true("typeof MIDIInputMap.prototype.has === 'function'");
+        assert_eval_true("typeof MIDIInputMap.prototype.forEach === 'function'");
+        assert_eval_type_error("MIDIInputMap.prototype.get.call({}, 'id')");
+        assert_eval_type_error("MIDIInputMap.prototype.has.call({}, 'id')");
+        assert_eval_type_error("MIDIInputMap.prototype.forEach.call({}, function () {})");
+
+        assert_eval_true("typeof MIDIOutputMap.prototype.get === 'function'");
+        assert_eval_type_error("MIDIOutputMap.prototype.get.call({}, 'id')");
+    }
+
+    /// Singleton entry points for speech, gamepad polling, MIDI, and vibration
+    /// remain absent because they would require a `navigator` host singleton,
+    /// a `speechSynthesis` host singleton, an OS-driven event loop, or device
+    /// polling that the standalone engine does not provide. Faking them would
+    /// silently mislead product code into believing a real speech engine,
+    /// gamepad device, MIDI driver, or haptics motor exists.
+    #[test]
+    fn e2e_speech_gamepad_midi_singletons_remain_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
+        assert_eval_true("typeof speechSynthesis === 'undefined'");
+        assert_eval_true("typeof getGamepads === 'undefined'");
+        assert_eval_true("typeof requestMIDIAccess === 'undefined'");
+        assert_eval_true("typeof vibrate === 'undefined'");
+        assert_eval_true("typeof GamepadPose === 'undefined'");
     }
 
     /// DOM UI / input / pointer / drag / touch / lifecycle event constructor
