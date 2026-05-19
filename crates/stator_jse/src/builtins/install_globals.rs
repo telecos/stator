@@ -27936,9 +27936,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_object_string_named_method_source() {
         assert_eval_true("({'foo'() {}}).foo.toString() === \"'foo'() {}\"");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_double_quoted_string_named_method_source() {
+        assert_eval_true("({\"foo\"() {}}).foo.toString() === '\"foo\"() {}'");
     }
 
     #[test]
@@ -28013,10 +28017,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_preserves_class_string_named_method_source() {
         assert_eval_true(
             "class Foo { 'foo'() {} } Foo.prototype.foo.toString() === \"'foo'() {}\"",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_double_quoted_string_named_method_source() {
+        assert_eval_true(
+            "class Foo { \"foo\"() {} } Foo.prototype.foo.toString() === '\"foo\"() {}'",
         );
     }
 
