@@ -16990,6 +16990,32 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Realtime / worker / messaging APIs (fail-closed) ────────────────
+        //
+        // WebSockets, server-sent events, workers, service workers, channels,
+        // ports, and broadcast messaging all require host-managed event loops,
+        // networking, cross-context lifetime, and message queue integration.
+        // Expose the globals that Edge page scripts commonly probe, but reject
+        // construction/invocation instead of returning fake connected or queued
+        // objects.
+        for name in [
+            "WebSocket",
+            "CloseEvent",
+            "EventSource",
+            "Worker",
+            "SharedWorker",
+            "ServiceWorker",
+            "ServiceWorkerRegistration",
+            "MessageChannel",
+            "MessagePort",
+            "BroadcastChannel",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+
         // ── Media / canvas / imaging (fail-closed) ──────────────────────────
         //
         // Media element constructors (`Image`, `Audio`), the Media Capture and
@@ -17504,6 +17530,16 @@ mod tests {
         assert!(globals.contains_key("EventTarget"));
         assert!(globals.contains_key("AbortController"));
         assert!(globals.contains_key("AbortSignal"));
+        assert!(globals.contains_key("WebSocket"));
+        assert!(globals.contains_key("CloseEvent"));
+        assert!(globals.contains_key("EventSource"));
+        assert!(globals.contains_key("Worker"));
+        assert!(globals.contains_key("SharedWorker"));
+        assert!(globals.contains_key("ServiceWorker"));
+        assert!(globals.contains_key("ServiceWorkerRegistration"));
+        assert!(globals.contains_key("MessageChannel"));
+        assert!(globals.contains_key("MessagePort"));
+        assert!(globals.contains_key("BroadcastChannel"));
         assert!(globals.contains_key("Location"));
         assert!(globals.contains_key("History"));
         assert!(globals.contains_key("location"));
@@ -17736,6 +17772,47 @@ mod tests {
         assert_eval_true("typeof AbortSignal === 'function' && AbortSignal.name === 'AbortSignal'");
         assert_eval_type_error("AbortSignal()");
         assert_eval_type_error("new AbortSignal()");
+    }
+
+    #[test]
+    fn e2e_realtime_worker_messaging_constructors_exist_but_fail_closed() {
+        for name in [
+            "WebSocket",
+            "CloseEvent",
+            "EventSource",
+            "Worker",
+            "SharedWorker",
+            "ServiceWorker",
+            "ServiceWorkerRegistration",
+            "MessageChannel",
+            "MessagePort",
+            "BroadcastChannel",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new WebSocket('wss://example.test/socket')");
+        assert_eval_type_error("new CloseEvent('close')");
+        assert_eval_type_error("new EventSource('/events')");
+        assert_eval_type_error("new Worker('/worker.js')");
+        assert_eval_type_error("new SharedWorker('/shared-worker.js')");
+        assert_eval_type_error("new ServiceWorker()");
+        assert_eval_type_error("new ServiceWorkerRegistration()");
+        assert_eval_type_error("new MessageChannel()");
+        assert_eval_type_error("new MessagePort()");
+        assert_eval_type_error("new BroadcastChannel('edge-stator')");
+    }
+
+    /// Service worker registration entry points remain absent because
+    /// `navigator` itself is intentionally not preinstalled by the standalone
+    /// engine. Exposing a fake `navigator.serviceWorker` would shadow a real
+    /// host/Blink binding and create fake registration success paths.
+    #[test]
+    fn e2e_navigator_service_worker_remains_absent() {
+        assert_eval_true("typeof navigator === 'undefined'");
     }
 
     #[test]
