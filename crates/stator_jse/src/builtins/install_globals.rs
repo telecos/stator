@@ -2970,6 +2970,34 @@ fn pseudo_random_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
+/// Maximum byte length accepted by `crypto.getRandomValues`.
+///
+/// Per the Web Crypto specification this is 65,536 bytes; requests
+/// exceeding this fail closed with a `QuotaExceededError` (modelled
+/// here as a `RangeError` since we do not implement `DOMException`).
+const CRYPTO_GET_RANDOM_VALUES_QUOTA: usize = 65_536;
+
+/// Returns `true` for the integer TypedArray kinds accepted by
+/// `crypto.getRandomValues`.
+///
+/// Float views (`Float16Array`, `Float32Array`, `Float64Array`) and
+/// non-TypedArray buffer views (e.g. `DataView`) are rejected. The
+/// modern Web Crypto spec accepts `BigInt64Array` and `BigUint64Array`.
+fn crypto_kind_is_integer(kind: TypedArrayKind) -> bool {
+    matches!(
+        kind,
+        TypedArrayKind::Int8
+            | TypedArrayKind::Uint8
+            | TypedArrayKind::Uint8Clamped
+            | TypedArrayKind::Int16
+            | TypedArrayKind::Uint16
+            | TypedArrayKind::Int32
+            | TypedArrayKind::Uint32
+            | TypedArrayKind::BigInt64
+            | TypedArrayKind::BigUint64
+    )
+}
+
 #[inline(never)]
 fn make_crypto() -> JsValue {
     let mut props = PropertyMap::new();
@@ -2977,19 +3005,72 @@ fn make_crypto() -> JsValue {
         "getRandomValues".into(),
         builtin_fn("getRandomValues", 1, |args| {
             let target = args.first().unwrap_or(&JsValue::Undefined);
-            match target {
-                JsValue::TypedArray(typed_array) => {
-                    let typed_array = typed_array.borrow();
-                    let random_bytes = pseudo_random_bytes(typed_array.length);
-                    for (index, byte) in random_bytes.into_iter().enumerate() {
-                        typed_array_set(&typed_array, index, &JsValue::Smi(i32::from(byte)))?;
-                    }
-                    Ok(target.clone())
-                }
-                _ => Err(StatorError::TypeError(
-                    "crypto.getRandomValues: argument must be a TypedArray".into(),
-                )),
+            if extract_dataview(target).is_some() {
+                return Err(StatorError::TypeError(
+                    "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+                ));
             }
+            let typed_array_rc = extract_typed_array(target).ok_or_else(|| {
+                StatorError::TypeError(
+                    "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+                )
+            })?;
+
+            let (byte_offset, byte_len) = {
+                let ta = typed_array_rc.borrow();
+                if !crypto_kind_is_integer(ta.kind) {
+                    return Err(StatorError::TypeError(
+                        "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+                    ));
+                }
+                let bpe = ta.kind.bytes_per_element();
+                let buf = ta.buffer.borrow();
+                if buf.detached {
+                    return Err(StatorError::TypeError(
+                        "crypto.getRandomValues: backing ArrayBuffer is detached".into(),
+                    ));
+                }
+                let buf_len = buf.data.len();
+                if ta.byte_offset > buf_len {
+                    return Err(StatorError::TypeError(
+                        "crypto.getRandomValues: TypedArray is out of bounds".into(),
+                    ));
+                }
+                let byte_len = if ta.auto_length {
+                    (buf_len - ta.byte_offset) / bpe * bpe
+                } else {
+                    let needed = ta.length.checked_mul(bpe).ok_or_else(|| {
+                        StatorError::RangeError(
+                            "crypto.getRandomValues: TypedArray byte length overflow".into(),
+                        )
+                    })?;
+                    let end = ta.byte_offset.checked_add(needed).ok_or_else(|| {
+                        StatorError::RangeError(
+                            "crypto.getRandomValues: TypedArray byte length overflow".into(),
+                        )
+                    })?;
+                    if end > buf_len {
+                        return Err(StatorError::TypeError(
+                            "crypto.getRandomValues: TypedArray is out of bounds".into(),
+                        ));
+                    }
+                    needed
+                };
+                if byte_len > CRYPTO_GET_RANDOM_VALUES_QUOTA {
+                    return Err(StatorError::RangeError(format!(
+                        "crypto.getRandomValues: byteLength {byte_len} exceeds quota of {CRYPTO_GET_RANDOM_VALUES_QUOTA} bytes"
+                    )));
+                }
+                (ta.byte_offset, byte_len)
+            };
+
+            if byte_len > 0 {
+                let random_bytes = pseudo_random_bytes(byte_len);
+                let ta = typed_array_rc.borrow();
+                let mut buf = ta.buffer.borrow_mut();
+                buf.data[byte_offset..byte_offset + byte_len].copy_from_slice(&random_bytes);
+            }
+            Ok(target.clone())
         }),
     );
     props.make_all_non_enumerable();
@@ -37386,7 +37467,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_crypto_get_random_values_returns_same_typed_array() {
         assert_eval_true(
             "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes) === bytes && bytes.length === 4",
@@ -37394,7 +37474,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_crypto_get_random_values_mutates_typed_array() {
         assert_eval_true(
             "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes); bytes[0] !== 0 || bytes[1] !== 0 || bytes[2] !== 0 || bytes[3] !== 0",
@@ -37404,6 +37483,91 @@ mod tests {
     #[test]
     fn e2e_crypto_get_random_values_rejects_plain_object() {
         assert_eval_type_error("crypto.getRandomValues({ length: 4 })");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_float32_array() {
+        assert_eval_type_error("crypto.getRandomValues(new Float32Array(4))");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_float64_array() {
+        assert_eval_type_error("crypto.getRandomValues(new Float64Array(2))");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_data_view() {
+        assert_eval_type_error("crypto.getRandomValues(new DataView(new ArrayBuffer(4)))");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_undefined() {
+        assert_eval_type_error("crypto.getRandomValues()");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_quota_exceeded() {
+        assert_eval_range_error("crypto.getRandomValues(new Uint8Array(65537))");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_quota_exceeded_multibyte() {
+        // 16385 * 4 = 65540 bytes > 65536 quota.
+        assert_eval_range_error("crypto.getRandomValues(new Uint32Array(16385))");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_accepts_quota_boundary() {
+        assert_eval_true(
+            "var b = new Uint8Array(65536); crypto.getRandomValues(b) === b && b.length === 65536",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_accepts_bigint64_array() {
+        assert_eval_true(
+            "var b = new BigInt64Array(2); crypto.getRandomValues(b) === b && b.length === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_accepts_biguint64_array() {
+        assert_eval_true(
+            "var b = new BigUint64Array(2); crypto.getRandomValues(b) === b && b.length === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_fills_multibyte_elements() {
+        // For a Uint32Array of length 4 (16 bytes), at least one element should be
+        // outside the 0..256 range when bytes are written across the full element width.
+        assert_eval_true(
+            "var b = new Uint32Array(4); crypto.getRandomValues(b); \
+             var anyAboveByte = false; \
+             for (var i = 0; i < b.length; i++) if (b[i] > 255) anyAboveByte = true; \
+             anyAboveByte",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_detached_buffer() {
+        assert_eval_type_error(
+            "var ab = new ArrayBuffer(8); var v = new Uint8Array(ab); ab.transfer(); \
+             crypto.getRandomValues(v)",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_accepts_empty_typed_array() {
+        assert_eval_true(
+            "var b = new Uint8Array(0); crypto.getRandomValues(b) === b && b.length === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_no_subtle_property() {
+        // Subtle crypto is not implemented; absence is acceptable fail-closed behavior.
+        assert_eval_true("typeof crypto.subtle === 'undefined'");
     }
 
     /// `structuredClone` copies nested plain objects and arrays.
