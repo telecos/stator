@@ -4803,6 +4803,440 @@ fn _url_legacy_unused() {
     let _ = form_urlencoded_decode as fn(&str) -> String;
 }
 
+// ── Real Headers ──────────────────────────────────────────────────────────
+//
+// Implements the WHATWG Fetch `Headers` data-structure semantics: name/value
+// validation, ASCII-lowercase name normalization, value trimming, and the
+// spec's "sort and combine" iteration order. The constructor and methods
+// are real; however, this engine does **not** integrate `Headers` with any
+// `Request` / `Response` / `fetch` flow because those surfaces remain
+// fail-closed (no host network, no body streams). The "guard" concept
+// (forbidden / response / request-no-cors) is therefore not implemented
+// — there is no associated request/response context to guard.
+
+use crate::builtins::headers::{
+    HeaderList, list_append, list_delete, list_get_combined, list_get_set_cookie, list_has,
+    list_set, normalize_value, sort_and_combine, validate_and_normalize_name, validate_value,
+};
+
+/// Hidden brand placed on every `Headers` instance for receiver checks.
+const HEADERS_BRAND: &str = "__is_headers__";
+
+thread_local! {
+    static HEADERS_STATES: RefCell<HashMap<usize, Rc<RefCell<HeaderList>>>> =
+        RefCell::new(HashMap::new());
+    static HEADERS_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> = const { RefCell::new(None) };
+}
+
+fn headers_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn install_headers_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<HeaderList>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    HEADERS_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_headers_state(value: &JsValue) -> StatorResult<Rc<RefCell<HeaderList>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(headers_type_error(
+            "Headers method called on non-Headers receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(HEADERS_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(headers_type_error(
+            "Headers method called on non-Headers receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    HEADERS_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| headers_type_error("Headers: internal state missing"))
+}
+
+fn resolve_headers_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(HEADERS_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+/// Decode a single `(name, value)` pair from a JS value, validate, and
+/// append to `list`. Used by the constructor for sequence init and by
+/// `append` / `set`.
+fn headers_validated_pair(name: &JsValue, value: &JsValue) -> StatorResult<(String, String)> {
+    let name_str = name.to_js_string()?;
+    let value_str = value.to_js_string()?;
+    let value_trimmed = normalize_value(&value_str);
+    let lowered = validate_and_normalize_name(&name_str).map_err(headers_type_error)?;
+    validate_value(&value_trimmed).map_err(headers_type_error)?;
+    Ok((lowered, value_trimmed))
+}
+
+/// Drain a JS value into a `HeaderList` for `Headers` construction.
+/// Accepts undefined/null (empty), another `Headers` instance (copy
+/// internal list), a JS array of `[name, value]` pair arrays, or a
+/// plain object (record).
+fn headers_init_from_value(value: &JsValue) -> StatorResult<HeaderList> {
+    match value {
+        JsValue::Undefined | JsValue::Null => Ok(Vec::new()),
+        JsValue::PlainObject(map) => {
+            // Another Headers instance: copy the internal list directly so
+            // duplicates and Set-Cookie entries are preserved.
+            if matches!(
+                map.borrow().get(HEADERS_BRAND),
+                Some(JsValue::Boolean(true))
+            ) {
+                let state = lookup_headers_state(value)?;
+                return Ok(state.borrow().clone());
+            }
+            // Record init: iterate own enumerable string properties in
+            // insertion order.
+            let mut out: HeaderList = Vec::new();
+            let entries: Vec<(String, JsValue)> = {
+                let borrowed = map.borrow();
+                borrowed
+                    .iter_with_attrs()
+                    .filter_map(|(k, v, attrs)| {
+                        if !attrs.contains(PropertyAttributes::ENUMERABLE) {
+                            return None;
+                        }
+                        if k.starts_with("__") && k.ends_with("__") {
+                            return None;
+                        }
+                        Some((k.to_string(), v.clone()))
+                    })
+                    .collect()
+            };
+            for (k, v) in entries {
+                let value_str = v.to_js_string()?;
+                let value_trimmed = normalize_value(&value_str);
+                let lowered = validate_and_normalize_name(&k).map_err(headers_type_error)?;
+                validate_value(&value_trimmed).map_err(headers_type_error)?;
+                list_append(&mut out, lowered, value_trimmed);
+            }
+            Ok(out)
+        }
+        JsValue::Array(arr) => {
+            let mut out: HeaderList = Vec::new();
+            for item in arr.borrow().iter() {
+                let JsValue::Array(pair) = item else {
+                    return Err(headers_type_error(
+                        "Headers: sequence element is not a pair",
+                    ));
+                };
+                let pair_ref = pair.borrow();
+                if pair_ref.len() != 2 {
+                    return Err(headers_type_error(
+                        "Headers: sequence pair must have length 2",
+                    ));
+                }
+                let (lowered, value_trimmed) = headers_validated_pair(&pair_ref[0], &pair_ref[1])?;
+                list_append(&mut out, lowered, value_trimmed);
+            }
+            Ok(out)
+        }
+        _ => Err(headers_type_error(
+            "Headers: init must be a sequence, record, or Headers object",
+        )),
+    }
+}
+
+/// Build a fresh `Headers` instance from a list.
+fn build_headers_instance(list: HeaderList) -> StatorResult<JsValue> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            HEADERS_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = HEADERS_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+        // The interpreter's `for..of` looks up `@@iterator` on the iterable's
+        // own property map (it does not walk the prototype chain), so we
+        // also install it directly on each instance to make
+        // `for (const e of headers) ...` work. The native closure resolves
+        // the receiver via the brand check and reuses the same sort-and-
+        // combine view as `entries()`.
+        props.insert_with_attrs(
+            "@@iterator".into(),
+            native(|args| {
+                let (recv, _) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let values: Vec<JsValue> = sort_and_combine(&state.borrow())
+                    .into_iter()
+                    .map(|(k, v)| {
+                        JsValue::new_array(vec![
+                            JsValue::String(k.into()),
+                            JsValue::String(v.into()),
+                        ])
+                    })
+                    .collect();
+                Ok(headers_make_iterator(values))
+            }),
+            PropertyAttributes::empty(),
+        );
+    }
+    install_headers_state(&inst, Rc::new(RefCell::new(list)));
+    Ok(JsValue::PlainObject(inst))
+}
+
+/// Build a `next`-style iterator wrapper over an in-memory list of
+/// values. The returned object exposes both `next()` (per the iterator
+/// protocol) and `@@iterator` (returning itself), so it is iterable
+/// directly via `for..of`.
+fn headers_make_iterator(values: Vec<JsValue>) -> JsValue {
+    let inner = Rc::new(RefCell::new(values.into_iter()));
+    let mut it_obj = PropertyMap::new();
+    let inner_for_next = Rc::clone(&inner);
+    it_obj.insert(
+        "next".into(),
+        native(move |_| {
+            let next = inner_for_next.borrow_mut().next();
+            let mut result = PropertyMap::new();
+            match next {
+                Some(v) => {
+                    result.insert("value".into(), v);
+                    result.insert("done".into(), JsValue::Boolean(false));
+                }
+                None => {
+                    result.insert("value".into(), JsValue::Undefined);
+                    result.insert("done".into(), JsValue::Boolean(true));
+                }
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+        }),
+    );
+    // `@@iterator()` on an iterator returns itself.
+    let obj_rc = Rc::new(RefCell::new(it_obj));
+    let self_ref = JsValue::PlainObject(Rc::clone(&obj_rc));
+    obj_rc
+        .borrow_mut()
+        .insert("@@iterator".into(), native(move |_| Ok(self_ref.clone())));
+    JsValue::PlainObject(obj_rc)
+}
+
+/// Build the real `Headers` constructor.
+#[inline(never)]
+fn make_headers_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let init = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let list = headers_init_from_value(&init)?;
+            build_headers_instance(list)
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        // append(name, value)
+        proto.insert(
+            "append".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (lowered, value_trimmed) = headers_validated_pair(&name, &value)?;
+                list_append(&mut state.borrow_mut(), lowered, value_trimmed);
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // delete(name)
+        proto.insert(
+            "delete".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let lowered = validate_and_normalize_name(&name).map_err(headers_type_error)?;
+                list_delete(&mut state.borrow_mut(), &lowered);
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // get(name) -> combined value or null
+        proto.insert(
+            "get".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let lowered = validate_and_normalize_name(&name).map_err(headers_type_error)?;
+                Ok(list_get_combined(&state.borrow(), &lowered)
+                    .map(|s| JsValue::String(s.into()))
+                    .unwrap_or(JsValue::Null))
+            }),
+        );
+
+        // getSetCookie() -> array of Set-Cookie values in insertion order
+        proto.insert(
+            "getSetCookie".into(),
+            native(|args| {
+                let (recv, _) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let values: Vec<JsValue> = list_get_set_cookie(&state.borrow())
+                    .into_iter()
+                    .map(|s| JsValue::String(s.into()))
+                    .collect();
+                Ok(JsValue::new_array(values))
+            }),
+        );
+
+        // has(name) -> boolean
+        proto.insert(
+            "has".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let lowered = validate_and_normalize_name(&name).map_err(headers_type_error)?;
+                Ok(JsValue::Boolean(list_has(&state.borrow(), &lowered)))
+            }),
+        );
+
+        // set(name, value) -> replaces all entries for name with one
+        proto.insert(
+            "set".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (lowered, value_trimmed) = headers_validated_pair(&name, &value)?;
+                list_set(&mut state.borrow_mut(), lowered, value_trimmed);
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // forEach(cb, thisArg?) — sort-and-combine view, with `Set-Cookie`
+        // entries emitted separately and other names merged with ", ".
+        proto.insert(
+            "forEach".into(),
+            native(|args| {
+                let (recv, rest) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let cb = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let this_arg = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let snapshot = sort_and_combine(&state.borrow());
+                for (k, v) in snapshot {
+                    dispatch_call_with_this(
+                        &cb,
+                        this_arg.clone(),
+                        vec![
+                            JsValue::String(v.into()),
+                            JsValue::String(k.into()),
+                            recv.clone(),
+                        ],
+                    )?;
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        // entries() / keys() / values() / @@iterator over sort-and-combine
+        let entries_fn = native(|args| {
+            let (recv, _) = resolve_headers_receiver(&args);
+            let state = lookup_headers_state(&recv)?;
+            let values: Vec<JsValue> = sort_and_combine(&state.borrow())
+                .into_iter()
+                .map(|(k, v)| {
+                    JsValue::new_array(vec![JsValue::String(k.into()), JsValue::String(v.into())])
+                })
+                .collect();
+            Ok(headers_make_iterator(values))
+        });
+        proto.insert("entries".into(), entries_fn.clone());
+        proto.insert("@@iterator".into(), entries_fn);
+
+        proto.insert(
+            "keys".into(),
+            native(|args| {
+                let (recv, _) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let values: Vec<JsValue> = sort_and_combine(&state.borrow())
+                    .into_iter()
+                    .map(|(k, _)| JsValue::String(k.into()))
+                    .collect();
+                Ok(headers_make_iterator(values))
+            }),
+        );
+        proto.insert(
+            "values".into(),
+            native(|args| {
+                let (recv, _) = resolve_headers_receiver(&args);
+                let state = lookup_headers_state(&recv)?;
+                let values: Vec<JsValue> = sort_and_combine(&state.borrow())
+                    .into_iter()
+                    .map(|(_, v)| JsValue::String(v.into()))
+                    .collect();
+                Ok(headers_make_iterator(values))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Headers".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        HEADERS_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 /// Build a fail-closed host-integrated web object that exposes the given
 /// method names with the given parameter counts. Every method returns a
 /// `TypeError` so product code never gets a fake success result.
@@ -17676,7 +18110,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert(
             "Headers".into(),
-            finalize_ctor(make_unsupported_web_constructor("Headers"), "Headers"),
+            finalize_ctor(make_headers_builtin(), "Headers"),
         );
         globals.insert(
             "FormData".into(),
@@ -19894,6 +20328,154 @@ mod tests {
     }
 
     #[test]
+    fn e2e_headers_constructor_shape() {
+        assert_eval_true("typeof Headers === 'function' && Headers.name === 'Headers'");
+        assert_eval_true("new Headers() instanceof Headers");
+        assert_eval_true("new Headers(undefined) instanceof Headers");
+        assert_eval_true("new Headers(null) instanceof Headers");
+        assert_eval_true("Object.prototype.toString.call(new Headers()) === '[object Headers]'");
+    }
+
+    #[test]
+    fn e2e_headers_construct_from_record() {
+        assert_eval_true(
+            "(new Headers({ 'Content-Type': 'text/plain', 'X-Foo': 'bar' })).get('content-type') === 'text/plain'",
+        );
+        assert_eval_true("(new Headers({ 'X-Foo': 'bar' })).get('X-FOO') === 'bar'");
+        assert_eval_true("(new Headers({ a: 'x' })).has('A') === true");
+    }
+
+    #[test]
+    fn e2e_headers_construct_from_sequence() {
+        assert_eval_true("(new Headers([['X-A','1'],['X-A','2']])).get('x-a') === '1, 2'");
+        assert_eval_true(
+            "(new Headers([['Set-Cookie','a=1'],['Set-Cookie','b=2']])).getSetCookie().length === 2",
+        );
+        assert_eval_type_error("new Headers([['only-one']])");
+        assert_eval_type_error("new Headers(['not-a-pair'])");
+    }
+
+    #[test]
+    fn e2e_headers_copy_from_another_headers() {
+        assert_eval_true(
+            "var h1 = new Headers({ 'X-A': '1' }); h1.append('X-A','2'); var h2 = new Headers(h1); h2.get('x-a') === '1, 2'",
+        );
+        assert_eval_true(
+            "var h1 = new Headers(); h1.append('Set-Cookie','a=1'); h1.append('Set-Cookie','b=2'); var h2 = new Headers(h1); h2.getSetCookie().length === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_append_set_delete_get_has() {
+        assert_eval_true(
+            "var h = new Headers(); h.append('A','1'); h.append('a','2'); h.get('a') === '1, 2'",
+        );
+        assert_eval_true(
+            "var h = new Headers(); h.append('a','1'); h.append('b','2'); h.append('a','3'); h.set('A','X'); h.get('a') === 'X' && h.get('b') === '2'",
+        );
+        assert_eval_true(
+            "var h = new Headers({ a:'1', b:'2' }); h.delete('A'); h.has('a') === false && h.has('b') === true",
+        );
+        assert_eval_true("(new Headers()).get('missing') === null");
+        assert_eval_true("(new Headers()).has('missing') === false");
+    }
+
+    #[test]
+    fn e2e_headers_value_normalization_trims_http_whitespace() {
+        assert_eval_true("(new Headers({ a: '  hello  ' })).get('a') === 'hello'");
+        assert_eval_true(
+            "var h = new Headers(); h.append('a', '\\t value \\t'); h.get('a') === 'value'",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_invalid_name_throws() {
+        assert_eval_type_error("new Headers({ '': 'x' })");
+        assert_eval_type_error("new Headers({ 'a b': 'x' })");
+        assert_eval_type_error("new Headers({ 'a:b': 'x' })");
+        assert_eval_type_error("(new Headers()).append('a b', 'x')");
+        assert_eval_type_error("(new Headers()).set('a:b', 'x')");
+        assert_eval_type_error("(new Headers()).get('a b')");
+        assert_eval_type_error("(new Headers()).has('a b')");
+        assert_eval_type_error("(new Headers()).delete('a b')");
+    }
+
+    #[test]
+    fn e2e_headers_invalid_value_throws() {
+        assert_eval_type_error("(new Headers()).append('a', 'bad\\0value')");
+        assert_eval_type_error("(new Headers()).append('a', 'bad\\nvalue')");
+        assert_eval_type_error("(new Headers()).append('a', 'bad\\rvalue')");
+        assert_eval_type_error("(new Headers()).set('a', 'bad\\0')");
+    }
+
+    #[test]
+    fn e2e_headers_iteration_sort_and_combine() {
+        // Iteration order is by sorted lowercase name; duplicates merged
+        // except for Set-Cookie which stays as separate entries.
+        assert_eval_true(
+            "var h = new Headers(); h.append('X-B','2'); h.append('X-A','1'); h.append('X-A','3'); var out = []; for (var e of h) out.push(e[0]+'='+e[1]); out.join('|') === 'x-a=1, 3|x-b=2'",
+        );
+        assert_eval_true(
+            "var h = new Headers(); h.append('Set-Cookie','a=1'); h.append('X-A','v'); h.append('Set-Cookie','b=2'); var out = []; for (var e of h.entries()) out.push(e[0]+'='+e[1]); out.join('|') === 'set-cookie=a=1|set-cookie=b=2|x-a=v'",
+        );
+        assert_eval_true(
+            "var h = new Headers({ z:'1', a:'2', m:'3' }); var keys = []; for (var k of h.keys()) keys.push(k); keys.join(',') === 'a,m,z'",
+        );
+        assert_eval_true(
+            "var h = new Headers({ z:'1', a:'2' }); var vals = []; for (var v of h.values()) vals.push(v); vals.join(',') === '2,1'",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_for_each_signature() {
+        assert_eval_true(
+            "var h = new Headers({ a:'1', b:'2' }); var calls = []; h.forEach(function(v,k,o){ calls.push(k+'='+v+'/'+(o===h)); }); calls.join('|') === 'a=1/true|b=2/true'",
+        );
+        assert_eval_true(
+            "var h = new Headers({ a:'1' }); var tag; h.forEach(function(){ tag = this.x; }, { x: 'thisArg' }); tag === 'thisArg'",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_get_set_cookie() {
+        assert_eval_true("Array.isArray((new Headers()).getSetCookie())");
+        assert_eval_true("(new Headers()).getSetCookie().length === 0");
+        assert_eval_true(
+            "var h = new Headers(); h.append('Set-Cookie','a=1'); h.append('set-cookie','b=2'); var r = h.getSetCookie(); r.length === 2 && r[0] === 'a=1' && r[1] === 'b=2'",
+        );
+        // get() still joins all Set-Cookie values with ", " per spec.
+        assert_eval_true(
+            "var h = new Headers(); h.append('Set-Cookie','a=1'); h.append('Set-Cookie','b=2'); h.get('set-cookie') === 'a=1, b=2'",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_branded_methods_reject_foreign_receiver() {
+        assert_eval_type_error("Headers.prototype.append.call({}, 'a', 'b')");
+        assert_eval_type_error("Headers.prototype.get.call({}, 'a')");
+        assert_eval_type_error("Headers.prototype.set.call(new Map(), 'a', 'b')");
+        // Branded receivers via .call work.
+        assert_eval_true(
+            "var h = new Headers(); Headers.prototype.append.call(h,'X','1'); h.get('x') === '1'",
+        );
+    }
+
+    #[test]
+    fn e2e_headers_does_not_unlock_fetch_or_request_response() {
+        // Real Headers must not regress fail-closed fetch / Request / Response.
+        assert_eval_true("typeof fetch === 'function'");
+        assert_eval_type_error("fetch('https://example.test/')");
+        assert_eval_type_error("new Request('/api')");
+        assert_eval_type_error("new Response('ok')");
+        // Even when given a real Headers object as part of init.
+        assert_eval_type_error(
+            "fetch('https://example.test/', { headers: new Headers({ 'X-A': '1' }) })",
+        );
+        assert_eval_type_error("new Request('/api', { headers: new Headers({ 'X-A': '1' }) })");
+        assert_eval_type_error("new Response('ok', { headers: new Headers({ 'X-A': '1' }) })");
+    }
+
+    #[test]
     fn e2e_dom_parser_serialization_constructors_exist_but_fail_closed() {
         for name in ["DOMParser", "XMLSerializer"] {
             assert_eval_true(&format!(
@@ -20145,7 +20727,6 @@ mod tests {
         for name in [
             "Request",
             "Response",
-            "Headers",
             "FormData",
             "Blob",
             "File",
@@ -20176,7 +20757,6 @@ mod tests {
 
         assert_eval_type_error("new Request('/api')");
         assert_eval_type_error("new Response('ok')");
-        assert_eval_type_error("new Headers({ Accept: 'application/json' })");
         assert_eval_type_error("new FormData()");
         assert_eval_type_error("new Blob(['body'])");
         assert_eval_type_error("new File(['body'], 'body.txt')");

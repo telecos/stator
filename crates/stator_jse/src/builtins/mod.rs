@@ -25,6 +25,8 @@ pub mod function;
 /// `parseInt`, `parseFloat`, `encodeURI`, `decodeURI`, `encodeURIComponent`,
 /// `decodeURIComponent`, `eval`, and the `NaN`/`Infinity`/`undefined` constants).
 pub mod global;
+/// WHATWG Fetch `Headers` data model (validation, normalization, list ops).
+pub mod headers;
 /// Pre-populates the global environment with all built-in constructors, namespace
 /// objects, and global functions so that JavaScript code can access `Math`,
 /// `console`, `JSON`, `parseInt`, etc.
