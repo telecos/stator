@@ -16767,6 +16767,34 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 "ReadableStream",
             ),
         );
+        globals.insert(
+            "TextEncoderStream".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("TextEncoderStream"),
+                "TextEncoderStream",
+            ),
+        );
+        globals.insert(
+            "TextDecoderStream".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("TextDecoderStream"),
+                "TextDecoderStream",
+            ),
+        );
+        globals.insert(
+            "CompressionStream".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("CompressionStream"),
+                "CompressionStream",
+            ),
+        );
+        globals.insert(
+            "DecompressionStream".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("DecompressionStream"),
+                "DecompressionStream",
+            ),
+        );
 
         // ── Web Storage (fail-closed) ───────────────────────────────────────
         // Storage is host-integrated and this standalone engine has no backing
@@ -17417,6 +17445,10 @@ mod tests {
         assert!(globals.contains_key("File"));
         assert!(globals.contains_key("XMLHttpRequest"));
         assert!(globals.contains_key("ReadableStream"));
+        assert!(globals.contains_key("TextEncoderStream"));
+        assert!(globals.contains_key("TextDecoderStream"));
+        assert!(globals.contains_key("CompressionStream"));
+        assert!(globals.contains_key("DecompressionStream"));
         assert!(globals.contains_key("Storage"));
         assert!(globals.contains_key("localStorage"));
         assert!(globals.contains_key("sessionStorage"));
@@ -17479,6 +17511,10 @@ mod tests {
             "File",
             "XMLHttpRequest",
             "ReadableStream",
+            "TextEncoderStream",
+            "TextDecoderStream",
+            "CompressionStream",
+            "DecompressionStream",
         ] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
@@ -17494,6 +17530,10 @@ mod tests {
         assert_eval_type_error("new File(['body'], 'body.txt')");
         assert_eval_type_error("new XMLHttpRequest()");
         assert_eval_type_error("new ReadableStream({ start() {} })");
+        assert_eval_type_error("new TextEncoderStream()");
+        assert_eval_type_error("new TextDecoderStream('utf-8')");
+        assert_eval_type_error("new CompressionStream('gzip')");
+        assert_eval_type_error("new DecompressionStream('gzip')");
     }
 
     #[test]
