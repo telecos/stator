@@ -5237,6 +5237,373 @@ fn make_headers_builtin() -> JsValue {
     ctor
 }
 
+/// Hidden brand placed on every `FormData` instance for receiver checks.
+const FORM_DATA_BRAND: &str = "__is_form_data__";
+
+/// Standalone `FormData` entry list. This engine only supports string values;
+/// Blob/File-backed entries and multipart/body integration remain unsupported.
+type FormDataList = Vec<(String, String)>;
+
+thread_local! {
+    static FORM_DATA_STATES: RefCell<HashMap<usize, Rc<RefCell<FormDataList>>>> =
+        RefCell::new(HashMap::new());
+    static FORM_DATA_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> = const { RefCell::new(None) };
+}
+
+fn form_data_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn install_form_data_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<FormDataList>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    FORM_DATA_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_form_data_state(value: &JsValue) -> StatorResult<Rc<RefCell<FormDataList>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(form_data_type_error(
+            "FormData method called on non-FormData receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(FORM_DATA_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(form_data_type_error(
+            "FormData method called on non-FormData receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    FORM_DATA_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| form_data_type_error("FormData: internal state missing"))
+}
+
+fn resolve_form_data_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(FORM_DATA_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+fn global_constructor_prototype(name: &str) -> Option<JsValue> {
+    current_global_env()
+        .and_then(|env| env.borrow().get(name).cloned())
+        .and_then(|ctor| {
+            dispatch_get_property_value(&ctor, JsValue::String("prototype".into())).ok()
+        })
+}
+
+fn is_blob_or_file_like(value: &JsValue) -> bool {
+    ["Blob", "File"]
+        .into_iter()
+        .filter_map(global_constructor_prototype)
+        .any(|prototype| value == &prototype || has_prototype_in_chain(value, &prototype))
+}
+
+fn form_data_string_pair(
+    name: &JsValue,
+    value: &JsValue,
+    filename: Option<&JsValue>,
+) -> StatorResult<(String, String)> {
+    if filename.is_some() {
+        return Err(form_data_type_error(
+            "FormData: Blob/File filename entries are not supported",
+        ));
+    }
+    if is_blob_or_file_like(value) {
+        return Err(form_data_type_error(
+            "FormData: Blob/File values are not supported",
+        ));
+    }
+    Ok((name.to_js_string()?, value.to_js_string()?))
+}
+
+fn form_data_set(list: &mut FormDataList, name: String, value: String) {
+    if let Some(first_index) = list.iter().position(|(k, _)| k == &name) {
+        list[first_index] = (name.clone(), value);
+        let mut seen_first = false;
+        list.retain(|(k, _)| {
+            if k != &name {
+                true
+            } else if !seen_first {
+                seen_first = true;
+                true
+            } else {
+                false
+            }
+        });
+    } else {
+        list.push((name, value));
+    }
+}
+
+fn form_data_make_iterator(values: Vec<JsValue>) -> JsValue {
+    headers_make_iterator(values)
+}
+
+fn build_form_data_instance(list: FormDataList) -> StatorResult<JsValue> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            FORM_DATA_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = FORM_DATA_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+        props.insert_with_attrs(
+            "@@iterator".into(),
+            native(|args| {
+                let (recv, _) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let values: Vec<JsValue> = state
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| {
+                        JsValue::new_array(vec![
+                            JsValue::String(k.clone().into()),
+                            JsValue::String(v.clone().into()),
+                        ])
+                    })
+                    .collect();
+                Ok(form_data_make_iterator(values))
+            }),
+            PropertyAttributes::empty(),
+        );
+    }
+    install_form_data_state(&inst, Rc::new(RefCell::new(list)));
+    Ok(JsValue::PlainObject(inst))
+}
+
+/// Build a standalone string-entry `FormData` constructor.
+#[inline(never)]
+fn make_form_data_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            if let Some(init) = args.first()
+                && !matches!(init, JsValue::Undefined)
+            {
+                return Err(form_data_type_error(
+                    "FormData: HTML form population is not supported",
+                ));
+            }
+            build_form_data_instance(Vec::new())
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        proto.insert(
+            "append".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (name, value) = form_data_string_pair(&name, &value, rest.get(2))?;
+                state.borrow_mut().push((name, value));
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        proto.insert(
+            "delete".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                state.borrow_mut().retain(|(k, _)| k != &name);
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        proto.insert(
+            "get".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                Ok(state
+                    .borrow()
+                    .iter()
+                    .find(|(k, _)| k == &name)
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .unwrap_or(JsValue::Null))
+            }),
+        );
+
+        proto.insert(
+            "getAll".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                let values = state
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| k == &name)
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .collect();
+                Ok(JsValue::new_array(values))
+            }),
+        );
+
+        proto.insert(
+            "has".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest
+                    .first()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+                    .to_js_string()?;
+                Ok(JsValue::Boolean(
+                    state.borrow().iter().any(|(k, _)| k == &name),
+                ))
+            }),
+        );
+
+        proto.insert(
+            "set".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (name, value) = form_data_string_pair(&name, &value, rest.get(2))?;
+                form_data_set(&mut state.borrow_mut(), name, value);
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        proto.insert(
+            "forEach".into(),
+            native(|args| {
+                let (recv, rest) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let cb = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let this_arg = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let snapshot = state.borrow().clone();
+                for (k, v) in snapshot {
+                    dispatch_call_with_this(
+                        &cb,
+                        this_arg.clone(),
+                        vec![
+                            JsValue::String(v.into()),
+                            JsValue::String(k.into()),
+                            recv.clone(),
+                        ],
+                    )?;
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+
+        let entries_fn = native(|args| {
+            let (recv, _) = resolve_form_data_receiver(&args);
+            let state = lookup_form_data_state(&recv)?;
+            let values: Vec<JsValue> = state
+                .borrow()
+                .iter()
+                .map(|(k, v)| {
+                    JsValue::new_array(vec![
+                        JsValue::String(k.clone().into()),
+                        JsValue::String(v.clone().into()),
+                    ])
+                })
+                .collect();
+            Ok(form_data_make_iterator(values))
+        });
+        proto.insert("entries".into(), entries_fn.clone());
+        proto.insert("@@iterator".into(), entries_fn);
+
+        proto.insert(
+            "keys".into(),
+            native(|args| {
+                let (recv, _) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let values = state
+                    .borrow()
+                    .iter()
+                    .map(|(k, _)| JsValue::String(k.clone().into()))
+                    .collect();
+                Ok(form_data_make_iterator(values))
+            }),
+        );
+        proto.insert(
+            "values".into(),
+            native(|args| {
+                let (recv, _) = resolve_form_data_receiver(&args);
+                let state = lookup_form_data_state(&recv)?;
+                let values = state
+                    .borrow()
+                    .iter()
+                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .collect();
+                Ok(form_data_make_iterator(values))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("FormData".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        FORM_DATA_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 /// Build a fail-closed host-integrated web object that exposes the given
 /// method names with the given parameter counts. Every method returns a
 /// `TypeError` so product code never gets a fake success result.
@@ -18114,7 +18481,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert(
             "FormData".into(),
-            finalize_ctor(make_unsupported_web_constructor("FormData"), "FormData"),
+            finalize_ctor(make_form_data_builtin(), "FormData"),
         );
         globals.insert(
             "Blob".into(),
@@ -20476,6 +20843,88 @@ mod tests {
     }
 
     #[test]
+    fn e2e_form_data_constructor_shape() {
+        assert_eval_true("typeof FormData === 'function' && FormData.name === 'FormData'");
+        assert_eval_true("new FormData() instanceof FormData");
+        assert_eval_true("new FormData(undefined) instanceof FormData");
+        assert_eval_true("Object.prototype.toString.call(new FormData()) === '[object FormData]'");
+        assert_eval_type_error("new FormData(null)");
+        assert_eval_type_error("new FormData({})");
+    }
+
+    #[test]
+    fn e2e_form_data_append_get_get_all_has_delete() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.append('a','2'); f.get('a') === '1'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.append('a','2'); var all = f.getAll('a'); all.length === 2 && all[0] === '1' && all[1] === '2'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.append('b','2'); f.has('a') && f.has('b') && !f.has('c')",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.append('a','2'); f.append('b','3'); f.delete('a'); !f.has('a') && f.get('a') === null && f.get('b') === '3'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_set_replaces_duplicates_in_place() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.append('b','2'); f.append('a','3'); f.set('a','X'); var out = []; for (var e of f) out.push(e[0]+'='+e[1]); out.join('|') === 'a=X|b=2'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a','1'); f.set('b','2'); var out = []; for (var e of f.entries()) out.push(e[0]+'='+e[1]); out.join('|') === 'a=1|b=2'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_iteration_and_for_each_order() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('b','2'); f.append('a','1'); f.append('a','3'); var out = []; for (var e of f.entries()) out.push(e[0]+'='+e[1]); out.join('|') === 'b=2|a=1|a=3'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('b','2'); f.append('a','1'); var keys = []; for (var k of f.keys()) keys.push(k); keys.join(',') === 'b,a'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('b','2'); f.append('a','1'); var vals = []; for (var v of f.values()) vals.push(v); vals.join(',') === '2,1'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('x','1'); var seen = []; f.forEach(function(v,k,o){ seen.push(this.tag+':'+k+'='+v+':'+(o===f)); }, { tag: 'T' }); seen.join('|') === 'T:x=1:true'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_string_coercion() {
+        assert_eval_true(
+            "var f = new FormData(); f.append(123, true); f.append(null, undefined); f.get('123') === 'true' && f.get('null') === 'undefined'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append({ toString: function(){ return 'name'; } }, { toString: function(){ return 'value'; } }); f.get('name') === 'value'",
+        );
+        assert_eval_type_error("(new FormData()).append(Symbol('s'), 'x')");
+        assert_eval_type_error("(new FormData()).append('a', Symbol('s'))");
+    }
+
+    #[test]
+    fn e2e_form_data_rejects_file_and_blob_paths() {
+        assert_eval_type_error("(new FormData()).append('a', 'b', 'file.txt')");
+        assert_eval_type_error("(new FormData()).set('a', 'b', 'file.txt')");
+        assert_eval_type_error("(new FormData()).append('blob', Object.create(Blob.prototype))");
+        assert_eval_type_error("(new FormData()).append('file', Object.create(File.prototype))");
+        assert_eval_type_error("(new FormData()).append('blob-proto', Blob.prototype)");
+        assert_eval_type_error("new Blob(['body'])");
+        assert_eval_type_error("new File(['body'], 'body.txt')");
+    }
+
+    #[test]
+    fn e2e_form_data_does_not_unlock_fetch_or_request_response() {
+        assert_eval_type_error("fetch('https://example.test/', { body: new FormData() })");
+        assert_eval_type_error("new Request('/api', { method: 'POST', body: new FormData() })");
+        assert_eval_type_error("new Response(new FormData())");
+    }
+
+    #[test]
     fn e2e_dom_parser_serialization_constructors_exist_but_fail_closed() {
         for name in ["DOMParser", "XMLSerializer"] {
             assert_eval_true(&format!(
@@ -20727,7 +21176,6 @@ mod tests {
         for name in [
             "Request",
             "Response",
-            "FormData",
             "Blob",
             "File",
             "XMLHttpRequest",
@@ -20757,7 +21205,6 @@ mod tests {
 
         assert_eval_type_error("new Request('/api')");
         assert_eval_type_error("new Response('ok')");
-        assert_eval_type_error("new FormData()");
         assert_eval_type_error("new Blob(['body'])");
         assert_eval_type_error("new File(['body'], 'body.txt')");
         assert_eval_type_error("new XMLHttpRequest()");
