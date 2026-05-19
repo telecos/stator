@@ -15468,6 +15468,29 @@ fn atomics_extract_ta(
     Ok((inner, index))
 }
 
+/// Extract the typed array and index for waitable Atomics operations
+/// (`wait`, `notify`, `waitAsync`).
+///
+/// Per ECMA-262 ValidateIntegerTypedArray with `waitable=true`, the typed
+/// array must be either an `Int32Array` or a `BigInt64Array`; any other
+/// integer typed array kind throws a `TypeError` before any other validation
+/// observable side effect.
+fn atomics_extract_waitable_ta(
+    args: &[JsValue],
+) -> StatorResult<(
+    Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
+    usize,
+)> {
+    let (inner, index) = atomics_extract_ta(args)?;
+    let kind = inner.borrow().kind;
+    if !matches!(kind, TypedArrayKind::Int32 | TypedArrayKind::BigInt64) {
+        return Err(StatorError::TypeError(
+            "Atomics: waitable operations require Int32Array or BigInt64Array".into(),
+        ));
+    }
+    Ok((inner, index))
+}
+
 fn atomics_read(ta: &crate::builtins::typed_array::JsTypedArray, index: usize) -> JsValue {
     typed_array_get(ta, index)
 }
@@ -15676,7 +15699,7 @@ fn make_atomics() -> JsValue {
     props.insert(
         "wait".into(),
         builtin_fn("wait", 4, |args| {
-            let (ta, index) = atomics_extract_ta(&args)?;
+            let (ta, index) = atomics_extract_waitable_ta(&args)?;
             let kind = ta.borrow().kind;
             let current = atomics_read(&ta.borrow(), index);
             let expected = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
@@ -15692,7 +15715,7 @@ fn make_atomics() -> JsValue {
     props.insert(
         "notify".into(),
         builtin_fn("notify", 3, |args| {
-            let _ = atomics_extract_ta(&args)?;
+            let _ = atomics_extract_waitable_ta(&args)?;
             Ok(JsValue::Smi(0))
         }),
     );
@@ -15701,7 +15724,7 @@ fn make_atomics() -> JsValue {
     props.insert(
         "waitAsync".into(),
         builtin_fn("waitAsync", 4, |args| {
-            let _ = atomics_extract_ta(&args)?;
+            let _ = atomics_extract_waitable_ta(&args)?;
             let mut props = PropertyMap::new();
             props.insert("async".into(), JsValue::Boolean(false));
             props.insert("value".into(), JsValue::String("timed-out".into()));
@@ -42941,6 +42964,41 @@ mod tests {
     fn e2e_atomics_reject_out_of_range_indices() {
         assert_eval_true(
             "try { Atomics.load(new Int32Array(new SharedArrayBuffer(4)), 1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_rejects_non_int32_typed_array() {
+        assert_eval_true(
+            "try { Atomics.wait(new Int16Array(new SharedArrayBuffer(2)), 0, 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_notify_rejects_non_int32_typed_array() {
+        assert_eval_true(
+            "try { Atomics.notify(new Uint32Array(new SharedArrayBuffer(4)), 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_async_rejects_non_int32_typed_array() {
+        assert_eval_true(
+            "try { Atomics.waitAsync(new Uint8Array(new SharedArrayBuffer(1)), 0, 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_accepts_bigint64_typed_array() {
+        assert_eval_true(
+            "var ta = new BigInt64Array(new SharedArrayBuffer(8)); ta[0] = 1n; Atomics.wait(ta, 0, 2n) === 'not-equal'",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_notify_accepts_bigint64_typed_array() {
+        assert_eval_true(
+            "var ta = new BigInt64Array(new SharedArrayBuffer(8)); Atomics.notify(ta, 0) === 0",
         );
     }
 
