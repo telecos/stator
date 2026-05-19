@@ -3606,15 +3606,28 @@ fn make_unsupported_web_function(name: &'static str, length: i32) -> JsValue {
 }
 
 fn make_unsupported_storage_object(name: &'static str) -> JsValue {
+    make_unsupported_web_object(
+        name,
+        &[
+            ("getItem", 1),
+            ("setItem", 2),
+            ("removeItem", 1),
+            ("clear", 0),
+            ("key", 1),
+        ],
+    )
+}
+
+/// Build a fail-closed host-integrated web object that exposes the given
+/// method names with the given parameter counts. Every method returns a
+/// `TypeError` so product code never gets a fake success result.
+fn make_unsupported_web_object(name: &'static str, methods: &[(&'static str, i32)]) -> JsValue {
     let mut props = PropertyMap::new();
-    for (method, length) in [
-        ("getItem", 1),
-        ("setItem", 2),
-        ("removeItem", 1),
-        ("clear", 0),
-        ("key", 1),
-    ] {
-        props.insert(method.into(), make_unsupported_web_function(name, length));
+    for (method, length) in methods {
+        props.insert(
+            (*method).into(),
+            make_unsupported_web_function(name, *length),
+        );
     }
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -16725,6 +16738,48 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             make_unsupported_storage_object("sessionStorage"),
         );
 
+        // ── Navigation (location / history, fail-closed) ────────────────────
+        // `location` and `history` are host-integrated browser globals that
+        // mutate the navigation state of a hosting document. This standalone
+        // engine has no document, URL, or session-history backing store, so
+        // expose the probed constructors and global objects but fail every
+        // side-effecting operation with a `TypeError`. Property accessors
+        // (e.g. `location.href`, `history.state`) are intentionally absent
+        // rather than faked, matching the Web Storage slice.
+        globals.insert(
+            "Location".into(),
+            finalize_ctor(make_unsupported_web_constructor("Location"), "Location"),
+        );
+        globals.insert(
+            "History".into(),
+            finalize_ctor(make_unsupported_web_constructor("History"), "History"),
+        );
+        globals.insert(
+            "location".into(),
+            make_unsupported_web_object(
+                "location",
+                &[
+                    ("assign", 1),
+                    ("replace", 1),
+                    ("reload", 0),
+                    ("toString", 0),
+                ],
+            ),
+        );
+        globals.insert(
+            "history".into(),
+            make_unsupported_web_object(
+                "history",
+                &[
+                    ("back", 0),
+                    ("forward", 0),
+                    ("go", 1),
+                    ("pushState", 3),
+                    ("replaceState", 3),
+                ],
+            ),
+        );
+
         // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
         globals.insert(
             "TextEncoder".into(),
@@ -17231,6 +17286,10 @@ mod tests {
         assert!(globals.contains_key("EventTarget"));
         assert!(globals.contains_key("AbortController"));
         assert!(globals.contains_key("AbortSignal"));
+        assert!(globals.contains_key("Location"));
+        assert!(globals.contains_key("History"));
+        assert!(globals.contains_key("location"));
+        assert!(globals.contains_key("history"));
     }
 
     #[test]
@@ -17271,6 +17330,59 @@ mod tests {
         assert_eval_type_error("sessionStorage.removeItem('edge-stator')");
         assert_eval_type_error("sessionStorage.clear()");
         assert_eval_type_error("sessionStorage.key(0)");
+    }
+
+    #[test]
+    fn e2e_location_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof Location === 'function' && Location.name === 'Location'");
+        assert_eval_type_error("Location()");
+        assert_eval_type_error("new Location()");
+    }
+
+    #[test]
+    fn e2e_history_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof History === 'function' && History.name === 'History'");
+        assert_eval_type_error("History()");
+        assert_eval_type_error("new History()");
+    }
+
+    #[test]
+    fn e2e_location_global_exists_but_operations_fail_closed() {
+        assert_eval_true("typeof location === 'object' && location !== null");
+        assert_eval_type_error("location.assign('https://example.test/')");
+        assert_eval_type_error("location.replace('https://example.test/')");
+        assert_eval_type_error("location.reload()");
+        assert_eval_type_error("location.toString()");
+    }
+
+    #[test]
+    fn e2e_history_global_exists_but_operations_fail_closed() {
+        assert_eval_true("typeof history === 'object' && history !== null");
+        assert_eval_true("location !== history");
+        assert_eval_type_error("history.back()");
+        assert_eval_type_error("history.forward()");
+        assert_eval_type_error("history.go(-1)");
+        assert_eval_type_error("history.pushState({}, '', '/x')");
+        assert_eval_type_error("history.replaceState({}, '', '/x')");
+    }
+
+    /// Browser self-reference globals (`window`, `self`, `frames`, `parent`,
+    /// `top`, `screen`, `navigator`, `document`) are intentionally absent
+    /// from the standalone engine — they are host-integrated and any built-in
+    /// stub would either fake a missing window/document or shadow a real
+    /// binding provided by an embedder (e.g. the DOM bridge in
+    /// `stator_ffi`). The host installs `document` per context; the engine
+    /// itself does not preinstall it.
+    #[test]
+    fn e2e_browser_self_reference_globals_are_absent() {
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof self === 'undefined'");
+        assert_eval_true("typeof frames === 'undefined'");
+        assert_eval_true("typeof parent === 'undefined'");
+        assert_eval_true("typeof top === 'undefined'");
+        assert_eval_true("typeof screen === 'undefined'");
+        assert_eval_true("typeof navigator === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
     }
 
     #[test]
