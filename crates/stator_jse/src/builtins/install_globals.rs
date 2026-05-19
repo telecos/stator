@@ -13736,15 +13736,15 @@ fn resolve_dataview_receiver(
     args: &[JsValue],
     display_name: &str,
 ) -> StatorResult<(Rc<RefCell<crate::builtins::typed_array::JsDataView>>, usize)> {
-    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
-        && let Some(inner) = extract_dataview(&this)
-    {
-        return Ok((inner, 0));
-    }
     if let Some(first) = args.first()
         && let Some(inner) = extract_dataview(first)
     {
         return Ok((inner, 1));
+    }
+    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && let Some(inner) = extract_dataview(&this)
+    {
+        return Ok((inner, 0));
     }
     Err(incompatible_receiver(display_name))
 }
@@ -13756,15 +13756,15 @@ fn resolve_arraybuffer_receiver(
     args: &[JsValue],
     display_name: &str,
 ) -> StatorResult<(Rc<RefCell<JsArrayBuffer>>, usize)> {
-    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
-        && let Some(inner) = extract_arraybuffer(&this)
-    {
-        return Ok((inner, 0));
-    }
     if let Some(first) = args.first()
         && let Some(inner) = extract_arraybuffer(first)
     {
         return Ok((inner, 1));
+    }
+    if let Some(this) = current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && let Some(inner) = extract_arraybuffer(&this)
+    {
+        return Ok((inner, 0));
     }
     Err(incompatible_receiver(display_name))
 }
@@ -40830,7 +40830,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arraybuffer_slice_uses_receiver() {
         assert_eval_true(
             "var bytes = new Uint8Array([1,2,3,4]); var slice = ArrayBuffer.prototype.slice; new Uint8Array(slice.call(bytes.buffer, 1, 3)).join(',') === '2,3'",
@@ -41435,7 +41434,7 @@ mod tests {
     #[test]
     fn e2e_dataview_prototype_methods_use_receiver() {
         assert_eval_true(
-            "var v = new DataView(new ArrayBuffer(1)); v.setUint8(0, 99); DataView.prototype.getUint8.call(v, 0) === 99",
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint8(1, 99); DataView.prototype.getUint8.call(v, 1) === 99",
         );
     }
 
