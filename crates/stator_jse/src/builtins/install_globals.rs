@@ -16721,6 +16721,53 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Fetch / network and body APIs (fail-closed) ─────────────────────
+        //
+        // Fetch, XHR, streams, and request/response body wrappers require host
+        // network, origin, stream scheduling, and byte-source integration. This
+        // standalone engine deliberately exposes commonly-probed globals but
+        // rejects every operation instead of fabricating successful requests,
+        // streams, bodies, or wrappers.
+        globals.insert("fetch".into(), make_unsupported_web_function("fetch", 1));
+        globals.insert(
+            "Request".into(),
+            finalize_ctor(make_unsupported_web_constructor("Request"), "Request"),
+        );
+        globals.insert(
+            "Response".into(),
+            finalize_ctor(make_unsupported_web_constructor("Response"), "Response"),
+        );
+        globals.insert(
+            "Headers".into(),
+            finalize_ctor(make_unsupported_web_constructor("Headers"), "Headers"),
+        );
+        globals.insert(
+            "FormData".into(),
+            finalize_ctor(make_unsupported_web_constructor("FormData"), "FormData"),
+        );
+        globals.insert(
+            "Blob".into(),
+            finalize_ctor(make_unsupported_web_constructor("Blob"), "Blob"),
+        );
+        globals.insert(
+            "File".into(),
+            finalize_ctor(make_unsupported_web_constructor("File"), "File"),
+        );
+        globals.insert(
+            "XMLHttpRequest".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("XMLHttpRequest"),
+                "XMLHttpRequest",
+            ),
+        );
+        globals.insert(
+            "ReadableStream".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("ReadableStream"),
+                "ReadableStream",
+            ),
+        );
+
         // ── Web Storage (fail-closed) ───────────────────────────────────────
         // Storage is host-integrated and this standalone engine has no backing
         // origin, persistence, quota, or lifetime model. Expose the probed
@@ -17276,6 +17323,15 @@ mod tests {
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
         assert!(globals.contains_key("URLSearchParams"));
+        assert!(globals.contains_key("fetch"));
+        assert!(globals.contains_key("Request"));
+        assert!(globals.contains_key("Response"));
+        assert!(globals.contains_key("Headers"));
+        assert!(globals.contains_key("FormData"));
+        assert!(globals.contains_key("Blob"));
+        assert!(globals.contains_key("File"));
+        assert!(globals.contains_key("XMLHttpRequest"));
+        assert!(globals.contains_key("ReadableStream"));
         assert!(globals.contains_key("Storage"));
         assert!(globals.contains_key("localStorage"));
         assert!(globals.contains_key("sessionStorage"));
@@ -17306,6 +17362,41 @@ mod tests {
         );
         assert_eval_type_error("URLSearchParams('x=1')");
         assert_eval_type_error("new URLSearchParams('x=1')");
+    }
+
+    #[test]
+    fn e2e_fetch_global_exists_but_fails_closed() {
+        assert_eval_true("typeof fetch === 'function' && fetch.name === 'fetch'");
+        assert_eval_type_error("fetch('https://example.test/data.json')");
+        assert_eval_type_error("fetch('/api', { method: 'POST', body: 'x' })");
+    }
+
+    #[test]
+    fn e2e_fetch_related_constructors_exist_but_fail_closed() {
+        for name in [
+            "Request",
+            "Response",
+            "Headers",
+            "FormData",
+            "Blob",
+            "File",
+            "XMLHttpRequest",
+            "ReadableStream",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new Request('/api')");
+        assert_eval_type_error("new Response('ok')");
+        assert_eval_type_error("new Headers({ Accept: 'application/json' })");
+        assert_eval_type_error("new FormData()");
+        assert_eval_type_error("new Blob(['body'])");
+        assert_eval_type_error("new File(['body'], 'body.txt')");
+        assert_eval_type_error("new XMLHttpRequest()");
+        assert_eval_type_error("new ReadableStream({ start() {} })");
     }
 
     #[test]
