@@ -6994,6 +6994,527 @@ fn make_request_builtin() -> JsValue {
     ctor
 }
 
+// ── Event / CustomEvent (DOM §2) ─────────────────────────────────────────────
+//
+// Standalone, side-effect-free `Event` and `CustomEvent` data objects. These
+// constructors mirror the WHATWG DOM `Event` constructor contract closely
+// enough for product code that uses `Event`/`CustomEvent` as a plain data
+// carrier (type/detail/cancelable/bubbles flags, `preventDefault`, propagation
+// stop flags, `composedPath`).
+//
+// They deliberately do **not** participate in any dispatch pipeline. Stator
+// exposes no `EventTarget`, no `dispatchEvent`, no listener registration, and
+// no host event loop, so `isTrusted` is always `false`, `target`,
+// `currentTarget`, `srcElement` are always `null`, `eventPhase` is always
+// `Event.NONE`, and `composedPath()` always returns an empty array. Every
+// other `XxxEvent` constructor, `EventTarget`, `AbortController`, and
+// `AbortSignal` remain fail-closed.
+//
+// Reference: https://dom.spec.whatwg.org/#interface-event
+
+/// Hidden brand placed on every `Event` instance for receiver checks.
+const EVENT_BRAND: &str = "__is_event__";
+
+/// Additional brand placed on `CustomEvent` instances (which also carry the
+/// `EVENT_BRAND` so prototype-chain-less brand probes still work).
+const CUSTOM_EVENT_BRAND: &str = "__is_custom_event__";
+
+/// Mutable internal state of an `Event` / `CustomEvent` instance.
+struct EventState {
+    /// `type` attribute — the event name string.
+    type_: String,
+    /// `bubbles` attribute (immutable after construction).
+    bubbles: bool,
+    /// `cancelable` attribute (immutable after construction).
+    cancelable: bool,
+    /// `composed` attribute (immutable after construction).
+    composed: bool,
+    /// Mutable canceled / default-prevented flag.
+    canceled: bool,
+    /// Mutable stop-propagation flag.
+    stop_propagation: bool,
+    /// Mutable stop-immediate-propagation flag.
+    stop_immediate_propagation: bool,
+    /// Creation-time `timeStamp` (DOMHighResTimeStamp, milliseconds).
+    time_stamp: f64,
+    /// `CustomEvent.detail`. Always `JsValue::Null` for plain `Event`.
+    detail: JsValue,
+}
+
+thread_local! {
+    static EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<EventState>>>> =
+        RefCell::new(HashMap::new());
+    static EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static CUSTOM_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn event_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn install_event_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<EventState>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    EVENT_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_event_state(value: &JsValue) -> StatorResult<Rc<RefCell<EventState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(event_type_error(
+            "Event method called on non-Event receiver",
+        ));
+    };
+    if !matches!(map.borrow().get(EVENT_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(event_type_error(
+            "Event method called on non-Event receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    EVENT_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| event_type_error("Event: internal state missing"))
+}
+
+fn resolve_event_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, EVENT_BRAND)
+}
+
+/// Read a boolean member from an `EventInit` dictionary, defaulting to
+/// `false` when absent. Per WebIDL, any value is coerced via `ToBoolean`.
+fn event_init_bool(init: &JsValue, name: &str) -> StatorResult<bool> {
+    if matches!(init, JsValue::Undefined | JsValue::Null) {
+        return Ok(false);
+    }
+    if !matches!(init, JsValue::PlainObject(_)) {
+        return Err(event_type_error("Event: eventInitDict must be an object"));
+    }
+    let value = dispatch_get_property_value(init, JsValue::String(name.to_string().into()))?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(false)
+    } else {
+        Ok(value.to_boolean())
+    }
+}
+
+/// Read the `detail` member from a `CustomEventInit` dictionary, defaulting
+/// to `null` when absent.
+fn custom_event_init_detail(init: &JsValue) -> StatorResult<JsValue> {
+    if matches!(init, JsValue::Undefined | JsValue::Null) {
+        return Ok(JsValue::Null);
+    }
+    if !matches!(init, JsValue::PlainObject(_)) {
+        return Err(event_type_error(
+            "CustomEvent: eventInitDict must be an object",
+        ));
+    }
+    let value = dispatch_get_property_value(init, JsValue::String("detail".into()))?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(JsValue::Null)
+    } else {
+        Ok(value)
+    }
+}
+
+/// Allocate a new `Event` (or `CustomEvent`) instance with the given
+/// prototype and brand set.
+fn build_event_instance(
+    state: EventState,
+    proto: Option<Rc<RefCell<PropertyMap>>>,
+    is_custom: bool,
+) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            EVENT_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if is_custom {
+            props.insert_with_attrs(
+                CUSTOM_EVENT_BRAND.into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+        }
+        if let Some(proto) = proto {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_event_state(&inst, Rc::new(RefCell::new(state)));
+    JsValue::PlainObject(inst)
+}
+
+/// Install the four `Event` phase constants on a property map (both the
+/// constructor and the prototype receive these per WebIDL).
+fn install_event_phase_constants(map: &mut PropertyMap) {
+    for (name, value) in [
+        ("NONE", 0_i32),
+        ("CAPTURING_PHASE", 1),
+        ("AT_TARGET", 2),
+        ("BUBBLING_PHASE", 3),
+    ] {
+        map.insert_with_attrs(
+            name.into(),
+            JsValue::Smi(value),
+            PropertyAttributes::empty(),
+        );
+    }
+}
+
+/// Build the shared `Event.prototype` accessor/method set. Used as-is for
+/// the `Event` prototype and as the `[[Prototype]]` of `CustomEvent.prototype`
+/// so `instanceof Event` still succeeds for `CustomEvent` instances.
+fn build_event_prototype() -> Rc<RefCell<PropertyMap>> {
+    let mut proto = PropertyMap::new();
+
+    // String accessors.
+    proto.insert_with_attrs(
+        "__get_type__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(JsValue::String(state.borrow().type_.clone().into()))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // Boolean accessors.
+    for (name, getter) in [
+        (
+            "__get_bubbles__",
+            (|s: &EventState| s.bubbles) as fn(&EventState) -> bool,
+        ),
+        ("__get_cancelable__", |s| s.cancelable),
+        ("__get_composed__", |s| s.composed),
+        ("__get_defaultPrevented__", |s| s.canceled),
+    ] {
+        proto.insert_with_attrs(
+            name.into(),
+            native(move |args| {
+                let (recv, _) = resolve_event_receiver(&args);
+                let state = lookup_event_state(&recv)?;
+                Ok(JsValue::Boolean(getter(&state.borrow())))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+    }
+
+    // `isTrusted` is always false: this engine has no trusted-event source.
+    proto.insert_with_attrs(
+        "__get_isTrusted__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            lookup_event_state(&recv)?;
+            Ok(JsValue::Boolean(false))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // `target` / `currentTarget` / `srcElement` are always null: there is no
+    // dispatch pipeline.
+    for name in [
+        "__get_target__",
+        "__get_currentTarget__",
+        "__get_srcElement__",
+    ] {
+        proto.insert_with_attrs(
+            name.into(),
+            native(|args| {
+                let (recv, _) = resolve_event_receiver(&args);
+                lookup_event_state(&recv)?;
+                Ok(JsValue::Null)
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+    }
+
+    // `eventPhase` is always NONE (0): never dispatched.
+    proto.insert_with_attrs(
+        "__get_eventPhase__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            lookup_event_state(&recv)?;
+            Ok(JsValue::Smi(0))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // `timeStamp` is the creation-time DOMHighResTimeStamp.
+    proto.insert_with_attrs(
+        "__get_timeStamp__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(JsValue::HeapNumber(state.borrow().time_stamp))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // Legacy `cancelBubble` accessor pair — getter returns the stop-propagation
+    // flag, setter sets it to true if assigned a truthy value (per spec the
+    // setter is a no-op for falsy assignments).
+    proto.insert_with_attrs(
+        "__get_cancelBubble__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(JsValue::Boolean(state.borrow().stop_propagation))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "__set_cancelBubble__".into(),
+        native(|args| {
+            let (recv, rest) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            let value = rest.first().cloned().unwrap_or(JsValue::Undefined);
+            if value.to_boolean() {
+                state.borrow_mut().stop_propagation = true;
+            }
+            Ok(JsValue::Undefined)
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // Legacy `returnValue` accessor pair — getter returns `!defaultPrevented`,
+    // setter sets `defaultPrevented` to true if assigned a *falsy* value when
+    // the event is cancelable (per spec).
+    proto.insert_with_attrs(
+        "__get_returnValue__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(JsValue::Boolean(!state.borrow().canceled))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "__set_returnValue__".into(),
+        native(|args| {
+            let (recv, rest) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            let value = rest.first().cloned().unwrap_or(JsValue::Undefined);
+            if !value.to_boolean() {
+                let mut s = state.borrow_mut();
+                if s.cancelable {
+                    s.canceled = true;
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    // Methods.
+    proto.insert(
+        "preventDefault".into(),
+        builtin_fn("preventDefault", 0, |args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            let mut s = state.borrow_mut();
+            if s.cancelable {
+                s.canceled = true;
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "stopPropagation".into(),
+        builtin_fn("stopPropagation", 0, |args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            state.borrow_mut().stop_propagation = true;
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "stopImmediatePropagation".into(),
+        builtin_fn("stopImmediatePropagation", 0, |args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            let mut s = state.borrow_mut();
+            s.stop_propagation = true;
+            s.stop_immediate_propagation = true;
+            Ok(JsValue::Undefined)
+        }),
+    );
+    // `composedPath` — always returns an empty array: this engine never
+    // dispatches an event so there is no path to report.
+    proto.insert(
+        "composedPath".into(),
+        builtin_fn("composedPath", 0, |args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            lookup_event_state(&recv)?;
+            Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+        }),
+    );
+
+    install_event_phase_constants(&mut proto);
+
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Event".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    proto.make_all_non_enumerable();
+    Rc::new(RefCell::new(proto))
+}
+
+/// Build the `Event` constructor.
+fn make_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("Event: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let bubbles = event_init_bool(&init, "bubbles")?;
+            let cancelable = event_init_bool(&init, "cancelable")?;
+            let composed = event_init_bool(&init, "composed")?;
+            let proto = EVENT_PROTO.with(|p| p.borrow().clone());
+            Ok(build_event_instance(
+                EventState {
+                    type_,
+                    bubbles,
+                    cancelable,
+                    composed,
+                    canceled: false,
+                    stop_propagation: false,
+                    stop_immediate_propagation: false,
+                    time_stamp: current_time_millis(),
+                    detail: JsValue::Null,
+                },
+                proto,
+                false,
+            ))
+        }),
+    );
+
+    let proto_rc = build_event_prototype();
+    EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    // Constants also live on the constructor (per WebIDL [Exposed] interface
+    // members) so `Event.NONE` etc. work without an instance.
+    install_event_phase_constants(&mut props);
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `CustomEvent` constructor. `CustomEvent.prototype` chains to
+/// `Event.prototype` (via the engine's `INTERNAL_PROTO_PROPERTY_KEY` slot) so
+/// that `instanceof Event` succeeds for `CustomEvent` instances and inherited
+/// methods/accessors resolve naturally.
+fn make_custom_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("CustomEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let bubbles = event_init_bool(&init, "bubbles")?;
+            let cancelable = event_init_bool(&init, "cancelable")?;
+            let composed = event_init_bool(&init, "composed")?;
+            let detail = custom_event_init_detail(&init)?;
+            let proto = CUSTOM_EVENT_PROTO.with(|p| p.borrow().clone());
+            Ok(build_event_instance(
+                EventState {
+                    type_,
+                    bubbles,
+                    cancelable,
+                    composed,
+                    canceled: false,
+                    stop_propagation: false,
+                    stop_immediate_propagation: false,
+                    time_stamp: current_time_millis(),
+                    detail,
+                },
+                proto,
+                true,
+            ))
+        }),
+    );
+
+    // CustomEvent.prototype is a small object whose internal proto is
+    // Event.prototype, so all of the Event accessors/methods resolve via the
+    // prototype chain. Only `detail` and `initCustomEvent` live directly on
+    // CustomEvent.prototype.
+    let mut proto = PropertyMap::new();
+    if let Some(event_proto) = EVENT_PROTO.with(|p| p.borrow().clone()) {
+        proto.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            JsValue::PlainObject(event_proto),
+            PropertyAttributes::empty(),
+        );
+    }
+    proto.insert_with_attrs(
+        "__get_detail__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(state.borrow().detail.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("CustomEvent".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    proto.make_all_non_enumerable();
+    let proto_rc = Rc::new(RefCell::new(proto));
+    CUSTOM_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    install_event_phase_constants(&mut props);
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 // ── Response (WHATWG Fetch §6) ───────────────────────────────────────────────
 //
 // Standalone in-memory `Response` implementation. The constructor, body
@@ -21322,23 +21843,28 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_text_decoder(), "TextDecoder"),
         );
 
-        // ── DOM Events / AbortController (fail-closed) ─────────────────────
+        // ── DOM Events / AbortController ─────────────────────────────────
         //
-        // The engine does not model event dispatch, listener registration or
-        // callback scheduling. We expose the standard constructors so feature
-        // detection (`typeof Event === 'function'`) succeeds, but any actual
-        // construction or invocation fails closed with a `TypeError` so that
-        // product code never relies on a fake event/abort surface.
-        globals.insert(
-            "Event".into(),
-            finalize_ctor(make_unsupported_web_constructor("Event"), "Event"),
-        );
+        // `Event` and `CustomEvent` are real, narrow data-object
+        // implementations: the constructors honour `EventInit`, the
+        // `bubbles`/`cancelable`/`composed`/`defaultPrevented`/`timeStamp`
+        // accessors and `preventDefault`/`stopPropagation`/
+        // `stopImmediatePropagation`/`composedPath()` methods work, and
+        // `CustomEvent.prototype` chains to `Event.prototype` so
+        // `instanceof Event` succeeds. They are deliberately not wired to
+        // any dispatch pipeline (this engine has no event loop, no
+        // `EventTarget`, no listener registration), so `isTrusted` is
+        // always false, `target`/`currentTarget`/`srcElement` are always
+        // null, and `composedPath()` always returns an empty array.
+        //
+        // `EventTarget`, `AbortController`, and `AbortSignal` remain
+        // fail-closed: they expose the constructor name for feature
+        // detection but reject construction/invocation with a `TypeError`
+        // so that product code never relies on a fake event/abort surface.
+        globals.insert("Event".into(), finalize_ctor(make_event_builtin(), "Event"));
         globals.insert(
             "CustomEvent".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("CustomEvent"),
-                "CustomEvent",
-            ),
+            finalize_ctor(make_custom_event_builtin(), "CustomEvent"),
         );
         globals.insert(
             "EventTarget".into(),
@@ -23546,6 +24072,184 @@ mod tests {
         assert_eval_type_error("caches.open('x')");
     }
 
+    // ── Event / CustomEvent (DOM §2) ───────────────────────────────────
+
+    #[test]
+    fn e2e_event_constructor_shape_and_defaults() {
+        assert_eval_true("typeof Event === 'function' && Event.name === 'Event'");
+        assert_eval_true("new Event('x') instanceof Event");
+        assert_eval_true("Object.prototype.toString.call(new Event('x')) === '[object Event]'");
+        // Type coercion of the type argument.
+        assert_eval_true("new Event(123).type === '123'");
+        // Default flags are all false.
+        assert_eval_true(
+            "var e = new Event('x'); \
+             e.type === 'x' && \
+             e.bubbles === false && \
+             e.cancelable === false && \
+             e.composed === false && \
+             e.defaultPrevented === false && \
+             e.isTrusted === false && \
+             e.eventPhase === 0 && \
+             e.target === null && \
+             e.currentTarget === null && \
+             e.srcElement === null && \
+             typeof e.timeStamp === 'number'",
+        );
+    }
+
+    #[test]
+    fn e2e_event_constructor_requires_type_argument() {
+        assert_eval_type_error("new Event()");
+    }
+
+    #[test]
+    fn e2e_event_init_dict_coerces_flags() {
+        assert_eval_true(
+            "var e = new Event('x', { bubbles: 1, cancelable: 'y', composed: {} }); \
+             e.bubbles === true && e.cancelable === true && e.composed === true",
+        );
+        assert_eval_true(
+            "var e = new Event('x', { bubbles: 0, cancelable: '', composed: null }); \
+             e.bubbles === false && e.cancelable === false && e.composed === false",
+        );
+        // Non-object, non-null/undefined init throws.
+        assert_eval_type_error("new Event('x', 42)");
+    }
+
+    #[test]
+    fn e2e_event_prevent_default_respects_cancelable() {
+        assert_eval_true(
+            "var e = new Event('x', { cancelable: true }); \
+             e.preventDefault(); e.defaultPrevented === true",
+        );
+        assert_eval_true(
+            "var e = new Event('x'); e.preventDefault(); e.defaultPrevented === false",
+        );
+    }
+
+    #[test]
+    fn e2e_event_stop_propagation_flags_are_observable_via_legacy_cancel_bubble() {
+        assert_eval_true(
+            "var e = new Event('x'); e.cancelBubble === false && \
+             (e.stopPropagation(), e.cancelBubble === true)",
+        );
+        assert_eval_true("var e = new Event('x'); e.cancelBubble = true; e.cancelBubble === true");
+        // Per spec, assigning false is a no-op (cannot un-stop propagation).
+        assert_eval_true(
+            "var e = new Event('x'); e.stopPropagation(); \
+             e.cancelBubble = false; e.cancelBubble === true",
+        );
+    }
+
+    #[test]
+    fn e2e_event_return_value_legacy_mirrors_default_prevented() {
+        assert_eval_true(
+            "var e = new Event('x', { cancelable: true }); \
+             e.returnValue === true && \
+             (e.returnValue = false, e.defaultPrevented === true && e.returnValue === false)",
+        );
+        // Non-cancelable events cannot be flagged via returnValue either.
+        assert_eval_true(
+            "var e = new Event('x'); e.returnValue = false; \
+             e.defaultPrevented === false && e.returnValue === true",
+        );
+    }
+
+    #[test]
+    fn e2e_event_composed_path_is_empty_array_without_dispatch() {
+        assert_eval_true(
+            "var p = new Event('x').composedPath(); Array.isArray(p) && p.length === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_event_phase_constants_exist() {
+        assert_eval_true(
+            "Event.NONE === 0 && Event.CAPTURING_PHASE === 1 && \
+             Event.AT_TARGET === 2 && Event.BUBBLING_PHASE === 3",
+        );
+        assert_eval_true(
+            "var e = new Event('x'); e.NONE === 0 && e.CAPTURING_PHASE === 1 && \
+             e.AT_TARGET === 2 && e.BUBBLING_PHASE === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_event_methods_reject_non_event_receivers() {
+        assert_eval_type_error("Event.prototype.preventDefault.call({})");
+        assert_eval_type_error("Event.prototype.composedPath.call({})");
+    }
+
+    #[test]
+    fn e2e_custom_event_constructor_and_detail() {
+        assert_eval_true("typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'");
+        assert_eval_true("new CustomEvent('x') instanceof CustomEvent");
+        // CustomEvent inherits from Event via the prototype chain.
+        assert_eval_true("new CustomEvent('x') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(CustomEvent.prototype) === Event.prototype");
+        assert_eval_true(
+            "Object.prototype.toString.call(new CustomEvent('x')) === '[object CustomEvent]'",
+        );
+        // detail defaults to null.
+        assert_eval_true("new CustomEvent('x').detail === null");
+        // detail is whatever was supplied (object identity preserved).
+        assert_eval_true("var d = { a: 1 }; new CustomEvent('x', { detail: d }).detail === d");
+        // Inherited Event behavior works.
+        assert_eval_true(
+            "var e = new CustomEvent('x', { cancelable: true, bubbles: true }); \
+             e.bubbles === true && e.cancelable === true && \
+             (e.preventDefault(), e.defaultPrevented === true)",
+        );
+        // CustomEvent type argument is also required.
+        assert_eval_type_error("new CustomEvent()");
+    }
+
+    #[test]
+    fn e2e_event_target_and_abort_remain_fail_closed() {
+        // Constructors still exist as functions for feature detection.
+        assert_eval_true("typeof EventTarget === 'function'");
+        assert_eval_true("typeof AbortController === 'function'");
+        assert_eval_true("typeof AbortSignal === 'function'");
+        // But construction throws.
+        assert_eval_type_error("new EventTarget()");
+        assert_eval_type_error("new AbortController()");
+        assert_eval_type_error("new AbortSignal()");
+    }
+
+    #[test]
+    fn e2e_host_event_constructors_remain_fail_closed() {
+        for ctor in [
+            "UIEvent",
+            "MouseEvent",
+            "PointerEvent",
+            "KeyboardEvent",
+            "InputEvent",
+            "FocusEvent",
+            "WheelEvent",
+            "DragEvent",
+            "TouchEvent",
+            "CompositionEvent",
+            "SubmitEvent",
+            "ToggleEvent",
+            "PopStateEvent",
+            "HashChangeEvent",
+            "PageTransitionEvent",
+            "StorageEvent",
+            "ProgressEvent",
+            "ErrorEvent",
+            "PromiseRejectionEvent",
+            "AnimationEvent",
+            "TransitionEvent",
+            "SecurityPolicyViolationEvent",
+            "CloseEvent",
+            "BeforeUnloadEvent",
+        ] {
+            assert_eval_true(&format!("typeof {ctor} === 'function'"));
+            assert_eval_type_error(&format!("new {ctor}('x')"));
+        }
+    }
+
     // ── Response (WHATWG Fetch §6) ──────────────────────────────────────
 
     #[test]
@@ -24608,17 +25312,22 @@ mod tests {
     }
 
     #[test]
-    fn e2e_event_constructor_exists_but_fails_closed() {
+    fn e2e_event_constructor_is_real_and_constructs() {
         assert_eval_true("typeof Event === 'function' && Event.name === 'Event'");
-        assert_eval_type_error("Event('click')");
-        assert_eval_type_error("new Event('click')");
+        // Real construction succeeds and returns an Event instance.
+        assert_eval_true("new Event('click') instanceof Event");
+        // Calling without `new` also constructs (matches Stator's pattern
+        // for fetch/URL/Headers/Request) and still returns an Event.
+        assert_eval_true("Event('click') instanceof Event");
     }
 
     #[test]
-    fn e2e_custom_event_constructor_exists_but_fails_closed() {
-        assert_eval_true("typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'");
-        assert_eval_type_error("CustomEvent('x')");
-        assert_eval_type_error("new CustomEvent('x', { detail: 1 })");
+    fn e2e_custom_event_constructor_is_real_and_constructs() {
+        assert_eval_true(
+            "typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'",
+        );
+        assert_eval_true("new CustomEvent('x', { detail: 1 }).detail === 1");
+        assert_eval_true("CustomEvent('x') instanceof CustomEvent");
     }
 
     #[test]
