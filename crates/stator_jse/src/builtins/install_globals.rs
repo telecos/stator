@@ -6155,6 +6155,208 @@ fn make_file_builtin() -> JsValue {
     ctor
 }
 
+// ── FileReaderSync (W3C File API §6) ─────────────────────────────────────────
+
+/// Hidden brand placed on every `FileReaderSync` instance for receiver checks.
+const FILE_READER_SYNC_BRAND: &str = "__is_file_reader_sync__";
+
+thread_local! {
+    static FILE_READER_SYNC_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Verify that `value` carries the `FileReaderSync` brand. Used by every
+/// prototype method so calls on the prototype itself or unrelated objects
+/// throw a `TypeError` instead of silently succeeding.
+fn ensure_file_reader_sync_receiver(value: &JsValue) -> StatorResult<()> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(blob_type_error(
+            "FileReaderSync method called on non-FileReaderSync receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(FILE_READER_SYNC_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(blob_type_error(
+            "FileReaderSync method called on non-FileReaderSync receiver",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the `FileReaderSync` receiver and the user-supplied `Blob` argument
+/// list. Mirrors `resolve_blob_receiver`: if `args[0]` is a `FileReaderSync`
+/// instance the call originated from `.call/.apply/.bind`, otherwise the
+/// receiver comes from the current global environment's `this`.
+fn resolve_file_reader_sync_call(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, FILE_READER_SYNC_BRAND)
+}
+
+/// Build the real `FileReaderSync` constructor and prototype. Methods operate
+/// synchronously on real Stator `Blob`/`File` byte state and never touch host
+/// I/O. The async `FileReader` event API remains fail-closed.
+#[inline(never)]
+fn make_file_reader_sync_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            let inst = Rc::new(RefCell::new(PropertyMap::new()));
+            {
+                let mut p = inst.borrow_mut();
+                p.insert_with_attrs(
+                    FILE_READER_SYNC_BRAND.into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
+                );
+                if let Some(proto) = FILE_READER_SYNC_PROTO.with(|p| p.borrow().clone()) {
+                    p.insert_with_attrs(
+                        INTERNAL_PROTO_PROPERTY_KEY.into(),
+                        JsValue::PlainObject(proto),
+                        PropertyAttributes::empty(),
+                    );
+                }
+            }
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        proto.insert(
+            "readAsText".into(),
+            native(|args| {
+                let (recv, rest) = resolve_file_reader_sync_call(&args);
+                ensure_file_reader_sync_receiver(&recv)?;
+                let blob_arg = rest
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| blob_type_error("FileReaderSync.readAsText: missing blob"))?;
+                let state = lookup_blob_state(&blob_arg)?;
+                // Per W3C File API §6.1, a missing/undefined encoding label
+                // defaults to UTF-8. Stator does not implement the full
+                // Encoding Standard label registry, so any other label is
+                // rejected rather than silently treated as UTF-8.
+                if let Some(label) = rest.get(1)
+                    && !matches!(label, JsValue::Undefined | JsValue::Null)
+                {
+                    let s = label.to_js_string()?;
+                    let normalized = s.trim().to_ascii_lowercase();
+                    if !matches!(
+                        normalized.as_str(),
+                        "" | "utf-8" | "utf8" | "unicode-1-1-utf-8"
+                    ) {
+                        return Err(blob_type_error(format!(
+                            "FileReaderSync.readAsText: encoding label {s:?} is not supported (only UTF-8 is implemented)"
+                        )));
+                    }
+                }
+                let decoded = String::from_utf8_lossy(&state.bytes).into_owned();
+                Ok(JsValue::String(decoded.into()))
+            }),
+        );
+
+        proto.insert(
+            "readAsArrayBuffer".into(),
+            native(|args| {
+                let (recv, rest) = resolve_file_reader_sync_call(&args);
+                ensure_file_reader_sync_receiver(&recv)?;
+                let blob_arg = rest.first().cloned().ok_or_else(|| {
+                    blob_type_error("FileReaderSync.readAsArrayBuffer: missing blob")
+                })?;
+                let state = lookup_blob_state(&blob_arg)?;
+                let buf = JsArrayBuffer {
+                    shared: false,
+                    max_byte_length: None,
+                    detached: false,
+                    data: state.bytes.clone(),
+                };
+                Ok(make_arraybuffer_instance(Rc::new(RefCell::new(buf))))
+            }),
+        );
+
+        proto.insert(
+            "readAsDataURL".into(),
+            native(|args| {
+                let (recv, rest) = resolve_file_reader_sync_call(&args);
+                ensure_file_reader_sync_receiver(&recv)?;
+                let blob_arg = rest
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| blob_type_error("FileReaderSync.readAsDataURL: missing blob"))?;
+                let state = lookup_blob_state(&blob_arg)?;
+                let mut out = String::with_capacity(state.bytes.len().div_ceil(3) * 4 + 32);
+                out.push_str("data:");
+                out.push_str(&state.mime);
+                out.push_str(";base64,");
+                for chunk in state.bytes.chunks(3) {
+                    let b0 = u32::from(chunk[0]);
+                    let b1 = chunk.get(1).copied().map(u32::from).unwrap_or(0);
+                    let b2 = chunk.get(2).copied().map(u32::from).unwrap_or(0);
+                    let n = (b0 << 16) | (b1 << 8) | b2;
+                    out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+                    out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+                    if chunk.len() > 1 {
+                        out.push(BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                    if chunk.len() > 2 {
+                        out.push(BASE64_ALPHABET[(n & 0x3f) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+                Ok(JsValue::String(out.into()))
+            }),
+        );
+
+        proto.insert(
+            "readAsBinaryString".into(),
+            native(|args| {
+                let (recv, rest) = resolve_file_reader_sync_call(&args);
+                ensure_file_reader_sync_receiver(&recv)?;
+                let blob_arg = rest.first().cloned().ok_or_else(|| {
+                    blob_type_error("FileReaderSync.readAsBinaryString: missing blob")
+                })?;
+                let state = lookup_blob_state(&blob_arg)?;
+                // Each byte becomes a single UTF-16 code unit (U+0000..U+00FF).
+                // String length in JS is counted in UTF-16 code units, so the
+                // resulting string has length === state.bytes.len(), and
+                // charCodeAt(i) === state.bytes[i].
+                let s: String = state.bytes.iter().map(|&b| char::from(b)).collect();
+                Ok(JsValue::String(s.into()))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("FileReaderSync".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        FILE_READER_SYNC_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 /// Build a fail-closed host-integrated web object that exposes the given
 /// method names with the given parameter counts. Every method returns a
 /// `TypeError` so product code never gets a fake success result.
@@ -19036,16 +19238,20 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert("Blob".into(), finalize_ctor(make_blob_builtin(), "Blob"));
         globals.insert("File".into(), finalize_ctor(make_file_builtin(), "File"));
+        globals.insert(
+            "FileReaderSync".into(),
+            finalize_ctor(make_file_reader_sync_builtin(), "FileReaderSync"),
+        );
 
         // ── File API / drag data stores (fail-closed) ───────────────────────
         // File readers, file lists, and drag data stores need host-backed bytes,
         // asynchronous read/event dispatch, object URL lifetime management, and
         // browser drag/drop stores. Expose Chromium-compatible globals for Edge
         // feature detection, but throw instead of fabricating reads, handles,
-        // or object URL lifetimes. `File` itself is standalone Blob-backed.
+        // or object URL lifetimes. `File` and `FileReaderSync` are standalone
+        // Blob-backed.
         for name in [
             "FileReader",
-            "FileReaderSync",
             "FileList",
             "DataTransfer",
             "DataTransferItem",
@@ -21653,6 +21859,162 @@ mod tests {
     }
 
     #[test]
+    fn e2e_file_reader_sync_constructor_and_brand_checks() {
+        assert_eval_true(
+            "typeof FileReaderSync === 'function' && FileReaderSync.name === 'FileReaderSync'",
+        );
+        assert_eval_true("new FileReaderSync() instanceof FileReaderSync");
+        assert_eval_true(
+            "Object.prototype.toString.call(new FileReaderSync()) === '[object FileReaderSync]'",
+        );
+        // Methods exist on the prototype only (not own properties).
+        assert_eval_true("typeof FileReaderSync.prototype.readAsText === 'function'");
+        assert_eval_true("typeof FileReaderSync.prototype.readAsArrayBuffer === 'function'");
+        assert_eval_true("typeof FileReaderSync.prototype.readAsDataURL === 'function'");
+        assert_eval_true("typeof FileReaderSync.prototype.readAsBinaryString === 'function'");
+        // Brand check: calling a method on the bare prototype or an unrelated
+        // object must throw, not silently produce a fake read.
+        assert_eval_type_error("FileReaderSync.prototype.readAsText(new Blob(['x']))");
+        assert_eval_type_error("FileReaderSync.prototype.readAsArrayBuffer(new Blob(['x']))");
+        assert_eval_type_error("FileReaderSync.prototype.readAsDataURL(new Blob(['x']))");
+        assert_eval_type_error("FileReaderSync.prototype.readAsBinaryString(new Blob(['x']))");
+        assert_eval_type_error("FileReaderSync.prototype.readAsText.call({}, new Blob(['x']))");
+        // Argument must be a real Blob/File.
+        assert_eval_type_error("(new FileReaderSync()).readAsText()");
+        assert_eval_type_error("(new FileReaderSync()).readAsText({})");
+        assert_eval_type_error("(new FileReaderSync()).readAsText(Blob.prototype)");
+        assert_eval_type_error("(new FileReaderSync()).readAsArrayBuffer('not a blob')");
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_read_as_text() {
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new Blob(['hello'])) === 'hello'",
+        );
+        // UTF-8 decoding by default.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new Blob(['caf\u{00e9}'])) === 'caf\u{00e9}'",
+        );
+        // File extends Blob so it works too.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new File(['hi'], 'h.txt')) === 'hi'",
+        );
+        // Slice of a Blob.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText((new Blob(['hello world'])).slice(6, 11)) === 'world'",
+        );
+        // Empty Blob => empty string.
+        assert_eval_true("var r = new FileReaderSync(); r.readAsText(new Blob([])) === ''");
+        // Explicit UTF-8 label is accepted.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new Blob(['hi']), 'utf-8') === 'hi'",
+        );
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new Blob(['hi']), 'UTF-8') === 'hi'",
+        );
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsText(new Blob(['hi']), undefined) === 'hi'",
+        );
+        // Invalid UTF-8 bytes are replaced (lossy decode), not silently faked.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var bad = new Uint8Array([0xff, 0xfe, 0x41]); r.readAsText(new Blob([bad])).indexOf('A') !== -1",
+        );
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_rejects_unsupported_encodings() {
+        // Anything other than UTF-8 is rejected rather than silently treated
+        // as UTF-8, so callers aren't lied to about a successful decode.
+        assert_eval_type_error("(new FileReaderSync()).readAsText(new Blob(['x']), 'iso-8859-1')");
+        assert_eval_type_error("(new FileReaderSync()).readAsText(new Blob(['x']), 'latin1')");
+        assert_eval_type_error(
+            "(new FileReaderSync()).readAsText(new Blob(['x']), 'windows-1252')",
+        );
+        assert_eval_type_error("(new FileReaderSync()).readAsText(new Blob(['x']), 'utf-16')");
+        assert_eval_type_error("(new FileReaderSync()).readAsText(new Blob(['x']), 'shift_jis')");
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_read_as_array_buffer() {
+        assert_eval_true(
+            "var r = new FileReaderSync(); var ab = r.readAsArrayBuffer(new Blob(['abc'])); ab instanceof ArrayBuffer && ab.byteLength === 3",
+        );
+        assert_eval_true(
+            "var r = new FileReaderSync(); var ab = r.readAsArrayBuffer(new Blob(['abc'])); var v = new Uint8Array(ab); v[0]===97 && v[1]===98 && v[2]===99",
+        );
+        // Fresh buffer each call — mutating one does not affect the other.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var b = new Blob(['abc']); var a1 = r.readAsArrayBuffer(b); var a2 = r.readAsArrayBuffer(b); new Uint8Array(a1)[0] = 0; new Uint8Array(a2)[0] === 97",
+        );
+        // Mutating the result does not retroactively alter the Blob.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var b = new Blob(['abc']); var ab = r.readAsArrayBuffer(b); new Uint8Array(ab)[0] = 0; r.readAsText(b) === 'abc'",
+        );
+        // Empty Blob => zero-length buffer.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsArrayBuffer(new Blob([])).byteLength === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_read_as_data_url() {
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsDataURL(new Blob(['Man'])) === 'data:;base64,TWFu'",
+        );
+        // MIME type from the Blob is preserved verbatim.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsDataURL(new Blob(['Man'], { type: 'text/plain' })) === 'data:text/plain;base64,TWFu'",
+        );
+        // Empty type yields the bare `data:;base64,` prefix.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsDataURL(new Blob([])) === 'data:;base64,'",
+        );
+        // Standard base64 padding for non-multiple-of-3 lengths.
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsDataURL(new Blob(['M'])) === 'data:;base64,TQ=='",
+        );
+        assert_eval_true(
+            "var r = new FileReaderSync(); r.readAsDataURL(new Blob(['Ma'])) === 'data:;base64,TWE='",
+        );
+        // Round-trip through atob agrees with the raw bytes.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var u = r.readAsDataURL(new Blob(['hello'])); atob(u.slice(u.indexOf(',')+1)) === 'hello'",
+        );
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_read_as_binary_string() {
+        // Each byte becomes a single UTF-16 code unit.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var u = new Uint8Array([0,1,127,128,255]); var s = r.readAsBinaryString(new Blob([u])); s.length === 5 && s.charCodeAt(0)===0 && s.charCodeAt(1)===1 && s.charCodeAt(2)===127 && s.charCodeAt(3)===128 && s.charCodeAt(4)===255",
+        );
+        // ASCII bytes survive untouched.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var s = r.readAsBinaryString(new Blob(['abc'])); s === 'abc' && s.length === 3",
+        );
+        // Empty Blob => empty string.
+        assert_eval_true("var r = new FileReaderSync(); r.readAsBinaryString(new Blob([])) === ''");
+        // UTF-8 multi-byte input is exposed byte-for-byte, not as code points.
+        assert_eval_true(
+            "var r = new FileReaderSync(); var s = r.readAsBinaryString(new Blob(['caf\u{00e9}'])); s.length === 5 && s.charCodeAt(3) === 0xc3 && s.charCodeAt(4) === 0xa9",
+        );
+    }
+
+    #[test]
+    fn e2e_file_reader_sync_does_not_unlock_async_or_object_url_paths() {
+        // FileReader (async event API) must remain fail-closed.
+        assert_eval_type_error("new FileReader()");
+        assert_eval_type_error("FileReader()");
+        // Object URL minting from a Blob/File remains fail-closed.
+        assert_eval_type_error("URL.createObjectURL(new Blob(['x']))");
+        assert_eval_type_error("URL.createObjectURL(new File(['x'], 'x.txt'))");
+        // fetch/Request/Response with Blob/File bodies remain fail-closed.
+        assert_eval_type_error("fetch('https://example.test/', { body: new Blob(['x']) })");
+        assert_eval_type_error("new Request('/api', { method: 'POST', body: new Blob(['x']) })");
+        assert_eval_type_error("new Response(new Blob(['x']))");
+    }
+
+    #[test]
     fn e2e_dom_parser_serialization_constructors_exist_but_fail_closed() {
         for name in ["DOMParser", "XMLSerializer"] {
             assert_eval_true(&format!(
@@ -22967,7 +23329,6 @@ mod tests {
     fn e2e_file_drag_data_constructors_exist_but_fail_closed() {
         for name in [
             "FileReader",
-            "FileReaderSync",
             "FileList",
             "DataTransfer",
             "DataTransferItem",
@@ -22980,7 +23341,6 @@ mod tests {
         }
 
         assert_eval_type_error("new FileReader()");
-        assert_eval_type_error("new FileReaderSync()");
         assert_eval_type_error("new FileList()");
         assert_eval_type_error("new DataTransfer()");
         assert_eval_type_error("new DataTransferItem()");
