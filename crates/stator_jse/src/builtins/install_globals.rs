@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
@@ -5626,6 +5627,24 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Hidden brand placed on every `File` instance for receiver checks.
+const FILE_BRAND: &str = "__is_file__";
+
+/// Metadata layered on top of the immutable `Blob` byte/type state for `File`.
+struct FileState {
+    /// Name supplied to the `File` constructor.
+    name: String,
+    /// Last modified timestamp in milliseconds since the Unix epoch.
+    last_modified: f64,
+}
+
+thread_local! {
+    static FILE_STATES: RefCell<HashMap<usize, Rc<FileState>>> =
+        RefCell::new(HashMap::new());
+    static FILE_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
 fn blob_type_error(message: impl Into<String>) -> StatorError {
     StatorError::TypeError(message.into())
 }
@@ -5633,6 +5652,13 @@ fn blob_type_error(message: impl Into<String>) -> StatorError {
 fn install_blob_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<BlobState>) {
     let id = Rc::as_ptr(instance) as usize;
     BLOB_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn install_file_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<FileState>) {
+    let id = Rc::as_ptr(instance) as usize;
+    FILE_STATES.with(|s| {
         s.borrow_mut().insert(id, state);
     });
 }
@@ -5648,6 +5674,19 @@ fn lookup_blob_state(value: &JsValue) -> StatorResult<Rc<BlobState>> {
     BLOB_STATES
         .with(|s| s.borrow().get(&id).cloned())
         .ok_or_else(|| blob_type_error("Blob: internal state missing"))
+}
+
+fn lookup_file_state(value: &JsValue) -> StatorResult<Rc<FileState>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(blob_type_error("File method called on non-File receiver"));
+    };
+    if !matches!(map.borrow().get(FILE_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(blob_type_error("File method called on non-File receiver"));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    FILE_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| blob_type_error("File: internal state missing"))
 }
 
 fn resolve_blob_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
@@ -5677,8 +5716,8 @@ fn normalize_blob_type(raw: &str) -> String {
 /// Extract bytes from a single Blob construction part. Supports strings
 /// (UTF-8 encoded), existing `Blob` instances, `ArrayBuffer` /
 /// `SharedArrayBuffer`, and any `ArrayBufferView` (TypedArray / DataView).
-/// Other plain objects (including `File` instances) are rejected to avoid
-/// fabricating successful conversions for fail-closed wrappers.
+/// Other plain objects are rejected to avoid fabricating successful conversions
+/// for fail-closed wrappers.
 fn blob_part_bytes(value: &JsValue) -> StatorResult<Vec<u8>> {
     if let JsValue::PlainObject(map) = value
         && matches!(map.borrow().get(BLOB_BRAND), Some(JsValue::Boolean(true)))
@@ -5777,6 +5816,28 @@ fn read_blob_type_option(options: &JsValue) -> StatorResult<String> {
         Ok(String::new())
     } else {
         Ok(normalize_blob_type(&t.to_js_string()?))
+    }
+}
+
+fn current_time_millis() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+fn read_file_last_modified_option(options: &JsValue) -> StatorResult<f64> {
+    if matches!(options, JsValue::Undefined | JsValue::Null) {
+        return Ok(current_time_millis());
+    }
+    if !matches!(options, JsValue::PlainObject(_)) {
+        return Err(blob_type_error("File: options must be an object"));
+    }
+    let value = dispatch_get_property_value(options, JsValue::String("lastModified".into()))?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(current_time_millis())
+    } else {
+        Ok(value.to_number()?)
     }
 }
 
@@ -5952,6 +6013,132 @@ fn make_blob_builtin() -> JsValue {
         proto.make_all_non_enumerable();
         let rc = Rc::new(RefCell::new(proto));
         BLOB_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+fn build_file_instance(bytes: Vec<u8>, mime: String, name: String, last_modified: f64) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            BLOB_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            FILE_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = FILE_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_blob_state(&inst, Rc::new(BlobState { bytes, mime }));
+    install_file_state(
+        &inst,
+        Rc::new(FileState {
+            name,
+            last_modified,
+        }),
+    );
+    JsValue::PlainObject(inst)
+}
+
+/// Build the real `File` constructor and prototype on top of `Blob` state.
+#[inline(never)]
+fn make_file_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let parts_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let name = args
+                .get(1)
+                .ok_or_else(|| blob_type_error("File: missing fileName"))?
+                .to_js_string()?;
+            let options = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let parts = collect_iterable_values(&parts_arg).map_err(|_| {
+                blob_type_error("File: first argument must be iterable (sequence of BlobParts)")
+            })?;
+            let mut bytes = Vec::new();
+            for part in &parts {
+                bytes.extend(blob_part_bytes(part)?);
+            }
+            let mime = read_blob_type_option(&options)?;
+            let last_modified = read_file_last_modified_option(&options)?;
+            Ok(build_file_instance(bytes, mime, name, last_modified))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        if let Some(blob_proto) = BLOB_PROTO.with(|p| p.borrow().clone()) {
+            proto.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(blob_proto),
+                PropertyAttributes::empty(),
+            );
+        }
+
+        proto.insert_with_attrs(
+            "__get_name__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, FILE_BRAND);
+                let state = lookup_file_state(&recv)?;
+                Ok(JsValue::String(state.name.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert_with_attrs(
+            "__get_lastModified__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, FILE_BRAND);
+                let state = lookup_file_state(&recv)?;
+                Ok(num(state.last_modified))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert_with_attrs(
+            "__get_webkitRelativePath__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, FILE_BRAND);
+                lookup_file_state(&recv)?;
+                Ok(JsValue::String("".into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("File".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        FILE_PROTO.with(|p| {
             *p.borrow_mut() = Some(Rc::clone(&rc));
         });
         props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
@@ -18848,17 +19035,14 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_form_data_builtin(), "FormData"),
         );
         globals.insert("Blob".into(), finalize_ctor(make_blob_builtin(), "Blob"));
-        globals.insert(
-            "File".into(),
-            finalize_ctor(make_unsupported_web_constructor("File"), "File"),
-        );
+        globals.insert("File".into(), finalize_ctor(make_file_builtin(), "File"));
 
         // ── File API / drag data stores (fail-closed) ───────────────────────
         // File readers, file lists, and drag data stores need host-backed bytes,
         // asynchronous read/event dispatch, object URL lifetime management, and
         // browser drag/drop stores. Expose Chromium-compatible globals for Edge
-        // feature detection, but throw instead of fabricating files, reads, or
-        // object URL lifetimes.
+        // feature detection, but throw instead of fabricating reads, handles,
+        // or object URL lifetimes. `File` itself is standalone Blob-backed.
         for name in [
             "FileReader",
             "FileReaderSync",
@@ -21275,7 +21459,7 @@ mod tests {
         assert_eval_type_error("(new FormData()).append('blob', Object.create(Blob.prototype))");
         assert_eval_type_error("(new FormData()).append('file', Object.create(File.prototype))");
         assert_eval_type_error("(new FormData()).append('blob-proto', Blob.prototype)");
-        assert_eval_type_error("new File(['body'], 'body.txt')");
+        assert_eval_type_error("(new FormData()).append('file', new File(['body'], 'body.txt'))");
     }
 
     #[test]
@@ -21381,14 +21565,91 @@ mod tests {
     }
 
     #[test]
-    fn e2e_blob_does_not_unlock_fetch_request_response_file_or_object_url() {
-        // Even with a real Blob value, fetch/Request/Response/File/objectURL
+    fn e2e_blob_does_not_unlock_fetch_request_response_or_object_url() {
+        // Even with a real Blob value, fetch/Request/Response/objectURL
         // remain fail-closed: no fake network/body/file/URL lifetime.
         assert_eval_type_error("fetch('https://example.test/', { body: new Blob(['x']) })");
         assert_eval_type_error("new Request('/api', { method: 'POST', body: new Blob(['x']) })");
         assert_eval_type_error("new Response(new Blob(['x']))");
-        assert_eval_type_error("new File([new Blob(['x'])], 'f.txt')");
         assert_eval_type_error("URL.createObjectURL(new Blob(['x']))");
+    }
+
+    #[test]
+    fn e2e_file_construction_properties_and_prototype_chain() {
+        assert_eval_true("typeof File === 'function' && File.name === 'File'");
+        assert_eval_true(
+            "var f = new File(['hello'], 'greeting.txt', { type: 'TEXT/Plain', lastModified: 1234 }); f instanceof File && f instanceof Blob",
+        );
+        assert_eval_true(
+            "var f = new File(['hello'], 'greeting.txt', { type: 'TEXT/Plain', lastModified: 1234 }); f.name === 'greeting.txt' && f.lastModified === 1234 && f.type === 'text/plain' && f.size === 5",
+        );
+        assert_eval_true(
+            "var f = new File([], 'x'); typeof f.lastModified === 'number' && f.lastModified >= 0",
+        );
+        assert_eval_true("var f = new File([], 'dir/name\\\\leaf'); f.name === 'dir/name\\\\leaf'");
+        assert_eval_true(
+            "var f = new File([], 'x'); f.webkitRelativePath === '' && Object.prototype.toString.call(f) === '[object File]'",
+        );
+    }
+
+    #[test]
+    fn e2e_file_blob_compatible_parts_and_immutability() {
+        assert_eval_true(
+            "var u = new Uint8Array([65, 66]); var f = new File([u, 'C'], 'abc.bin'); f.size === 3",
+        );
+        assert_eval_true(
+            "var ab = new ArrayBuffer(4); var v = new Uint8Array(ab); v[0]=1;v[1]=2;v[2]=3;v[3]=4; var f = new File([ab], 'bytes.bin'); v[0]=9; f.size === 4",
+        );
+        assert_eval_true(
+            "var b = new Blob(['abc']); var f = new File([b, 'de'], 'abcde.txt'); f.size === 5",
+        );
+        assert_eval_true(
+            "var f1 = new File(['abc'], 'a.txt'); var f2 = new File([f1, 'd'], 'b.txt'); f2.size === 4",
+        );
+        assert_eval_true(
+            "var ab = new ArrayBuffer(8); var dv = new DataView(ab, 2, 4); var f = new File([dv], 'view.bin'); f.size === 4",
+        );
+        assert_eval_true(
+            "var f = new File(['x'], 'x.txt'); f.name = 'evil'; f.lastModified = 9; f.name === 'x.txt' && f.lastModified !== 9",
+        );
+    }
+
+    #[test]
+    fn e2e_file_type_normalization_slice_text_and_array_buffer() {
+        assert_eval_true(
+            "var f = new File(['x'], 'x.txt', { type: 'TEXT/HTML' }); f.type === 'text/html'",
+        );
+        assert_eval_true(
+            "var f = new File(['x'], 'x.txt', { type: 'tex\u{00e9}/plain' }); f.type === ''",
+        );
+        assert_eval_true(
+            "var f = new File(['hello world'], 'h.txt', { type: 'text/plain' }); var s = f.slice(6, 11, 'TEXT/Plain'); s instanceof Blob && !(s instanceof File) && s.size === 5 && s.type === 'text/plain'",
+        );
+        assert_eval_true(
+            "var f = new File(['hi'], 'h.txt'); var seen = ''; f.text().then(function(v){ seen = v; }); Promise.resolve().then(function(){}); seen === 'hi' || seen === ''",
+        );
+        assert_eval_true(
+            "var f = new File(['hi'], 'h.txt'); var p = f.arrayBuffer(); typeof p === 'object' && typeof p.then === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_file_rejects_unsupported_paths_and_remains_fail_closed() {
+        assert_eval_type_error("new File([{}], 'x.txt')");
+        assert_eval_type_error("new File([[1, 2, 3]], 'x.txt')");
+        assert_eval_type_error("new File(5, 'x.txt')");
+        assert_eval_type_error("new File(['x'])");
+        assert_eval_type_error("new File(['x'], 'x.txt', 42)");
+        assert_eval_type_error("(new File(['x'], 'x.txt')).stream()");
+        assert_eval_type_error("(new File(['x'], 'x.txt')).bytes()");
+        assert_eval_type_error(
+            "fetch('https://example.test/', { body: new File(['x'], 'x.txt') })",
+        );
+        assert_eval_type_error(
+            "new Request('/api', { method: 'POST', body: new File(['x'], 'x.txt') })",
+        );
+        assert_eval_type_error("new Response(new File(['x'], 'x.txt'))");
+        assert_eval_type_error("URL.createObjectURL(new File(['x'], 'x.txt'))");
     }
 
     #[test]
@@ -21643,7 +21904,6 @@ mod tests {
         for name in [
             "Request",
             "Response",
-            "File",
             "XMLHttpRequest",
             "ReadableStream",
             "WritableStream",
@@ -21671,7 +21931,6 @@ mod tests {
 
         assert_eval_type_error("new Request('/api')");
         assert_eval_type_error("new Response('ok')");
-        assert_eval_type_error("new File(['body'], 'body.txt')");
         assert_eval_type_error("new XMLHttpRequest()");
         assert_eval_type_error("new ReadableStream({ start() {} })");
         assert_eval_type_error("new WritableStream({ write() {} })");
