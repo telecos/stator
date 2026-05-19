@@ -9597,9 +9597,30 @@ fn make_function() -> JsValue {
         proto.insert(
             "call".into(),
             native(|args| {
-                let func = args.first().cloned().unwrap_or(JsValue::Undefined);
-                let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let call_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+                // Two invocation conventions converge here:
+                //   * `Function.prototype.call.call(fn, thisArg, ...)` —
+                //     `function_call` prepends `fn` so `args[0]` is the
+                //     target callable.
+                //   * `fn.call(thisArg, ...)` via method dispatch — the
+                //     receiver lives in `current_this()` and `args[0]` is
+                //     the user's `thisArg`.
+                // Prefer `args[0]` only when it is itself callable, which
+                // disambiguates the two paths (a callable PlainObject `this`
+                // would otherwise be mistaken for an argument list head).
+                let (func, this_arg, call_args): (JsValue, JsValue, Vec<JsValue>) =
+                    if args.first().is_some_and(is_callable) {
+                        (
+                            args[0].clone(),
+                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
+                            args.get(2..).unwrap_or(&[]).to_vec(),
+                        )
+                    } else {
+                        (
+                            current_this().unwrap_or(JsValue::Undefined),
+                            args.first().cloned().unwrap_or(JsValue::Undefined),
+                            args.get(1..).unwrap_or(&[]).to_vec(),
+                        )
+                    };
                 match &func {
                     JsValue::NativeFunction(f) => function_call(f, &this_arg, &call_args),
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
@@ -9616,9 +9637,23 @@ fn make_function() -> JsValue {
         proto.insert(
             "apply".into(),
             native(|args| {
-                let func = args.first().cloned().unwrap_or(JsValue::Undefined);
-                let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let args_array = match args.get(2) {
+                // See `Function.prototype.call` above for the dual
+                // invocation conventions handled here.
+                let (func, this_arg, args_slot): (JsValue, JsValue, Option<JsValue>) =
+                    if args.first().is_some_and(is_callable) {
+                        (
+                            args[0].clone(),
+                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
+                            args.get(2).cloned(),
+                        )
+                    } else {
+                        (
+                            current_this().unwrap_or(JsValue::Undefined),
+                            args.first().cloned().unwrap_or(JsValue::Undefined),
+                            args.get(1).cloned(),
+                        )
+                    };
+                let args_array = match args_slot {
                     Some(JsValue::Array(arr)) => Some(arr.borrow().clone()),
                     Some(JsValue::PlainObject(map)) => {
                         let borrow = map.borrow();
@@ -9662,9 +9697,24 @@ fn make_function() -> JsValue {
         proto.insert(
             "bind".into(),
             native(|args| {
-                let func = args.first().cloned().unwrap_or(JsValue::Undefined);
-                let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+                // See `Function.prototype.call` above for the dual
+                // invocation conventions handled here. This enables
+                // chained `f.bind(...).bind(...)` where the second `.bind`
+                // is dispatched as a method on the bound PlainObject.
+                let (func, this_arg, bound_args): (JsValue, JsValue, Vec<JsValue>) =
+                    if args.first().is_some_and(is_callable) {
+                        (
+                            args[0].clone(),
+                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
+                            args.get(2..).unwrap_or(&[]).to_vec(),
+                        )
+                    } else {
+                        (
+                            current_this().unwrap_or(JsValue::Undefined),
+                            args.first().cloned().unwrap_or(JsValue::Undefined),
+                            args.get(1..).unwrap_or(&[]).to_vec(),
+                        )
+                    };
                 let result_len =
                     function_length(function_length_value(&func) as u32, bound_args.len() as u32)
                         as i32;
@@ -27808,10 +27858,35 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_bind_supports_chained_partial_application() {
         assert_eval_true(
             "function sum(a, b, c) { return a + b + c; } sum.bind(null, 1).bind(null, 2)(3) === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_chained_preserves_bound_this() {
+        // Per spec, once a function is bound, subsequent `.bind` calls
+        // cannot override the original bound `this`.
+        assert_eval_true(
+            "function f(a) { return this.base + a; } var g = f.bind({ base: 40 }); g.bind({ base: 99 })(2) === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_on_bound_function_routes_via_proto() {
+        // `g.call(...)` on a bound PlainObject must route through
+        // Function.prototype.call (or callable_plain_object_function_method)
+        // and forward the bound `this`/args correctly.
+        assert_eval_true(
+            "function f(a, b) { return this.base + a + b; } var g = f.bind({ base: 10 }, 1); g.call(null, 2) === 13",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_on_bound_function_routes_via_proto() {
+        assert_eval_true(
+            "function f(a, b) { return this.base + a + b; } var g = f.bind({ base: 10 }, 1); g.apply(null, [2]) === 13",
         );
     }
 
