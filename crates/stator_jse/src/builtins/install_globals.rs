@@ -3481,6 +3481,101 @@ fn make_text_decoder() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn btoa_encode(input: &str) -> StatorResult<String> {
+    let mut bytes = Vec::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch as u32 > 0xff {
+            return Err(StatorError::TypeError(
+                "btoa: string contains characters outside of the Latin1 range".into(),
+            ));
+        }
+        bytes.push(ch as u8);
+    }
+
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map(u32::from).unwrap_or(0);
+        let b2 = chunk.get(2).copied().map(u32::from).unwrap_or(0);
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    Ok(out)
+}
+
+fn atob_invalid_character() -> StatorError {
+    StatorError::TypeError("atob: invalid character".into())
+}
+
+fn atob_base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn atob_is_ascii_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | 0x0c | b'\r' | b' ')
+}
+
+fn atob_decode(input: &str) -> StatorResult<String> {
+    let mut data: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !atob_is_ascii_whitespace(*byte))
+        .collect();
+
+    if data.len().is_multiple_of(4) {
+        if matches!(data.last(), Some(b'=')) {
+            data.pop();
+        }
+        if matches!(data.last(), Some(b'=')) {
+            data.pop();
+        }
+    }
+
+    if data.len() % 4 == 1 || data.contains(&b'=') {
+        return Err(atob_invalid_character());
+    }
+
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in data {
+        let value = u32::from(atob_base64_value(byte).ok_or_else(atob_invalid_character)?);
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+            buffer = if bits == 0 {
+                0
+            } else {
+                buffer & ((1 << bits) - 1)
+            };
+        }
+    }
+
+    Ok(out.into_iter().map(char::from).collect())
+}
+
 fn make_unsupported_web_constructor(name: &'static str) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert(
@@ -16816,37 +16911,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "btoa".into(),
             builtin_fn("btoa", 1, |args| {
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                // Validate: btoa only accepts Latin-1 (each char code < 256).
-                for ch in input.chars() {
-                    if ch as u32 > 255 {
-                        return Err(StatorError::TypeError(
-                            "btoa: string contains characters outside of the Latin1 range".into(),
-                        ));
-                    }
-                }
-                let bytes: Vec<u8> = input.chars().map(|c| c as u8).collect();
-                const B64: &[u8; 64] =
-                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-                for chunk in bytes.chunks(3) {
-                    let b0 = chunk[0] as u32;
-                    let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-                    let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-                    let n = (b0 << 16) | (b1 << 8) | b2;
-                    out.push(B64[((n >> 18) & 0x3F) as usize] as char);
-                    out.push(B64[((n >> 12) & 0x3F) as usize] as char);
-                    if chunk.len() > 1 {
-                        out.push(B64[((n >> 6) & 0x3F) as usize] as char);
-                    } else {
-                        out.push('=');
-                    }
-                    if chunk.len() > 2 {
-                        out.push(B64[(n & 0x3F) as usize] as char);
-                    } else {
-                        out.push('=');
-                    }
-                }
-                Ok(JsValue::String(out.into()))
+                Ok(JsValue::String(btoa_encode(&input)?.into()))
             }),
         );
 
@@ -16856,44 +16921,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "atob".into(),
             builtin_fn("atob", 1, |args| {
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                // Strip whitespace per spec.
-                let clean: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                fn b64_val(c: u8) -> Option<u32> {
-                    match c {
-                        b'A'..=b'Z' => Some((c - b'A') as u32),
-                        b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-                        b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-                        b'+' => Some(62),
-                        b'/' => Some(63),
-                        b'=' => Some(0),
-                        _ => None,
-                    }
-                }
-                let bytes = clean.as_bytes();
-                if !bytes.len().is_multiple_of(4) {
-                    return Err(StatorError::TypeError("atob: invalid character".into()));
-                }
-                let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-                for chunk in bytes.chunks(4) {
-                    let a = b64_val(chunk[0])
-                        .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
-                    let b = b64_val(chunk[1])
-                        .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
-                    let c = b64_val(chunk[2])
-                        .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
-                    let d = b64_val(chunk[3])
-                        .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
-                    let n = (a << 18) | (b << 12) | (c << 6) | d;
-                    out.push(((n >> 16) & 0xFF) as u8);
-                    if chunk[2] != b'=' {
-                        out.push(((n >> 8) & 0xFF) as u8);
-                    }
-                    if chunk[3] != b'=' {
-                        out.push((n & 0xFF) as u8);
-                    }
-                }
-                let result: String = out.iter().map(|&b| b as char).collect();
-                Ok(JsValue::String(result.into()))
+                Ok(JsValue::String(atob_decode(&input)?.into()))
             }),
         );
 
@@ -38138,6 +38166,42 @@ mod tests {
     #[test]
     fn e2e_atob_ignores_ascii_whitespace() {
         assert_eval_true("atob('U 3RhdG9y\\n') === 'Stator'");
+    }
+
+    #[test]
+    fn e2e_atob_accepts_unpadded_input() {
+        assert_eval_true(
+            "atob('YQ') === 'a'
+                && atob('YWE') === 'aa'
+                && atob('AAA').length === 2
+                && atob('AAA').charCodeAt(0) === 0
+                && atob('AAA').charCodeAt(1) === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_atob_rejects_malformed_padding() {
+        assert_eval_type_error("atob('YQ=')");
+        assert_eval_type_error("atob('Y===')");
+        assert_eval_type_error("atob('====')");
+        assert_eval_type_error("atob('AA=A')");
+        assert_eval_type_error("atob('AA==AA')");
+    }
+
+    #[test]
+    fn e2e_atob_rejects_invalid_length_and_alphabet() {
+        assert_eval_type_error("atob('A')");
+        assert_eval_type_error("atob('Zm-9')");
+    }
+
+    #[test]
+    fn e2e_btoa_rejects_non_latin1() {
+        assert_eval_type_error("btoa('€')");
+    }
+
+    #[test]
+    fn e2e_btoa_stringifies_inputs() {
+        assert_eval_true("btoa(42) === 'NDI=' && btoa() === 'dW5kZWZpbmVk'");
     }
 
     #[test]
