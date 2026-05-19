@@ -3083,13 +3083,189 @@ fn make_crypto() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+/// Resolve the receiver for a `TextEncoder.prototype.*` method invocation.
+///
+/// Mirrors [`resolve_arraybuffer_receiver`]: accepts either the
+/// `.call/.apply/.bind` calling convention (receiver at `args[0]`) or the
+/// method-dispatch convention (receiver published on the current global
+/// environment).  Returns the index of the first user-supplied argument and
+/// errors with a `TypeError` if the receiver is not a branded TextEncoder
+/// instance.
+fn resolve_text_encoder_receiver(args: &[JsValue], display_name: &str) -> StatorResult<usize> {
+    if let Some(JsValue::PlainObject(map)) = args.first()
+        && matches!(
+            map.borrow().get("__is_text_encoder__"),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return Ok(1);
+    }
+    if let Some(JsValue::PlainObject(map)) =
+        current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && matches!(
+            map.borrow().get("__is_text_encoder__"),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return Ok(0);
+    }
+    Err(incompatible_receiver(display_name))
+}
+
+/// ECMAScript ToString applied to the optional `input` argument of
+/// `TextEncoder.prototype.encode` / `encodeInto`.
+///
+/// Per the WHATWG Encoding Standard §7.1, a missing argument is treated as the
+/// empty string; an explicit `undefined` follows ECMAScript ToString and
+/// becomes `"undefined"`.
+fn text_encoder_to_source_string(arg: Option<&JsValue>) -> StatorResult<String> {
+    match arg {
+        None => Ok(String::new()),
+        Some(v) => v.to_js_string(),
+    }
+}
+
+/// Build the WHATWG Encoding Standard `TextEncoder` constructor and prototype.
+///
+/// `TextEncoder` always encodes to UTF-8.  The constructor takes no arguments
+/// and ignores any that are passed.  The prototype exposes:
+///
+/// * `get encoding()` — returns the static string `"utf-8"`.
+/// * `encode(input)` — returns a fresh `Uint8Array` containing the UTF-8
+///   encoding of `ToString(input)`.
+/// * `encodeInto(source, destination)` — writes UTF-8 bytes into the supplied
+///   `Uint8Array` (only writing whole code points that fit) and returns
+///   `{ read, written }` where `read` is the count of UTF-16 code units
+///   consumed from `source` and `written` is the count of bytes written.
+///
+/// Receivers are branded via a non-enumerable `__is_text_encoder__` slot, so
+/// stealing the prototype methods and invoking them on foreign objects raises
+/// a `TypeError` like other built-ins (`Map`, `Set`, `ArrayBuffer`).
+#[inline(never)]
+fn make_text_encoder() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("TextEncoder".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert(
+        "__get_encoding__".into(),
+        native(|args| {
+            resolve_text_encoder_receiver(&args, "get TextEncoder.prototype.encoding")?;
+            Ok(JsValue::String("utf-8".into()))
+        }),
+    );
+    proto.insert(
+        "encode".into(),
+        builtin_fn("encode", 1, |args| {
+            let base = resolve_text_encoder_receiver(&args, "TextEncoder.prototype.encode")?;
+            let source = text_encoder_to_source_string(args.get(base))?;
+            let bytes = source.into_bytes();
+            let len = bytes.len();
+            let ta = crate::builtins::typed_array::typed_array_new_from_length(
+                TypedArrayKind::Uint8,
+                len,
+            );
+            if len > 0 {
+                ta.buffer.borrow_mut().data.copy_from_slice(&bytes);
+            }
+            let inner = Rc::new(RefCell::new(ta));
+            Ok(make_typed_array_instance(
+                TypedArrayKind::Uint8,
+                inner,
+                None,
+            ))
+        }),
+    );
+    proto.insert(
+        "encodeInto".into(),
+        builtin_fn("encodeInto", 2, |args| {
+            let base = resolve_text_encoder_receiver(&args, "TextEncoder.prototype.encodeInto")?;
+            let source = text_encoder_to_source_string(args.get(base))?;
+            let dest_val = args.get(base + 1).cloned().unwrap_or(JsValue::Undefined);
+            let dest_inner = extract_typed_array(&dest_val).ok_or_else(|| {
+                StatorError::TypeError(
+                    "TextEncoder.prototype.encodeInto destination must be a Uint8Array".into(),
+                )
+            })?;
+            let dest_borrow = dest_inner.borrow();
+            if dest_borrow.kind != TypedArrayKind::Uint8 {
+                return Err(StatorError::TypeError(
+                    "TextEncoder.prototype.encodeInto destination must be a Uint8Array".into(),
+                ));
+            }
+            let buf_rc = Rc::clone(&dest_borrow.buffer);
+            if buf_rc.borrow().detached {
+                return Err(StatorError::TypeError(
+                    "TextEncoder.prototype.encodeInto destination ArrayBuffer is detached".into(),
+                ));
+            }
+            let dest_byte_offset = dest_borrow.effective_byte_offset();
+            let dest_byte_len = dest_borrow.effective_byte_length();
+            drop(dest_borrow);
+
+            let mut read_utf16: usize = 0;
+            let mut written: usize = 0;
+            {
+                let mut buf = buf_rc.borrow_mut();
+                for ch in source.chars() {
+                    let needed = ch.len_utf8();
+                    if written + needed > dest_byte_len {
+                        break;
+                    }
+                    let start = dest_byte_offset + written;
+                    let mut tmp = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut tmp);
+                    buf.data[start..start + needed].copy_from_slice(encoded.as_bytes());
+                    written += needed;
+                    read_utf16 += ch.len_utf16();
+                }
+            }
+
+            let mut result = PropertyMap::new();
+            result.insert("read".into(), JsValue::Smi(read_utf16 as i32));
+            result.insert("written".into(), JsValue::Smi(written as i32));
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+        }),
+    );
+    proto.make_all_non_enumerable();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            let mut obj = PropertyMap::new();
+            obj.insert("__is_text_encoder__".into(), JsValue::Boolean(true));
+            obj.insert(
+                "__proto__".into(),
+                constructor_prototype("TextEncoder").unwrap_or(JsValue::Null),
+            );
+            obj.insert(
+                "@@toStringTag".into(),
+                JsValue::String("TextEncoder".into()),
+            );
+            obj.make_all_non_enumerable();
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 fn make_unsupported_web_constructor(name: &'static str) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert(
         "__call__".into(),
         native(move |_args| {
             Err(StatorError::TypeError(format!(
-                "{name}: URL parsing is not implemented"
+                "{name}: web platform feature is not implemented"
             )))
         }),
     );
@@ -16192,6 +16368,23 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
+        globals.insert(
+            "TextEncoder".into(),
+            finalize_ctor(make_text_encoder(), "TextEncoder"),
+        );
+        // TextDecoder is intentionally fail-closed for now: returning a fake
+        // decoder would silently corrupt non-ASCII input. Throw on
+        // construction so callers can feature-detect via try/catch instead of
+        // receiving wrong data.
+        globals.insert(
+            "TextDecoder".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("TextDecoder"),
+                "TextDecoder",
+            ),
+        );
+
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
 
@@ -16695,6 +16888,8 @@ mod tests {
         assert!(globals.contains_key("crypto"));
         assert!(globals.contains_key("URL"));
         assert!(globals.contains_key("URLSearchParams"));
+        assert!(globals.contains_key("TextEncoder"));
+        assert!(globals.contains_key("TextDecoder"));
     }
 
     #[test]
@@ -16711,6 +16906,161 @@ mod tests {
         );
         assert_eval_type_error("URLSearchParams('x=1')");
         assert_eval_type_error("new URLSearchParams('x=1')");
+    }
+
+    #[test]
+    fn e2e_text_encoder_constructor_and_encoding() {
+        assert_eval_true("typeof TextEncoder === 'function' && TextEncoder.name === 'TextEncoder'");
+        assert_eval_true("new TextEncoder().encoding === 'utf-8'");
+        assert_eval_true("(new TextEncoder())[Symbol.toStringTag] === 'TextEncoder'");
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_ascii() {
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode('abc');
+                return a instanceof Uint8Array
+                    && a.length === 3
+                    && a[0] === 0x61 && a[1] === 0x62 && a[2] === 0x63;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_empty_and_default() {
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode();
+                const b = new TextEncoder().encode('');
+                return a instanceof Uint8Array && a.length === 0
+                    && b instanceof Uint8Array && b.length === 0;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_undefined_stringifies() {
+        // encode(undefined) explicitly passes Undefined; WHATWG defers to
+        // ECMAScript ToString => "undefined" (9 bytes).
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode(undefined);
+                return a.length === 9 && a[0] === 0x75 && a[8] === 0x64;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_multibyte_utf8() {
+        // "é" = 0xC3 0xA9 ; "€" = 0xE2 0x82 0xAC ; "𝄞" = 0xF0 0x9D 0x84 0x9E
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode('é');
+                return a.length === 2 && a[0] === 0xC3 && a[1] === 0xA9;
+            })()",
+        );
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode('€');
+                return a.length === 3 && a[0] === 0xE2 && a[1] === 0x82 && a[2] === 0xAC;
+            })()",
+        );
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode('𝄞');
+                return a.length === 4
+                    && a[0] === 0xF0 && a[1] === 0x9D
+                    && a[2] === 0x84 && a[3] === 0x9E;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_coerces_non_string() {
+        assert_eval_true(
+            "(() => {
+                const a = new TextEncoder().encode(42);
+                return a.length === 2 && a[0] === 0x34 && a[1] === 0x32;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_into_basic() {
+        assert_eval_true(
+            "(() => {
+                const dst = new Uint8Array(5);
+                const r = new TextEncoder().encodeInto('abc', dst);
+                return r.read === 3 && r.written === 3
+                    && dst[0] === 0x61 && dst[1] === 0x62 && dst[2] === 0x63
+                    && dst[3] === 0 && dst[4] === 0;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_into_truncates_on_boundary() {
+        // "é" needs 2 bytes; a 1-byte buffer must write 0 bytes / read 0 units.
+        assert_eval_true(
+            "(() => {
+                const dst = new Uint8Array(1);
+                const r = new TextEncoder().encodeInto('é', dst);
+                return r.read === 0 && r.written === 0 && dst[0] === 0;
+            })()",
+        );
+        // "aé": 'a' fits (1 byte) but 'é' (2 bytes) does not in 2 total.
+        assert_eval_true(
+            "(() => {
+                const dst = new Uint8Array(2);
+                const r = new TextEncoder().encodeInto('aé', dst);
+                return r.read === 1 && r.written === 1 && dst[0] === 0x61 && dst[1] === 0;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_into_surrogate_pair_read_units() {
+        // U+1D11E (𝄞) is one char but two UTF-16 code units and 4 UTF-8 bytes.
+        assert_eval_true(
+            "(() => {
+                const dst = new Uint8Array(4);
+                const r = new TextEncoder().encodeInto('𝄞', dst);
+                return r.read === 2 && r.written === 4
+                    && dst[0] === 0xF0 && dst[1] === 0x9D
+                    && dst[2] === 0x84 && dst[3] === 0x9E;
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_encoder_encode_into_rejects_non_uint8_destination() {
+        assert_eval_type_error("new TextEncoder().encodeInto('x', [])");
+        assert_eval_type_error("new TextEncoder().encodeInto('x', new Uint16Array(4))");
+        assert_eval_type_error("new TextEncoder().encodeInto('x', new Int8Array(4))");
+        assert_eval_type_error("new TextEncoder().encodeInto('x')");
+    }
+
+    #[test]
+    fn e2e_text_encoder_prototype_brand_check() {
+        assert_eval_type_error("TextEncoder.prototype.encode.call({}, 'x')");
+        assert_eval_type_error("TextEncoder.prototype.encodeInto.call({}, 'x', new Uint8Array(4))");
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(\
+                Object.getPrototypeOf(new TextEncoder()), 'encoding') \
+                && (function(){ \
+                    const g = Object.getOwnPropertyDescriptor(\
+                        Object.getPrototypeOf(new TextEncoder()), 'encoding').get; \
+                    return g.call({}); \
+                })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_decoder_constructor_exists_but_fails_closed() {
+        assert_eval_true("typeof TextDecoder === 'function' && TextDecoder.name === 'TextDecoder'");
+        assert_eval_type_error("new TextDecoder()");
+        assert_eval_type_error("TextDecoder()");
     }
 
     #[test]
