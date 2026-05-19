@@ -16827,6 +16827,91 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── Observers / frame & idle scheduling (fail-closed) ───────────────
+        //
+        // `MutationObserver`, `IntersectionObserver`, `ResizeObserver`, and
+        // `PerformanceObserver` require a live DOM, layout pipeline, and
+        // host event-loop integration to deliver records. `requestAnimationFrame`
+        // / `cancelAnimationFrame` need a rendering-driven frame scheduler and
+        // `requestIdleCallback` / `cancelIdleCallback` need an idle-period
+        // scheduler with a host-provided deadline. This standalone engine has
+        // none of those, so the constructors and scheduling functions are
+        // exposed (because product code commonly probes them) but every
+        // operation fails with a `TypeError` instead of pretending to schedule
+        // callbacks or observe records.
+        globals.insert(
+            "MutationObserver".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("MutationObserver"),
+                "MutationObserver",
+            ),
+        );
+        globals.insert(
+            "MutationRecord".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("MutationRecord"),
+                "MutationRecord",
+            ),
+        );
+        globals.insert(
+            "IntersectionObserver".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("IntersectionObserver"),
+                "IntersectionObserver",
+            ),
+        );
+        globals.insert(
+            "IntersectionObserverEntry".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("IntersectionObserverEntry"),
+                "IntersectionObserverEntry",
+            ),
+        );
+        globals.insert(
+            "ResizeObserver".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("ResizeObserver"),
+                "ResizeObserver",
+            ),
+        );
+        globals.insert(
+            "ResizeObserverEntry".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("ResizeObserverEntry"),
+                "ResizeObserverEntry",
+            ),
+        );
+        globals.insert(
+            "PerformanceObserver".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceObserver"),
+                "PerformanceObserver",
+            ),
+        );
+        globals.insert(
+            "PerformanceObserverEntryList".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceObserverEntryList"),
+                "PerformanceObserverEntryList",
+            ),
+        );
+        globals.insert(
+            "requestAnimationFrame".into(),
+            make_unsupported_web_function("requestAnimationFrame", 1),
+        );
+        globals.insert(
+            "cancelAnimationFrame".into(),
+            make_unsupported_web_function("cancelAnimationFrame", 1),
+        );
+        globals.insert(
+            "requestIdleCallback".into(),
+            make_unsupported_web_function("requestIdleCallback", 1),
+        );
+        globals.insert(
+            "cancelIdleCallback".into(),
+            make_unsupported_web_function("cancelIdleCallback", 1),
+        );
+
         // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
         globals.insert(
             "TextEncoder".into(),
@@ -17346,6 +17431,18 @@ mod tests {
         assert!(globals.contains_key("History"));
         assert!(globals.contains_key("location"));
         assert!(globals.contains_key("history"));
+        assert!(globals.contains_key("MutationObserver"));
+        assert!(globals.contains_key("MutationRecord"));
+        assert!(globals.contains_key("IntersectionObserver"));
+        assert!(globals.contains_key("IntersectionObserverEntry"));
+        assert!(globals.contains_key("ResizeObserver"));
+        assert!(globals.contains_key("ResizeObserverEntry"));
+        assert!(globals.contains_key("PerformanceObserver"));
+        assert!(globals.contains_key("PerformanceObserverEntryList"));
+        assert!(globals.contains_key("requestAnimationFrame"));
+        assert!(globals.contains_key("cancelAnimationFrame"));
+        assert!(globals.contains_key("requestIdleCallback"));
+        assert!(globals.contains_key("cancelIdleCallback"));
     }
 
     #[test]
@@ -17455,6 +17552,49 @@ mod tests {
         assert_eval_type_error("history.go(-1)");
         assert_eval_type_error("history.pushState({}, '', '/x')");
         assert_eval_type_error("history.replaceState({}, '', '/x')");
+    }
+
+    #[test]
+    fn e2e_observer_constructors_exist_but_fail_closed() {
+        for name in [
+            "MutationObserver",
+            "MutationRecord",
+            "IntersectionObserver",
+            "IntersectionObserverEntry",
+            "ResizeObserver",
+            "ResizeObserverEntry",
+            "PerformanceObserver",
+            "PerformanceObserverEntryList",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new MutationObserver(function () {})");
+        assert_eval_type_error("new IntersectionObserver(function () {})");
+        assert_eval_type_error("new ResizeObserver(function () {})");
+        assert_eval_type_error("new PerformanceObserver(function () {})");
+    }
+
+    #[test]
+    fn e2e_frame_and_idle_scheduling_globals_fail_closed() {
+        for name in [
+            "requestAnimationFrame",
+            "cancelAnimationFrame",
+            "requestIdleCallback",
+            "cancelIdleCallback",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+        }
+
+        assert_eval_type_error("requestAnimationFrame(function () {})");
+        assert_eval_type_error("cancelAnimationFrame(1)");
+        assert_eval_type_error("requestIdleCallback(function () {})");
+        assert_eval_type_error("cancelIdleCallback(1)");
     }
 
     /// Browser self-reference globals (`window`, `self`, `frames`, `parent`,
