@@ -3259,6 +3259,228 @@ fn make_text_encoder() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+/// Resolve the receiver for a `TextDecoder.prototype.*` method invocation.
+fn resolve_text_decoder_receiver(
+    args: &[JsValue],
+    display_name: &str,
+) -> StatorResult<(Rc<RefCell<PropertyMap>>, usize)> {
+    if let Some(JsValue::PlainObject(map)) = args.first()
+        && matches!(
+            map.borrow().get("__is_text_decoder__"),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return Ok((Rc::clone(map), 1));
+    }
+    if let Some(JsValue::PlainObject(map)) =
+        current_global_env().and_then(|env| env.borrow().get_this().cloned())
+        && matches!(
+            map.borrow().get("__is_text_decoder__"),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return Ok((map, 0));
+    }
+    Err(incompatible_receiver(display_name))
+}
+
+/// Return whether a `TextDecoder` constructor label is Stator's supported UTF-8 label.
+fn text_decoder_label_is_utf8(label: Option<&JsValue>) -> StatorResult<bool> {
+    let Some(label) = label.filter(|value| !value.is_undefined()) else {
+        return Ok(true);
+    };
+    Ok(label.to_js_string()?.eq_ignore_ascii_case("utf-8"))
+}
+
+/// Extract bytes accepted by `TextDecoder.prototype.decode`.
+fn text_decoder_input_bytes(input: Option<&JsValue>) -> StatorResult<Vec<u8>> {
+    let Some(input) = input.filter(|value| !value.is_undefined()) else {
+        return Ok(Vec::new());
+    };
+    if let Some(buf_rc) = extract_arraybuffer(input) {
+        let buf = buf_rc.borrow();
+        if buf.detached {
+            return Err(StatorError::TypeError(
+                "TextDecoder.prototype.decode input ArrayBuffer is detached".into(),
+            ));
+        }
+        return Ok(buf.data.clone());
+    }
+    if let Some(ta_rc) = extract_typed_array(input) {
+        let ta = ta_rc.borrow();
+        let buf = ta.buffer.borrow();
+        if buf.detached {
+            return Err(StatorError::TypeError(
+                "TextDecoder.prototype.decode input TypedArray is backed by a detached ArrayBuffer"
+                    .into(),
+            ));
+        }
+        let start = ta.effective_byte_offset();
+        let len = ta.effective_byte_length();
+        let end = start.checked_add(len).ok_or_else(|| {
+            StatorError::RangeError("TextDecoder.prototype.decode TypedArray range overflow".into())
+        })?;
+        if end > buf.data.len() {
+            return Err(StatorError::TypeError(
+                "TextDecoder.prototype.decode input TypedArray is out of bounds".into(),
+            ));
+        }
+        return Ok(buf.data[start..end].to_vec());
+    }
+    if let Some(dv_rc) = extract_dataview(input) {
+        let dv = dv_rc.borrow();
+        let buf = dv.buffer.borrow();
+        if buf.detached {
+            return Err(StatorError::TypeError(
+                "TextDecoder.prototype.decode input DataView is backed by a detached ArrayBuffer"
+                    .into(),
+            ));
+        }
+        let start = dataview_byte_offset(&dv)?;
+        let len = dataview_byte_length(&dv)?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            StatorError::RangeError("TextDecoder.prototype.decode DataView range overflow".into())
+        })?;
+        if end > buf.data.len() {
+            return Err(StatorError::TypeError(
+                "TextDecoder.prototype.decode input DataView is out of bounds".into(),
+            ));
+        }
+        return Ok(buf.data[start..end].to_vec());
+    }
+    Err(StatorError::TypeError(
+        "TextDecoder.prototype.decode input must be an ArrayBuffer or ArrayBuffer view".into(),
+    ))
+}
+
+/// Build the WHATWG Encoding Standard `TextDecoder` constructor and prototype.
+///
+/// This is a focused UTF-8-only implementation. Unsupported labels fail closed
+/// at construction, invalid UTF-8 uses replacement semantics by default, and
+/// `{ fatal: true }` switches invalid input to a `TypeError`.
+#[inline(never)]
+fn make_text_decoder() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("TextDecoder".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert(
+        "__get_encoding__".into(),
+        native(|args| {
+            resolve_text_decoder_receiver(&args, "get TextDecoder.prototype.encoding")?;
+            Ok(JsValue::String("utf-8".into()))
+        }),
+    );
+    proto.insert(
+        "__get_fatal__".into(),
+        native(|args| {
+            let (receiver, _) =
+                resolve_text_decoder_receiver(&args, "get TextDecoder.prototype.fatal")?;
+            Ok(receiver
+                .borrow()
+                .get("__text_decoder_fatal__")
+                .cloned()
+                .unwrap_or(JsValue::Boolean(false)))
+        }),
+    );
+    proto.insert(
+        "__get_ignoreBOM__".into(),
+        native(|args| {
+            let (receiver, _) =
+                resolve_text_decoder_receiver(&args, "get TextDecoder.prototype.ignoreBOM")?;
+            Ok(receiver
+                .borrow()
+                .get("__text_decoder_ignore_bom__")
+                .cloned()
+                .unwrap_or(JsValue::Boolean(false)))
+        }),
+    );
+    proto.insert(
+        "decode".into(),
+        builtin_fn("decode", 1, |args| {
+            let (receiver, base) =
+                resolve_text_decoder_receiver(&args, "TextDecoder.prototype.decode")?;
+            let fatal = matches!(
+                receiver.borrow().get("__text_decoder_fatal__"),
+                Some(JsValue::Boolean(true))
+            );
+            let ignore_bom = matches!(
+                receiver.borrow().get("__text_decoder_ignore_bom__"),
+                Some(JsValue::Boolean(true))
+            );
+            let bytes = text_decoder_input_bytes(args.get(base))?;
+            let mut decoded = if fatal {
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| {
+                        StatorError::TypeError(
+                            "TextDecoder.prototype.decode input contains invalid UTF-8".into(),
+                        )
+                    })?
+                    .to_string()
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            if !ignore_bom && decoded.starts_with('\u{feff}') {
+                decoded.replace_range(..'\u{feff}'.len_utf8(), "");
+            }
+            Ok(JsValue::String(Rc::from(decoded)))
+        }),
+    );
+    proto.make_all_non_enumerable();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            if !text_decoder_label_is_utf8(args.first())? {
+                return Err(StatorError::RangeError(
+                    "TextDecoder: unsupported encoding label".into(),
+                ));
+            }
+            let options = args.get(1).filter(|value| !value.is_undefined());
+            let fatal = if let Some(options) = options {
+                dispatch_get_property_value(options, JsValue::String("fatal".into()))?.to_boolean()
+            } else {
+                false
+            };
+            let ignore_bom = if let Some(options) = options {
+                dispatch_get_property_value(options, JsValue::String("ignoreBOM".into()))?
+                    .to_boolean()
+            } else {
+                false
+            };
+
+            let mut obj = PropertyMap::new();
+            obj.insert("__is_text_decoder__".into(), JsValue::Boolean(true));
+            obj.insert("__text_decoder_fatal__".into(), JsValue::Boolean(fatal));
+            obj.insert(
+                "__text_decoder_ignore_bom__".into(),
+                JsValue::Boolean(ignore_bom),
+            );
+            obj.insert(
+                "__proto__".into(),
+                constructor_prototype("TextDecoder").unwrap_or(JsValue::Null),
+            );
+            obj.insert(
+                "@@toStringTag".into(),
+                JsValue::String("TextDecoder".into()),
+            );
+            obj.make_all_non_enumerable();
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 fn make_unsupported_web_constructor(name: &'static str) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert(
@@ -16373,16 +16595,9 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "TextEncoder".into(),
             finalize_ctor(make_text_encoder(), "TextEncoder"),
         );
-        // TextDecoder is intentionally fail-closed for now: returning a fake
-        // decoder would silently corrupt non-ASCII input. Throw on
-        // construction so callers can feature-detect via try/catch instead of
-        // receiving wrong data.
         globals.insert(
             "TextDecoder".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("TextDecoder"),
-                "TextDecoder",
-            ),
+            finalize_ctor(make_text_decoder(), "TextDecoder"),
         );
 
         // ── Error constructors ────────────────────────────────────────────────
@@ -17057,10 +17272,57 @@ mod tests {
     }
 
     #[test]
-    fn e2e_text_decoder_constructor_exists_but_fails_closed() {
-        assert_eval_true("typeof TextDecoder === 'function' && TextDecoder.name === 'TextDecoder'");
-        assert_eval_type_error("new TextDecoder()");
-        assert_eval_type_error("TextDecoder()");
+    fn e2e_text_decoder_constructor_and_properties() {
+        assert_eval_true(
+            "(() => {
+                const d = new TextDecoder('UTF-8', { fatal: true, ignoreBOM: true });
+                return typeof TextDecoder === 'function'
+                    && TextDecoder.name === 'TextDecoder'
+                    && d.encoding === 'utf-8'
+                    && d.fatal === true
+                    && d.ignoreBOM === true;
+            })()",
+        );
+        assert_eval_range_error("new TextDecoder('utf-16le')");
+    }
+
+    #[test]
+    fn e2e_text_decoder_decode_utf8_views() {
+        assert_eval_true(
+            "(() => {
+                const bytes = new Uint8Array([0x48, 0xc3, 0xa9, 0xf0, 0x9d, 0x84, 0x9e]);
+                const d = new TextDecoder();
+                const buf = bytes.buffer;
+                const dv = new DataView(buf, 1, 2);
+                return d.decode() === ''
+                    && d.decode(bytes) === 'Hé𝄞'
+                    && d.decode(buf) === 'Hé𝄞'
+                    && d.decode(dv) === 'é'
+                    && d.decode(new Uint16Array([0x6548])) === 'He';
+            })()",
+        );
+    }
+
+    #[test]
+    fn e2e_text_decoder_decode_invalid_and_fatal_utf8() {
+        assert_eval_true("new TextDecoder().decode(new Uint8Array([0xff])) === '\u{fffd}'");
+        assert_eval_type_error(
+            "new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xff]))",
+        );
+    }
+
+    #[test]
+    fn e2e_text_decoder_bom_and_prototype_brand_check() {
+        assert_eval_true(
+            "new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])) === 'A'
+                && new TextDecoder('utf-8', { ignoreBOM: true })
+                    .decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])).length === 2",
+        );
+        assert_eval_type_error("TextDecoder.prototype.decode.call({}, new Uint8Array([0x41]))");
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(
+                Object.getPrototypeOf(new TextDecoder()), 'encoding').get.call({})",
+        );
     }
 
     #[test]
