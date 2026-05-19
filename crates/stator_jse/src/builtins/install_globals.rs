@@ -41814,10 +41814,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_for_each_uses_js_callback() {
         assert_eval_true(
-            "var sum = 0; new Uint8Array([1,2,3]).forEach(function(v, i, self) { sum += v + i + self.length; }); sum === 15",
+            "var sum = 0; new Uint8Array([1,2,3]).forEach(function(v, i, self) { sum += v + i + self.length; }); sum === 18",
         );
     }
 
@@ -41836,10 +41835,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_reduce_passes_receiver() {
         assert_eval_true(
-            "new Uint8Array([1,2,3]).reduce(function(acc, v, i, self) { return acc + self.length + i + v; }, 0) === 15",
+            "new Uint8Array([1,2,3]).reduce(function(acc, v, i, self) { return acc + self.length + i + v; }, 0) === 18",
         );
     }
 
@@ -41847,6 +41845,13 @@ mod tests {
     fn e2e_typed_array_reduce_right_uses_js_callback() {
         assert_eval_true(
             "new Uint8Array([1,2,3]).reduceRight(function(acc, v) { return acc * 10 + v; }, 0) === 321",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_right_passes_receiver() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).reduceRight(function(acc, v, i, self) { return acc + self.length + i + v; }, 0) === 18",
         );
     }
 
