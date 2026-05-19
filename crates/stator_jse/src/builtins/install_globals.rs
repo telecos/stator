@@ -3597,6 +3597,23 @@ fn make_unsupported_web_function(name: &'static str, length: i32) -> JsValue {
     })
 }
 
+fn make_unsupported_url_constructor() -> JsValue {
+    let ctor = make_unsupported_web_constructor("URL");
+    if let JsValue::PlainObject(ref rc) = ctor {
+        let mut props = rc.borrow_mut();
+        props.insert(
+            "createObjectURL".into(),
+            make_unsupported_web_function("URL.createObjectURL", 1),
+        );
+        props.insert(
+            "revokeObjectURL".into(),
+            make_unsupported_web_function("URL.revokeObjectURL", 1),
+        );
+        props.make_all_non_enumerable();
+    }
+    ctor
+}
+
 fn make_unsupported_storage_object(name: &'static str) -> JsValue {
     make_unsupported_web_object(
         name,
@@ -16149,7 +16166,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert(
             "URL".into(),
-            finalize_ctor(make_unsupported_web_constructor("URL"), "URL"),
+            finalize_ctor(make_unsupported_url_constructor(), "URL"),
         );
         globals.insert(
             "URLSearchParams".into(),
@@ -16191,6 +16208,26 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "File".into(),
             finalize_ctor(make_unsupported_web_constructor("File"), "File"),
         );
+
+        // ── File API / drag data stores (fail-closed) ───────────────────────
+        // File readers, file lists, and drag data stores need host-backed bytes,
+        // asynchronous read/event dispatch, object URL lifetime management, and
+        // browser drag/drop stores. Expose Chromium-compatible globals for Edge
+        // feature detection, but throw instead of fabricating files, reads, or
+        // object URL lifetimes.
+        for name in [
+            "FileReader",
+            "FileReaderSync",
+            "FileList",
+            "DataTransfer",
+            "DataTransferItem",
+            "DataTransferItemList",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
         globals.insert(
             "XMLHttpRequest".into(),
             finalize_ctor(
@@ -16707,7 +16744,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // `typeof XxxEvent === 'function'` and sometimes via `instanceof`
         // checks. Chromium exposes all of them as real browser globals.
         // The standalone engine has no DOM, no view/window, no input device,
-        // no `DataTransfer`, no touch lists, no storage areas, no CSS
+        // no drag data store, no touch lists, no storage areas, no CSS
         // animation/transition pipeline, no session-history navigation,
         // and no security-policy context. Returning fake instances would
         // mislead product code into assuming a real DOM event/source/target
@@ -17666,8 +17703,12 @@ mod tests {
     #[test]
     fn e2e_url_constructor_exists_but_fails_closed() {
         assert_eval_true("typeof URL === 'function' && URL.name === 'URL'");
+        assert_eval_true("typeof URL.createObjectURL === 'function'");
+        assert_eval_true("typeof URL.revokeObjectURL === 'function'");
         assert_eval_type_error("URL('https://example.test/path?x=1')");
         assert_eval_type_error("new URL('https://example.test/path?x=1')");
+        assert_eval_type_error("URL.createObjectURL({})");
+        assert_eval_type_error("URL.revokeObjectURL('blob:https://example.test/id')");
     }
 
     #[test]
@@ -18279,7 +18320,7 @@ mod tests {
     /// `SecurityPolicyViolationEvent`) are exposed so Edge page scripts can
     /// `typeof`/`instanceof`-probe them, but construction fails closed with
     /// a clear `TypeError`. The engine has no DOM, no view/window, no input
-    /// device, no `DataTransfer`, no touch lists, no storage areas, no CSS
+    /// device, no drag data store, no touch lists, no storage areas, no CSS
     /// animation/transition pipeline, no session-history navigation, and no
     /// security-policy context — fabricating events would mislead product
     /// code into assuming a real DOM event source/target exists.
@@ -18348,17 +18389,38 @@ mod tests {
         assert_eval_type_error("new SecurityPolicyViolationEvent('securitypolicyviolation')");
     }
 
-    /// `window`, `document`, `DataTransfer`, and host event dispatch/listener
-    /// objects remain intentionally absent — the standalone engine does not
-    /// preinstall a DOM or fabricate trusted-event state, so page scripts
-    /// must rely on the real host/Blink bindings rather than a stator stub.
+    /// `window`, `document`, and host event dispatch/listener objects remain
+    /// intentionally absent — the standalone engine does not preinstall a DOM
+    /// or fabricate trusted-event state, so page scripts must rely on the real
+    /// host/Blink bindings rather than a stator stub.
     #[test]
     fn e2e_dom_host_objects_remain_absent() {
         assert_eval_true("typeof window === 'undefined'");
         assert_eval_true("typeof document === 'undefined'");
-        assert_eval_true("typeof DataTransfer === 'undefined'");
-        assert_eval_true("typeof DataTransferItem === 'undefined'");
-        assert_eval_true("typeof DataTransferItemList === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_file_drag_data_constructors_exist_but_fail_closed() {
+        for name in [
+            "FileReader",
+            "FileReaderSync",
+            "FileList",
+            "DataTransfer",
+            "DataTransferItem",
+            "DataTransferItemList",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+        }
+
+        assert_eval_type_error("new FileReader()");
+        assert_eval_type_error("new FileReaderSync()");
+        assert_eval_type_error("new FileList()");
+        assert_eval_type_error("new DataTransfer()");
+        assert_eval_type_error("new DataTransferItem()");
+        assert_eval_type_error("new DataTransferItemList()");
     }
 
     #[test]
