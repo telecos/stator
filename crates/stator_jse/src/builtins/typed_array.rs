@@ -989,7 +989,10 @@ pub fn typed_array_set_from(
     source: &[JsValue],
     offset: usize,
 ) -> StatorResult<()> {
-    if offset + source.len() > ta.effective_length() {
+    if offset
+        .checked_add(source.len())
+        .is_none_or(|end| end > ta.effective_length())
+    {
         return Err(StatorError::RangeError("Source is too large".into()));
     }
     for (i, v) in source.iter().enumerate() {

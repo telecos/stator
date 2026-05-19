@@ -14990,14 +14990,12 @@ fn make_typed_array_instance(
                         Some(source) => collect_typed_array_source_values(source)?,
                         None => Vec::new(),
                     };
-                    let offset = a
-                        .get(1)
-                        .map(|v| {
-                            crate::builtins::util::clamped_f64_to_usize(
-                                v.to_number().unwrap_or(0.0),
-                            )
-                        })
-                        .unwrap_or(0);
+                    let offset = match a.get(1) {
+                        Some(offset) => {
+                            crate::builtins::util::checked_f64_to_index(offset.to_number()?)?
+                        }
+                        None => 0,
+                    };
                     typed_array_set_from(&inner.borrow(), &source, offset)?;
                     Ok(JsValue::Undefined)
                 }),
@@ -42052,7 +42050,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_set_array_offset() {
         assert_eval_true(
             "var a = new Int32Array(5); a.set([10, 20], 2); a[2] === 10 && a[3] === 20 && a[0] === 0",
@@ -42060,11 +42057,32 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_set_typed_array() {
         assert_eval_true(
             "var a = new Int32Array(4); var b = new Int32Array([7, 8]); a.set(b, 1); a[1] === 7 && a[2] === 8",
         );
+    }
+
+    #[test]
+    fn e2e_typed_array_set_truncates_fractional_offset() {
+        assert_eval_true(
+            "var a = new Uint8Array(4); a.set([5, 6], 1.9); a.join(',') === '0,5,6,0'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_set_negative_offset_throws_range_error() {
+        assert_eval_range_error("new Uint8Array(2).set([9], -1)");
+    }
+
+    #[test]
+    fn e2e_typed_array_set_too_large_throws_range_error() {
+        assert_eval_range_error("new Uint8Array(2).set([7, 8], 1)");
+    }
+
+    #[test]
+    fn e2e_typed_array_set_symbol_offset_throws_type_error() {
+        assert_eval_type_error("new Uint8Array(2).set([9], Symbol())");
     }
 
     #[test]
