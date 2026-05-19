@@ -3062,15 +3062,17 @@ fn arg_f64(args: &[JsValue], idx: usize) -> StatorResult<f64> {
 }
 
 fn is_callable_value(value: &JsValue) -> bool {
-    matches!(value, JsValue::Function(_) | JsValue::NativeFunction(_))
-        || matches!(
-            value,
-            JsValue::PlainObject(map)
-                if matches!(
-                    map.borrow().get("__call__"),
-                    Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
-                )
-        )
+    matches!(
+        value,
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_)
+    ) || matches!(
+        value,
+        JsValue::PlainObject(map)
+            if matches!(
+                map.borrow().get("__call__"),
+                Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
+            )
+    )
 }
 
 /// Deep-clone a `JsValue`, recursing into plain objects and arrays.
@@ -6996,19 +6998,15 @@ fn make_request_builtin() -> JsValue {
 
 // ── Event / CustomEvent (DOM §2) ─────────────────────────────────────────────
 //
-// Standalone, side-effect-free `Event` and `CustomEvent` data objects. These
-// constructors mirror the WHATWG DOM `Event` constructor contract closely
-// enough for product code that uses `Event`/`CustomEvent` as a plain data
-// carrier (type/detail/cancelable/bubbles flags, `preventDefault`, propagation
-// stop flags, `composedPath`).
+// Standalone `Event`, `CustomEvent`, and `EventTarget` implementations. These
+// mirror the narrow WHATWG DOM surface useful to product code without faking a
+// DOM tree, host event loop, trusted events, default actions, or host event
+// sources. `EventTarget` dispatches only to its own per-instance listener list:
+// there is no capture/bubble propagation beyond the target itself, and
+// `composedPath()` intentionally remains an empty array.
 //
-// They deliberately do **not** participate in any dispatch pipeline. Stator
-// exposes no `EventTarget`, no `dispatchEvent`, no listener registration, and
-// no host event loop, so `isTrusted` is always `false`, `target`,
-// `currentTarget`, `srcElement` are always `null`, `eventPhase` is always
-// `Event.NONE`, and `composedPath()` always returns an empty array. Every
-// other `XxxEvent` constructor, `EventTarget`, `AbortController`, and
-// `AbortSignal` remain fail-closed.
+// Every other `XxxEvent` constructor, `AbortController`, and `AbortSignal`
+// remains fail-closed.
 //
 // Reference: https://dom.spec.whatwg.org/#interface-event
 
@@ -7018,6 +7016,25 @@ const EVENT_BRAND: &str = "__is_event__";
 /// Additional brand placed on `CustomEvent` instances (which also carry the
 /// `EVENT_BRAND` so prototype-chain-less brand probes still work).
 const CUSTOM_EVENT_BRAND: &str = "__is_custom_event__";
+
+/// Hidden brand placed on every `EventTarget` instance for receiver checks.
+const EVENT_TARGET_BRAND: &str = "__is_event_target__";
+
+#[derive(Clone)]
+struct EventListenerEntry {
+    id: u64,
+    type_: String,
+    callback: JsValue,
+    capture: bool,
+    once: bool,
+    passive: bool,
+    removed: bool,
+}
+
+struct EventTargetState {
+    listeners: Vec<EventListenerEntry>,
+    next_listener_id: u64,
+}
 
 /// Mutable internal state of an `Event` / `CustomEvent` instance.
 struct EventState {
@@ -7039,6 +7056,16 @@ struct EventState {
     time_stamp: f64,
     /// `CustomEvent.detail`. Always `JsValue::Null` for plain `Event`.
     detail: JsValue,
+    /// Dispatch target, preserved after dispatch once initialized.
+    target: JsValue,
+    /// Current dispatch target while invoking listeners; `null` otherwise.
+    current_target: JsValue,
+    /// Current event phase (`NONE` or `AT_TARGET` in this standalone model).
+    event_phase: i32,
+    /// True while the event is being dispatched.
+    dispatching: bool,
+    /// True while invoking a passive listener; cancelation requests are ignored.
+    in_passive_listener: bool,
 }
 
 thread_local! {
@@ -7047,6 +7074,10 @@ thread_local! {
     static EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
     static CUSTOM_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static EVENT_TARGET_STATES: RefCell<HashMap<usize, Rc<RefCell<EventTargetState>>>> =
+        RefCell::new(HashMap::new());
+    static EVENT_TARGET_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
 }
 
@@ -7057,6 +7088,16 @@ fn event_type_error(message: impl Into<String>) -> StatorError {
 fn install_event_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<EventState>>) {
     let id = Rc::as_ptr(instance) as usize;
     EVENT_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn install_event_target_state(
+    instance: &Rc<RefCell<PropertyMap>>,
+    state: Rc<RefCell<EventTargetState>>,
+) {
+    let id = Rc::as_ptr(instance) as usize;
+    EVENT_TARGET_STATES.with(|s| {
         s.borrow_mut().insert(id, state);
     });
 }
@@ -7078,8 +7119,38 @@ fn lookup_event_state(value: &JsValue) -> StatorResult<Rc<RefCell<EventState>>> 
         .ok_or_else(|| event_type_error("Event: internal state missing"))
 }
 
+fn lookup_event_target_state(value: &JsValue) -> StatorResult<Rc<RefCell<EventTargetState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(event_type_error(
+            "EventTarget method called on non-EventTarget receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(EVENT_TARGET_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(event_type_error(
+            "EventTarget method called on non-EventTarget receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    EVENT_TARGET_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| event_type_error("EventTarget: internal state missing"))
+}
+
 fn resolve_event_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
     resolve_branded_receiver(args, EVENT_BRAND)
+}
+
+fn resolve_event_target_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, EVENT_TARGET_BRAND)
+}
+
+fn set_event_canceled(state: &mut EventState) {
+    if state.cancelable && !state.in_passive_listener {
+        state.canceled = true;
+    }
 }
 
 /// Read a boolean member from an `EventInit` dictionary, defaulting to
@@ -7097,6 +7168,59 @@ fn event_init_bool(init: &JsValue, name: &str) -> StatorResult<bool> {
     } else {
         Ok(value.to_boolean())
     }
+}
+
+fn event_listener_options_bool(options: &JsValue, name: &str) -> StatorResult<bool> {
+    if matches!(options, JsValue::Undefined | JsValue::Null) {
+        return Ok(false);
+    }
+    if !matches!(options, JsValue::PlainObject(_)) {
+        return Ok(name == "capture" && options.to_boolean());
+    }
+    let value = dispatch_get_property_value(options, JsValue::String(name.to_string().into()))?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(false)
+    } else {
+        Ok(value.to_boolean())
+    }
+}
+
+fn event_listener_capture(options: &JsValue) -> StatorResult<bool> {
+    event_listener_options_bool(options, "capture")
+}
+
+fn event_listener_once(options: &JsValue) -> StatorResult<bool> {
+    event_listener_options_bool(options, "once")
+}
+
+fn event_listener_passive(options: &JsValue) -> StatorResult<bool> {
+    event_listener_options_bool(options, "passive")
+}
+
+fn reject_event_listener_signal(options: &JsValue) -> StatorResult<()> {
+    if matches!(options, JsValue::Undefined | JsValue::Null)
+        || !matches!(options, JsValue::PlainObject(_))
+    {
+        return Ok(());
+    }
+    let signal = dispatch_get_property_value(options, JsValue::String("signal".into()))?;
+    if matches!(signal, JsValue::Undefined | JsValue::Null) {
+        Ok(())
+    } else {
+        Err(event_type_error(
+            "EventTarget: AbortSignal listener option is not implemented",
+        ))
+    }
+}
+
+fn is_event_listener_candidate(callback: &JsValue) -> bool {
+    matches!(
+        callback,
+        JsValue::Function(_)
+            | JsValue::NativeFunction(_)
+            | JsValue::PlainObject(_)
+            | JsValue::Proxy(_)
+    )
 }
 
 /// Read the `detail` member from a `CustomEventInit` dictionary, defaulting
@@ -7218,31 +7342,40 @@ fn build_event_prototype() -> Rc<RefCell<PropertyMap>> {
         PropertyAttributes::CONFIGURABLE,
     );
 
-    // `target` / `currentTarget` / `srcElement` are always null: there is no
-    // dispatch pipeline.
-    for name in [
-        "__get_target__",
-        "__get_currentTarget__",
-        "__get_srcElement__",
-    ] {
-        proto.insert_with_attrs(
-            name.into(),
-            native(|args| {
-                let (recv, _) = resolve_event_receiver(&args);
-                lookup_event_state(&recv)?;
-                Ok(JsValue::Null)
-            }),
-            PropertyAttributes::CONFIGURABLE,
-        );
-    }
+    proto.insert_with_attrs(
+        "__get_target__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(state.borrow().target.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "__get_currentTarget__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(state.borrow().current_target.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "__get_srcElement__".into(),
+        native(|args| {
+            let (recv, _) = resolve_event_receiver(&args);
+            let state = lookup_event_state(&recv)?;
+            Ok(state.borrow().target.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
 
-    // `eventPhase` is always NONE (0): never dispatched.
     proto.insert_with_attrs(
         "__get_eventPhase__".into(),
         native(|args| {
             let (recv, _) = resolve_event_receiver(&args);
-            lookup_event_state(&recv)?;
-            Ok(JsValue::Smi(0))
+            let state = lookup_event_state(&recv)?;
+            Ok(JsValue::Smi(state.borrow().event_phase))
         }),
         PropertyAttributes::CONFIGURABLE,
     );
@@ -7303,10 +7436,7 @@ fn build_event_prototype() -> Rc<RefCell<PropertyMap>> {
             let state = lookup_event_state(&recv)?;
             let value = rest.first().cloned().unwrap_or(JsValue::Undefined);
             if !value.to_boolean() {
-                let mut s = state.borrow_mut();
-                if s.cancelable {
-                    s.canceled = true;
-                }
+                set_event_canceled(&mut state.borrow_mut());
             }
             Ok(JsValue::Undefined)
         }),
@@ -7319,10 +7449,7 @@ fn build_event_prototype() -> Rc<RefCell<PropertyMap>> {
         builtin_fn("preventDefault", 0, |args| {
             let (recv, _) = resolve_event_receiver(&args);
             let state = lookup_event_state(&recv)?;
-            let mut s = state.borrow_mut();
-            if s.cancelable {
-                s.canceled = true;
-            }
+            set_event_canceled(&mut state.borrow_mut());
             Ok(JsValue::Undefined)
         }),
     );
@@ -7397,6 +7524,11 @@ fn make_event_builtin() -> JsValue {
                     stop_immediate_propagation: false,
                     time_stamp: current_time_millis(),
                     detail: JsValue::Null,
+                    target: JsValue::Null,
+                    current_target: JsValue::Null,
+                    event_phase: 0,
+                    dispatching: false,
+                    in_passive_listener: false,
                 },
                 proto,
                 false,
@@ -7459,6 +7591,11 @@ fn make_custom_event_builtin() -> JsValue {
                     stop_immediate_propagation: false,
                     time_stamp: current_time_millis(),
                     detail,
+                    target: JsValue::Null,
+                    current_target: JsValue::Null,
+                    event_phase: 0,
+                    dispatching: false,
+                    in_passive_listener: false,
                 },
                 proto,
                 true,
@@ -7505,6 +7642,249 @@ fn make_custom_event_builtin() -> JsValue {
 
     install_event_phase_constants(&mut props);
 
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+fn invoke_event_listener(
+    callback: &JsValue,
+    event_target: &JsValue,
+    event: &JsValue,
+) -> StatorResult<()> {
+    match callback {
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => {
+            dispatch_call_with_this(callback, event_target.clone(), [event.clone()])?;
+        }
+        JsValue::PlainObject(map) if map.borrow().contains_key("__call__") => {
+            dispatch_call_with_this(callback, event_target.clone(), [event.clone()])?;
+        }
+        JsValue::PlainObject(_) => {
+            let handle_event =
+                dispatch_get_property_value(callback, JsValue::String("handleEvent".into()))?;
+            if is_callable_value(&handle_event) {
+                dispatch_call_with_this(&handle_event, callback.clone(), [event.clone()])?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn mark_event_dispatch_finished(event_state: &Rc<RefCell<EventState>>) {
+    let mut event = event_state.borrow_mut();
+    event.current_target = JsValue::Null;
+    event.event_phase = 0;
+    event.dispatching = false;
+    event.in_passive_listener = false;
+}
+
+fn make_event_target_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            let inst = Rc::new(RefCell::new(PropertyMap::new()));
+            {
+                let mut props = inst.borrow_mut();
+                props.insert_with_attrs(
+                    EVENT_TARGET_BRAND.into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
+                );
+                if let Some(proto) = EVENT_TARGET_PROTO.with(|p| p.borrow().clone()) {
+                    props.insert_with_attrs(
+                        INTERNAL_PROTO_PROPERTY_KEY.into(),
+                        JsValue::PlainObject(proto),
+                        PropertyAttributes::empty(),
+                    );
+                }
+            }
+            install_event_target_state(
+                &inst,
+                Rc::new(RefCell::new(EventTargetState {
+                    listeners: Vec::new(),
+                    next_listener_id: 0,
+                })),
+            );
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let mut proto = PropertyMap::new();
+    proto.insert(
+        "addEventListener".into(),
+        builtin_fn("addEventListener", 2, |args| {
+            let (recv, rest) = resolve_event_target_receiver(&args);
+            let state = lookup_event_target_state(&recv)?;
+            let type_ = rest
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::Undefined)
+                .to_js_string()?
+                .to_string();
+            let callback = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if matches!(callback, JsValue::Undefined | JsValue::Null) {
+                return Ok(JsValue::Undefined);
+            }
+            if !is_event_listener_candidate(&callback) {
+                return Err(event_type_error(
+                    "EventTarget: callback must be a function, object, or null",
+                ));
+            }
+            let options = rest.get(2).cloned().unwrap_or(JsValue::Undefined);
+            reject_event_listener_signal(&options)?;
+            let capture = event_listener_capture(&options)?;
+            let once = event_listener_once(&options)?;
+            let passive = event_listener_passive(&options)?;
+            let mut target = state.borrow_mut();
+            if target.listeners.iter().any(|entry| {
+                !entry.removed
+                    && entry.type_ == type_
+                    && entry.capture == capture
+                    && entry.callback == callback
+            }) {
+                return Ok(JsValue::Undefined);
+            }
+            let id = target.next_listener_id;
+            target.next_listener_id = target.next_listener_id.wrapping_add(1);
+            target.listeners.push(EventListenerEntry {
+                id,
+                type_,
+                callback,
+                capture,
+                once,
+                passive,
+                removed: false,
+            });
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "removeEventListener".into(),
+        builtin_fn("removeEventListener", 2, |args| {
+            let (recv, rest) = resolve_event_target_receiver(&args);
+            let state = lookup_event_target_state(&recv)?;
+            let type_ = rest
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::Undefined)
+                .to_js_string()?
+                .to_string();
+            let callback = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if matches!(callback, JsValue::Undefined | JsValue::Null) {
+                return Ok(JsValue::Undefined);
+            }
+            let options = rest.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let capture = event_listener_capture(&options)?;
+            let mut target = state.borrow_mut();
+            for entry in &mut target.listeners {
+                if !entry.removed
+                    && entry.type_ == type_
+                    && entry.capture == capture
+                    && entry.callback == callback
+                {
+                    entry.removed = true;
+                }
+            }
+            target.listeners.retain(|entry| !entry.removed);
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "dispatchEvent".into(),
+        builtin_fn("dispatchEvent", 1, |args| {
+            let (recv, rest) = resolve_event_target_receiver(&args);
+            let state = lookup_event_target_state(&recv)?;
+            let event_value = rest.first().cloned().unwrap_or(JsValue::Undefined);
+            let event_state = lookup_event_state(&event_value)?;
+            {
+                let mut event = event_state.borrow_mut();
+                if event.dispatching {
+                    return Err(event_type_error(
+                        "EventTarget: cannot redispatch an event while it is dispatching",
+                    ));
+                }
+                event.dispatching = true;
+                event.target = recv.clone();
+                event.current_target = recv.clone();
+                event.event_phase = 2;
+                event.stop_propagation = false;
+                event.stop_immediate_propagation = false;
+                event.in_passive_listener = false;
+            }
+
+            let event_type = event_state.borrow().type_.clone();
+            let snapshot: Vec<EventListenerEntry> = state
+                .borrow()
+                .listeners
+                .iter()
+                .filter(|entry| !entry.removed && entry.type_ == event_type)
+                .cloned()
+                .collect();
+
+            for entry in snapshot {
+                if !state
+                    .borrow()
+                    .listeners
+                    .iter()
+                    .any(|current| current.id == entry.id && !current.removed)
+                {
+                    continue;
+                }
+                if entry.once {
+                    for current in &mut state.borrow_mut().listeners {
+                        if current.id == entry.id {
+                            current.removed = true;
+                            break;
+                        }
+                    }
+                }
+                {
+                    let mut event = event_state.borrow_mut();
+                    event.in_passive_listener = entry.passive;
+                }
+                if let Err(err) = invoke_event_listener(&entry.callback, &recv, &event_value) {
+                    mark_event_dispatch_finished(&event_state);
+                    state.borrow_mut().listeners.retain(|entry| !entry.removed);
+                    return Err(err);
+                }
+                {
+                    let mut event = event_state.borrow_mut();
+                    event.in_passive_listener = false;
+                    if event.stop_immediate_propagation || event.stop_propagation {
+                        break;
+                    }
+                }
+            }
+
+            let canceled = event_state.borrow().canceled && event_state.borrow().cancelable;
+            mark_event_dispatch_finished(&event_state);
+            state.borrow_mut().listeners.retain(|entry| !entry.removed);
+            Ok(JsValue::Boolean(!canceled))
+        }),
+    );
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("EventTarget".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let proto_rc = Rc::new(RefCell::new(proto));
+    EVENT_TARGET_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
     proto_rc.borrow_mut().insert_with_attrs(
@@ -21845,22 +22225,15 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
         // ── DOM Events / AbortController ─────────────────────────────────
         //
-        // `Event` and `CustomEvent` are real, narrow data-object
-        // implementations: the constructors honour `EventInit`, the
-        // `bubbles`/`cancelable`/`composed`/`defaultPrevented`/`timeStamp`
-        // accessors and `preventDefault`/`stopPropagation`/
-        // `stopImmediatePropagation`/`composedPath()` methods work, and
-        // `CustomEvent.prototype` chains to `Event.prototype` so
-        // `instanceof Event` succeeds. They are deliberately not wired to
-        // any dispatch pipeline (this engine has no event loop, no
-        // `EventTarget`, no listener registration), so `isTrusted` is
-        // always false, `target`/`currentTarget`/`srcElement` are always
-        // null, and `composedPath()` always returns an empty array.
+        // `Event`/`CustomEvent` are real data objects, and `EventTarget`
+        // provides standalone per-instance listener registration/dispatch.
+        // Dispatch is intentionally target-only: no DOM tree/window/document,
+        // no host event loop, no trusted events, no default actions, and no
+        // capture/bubble propagation beyond the target listener list.
         //
-        // `EventTarget`, `AbortController`, and `AbortSignal` remain
-        // fail-closed: they expose the constructor name for feature
-        // detection but reject construction/invocation with a `TypeError`
-        // so that product code never relies on a fake event/abort surface.
+        // `AbortController` and `AbortSignal` remain fail-closed: they expose
+        // constructor names for feature detection but reject construction so
+        // product code never relies on a fake abort surface.
         globals.insert("Event".into(), finalize_ctor(make_event_builtin(), "Event"));
         globals.insert(
             "CustomEvent".into(),
@@ -21868,10 +22241,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert(
             "EventTarget".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("EventTarget"),
-                "EventTarget",
-            ),
+            finalize_ctor(make_event_target_builtin(), "EventTarget"),
         );
         globals.insert(
             "AbortController".into(),
@@ -24206,13 +24576,129 @@ mod tests {
     }
 
     #[test]
-    fn e2e_event_target_and_abort_remain_fail_closed() {
+    fn e2e_event_target_add_remove_and_dispatch() {
+        assert_eval_true("typeof EventTarget === 'function' && EventTarget.name === 'EventTarget'");
+        assert_eval_true("new EventTarget() instanceof EventTarget");
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f); \
+             t.dispatchEvent(new Event('x')) === true && seen === 1",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f); t.removeEventListener('x', f); \
+             t.dispatchEvent(new Event('x')); seen === 0",
+        );
+        assert_eval_type_error("EventTarget.prototype.dispatchEvent.call({}, new Event('x'))");
+        assert_eval_type_error("(new EventTarget()).dispatchEvent({ type: 'x' })");
+    }
+
+    #[test]
+    fn e2e_event_target_duplicate_listener_rules() {
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f); t.addEventListener('x', f); \
+             t.dispatchEvent(new Event('x')); seen === 1",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = ''; function f(e) { seen += 'f'; } \
+             t.addEventListener('x', f, true); t.addEventListener('x', f, false); \
+             t.dispatchEvent(new Event('x')); seen === 'ff'",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_once_and_capture_removal_matching() {
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f, { once: true }); \
+             t.dispatchEvent(new Event('x')); t.dispatchEvent(new Event('x')); seen === 1",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f, true); t.removeEventListener('x', f, false); \
+             t.dispatchEvent(new Event('x')); seen === 1",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = 0; function f(e) { seen += 1; } \
+             t.addEventListener('x', f, { capture: true }); \
+             t.removeEventListener('x', f, true); t.dispatchEvent(new Event('x')); seen === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_prevent_default_return_value_and_passive() {
+        assert_eval_true(
+            "var t = new EventTarget(); var e = new Event('x', { cancelable: true }); \
+             t.addEventListener('x', function(ev) { ev.preventDefault(); }); \
+             t.dispatchEvent(e) === false && e.defaultPrevented === true",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var e = new Event('x', { cancelable: true }); \
+             t.addEventListener('x', function(ev) { ev.preventDefault(); }, { passive: true }); \
+             t.dispatchEvent(e) === true && e.defaultPrevented === false",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_target_current_target_and_phase() {
+        assert_eval_true(
+            "var t = new EventTarget(); var e = new Event('x'); var during = false; \
+             t.addEventListener('x', function(ev) { \
+                 during = ev.target === t && ev.srcElement === t && \
+                     ev.currentTarget === t && ev.eventPhase === Event.AT_TARGET && \
+                     ev.isTrusted === false; \
+             }); \
+             t.dispatchEvent(e); during && e.target === t && e.srcElement === t && \
+                 e.currentTarget === null && e.eventPhase === Event.NONE",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_stop_propagation_affects_target_listener_list() {
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = ''; \
+             t.addEventListener('x', function(e) { seen += 'a'; e.stopImmediatePropagation(); }); \
+             t.addEventListener('x', function(e) { seen += 'b'; }); \
+             t.dispatchEvent(new Event('x')); seen === 'a'",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = ''; \
+             t.addEventListener('x', function(e) { seen += 'a'; e.stopPropagation(); }); \
+             t.addEventListener('x', function(e) { seen += 'b'; }); \
+             t.dispatchEvent(new Event('x')); seen === 'a'",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_object_listeners_and_listener_errors() {
+        assert_eval_true(
+            "var t = new EventTarget(); var listener = { seen: false, \
+                 handleEvent: function(e) { this.seen = e.currentTarget === t; } }; \
+             t.addEventListener('x', listener); t.dispatchEvent(new Event('x')); listener.seen === true",
+        );
+        assert_eval_type_error(
+            "var t = new EventTarget(); \
+             t.addEventListener('x', function(e) { Event.prototype.preventDefault.call({}); }); \
+             t.dispatchEvent(new Event('x'))",
+        );
+    }
+
+    #[test]
+    fn e2e_event_target_abort_signal_option_is_fail_closed() {
+        assert_eval_type_error(
+            "(new EventTarget()).addEventListener('x', function() {}, { signal: {} })",
+        );
+    }
+
+    #[test]
+    fn e2e_abort_remains_fail_closed() {
         // Constructors still exist as functions for feature detection.
         assert_eval_true("typeof EventTarget === 'function'");
         assert_eval_true("typeof AbortController === 'function'");
         assert_eval_true("typeof AbortSignal === 'function'");
-        // But construction throws.
-        assert_eval_type_error("new EventTarget()");
+        // EventTarget is now real; abort types still throw.
+        assert_eval_true("new EventTarget() instanceof EventTarget");
         assert_eval_type_error("new AbortController()");
         assert_eval_type_error("new AbortSignal()");
     }
@@ -25323,18 +25809,16 @@ mod tests {
 
     #[test]
     fn e2e_custom_event_constructor_is_real_and_constructs() {
-        assert_eval_true(
-            "typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'",
-        );
+        assert_eval_true("typeof CustomEvent === 'function' && CustomEvent.name === 'CustomEvent'");
         assert_eval_true("new CustomEvent('x', { detail: 1 }).detail === 1");
         assert_eval_true("CustomEvent('x') instanceof CustomEvent");
     }
 
     #[test]
-    fn e2e_event_target_constructor_exists_but_fails_closed() {
+    fn e2e_event_target_constructor_is_real_and_constructs() {
         assert_eval_true("typeof EventTarget === 'function' && EventTarget.name === 'EventTarget'");
-        assert_eval_type_error("EventTarget()");
-        assert_eval_type_error("new EventTarget()");
+        assert_eval_true("new EventTarget() instanceof EventTarget");
+        assert_eval_true("EventTarget() instanceof EventTarget");
     }
 
     #[test]
