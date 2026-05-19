@@ -29,8 +29,6 @@ pub mod global;
 /// objects, and global functions so that JavaScript code can access `Math`,
 /// `console`, `JSON`, `parseInt`, etc.
 pub mod install_globals;
-/// ECMA-402 `Intl` namespace — internationalization constructors and formatters.
-pub mod intl;
 /// ECMAScript §27 Iterator and Generator protocol: `Symbol.iterator`,
 /// `IteratorRecord`, and built-in iterators for `Array`, `String`, `Map`, `Set`.
 pub mod iterator;

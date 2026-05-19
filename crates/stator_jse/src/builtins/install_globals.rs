@@ -59,14 +59,6 @@ use crate::builtins::global::{
     global_encode_uri_component, global_escape, global_eval, global_is_finite, global_is_nan,
     global_parse_float, global_parse_int, global_unescape,
 };
-use crate::builtins::intl::{
-    collator_compare_js, date_time_format_js, date_time_format_to_parts_js, display_names_of_typed,
-    list_format_js, list_format_to_parts_js, locale_base_name, locale_language, locale_maximize,
-    locale_minimize, locale_region, locale_script, number_format_js, number_format_range_js,
-    number_format_range_to_parts_js, number_format_to_parts_js, plural_rules_select_js,
-    plural_rules_select_range_js, relative_time_format_js, relative_time_format_to_parts_js,
-    segmenter_segment_objects,
-};
 use crate::builtins::iterator::{
     async_iterator_drop, async_iterator_every, async_iterator_filter, async_iterator_find,
     async_iterator_flat_map, async_iterator_for_each, async_iterator_from, async_iterator_map,
@@ -12696,674 +12688,120 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
 
 // ── Intl ─────────────────────────────────────────────────────────────────────
 
-/// Create a `supportedLocalesOf` native function shared by all Intl constructors.
-///
-/// Stub: returns all requested locales (we fall back to en-US for everything).
-#[inline(never)]
-fn make_supported_locales_of() -> JsValue {
-    native(|args| {
-        let locales: Vec<JsValue> = match args.first() {
-            Some(JsValue::Array(arr)) => arr.borrow().iter().cloned().collect(),
-            Some(JsValue::String(s)) => vec![JsValue::String(s.clone())],
-            _ => Vec::new(),
-        };
-        Ok(JsValue::new_array(locales))
-    })
+fn make_unsupported_intl_constructor(
+    name: &'static str,
+    prototype_methods: &[(&'static str, i32)],
+    has_supported_locales_of: bool,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let display_name = format!("Intl.{name}");
+    props.insert(
+        "__call__".into(),
+        native(move |_args| {
+            Err(StatorError::TypeError(format!(
+                "{display_name}: web platform feature is not implemented"
+            )))
+        }),
+    );
+    if has_supported_locales_of {
+        props.insert(
+            "supportedLocalesOf".into(),
+            make_unsupported_web_function("supportedLocalesOf", 1),
+        );
+    }
+
+    let mut proto = PropertyMap::new();
+    for &(method, length) in prototype_methods {
+        proto.insert(method.into(), make_unsupported_web_function(method, length));
+    }
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(format!("Intl.{name}").into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    finalize_ctor(JsValue::PlainObject(Rc::new(RefCell::new(props))), name)
 }
 
-/// Build the `Intl` namespace object (ECMA-402).
+/// Build a fail-closed `Intl` namespace object.
 ///
-/// Each property is a constructor-like `PlainObject` with a `__call__` method
-/// that returns an instance (another `PlainObject`) carrying a `format` (or
-/// `compare` / `select`) method.
+/// Stator does not currently ship ICU/CLDR data or ECMA-402 locale algorithms.
+/// Expose the Chromium-stable namespace shape so page probes are explicit, but
+/// every locale-sensitive constructor/function throws instead of returning fake
+/// formatting, collation, segmentation, canonicalization, calendars, or names.
 #[inline(never)]
 fn make_intl() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
-        let mut ns = PropertyMap::new();
+    let mut ns = PropertyMap::new();
 
-        // ── Intl.NumberFormat ────────────────────────────────────────────────
-        ns.insert("NumberFormat".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert("format".into(), native(|a| number_format_js(&a)));
-                    obj.insert(
-                        "formatToParts".into(),
-                        native(|a| number_format_to_parts_js(&a)),
-                    );
-                    obj.insert("formatRange".into(), native(|a| number_format_range_js(&a)));
-                    obj.insert(
-                        "formatRangeToParts".into(),
-                        native(|a| number_format_range_to_parts_js(&a)),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert("format".into(), native(|a| number_format_js(&a)));
-            proto.insert(
-                "formatToParts".into(),
-                native(|a| number_format_to_parts_js(&a)),
-            );
-            proto.insert("formatRange".into(), native(|a| number_format_range_js(&a)));
-            proto.insert(
-                "formatRangeToParts".into(),
-                native(|a| number_format_range_to_parts_js(&a)),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.NumberFormat".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "NumberFormat",
-            )
-        });
-
-        // ── Intl.DateTimeFormat ──────────────────────────────────────────────
-        ns.insert("DateTimeFormat".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert("format".into(), native(|a| date_time_format_js(&a)));
-                    obj.insert(
-                        "formatToParts".into(),
-                        native(|a| date_time_format_to_parts_js(&a)),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("calendar".into(), JsValue::String("gregory".into()));
-                            opts.insert("timeZone".into(), JsValue::String("UTC".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert("format".into(), native(|a| date_time_format_js(&a)));
-            proto.insert(
-                "formatToParts".into(),
-                native(|a| date_time_format_to_parts_js(&a)),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("calendar".into(), JsValue::String("gregory".into()));
-                    opts.insert("timeZone".into(), JsValue::String("UTC".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.DateTimeFormat".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "DateTimeFormat",
-            )
-        });
-
-        // ── Intl.Collator ───────────────────────────────────────────────────
-        ns.insert("Collator".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert("compare".into(), native(|a| collator_compare_js(&a)));
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("sensitivity".into(), JsValue::String("variant".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert("compare".into(), native(|a| collator_compare_js(&a)));
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("sensitivity".into(), JsValue::String("variant".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.Collator".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "Collator",
-            )
-        });
-
-        // ── Intl.PluralRules ────────────────────────────────────────────────
-        ns.insert("PluralRules".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert("select".into(), native(|a| plural_rules_select_js(&a)));
-                    obj.insert(
-                        "selectRange".into(),
-                        native(|a| plural_rules_select_range_js(&a)),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("type".into(), JsValue::String("cardinal".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert("select".into(), native(|a| plural_rules_select_js(&a)));
-            proto.insert(
-                "selectRange".into(),
-                native(|a| plural_rules_select_range_js(&a)),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("type".into(), JsValue::String("cardinal".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.PluralRules".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "PluralRules",
-            )
-        });
-
-        // ── Intl.ListFormat ─────────────────────────────────────────────────
-        ns.insert("ListFormat".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|args| {
-                    let list_type = if let Some(JsValue::PlainObject(opts)) = args.get(1) {
-                        opts.borrow()
-                            .get("type")
-                            .and_then(|v| {
-                                if let JsValue::String(s) = v {
-                                    Some(s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "conjunction".to_string())
-                    } else {
-                        "conjunction".to_string()
-                    };
-                    let lt = list_type.clone();
-                    let mut obj = PropertyMap::new();
-                    obj.insert(
-                        "format".into(),
-                        native(move |a| list_format_js(&a, &list_type)),
-                    );
-                    obj.insert(
-                        "formatToParts".into(),
-                        native(move |a| list_format_to_parts_js(&a, &lt)),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("type".into(), JsValue::String("conjunction".into()));
-                            opts.insert("style".into(), JsValue::String("long".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert(
-                "format".into(),
-                native(|a| list_format_js(&a, "conjunction")),
-            );
-            proto.insert(
-                "formatToParts".into(),
-                native(|a| list_format_to_parts_js(&a, "conjunction")),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("type".into(), JsValue::String("conjunction".into()));
-                    opts.insert("style".into(), JsValue::String("long".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.ListFormat".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "ListFormat",
-            )
-        });
-
-        // ── Intl.RelativeTimeFormat ─────────────────────────────────────────
-        ns.insert("RelativeTimeFormat".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
-                    obj.insert(
-                        "formatToParts".into(),
-                        native(|a| relative_time_format_to_parts_js(&a)),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("style".into(), JsValue::String("long".into()));
-                            opts.insert("numeric".into(), JsValue::String("always".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert("format".into(), native(|a| relative_time_format_js(&a)));
-            proto.insert(
-                "formatToParts".into(),
-                native(|a| relative_time_format_to_parts_js(&a)),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("style".into(), JsValue::String("long".into()));
-                    opts.insert("numeric".into(), JsValue::String("always".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.RelativeTimeFormat".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "RelativeTimeFormat",
-            )
-        });
-
-        // ── Intl.Segmenter ──────────────────────────────────────────────────
-        ns.insert("Segmenter".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|_args| {
-                    let mut obj = PropertyMap::new();
-                    obj.insert(
-                        "segment".into(),
-                        native(|a| {
-                            let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                            segmenter_segment_objects(&s)
-                        }),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(|_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("granularity".into(), JsValue::String("grapheme".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert(
-                "segment".into(),
-                native(|a| {
-                    let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                    segmenter_segment_objects(&s)
-                }),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("granularity".into(), JsValue::String("grapheme".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.Segmenter".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "Segmenter",
-            )
-        });
-
-        // ── Intl.DisplayNames ───────────────────────────────────────────────
-        ns.insert("DisplayNames".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|args| {
-                    let dn_type = if let Some(JsValue::PlainObject(opts)) = args.get(1) {
-                        opts.borrow()
-                            .get("type")
-                            .and_then(|v| {
-                                if let JsValue::String(s) = v {
-                                    Some(s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "language".to_string())
-                    } else {
-                        "language".to_string()
-                    };
-                    let dt = dn_type.clone();
-                    let mut obj = PropertyMap::new();
-                    obj.insert(
-                        "of".into(),
-                        native(move |a| {
-                            let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                            Ok(JsValue::String(
-                                display_names_of_typed(&code, &dn_type).into(),
-                            ))
-                        }),
-                    );
-                    obj.insert(
-                        "resolvedOptions".into(),
-                        native(move |_| {
-                            let mut opts = PropertyMap::new();
-                            opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("type".into(), JsValue::String(dt.clone().into()));
-                            opts.insert("style".into(), JsValue::String("long".into()));
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                        }),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            let mut proto = PropertyMap::new();
-            proto.insert(
-                "of".into(),
-                native(|a| {
-                    let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                    Ok(JsValue::String(
-                        display_names_of_typed(&code, "language").into(),
-                    ))
-                }),
-            );
-            proto.insert(
-                "resolvedOptions".into(),
-                native(|_| {
-                    let mut opts = PropertyMap::new();
-                    opts.insert("locale".into(), JsValue::String("en-US".into()));
-                    opts.insert("type".into(), JsValue::String("language".into()));
-                    opts.insert("style".into(), JsValue::String("long".into()));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
-                }),
-            );
-            proto.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Intl.DisplayNames".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-            );
-            finalize_ctor(
-                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
-                "DisplayNames",
-            )
-        });
-
-        // ── Intl.Locale ─────────────────────────────────────────────────────
-        ns.insert("Locale".into(), {
-            let mut ctor = PropertyMap::new();
-            ctor.insert(
-                "__call__".into(),
-                native(|args| {
-                    let tag = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                    let mut obj = PropertyMap::new();
-                    obj.insert(
-                        "language".into(),
-                        JsValue::String(locale_language(&tag).into()),
-                    );
-                    obj.insert(
-                        "baseName".into(),
-                        JsValue::String(locale_base_name(&tag).into()),
-                    );
-                    obj.insert("region".into(), JsValue::String(locale_region(&tag).into()));
-                    obj.insert("script".into(), JsValue::String(locale_script(&tag).into()));
-                    let tag_max = tag.clone();
-                    obj.insert(
-                        "maximize".into(),
-                        native(move |_| {
-                            let maximized = locale_maximize(&tag_max);
-                            // Return a new Locale-like object
-                            let mut m = PropertyMap::new();
-                            m.insert(
-                                "language".into(),
-                                JsValue::String(locale_language(&maximized).into()),
-                            );
-                            m.insert("baseName".into(), JsValue::String(maximized.clone().into()));
-                            m.insert(
-                                "region".into(),
-                                JsValue::String(locale_region(&maximized).into()),
-                            );
-                            m.insert(
-                                "script".into(),
-                                JsValue::String(locale_script(&maximized).into()),
-                            );
-                            let ms = maximized.clone();
-                            m.insert(
-                                "toString".into(),
-                                native(move |_| Ok(JsValue::String(ms.clone().into()))),
-                            );
-                            m.make_all_non_enumerable();
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(m))))
-                        }),
-                    );
-                    let tag_min = tag.clone();
-                    obj.insert(
-                        "minimize".into(),
-                        native(move |_| {
-                            let minimized = locale_minimize(&tag_min);
-                            let mut m = PropertyMap::new();
-                            m.insert(
-                                "language".into(),
-                                JsValue::String(locale_language(&minimized).into()),
-                            );
-                            m.insert("baseName".into(), JsValue::String(minimized.clone().into()));
-                            let ms = minimized.clone();
-                            m.insert(
-                                "toString".into(),
-                                native(move |_| Ok(JsValue::String(ms.clone().into()))),
-                            );
-                            m.make_all_non_enumerable();
-                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(m))))
-                        }),
-                    );
-                    obj.insert(
-                        "toString".into(),
-                        native(move |_| Ok(JsValue::String(tag.clone().into()))),
-                    );
-                    obj.make_all_non_enumerable();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-                }),
-            );
-            ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            {
-                let mut locale_proto = PropertyMap::new();
-                locale_proto.insert_with_attrs(
-                    "@@toStringTag".into(),
-                    JsValue::String("Intl.Locale".into()),
-                    PropertyAttributes::CONFIGURABLE,
-                );
-                ctor.insert(
-                    "prototype".into(),
-                    JsValue::PlainObject(Rc::new(RefCell::new(locale_proto))),
-                );
-            }
-            finalize_ctor(JsValue::PlainObject(Rc::new(RefCell::new(ctor))), "Locale")
-        });
-
-        // ── Intl.getCanonicalLocales ────────────────────────────────────────
+    for (name, prototype_methods) in [
+        ("Collator", &[("compare", 2), ("resolvedOptions", 0)][..]),
+        (
+            "DateTimeFormat",
+            &[("format", 1), ("formatToParts", 1), ("resolvedOptions", 0)][..],
+        ),
+        ("DisplayNames", &[("of", 1), ("resolvedOptions", 0)][..]),
+        (
+            "DurationFormat",
+            &[("format", 1), ("formatToParts", 1), ("resolvedOptions", 0)][..],
+        ),
+        (
+            "ListFormat",
+            &[("format", 1), ("formatToParts", 1), ("resolvedOptions", 0)][..],
+        ),
+        (
+            "NumberFormat",
+            &[
+                ("format", 1),
+                ("formatToParts", 1),
+                ("formatRange", 2),
+                ("formatRangeToParts", 2),
+                ("resolvedOptions", 0),
+            ][..],
+        ),
+        (
+            "PluralRules",
+            &[("select", 1), ("selectRange", 2), ("resolvedOptions", 0)][..],
+        ),
+        (
+            "RelativeTimeFormat",
+            &[("format", 2), ("formatToParts", 2), ("resolvedOptions", 0)][..],
+        ),
+        ("Segmenter", &[("segment", 1), ("resolvedOptions", 0)][..]),
+    ] {
         ns.insert(
-            "getCanonicalLocales".into(),
-            native(|args| {
-                let locales: Vec<JsValue> = match args.first() {
-                    Some(JsValue::Array(arr)) => arr
-                        .borrow()
-                        .iter()
-                        .map(|v| match v {
-                            JsValue::String(s) => Ok(JsValue::String(s.clone())),
-                            other => Ok(JsValue::String(other.to_js_string()?.into())),
-                        })
-                        .collect::<StatorResult<Vec<_>>>()?,
-                    Some(JsValue::String(s)) => vec![JsValue::String(s.clone())],
-                    _ => Vec::new(),
-                };
-                Ok(JsValue::new_array(locales))
-            }),
+            name.into(),
+            make_unsupported_intl_constructor(name, prototype_methods, true),
         );
+    }
 
-        // ── Intl.supportedValuesOf ──────────────────────────────────────────
-        ns.insert(
-            "supportedValuesOf".into(),
-            native(|args| {
-                let key = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let values: Vec<JsValue> = match key.as_str() {
-                    "calendar" => vec![JsValue::String("gregory".into())],
-                    "collation" => vec![JsValue::String("default".into())],
-                    "currency" => vec![JsValue::String("USD".into())],
-                    "numberingSystem" => vec![JsValue::String("latn".into())],
-                    "timeZone" => vec![JsValue::String("UTC".into())],
-                    "unit" => vec![],
-                    _ => Vec::new(),
-                };
-                Ok(JsValue::new_array(values))
-            }),
-        );
-
-        ns.insert_with_attrs(
-            "@@toStringTag".into(),
-            JsValue::String("Intl".into()),
-            PropertyAttributes::CONFIGURABLE,
-        );
-        ns.make_all_non_enumerable();
-        JsValue::PlainObject(Rc::new(RefCell::new(ns)))
-    })
+    ns.insert(
+        "Locale".into(),
+        make_unsupported_intl_constructor(
+            "Locale",
+            &[("maximize", 0), ("minimize", 0), ("toString", 0)],
+            false,
+        ),
+    );
+    ns.insert(
+        "getCanonicalLocales".into(),
+        make_unsupported_web_function("getCanonicalLocales", 1),
+    );
+    ns.insert(
+        "supportedValuesOf".into(),
+        make_unsupported_web_function("supportedValuesOf", 1),
+    );
+    ns.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Intl".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    ns.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(ns)))
 }
 
 // ── Proxy ────────────────────────────────────────────────────────────────────
@@ -19198,662 +18636,63 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_object_to_string_uses_tag() {
-        assert_eval_true("Object.prototype.toString.call(Intl) === '[object Intl]'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_number_format_exists() {
-        assert_eval_true("typeof Intl.NumberFormat === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_name() {
-        assert_eval_true("Intl.NumberFormat.name === 'NumberFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_prototype_constructor() {
-        assert_eval_true("Intl.NumberFormat.prototype.constructor === Intl.NumberFormat");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_new_returns_string() {
-        assert_eval_true("typeof new Intl.NumberFormat().format(123) === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_formats_integer() {
-        assert_eval_true("new Intl.NumberFormat().format(123) === '123'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_call_without_new_formats() {
-        assert_eval_true("Intl.NumberFormat().format(7) === '7'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_nan() {
-        assert_eval_true("Intl.NumberFormat().format(NaN) === 'NaN'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_resolved_options_locale() {
-        assert_eval_true("Intl.NumberFormat().resolvedOptions().locale === 'en-US'");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_supported_locales_of() {
-        assert_eval_true(
-            "Intl.NumberFormat.supportedLocalesOf('en-US').length === 1 && Intl.NumberFormat.supportedLocalesOf('en-US')[0] === 'en-US'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_number_format_to_parts_length() {
-        assert_eval_true("Intl.NumberFormat().formatToParts(12.5).length === 3");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_date_time_format_exists() {
-        assert_eval_true("typeof Intl.DateTimeFormat === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_name() {
-        assert_eval_true("Intl.DateTimeFormat.name === 'DateTimeFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_prototype_constructor() {
-        assert_eval_true("Intl.DateTimeFormat.prototype.constructor === Intl.DateTimeFormat");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_new_returns_string() {
-        assert_eval_true("typeof new Intl.DateTimeFormat().format(0) === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_epoch_contains_1970() {
-        assert_eval_true("new Intl.DateTimeFormat().format(0).indexOf('1970') !== -1");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_call_without_new_formats() {
-        assert_eval_true("Intl.DateTimeFormat().format(0).length > 0");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_resolved_options_time_zone() {
-        assert_eval_true("Intl.DateTimeFormat().resolvedOptions().timeZone === 'UTC'");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_to_parts_has_month() {
-        assert_eval_true(
-            "Intl.DateTimeFormat().formatToParts(0).length > 0 && Intl.DateTimeFormat().formatToParts(0)[0].type === 'month'",
-        );
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_collator_exists() {
-        assert_eval_true("typeof Intl.Collator === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_collator_name() {
-        assert_eval_true("Intl.Collator.name === 'Collator'");
-    }
-
-    #[test]
-    fn e2e_intl_collator_prototype_constructor() {
-        assert_eval_true("Intl.Collator.prototype.constructor === Intl.Collator");
-    }
-
-    #[test]
-    fn e2e_intl_collator_new_returns_object() {
-        assert_eval_true("typeof new Intl.Collator() === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_collator_compare_less() {
-        assert_eval_true("new Intl.Collator().compare('a', 'b') === -1");
-    }
-
-    #[test]
-    fn e2e_intl_collator_compare_equal() {
-        assert_eval_true("new Intl.Collator().compare('same', 'same') === 0");
-    }
-
-    #[test]
-    fn e2e_intl_collator_call_without_new_compare() {
-        assert_eval_true("Intl.Collator().compare('b', 'a') === 1");
-    }
-
-    #[test]
-    fn e2e_intl_collator_resolved_options_locale() {
-        assert_eval_true("Intl.Collator().resolvedOptions().locale === 'en-US'");
-    }
-
-    #[test]
-    fn e2e_intl_get_canonical_locales() {
-        assert_eval_true(
-            "Intl.getCanonicalLocales('en-US').length === 1 && Intl.getCanonicalLocales('en-US')[0] === 'en-US'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_supported_values_of_time_zone() {
-        assert_eval_true(
-            "Intl.supportedValuesOf('timeZone').length === 1 && Intl.supportedValuesOf('timeZone')[0] === 'UTC'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_locale_language() {
-        assert_eval_true("Intl.Locale('en-US').language === 'en'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_base_name() {
-        assert_eval_true("new Intl.Locale('en-US').baseName === 'en-US'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_name() {
-        assert_eval_true("Intl.Locale.name === 'Locale'");
-    }
-
-    // ── PluralRules e2e ─────────────────────────────────────────────────────
-
-    #[test]
-    #[ignore] // TODO: Intl.PluralRules typeof check fails in release mode
-    fn e2e_intl_plural_rules_exists() {
-        assert_eval_true("typeof Intl.PluralRules === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_name() {
-        assert_eval_true("Intl.PluralRules.name === 'PluralRules'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_prototype_constructor() {
-        assert_eval_true("Intl.PluralRules.prototype.constructor === Intl.PluralRules");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_select_one() {
-        assert_eval_true("new Intl.PluralRules().select(1) === 'one'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_select_other() {
-        assert_eval_true("new Intl.PluralRules().select(5) === 'other'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_resolved_options_type() {
-        assert_eval_true("Intl.PluralRules().resolvedOptions().type === 'cardinal'");
-    }
-
-    // ── ListFormat e2e ──────────────────────────────────────────────────────
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_list_format_exists() {
-        assert_eval_true("typeof Intl.ListFormat === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_list_format_name() {
-        assert_eval_true("Intl.ListFormat.name === 'ListFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_list_format_prototype_constructor() {
-        assert_eval_true("Intl.ListFormat.prototype.constructor === Intl.ListFormat");
-    }
-
-    #[test]
-    fn e2e_intl_list_format_format_returns_string() {
-        assert_eval_true("typeof new Intl.ListFormat().format(['a','b']) === 'string'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_list_format_format_two_items() {
-        assert_eval_true("new Intl.ListFormat().format(['A','B']) === 'A and B'");
-    }
-
-    #[test]
-    fn e2e_intl_list_format_resolved_options_locale() {
-        assert_eval_true("Intl.ListFormat().resolvedOptions().locale === 'en-US'");
-    }
-
-    // ── RelativeTimeFormat e2e ──────────────────────────────────────────────
-
-    #[test]
-    #[ignore] // TODO: Intl.RelativeTimeFormat existence check fails
-    fn e2e_intl_relative_time_format_exists() {
-        assert_eval_true("typeof Intl.RelativeTimeFormat === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_relative_time_format_name() {
-        assert_eval_true("Intl.RelativeTimeFormat.name === 'RelativeTimeFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_relative_time_format_prototype_constructor() {
-        assert_eval_true(
-            "Intl.RelativeTimeFormat.prototype.constructor === Intl.RelativeTimeFormat",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_relative_time_format_format_returns_string() {
-        assert_eval_true("typeof new Intl.RelativeTimeFormat().format(-1, 'day') === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_relative_time_format_resolved_options_locale() {
-        assert_eval_true("Intl.RelativeTimeFormat().resolvedOptions().locale === 'en-US'");
-    }
-
-    // ── Segmenter e2e ───────────────────────────────────────────────────────
-
-    #[test]
-    #[ignore] // TODO: Intl.Segmenter existence check fails
-    fn e2e_intl_segmenter_exists() {
-        assert_eval_true("typeof Intl.Segmenter === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_name() {
-        assert_eval_true("Intl.Segmenter.name === 'Segmenter'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_prototype_constructor() {
-        assert_eval_true("Intl.Segmenter.prototype.constructor === Intl.Segmenter");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_returns_object() {
-        assert_eval_true("typeof new Intl.Segmenter().segment('hi') === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_length() {
-        assert_eval_true("new Intl.Segmenter().segment('abc').length === 3");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_resolved_options_granularity() {
-        assert_eval_true("Intl.Segmenter().resolvedOptions().granularity === 'grapheme'");
-    }
-
-    // ── Symbol.toStringTag on all constructor prototypes ────────────────────
-
-    #[test]
-    fn e2e_intl_number_format_to_string_tag() {
-        assert_eval_true("Intl.NumberFormat.prototype[Symbol.toStringTag] === 'Intl.NumberFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_date_time_format_to_string_tag() {
-        assert_eval_true(
-            "Intl.DateTimeFormat.prototype[Symbol.toStringTag] === 'Intl.DateTimeFormat'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_collator_to_string_tag() {
-        assert_eval_true("Intl.Collator.prototype[Symbol.toStringTag] === 'Intl.Collator'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_to_string_tag() {
-        assert_eval_true("Intl.PluralRules.prototype[Symbol.toStringTag] === 'Intl.PluralRules'");
-    }
-
-    #[test]
-    fn e2e_intl_list_format_to_string_tag() {
-        assert_eval_true("Intl.ListFormat.prototype[Symbol.toStringTag] === 'Intl.ListFormat'");
-    }
-
-    #[test]
-    fn e2e_intl_relative_time_format_to_string_tag() {
-        assert_eval_true(
-            "Intl.RelativeTimeFormat.prototype[Symbol.toStringTag] === 'Intl.RelativeTimeFormat'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_to_string_tag() {
-        assert_eval_true("Intl.Segmenter.prototype[Symbol.toStringTag] === 'Intl.Segmenter'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_to_string_tag() {
-        assert_eval_true("Intl.Locale.prototype[Symbol.toStringTag] === 'Intl.Locale'");
-    }
-
-    // ── Additional coverage ─────────────────────────────────────────────────
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_get_canonical_locales_array() {
-        assert_eval_true("Intl.getCanonicalLocales(['en-US','fr']).length === 2");
-    }
-
-    #[test]
-    fn e2e_intl_supported_values_of_calendar() {
-        assert_eval_true("Array.isArray(Intl.supportedValuesOf('calendar'))");
-    }
-
-    #[test]
-    fn e2e_intl_collator_compare_greater() {
-        assert_eval_true("new Intl.Collator().compare('z', 'a') === 1");
-    }
-
-    #[test]
-    fn e2e_intl_number_format_decimal_format() {
-        assert_eval_true("new Intl.NumberFormat().format(3.14) === '3.14'");
-    }
-
-    #[test]
-    fn e2e_intl_plural_rules_select_zero() {
-        assert_eval_true("new Intl.PluralRules().select(0) === 'other'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_list_format_format_three_items() {
-        assert_eval_true("new Intl.ListFormat().format(['A','B','C']) === 'A, B, and C'");
-    }
-
-    // ── Intl advanced method conformance e2e ────────────────────────────────
-
-    // NumberFormat.formatToParts
-    #[test]
-    fn e2e_intl_nf_format_to_parts_integer_type() {
-        assert_eval_true("Intl.NumberFormat().formatToParts(42)[0].type === 'integer'");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_to_parts_integer_value() {
-        assert_eval_true("Intl.NumberFormat().formatToParts(42)[0].value === '42'");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_to_parts_decimal() {
-        assert_eval_true("Intl.NumberFormat().formatToParts(1.5)[1].type === 'decimal'");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_to_parts_fraction() {
-        assert_eval_true("Intl.NumberFormat().formatToParts(1.5)[2].type === 'fraction'");
-    }
-
-    // DateTimeFormat.formatToParts
-    #[test]
-    fn e2e_intl_dtf_format_to_parts_year() {
-        assert_eval_true(
-            "Intl.DateTimeFormat().formatToParts(0).some(function(p) { return p.type === 'year' })",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_dtf_format_to_parts_day() {
-        assert_eval_true(
-            "Intl.DateTimeFormat().formatToParts(0).some(function(p) { return p.type === 'day' })",
-        );
-    }
-
-    // NumberFormat.formatRange
-    #[test]
-    fn e2e_intl_nf_format_range_returns_string() {
-        assert_eval_true("typeof new Intl.NumberFormat().formatRange(1, 10) === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_range_contains_dash() {
-        assert_eval_true("new Intl.NumberFormat().formatRange(1, 10).indexOf('–') !== -1");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_range_contains_start() {
-        assert_eval_true("new Intl.NumberFormat().formatRange(3, 7).indexOf('3') !== -1");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_range_contains_end() {
-        assert_eval_true("new Intl.NumberFormat().formatRange(3, 7).indexOf('7') !== -1");
-    }
-
-    // NumberFormat.formatRangeToParts
-    #[test]
-    fn e2e_intl_nf_format_range_to_parts_length() {
-        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10).length === 3");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_range_to_parts_start() {
-        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10)[0].type === 'startRange'");
-    }
-
-    #[test]
-    fn e2e_intl_nf_format_range_to_parts_end() {
-        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10)[2].type === 'endRange'");
-    }
-
-    // PluralRules.selectRange
-    #[test]
-    fn e2e_intl_pr_select_range_other() {
-        assert_eval_true("new Intl.PluralRules().selectRange(1, 5) === 'other'");
-    }
-
-    #[test]
-    fn e2e_intl_pr_select_range_one() {
-        assert_eval_true("new Intl.PluralRules().selectRange(0, 1) === 'one'");
-    }
-
-    #[test]
-    fn e2e_intl_pr_select_range_returns_string() {
-        assert_eval_true("typeof new Intl.PluralRules().selectRange(1, 2) === 'string'");
-    }
-
-    // Intl.Locale: region and script getters
-    #[test]
-    fn e2e_intl_locale_region() {
-        assert_eval_true("new Intl.Locale('en-US').region === 'US'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_region_empty() {
-        assert_eval_true("new Intl.Locale('en').region === ''");
-    }
-
-    #[test]
-    fn e2e_intl_locale_script() {
-        assert_eval_true("new Intl.Locale('zh-Hans-CN').script === 'Hans'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_script_empty() {
-        assert_eval_true("new Intl.Locale('en-US').script === ''");
-    }
-
-    // Intl.Locale.maximize / minimize
-    #[test]
-    fn e2e_intl_locale_maximize_language() {
-        assert_eval_true("new Intl.Locale('en').maximize().language === 'en'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_maximize_has_script() {
-        assert_eval_true("new Intl.Locale('en').maximize().script === 'Latn'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_maximize_has_region() {
-        assert_eval_true("new Intl.Locale('en').maximize().region === 'US'");
-    }
-
-    #[test]
-    fn e2e_intl_locale_minimize_returns_language() {
-        assert_eval_true("new Intl.Locale('en-US').minimize().language === 'en'");
-    }
-
-    // Intl.DisplayNames.of with type
-    #[test]
-    fn e2e_intl_display_names_language_en() {
-        assert_eval_true(
-            "new Intl.DisplayNames('en', { type: 'language' }).of('en') === 'English'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_display_names_region_us() {
-        assert_eval_true(
-            "new Intl.DisplayNames('en', { type: 'region' }).of('US') === 'United States'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_display_names_script_latn() {
-        assert_eval_true("new Intl.DisplayNames('en', { type: 'script' }).of('Latn') === 'Latin'");
-    }
-
-    #[test]
-    fn e2e_intl_display_names_currency_usd() {
-        assert_eval_true(
-            "new Intl.DisplayNames('en', { type: 'currency' }).of('USD') === 'US Dollar'",
-        );
-    }
-
-    // Segmenter.segment with containing()
-    #[test]
-    fn e2e_intl_segmenter_segment_has_containing() {
-        assert_eval_true("typeof new Intl.Segmenter().segment('hi').containing === 'function'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_containing_returns_object() {
-        assert_eval_true("typeof new Intl.Segmenter().segment('hi').containing(0) === 'object'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_containing_segment_value() {
-        assert_eval_true("new Intl.Segmenter().segment('hi').containing(0).segment === 'h'");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_containing_index() {
-        assert_eval_true("new Intl.Segmenter().segment('hi').containing(1).index === 1");
-    }
-
-    #[test]
-    fn e2e_intl_segmenter_segment_containing_input() {
-        assert_eval_true("new Intl.Segmenter().segment('hi').containing(0).input === 'hi'");
-    }
-
-    // ListFormat.formatToParts
-    #[test]
-    fn e2e_intl_lf_format_to_parts_returns_array() {
-        assert_eval_true("Array.isArray(new Intl.ListFormat().formatToParts(['A','B']))");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_lf_format_to_parts_element_type() {
-        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[0].type === 'element'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_lf_format_to_parts_element_value() {
-        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[0].value === 'A'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_lf_format_to_parts_literal_type() {
-        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[1].type === 'literal'");
-    }
-
-    #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_intl_lf_format_to_parts_length() {
-        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B']).length === 3");
-    }
-
-    // RelativeTimeFormat.formatToParts
-    #[test]
-    fn e2e_intl_rtf_format_to_parts_returns_array() {
-        assert_eval_true("Array.isArray(new Intl.RelativeTimeFormat().formatToParts(-1, 'day'))");
-    }
-
-    #[test]
-    fn e2e_intl_rtf_format_to_parts_has_integer() {
-        assert_eval_true(
-            "new Intl.RelativeTimeFormat().formatToParts(-1, 'day').some(function(p) { return p.type === 'integer' })",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_rtf_format_to_parts_has_unit() {
-        assert_eval_true(
-            "new Intl.RelativeTimeFormat().formatToParts(-1, 'day').some(function(p) { return p.type === 'unit' })",
-        );
-    }
-
-    // All constructors accept locales and options parameters
-    #[test]
-    fn e2e_intl_nf_accepts_locale_param() {
-        assert_eval_true("typeof new Intl.NumberFormat('en-US').format(1) === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_dtf_accepts_locale_param() {
-        assert_eval_true("typeof new Intl.DateTimeFormat('en-US').format(0) === 'string'");
-    }
-
-    #[test]
-    fn e2e_intl_collator_accepts_locale_param() {
-        assert_eval_true("typeof new Intl.Collator('en-US') === 'object'");
-    }
-
-    // Intl.supportedValuesOf
-    #[test]
-    fn e2e_intl_supported_values_of_collation() {
-        assert_eval_true("Intl.supportedValuesOf('collation').length >= 1");
-    }
-
-    #[test]
-    fn e2e_intl_supported_values_of_currency() {
-        assert_eval_true(
-            "Intl.supportedValuesOf('currency').length >= 1 && Intl.supportedValuesOf('currency')[0] === 'USD'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_supported_values_of_numbering_system() {
-        assert_eval_true(
-            "Intl.supportedValuesOf('numberingSystem').length >= 1 && Intl.supportedValuesOf('numberingSystem')[0] === 'latn'",
-        );
-    }
-
-    #[test]
-    fn e2e_intl_supported_values_of_unknown_returns_empty() {
-        assert_eval_true("Intl.supportedValuesOf('unknown').length === 0");
+    fn e2e_intl_chromium_stable_namespace_shape_fails_closed() {
+        for name in [
+            "Collator",
+            "DateTimeFormat",
+            "DisplayNames",
+            "DurationFormat",
+            "ListFormat",
+            "Locale",
+            "NumberFormat",
+            "PluralRules",
+            "RelativeTimeFormat",
+            "Segmenter",
+        ] {
+            assert_eval_true(&format!(
+                "typeof Intl.{name} === 'function' && Intl.{name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("Intl.{name}()"));
+            assert_eval_type_error(&format!("new Intl.{name}()"));
+        }
+    }
+
+    #[test]
+    fn e2e_intl_service_constructor_static_locale_matching_fails_closed() {
+        for name in [
+            "Collator",
+            "DateTimeFormat",
+            "DisplayNames",
+            "DurationFormat",
+            "ListFormat",
+            "NumberFormat",
+            "PluralRules",
+            "RelativeTimeFormat",
+            "Segmenter",
+        ] {
+            assert_eval_true(&format!(
+                "typeof Intl.{name}.supportedLocalesOf === 'function'"
+            ));
+            assert_eval_type_error(&format!("Intl.{name}.supportedLocalesOf('en-US')"));
+        }
+    }
+
+    #[test]
+    fn e2e_intl_namespace_functions_fail_closed() {
+        assert_eval_true("typeof Intl.getCanonicalLocales === 'function'");
+        assert_eval_true("typeof Intl.supportedValuesOf === 'function'");
+        assert_eval_type_error("Intl.getCanonicalLocales('en-US')");
+        assert_eval_type_error("Intl.supportedValuesOf('timeZone')");
+    }
+
+    #[test]
+    fn e2e_intl_prototype_methods_fail_closed() {
+        assert_eval_true("typeof Intl.NumberFormat.prototype.format === 'function'");
+        assert_eval_type_error("Intl.NumberFormat.prototype.format(123)");
+        assert_eval_true("typeof Intl.Collator.prototype.compare === 'function'");
+        assert_eval_type_error("Intl.Collator.prototype.compare('a', 'b')");
+        assert_eval_true("typeof Intl.Locale.prototype.maximize === 'function'");
+        assert_eval_type_error("Intl.Locale.prototype.maximize()");
     }
 
     /// Verify that the `Math` object has the expected properties.
