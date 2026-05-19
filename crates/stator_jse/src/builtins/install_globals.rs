@@ -16700,6 +16700,54 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
+        // ── DOM UI / input / pointer / drag / touch / lifecycle event
+        //    constructor globals (fail-closed) ───────────────────────────────
+        //
+        // Edge page scripts probe for these constructors via
+        // `typeof XxxEvent === 'function'` and sometimes via `instanceof`
+        // checks. Chromium exposes all of them as real browser globals.
+        // The standalone engine has no DOM, no view/window, no input device,
+        // no `DataTransfer`, no touch lists, no storage areas, no CSS
+        // animation/transition pipeline, no session-history navigation,
+        // and no security-policy context. Returning fake instances would
+        // mislead product code into assuming a real DOM event/source/target
+        // exists, so every constructor is exposed for feature detection but
+        // rejects construction/invocation with a clear `TypeError`. No fake
+        // event dispatch, trusted-event flag, bubbling/cancelation state,
+        // or DOM integration is provided.
+        for name in [
+            "UIEvent",
+            "MouseEvent",
+            "PointerEvent",
+            "KeyboardEvent",
+            "InputEvent",
+            "BeforeUnloadEvent",
+            "FocusEvent",
+            "WheelEvent",
+            "DragEvent",
+            "Touch",
+            "TouchEvent",
+            "TouchList",
+            "CompositionEvent",
+            "SubmitEvent",
+            "ToggleEvent",
+            "PopStateEvent",
+            "HashChangeEvent",
+            "PageTransitionEvent",
+            "StorageEvent",
+            "ProgressEvent",
+            "ErrorEvent",
+            "PromiseRejectionEvent",
+            "AnimationEvent",
+            "TransitionEvent",
+            "SecurityPolicyViolationEvent",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
+
         // ── Realtime / worker / messaging APIs (fail-closed) ────────────────
         //
         // WebSockets, server-sent events, workers, service workers, channels,
@@ -17389,6 +17437,31 @@ mod tests {
         assert!(globals.contains_key("EventTarget"));
         assert!(globals.contains_key("AbortController"));
         assert!(globals.contains_key("AbortSignal"));
+        assert!(globals.contains_key("UIEvent"));
+        assert!(globals.contains_key("MouseEvent"));
+        assert!(globals.contains_key("PointerEvent"));
+        assert!(globals.contains_key("KeyboardEvent"));
+        assert!(globals.contains_key("InputEvent"));
+        assert!(globals.contains_key("BeforeUnloadEvent"));
+        assert!(globals.contains_key("FocusEvent"));
+        assert!(globals.contains_key("WheelEvent"));
+        assert!(globals.contains_key("DragEvent"));
+        assert!(globals.contains_key("Touch"));
+        assert!(globals.contains_key("TouchEvent"));
+        assert!(globals.contains_key("TouchList"));
+        assert!(globals.contains_key("CompositionEvent"));
+        assert!(globals.contains_key("SubmitEvent"));
+        assert!(globals.contains_key("ToggleEvent"));
+        assert!(globals.contains_key("PopStateEvent"));
+        assert!(globals.contains_key("HashChangeEvent"));
+        assert!(globals.contains_key("PageTransitionEvent"));
+        assert!(globals.contains_key("StorageEvent"));
+        assert!(globals.contains_key("ProgressEvent"));
+        assert!(globals.contains_key("ErrorEvent"));
+        assert!(globals.contains_key("PromiseRejectionEvent"));
+        assert!(globals.contains_key("AnimationEvent"));
+        assert!(globals.contains_key("TransitionEvent"));
+        assert!(globals.contains_key("SecurityPolicyViolationEvent"));
         assert!(globals.contains_key("WebSocket"));
         assert!(globals.contains_key("CloseEvent"));
         assert!(globals.contains_key("EventSource"));
@@ -18194,6 +18267,98 @@ mod tests {
         assert_eval_type_error("new MessageChannel()");
         assert_eval_type_error("new MessagePort()");
         assert_eval_type_error("new BroadcastChannel('edge-stator')");
+    }
+
+    /// DOM UI / input / pointer / drag / touch / lifecycle event constructor
+    /// globals (`UIEvent`, `MouseEvent`, `PointerEvent`, `KeyboardEvent`,
+    /// `InputEvent`, `BeforeUnloadEvent`, `FocusEvent`, `WheelEvent`,
+    /// `DragEvent`, `Touch`, `TouchEvent`, `TouchList`, `CompositionEvent`,
+    /// `SubmitEvent`, `ToggleEvent`, `PopStateEvent`, `HashChangeEvent`,
+    /// `PageTransitionEvent`, `StorageEvent`, `ProgressEvent`, `ErrorEvent`,
+    /// `PromiseRejectionEvent`, `AnimationEvent`, `TransitionEvent`,
+    /// `SecurityPolicyViolationEvent`) are exposed so Edge page scripts can
+    /// `typeof`/`instanceof`-probe them, but construction fails closed with
+    /// a clear `TypeError`. The engine has no DOM, no view/window, no input
+    /// device, no `DataTransfer`, no touch lists, no storage areas, no CSS
+    /// animation/transition pipeline, no session-history navigation, and no
+    /// security-policy context — fabricating events would mislead product
+    /// code into assuming a real DOM event source/target exists.
+    #[test]
+    fn e2e_dom_ui_input_event_constructors_exist_but_fail_closed() {
+        for name in [
+            "UIEvent",
+            "MouseEvent",
+            "PointerEvent",
+            "KeyboardEvent",
+            "InputEvent",
+            "BeforeUnloadEvent",
+            "FocusEvent",
+            "WheelEvent",
+            "DragEvent",
+            "Touch",
+            "TouchEvent",
+            "TouchList",
+            "CompositionEvent",
+            "SubmitEvent",
+            "ToggleEvent",
+            "PopStateEvent",
+            "HashChangeEvent",
+            "PageTransitionEvent",
+            "StorageEvent",
+            "ProgressEvent",
+            "ErrorEvent",
+            "PromiseRejectionEvent",
+            "AnimationEvent",
+            "TransitionEvent",
+            "SecurityPolicyViolationEvent",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new UIEvent('uievent')");
+        assert_eval_type_error("new MouseEvent('click')");
+        assert_eval_type_error("new PointerEvent('pointerdown')");
+        assert_eval_type_error("new KeyboardEvent('keydown', { key: 'a' })");
+        assert_eval_type_error("new InputEvent('input', { data: 'x' })");
+        assert_eval_type_error("new BeforeUnloadEvent('beforeunload')");
+        assert_eval_type_error("new FocusEvent('focus')");
+        assert_eval_type_error("new WheelEvent('wheel')");
+        assert_eval_type_error("new DragEvent('dragstart')");
+        assert_eval_type_error("new Touch({ identifier: 0, target: null })");
+        assert_eval_type_error("new TouchEvent('touchstart')");
+        assert_eval_type_error("new TouchList()");
+        assert_eval_type_error("new CompositionEvent('compositionstart')");
+        assert_eval_type_error("new SubmitEvent('submit')");
+        assert_eval_type_error("new ToggleEvent('toggle')");
+        assert_eval_type_error("new PopStateEvent('popstate')");
+        assert_eval_type_error("new HashChangeEvent('hashchange')");
+        assert_eval_type_error("new PageTransitionEvent('pageshow')");
+        assert_eval_type_error("new StorageEvent('storage')");
+        assert_eval_type_error("new ProgressEvent('progress')");
+        assert_eval_type_error("new ErrorEvent('error', { message: 'boom' })");
+        assert_eval_type_error(
+            "new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(), reason: 0 })",
+        );
+        assert_eval_type_error("new AnimationEvent('animationstart')");
+        assert_eval_type_error("new TransitionEvent('transitionend')");
+        assert_eval_type_error("new SecurityPolicyViolationEvent('securitypolicyviolation')");
+    }
+
+    /// `window`, `document`, `DataTransfer`, and host event dispatch/listener
+    /// objects remain intentionally absent — the standalone engine does not
+    /// preinstall a DOM or fabricate trusted-event state, so page scripts
+    /// must rely on the real host/Blink bindings rather than a stator stub.
+    #[test]
+    fn e2e_dom_host_objects_remain_absent() {
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof DataTransfer === 'undefined'");
+        assert_eval_true("typeof DataTransferItem === 'undefined'");
+        assert_eval_true("typeof DataTransferItemList === 'undefined'");
     }
 
     #[test]
