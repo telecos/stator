@@ -3088,6 +3088,7 @@ fn construct_class_from_plain_object(
     ctor_proto: &JsValue,
     args: CallArgs,
 ) -> StatorResult<()> {
+    let constructor_args = args.clone();
     // 1. Create `this`.
     let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     if !matches!(ctor_proto, JsValue::Undefined) {
@@ -3177,6 +3178,26 @@ fn construct_class_from_plain_object(
     pop_call_frame();
     ctx.frame.global_cache_invalidate();
     let val = result?;
+
+    if is_derived
+        && ctx
+            .frame
+            .global_env
+            .borrow()
+            .get_this()
+            .is_some_and(|this| *this == JsValue::TheHole)
+        && let Some(parent) = class_map.borrow().get("__proto__").cloned()
+        && ctx
+            .frame
+            .global_env
+            .borrow()
+            .get("Promise")
+            .is_some_and(|promise_ctor| *promise_ctor == parent)
+    {
+        ctx.frame.global_env.borrow_mut().set_this(this_val.clone());
+        dispatch_call_value(&parent, constructor_args.into_vec())?;
+        ctx.frame.global_cache_invalidate();
+    }
 
     // 6. For derived classes, run field initializer after the constructor.
     if is_derived {

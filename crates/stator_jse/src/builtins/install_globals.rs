@@ -2226,26 +2226,12 @@ fn promise_static_constructor() -> Option<JsValue> {
 }
 
 fn promise_static_species_constructor(constructor: &JsValue) -> StatorResult<JsValue> {
-    let species = match constructor {
-        JsValue::PlainObject(map) => {
-            let borrow = map.borrow();
-            if let Some(getter) = borrow.get("__get_@@species__").cloned() {
-                drop(borrow);
-                dispatch_call_value(&getter, vec![constructor.clone()])?
-            } else {
-                borrow
-                    .get("@@species")
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined)
-            }
-        }
-        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => JsValue::Undefined,
-        _ => {
-            return Err(StatorError::TypeError(
-                "Promise constructor is not an object".into(),
-            ));
-        }
-    };
+    if constructor.is_primitive() {
+        return Err(StatorError::TypeError(
+            "Promise constructor is not an object".into(),
+        ));
+    }
+    let species = dispatch_get_property_value(constructor, JsValue::String("@@species".into()))?;
 
     if species.is_undefined() || matches!(species, JsValue::Null) {
         return Ok(constructor.clone());
@@ -2324,26 +2310,12 @@ fn promise_species_constructor(
         return Ok(None);
     }
 
-    let species = match &constructor {
-        JsValue::PlainObject(map) => {
-            let borrow = map.borrow();
-            if let Some(getter) = borrow.get("__get_@@species__").cloned() {
-                drop(borrow);
-                dispatch_call_value(&getter, vec![constructor.clone()])?
-            } else {
-                borrow
-                    .get("@@species")
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined)
-            }
-        }
-        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => JsValue::Undefined,
-        _ => {
-            return Err(StatorError::TypeError(
-                "Promise constructor is not an object".into(),
-            ));
-        }
-    };
+    if constructor.is_primitive() {
+        return Err(StatorError::TypeError(
+            "Promise constructor is not an object".into(),
+        ));
+    }
+    let species = dispatch_get_property_value(&constructor, JsValue::String("@@species".into()))?;
 
     if species.is_undefined() || matches!(species, JsValue::Null) {
         return Ok(None);
@@ -2354,6 +2326,17 @@ fn promise_species_constructor(
         ));
     }
     Ok(Some(species))
+}
+
+fn promise_from_receiver(value: &JsValue) -> Option<crate::builtins::promise::JsPromise> {
+    match value {
+        JsValue::Promise(promise) => Some(promise.clone()),
+        JsValue::PlainObject(map) => match map.borrow().get("__promise__") {
+            Some(JsValue::Promise(promise)) => Some(promise.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn promise_species_result(
@@ -2379,13 +2362,15 @@ fn promise_method_receiver(
 ) -> StatorResult<(crate::builtins::promise::JsPromise, usize)> {
     if let Some(this_value) =
         current_global_env().and_then(|global_env| global_env.borrow().get_this().cloned())
-        && let JsValue::Promise(promise) = this_value
+        && let Some(promise) = promise_from_receiver(&this_value)
     {
         return Ok((promise, 0));
     }
 
     match args.first() {
-        Some(JsValue::Promise(promise)) => Ok((promise.clone(), 1)),
+        Some(value) => promise_from_receiver(value)
+            .map(|promise| (promise, 1))
+            .ok_or_else(|| StatorError::TypeError(format!("{display_name} called on non-Promise"))),
         _ => Err(StatorError::TypeError(format!(
             "{display_name} called on non-Promise"
         ))),
@@ -11015,6 +11000,11 @@ fn make_promise() -> JsValue {
                         &q,
                     );
                     p.set_prototype(derived_proto);
+                    if let Some(target) = current_derived_constructor_this() {
+                        target
+                            .borrow_mut()
+                            .insert("__promise__".into(), JsValue::Promise(p.clone()));
+                    }
                     Ok(JsValue::Promise(p))
                 }),
             );
@@ -35971,7 +35961,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_respects_default_species_subclass() {
         assert_eval_true(
             "class SubPromise extends Promise {} \
@@ -35982,7 +35971,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_respects_default_species_subclass() {
         assert_eval_true(
             "class SubPromise extends Promise {} \
@@ -35993,7 +35981,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_respects_default_species_subclass() {
         assert_eval_true(
             "class SubPromise extends Promise {} \
@@ -36004,7 +35991,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_then_respects_species_override_to_promise() {
         assert_eval_true(
             "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } \
@@ -36015,7 +36001,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_catch_respects_species_override_to_other_subclass() {
         assert_eval_true(
             "class OtherPromise extends Promise {} \
@@ -36027,7 +36012,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_finally_respects_null_species_fallback() {
         assert_eval_true(
             "class SubPromise extends Promise { static get [Symbol.species]() { return null; } } \
@@ -36038,15 +36022,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_subclass_chain_result_still_settles() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "class SubPromise extends Promise {} \
-              var out = 0; \
-              new SubPromise(function(resolve) { resolve(2); })\
+               var out = 0; \
+               new SubPromise(function(resolve) { resolve(2); })\
                 .then(function(v) { return v * 5; })\
-                .then(function(v) { out = v; }); \
-              out === 10",
+                .then(function(v) { out = v; });",
+            "out === 10",
         );
     }
 
