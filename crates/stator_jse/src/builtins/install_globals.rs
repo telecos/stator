@@ -6357,14 +6357,651 @@ fn make_file_reader_sync_builtin() -> JsValue {
     ctor
 }
 
+// ── Request (WHATWG Fetch §5) ────────────────────────────────────────────────
+//
+// Standalone in-memory `Request` implementation. It supports construction from
+// absolute URL strings / URL instances and from another Stator `Request`, plus
+// safe in-memory body snapshots. It deliberately does not implement fetch,
+// networking, streaming, AbortSignal integration, redirects, credentials,
+// referrer side effects, service workers, or Cache integration.
+
+/// Hidden brand placed on every `Request` instance for receiver checks.
+const REQUEST_BRAND: &str = "__is_request__";
+
+/// Mutable internal state of a `Request` instance.
+struct RequestState {
+    /// Normalized HTTP method.
+    method: String,
+    /// Serialized absolute URL.
+    url: String,
+    /// Underlying body bytes. Empty when `body_null` is true.
+    bytes: Vec<u8>,
+    /// Whether the body is conceptually null.
+    body_null: bool,
+    /// Has the body been consumed by `text/json/blob/arrayBuffer`?
+    body_used: bool,
+    /// Shared `Headers` list.
+    headers_list: Rc<RefCell<HeaderList>>,
+    /// Cached `Headers` object exposed via the `headers` getter.
+    headers_obj: JsValue,
+    /// Referrer string.
+    referrer: String,
+    /// Referrer policy string.
+    referrer_policy: String,
+    /// Request mode.
+    mode: String,
+    /// Request credentials mode.
+    credentials: String,
+    /// Cache mode.
+    cache: String,
+    /// Redirect mode.
+    redirect: String,
+    /// Subresource integrity metadata.
+    integrity: String,
+    /// Keepalive flag.
+    keepalive: bool,
+}
+
+thread_local! {
+    static REQUEST_STATES: RefCell<HashMap<usize, Rc<RefCell<RequestState>>>> =
+        RefCell::new(HashMap::new());
+    static REQUEST_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn request_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn install_request_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<RequestState>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    REQUEST_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_request_state(value: &JsValue) -> StatorResult<Rc<RefCell<RequestState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(request_type_error(
+            "Request method called on non-Request receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(REQUEST_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(request_type_error(
+            "Request method called on non-Request receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    REQUEST_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| request_type_error("Request: internal state missing"))
+}
+
+fn resolve_request_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, REQUEST_BRAND)
+}
+
+fn request_normalize_method(value: &JsValue) -> StatorResult<String> {
+    if matches!(value, JsValue::Undefined) {
+        return Ok("GET".to_string());
+    }
+    let method = value.to_js_string()?.to_string();
+    validate_and_normalize_name(&method)
+        .map_err(|_| request_type_error("Request: invalid method"))?;
+    let upper = method.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+        return Err(request_type_error("Request: forbidden method"));
+    }
+    Ok(match upper.as_str() {
+        "DELETE" | "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT" => upper,
+        _ => method,
+    })
+}
+
+fn request_parse_url(input: &JsValue) -> StatorResult<String> {
+    if let Ok(state) = lookup_url_state(input) {
+        return Ok(state.borrow().href());
+    }
+    let s = input.to_js_string()?.to_string();
+    parse_url(&s, None)
+        .map(|u| u.href())
+        .map_err(|e| request_type_error(format!("Request: invalid URL: {e}")))
+}
+
+fn request_init_property(init: &JsValue, name: &str) -> StatorResult<JsValue> {
+    if matches!(init, JsValue::Undefined | JsValue::Null) {
+        return Ok(JsValue::Undefined);
+    }
+    if !matches!(init, JsValue::PlainObject(_)) {
+        return Err(request_type_error("Request: init must be an object"));
+    }
+    dispatch_get_property_value(init, JsValue::String(name.to_string().into()))
+}
+
+fn request_enum(
+    init: &JsValue,
+    name: &str,
+    default: &str,
+    allowed: &[&str],
+) -> StatorResult<String> {
+    let value = request_init_property(init, name)?;
+    if matches!(value, JsValue::Undefined) {
+        return Ok(default.to_string());
+    }
+    let s = value.to_js_string()?.to_string();
+    if allowed.contains(&s.as_str()) {
+        Ok(s)
+    } else {
+        Err(request_type_error(format!(
+            "Request: init.{name} has unsupported value"
+        )))
+    }
+}
+
+fn request_bool(init: &JsValue, name: &str, default: bool) -> StatorResult<bool> {
+    let value = request_init_property(init, name)?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(default)
+    } else {
+        Ok(value.to_boolean())
+    }
+}
+
+fn request_string(init: &JsValue, name: &str, default: &str) -> StatorResult<String> {
+    let value = request_init_property(init, name)?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_js_string()?.to_string())
+    }
+}
+
+fn request_extract_body(value: &JsValue) -> StatorResult<(Vec<u8>, Option<String>, bool)> {
+    response_extract_body(value).map_err(|err| match err {
+        StatorError::TypeError(message) => {
+            StatorError::TypeError(message.replacen("Response:", "Request:", 1))
+        }
+        other => other,
+    })
+}
+
+fn request_take_body(state: &Rc<RefCell<RequestState>>) -> StatorResult<Vec<u8>> {
+    let mut s = state.borrow_mut();
+    if s.body_used {
+        return Err(request_type_error(
+            "Request: body has already been consumed",
+        ));
+    }
+    s.body_used = true;
+    Ok(s.bytes.clone())
+}
+
+fn request_content_type(state: &Rc<RefCell<RequestState>>) -> String {
+    list_get_combined(&state.borrow().headers_list.borrow(), "content-type").unwrap_or_default()
+}
+
+fn build_request_instance(state: RequestState) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            REQUEST_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = REQUEST_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_request_state(&inst, Rc::new(RefCell::new(state)));
+    JsValue::PlainObject(inst)
+}
+
+fn request_build_headers(
+    init_headers: &JsValue,
+    input_headers: Option<Rc<RefCell<HeaderList>>>,
+    default_mime: Option<&str>,
+) -> StatorResult<(Rc<RefCell<HeaderList>>, JsValue)> {
+    let mut list = if matches!(init_headers, JsValue::Undefined) {
+        input_headers
+            .as_ref()
+            .map(|headers| headers.borrow().clone())
+            .unwrap_or_default()
+    } else {
+        headers_init_from_value(init_headers)?
+    };
+    if let Some(mime) = default_mime
+        && !mime.is_empty()
+        && !list_has(&list, "content-type")
+    {
+        list_append(&mut list, "content-type".into(), mime.to_string());
+    }
+    let rc = Rc::new(RefCell::new(list));
+    let headers_obj = build_headers_instance_shared(Rc::clone(&rc))?;
+    Ok((rc, headers_obj))
+}
+
+fn request_add_string_getter(
+    proto: &mut PropertyMap,
+    name: &str,
+    getter: fn(&RequestState) -> String,
+) {
+    let getter_key = format!("__get_{name}__");
+    proto.insert_with_attrs(
+        getter_key,
+        native(move |args| {
+            let (recv, _) = resolve_request_receiver(&args);
+            let state = lookup_request_state(&recv)?;
+            Ok(JsValue::String(getter(&state.borrow()).into()))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+fn request_state_method(s: &RequestState) -> String {
+    s.method.clone()
+}
+
+fn request_state_url(s: &RequestState) -> String {
+    s.url.clone()
+}
+
+fn request_state_destination(_s: &RequestState) -> String {
+    String::new()
+}
+
+fn request_state_referrer(s: &RequestState) -> String {
+    s.referrer.clone()
+}
+
+fn request_state_referrer_policy(s: &RequestState) -> String {
+    s.referrer_policy.clone()
+}
+
+fn request_state_mode(s: &RequestState) -> String {
+    s.mode.clone()
+}
+
+fn request_state_credentials(s: &RequestState) -> String {
+    s.credentials.clone()
+}
+
+fn request_state_cache(s: &RequestState) -> String {
+    s.cache.clone()
+}
+
+fn request_state_redirect(s: &RequestState) -> String {
+    s.redirect.clone()
+}
+
+fn request_state_integrity(s: &RequestState) -> String {
+    s.integrity.clone()
+}
+
+/// Build the real `Request` constructor and prototype.
+#[inline(never)]
+fn make_request_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let input = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let init_method = request_init_property(&init, "method")?;
+            let init_headers = request_init_property(&init, "headers")?;
+            let init_body = request_init_property(&init, "body")?;
+
+            let input_state = lookup_request_state(&input).ok();
+            let (
+                mut method,
+                url,
+                input_bytes,
+                input_body_null,
+                input_headers_list,
+                referrer_default,
+                referrer_policy_default,
+                mode_default,
+                credentials_default,
+                cache_default,
+                redirect_default,
+                integrity_default,
+                keepalive_default,
+            ) = if let Some(state_rc) = input_state {
+                let state = state_rc.borrow();
+                if state.body_used {
+                    return Err(request_type_error(
+                        "Request: input Request body has already been consumed",
+                    ));
+                }
+                (
+                    state.method.clone(),
+                    state.url.clone(),
+                    state.bytes.clone(),
+                    state.body_null,
+                    Some(Rc::clone(&state.headers_list)),
+                    state.referrer.clone(),
+                    state.referrer_policy.clone(),
+                    state.mode.clone(),
+                    state.credentials.clone(),
+                    state.cache.clone(),
+                    state.redirect.clone(),
+                    state.integrity.clone(),
+                    state.keepalive,
+                )
+            } else {
+                (
+                    "GET".to_string(),
+                    request_parse_url(&input)?,
+                    Vec::new(),
+                    true,
+                    None,
+                    "about:client".to_string(),
+                    String::new(),
+                    "cors".to_string(),
+                    "same-origin".to_string(),
+                    "default".to_string(),
+                    "follow".to_string(),
+                    String::new(),
+                    false,
+                )
+            };
+
+            if !matches!(init_method, JsValue::Undefined) {
+                method = request_normalize_method(&init_method)?;
+            }
+
+            let (bytes, default_mime, body_null) = if matches!(init_body, JsValue::Undefined) {
+                (input_bytes, None, input_body_null)
+            } else {
+                request_extract_body(&init_body)?
+            };
+            if !body_null && matches!(method.as_str(), "GET" | "HEAD") {
+                return Err(request_type_error("Request: GET/HEAD cannot have a body"));
+            }
+
+            let (headers_list, headers_obj) =
+                request_build_headers(&init_headers, input_headers_list, default_mime.as_deref())?;
+
+            Ok(build_request_instance(RequestState {
+                method,
+                url,
+                bytes,
+                body_null,
+                body_used: false,
+                headers_list,
+                headers_obj,
+                referrer: request_string(&init, "referrer", &referrer_default)?,
+                referrer_policy: request_enum(
+                    &init,
+                    "referrerPolicy",
+                    &referrer_policy_default,
+                    &[
+                        "",
+                        "no-referrer",
+                        "no-referrer-when-downgrade",
+                        "same-origin",
+                        "origin",
+                        "strict-origin",
+                        "origin-when-cross-origin",
+                        "strict-origin-when-cross-origin",
+                        "unsafe-url",
+                    ],
+                )?,
+                mode: request_enum(
+                    &init,
+                    "mode",
+                    &mode_default,
+                    &["same-origin", "no-cors", "cors", "navigate"],
+                )?,
+                credentials: request_enum(
+                    &init,
+                    "credentials",
+                    &credentials_default,
+                    &["omit", "same-origin", "include"],
+                )?,
+                cache: request_enum(
+                    &init,
+                    "cache",
+                    &cache_default,
+                    &[
+                        "default",
+                        "no-store",
+                        "reload",
+                        "no-cache",
+                        "force-cache",
+                        "only-if-cached",
+                    ],
+                )?,
+                redirect: request_enum(
+                    &init,
+                    "redirect",
+                    &redirect_default,
+                    &["follow", "error", "manual"],
+                )?,
+                integrity: request_string(&init, "integrity", &integrity_default)?,
+                keepalive: request_bool(&init, "keepalive", keepalive_default)?,
+            }))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        request_add_string_getter(&mut proto, "method", request_state_method);
+        request_add_string_getter(&mut proto, "url", request_state_url);
+        request_add_string_getter(&mut proto, "destination", request_state_destination);
+        request_add_string_getter(&mut proto, "referrer", request_state_referrer);
+        request_add_string_getter(&mut proto, "referrerPolicy", request_state_referrer_policy);
+        request_add_string_getter(&mut proto, "mode", request_state_mode);
+        request_add_string_getter(&mut proto, "credentials", request_state_credentials);
+        request_add_string_getter(&mut proto, "cache", request_state_cache);
+        request_add_string_getter(&mut proto, "redirect", request_state_redirect);
+        request_add_string_getter(&mut proto, "integrity", request_state_integrity);
+
+        proto.insert_with_attrs(
+            "__get_keepalive__".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                Ok(JsValue::Boolean(state.borrow().keepalive))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_headers__".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                Ok(state.borrow().headers_obj.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_signal__".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                lookup_request_state(&recv)?;
+                Ok(JsValue::Null)
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_body__".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                lookup_request_state(&recv)?;
+                Ok(JsValue::Null)
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_bodyUsed__".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                Ok(JsValue::Boolean(state.borrow().body_used))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.insert(
+            "text".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                match request_take_body(&state) {
+                    Ok(bytes) => {
+                        let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                        Ok(blob_resolved_promise(JsValue::String(decoded.into())))
+                    }
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+        proto.insert(
+            "arrayBuffer".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                match request_take_body(&state) {
+                    Ok(bytes) => {
+                        let buf = JsArrayBuffer {
+                            shared: false,
+                            max_byte_length: None,
+                            detached: false,
+                            data: bytes,
+                        };
+                        let ab = make_arraybuffer_instance(Rc::new(RefCell::new(buf)));
+                        Ok(blob_resolved_promise(ab))
+                    }
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+        proto.insert(
+            "blob".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                let mime = request_content_type(&state);
+                match request_take_body(&state) {
+                    Ok(bytes) => {
+                        let blob = build_blob_instance(bytes, normalize_blob_type(&mime));
+                        Ok(blob_resolved_promise(blob))
+                    }
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+        proto.insert(
+            "json".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                let bytes = match request_take_body(&state) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(response_rejected_promise(e)),
+                };
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let json_global = match lookup_global_json() {
+                    Ok(v) => v,
+                    Err(e) => return Ok(response_rejected_promise(e)),
+                };
+                let parse_fn = match dispatch_get_property_value(
+                    &json_global,
+                    JsValue::String("parse".into()),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(response_rejected_promise(e)),
+                };
+                match dispatch_call_with_this(
+                    &parse_fn,
+                    json_global,
+                    vec![JsValue::String(text.into())],
+                ) {
+                    Ok(v) => Ok(blob_resolved_promise(v)),
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+
+        proto.insert(
+            "clone".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                let s = state.borrow();
+                if s.body_used {
+                    return Err(request_type_error(
+                        "Request.clone: body has already been consumed",
+                    ));
+                }
+                let (headers_list, headers_obj) = request_build_headers(
+                    &JsValue::Undefined,
+                    Some(Rc::clone(&s.headers_list)),
+                    None,
+                )?;
+                Ok(build_request_instance(RequestState {
+                    method: s.method.clone(),
+                    url: s.url.clone(),
+                    bytes: s.bytes.clone(),
+                    body_null: s.body_null,
+                    body_used: false,
+                    headers_list,
+                    headers_obj,
+                    referrer: s.referrer.clone(),
+                    referrer_policy: s.referrer_policy.clone(),
+                    mode: s.mode.clone(),
+                    credentials: s.credentials.clone(),
+                    cache: s.cache.clone(),
+                    redirect: s.redirect.clone(),
+                    integrity: s.integrity.clone(),
+                    keepalive: s.keepalive,
+                }))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Request".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        REQUEST_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 // ── Response (WHATWG Fetch §6) ───────────────────────────────────────────────
 //
 // Standalone in-memory `Response` implementation. The constructor, body
 // methods (`text`/`arrayBuffer`/`blob`/`json`), and the
 // `Response.error()` / `Response.redirect()` / `Response.json()` static
-// methods are real; however, this engine does **not** implement
-// `Request`, `fetch`, network/Cache integration, service workers, or
-// real `ReadableStream` byte sources. Therefore:
+// methods are real; however, this engine does **not** implement `fetch`,
+// network/Cache integration, service workers, or real `ReadableStream` byte
+// sources. Therefore:
 //
 // * `Response.prototype.body` is always `null` (no fake stream).
 // * `bodyUsed` flips to `true` once any of the body consume methods is
@@ -19972,17 +20609,18 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_unsupported_node_filter_constructor(), "NodeFilter"),
         );
 
-        // ── Fetch / network and body APIs (fail-closed) ─────────────────────
+        // ── Fetch / network and body APIs ───────────────────────────────────
         //
-        // Fetch, XHR, streams, and request/response body wrappers require host
+        // Fetch, XHR, and streams require host
         // network, origin, stream scheduling, and byte-source integration. This
         // standalone engine deliberately exposes commonly-probed globals but
-        // rejects every operation instead of fabricating successful requests,
-        // streams, bodies, or wrappers.
+        // keeps host-integrated operations fail-closed instead of fabricating
+        // successful requests, streams, bodies, or wrappers. Request/Response
+        // are standalone in-memory wrappers only; `fetch(request)` still fails.
         globals.insert("fetch".into(), make_unsupported_web_function("fetch", 1));
         globals.insert(
             "Request".into(),
-            finalize_ctor(make_unsupported_web_constructor("Request"), "Request"),
+            finalize_ctor(make_request_builtin(), "Request"),
         );
         globals.insert(
             "Response".into(),
@@ -22339,9 +22977,9 @@ mod tests {
     }
 
     #[test]
-    fn e2e_headers_does_not_unlock_fetch_or_request_response() {
-        // Real Headers must not regress fail-closed fetch / Request.
-        // (Real Response is now implemented standalone; see Response tests.)
+    fn e2e_headers_does_not_unlock_fetch() {
+        // Real Headers must not regress fail-closed fetch. Request/Response are
+        // standalone in-memory wrappers only.
         assert_eval_true("typeof fetch === 'function'");
         assert_eval_type_error("fetch('https://example.test/')");
         assert_eval_type_error("new Request('/api')");
@@ -22349,7 +22987,9 @@ mod tests {
         assert_eval_type_error(
             "fetch('https://example.test/', { headers: new Headers({ 'X-A': '1' }) })",
         );
-        assert_eval_type_error("new Request('/api', { headers: new Headers({ 'X-A': '1' }) })");
+        assert_eval_true(
+            "var q = new Request('https://example.test/api', { headers: new Headers({ 'X-A': '1' }) }); q.headers.get('x-a') === '1'",
+        );
         // Response accepts a real Headers init and copies values.
         assert_eval_true(
             "var r = new Response('ok', { headers: new Headers({ 'X-A': '1' }) }); r.headers.get('x-a') === '1'",
@@ -22434,7 +23074,9 @@ mod tests {
     #[test]
     fn e2e_form_data_does_not_unlock_fetch_or_request_response() {
         assert_eval_type_error("fetch('https://example.test/', { body: new FormData() })");
-        assert_eval_type_error("new Request('/api', { method: 'POST', body: new FormData() })");
+        assert_eval_type_error(
+            "new Request('https://example.test/api', { method: 'POST', body: new FormData() })",
+        );
         // FormData bodies are explicitly rejected by the standalone Response
         // because no real multipart serializer exists in this engine.
         assert_eval_type_error("new Response(new FormData())");
@@ -22536,12 +23178,14 @@ mod tests {
     }
 
     #[test]
-    fn e2e_blob_does_not_unlock_fetch_request_response_or_object_url() {
-        // Even with a real Blob value, fetch/Request/objectURL remain
-        // fail-closed: no fake network/file/URL lifetime. Real Response
-        // accepts a Blob body and snapshots its bytes into memory.
+    fn e2e_blob_does_not_unlock_fetch_or_object_url() {
+        // Even with a real Blob value, fetch/objectURL remain fail-closed: no
+        // fake network/file/URL lifetime. Real Request/Response accept Blob
+        // bodies and snapshot bytes into memory.
         assert_eval_type_error("fetch('https://example.test/', { body: new Blob(['x']) })");
-        assert_eval_type_error("new Request('/api', { method: 'POST', body: new Blob(['x']) })");
+        assert_eval_true(
+            "var q = new Request('https://example.test/api', { method: 'POST', body: new Blob(['x']) }); q.headers.get('content-type') === null",
+        );
         assert_eval_true(
             "var r = new Response(new Blob(['x'], { type: 'text/plain' })); r.headers.get('content-type') === 'text/plain'",
         );
@@ -22619,10 +23263,10 @@ mod tests {
         assert_eval_type_error(
             "fetch('https://example.test/', { body: new File(['x'], 'x.txt') })",
         );
-        assert_eval_type_error(
-            "new Request('/api', { method: 'POST', body: new File(['x'], 'x.txt') })",
+        assert_eval_true(
+            "new Request('https://example.test/api', { method: 'POST', body: new File(['x'], 'x.txt') }) instanceof Request",
         );
-        // File bodies are accepted by the standalone Response.
+        // File bodies are accepted by standalone Request/Response.
         assert_eval_true(
             "var r = new Response(new File(['x'], 'x.txt', { type: 'text/plain' })); r.headers.get('content-type') === 'text/plain'",
         );
@@ -22779,11 +23423,127 @@ mod tests {
         // Object URL minting from a Blob/File remains fail-closed.
         assert_eval_type_error("URL.createObjectURL(new Blob(['x']))");
         assert_eval_type_error("URL.createObjectURL(new File(['x'], 'x.txt'))");
-        // fetch/Request with Blob/File bodies remain fail-closed. Real
-        // Response accepts a Blob body (snapshotted into memory).
+        // fetch remains fail-closed. Real Request/Response accept Blob/File
+        // bodies (snapshotted into memory).
         assert_eval_type_error("fetch('https://example.test/', { body: new Blob(['x']) })");
-        assert_eval_type_error("new Request('/api', { method: 'POST', body: new Blob(['x']) })");
+        assert_eval_true(
+            "new Request('https://example.test/api', { method: 'POST', body: new Blob(['x']) }) instanceof Request",
+        );
         assert_eval_true("new Response(new Blob(['x'])) instanceof Response");
+    }
+
+    // ── Request (WHATWG Fetch §5) ────────────────────────────────────────
+
+    #[test]
+    fn e2e_request_constructor_shape_and_defaults() {
+        assert_eval_true("typeof Request === 'function' && Request.name === 'Request'");
+        assert_eval_true("new Request('https://example.test/') instanceof Request");
+        assert_eval_true(
+            "Object.prototype.toString.call(new Request('https://example.test/')) === '[object Request]'",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/path?q=1'); q.method === 'GET' && q.url === 'https://example.test/path?q=1'",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/'); q.destination === '' && q.referrer === 'about:client' && q.referrerPolicy === ''",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/'); q.mode === 'cors' && q.credentials === 'same-origin' && q.cache === 'default' && q.redirect === 'follow'",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/'); q.integrity === '' && q.keepalive === false && q.signal === null && q.body === null && q.bodyUsed === false",
+        );
+    }
+
+    #[test]
+    fn e2e_request_constructs_from_url_and_rejects_relative_without_base() {
+        assert_eval_true(
+            "var u = new URL('https://example.test/a/../b'); var q = new Request(u); q.url === 'https://example.test/b'",
+        );
+        assert_eval_type_error("new Request('/relative')");
+        assert_eval_type_error("new Request('not a url')");
+    }
+
+    #[test]
+    fn e2e_request_init_method_headers_and_modes() {
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'post', headers: { 'X-A': '1' } }); q.method === 'POST' && q.headers.get('x-a') === '1'",
+        );
+        assert_eval_true(
+            "var h = new Headers({ A: '1' }); var q = new Request('https://example.test/', { headers: h }); q.headers instanceof Headers && q.headers === q.headers && q.headers.get('a') === '1'",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { mode: 'same-origin', credentials: 'include', cache: 'reload', redirect: 'manual', integrity: 'sha256-x', keepalive: true, referrer: '' }); q.mode === 'same-origin' && q.credentials === 'include' && q.cache === 'reload' && q.redirect === 'manual' && q.integrity === 'sha256-x' && q.keepalive === true && q.referrer === ''",
+        );
+        assert_eval_type_error("new Request('https://example.test/', { method: 'bad method' })");
+        assert_eval_type_error("new Request('https://example.test/', { method: 'TRACE' })");
+        assert_eval_type_error("new Request('https://example.test/', { mode: 'websocket' })");
+    }
+
+    #[test]
+    fn e2e_request_body_types_supported_and_get_head_rejected() {
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'POST', body: 'hi' }); q.headers.get('content-type') === 'text/plain;charset=UTF-8'",
+        );
+        assert_eval_true(
+            "new Request('https://example.test/', { method: 'POST', body: new Blob(['hi'], { type: 'text/plain' }) }).headers.get('content-type') === 'text/plain'",
+        );
+        assert_eval_true(
+            "new Request('https://example.test/', { method: 'POST', body: new Uint8Array([1,2,3]) }) instanceof Request",
+        );
+        assert_eval_true(
+            "new Request('https://example.test/', { method: 'POST', body: new DataView(new ArrayBuffer(2)) }) instanceof Request",
+        );
+        assert_eval_type_error("new Request('https://example.test/', { body: 'x' })");
+        assert_eval_type_error(
+            "new Request('https://example.test/', { method: 'HEAD', body: 'x' })",
+        );
+        assert_eval_type_error(
+            "new Request('https://example.test/', { method: 'POST', body: new FormData() })",
+        );
+    }
+
+    #[test]
+    fn e2e_request_body_methods_body_used_and_clone() {
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'POST', body: 'hi' }); var p = q.text(); typeof p === 'object' && typeof p.then === 'function' && q.bodyUsed === true",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'POST', body: '{\"a\":1}' }); var got = null; q.json().then(function(v){ got = v; }); Promise.resolve().then(function(){}); got === null || got.a === 1",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); var c = q.clone(); q.text(); c.bodyUsed === false && c.method === 'POST' && c.url === q.url",
+        );
+        assert_eval_type_error(
+            "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); q.clone()",
+        );
+        assert_eval_true(
+            "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); var rejected = false; q.text().then(function(){}, function(){ rejected = true; }); Promise.resolve().then(function(){}); rejected === false || rejected === true",
+        );
+    }
+
+    #[test]
+    fn e2e_request_constructs_from_request_and_overrides_init() {
+        assert_eval_true(
+            "var a = new Request('https://example.test/a', { method: 'POST', body: 'x', headers: { A: '1' } }); var b = new Request(a); b.method === 'POST' && b.url === 'https://example.test/a' && b.headers.get('a') === '1'",
+        );
+        assert_eval_true(
+            "var a = new Request('https://example.test/a', { method: 'POST', body: 'x', headers: { A: '1' } }); var b = new Request(a, { method: 'PUT', body: 'y', headers: { B: '2' } }); b.method === 'PUT' && b.headers.get('a') === null && b.headers.get('b') === '2'",
+        );
+        assert_eval_type_error(
+            "var a = new Request('https://example.test/a', { method: 'POST', body: 'x' }); a.text(); new Request(a)",
+        );
+    }
+
+    #[test]
+    fn e2e_request_does_not_unlock_fetch_streams_or_cache() {
+        assert_eval_type_error("fetch(new Request('https://example.test/'))");
+        assert_eval_type_error("new ReadableStream({ start() {} })");
+        assert_eval_type_error("new WritableStream({ write() {} })");
+        assert_eval_true(
+            "new Request('https://example.test/', { method: 'POST', body: 'x' }).body === null",
+        );
+        assert_eval_type_error("caches.open('x')");
     }
 
     // ── Response (WHATWG Fetch §6) ──────────────────────────────────────
