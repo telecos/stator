@@ -3628,6 +3628,43 @@ fn make_unsupported_web_constructor_with_prototype(
     ctor
 }
 
+fn make_unsupported_node_filter_constructor() -> JsValue {
+    let ctor = make_unsupported_web_constructor_with_prototype(
+        "NodeFilter",
+        &[][..],
+        &[
+            ("FILTER_ACCEPT", 1),
+            ("FILTER_REJECT", 2),
+            ("FILTER_SKIP", 3),
+            ("SHOW_ELEMENT", 1),
+            ("SHOW_ATTRIBUTE", 2),
+            ("SHOW_TEXT", 4),
+            ("SHOW_CDATA_SECTION", 8),
+            ("SHOW_ENTITY_REFERENCE", 16),
+            ("SHOW_ENTITY", 32),
+            ("SHOW_PROCESSING_INSTRUCTION", 64),
+            ("SHOW_COMMENT", 128),
+            ("SHOW_DOCUMENT", 256),
+            ("SHOW_DOCUMENT_TYPE", 512),
+            ("SHOW_DOCUMENT_FRAGMENT", 1024),
+            ("SHOW_NOTATION", 2048),
+        ],
+    );
+    if let JsValue::PlainObject(ref rc) = ctor {
+        {
+            let mut props = rc.borrow_mut();
+            props.insert("SHOW_ALL".into(), JsValue::HeapNumber(4_294_967_295.0));
+            props.make_all_non_enumerable();
+        }
+        if let Some(JsValue::PlainObject(proto_rc)) = rc.borrow().get("prototype").cloned() {
+            let mut proto = proto_rc.borrow_mut();
+            proto.insert("SHOW_ALL".into(), JsValue::HeapNumber(4_294_967_295.0));
+            proto.make_all_non_enumerable();
+        }
+    }
+    ctor
+}
+
 fn make_unsupported_url_constructor() -> JsValue {
     let ctor = make_unsupported_web_constructor("URL");
     if let JsValue::PlainObject(ref rc) = ctor {
@@ -16408,6 +16445,113 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
+        // ── DOM selection / ranges / traversal / view integration (fail-closed)
+        //
+        // Range, Selection, traversal, editing/view and visual-viewport related
+        // interfaces are often probed by browser page scripts. Real behavior
+        // requires host-owned Document/Node/Element instances, live selection
+        // and focus state, DOM traversal cursors, editing commands, layout,
+        // viewport, scrollbar/chrome state, and visual viewport integration.
+        // This standalone engine has none of those, so expose only the
+        // Chromium-style constructor/prototype names and reject all operations.
+        // Do not add `document`, `window`, `Node`, `Document`, `Element`,
+        // `HTMLElement`, a `getSelection` result, or any traversal/range/view
+        // instance here; host page contexts must install real bindings.
+        for (name, methods, constants) in [
+            (
+                "Range",
+                &[
+                    ("setStart", 2),
+                    ("setEnd", 2),
+                    ("setStartBefore", 1),
+                    ("setStartAfter", 1),
+                    ("setEndBefore", 1),
+                    ("setEndAfter", 1),
+                    ("collapse", 1),
+                    ("selectNode", 1),
+                    ("selectNodeContents", 1),
+                    ("compareBoundaryPoints", 2),
+                    ("deleteContents", 0),
+                    ("extractContents", 0),
+                    ("cloneContents", 0),
+                    ("insertNode", 1),
+                    ("surroundContents", 1),
+                    ("cloneRange", 0),
+                    ("detach", 0),
+                    ("isPointInRange", 2),
+                    ("comparePoint", 2),
+                    ("intersectsNode", 1),
+                    ("getClientRects", 0),
+                    ("getBoundingClientRect", 0),
+                    ("createContextualFragment", 1),
+                    ("toString", 0),
+                ][..],
+                &[
+                    ("START_TO_START", 0),
+                    ("START_TO_END", 1),
+                    ("END_TO_END", 2),
+                    ("END_TO_START", 3),
+                ][..],
+            ),
+            ("StaticRange", &[][..], &[][..]),
+            (
+                "Selection",
+                &[
+                    ("getRangeAt", 1),
+                    ("addRange", 1),
+                    ("removeRange", 1),
+                    ("removeAllRanges", 0),
+                    ("empty", 0),
+                    ("collapse", 2),
+                    ("setPosition", 2),
+                    ("collapseToStart", 0),
+                    ("collapseToEnd", 0),
+                    ("extend", 2),
+                    ("setBaseAndExtent", 4),
+                    ("selectAllChildren", 1),
+                    ("deleteFromDocument", 0),
+                    ("containsNode", 2),
+                    ("modify", 3),
+                    ("toString", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "TreeWalker",
+                &[
+                    ("parentNode", 0),
+                    ("firstChild", 0),
+                    ("lastChild", 0),
+                    ("previousSibling", 0),
+                    ("nextSibling", 0),
+                    ("previousNode", 0),
+                    ("nextNode", 0),
+                ][..],
+                &[][..],
+            ),
+            (
+                "NodeIterator",
+                &[("nextNode", 0), ("previousNode", 0), ("detach", 0)][..],
+                &[][..],
+            ),
+            ("DOMRectList", &[("item", 1)][..], &[][..]),
+            ("CaretPosition", &[("getClientRect", 0)][..], &[][..]),
+            ("VisualViewport", &[][..], &[][..]),
+            ("BarProp", &[][..], &[][..]),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, constants),
+                    name,
+                ),
+            );
+        }
+        globals.insert(
+            "NodeFilter".into(),
+            finalize_ctor(make_unsupported_node_filter_constructor(), "NodeFilter"),
+        );
+
         // ── Fetch / network and body APIs (fail-closed) ─────────────────────
         //
         // Fetch, XHR, streams, and request/response body wrappers require host
@@ -17842,6 +17986,16 @@ mod tests {
         assert!(globals.contains_key("history"));
         assert!(globals.contains_key("MutationObserver"));
         assert!(globals.contains_key("MutationRecord"));
+        assert!(globals.contains_key("Range"));
+        assert!(globals.contains_key("StaticRange"));
+        assert!(globals.contains_key("Selection"));
+        assert!(globals.contains_key("TreeWalker"));
+        assert!(globals.contains_key("NodeIterator"));
+        assert!(globals.contains_key("NodeFilter"));
+        assert!(globals.contains_key("DOMRectList"));
+        assert!(globals.contains_key("CaretPosition"));
+        assert!(globals.contains_key("VisualViewport"));
+        assert!(globals.contains_key("BarProp"));
         assert!(globals.contains_key("IntersectionObserver"));
         assert!(globals.contains_key("IntersectionObserverEntry"));
         assert!(globals.contains_key("ResizeObserver"));
@@ -18153,6 +18307,65 @@ mod tests {
         assert_eval_true("typeof Document === 'undefined'");
         assert_eval_true("typeof Element === 'undefined'");
         assert_eval_true("typeof HTMLElement === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_selection_range_view_constructors_exist_but_fail_closed() {
+        for name in [
+            "Range",
+            "StaticRange",
+            "Selection",
+            "TreeWalker",
+            "NodeIterator",
+            "NodeFilter",
+            "DOMRectList",
+            "CaretPosition",
+            "VisualViewport",
+            "BarProp",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_true(&format!("typeof {name}.prototype === 'object'"));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_true("Range.START_TO_START === 0 && Range.prototype.END_TO_START === 3");
+        assert_eval_true(
+            "NodeFilter.FILTER_ACCEPT === 1 && NodeFilter.SHOW_ELEMENT === 1 && NodeFilter.SHOW_ALL === 4294967295",
+        );
+
+        assert_eval_true("typeof Range.prototype.setStart === 'function'");
+        assert_eval_true("typeof Range.prototype.getClientRects === 'function'");
+        assert_eval_true("typeof Range.prototype.createContextualFragment === 'function'");
+        assert_eval_true("typeof Selection.prototype.getRangeAt === 'function'");
+        assert_eval_true("typeof Selection.prototype.deleteFromDocument === 'function'");
+        assert_eval_true("typeof TreeWalker.prototype.nextNode === 'function'");
+        assert_eval_true("typeof NodeIterator.prototype.previousNode === 'function'");
+        assert_eval_true("typeof DOMRectList.prototype.item === 'function'");
+        assert_eval_true("typeof CaretPosition.prototype.getClientRect === 'function'");
+
+        assert_eval_type_error("Range.prototype.setStart.call({}, {}, 0)");
+        assert_eval_type_error("Range.prototype.getClientRects.call({})");
+        assert_eval_type_error("Range.prototype.createContextualFragment.call({}, '<p>x</p>')");
+        assert_eval_type_error("Selection.prototype.getRangeAt.call({}, 0)");
+        assert_eval_type_error("Selection.prototype.deleteFromDocument.call({})");
+        assert_eval_type_error("TreeWalker.prototype.nextNode.call({})");
+        assert_eval_type_error("NodeIterator.prototype.previousNode.call({})");
+        assert_eval_type_error("DOMRectList.prototype.item.call({}, 0)");
+        assert_eval_type_error("CaretPosition.prototype.getClientRect.call({})");
+    }
+
+    #[test]
+    fn e2e_selection_range_host_entry_points_remain_absent() {
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof Node === 'undefined'");
+        assert_eval_true("typeof Document === 'undefined'");
+        assert_eval_true("typeof Element === 'undefined'");
+        assert_eval_true("typeof HTMLElement === 'undefined'");
+        assert_eval_true("typeof getSelection === 'undefined'");
     }
 
     #[test]
