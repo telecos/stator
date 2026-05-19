@@ -14364,6 +14364,17 @@ fn make_dataview() -> JsValue {
                 }
                 _ => 0,
             };
+            {
+                let buffer = buf_rc.borrow();
+                if buffer.detached {
+                    return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+                }
+                if offset > buffer.data.len() {
+                    return Err(StatorError::RangeError(
+                        "Start offset is outside the bounds of the buffer".into(),
+                    ));
+                }
+            }
             let length = match args.get(2) {
                 Some(v) if !v.is_undefined() => {
                     Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
@@ -41377,6 +41388,20 @@ mod tests {
     fn e2e_dataview_constructor_rejects_invalid_length() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(8), 4, 5); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_checks_detached_before_length_conversion() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var converted = false; buf.transfer(); try { new DataView(buf, 0, { valueOf: function() { converted = true; return 1; } }); false; } catch (e) { e instanceof TypeError && converted === false; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_checks_offset_bounds_before_length_conversion() {
+        assert_eval_true(
+            "var converted = false; try { new DataView(new ArrayBuffer(4), 5, { valueOf: function() { converted = true; return 1; } }); false; } catch (e) { e instanceof RangeError && converted === false; }",
         );
     }
 
