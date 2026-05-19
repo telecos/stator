@@ -16198,41 +16198,34 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 "XMLHttpRequest",
             ),
         );
-        globals.insert(
-            "ReadableStream".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("ReadableStream"),
-                "ReadableStream",
-            ),
-        );
-        globals.insert(
-            "TextEncoderStream".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("TextEncoderStream"),
-                "TextEncoderStream",
-            ),
-        );
-        globals.insert(
-            "TextDecoderStream".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("TextDecoderStream"),
-                "TextDecoderStream",
-            ),
-        );
-        globals.insert(
-            "CompressionStream".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("CompressionStream"),
-                "CompressionStream",
-            ),
-        );
-        globals.insert(
-            "DecompressionStream".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("DecompressionStream"),
-                "DecompressionStream",
-            ),
-        );
+        // ── Web Streams (fail-closed) ───────────────────────────────────────
+        // Streams need host-integrated queues, backpressure, promises, locking,
+        // and event-loop scheduling. Expose Chromium-compatible globals, but
+        // throw instead of faking asynchronous stream behavior.
+        for name in [
+            "ReadableStream",
+            "WritableStream",
+            "TransformStream",
+            "ReadableStreamDefaultReader",
+            "ReadableStreamBYOBReader",
+            "ReadableStreamDefaultController",
+            "ReadableByteStreamController",
+            "ReadableStreamBYOBRequest",
+            "WritableStreamDefaultWriter",
+            "WritableStreamDefaultController",
+            "TransformStreamDefaultController",
+            "ByteLengthQueuingStrategy",
+            "CountQueuingStrategy",
+            "TextEncoderStream",
+            "TextDecoderStream",
+            "CompressionStream",
+            "DecompressionStream",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
 
         // ── Web Storage (fail-closed) ───────────────────────────────────────
         // Storage is host-integrated and this standalone engine has no backing
@@ -17370,6 +17363,18 @@ mod tests {
         assert!(globals.contains_key("File"));
         assert!(globals.contains_key("XMLHttpRequest"));
         assert!(globals.contains_key("ReadableStream"));
+        assert!(globals.contains_key("WritableStream"));
+        assert!(globals.contains_key("TransformStream"));
+        assert!(globals.contains_key("ReadableStreamDefaultReader"));
+        assert!(globals.contains_key("ReadableStreamBYOBReader"));
+        assert!(globals.contains_key("ReadableStreamDefaultController"));
+        assert!(globals.contains_key("ReadableByteStreamController"));
+        assert!(globals.contains_key("ReadableStreamBYOBRequest"));
+        assert!(globals.contains_key("WritableStreamDefaultWriter"));
+        assert!(globals.contains_key("WritableStreamDefaultController"));
+        assert!(globals.contains_key("TransformStreamDefaultController"));
+        assert!(globals.contains_key("ByteLengthQueuingStrategy"));
+        assert!(globals.contains_key("CountQueuingStrategy"));
         assert!(globals.contains_key("TextEncoderStream"));
         assert!(globals.contains_key("TextDecoderStream"));
         assert!(globals.contains_key("CompressionStream"));
@@ -17619,6 +17624,18 @@ mod tests {
             "File",
             "XMLHttpRequest",
             "ReadableStream",
+            "WritableStream",
+            "TransformStream",
+            "ReadableStreamDefaultReader",
+            "ReadableStreamBYOBReader",
+            "ReadableStreamDefaultController",
+            "ReadableByteStreamController",
+            "ReadableStreamBYOBRequest",
+            "WritableStreamDefaultWriter",
+            "WritableStreamDefaultController",
+            "TransformStreamDefaultController",
+            "ByteLengthQueuingStrategy",
+            "CountQueuingStrategy",
             "TextEncoderStream",
             "TextDecoderStream",
             "CompressionStream",
@@ -17638,6 +17655,18 @@ mod tests {
         assert_eval_type_error("new File(['body'], 'body.txt')");
         assert_eval_type_error("new XMLHttpRequest()");
         assert_eval_type_error("new ReadableStream({ start() {} })");
+        assert_eval_type_error("new WritableStream({ write() {} })");
+        assert_eval_type_error("new TransformStream({ transform() {} })");
+        assert_eval_type_error("new ReadableStreamDefaultReader({})");
+        assert_eval_type_error("new ReadableStreamBYOBReader({})");
+        assert_eval_type_error("new ReadableStreamDefaultController()");
+        assert_eval_type_error("new ReadableByteStreamController()");
+        assert_eval_type_error("new ReadableStreamBYOBRequest()");
+        assert_eval_type_error("new WritableStreamDefaultWriter({})");
+        assert_eval_type_error("new WritableStreamDefaultController()");
+        assert_eval_type_error("new TransformStreamDefaultController()");
+        assert_eval_type_error("new ByteLengthQueuingStrategy({ highWaterMark: 1 })");
+        assert_eval_type_error("new CountQueuingStrategy({ highWaterMark: 1 })");
         assert_eval_type_error("new TextEncoderStream()");
         assert_eval_type_error("new TextDecoderStream('utf-8')");
         assert_eval_type_error("new CompressionStream('gzip')");
