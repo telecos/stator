@@ -3064,8 +3064,39 @@ fn make_crypto() -> JsValue {
             Ok(target.clone())
         }),
     );
+    props.insert(
+        "randomUUID".into(),
+        builtin_fn("randomUUID", 0, |_args| {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).map_err(|err| {
+                StatorError::Error(format!(
+                    "crypto.randomUUID: secure random source failed: {err}"
+                ))
+            })?;
+            // RFC 4122 / 9562 version 4 + variant bits.
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            Ok(JsValue::String(Rc::from(format_uuid_v4(&bytes))))
+        }),
+    );
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Format 16 bytes as a lowercase RFC 4122 / 9562 UUID string
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Caller is responsible
+/// for setting the version and variant bits in `bytes`.
+fn format_uuid_v4(bytes: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 // ── Math ─────────────────────────────────────────────────────────────────────
@@ -37562,6 +37593,59 @@ mod tests {
     fn e2e_crypto_no_subtle_property() {
         // Subtle crypto is not implemented; absence is acceptable fail-closed behavior.
         assert_eval_true("typeof crypto.subtle === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_exists() {
+        assert_eval_true("typeof crypto.randomUUID === 'function'");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_returns_string() {
+        assert_eval_true("typeof crypto.randomUUID() === 'string'");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_length_36() {
+        assert_eval_true("crypto.randomUUID().length === 36");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_matches_rfc4122_v4_shape() {
+        // 8-4-4-4-12 lowercase hex, version nibble = 4, variant nibble in 8/9/a/b.
+        assert_eval_true(
+            "/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID())",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_is_lowercase() {
+        assert_eval_true("var u = crypto.randomUUID(); u === u.toLowerCase()");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_version_nibble_is_4() {
+        assert_eval_true("crypto.randomUUID().charAt(14) === '4'");
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_variant_nibble_is_rfc4122() {
+        assert_eval_true(
+            "var c = crypto.randomUUID().charAt(19); c === '8' || c === '9' || c === 'a' || c === 'b'",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_unique_across_calls() {
+        // Collisions for v4 UUIDs are astronomically unlikely; this is non-flaky in practice.
+        assert_eval_true(
+            "var s = new Set(); for (var i = 0; i < 64; i++) { s.add(crypto.randomUUID()); } s.size === 64",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_random_uuid_ignores_extra_arguments() {
+        assert_eval_true("typeof crypto.randomUUID(1, 2, 3) === 'string'");
     }
 
     /// `structuredClone` copies nested plain objects and arrays.
