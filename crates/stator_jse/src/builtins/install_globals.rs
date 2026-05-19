@@ -14442,15 +14442,38 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         }),
     );
 
-    // TypedArray.from(source)
+    // %TypedArray%.from(source, mapfn?, thisArg?) — §23.2.2.1.
+    //
+    // When `mapfn` is supplied, it must be callable and is invoked with
+    // `(kValue, k)` and `thisArg` for each element of the source, with the
+    // return value used in place of the original element before the typed
+    // array is materialized.
     props.insert(
         "from".into(),
         native(move |args| {
             let source = args.first().ok_or_else(|| {
                 StatorError::TypeError("TypedArray.from requires a source value".into())
             })?;
-            let source = collect_typed_array_source_values(source)?;
-            let ta = typed_array_from_values(kind, &source)?;
+            let map_fn = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let has_map_fn = !matches!(map_fn, JsValue::Undefined);
+            if has_map_fn && !is_callable(&map_fn) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.from mapfn must be callable".into(),
+                ));
+            }
+            let mut values = collect_typed_array_source_values(source)?;
+            if has_map_fn {
+                for (index, value) in values.iter_mut().enumerate() {
+                    let mapped = call_callback_with_this(
+                        &map_fn,
+                        this_arg.clone(),
+                        vec![value.clone(), JsValue::Smi(index as i32)],
+                    )?;
+                    *value = mapped;
+                }
+            }
+            let ta = typed_array_from_values(kind, &values)?;
             let inner = Rc::new(RefCell::new(ta));
             Ok(make_typed_array_instance(kind, inner, None))
         }),
@@ -41705,7 +41728,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_buffer_property() {
         assert_eval_true("new Uint8Array(4).buffer.byteLength === 4");
     }
@@ -41859,7 +41881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_object_to_string_uses_tag() {
         assert_eval_true(
             "Object.prototype.toString.call(new Float64Array(1)) === '[object Float64Array]'",
@@ -41888,7 +41909,6 @@ mod tests {
     // ── New TypedArray method e2e tests ──────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_sort_numeric_default() {
         assert_eval_true(
             "var a = new Int32Array([30, 10, 20]); a.sort(); a[0] === 10 && a[1] === 20 && a[2] === 30",
@@ -41896,7 +41916,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_sort_float64_negative() {
         assert_eval_true(
             "var a = new Float64Array([3.5, -1.5, 0, 2.5]); a.sort(); a[0] === -1.5 && a[1] === 0 && a[2] === 2.5 && a[3] === 3.5",
@@ -42154,7 +42173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_map_double() {
         assert_eval_true(
             "var m = new Int32Array([1,2,3]).map(function(x) { return x * 2; }); m[0] === 2 && m[1] === 4 && m[2] === 6",
@@ -42162,7 +42180,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_map_preserves_kind() {
         assert_eval_true(
             "new Uint8Array([1,2,3]).map(function(x) { return x * 2; }).constructor === Uint8Array",
@@ -42170,7 +42187,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_filter_basic() {
         assert_eval_true(
             "var f = new Int32Array([1,2,3,4]).filter(function(x) { return x > 2; }); f.length === 2 && f[0] === 3 && f[1] === 4",
@@ -42178,7 +42194,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_filter_preserves_kind() {
         assert_eval_true(
             "new Uint8Array([1,2,3]).filter(function(x) { return x > 1; }).constructor === Uint8Array",
@@ -42223,7 +42238,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_reverse_basic() {
         assert_eval_true(
             "var a = new Int32Array([1,2,3]); a.reverse(); a[0] === 3 && a[1] === 2 && a[2] === 1",
@@ -42350,7 +42364,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_static_of_multiple() {
         assert_eval_true(
             "var a = Int32Array.of(1, 2, 3); a.length === 3 && a[0] === 1 && a[2] === 3",
@@ -42358,7 +42371,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_from_with_map_fn() {
         assert_eval_true(
             "var a = Uint8Array.from([1,2,3], function(x) { return x * 2; }); a[0] === 2 && a[1] === 4 && a[2] === 6",
@@ -42366,9 +42378,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_from_preserves_kind() {
         assert_eval_true("Uint8Array.from([1,2,3]).constructor === Uint8Array");
+    }
+
+    #[test]
+    fn e2e_typed_array_from_map_fn_receives_index() {
+        assert_eval_true(
+            "var a = Uint8Array.from([10,20,30], function(v, i) { return v + i; }); a[0] === 10 && a[1] === 21 && a[2] === 32",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_map_fn_honors_this_arg() {
+        assert_eval_true(
+            "var a = Int32Array.from([1,2,3], function(v) { return v * this.k; }, { k: 5 }); a[0] === 5 && a[1] === 10 && a[2] === 15",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_rejects_non_callable_map_fn() {
+        assert_eval_true(
+            "var threw = false; try { Uint8Array.from([1,2,3], 'nope'); } catch (e) { threw = e instanceof TypeError; } threw",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_undefined_map_fn_is_noop() {
+        assert_eval_true(
+            "var a = Uint8Array.from([1,2,3], undefined); a[0] === 1 && a[1] === 2 && a[2] === 3",
+        );
     }
 
     #[test]
@@ -42394,7 +42433,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_typed_array_fill_returns_receiver_check() {
         assert_eval_true(
             "var a = new Int32Array(3); var b = a.fill(5); b === a && a[0] === 5 && a[2] === 5",
