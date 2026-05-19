@@ -16923,6 +16923,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 "PerformanceObserverEntryList",
             ),
         );
+        globals.insert(
+            "ResizeObserverSize".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("ResizeObserverSize"),
+                "ResizeObserverSize",
+            ),
+        );
 
         // ── Performance / User Timing / Resource Timing (fail-closed) ──────
         //
@@ -17062,6 +17069,63 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "cancelIdleCallback".into(),
             make_unsupported_web_function("cancelIdleCallback", 1),
         );
+
+        // ── CSSOM / geometry / animations / visual media (fail-closed) ─────
+        //
+        // CSSOM constructors and the `CSS` namespace require a CSS parser,
+        // stylesheet lifetime tracking, rule mutation semantics, and style
+        // recalculation. Geometry and Web Animations objects require layout
+        // trees, transform math, document timelines, and rendering integration.
+        // Font, media-query, screen, and orientation surfaces require host
+        // font loading, viewport/media evaluation, and OS display state. Expose
+        // the Chromium globals page scripts commonly probe, but reject all
+        // construction/invocation rather than returning fake style, geometry,
+        // timeline, font, media-query, screen, or orientation data.
+        globals.insert(
+            "CSS".into(),
+            make_unsupported_web_object(
+                "CSS",
+                &[("supports", 1), ("escape", 1), ("registerProperty", 1)],
+            ),
+        );
+        for name in [
+            "CSSStyleSheet",
+            "CSSRule",
+            "CSSStyleRule",
+            "CSSMediaRule",
+            "CSSSupportsRule",
+            "CSSImportRule",
+            "CSSFontFaceRule",
+            "CSSKeyframesRule",
+            "CSSKeyframeRule",
+            "CSSStyleDeclaration",
+            "StyleSheet",
+            "StyleSheetList",
+            "MediaList",
+            "DOMRect",
+            "DOMRectReadOnly",
+            "DOMPoint",
+            "DOMPointReadOnly",
+            "DOMMatrix",
+            "DOMMatrixReadOnly",
+            "DOMQuad",
+            "Animation",
+            "AnimationEffect",
+            "KeyframeEffect",
+            "DocumentTimeline",
+            "AnimationTimeline",
+            "FontFace",
+            "FontFaceSet",
+            "MediaQueryList",
+            "MediaQueryListEvent",
+            "Screen",
+            "ScreenOrientation",
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(make_unsupported_web_constructor(name), name),
+            );
+        }
 
         // ── Text encoding (WHATWG Encoding Standard) ────────────────────────
         globals.insert(
@@ -17885,6 +17949,7 @@ mod tests {
         assert!(globals.contains_key("ResizeObserverEntry"));
         assert!(globals.contains_key("PerformanceObserver"));
         assert!(globals.contains_key("PerformanceObserverEntryList"));
+        assert!(globals.contains_key("ResizeObserverSize"));
         assert!(globals.contains_key("Performance"));
         assert!(globals.contains_key("PerformanceEntry"));
         assert!(globals.contains_key("PerformanceMark"));
@@ -17904,6 +17969,38 @@ mod tests {
         assert!(globals.contains_key("cancelAnimationFrame"));
         assert!(globals.contains_key("requestIdleCallback"));
         assert!(globals.contains_key("cancelIdleCallback"));
+        assert!(globals.contains_key("CSS"));
+        assert!(globals.contains_key("CSSStyleSheet"));
+        assert!(globals.contains_key("CSSRule"));
+        assert!(globals.contains_key("CSSStyleRule"));
+        assert!(globals.contains_key("CSSMediaRule"));
+        assert!(globals.contains_key("CSSSupportsRule"));
+        assert!(globals.contains_key("CSSImportRule"));
+        assert!(globals.contains_key("CSSFontFaceRule"));
+        assert!(globals.contains_key("CSSKeyframesRule"));
+        assert!(globals.contains_key("CSSKeyframeRule"));
+        assert!(globals.contains_key("CSSStyleDeclaration"));
+        assert!(globals.contains_key("StyleSheet"));
+        assert!(globals.contains_key("StyleSheetList"));
+        assert!(globals.contains_key("MediaList"));
+        assert!(globals.contains_key("DOMRect"));
+        assert!(globals.contains_key("DOMRectReadOnly"));
+        assert!(globals.contains_key("DOMPoint"));
+        assert!(globals.contains_key("DOMPointReadOnly"));
+        assert!(globals.contains_key("DOMMatrix"));
+        assert!(globals.contains_key("DOMMatrixReadOnly"));
+        assert!(globals.contains_key("DOMQuad"));
+        assert!(globals.contains_key("Animation"));
+        assert!(globals.contains_key("AnimationEffect"));
+        assert!(globals.contains_key("KeyframeEffect"));
+        assert!(globals.contains_key("DocumentTimeline"));
+        assert!(globals.contains_key("AnimationTimeline"));
+        assert!(globals.contains_key("FontFace"));
+        assert!(globals.contains_key("FontFaceSet"));
+        assert!(globals.contains_key("MediaQueryList"));
+        assert!(globals.contains_key("MediaQueryListEvent"));
+        assert!(globals.contains_key("Screen"));
+        assert!(globals.contains_key("ScreenOrientation"));
     }
 
     #[test]
@@ -18034,6 +18131,7 @@ mod tests {
             "ResizeObserverEntry",
             "PerformanceObserver",
             "PerformanceObserverEntryList",
+            "ResizeObserverSize",
         ] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
@@ -18045,6 +18143,7 @@ mod tests {
         assert_eval_type_error("new IntersectionObserver(function () {})");
         assert_eval_type_error("new ResizeObserver(function () {})");
         assert_eval_type_error("new PerformanceObserver(function () {})");
+        assert_eval_type_error("new ResizeObserverSize()");
     }
 
     #[test]
@@ -18064,6 +18163,121 @@ mod tests {
         assert_eval_type_error("cancelAnimationFrame(1)");
         assert_eval_type_error("requestIdleCallback(function () {})");
         assert_eval_type_error("cancelIdleCallback(1)");
+    }
+
+    #[test]
+    fn e2e_css_namespace_exists_but_operations_fail_closed() {
+        assert_eval_true("typeof CSS === 'object' && CSS !== null");
+        assert_eval_type_error("CSS.supports('display', 'grid')");
+        assert_eval_type_error("CSS.supports('display: grid')");
+        assert_eval_type_error("CSS.escape('edge stator')");
+        assert_eval_type_error(
+            "CSS.registerProperty({ name: '--x', syntax: '<length>', inherits: false, initialValue: '0px' })",
+        );
+    }
+
+    #[test]
+    fn e2e_cssom_style_constructors_exist_but_fail_closed() {
+        for name in [
+            "CSSStyleSheet",
+            "CSSRule",
+            "CSSStyleRule",
+            "CSSMediaRule",
+            "CSSSupportsRule",
+            "CSSImportRule",
+            "CSSFontFaceRule",
+            "CSSKeyframesRule",
+            "CSSKeyframeRule",
+            "CSSStyleDeclaration",
+            "StyleSheet",
+            "StyleSheetList",
+            "MediaList",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new CSSStyleSheet()");
+        assert_eval_type_error("new CSSStyleRule()");
+    }
+
+    #[test]
+    fn e2e_geometry_constructors_exist_but_fail_closed() {
+        for name in [
+            "DOMRect",
+            "DOMRectReadOnly",
+            "DOMPoint",
+            "DOMPointReadOnly",
+            "DOMMatrix",
+            "DOMMatrixReadOnly",
+            "DOMQuad",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new DOMRect(0, 0, 1, 1)");
+        assert_eval_type_error("new DOMPoint(1, 2, 3, 4)");
+        assert_eval_type_error("new DOMMatrix([1, 0, 0, 1, 0, 0])");
+    }
+
+    #[test]
+    fn e2e_animation_constructors_exist_but_fail_closed() {
+        for name in [
+            "Animation",
+            "AnimationEffect",
+            "KeyframeEffect",
+            "DocumentTimeline",
+            "AnimationTimeline",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new KeyframeEffect(null, [{ opacity: 1 }])");
+        assert_eval_type_error("new DocumentTimeline({ originTime: 0 })");
+    }
+
+    #[test]
+    fn e2e_font_media_screen_constructors_exist_but_fail_closed() {
+        for name in [
+            "FontFace",
+            "FontFaceSet",
+            "MediaQueryList",
+            "MediaQueryListEvent",
+            "Screen",
+            "ScreenOrientation",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new FontFace('EdgeStator', 'url(font.woff2)')");
+        assert_eval_type_error("new MediaQueryListEvent('change', { matches: true })");
+        assert_eval_type_error("new ScreenOrientation()");
+    }
+
+    /// Entry points that would vend fake document/window/screen/media-query
+    /// host objects remain absent; their constructors above only fail closed
+    /// for feature detection.
+    #[test]
+    fn e2e_visual_host_entry_points_remain_absent() {
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof screen === 'undefined'");
+        assert_eval_true("typeof matchMedia === 'undefined'");
     }
 
     /// Performance timeline constructors (`Performance`, `PerformanceEntry`
