@@ -16923,6 +16923,129 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 "PerformanceObserverEntryList",
             ),
         );
+
+        // ── Performance / User Timing / Resource Timing (fail-closed) ──────
+        //
+        // The Performance APIs (`Performance`, `PerformanceEntry` and its
+        // subclasses for marks, measures, navigation/resource/paint/event/
+        // long-task timing, largest-contentful-paint, layout-shift and
+        // visibility-state entries) require a browser timeline, a resource
+        // loader, a rendering pipeline, an event loop with task attribution
+        // and a navigation/painting/scheduling host integration to populate
+        // real entries. This standalone engine has none of those, so the
+        // constructors are exposed (because product code commonly probes
+        // them via `typeof PerformanceEntry === 'function'`) but every
+        // construction fails with a `TypeError` instead of pretending to
+        // produce timeline entries.
+        //
+        // The `performance` global object itself is intentionally left
+        // absent. Exposing a stub object would invite product code to read
+        // `performance.now()`, `performance.timeOrigin`,
+        // `performance.getEntries*`, `performance.mark`, `performance.measure`,
+        // `performance.timing` and `performance.navigation` and silently
+        // receive fake or zero values; that is worse than the global being
+        // undefined. When a host eventually wires a real timeline into the
+        // engine it can install `performance` itself; until then the
+        // absence is asserted by `e2e_performance_global_remains_absent`.
+        globals.insert(
+            "Performance".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("Performance"),
+                "Performance",
+            ),
+        );
+        globals.insert(
+            "PerformanceEntry".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceEntry"),
+                "PerformanceEntry",
+            ),
+        );
+        globals.insert(
+            "PerformanceMark".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceMark"),
+                "PerformanceMark",
+            ),
+        );
+        globals.insert(
+            "PerformanceMeasure".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceMeasure"),
+                "PerformanceMeasure",
+            ),
+        );
+        globals.insert(
+            "PerformanceResourceTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceResourceTiming"),
+                "PerformanceResourceTiming",
+            ),
+        );
+        globals.insert(
+            "PerformanceNavigationTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceNavigationTiming"),
+                "PerformanceNavigationTiming",
+            ),
+        );
+        globals.insert(
+            "PerformancePaintTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformancePaintTiming"),
+                "PerformancePaintTiming",
+            ),
+        );
+        globals.insert(
+            "PerformanceEventTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceEventTiming"),
+                "PerformanceEventTiming",
+            ),
+        );
+        globals.insert(
+            "PerformanceLongTaskTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("PerformanceLongTaskTiming"),
+                "PerformanceLongTaskTiming",
+            ),
+        );
+        globals.insert(
+            "TaskAttributionTiming".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("TaskAttributionTiming"),
+                "TaskAttributionTiming",
+            ),
+        );
+        globals.insert(
+            "LargestContentfulPaint".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("LargestContentfulPaint"),
+                "LargestContentfulPaint",
+            ),
+        );
+        globals.insert(
+            "LayoutShift".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("LayoutShift"),
+                "LayoutShift",
+            ),
+        );
+        globals.insert(
+            "LayoutShiftAttribution".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("LayoutShiftAttribution"),
+                "LayoutShiftAttribution",
+            ),
+        );
+        globals.insert(
+            "VisibilityStateEntry".into(),
+            finalize_ctor(
+                make_unsupported_web_constructor("VisibilityStateEntry"),
+                "VisibilityStateEntry",
+            ),
+        );
+
         globals.insert(
             "requestAnimationFrame".into(),
             make_unsupported_web_function("requestAnimationFrame", 1),
@@ -17762,6 +17885,21 @@ mod tests {
         assert!(globals.contains_key("ResizeObserverEntry"));
         assert!(globals.contains_key("PerformanceObserver"));
         assert!(globals.contains_key("PerformanceObserverEntryList"));
+        assert!(globals.contains_key("Performance"));
+        assert!(globals.contains_key("PerformanceEntry"));
+        assert!(globals.contains_key("PerformanceMark"));
+        assert!(globals.contains_key("PerformanceMeasure"));
+        assert!(globals.contains_key("PerformanceResourceTiming"));
+        assert!(globals.contains_key("PerformanceNavigationTiming"));
+        assert!(globals.contains_key("PerformancePaintTiming"));
+        assert!(globals.contains_key("PerformanceEventTiming"));
+        assert!(globals.contains_key("PerformanceLongTaskTiming"));
+        assert!(globals.contains_key("TaskAttributionTiming"));
+        assert!(globals.contains_key("LargestContentfulPaint"));
+        assert!(globals.contains_key("LayoutShift"));
+        assert!(globals.contains_key("LayoutShiftAttribution"));
+        assert!(globals.contains_key("VisibilityStateEntry"));
+        assert!(!globals.contains_key("performance"));
         assert!(globals.contains_key("requestAnimationFrame"));
         assert!(globals.contains_key("cancelAnimationFrame"));
         assert!(globals.contains_key("requestIdleCallback"));
@@ -17926,6 +18064,54 @@ mod tests {
         assert_eval_type_error("cancelAnimationFrame(1)");
         assert_eval_type_error("requestIdleCallback(function () {})");
         assert_eval_type_error("cancelIdleCallback(1)");
+    }
+
+    /// Performance timeline constructors (`Performance`, `PerformanceEntry`
+    /// and its subclasses for marks, measures, navigation/resource/paint/
+    /// event/long-task timing, largest-contentful-paint, layout-shift and
+    /// visibility-state entries) are exposed so feature detection succeeds,
+    /// but construction fails closed because the engine has no browser
+    /// timeline, resource loader, rendering pipeline, navigation scheduler
+    /// or task-attribution machinery to populate real entries.
+    #[test]
+    fn e2e_performance_timeline_constructors_exist_but_fail_closed() {
+        for name in [
+            "Performance",
+            "PerformanceEntry",
+            "PerformanceMark",
+            "PerformanceMeasure",
+            "PerformanceResourceTiming",
+            "PerformanceNavigationTiming",
+            "PerformancePaintTiming",
+            "PerformanceEventTiming",
+            "PerformanceLongTaskTiming",
+            "TaskAttributionTiming",
+            "LargestContentfulPaint",
+            "LayoutShift",
+            "LayoutShiftAttribution",
+            "VisibilityStateEntry",
+        ] {
+            assert_eval_true(&format!(
+                "typeof {name} === 'function' && {name}.name === '{name}'"
+            ));
+            assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
+        }
+
+        assert_eval_type_error("new PerformanceMark('start')");
+        assert_eval_type_error("new PerformanceMark('start', { startTime: 0 })");
+    }
+
+    /// The `performance` global object is intentionally absent. Exposing a
+    /// stub would invite product code to read `performance.now()`,
+    /// `performance.timeOrigin`, `performance.getEntries*`,
+    /// `performance.mark`, `performance.measure`, `performance.timing` or
+    /// `performance.navigation` and silently receive fake or zero values,
+    /// which is worse than the global being undefined. Until a host wires
+    /// a real timeline into the engine, `performance` stays undefined.
+    #[test]
+    fn e2e_performance_global_remains_absent() {
+        assert_eval_true("typeof performance === 'undefined'");
     }
 
     /// Browser self-reference globals (`window`, `self`, `frames`, `parent`,
