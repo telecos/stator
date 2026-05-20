@@ -29202,16 +29202,42 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "HTMLMediaElement",
             "HTMLVideoElement",
             "HTMLCanvasElement",
+            "HTMLPictureElement",
+            "HTMLSourceElement",
+            "HTMLTrackElement",
             "MediaSource",
             "SourceBuffer",
+            "SourceBufferList",
             "MediaStream",
             "MediaStreamTrack",
+            "MediaStreamTrackEvent",
             "MediaRecorder",
             "OffscreenCanvas",
             "CanvasRenderingContext2D",
             "OffscreenCanvasRenderingContext2D",
             "ImageBitmap",
+            "ImageBitmapRenderingContext",
             "Path2D",
+            // Text tracks (subtitle/caption rendering requires a media element
+            // and parser the standalone engine does not provide).
+            "TextTrack",
+            "TextTrackList",
+            "TextTrackCue",
+            "TextTrackCueList",
+            "VTTCue",
+            "VTTRegion",
+            "TrackEvent",
+            // Media error / capabilities / Encrypted Media Extensions: every
+            // real instance requires platform decoders, CDMs, or capability
+            // probes that the standalone engine cannot back honestly.
+            "MediaError",
+            "MediaCapabilities",
+            "MediaKeys",
+            "MediaKeySession",
+            "MediaKeyStatusMap",
+            "MediaKeyMessageEvent",
+            "MediaKeySystemAccess",
+            "MediaEncryptedEvent",
         ] {
             globals.insert(
                 name.into(),
@@ -34639,21 +34665,43 @@ mod tests {
             "HTMLMediaElement",
             "HTMLVideoElement",
             "HTMLCanvasElement",
+            "HTMLPictureElement",
+            "HTMLSourceElement",
+            "HTMLTrackElement",
             "MediaSource",
             "SourceBuffer",
+            "SourceBufferList",
             "MediaStream",
             "MediaStreamTrack",
+            "MediaStreamTrackEvent",
             "MediaRecorder",
             "OffscreenCanvas",
             "CanvasRenderingContext2D",
             "OffscreenCanvasRenderingContext2D",
             "ImageBitmap",
+            "ImageBitmapRenderingContext",
             "Path2D",
+            "TextTrack",
+            "TextTrackList",
+            "TextTrackCue",
+            "TextTrackCueList",
+            "VTTCue",
+            "VTTRegion",
+            "TrackEvent",
+            "MediaError",
+            "MediaCapabilities",
+            "MediaKeys",
+            "MediaKeySession",
+            "MediaKeyStatusMap",
+            "MediaKeyMessageEvent",
+            "MediaKeySystemAccess",
+            "MediaEncryptedEvent",
         ] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
             ));
             assert_eval_type_error(&format!("{name}()"));
+            assert_eval_type_error(&format!("new {name}()"));
         }
 
         assert_eval_type_error("new Image()");
@@ -34665,6 +34713,40 @@ mod tests {
         assert_eval_type_error("new MediaRecorder({})");
         assert_eval_type_error("new OffscreenCanvas(64, 64)");
         assert_eval_type_error("new Path2D()");
+        assert_eval_type_error("new Path2D('M0 0 L10 10')");
+        assert_eval_type_error("new VTTCue(0, 1, 'hi')");
+        assert_eval_type_error("new MediaKeyMessageEvent('message', {})");
+        assert_eval_type_error("new MediaEncryptedEvent('encrypted', {})");
+        assert_eval_type_error("new TrackEvent('addtrack', {})");
+        assert_eval_type_error("new MediaStreamTrackEvent('addtrack', { track: null })");
+    }
+
+    /// Host entry points that would vend fake decoders, capture devices,
+    /// playback surfaces, or per-frame callbacks remain absent: the standalone
+    /// engine never exposes vendor-prefixed `requestAnimationFrame`,
+    /// `requestVideoFrameCallback`, `getDisplayMedia`, or
+    /// `navigator.mediaDevices`. Real `requestAnimationFrame` is itself
+    /// fail-closed (see `e2e_request_animation_frame_fails_closed`).
+    #[test]
+    fn e2e_media_capture_and_playback_host_entry_points_remain_absent() {
+        for name in [
+            "webkitRequestAnimationFrame",
+            "mozRequestAnimationFrame",
+            "msRequestAnimationFrame",
+            "oRequestAnimationFrame",
+            "webkitCancelAnimationFrame",
+            "mozCancelAnimationFrame",
+            "requestVideoFrameCallback",
+            "cancelVideoFrameCallback",
+            "getDisplayMedia",
+            "getUserMedia",
+            "webkitGetUserMedia",
+            "mozGetUserMedia",
+        ] {
+            assert_eval_true(&format!("typeof {name} === 'undefined'"));
+        }
+        assert_eval_true("typeof navigator === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
     }
 
     #[test]
