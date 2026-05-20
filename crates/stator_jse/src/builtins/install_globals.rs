@@ -32940,6 +32940,25 @@ mod tests {
     }
 
     #[test]
+    fn e2e_frame_and_idle_scheduling_do_not_return_fake_handles() {
+        assert_eval_true(
+            "var ran = false; var result = 'unset'; \
+             try { result = requestAnimationFrame(function () { ran = true; }); } catch (e) { result = 'threw'; } \
+             result === 'threw' && ran === false",
+        );
+        assert_eval_true(
+            "var ran = false; var result = 'unset'; \
+             try { result = requestIdleCallback(function () { ran = true; }); } catch (e) { result = 'threw'; } \
+             result === 'threw' && ran === false",
+        );
+    }
+
+    #[test]
+    fn e2e_scheduler_post_task_remains_absent_without_host_scheduler() {
+        assert_eval_true("typeof scheduler === 'undefined'");
+    }
+
+    #[test]
     fn e2e_css_namespace_exists_but_operations_fail_closed() {
         assert_eval_true("typeof CSS === 'object' && CSS !== null");
         assert_eval_type_error("CSS.supports('display', 'grid')");
@@ -55093,6 +55112,18 @@ mod tests {
     }
 
     #[test]
+    fn e2e_queue_microtask_errors_do_not_block_following_microtasks() {
+        global_eval(
+            "var order = []; \
+             queueMicrotask(function () { order.push('first'); throw new Error('boom'); }); \
+             queueMicrotask(function () { order.push('second'); });",
+        )
+        .unwrap();
+        drain_microtasks();
+        assert_eval_true("order.join(',') === 'first,second'");
+    }
+
+    #[test]
     fn e2e_queue_microtask_uses_fifo_order_with_promises() {
         global_eval(
             "var order = [];
@@ -55103,6 +55134,21 @@ mod tests {
         .unwrap();
         drain_microtasks();
         assert_eval_true("order.join(',') === 'queue-1,promise,queue-2'");
+    }
+
+    #[test]
+    fn e2e_queue_microtask_shares_queue_with_promises_enqueued_inside_callback() {
+        global_eval(
+            "var order = []; \
+             queueMicrotask(function () { \
+                 order.push('queue'); \
+                 Promise.resolve().then(function () { order.push('promise-inside'); }); \
+             }); \
+             Promise.resolve().then(function () { order.push('promise-before'); });",
+        )
+        .unwrap();
+        drain_microtasks();
+        assert_eval_true("order.join(',') === 'queue,promise-before,promise-inside'");
     }
 
     #[test]
@@ -55332,6 +55378,30 @@ mod tests {
         );
         assert_eval_true(
             "var intervalRan = false; try { setInterval(function () { intervalRan = true; }, 0); } catch (e) {} intervalRan === false",
+        );
+    }
+
+    #[test]
+    fn e2e_timer_globals_do_not_return_fake_handles() {
+        assert_eval_true(
+            "var ran = false; var result = 'unset'; \
+             try { result = setTimeout(function () { ran = true; }, 0); } catch (e) { result = 'threw'; } \
+             result === 'threw' && ran === false",
+        );
+        assert_eval_true(
+            "var ran = false; var result = 'unset'; \
+             try { result = setInterval(function () { ran = true; }, 0); } catch (e) { result = 'threw'; } \
+             result === 'threw' && ran === false",
+        );
+        assert_eval_true(
+            "var result = 'unset'; \
+             try { result = clearTimeout(1); } catch (e) { result = 'threw'; } \
+             result === 'threw'",
+        );
+        assert_eval_true(
+            "var result = 'unset'; \
+             try { result = clearInterval(1); } catch (e) { result = 'threw'; } \
+             result === 'threw'",
         );
     }
 
