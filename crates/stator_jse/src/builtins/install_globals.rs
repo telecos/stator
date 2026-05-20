@@ -34247,6 +34247,118 @@ mod tests {
         assert_eval_true("typeof onoffline === 'undefined'");
     }
 
+    /// Trusted Types is a host-integrated browser API: a real
+    /// `TrustedTypePolicyFactory` is owned by the document/CSP enforcement
+    /// pipeline, and `TrustedHTML` / `TrustedScript` / `TrustedScriptURL`
+    /// are only meaningful as opaque markers consumed by sink guards in the
+    /// HTML parser, script loader, and URL execution machinery. None of that
+    /// infrastructure exists in the standalone engine. Exposing a fake
+    /// `trustedTypes` factory or unforgeable wrapper types would let pages
+    /// believe they are sanitizing/marking content when nothing actually
+    /// gates execution — strictly worse than the API being absent.
+    #[test]
+    fn e2e_trusted_types_globals_remain_absent() {
+        assert_eval_true("typeof trustedTypes === 'undefined'");
+        assert_eval_true("typeof TrustedTypePolicyFactory === 'undefined'");
+        assert_eval_true("typeof TrustedTypePolicy === 'undefined'");
+        assert_eval_true("typeof TrustedHTML === 'undefined'");
+        assert_eval_true("typeof TrustedScript === 'undefined'");
+        assert_eval_true("typeof TrustedScriptURL === 'undefined'");
+        // Also reject access via globalThis to catch any accidental
+        // non-configurable own property installs.
+        assert_eval_true("!('trustedTypes' in globalThis)");
+        assert_eval_true("!('TrustedTypePolicyFactory' in globalThis)");
+        assert_eval_true("!('TrustedTypePolicy' in globalThis)");
+        assert_eval_true("!('TrustedHTML' in globalThis)");
+        assert_eval_true("!('TrustedScript' in globalThis)");
+        assert_eval_true("!('TrustedScriptURL' in globalThis)");
+    }
+
+    /// The Sanitizer API (`Sanitizer`, `SanitizerConfig`, `Element.setHTML`)
+    /// only has meaningful semantics when paired with the live HTML parser
+    /// and a DOM that can be walked and filtered. Stator deliberately does
+    /// not expose `Element`/`Document`, so a sanitizer can produce no
+    /// observable sanitized output. Returning fabricated "sanitized" strings
+    /// or a no-op `Sanitizer` would invite XSS by misleading callers, so
+    /// these globals are intentionally absent.
+    #[test]
+    fn e2e_sanitizer_api_remains_absent() {
+        assert_eval_true("typeof Sanitizer === 'undefined'");
+        assert_eval_true("typeof SanitizerConfig === 'undefined'");
+        assert_eval_true("!('Sanitizer' in globalThis)");
+        assert_eval_true("!('SanitizerConfig' in globalThis)");
+        // `setHTML` is a DOM Element method; with no Element/Document
+        // exposed, there is no receiver to host it on. Ensure no global
+        // helper has been added by accident.
+        assert_eval_true("typeof setHTML === 'undefined'");
+        assert_eval_true("typeof Element === 'undefined'");
+        assert_eval_true("typeof Document === 'undefined'");
+    }
+
+    /// CSP violation reporting is driven by the host: `securitypolicyviolation`
+    /// events are dispatched by the resource fetch / script execution
+    /// pipeline against the document, and the global `onsecuritypolicyviolation`
+    /// handler only fires when that pipeline observes a violation. Without
+    /// a document or fetch enforcement, the global handler cannot be reached.
+    /// Exposing it as an assignable slot would suggest installed handlers
+    /// run during normal operation when no violation reporting actually
+    /// occurs. The `SecurityPolicyViolationEvent` *constructor* stays
+    /// fail-closed and is covered by
+    /// `e2e_security_policy_violation_event_remains_fail_closed`.
+    #[test]
+    fn e2e_security_policy_violation_handler_globals_remain_absent() {
+        assert_eval_true("typeof onsecuritypolicyviolation === 'undefined'");
+        assert_eval_true("!('onsecuritypolicyviolation' in globalThis)");
+        // Related per-document/per-window reporting hooks must not appear
+        // either — they imply a document/window that Stator does not have.
+        assert_eval_true("typeof securityPolicyViolation === 'undefined'");
+        assert_eval_true("!('securityPolicyViolation' in globalThis)");
+        // Assigning to the slot must not magically materialize a handler
+        // property: writes to a non-existent host accessor become plain
+        // data writes on the global object, but reads through `typeof`
+        // before assignment must still report 'undefined'. After assignment
+        // it is just a normal property — no reporting wiring exists.
+        assert_eval_true(
+            "var before = typeof onsecuritypolicyviolation; \
+             globalThis.onsecuritypolicyviolation = function () {}; \
+             before === 'undefined'",
+        );
+        // Clean up the property we just set so later tests in the same
+        // global see the original absent state.
+        assert_eval_true(
+            "delete globalThis.onsecuritypolicyviolation; \
+             typeof onsecuritypolicyviolation === 'undefined'",
+        );
+    }
+
+    /// The Reporting API's *delivery* infrastructure — the queue that hands
+    /// `Report` instances to `ReportingObserver` callbacks, and the global
+    /// `report-to` / `Reporting-Endpoints` endpoint registry — lives in the
+    /// host. Stator exposes the report body *constructors* fail-closed
+    /// (covered by `e2e_reporting_background_delivery_*`) so reflective code
+    /// can see their shape, but the host-driven entry points that would
+    /// produce reports must not exist as callable globals.
+    #[test]
+    fn e2e_reporting_delivery_host_entry_points_remain_absent() {
+        // No global queue/observer registry / "send a report" entry points.
+        // (`reportError` is the spec's standalone API for surfacing errors to
+        // the host's error-reporting pipeline — Stator does not expose it
+        // because it has no error-reporting host to surface to. The
+        // Reporting-API generation entry points below are host-integrated
+        // and must stay absent so callers cannot generate fake
+        // deprecation/intervention reports out of thin air.)
+        assert_eval_true("typeof reportError === 'undefined'");
+        assert_eval_true("typeof generateReport === 'undefined'");
+        assert_eval_true("typeof queueReport === 'undefined'");
+        assert_eval_true("typeof ReportingEndpoint === 'undefined'");
+        assert_eval_true("typeof ReportingEndpoints === 'undefined'");
+        // `ReportingObserver` itself exists as a fail-closed constructor
+        // (covered elsewhere). Confirm there is no host-managed default
+        // observer or "current" report list exposed on the global.
+        assert_eval_true("typeof reportingObserver === 'undefined'");
+        assert_eval_true("typeof __reports__ === 'undefined'");
+    }
+
     #[test]
     fn e2e_speech_gamepad_midi_constructors_exist_but_fail_closed() {
         for name in [
