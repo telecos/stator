@@ -35161,6 +35161,33 @@ mod tests {
         assert_eval_type_error("new Intl.Locale('en-US').toString()");
     }
 
+    #[test]
+    fn e2e_locale_sensitive_builtins_use_locale_insensitive_fallbacks() {
+        // Without ICU/Intl services, locale-sensitive built-ins outside `Intl`
+        // must not pretend to support localized formatting, collation, or case
+        // mapping. They keep the existing spec-allowed locale-insensitive
+        // fallbacks instead.
+        assert_eval_true("(1234567).toLocaleString('en-US', { useGrouping: true }) === '1234567'");
+        assert_eval_true(
+            "(1234567.89).toLocaleString('en-US', { useGrouping: true }) === '1234567.89'",
+        );
+        assert_eval_true(
+            "var d = new Date(0); \
+             d.toLocaleString('en-US', { timeZone: 'UTC' }) === d.toString() && \
+             d.toLocaleDateString('en-US', { timeZone: 'UTC' }) === d.toDateString() && \
+             d.toLocaleTimeString('en-US', { timeZone: 'UTC' }) === d.toTimeString()",
+        );
+        assert_eval_true(
+            "'I'.toLocaleLowerCase('tr') === 'i' && \
+             'i'.toLocaleUpperCase('tr') === 'I'",
+        );
+        assert_eval_true("'2'.localeCompare('10', undefined, { numeric: true }) > 0");
+        assert_eval_true("'a'.localeCompare('A', undefined, { sensitivity: 'base' }) > 0");
+        assert_eval_true(
+            "[1234567, 'I'].toLocaleString('en-US', { useGrouping: true }) === '1234567,I'",
+        );
+    }
+
     /// Verify that the `Math` object has the expected properties.
     #[test]
     fn test_math_object_properties() {
