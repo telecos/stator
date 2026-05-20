@@ -31488,6 +31488,113 @@ mod tests {
         );
     }
 
+    /// Author-synthesized `ErrorEvent` / `PromiseRejectionEvent` instances are
+    /// pure data carriers. They must **not** feed Stator's host-visible
+    /// promise-rejection queue (the FFI surface the embedder drains to learn
+    /// about engine-detected unhandled rejections) and they must not invoke
+    /// any global error-reporting hook out of thin air.
+    ///
+    /// Engine-detected unhandled rejections (real `Promise.reject(...)` with
+    /// no handler) **must** still produce exactly one queue entry, confirming
+    /// the queue itself is wired and not globally suppressed.
+    #[test]
+    fn e2e_data_only_event_constructors_do_not_feed_host_error_reporting() {
+        use crate::builtins::promise::{
+            PromiseRejectionEventKind, active_promise_rejection_event_count,
+            clear_active_promise_rejection_events, drain_active_microtask_queue,
+            drain_active_promise_rejection_events,
+        };
+
+        // Start from a clean host queue: earlier tests on this thread may have
+        // left engine-detected rejection events behind.
+        clear_active_promise_rejection_events();
+
+        // Constructing a populated ErrorEvent — including one whose `error`
+        // field is a real Error object — must not push anything into the host
+        // queue and must not auto-install `onerror`.
+        let _ = global_eval(
+            "var e = new ErrorEvent('error', { \
+                 message: 'm', filename: 'f.js', lineno: 1, colno: 2, error: new Error('x') \
+             }); e.type",
+        )
+        .unwrap();
+        drain_active_microtask_queue();
+        assert_eq!(active_promise_rejection_event_count(), 0);
+        assert_eval_true("typeof onerror === 'undefined'");
+
+        // Constructing PromiseRejectionEvent instances for both 'unhandled'
+        // and 'handled' event types must not push anything into the host
+        // queue. The host queue tracks engine-detected rejections, not
+        // author-synthesized event objects.
+        clear_active_promise_rejection_events();
+        let _ = global_eval(
+            "var p = Promise.resolve(1); \
+             var e1 = new PromiseRejectionEvent('unhandledrejection', { promise: p, reason: 'r' }); \
+             var e2 = new PromiseRejectionEvent('rejectionhandled', { promise: p }); \
+             e1.type + ',' + e2.type",
+        )
+        .unwrap();
+        drain_active_microtask_queue();
+        assert_eq!(active_promise_rejection_event_count(), 0);
+        assert_eval_true("typeof onunhandledrejection === 'undefined'");
+        assert_eval_true("typeof onrejectionhandled === 'undefined'");
+
+        // Sanity: a real engine-detected unhandled rejection still produces
+        // exactly one RejectedWithNoHandler entry on the host queue. This
+        // confirms the queue is not globally suppressed by the assertions
+        // above.
+        clear_active_promise_rejection_events();
+        let _ = global_eval("Promise.reject('boom'); 1").unwrap();
+        drain_active_microtask_queue();
+        let events = drain_active_promise_rejection_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            PromiseRejectionEventKind::RejectedWithNoHandler
+        );
+        assert_eq!(events[0].reason, "boom");
+
+        // Leave the queue clean for sibling tests sharing this thread.
+        clear_active_promise_rejection_events();
+    }
+
+    /// Host-driven error-reporting surfaces — the spec-standalone `reportError`
+    /// entry point, the `onerror` / `onunhandledrejection` / `onrejectionhandled`
+    /// global event handler IDL attributes, and any `EventTarget` methods on
+    /// `globalThis` itself — require a host error-reporting pipeline that
+    /// Stator does not provide. They must stay absent so author code cannot
+    /// silently install no-op handlers that look like they are wired up. No
+    /// fake source-map / DevTools / inspector globals may leak either.
+    #[test]
+    fn e2e_host_error_reporting_globals_remain_absent() {
+        // Spec-standalone host hooks.
+        assert_eval_true("typeof reportError === 'undefined'");
+        assert_eval_true("typeof onerror === 'undefined'");
+        assert_eval_true("typeof onunhandledrejection === 'undefined'");
+        assert_eval_true("typeof onrejectionhandled === 'undefined'");
+
+        // `globalThis` is a plain object, not an EventTarget. Author code
+        // must not be able to attach 'error' or 'unhandledrejection'
+        // listeners on it that would silently never fire.
+        assert_eval_true("typeof globalThis.addEventListener === 'undefined'");
+        assert_eval_true("typeof globalThis.removeEventListener === 'undefined'");
+        assert_eval_true("typeof globalThis.dispatchEvent === 'undefined'");
+        assert_eval_true("globalThis instanceof EventTarget === false");
+
+        // Source-map / source URL resolution belongs to the embedder. No
+        // pretend metadata may appear on Error or Function instances.
+        assert_eval_true("new Error('x').sourceURL === undefined");
+        assert_eval_true("new Error('x').sourceMappingURL === undefined");
+        assert_eval_true("(function f(){}).sourceURL === undefined");
+        assert_eval_true("(function f(){}).sourceMappingURL === undefined");
+
+        // No fake DevTools / inspector surfaces.
+        assert_eval_true("typeof chrome === 'undefined'");
+        assert_eval_true("typeof __inspector__ === 'undefined'");
+        assert_eval_true("typeof Debug === 'undefined'");
+        assert_eval_true("typeof v8debug === 'undefined'");
+    }
+
     #[test]
     fn e2e_page_transition_hash_popstate_events_constructor_defaults_and_init() {
         assert_eval_true(
