@@ -4015,17 +4015,23 @@ fn parse_mark_options(
     default_start_time: f64,
 ) -> StatorResult<(f64, JsValue)> {
     let Some(opts) = options else {
-        return Ok((default_start_time, JsValue::Undefined));
+        return Ok((default_start_time, JsValue::Null));
     };
     match opts {
-        JsValue::Undefined | JsValue::Null => Ok((default_start_time, JsValue::Undefined)),
+        JsValue::Undefined | JsValue::Null => Ok((default_start_time, JsValue::Null)),
         JsValue::PlainObject(map) => {
             let b = map.borrow();
             let start_time = match b.get("startTime") {
                 Some(JsValue::Undefined) | None => default_start_time,
                 Some(v) => finite_non_negative(v.to_number()?, "mark startTime")?,
             };
-            let detail = b.get("detail").cloned().unwrap_or(JsValue::Undefined);
+            // Per User-Timing spec: if `markOptions.detail` is null or
+            // undefined (or absent), the resulting entry's `detail` is
+            // `null` — not `undefined`. This matches `CustomEvent.detail`.
+            let detail = match b.get("detail") {
+                None | Some(JsValue::Undefined) | Some(JsValue::Null) => JsValue::Null,
+                Some(v) => v.clone(),
+            };
             Ok((start_time, detail))
         }
         _ => Err(StatorError::TypeError(
@@ -4098,7 +4104,10 @@ fn performance_measure(
                         .into(),
                 ));
             }
-            let detail = b.get("detail").cloned().unwrap_or(JsValue::Undefined);
+            let detail = match b.get("detail") {
+                None | Some(JsValue::Undefined) | Some(JsValue::Null) => JsValue::Null,
+                Some(v) => v.clone(),
+            };
             let start_opt = if has_start {
                 Some(resolve_measure_endpoint(
                     state,
@@ -4134,7 +4143,7 @@ fn performance_measure(
             };
             (start, end, detail)
         }
-        JsValue::Undefined | JsValue::Null => (0.0, now, JsValue::Undefined),
+        JsValue::Undefined | JsValue::Null => (0.0, now, JsValue::Null),
         other => {
             let start = resolve_measure_endpoint(state, other, "start")?;
             let end = if matches!(end_mark, JsValue::Undefined) {
@@ -4142,7 +4151,7 @@ fn performance_measure(
             } else {
                 resolve_measure_endpoint(state, &end_mark, "end")?
             };
-            (start, end, JsValue::Undefined)
+            (start, end, JsValue::Null)
         }
     };
 
@@ -31896,6 +31905,89 @@ mod tests {
         assert_eval_true("typeof performance.navigation === 'undefined'");
         assert_eval_true("typeof performance.memory === 'undefined'");
         assert_eval_true("typeof performance.onresourcetimingbufferfull === 'undefined'");
+    }
+
+    /// `performance.mark` and `new PerformanceMark` default `detail` to
+    /// `null` (per User-Timing spec), not `undefined`. The detail value
+    /// passed through `{ detail }` is preserved as-is.
+    #[test]
+    fn e2e_performance_mark_detail_defaults_to_null() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                const m1 = performance.mark('a');                        \
+                if (m1.detail !== null) return false;                    \
+                const m2 = performance.mark('b', { startTime: 1 });      \
+                if (m2.detail !== null) return false;                    \
+                const m3 = performance.mark('c', { detail: undefined }); \
+                if (m3.detail !== null) return false;                    \
+                const m4 = performance.mark('d', { detail: null });      \
+                if (m4.detail !== null) return false;                    \
+                const m5 = new PerformanceMark('e');                     \
+                if (m5.detail !== null) return false;                    \
+                const m6 = new PerformanceMark('f', { startTime: 0 });   \
+                if (m6.detail !== null) return false;                    \
+                return true;                                             \
+            })()",
+        );
+    }
+
+    /// `performance.measure` defaults `detail` to `null`, regardless of
+    /// whether the options bag is omitted, an options bag without a
+    /// `detail` key is passed, or the legacy `(name, startMark, endMark)`
+    /// form is used.
+    #[test]
+    fn e2e_performance_measure_detail_defaults_to_null() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                performance.mark('s'); performance.mark('e');            \
+                const a = performance.measure('a');                      \
+                if (a.detail !== null) return false;                     \
+                const b = performance.measure('b', 's', 'e');            \
+                if (b.detail !== null) return false;                     \
+                const c = performance.measure('c', { start: 0, end: 1 }); \
+                if (c.detail !== null) return false;                     \
+                const d = performance.measure('d', { start: 0, end: 1, detail: { k: 7 } }); \
+                if (!d.detail || d.detail.k !== 7) return false;         \
+                return true;                                             \
+            })()",
+        );
+    }
+
+    /// Observers that depend on a live DOM, layout pipeline, resource
+    /// loader, or host event loop remain fail-closed: their constructors
+    /// throw and `performance.getEntriesByType` returns empty arrays for
+    /// host-integrated entry types (no fabricated records leak in).
+    #[test]
+    fn e2e_observers_remain_fail_closed_and_no_fake_entries() {
+        for ctor in [
+            "new MutationObserver(function () {})",
+            "new IntersectionObserver(function () {})",
+            "new ResizeObserver(function () {})",
+            "new PerformanceObserver(function () {})",
+            "new ReportingObserver(function () {})",
+        ] {
+            assert_eval_type_error(ctor);
+        }
+        // No host producer is wired, so getEntries must not contain
+        // anything beyond the user-timing entries we explicitly created.
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                const all = performance.getEntries();                    \
+                if (all.length !== 0) return false;                      \
+                for (const ty of ['resource','navigation','paint',       \
+                                  'longtask','event','layout-shift',     \
+                                  'largest-contentful-paint',            \
+                                  'first-input','element','visibility-state', \
+                                  'taskattribution']) {                  \
+                    const e = performance.getEntriesByType(ty);          \
+                    if (!Array.isArray(e) || e.length !== 0) return false; \
+                }                                                        \
+                return true;                                             \
+            })()",
+        );
     }
 
     /// Browser self-reference globals (`window`, `self`, `frames`, `parent`,
