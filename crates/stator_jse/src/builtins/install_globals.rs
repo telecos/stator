@@ -33735,6 +33735,123 @@ mod tests {
         assert_eval_type_error("new MessageChannel()");
         assert_eval_type_error("new MessagePort()");
         assert_eval_type_error("new BroadcastChannel('edge-stator')");
+
+        // Construction with realistic option dictionaries is still rejected:
+        // no fake module/credentials worker, named shared worker, or named
+        // broadcast channel is created.
+        assert_eval_type_error("new Worker('/worker.js', { type: 'module' })");
+        assert_eval_type_error(
+            "new Worker('/worker.js', { type: 'module', credentials: 'same-origin', name: 'w' })",
+        );
+        assert_eval_type_error("new SharedWorker('/shared-worker.js', 'name')");
+        assert_eval_type_error(
+            "new SharedWorker('/shared-worker.js', { name: 'n', type: 'module' })",
+        );
+        assert_eval_type_error("new BroadcastChannel('')");
+
+        // `Reflect.construct` (with and without a `newTarget`) must not
+        // bypass the fail-closed `__call__` check.
+        for name in [
+            "Worker",
+            "SharedWorker",
+            "ServiceWorker",
+            "ServiceWorkerRegistration",
+            "MessageChannel",
+            "MessagePort",
+            "BroadcastChannel",
+        ] {
+            assert_eval_type_error(&format!("Reflect.construct({name}, [])"));
+        }
+
+        // The fail-closed prototypes intentionally expose no messaging
+        // methods or attribute event handlers — exposing fake ones would
+        // mislead product code that does `typeof port.postMessage ===
+        // 'function'` feature checks.
+        for (ctor, member) in [
+            ("Worker", "postMessage"),
+            ("Worker", "terminate"),
+            ("Worker", "onmessage"),
+            ("Worker", "onmessageerror"),
+            ("Worker", "onerror"),
+            ("SharedWorker", "port"),
+            ("SharedWorker", "onerror"),
+            ("ServiceWorker", "postMessage"),
+            ("ServiceWorker", "state"),
+            ("ServiceWorker", "scriptURL"),
+            ("ServiceWorker", "onstatechange"),
+            ("ServiceWorkerRegistration", "active"),
+            ("ServiceWorkerRegistration", "installing"),
+            ("ServiceWorkerRegistration", "waiting"),
+            ("ServiceWorkerRegistration", "scope"),
+            ("ServiceWorkerRegistration", "update"),
+            ("ServiceWorkerRegistration", "unregister"),
+            ("MessageChannel", "port1"),
+            ("MessageChannel", "port2"),
+            ("MessagePort", "postMessage"),
+            ("MessagePort", "start"),
+            ("MessagePort", "close"),
+            ("MessagePort", "onmessage"),
+            ("MessagePort", "onmessageerror"),
+            ("BroadcastChannel", "postMessage"),
+            ("BroadcastChannel", "close"),
+            ("BroadcastChannel", "name"),
+            ("BroadcastChannel", "onmessage"),
+            ("BroadcastChannel", "onmessageerror"),
+        ] {
+            assert_eval_true(&format!(
+                "!Object.prototype.hasOwnProperty.call({ctor}.prototype, '{member}')"
+            ));
+        }
+    }
+
+    /// No standalone `postMessage` / `onmessage` / `onmessageerror` global is
+    /// installed. Exposing one would either fake cross-context message
+    /// delivery (when no real worker/channel/window exists) or shadow a
+    /// real binding an embedder might provide. The DOM `dispatchEvent`
+    /// surfaces remain reachable only via real `EventTarget` instances.
+    #[test]
+    fn e2e_standalone_post_message_globals_are_absent() {
+        assert_eval_true("typeof postMessage === 'undefined'");
+        assert_eval_true("typeof onmessage === 'undefined'");
+        assert_eval_true("typeof onmessageerror === 'undefined'");
+        // `close` (as a Window-level method that ends the browsing context)
+        // must not be installed either — there is no window to close.
+        assert_eval_true("typeof close === 'undefined'");
+    }
+
+    /// `MessageEvent` instance state is per-instance and the `ports` getter
+    /// returns a *fresh* array each call so script mutations cannot leak
+    /// into a future read or affect another event.
+    #[test]
+    fn e2e_message_event_state_is_per_instance_and_ports_are_fresh() {
+        assert_eval_true(
+            "var a = new MessageEvent('m', { data: 1, origin: 'a', lastEventId: '1' }); \
+             var b = new MessageEvent('m', { data: 2, origin: 'b', lastEventId: '2' }); \
+             a.data === 1 && b.data === 2 && a.origin === 'a' && b.origin === 'b' && \
+             a.lastEventId === '1' && b.lastEventId === '2'",
+        );
+        // `data` identity is preserved across repeated getter reads.
+        assert_eval_true(
+            "var d = { k: 1 }; var e = new MessageEvent('m', { data: d }); \
+             e.data === d && e.data === e.data",
+        );
+        // Every `ports` read yields a distinct empty array, so mutating
+        // one return value cannot poison subsequent reads.
+        assert_eval_true(
+            "var e = new MessageEvent('m'); \
+             var p1 = e.ports; var p2 = e.ports; \
+             Array.isArray(p1) && Array.isArray(p2) && p1 !== p2 && \
+             p1.length === 0 && p2.length === 0",
+        );
+        assert_eval_true(
+            "var e = new MessageEvent('m'); \
+             e.ports.push('x'); e.ports.length === 0",
+        );
+        // `source` stays null regardless of how many times it is read.
+        assert_eval_true("var e = new MessageEvent('m'); e.source === null && e.source === null");
+        // Legacy `initMessageEvent` is intentionally not implemented — no
+        // way to retroactively attach a fake source/port to an event.
+        assert_eval_true("typeof MessageEvent.prototype.initMessageEvent === 'undefined'");
     }
 
     #[test]
