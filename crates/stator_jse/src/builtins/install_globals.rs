@@ -9051,6 +9051,21 @@ const CLOSE_EVENT_BRAND: &str = "__is_close_event__";
 /// Hidden brand placed on every `MessageEvent` instance.
 const MESSAGE_EVENT_BRAND: &str = "__is_message_event__";
 
+/// Hidden brand placed on every `PromiseRejectionEvent` instance.
+const PROMISE_REJECTION_EVENT_BRAND: &str = "__is_promise_rejection_event__";
+
+/// Hidden brand placed on every `PageTransitionEvent` instance.
+const PAGE_TRANSITION_EVENT_BRAND: &str = "__is_page_transition_event__";
+
+/// Hidden brand placed on every `HashChangeEvent` instance.
+const HASH_CHANGE_EVENT_BRAND: &str = "__is_hash_change_event__";
+
+/// Hidden brand placed on every `PopStateEvent` instance.
+const POP_STATE_EVENT_BRAND: &str = "__is_pop_state_event__";
+
+/// Hidden brand placed on every `StorageEvent` instance.
+const STORAGE_EVENT_BRAND: &str = "__is_storage_event__";
+
 #[derive(Clone)]
 struct EventListenerEntry {
     id: u64,
@@ -9143,6 +9158,26 @@ thread_local! {
         RefCell::new(HashMap::new());
     static MESSAGE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
+    static PROMISE_REJECTION_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<PromiseRejectionEventData>>>> =
+        RefCell::new(HashMap::new());
+    static PROMISE_REJECTION_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static PAGE_TRANSITION_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<PageTransitionEventData>>>> =
+        RefCell::new(HashMap::new());
+    static PAGE_TRANSITION_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static HASH_CHANGE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<HashChangeEventData>>>> =
+        RefCell::new(HashMap::new());
+    static HASH_CHANGE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static POP_STATE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<PopStateEventData>>>> =
+        RefCell::new(HashMap::new());
+    static POP_STATE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static STORAGE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<StorageEventData>>>> =
+        RefCell::new(HashMap::new());
+    static STORAGE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
 }
 
 /// Immutable data carried by a `ProgressEvent` instance.
@@ -9175,6 +9210,37 @@ struct MessageEventData {
     data: JsValue,
     origin: String,
     last_event_id: String,
+}
+
+/// Immutable data carried by a `PromiseRejectionEvent` instance.
+struct PromiseRejectionEventData {
+    promise: JsValue,
+    reason: JsValue,
+}
+
+/// Immutable data carried by a `PageTransitionEvent` instance.
+struct PageTransitionEventData {
+    persisted: bool,
+}
+
+/// Immutable data carried by a `HashChangeEvent` instance.
+struct HashChangeEventData {
+    old_url: String,
+    new_url: String,
+}
+
+/// Immutable data carried by a `PopStateEvent` instance.
+struct PopStateEventData {
+    state: JsValue,
+}
+
+/// Immutable data carried by a `StorageEvent` instance.
+struct StorageEventData {
+    key: JsValue,
+    old_value: JsValue,
+    new_value: JsValue,
+    url: String,
+    storage_area: JsValue,
 }
 
 fn event_type_error(message: impl Into<String>) -> StatorError {
@@ -9820,11 +9886,11 @@ fn make_custom_event_builtin() -> JsValue {
 
 // ── Data-only subtype Event constructors ────────────────────────────────────
 //
-// `ProgressEvent`, `ErrorEvent`, `CloseEvent`, and `MessageEvent` are
-// implemented as real subtypes of `Event`: each instance carries the
-// `EVENT_BRAND` (so the inherited `Event` accessors work) plus its own
-// subtype brand, and its `[[Prototype]]` is the subtype's prototype, which
-// in turn chains to `Event.prototype` so `instanceof Event` succeeds.
+// These data-only event constructors are implemented as real subtypes of
+// `Event`: each instance carries the `EVENT_BRAND` (so the inherited `Event`
+// accessors work) plus its own subtype brand, and its `[[Prototype]]` is the
+// subtype's prototype, which in turn chains to `Event.prototype` so
+// `instanceof Event` succeeds.
 //
 // These constructors deliberately do **not** plug into any host pipeline:
 // no global error reporting, no WebSocket close handshake, no
@@ -9852,6 +9918,13 @@ fn dict_field_string(init: &JsValue, name: &str) -> StatorResult<Option<String>>
     match dict_field(init, name)? {
         Some(v) => Ok(Some(v.to_js_string()?.to_string())),
         None => Ok(None),
+    }
+}
+
+fn dict_field_nullable_string(init: &JsValue, name: &str) -> StatorResult<JsValue> {
+    match dict_field(init, name)? {
+        Some(JsValue::Null) | None => Ok(JsValue::Null),
+        Some(v) => Ok(JsValue::String(v.to_js_string()?.to_string().into())),
     }
 }
 
@@ -10446,6 +10519,451 @@ fn make_message_event_builtin() -> JsValue {
         proto.make_all_non_enumerable();
     }
     MESSAGE_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `PromiseRejectionEvent` constructor.
+///
+/// Instances are data-only containers for an explicit Promise and reason. They
+/// do not report to `unhandledrejection` / `rejectionhandled` or install any
+/// global rejection event dispatch.
+fn make_promise_rejection_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error(
+                    "PromiseRejectionEvent: type argument is required",
+                ));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let Some(promise) = dict_field(&init, "promise")? else {
+                return Err(event_type_error(
+                    "PromiseRejectionEvent: promise is required",
+                ));
+            };
+            if !matches!(promise, JsValue::Promise(_)) {
+                return Err(event_type_error(
+                    "PromiseRejectionEvent: promise must be a Promise",
+                ));
+            }
+            let reason = dict_field(&init, "reason")?.unwrap_or(JsValue::Undefined);
+            let proto = PROMISE_REJECTION_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst =
+                build_event_subtype_instance(event_state, proto, PROMISE_REJECTION_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(PromiseRejectionEventData { promise, reason }));
+            let id = Rc::as_ptr(&inst) as usize;
+            PROMISE_REJECTION_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("PromiseRejectionEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_promise__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PROMISE_REJECTION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PROMISE_REJECTION_EVENT_BRAND,
+                    &PROMISE_REJECTION_EVENT_STATES,
+                    "PromiseRejectionEvent",
+                )?;
+                Ok(s.borrow().promise.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_reason__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PROMISE_REJECTION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PROMISE_REJECTION_EVENT_BRAND,
+                    &PROMISE_REJECTION_EVENT_STATES,
+                    "PromiseRejectionEvent",
+                )?;
+                Ok(s.borrow().reason.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    PROMISE_REJECTION_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `PageTransitionEvent` constructor.
+fn make_page_transition_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error(
+                    "PageTransitionEvent: type argument is required",
+                ));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let persisted = event_init_bool(&init, "persisted")?;
+            let proto = PAGE_TRANSITION_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst =
+                build_event_subtype_instance(event_state, proto, PAGE_TRANSITION_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(PageTransitionEventData { persisted }));
+            let id = Rc::as_ptr(&inst) as usize;
+            PAGE_TRANSITION_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("PageTransitionEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_persisted__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PAGE_TRANSITION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PAGE_TRANSITION_EVENT_BRAND,
+                    &PAGE_TRANSITION_EVENT_STATES,
+                    "PageTransitionEvent",
+                )?;
+                Ok(JsValue::Boolean(s.borrow().persisted))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    PAGE_TRANSITION_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `HashChangeEvent` constructor.
+fn make_hash_change_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error(
+                    "HashChangeEvent: type argument is required",
+                ));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let old_url = dict_field_string(&init, "oldURL")?.unwrap_or_default();
+            let new_url = dict_field_string(&init, "newURL")?.unwrap_or_default();
+            let proto = HASH_CHANGE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, HASH_CHANGE_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(HashChangeEventData { old_url, new_url }));
+            let id = Rc::as_ptr(&inst) as usize;
+            HASH_CHANGE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("HashChangeEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_oldURL__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, HASH_CHANGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    HASH_CHANGE_EVENT_BRAND,
+                    &HASH_CHANGE_EVENT_STATES,
+                    "HashChangeEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().old_url.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_newURL__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, HASH_CHANGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    HASH_CHANGE_EVENT_BRAND,
+                    &HASH_CHANGE_EVENT_STATES,
+                    "HashChangeEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().new_url.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    HASH_CHANGE_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `PopStateEvent` constructor.
+fn make_pop_state_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("PopStateEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let state_value = dict_field_any(&init, "state")?;
+            let proto = POP_STATE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, POP_STATE_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(PopStateEventData { state: state_value }));
+            let id = Rc::as_ptr(&inst) as usize;
+            POP_STATE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("PopStateEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_state__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, POP_STATE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    POP_STATE_EVENT_BRAND,
+                    &POP_STATE_EVENT_STATES,
+                    "PopStateEvent",
+                )?;
+                Ok(s.borrow().state.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    POP_STATE_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `StorageEvent` constructor.
+///
+/// The data fields are accepted from the init dict, but no cross-context
+/// storage-event dispatch is wired up.
+fn make_storage_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("StorageEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let key = dict_field_nullable_string(&init, "key")?;
+            let old_value = dict_field_nullable_string(&init, "oldValue")?;
+            let new_value = dict_field_nullable_string(&init, "newValue")?;
+            let url = dict_field_string(&init, "url")?.unwrap_or_default();
+            let storage_area = match dict_field(&init, "storageArea")? {
+                Some(JsValue::Null) | None => JsValue::Null,
+                Some(value) => {
+                    lookup_storage_state(&value).map_err(|_| {
+                        event_type_error(
+                            "StorageEvent: storageArea must be null or a Storage object",
+                        )
+                    })?;
+                    value
+                }
+            };
+            let proto = STORAGE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, STORAGE_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(StorageEventData {
+                key,
+                old_value,
+                new_value,
+                url,
+                storage_area,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            STORAGE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("StorageEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_key__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, STORAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    STORAGE_EVENT_BRAND,
+                    &STORAGE_EVENT_STATES,
+                    "StorageEvent",
+                )?;
+                Ok(s.borrow().key.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_oldValue__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, STORAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    STORAGE_EVENT_BRAND,
+                    &STORAGE_EVENT_STATES,
+                    "StorageEvent",
+                )?;
+                Ok(s.borrow().old_value.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_newValue__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, STORAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    STORAGE_EVENT_BRAND,
+                    &STORAGE_EVENT_STATES,
+                    "StorageEvent",
+                )?;
+                Ok(s.borrow().new_value.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_url__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, STORAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    STORAGE_EVENT_BRAND,
+                    &STORAGE_EVENT_STATES,
+                    "StorageEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().url.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_storageArea__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, STORAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    STORAGE_EVENT_BRAND,
+                    &STORAGE_EVENT_STATES,
+                    "StorageEvent",
+                )?;
+                Ok(s.borrow().storage_area.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    STORAGE_EVENT_PROTO.with(|p| {
         *p.borrow_mut() = Some(Rc::clone(&proto_rc));
     });
     props.insert(
@@ -27654,11 +28172,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // expose only init-dict-derived data and inherit `preventDefault`,
         // `stopPropagation`, `composedPath`, etc. from `Event.prototype`.
         //
-        // No host plumbing is hooked up: `ErrorEvent` does not feed
-        // global error reporting, `CloseEvent` does not run a WebSocket
-        // closing handshake, and `MessageEvent.source` / `ports` reject
-        // non-null / non-empty values because no `Window`, `MessagePort`,
-        // or `ServiceWorker` host identities exist in this engine.
+        // No host plumbing is hooked up: `ErrorEvent` and
+        // `PromiseRejectionEvent` do not feed global error reporting,
+        // `CloseEvent` does not run a WebSocket closing handshake,
+        // lifecycle/navigation/storage events do not drive browser state, and
+        // `MessageEvent.source` / `ports` reject non-null / non-empty values
+        // because no `Window`, `MessagePort`, or `ServiceWorker` host
+        // identities exist in this engine.
         globals.insert(
             "ProgressEvent".into(),
             finalize_ctor(make_progress_event_builtin(), "ProgressEvent"),
@@ -27674,6 +28194,29 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "MessageEvent".into(),
             finalize_ctor(make_message_event_builtin(), "MessageEvent"),
+        );
+        globals.insert(
+            "PromiseRejectionEvent".into(),
+            finalize_ctor(
+                make_promise_rejection_event_builtin(),
+                "PromiseRejectionEvent",
+            ),
+        );
+        globals.insert(
+            "PageTransitionEvent".into(),
+            finalize_ctor(make_page_transition_event_builtin(), "PageTransitionEvent"),
+        );
+        globals.insert(
+            "HashChangeEvent".into(),
+            finalize_ctor(make_hash_change_event_builtin(), "HashChangeEvent"),
+        );
+        globals.insert(
+            "PopStateEvent".into(),
+            finalize_ctor(make_pop_state_event_builtin(), "PopStateEvent"),
+        );
+        globals.insert(
+            "StorageEvent".into(),
+            finalize_ctor(make_storage_event_builtin(), "StorageEvent"),
         );
 
         // ── DOM UI / input / pointer / drag / touch / lifecycle event
@@ -27707,11 +28250,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "CompositionEvent",
             "SubmitEvent",
             "ToggleEvent",
-            "PopStateEvent",
-            "HashChangeEvent",
-            "PageTransitionEvent",
-            "StorageEvent",
-            "PromiseRejectionEvent",
             "AnimationEvent",
             "TransitionEvent",
             "SecurityPolicyViolationEvent",
@@ -30061,8 +30599,7 @@ mod tests {
         assert_eval_type_error("new CustomEvent()");
     }
 
-    // ── Data-event subtypes (ProgressEvent / ErrorEvent / CloseEvent /
-    //    MessageEvent) ─────────────────────────────────────────────────────
+    // ── Data-event subtypes ────────────────────────────────────────────────
 
     #[test]
     fn e2e_progress_event_constructor_defaults_and_init() {
@@ -30208,16 +30745,140 @@ mod tests {
     }
 
     #[test]
+    fn e2e_promise_rejection_event_constructor_defaults_and_init() {
+        assert_eval_true(
+            "typeof PromiseRejectionEvent === 'function' && PromiseRejectionEvent.name === 'PromiseRejectionEvent'",
+        );
+        assert_eval_true(
+            "new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(1), reason: 'x' }) instanceof PromiseRejectionEvent",
+        );
+        assert_eval_true(
+            "new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(1), reason: 'x' }) instanceof Event",
+        );
+        assert_eval_true(
+            "Object.getPrototypeOf(PromiseRejectionEvent.prototype) === Event.prototype",
+        );
+        assert_eval_type_error("new PromiseRejectionEvent()");
+        assert_eval_type_error("new PromiseRejectionEvent('unhandledrejection')");
+        assert_eval_type_error(
+            "new PromiseRejectionEvent('unhandledrejection', { promise: {}, reason: 0 })",
+        );
+        assert_eval_true(
+            "var p = Promise.reject('no'); \
+             var e = new PromiseRejectionEvent('unhandledrejection', { promise: p, reason: 42 }); \
+             e.type === 'unhandledrejection' && e.promise === p && e.reason === 42",
+        );
+        assert_eval_true(
+            "var p = Promise.resolve(1); \
+             var e = new PromiseRejectionEvent('rejectionhandled', { promise: p }); \
+             e.reason === undefined && typeof onunhandledrejection === 'undefined' && typeof onrejectionhandled === 'undefined'",
+        );
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(PromiseRejectionEvent.prototype, 'promise'); \
+             typeof d.get === 'function' && d.set === undefined",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(PromiseRejectionEvent.prototype, 'promise').get.call({})",
+        );
+    }
+
+    #[test]
+    fn e2e_page_transition_hash_popstate_events_constructor_defaults_and_init() {
+        assert_eval_true(
+            "typeof PageTransitionEvent === 'function' && PageTransitionEvent.name === 'PageTransitionEvent'",
+        );
+        assert_eval_true("new PageTransitionEvent('pageshow') instanceof PageTransitionEvent");
+        assert_eval_true("new PageTransitionEvent('pageshow') instanceof Event");
+        assert_eval_true(
+            "Object.getPrototypeOf(PageTransitionEvent.prototype) === Event.prototype",
+        );
+        assert_eval_type_error("new PageTransitionEvent()");
+        assert_eval_true(
+            "var e = new PageTransitionEvent('pagehide', { persisted: 1, cancelable: true }); \
+             e.persisted === true && e.cancelable === true",
+        );
+
+        assert_eval_true(
+            "typeof HashChangeEvent === 'function' && HashChangeEvent.name === 'HashChangeEvent'",
+        );
+        assert_eval_true("new HashChangeEvent('hashchange') instanceof HashChangeEvent");
+        assert_eval_true("new HashChangeEvent('hashchange') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(HashChangeEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new HashChangeEvent()");
+        assert_eval_true(
+            "var e = new HashChangeEvent('hashchange', { oldURL: 1, newURL: 'https://x.test/#a' }); \
+             e.oldURL === '1' && e.newURL === 'https://x.test/#a'",
+        );
+
+        assert_eval_true(
+            "typeof PopStateEvent === 'function' && PopStateEvent.name === 'PopStateEvent'",
+        );
+        assert_eval_true("new PopStateEvent('popstate') instanceof PopStateEvent");
+        assert_eval_true("new PopStateEvent('popstate') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(PopStateEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new PopStateEvent()");
+        assert_eval_true("var e = new PopStateEvent('popstate'); e.state === null");
+        assert_eval_true(
+            "var s = { page: 1 }; var e = new PopStateEvent('popstate', { state: s }); e.state === s",
+        );
+        assert_eval_type_error("new History()");
+        assert_eval_type_error("new Location()");
+    }
+
+    #[test]
+    fn e2e_storage_event_constructor_defaults_and_init() {
+        assert_eval_true(
+            "typeof StorageEvent === 'function' && StorageEvent.name === 'StorageEvent'",
+        );
+        assert_eval_true("new StorageEvent('storage') instanceof StorageEvent");
+        assert_eval_true("new StorageEvent('storage') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(StorageEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new StorageEvent()");
+        assert_eval_true(
+            "var e = new StorageEvent('storage'); \
+             e.key === null && e.oldValue === null && e.newValue === null && \
+             e.url === '' && e.storageArea === null",
+        );
+        assert_eval_true(
+            "var e = new StorageEvent('storage', { key: 1, oldValue: false, newValue: 'v', url: 9, storageArea: localStorage }); \
+             e.key === '1' && e.oldValue === 'false' && e.newValue === 'v' && \
+             e.url === '9' && e.storageArea === localStorage",
+        );
+        assert_eval_true(
+            "var e = new StorageEvent('storage', { key: null, oldValue: null, newValue: null, storageArea: null }); \
+             e.key === null && e.oldValue === null && e.newValue === null && e.storageArea === null",
+        );
+        assert_eval_type_error("new StorageEvent('storage', { storageArea: {} })");
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(StorageEvent.prototype, 'key'); \
+             typeof d.get === 'function' && d.set === undefined",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(StorageEvent.prototype, 'key').get.call({})",
+        );
+    }
+
+    #[test]
     fn e2e_data_event_subtype_prototype_chains_are_distinct() {
         // Each subtype has its own prototype, distinct from Event.prototype.
         assert_eval_true("ProgressEvent.prototype !== Event.prototype");
         assert_eval_true("ErrorEvent.prototype !== Event.prototype");
         assert_eval_true("CloseEvent.prototype !== Event.prototype");
         assert_eval_true("MessageEvent.prototype !== Event.prototype");
+        assert_eval_true("PromiseRejectionEvent.prototype !== Event.prototype");
+        assert_eval_true("PageTransitionEvent.prototype !== Event.prototype");
+        assert_eval_true("HashChangeEvent.prototype !== Event.prototype");
+        assert_eval_true("PopStateEvent.prototype !== Event.prototype");
+        assert_eval_true("StorageEvent.prototype !== Event.prototype");
         assert_eval_true("ProgressEvent.prototype.constructor === ProgressEvent");
         assert_eval_true("ErrorEvent.prototype.constructor === ErrorEvent");
         assert_eval_true("CloseEvent.prototype.constructor === CloseEvent");
         assert_eval_true("MessageEvent.prototype.constructor === MessageEvent");
+        assert_eval_true("PromiseRejectionEvent.prototype.constructor === PromiseRejectionEvent");
+        assert_eval_true("PageTransitionEvent.prototype.constructor === PageTransitionEvent");
+        assert_eval_true("HashChangeEvent.prototype.constructor === HashChangeEvent");
+        assert_eval_true("PopStateEvent.prototype.constructor === PopStateEvent");
+        assert_eval_true("StorageEvent.prototype.constructor === StorageEvent");
         // Cross-type brand checks reject foreign receivers on subtype accessors.
         assert_eval_type_error(
             "Object.getOwnPropertyDescriptor(ProgressEvent.prototype, 'loaded').get.call(new Event('x'))",
@@ -30227,6 +30888,12 @@ mod tests {
         );
         assert_eval_type_error(
             "Object.getOwnPropertyDescriptor(CloseEvent.prototype, 'code').get.call(new MessageEvent('m'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(HashChangeEvent.prototype, 'oldURL').get.call(new PopStateEvent('p'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(StorageEvent.prototype, 'url').get.call(new HashChangeEvent('h'))",
         );
     }
 
@@ -30241,6 +30908,12 @@ mod tests {
              t.dispatchEvent(pe); \
              seen === pe && seen.loaded === 50 && seen.target === t",
         );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = null; \
+             t.addEventListener('popstate', function (e) { seen = e; e.preventDefault(); }); \
+             var s = { n: 1 }; var ev = new PopStateEvent('popstate', { state: s, cancelable: true }); \
+             t.dispatchEvent(ev) === false && seen === ev && seen.state === s && ev.target === t",
+        );
     }
 
     #[test]
@@ -30250,6 +30923,11 @@ mod tests {
         assert_eval_type_error("new ErrorEvent('e', 'oops')");
         assert_eval_type_error("new CloseEvent('c', true)");
         assert_eval_type_error("new MessageEvent('m', 7)");
+        assert_eval_type_error("new PageTransitionEvent('p', 1)");
+        assert_eval_type_error("new HashChangeEvent('h', 1)");
+        assert_eval_type_error("new PopStateEvent('p', 1)");
+        assert_eval_type_error("new StorageEvent('s', 1)");
+        assert_eval_type_error("new PromiseRejectionEvent('p', 1)");
     }
 
     #[test]
@@ -30472,11 +31150,6 @@ mod tests {
             "CompositionEvent",
             "SubmitEvent",
             "ToggleEvent",
-            "PopStateEvent",
-            "HashChangeEvent",
-            "PageTransitionEvent",
-            "StorageEvent",
-            "PromiseRejectionEvent",
             "AnimationEvent",
             "TransitionEvent",
             "SecurityPolicyViolationEvent",
@@ -32434,13 +33107,6 @@ mod tests {
         assert_eval_type_error("new CompositionEvent('compositionstart')");
         assert_eval_type_error("new SubmitEvent('submit')");
         assert_eval_type_error("new ToggleEvent('toggle')");
-        assert_eval_type_error("new PopStateEvent('popstate')");
-        assert_eval_type_error("new HashChangeEvent('hashchange')");
-        assert_eval_type_error("new PageTransitionEvent('pageshow')");
-        assert_eval_type_error("new StorageEvent('storage')");
-        assert_eval_type_error(
-            "new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(), reason: 0 })",
-        );
         assert_eval_type_error("new AnimationEvent('animationstart')");
         assert_eval_type_error("new TransitionEvent('transitionend')");
         assert_eval_type_error("new SecurityPolicyViolationEvent('securitypolicyviolation')");
