@@ -28796,15 +28796,17 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
         // ── Realtime / worker / messaging APIs (fail-closed) ────────────────
         //
-        // WebSockets, server-sent events, workers, service workers, channels,
-        // ports, and broadcast messaging all require host-managed event loops,
-        // networking, cross-context lifetime, and message queue integration.
+        // WebSockets, server-sent events, WebTransport, workers, service
+        // workers, channels, ports, and broadcast messaging all require
+        // host-managed event loops, networking, cross-context lifetime, and
+        // message queue integration.
         // Expose the globals that Edge page scripts commonly probe, but reject
         // construction/invocation instead of returning fake connected or queued
         // objects.
         for name in [
             "WebSocket",
             "EventSource",
+            "WebTransport",
             "Worker",
             "SharedWorker",
             "ServiceWorker",
@@ -29847,6 +29849,7 @@ mod tests {
         assert!(globals.contains_key("WebSocket"));
         assert!(globals.contains_key("CloseEvent"));
         assert!(globals.contains_key("EventSource"));
+        assert!(globals.contains_key("WebTransport"));
         assert!(globals.contains_key("Worker"));
         assert!(globals.contains_key("SharedWorker"));
         assert!(globals.contains_key("ServiceWorker"));
@@ -33712,6 +33715,7 @@ mod tests {
         for name in [
             "WebSocket",
             "EventSource",
+            "WebTransport",
             "Worker",
             "SharedWorker",
             "ServiceWorker",
@@ -33728,6 +33732,7 @@ mod tests {
 
         assert_eval_type_error("new WebSocket('wss://example.test/socket')");
         assert_eval_type_error("new EventSource('/events')");
+        assert_eval_type_error("new WebTransport('https://example.test/transport')");
         assert_eval_type_error("new Worker('/worker.js')");
         assert_eval_type_error("new SharedWorker('/shared-worker.js')");
         assert_eval_type_error("new ServiceWorker()");
@@ -33797,6 +33802,15 @@ mod tests {
             ("BroadcastChannel", "name"),
             ("BroadcastChannel", "onmessage"),
             ("BroadcastChannel", "onmessageerror"),
+            ("WebSocket", "readyState"),
+            ("WebSocket", "send"),
+            ("WebSocket", "close"),
+            ("EventSource", "readyState"),
+            ("EventSource", "close"),
+            ("WebTransport", "ready"),
+            ("WebTransport", "closed"),
+            ("WebTransport", "datagrams"),
+            ("WebTransport", "close"),
         ] {
             assert_eval_true(&format!(
                 "!Object.prototype.hasOwnProperty.call({ctor}.prototype, '{member}')"
@@ -33992,15 +34006,20 @@ mod tests {
         assert_eval_type_error("BackgroundFetchRegistration.prototype.updateUI.call({}, {})");
     }
 
-    /// `navigator.sendBeacon`, `navigator.serviceWorker`, and registration-
-    /// vended managers (`pushManager`, `sync`, `periodicSync`,
+    /// `navigator.sendBeacon`, `navigator.serviceWorker`, network-status, and
+    /// registration-vended managers (`pushManager`, `sync`, `periodicSync`,
     /// `backgroundFetch`) remain absent because the standalone engine does not
-    /// preinstall `navigator` or service-worker registration objects.
+    /// preinstall `navigator`, connection state, or service-worker registration
+    /// objects.
     #[test]
     fn e2e_beacon_and_background_entry_points_remain_absent() {
         assert_eval_true("typeof navigator === 'undefined'");
         assert_eval_true("typeof serviceWorkerRegistration === 'undefined'");
         assert_eval_true("typeof Beacon === 'undefined'");
+        assert_eval_true("typeof NetworkInformation === 'undefined'");
+        assert_eval_true("typeof connection === 'undefined'");
+        assert_eval_true("typeof ononline === 'undefined'");
+        assert_eval_true("typeof onoffline === 'undefined'");
     }
 
     #[test]
