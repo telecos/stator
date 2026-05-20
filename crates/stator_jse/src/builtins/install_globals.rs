@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
@@ -3383,6 +3383,791 @@ fn make_crypto_instance(crypto_proto: JsValue, subtle: JsValue) -> JsValue {
     props.insert("@@toStringTag".into(), JsValue::String("Crypto".into()));
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+// ── Performance / User Timing ───────────────────────────────────────────────
+//
+// A small, real subset of the HR-Time and User-Timing specifications: a
+// `performance` global with `timeOrigin`, monotonic `now()` and the User
+// Timing `mark`/`measure`/`clear*`/`getEntries*` family. Navigation, resource,
+// paint, event, long-task, layout-shift and visibility timing remain absent
+// because they require a host browser timeline. `PerformanceObserver` also
+// remains fail-closed for the same reason.
+
+const PERFORMANCE_BRAND: &str = "__is_performance__";
+const PERFORMANCE_ENTRY_BRAND: &str = "__is_performance_entry__";
+
+/// Per-context Performance state: the captured Unix-epoch baseline that
+/// `timeOrigin` reports, a monotonic `Instant` baseline that `now()` is
+/// measured against, the last reported `now()` (so a single context's
+/// timeline is non-decreasing even across `Instant` clock anomalies), and
+/// the buffered user-timing entries (marks and measures).
+struct PerformanceState {
+    time_origin_ms: f64,
+    instant_origin: Instant,
+    last_now: f64,
+    entries: Vec<JsValue>,
+}
+
+thread_local! {
+    static PERFORMANCE_STATES: RefCell<HashMap<usize, Rc<RefCell<PerformanceState>>>> =
+        RefCell::new(HashMap::new());
+    static PERFORMANCE_ENTRY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static PERFORMANCE_MARK_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static PERFORMANCE_MEASURE_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn performance_unix_epoch_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
+fn install_performance_state(instance: &Rc<RefCell<PropertyMap>>) -> Rc<RefCell<PerformanceState>> {
+    let state = Rc::new(RefCell::new(PerformanceState {
+        time_origin_ms: performance_unix_epoch_ms(),
+        instant_origin: Instant::now(),
+        last_now: 0.0,
+        entries: Vec::new(),
+    }));
+    let id = Rc::as_ptr(instance) as usize;
+    PERFORMANCE_STATES.with(|s| {
+        s.borrow_mut().insert(id, state.clone());
+    });
+    state
+}
+
+fn lookup_performance_state(
+    value: &JsValue,
+    display_name: &str,
+) -> StatorResult<Rc<RefCell<PerformanceState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    };
+    if !matches!(
+        map.borrow().get(PERFORMANCE_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    PERFORMANCE_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| StatorError::TypeError(format!("{display_name}: internal state missing")))
+}
+
+fn performance_now_value(state: &Rc<RefCell<PerformanceState>>) -> f64 {
+    let mut st = state.borrow_mut();
+    let elapsed_ms = st.instant_origin.elapsed().as_secs_f64() * 1000.0;
+    let now = if elapsed_ms > st.last_now {
+        elapsed_ms
+    } else {
+        st.last_now
+    };
+    st.last_now = now;
+    now
+}
+
+fn finite_non_negative(value: f64, what: &str) -> StatorResult<f64> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(StatorError::TypeError(format!(
+            "performance: {what} must be a finite non-negative number"
+        )));
+    }
+    Ok(value)
+}
+
+fn entry_name_of(value: &JsValue) -> Option<Rc<str>> {
+    let JsValue::PlainObject(map) = value else {
+        return None;
+    };
+    let b = map.borrow();
+    if !matches!(b.get(PERFORMANCE_ENTRY_BRAND), Some(JsValue::Boolean(true))) {
+        return None;
+    }
+    match b.get("__pe_name__") {
+        Some(JsValue::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn entry_type_of(value: &JsValue) -> Option<Rc<str>> {
+    let JsValue::PlainObject(map) = value else {
+        return None;
+    };
+    let b = map.borrow();
+    if !matches!(b.get(PERFORMANCE_ENTRY_BRAND), Some(JsValue::Boolean(true))) {
+        return None;
+    }
+    match b.get("__pe_type__") {
+        Some(JsValue::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn entry_start_of(value: &JsValue) -> Option<f64> {
+    let JsValue::PlainObject(map) = value else {
+        return None;
+    };
+    let b = map.borrow();
+    if !matches!(b.get(PERFORMANCE_ENTRY_BRAND), Some(JsValue::Boolean(true))) {
+        return None;
+    }
+    b.get("__pe_start__").and_then(|v| v.to_number().ok())
+}
+
+fn build_entry_instance(
+    proto: Option<Rc<RefCell<PropertyMap>>>,
+    name: Rc<str>,
+    entry_type: &'static str,
+    start_time: f64,
+    duration: f64,
+    detail: JsValue,
+    tag: &'static str,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let hidden = PropertyAttributes::empty();
+    props.insert_with_attrs(
+        PERFORMANCE_ENTRY_BRAND.into(),
+        JsValue::Boolean(true),
+        hidden,
+    );
+    props.insert_with_attrs("__pe_name__".into(), JsValue::String(name), hidden);
+    props.insert_with_attrs(
+        "__pe_type__".into(),
+        JsValue::String(entry_type.into()),
+        hidden,
+    );
+    props.insert_with_attrs("__pe_start__".into(), num(start_time), hidden);
+    props.insert_with_attrs("__pe_duration__".into(), num(duration), hidden);
+    props.insert_with_attrs("__pe_detail__".into(), detail, hidden);
+    if let Some(p) = proto {
+        props.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            JsValue::PlainObject(p),
+            hidden,
+        );
+    }
+    props.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(tag.into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Native getter for one of the `PerformanceEntry` accessor slots
+/// (`name`, `entryType`, `startTime`, `duration`).
+fn entry_slot_getter(slot: &'static str, display_name: &'static str) -> JsValue {
+    native(move |args| {
+        let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_ENTRY_BRAND);
+        let JsValue::PlainObject(map) = recv else {
+            return Err(StatorError::TypeError(format!(
+                "{display_name} called on incompatible receiver"
+            )));
+        };
+        let borrow = map.borrow();
+        if !matches!(
+            borrow.get(PERFORMANCE_ENTRY_BRAND),
+            Some(JsValue::Boolean(true))
+        ) {
+            return Err(StatorError::TypeError(format!(
+                "{display_name} called on incompatible receiver"
+            )));
+        }
+        Ok(borrow.get(slot).cloned().unwrap_or(JsValue::Undefined))
+    })
+}
+
+fn install_entry_accessors(proto: &mut PropertyMap) {
+    let accessor_attrs = PropertyAttributes::CONFIGURABLE;
+    proto.insert_with_attrs(
+        "__get_name__".into(),
+        entry_slot_getter("__pe_name__", "get PerformanceEntry.prototype.name"),
+        accessor_attrs,
+    );
+    proto.insert_with_attrs(
+        "__get_entryType__".into(),
+        entry_slot_getter("__pe_type__", "get PerformanceEntry.prototype.entryType"),
+        accessor_attrs,
+    );
+    proto.insert_with_attrs(
+        "__get_startTime__".into(),
+        entry_slot_getter("__pe_start__", "get PerformanceEntry.prototype.startTime"),
+        accessor_attrs,
+    );
+    proto.insert_with_attrs(
+        "__get_duration__".into(),
+        entry_slot_getter("__pe_duration__", "get PerformanceEntry.prototype.duration"),
+        accessor_attrs,
+    );
+    proto.insert(
+        "toJSON".into(),
+        builtin_fn("toJSON", 0, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_ENTRY_BRAND);
+            let JsValue::PlainObject(map) = recv else {
+                return Err(StatorError::TypeError(
+                    "PerformanceEntry.prototype.toJSON called on incompatible receiver".into(),
+                ));
+            };
+            let b = map.borrow();
+            if !matches!(b.get(PERFORMANCE_ENTRY_BRAND), Some(JsValue::Boolean(true))) {
+                return Err(StatorError::TypeError(
+                    "PerformanceEntry.prototype.toJSON called on incompatible receiver".into(),
+                ));
+            }
+            let mut out = PropertyMap::new();
+            out.insert(
+                "name".into(),
+                b.get("__pe_name__").cloned().unwrap_or(JsValue::Undefined),
+            );
+            out.insert(
+                "entryType".into(),
+                b.get("__pe_type__").cloned().unwrap_or(JsValue::Undefined),
+            );
+            out.insert(
+                "startTime".into(),
+                b.get("__pe_start__").cloned().unwrap_or(JsValue::Undefined),
+            );
+            out.insert(
+                "duration".into(),
+                b.get("__pe_duration__")
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+        }),
+    );
+}
+
+fn make_performance_entry_constructor() -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("PerformanceEntry".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    install_entry_accessors(&mut proto);
+    proto.make_all_non_enumerable();
+
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "PerformanceEntry: illegal constructor".into(),
+            ))
+        }),
+    );
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_performance_mark_constructor(entry_proto: Rc<RefCell<PropertyMap>>) -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("PerformanceMark".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        INTERNAL_PROTO_PROPERTY_KEY.into(),
+        JsValue::PlainObject(entry_proto),
+        PropertyAttributes::empty(),
+    );
+    proto.insert_with_attrs(
+        "__get_detail__".into(),
+        entry_slot_getter("__pe_detail__", "get PerformanceMark.prototype.detail"),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let proto_value = JsValue::PlainObject(Rc::new(RefCell::new(proto)));
+    let proto_for_ctor = proto_value.clone();
+    let constructor = native(move |args| {
+        // `new PerformanceMark(name, options?)` — spec-allowed constructor.
+        let name = args
+            .first()
+            .ok_or_else(|| {
+                StatorError::TypeError(
+                    "PerformanceMark: 1 argument required, but only 0 present".into(),
+                )
+            })?
+            .to_js_string()?;
+        let mark_proto = PERFORMANCE_MARK_PROTO
+            .with(|p| p.borrow().clone())
+            .ok_or_else(|| {
+                StatorError::TypeError("PerformanceMark: prototype not installed".into())
+            })?;
+        let (start_time, detail) = parse_mark_options(args.get(1), 0.0)?;
+        Ok(build_entry_instance(
+            Some(mark_proto),
+            Rc::from(name.as_str()),
+            "mark",
+            start_time,
+            0.0,
+            detail,
+            "PerformanceMark",
+        ))
+    });
+
+    let mut props = PropertyMap::new();
+    props.insert("__call__".into(), constructor.clone());
+    props.insert("__construct__".into(), constructor);
+    props.insert("prototype".into(), proto_for_ctor);
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_performance_measure_constructor(entry_proto: Rc<RefCell<PropertyMap>>) -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("PerformanceMeasure".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        INTERNAL_PROTO_PROPERTY_KEY.into(),
+        JsValue::PlainObject(entry_proto),
+        PropertyAttributes::empty(),
+    );
+    proto.insert_with_attrs(
+        "__get_detail__".into(),
+        entry_slot_getter("__pe_detail__", "get PerformanceMeasure.prototype.detail"),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "PerformanceMeasure: illegal constructor".into(),
+            ))
+        }),
+    );
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn parse_mark_options(
+    options: Option<&JsValue>,
+    default_start_time: f64,
+) -> StatorResult<(f64, JsValue)> {
+    let Some(opts) = options else {
+        return Ok((default_start_time, JsValue::Undefined));
+    };
+    match opts {
+        JsValue::Undefined | JsValue::Null => Ok((default_start_time, JsValue::Undefined)),
+        JsValue::PlainObject(map) => {
+            let b = map.borrow();
+            let start_time = match b.get("startTime") {
+                Some(JsValue::Undefined) | None => default_start_time,
+                Some(v) => finite_non_negative(v.to_number()?, "mark startTime")?,
+            };
+            let detail = b.get("detail").cloned().unwrap_or(JsValue::Undefined);
+            Ok((start_time, detail))
+        }
+        _ => Err(StatorError::TypeError(
+            "performance.mark: options must be an object".into(),
+        )),
+    }
+}
+
+fn most_recent_mark_start(state: &Rc<RefCell<PerformanceState>>, name: &str) -> Option<f64> {
+    for e in state.borrow().entries.iter().rev() {
+        if entry_type_of(e).as_deref() == Some("mark")
+            && entry_name_of(e).as_deref() == Some(name)
+            && let Some(s) = entry_start_of(e)
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn resolve_measure_endpoint(
+    state: &Rc<RefCell<PerformanceState>>,
+    value: &JsValue,
+    role: &str,
+) -> StatorResult<f64> {
+    match value {
+        JsValue::String(s) => most_recent_mark_start(state, s.as_ref()).ok_or_else(|| {
+            StatorError::SyntaxError(format!(
+                "performance.measure: {role} mark '{s}' does not exist"
+            ))
+        }),
+        _ => {
+            let n = value.to_number()?;
+            finite_non_negative(n, &format!("{role} time"))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn performance_measure(
+    state: &Rc<RefCell<PerformanceState>>,
+    user_args: &[JsValue],
+) -> StatorResult<JsValue> {
+    let name_val = user_args.first().unwrap_or(&JsValue::Undefined);
+    let name = name_val.to_js_string()?;
+    let now = performance_now_value(state);
+
+    let start_or_options = user_args.get(1).cloned().unwrap_or(JsValue::Undefined);
+    let end_mark = user_args.get(2).cloned().unwrap_or(JsValue::Undefined);
+
+    let (start_time, end_time, detail) = match &start_or_options {
+        JsValue::PlainObject(map) => {
+            if !matches!(end_mark, JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "performance.measure: cannot pass endMark when options object is given".into(),
+                ));
+            }
+            let b = map.borrow();
+            let has_start = b
+                .get("start")
+                .is_some_and(|v| !matches!(v, JsValue::Undefined));
+            let has_end = b
+                .get("end")
+                .is_some_and(|v| !matches!(v, JsValue::Undefined));
+            let dur_val = b.get("duration").cloned().unwrap_or(JsValue::Undefined);
+            let has_duration = !matches!(dur_val, JsValue::Undefined);
+            if has_start && has_end && has_duration {
+                return Err(StatorError::SyntaxError(
+                    "performance.measure: options can have at most two of start, end, duration"
+                        .into(),
+                ));
+            }
+            let detail = b.get("detail").cloned().unwrap_or(JsValue::Undefined);
+            let start_opt = if has_start {
+                Some(resolve_measure_endpoint(
+                    state,
+                    b.get("start").unwrap(),
+                    "start",
+                )?)
+            } else {
+                None
+            };
+            let end_opt = if has_end {
+                Some(resolve_measure_endpoint(
+                    state,
+                    b.get("end").unwrap(),
+                    "end",
+                )?)
+            } else {
+                None
+            };
+            let duration_opt = if has_duration {
+                Some(finite_non_negative(dur_val.to_number()?, "duration")?)
+            } else {
+                None
+            };
+            let (start, end) = match (start_opt, end_opt, duration_opt) {
+                (Some(s), Some(e), None) => (s, e),
+                (Some(s), None, Some(d)) => (s, s + d),
+                (None, Some(e), Some(d)) => (e - d, e),
+                (Some(s), None, None) => (s, now),
+                (None, Some(e), None) => (0.0, e),
+                (None, None, Some(d)) => (0.0, d),
+                (None, None, None) => (0.0, now),
+                _ => unreachable!(),
+            };
+            (start, end, detail)
+        }
+        JsValue::Undefined | JsValue::Null => (0.0, now, JsValue::Undefined),
+        other => {
+            let start = resolve_measure_endpoint(state, other, "start")?;
+            let end = if matches!(end_mark, JsValue::Undefined) {
+                now
+            } else {
+                resolve_measure_endpoint(state, &end_mark, "end")?
+            };
+            (start, end, JsValue::Undefined)
+        }
+    };
+
+    let duration = end_time - start_time;
+    let measure_proto = PERFORMANCE_MEASURE_PROTO
+        .with(|p| p.borrow().clone())
+        .ok_or_else(|| {
+            StatorError::TypeError("performance.measure: prototype not installed".into())
+        })?;
+    let entry = build_entry_instance(
+        Some(measure_proto),
+        Rc::from(name.as_str()),
+        "measure",
+        start_time,
+        duration,
+        detail,
+        "PerformanceMeasure",
+    );
+    state.borrow_mut().entries.push(entry.clone());
+    Ok(entry)
+}
+
+fn performance_mark(
+    state: &Rc<RefCell<PerformanceState>>,
+    user_args: &[JsValue],
+) -> StatorResult<JsValue> {
+    let name = user_args
+        .first()
+        .unwrap_or(&JsValue::Undefined)
+        .to_js_string()?;
+    let now = performance_now_value(state);
+    let (start_time, detail) = parse_mark_options(user_args.get(1), now)?;
+    let mark_proto = PERFORMANCE_MARK_PROTO
+        .with(|p| p.borrow().clone())
+        .ok_or_else(|| {
+            StatorError::TypeError("performance.mark: prototype not installed".into())
+        })?;
+    let entry = build_entry_instance(
+        Some(mark_proto),
+        Rc::from(name.as_str()),
+        "mark",
+        start_time,
+        0.0,
+        detail,
+        "PerformanceMark",
+    );
+    state.borrow_mut().entries.push(entry.clone());
+    Ok(entry)
+}
+
+fn performance_clear(
+    state: &Rc<RefCell<PerformanceState>>,
+    user_args: &[JsValue],
+    entry_type: &str,
+) -> StatorResult<JsValue> {
+    let name_filter = match user_args.first() {
+        None | Some(JsValue::Undefined) => None,
+        Some(v) => Some(v.to_js_string()?),
+    };
+    let mut st = state.borrow_mut();
+    st.entries.retain(|e| {
+        if entry_type_of(e).as_deref() != Some(entry_type) {
+            return true;
+        }
+        match &name_filter {
+            Some(name) => entry_name_of(e).as_deref() != Some(name.as_str()),
+            None => false,
+        }
+    });
+    Ok(JsValue::Undefined)
+}
+
+fn performance_sorted_entries(state: &Rc<RefCell<PerformanceState>>) -> Vec<JsValue> {
+    let mut entries: Vec<JsValue> = state.borrow().entries.clone();
+    entries.sort_by(|a, b| {
+        let sa = entry_start_of(a).unwrap_or(0.0);
+        let sb = entry_start_of(b).unwrap_or(0.0);
+        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
+}
+
+fn make_performance_constructor() -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Performance".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    let accessor_attrs = PropertyAttributes::CONFIGURABLE;
+    proto.insert_with_attrs(
+        "__get_timeOrigin__".into(),
+        native(|args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "get Performance.prototype.timeOrigin")?;
+            let v = state.borrow().time_origin_ms;
+            Ok(num(v))
+        }),
+        accessor_attrs,
+    );
+
+    proto.insert(
+        "now".into(),
+        builtin_fn("now", 0, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.now")?;
+            Ok(num(performance_now_value(&state)))
+        }),
+    );
+
+    proto.insert(
+        "mark".into(),
+        builtin_fn("mark", 1, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.mark")?;
+            performance_mark(&state, &user_args)
+        }),
+    );
+
+    proto.insert(
+        "measure".into(),
+        builtin_fn("measure", 1, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.measure")?;
+            performance_measure(&state, &user_args)
+        }),
+    );
+
+    proto.insert(
+        "clearMarks".into(),
+        builtin_fn("clearMarks", 0, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.clearMarks")?;
+            performance_clear(&state, &user_args, "mark")
+        }),
+    );
+
+    proto.insert(
+        "clearMeasures".into(),
+        builtin_fn("clearMeasures", 0, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.clearMeasures")?;
+            performance_clear(&state, &user_args, "measure")
+        }),
+    );
+
+    // The resource-timing buffer is not populated in standalone Stator
+    // (there is no resource loader). Both buffer-management methods are
+    // accepted but no-ops, matching the browser shape for product code
+    // that defensively calls them.
+    proto.insert(
+        "clearResourceTimings".into(),
+        builtin_fn("clearResourceTimings", 0, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            lookup_performance_state(&recv, "Performance.prototype.clearResourceTimings")?;
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "setResourceTimingBufferSize".into(),
+        builtin_fn("setResourceTimingBufferSize", 1, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            lookup_performance_state(&recv, "Performance.prototype.setResourceTimingBufferSize")?;
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    proto.insert(
+        "getEntries".into(),
+        builtin_fn("getEntries", 0, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.getEntries")?;
+            Ok(JsValue::new_array(performance_sorted_entries(&state)))
+        }),
+    );
+
+    proto.insert(
+        "getEntriesByName".into(),
+        builtin_fn("getEntriesByName", 1, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.getEntriesByName")?;
+            let name = user_args
+                .first()
+                .unwrap_or(&JsValue::Undefined)
+                .to_js_string()?;
+            let type_filter = match user_args.get(1) {
+                None | Some(JsValue::Undefined) => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            let entries = performance_sorted_entries(&state)
+                .into_iter()
+                .filter(|e| {
+                    entry_name_of(e).as_deref() == Some(name.as_str())
+                        && type_filter
+                            .as_deref()
+                            .map(|t| entry_type_of(e).as_deref() == Some(t))
+                            .unwrap_or(true)
+                })
+                .collect();
+            Ok(JsValue::new_array(entries))
+        }),
+    );
+
+    proto.insert(
+        "getEntriesByType".into(),
+        builtin_fn("getEntriesByType", 1, |args| {
+            let (recv, user_args) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.getEntriesByType")?;
+            let type_name = user_args
+                .first()
+                .unwrap_or(&JsValue::Undefined)
+                .to_js_string()?;
+            // Types with no host integration in standalone Stator return an
+            // empty list (matching browser shape) instead of fabricating
+            // entries. Only "mark" and "measure" actually have data.
+            let entries = performance_sorted_entries(&state)
+                .into_iter()
+                .filter(|e| entry_type_of(e).as_deref() == Some(type_name.as_str()))
+                .collect();
+            Ok(JsValue::new_array(entries))
+        }),
+    );
+
+    proto.insert(
+        "toJSON".into(),
+        builtin_fn("toJSON", 0, |args| {
+            let (recv, _) = resolve_branded_receiver(&args, PERFORMANCE_BRAND);
+            let state = lookup_performance_state(&recv, "Performance.prototype.toJSON")?;
+            let mut out = PropertyMap::new();
+            out.insert("timeOrigin".into(), num(state.borrow().time_origin_ms));
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+        }),
+    );
+
+    proto.make_all_non_enumerable();
+
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "Performance: illegal constructor".into(),
+            ))
+        }),
+    );
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_performance_instance(performance_proto: JsValue) -> JsValue {
+    let instance = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = instance.borrow_mut();
+        props.insert(PERFORMANCE_BRAND.into(), JsValue::Boolean(true));
+        props.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), performance_proto);
+        props.insert(
+            "@@toStringTag".into(),
+            JsValue::String("Performance".into()),
+        );
+        props.make_all_non_enumerable();
+    }
+    install_performance_state(&instance);
+    JsValue::PlainObject(instance)
 }
 
 /// Resolve the receiver for a `TextEncoder.prototype.*` method invocation.
@@ -23182,57 +23967,77 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
-        // ── Performance / User Timing / Resource Timing (fail-closed) ──────
+        // ── Performance / User Timing ───────────────────────────────────────
         //
-        // The Performance APIs (`Performance`, `PerformanceEntry` and its
-        // subclasses for marks, measures, navigation/resource/paint/event/
-        // long-task timing, largest-contentful-paint, layout-shift and
-        // visibility-state entries) require a browser timeline, a resource
-        // loader, a rendering pipeline, an event loop with task attribution
-        // and a navigation/painting/scheduling host integration to populate
-        // real entries. This standalone engine has none of those, so the
-        // constructors are exposed (because product code commonly probes
-        // them via `typeof PerformanceEntry === 'function'`) but every
-        // construction fails with a `TypeError` instead of pretending to
-        // produce timeline entries.
+        // The High-Resolution Time and User-Timing subsets are implemented
+        // for real: a `performance` global with a stable `timeOrigin`, a
+        // monotonic `now()`, and the `mark`/`measure`/`clear*`/`getEntries*`
+        // family. Marks and measures are `PerformanceMark`/`PerformanceMeasure`
+        // instances that derive from `PerformanceEntry` and expose the
+        // standard `name`/`entryType`/`startTime`/`duration` accessors plus
+        // `toJSON`. The `PerformanceMark` constructor is callable per spec
+        // (`new PerformanceMark(name, options?)`); `Performance`,
+        // `PerformanceEntry` and `PerformanceMeasure` constructors are
+        // intentionally illegal, matching browser behavior.
         //
-        // The `performance` global object itself is intentionally left
-        // absent. Exposing a stub object would invite product code to read
-        // `performance.now()`, `performance.timeOrigin`,
-        // `performance.getEntries*`, `performance.mark`, `performance.measure`,
-        // `performance.timing` and `performance.navigation` and silently
-        // receive fake or zero values; that is worse than the global being
-        // undefined. When a host eventually wires a real timeline into the
-        // engine it can install `performance` itself; until then the
-        // absence is asserted by `e2e_performance_global_remains_absent`.
-        globals.insert(
-            "Performance".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("Performance"),
-                "Performance",
-            ),
+        // Resource, navigation, paint, event, long-task, layout-shift,
+        // largest-contentful-paint and visibility-state timing entries
+        // require a browser timeline, resource loader, rendering pipeline
+        // or host event loop to populate. Their constructors stay
+        // fail-closed; `performance.getEntriesByType("resource")` and
+        // friends return empty arrays (matching browser shape) rather than
+        // fabricated entries.
+        let performance_ctor = finalize_ctor(make_performance_constructor(), "Performance");
+        let performance_proto = match &performance_ctor {
+            JsValue::PlainObject(map) => map
+                .borrow()
+                .get("prototype")
+                .cloned()
+                .unwrap_or(JsValue::Null),
+            _ => JsValue::Null,
+        };
+        globals.insert("Performance".into(), performance_ctor);
+
+        let performance_entry_ctor =
+            finalize_ctor(make_performance_entry_constructor(), "PerformanceEntry");
+        let entry_proto_rc = match &performance_entry_ctor {
+            JsValue::PlainObject(map) => match map.borrow().get("prototype").cloned() {
+                Some(JsValue::PlainObject(p)) => p,
+                _ => Rc::new(RefCell::new(PropertyMap::new())),
+            },
+            _ => Rc::new(RefCell::new(PropertyMap::new())),
+        };
+        globals.insert("PerformanceEntry".into(), performance_entry_ctor);
+
+        let performance_mark_ctor = finalize_ctor(
+            make_performance_mark_constructor(entry_proto_rc.clone()),
+            "PerformanceMark",
         );
-        globals.insert(
-            "PerformanceEntry".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("PerformanceEntry"),
-                "PerformanceEntry",
-            ),
+        if let JsValue::PlainObject(map) = &performance_mark_ctor
+            && let Some(JsValue::PlainObject(p)) = map.borrow().get("prototype").cloned()
+        {
+            PERFORMANCE_MARK_PROTO.with(|slot| *slot.borrow_mut() = Some(p));
+        }
+        globals.insert("PerformanceMark".into(), performance_mark_ctor);
+
+        let performance_measure_ctor = finalize_ctor(
+            make_performance_measure_constructor(entry_proto_rc.clone()),
+            "PerformanceMeasure",
         );
+        if let JsValue::PlainObject(map) = &performance_measure_ctor
+            && let Some(JsValue::PlainObject(p)) = map.borrow().get("prototype").cloned()
+        {
+            PERFORMANCE_MEASURE_PROTO.with(|slot| *slot.borrow_mut() = Some(p));
+        }
+        globals.insert("PerformanceMeasure".into(), performance_measure_ctor);
+
+        PERFORMANCE_ENTRY_PROTO.with(|slot| *slot.borrow_mut() = Some(entry_proto_rc));
+
         globals.insert(
-            "PerformanceMark".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("PerformanceMark"),
-                "PerformanceMark",
-            ),
+            "performance".into(),
+            make_performance_instance(performance_proto),
         );
-        globals.insert(
-            "PerformanceMeasure".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("PerformanceMeasure"),
-                "PerformanceMeasure",
-            ),
-        );
+
         globals.insert(
             "PerformanceResourceTiming".into(),
             finalize_ctor(
@@ -24732,7 +25537,8 @@ mod tests {
         assert!(globals.contains_key("LayoutShift"));
         assert!(globals.contains_key("LayoutShiftAttribution"));
         assert!(globals.contains_key("VisibilityStateEntry"));
-        assert!(!globals.contains_key("performance"));
+        assert!(!globals.contains_key("performance.now"));
+        assert!(globals.contains_key("performance"));
         assert!(globals.contains_key("requestAnimationFrame"));
         assert!(globals.contains_key("cancelAnimationFrame"));
         assert!(globals.contains_key("requestIdleCallback"));
@@ -27297,19 +28103,19 @@ mod tests {
         assert_eval_true("typeof matchMedia === 'undefined'");
     }
 
-    /// Performance timeline constructors (`Performance`, `PerformanceEntry`
-    /// and its subclasses for marks, measures, navigation/resource/paint/
-    /// event/long-task timing, largest-contentful-paint, layout-shift and
-    /// visibility-state entries) are exposed so feature detection succeeds,
-    /// but construction fails closed because the engine has no browser
-    /// timeline, resource loader, rendering pipeline, navigation scheduler
-    /// or task-attribution machinery to populate real entries.
+    /// Performance timeline subclasses that require a browser timeline,
+    /// resource loader, rendering pipeline, navigation scheduler or
+    /// task-attribution machinery to populate real entries are exposed as
+    /// fail-closed constructors so feature detection succeeds but
+    /// construction throws. `Performance`, `PerformanceEntry` and
+    /// `PerformanceMeasure` constructors are also illegal per the spec.
+    /// `PerformanceMark` IS a real constructor (see
+    /// `e2e_performance_mark_constructor_works`).
     #[test]
     fn e2e_performance_timeline_constructors_exist_but_fail_closed() {
         for name in [
             "Performance",
             "PerformanceEntry",
-            "PerformanceMark",
             "PerformanceMeasure",
             "PerformanceResourceTiming",
             "PerformanceNavigationTiming",
@@ -27328,21 +28134,214 @@ mod tests {
             assert_eval_type_error(&format!("{name}()"));
             assert_eval_type_error(&format!("new {name}()"));
         }
-
-        assert_eval_type_error("new PerformanceMark('start')");
-        assert_eval_type_error("new PerformanceMark('start', { startTime: 0 })");
     }
 
-    /// The `performance` global object is intentionally absent. Exposing a
-    /// stub would invite product code to read `performance.now()`,
-    /// `performance.timeOrigin`, `performance.getEntries*`,
-    /// `performance.mark`, `performance.measure`, `performance.timing` or
-    /// `performance.navigation` and silently receive fake or zero values,
-    /// which is worse than the global being undefined. Until a host wires
-    /// a real timeline into the engine, `performance` stays undefined.
+    /// The `performance` global is installed and exposes a stable
+    /// `timeOrigin` (Unix-epoch ms captured at install time), a monotonic
+    /// `now()` (ms since `timeOrigin`), and the User Timing surface.
     #[test]
-    fn e2e_performance_global_remains_absent() {
-        assert_eval_true("typeof performance === 'undefined'");
+    fn e2e_performance_global_exists_with_real_shape() {
+        assert_eval_true("typeof performance === 'object' && performance !== null");
+        assert_eval_true("performance instanceof Performance");
+        assert_eval_true(
+            "typeof performance.now === 'function' && typeof performance.timeOrigin === 'number'",
+        );
+        assert_eval_true("typeof performance.mark === 'function'");
+        assert_eval_true("typeof performance.measure === 'function'");
+        assert_eval_true("typeof performance.clearMarks === 'function'");
+        assert_eval_true("typeof performance.clearMeasures === 'function'");
+        assert_eval_true("typeof performance.getEntries === 'function'");
+        assert_eval_true("typeof performance.getEntriesByName === 'function'");
+        assert_eval_true("typeof performance.getEntriesByType === 'function'");
+    }
+
+    /// `performance.timeOrigin` is captured at install time and never
+    /// changes for the lifetime of the context.
+    #[test]
+    fn e2e_performance_time_origin_is_stable() {
+        assert_eval_true(
+            "const a = performance.timeOrigin; const b = performance.timeOrigin; a === b",
+        );
+        assert_eval_true("performance.timeOrigin > 0 && Number.isFinite(performance.timeOrigin)");
+    }
+
+    /// `performance.now()` is monotonic non-decreasing within a context.
+    #[test]
+    fn e2e_performance_now_is_monotonic() {
+        assert_eval_true(
+            "(function () {                 \
+                let prev = performance.now();        \
+                for (let i = 0; i < 1000; i++) {     \
+                    const v = performance.now();     \
+                    if (v < prev) return false;      \
+                    prev = v;                        \
+                }                                    \
+                return true;                         \
+            })()",
+        );
+    }
+
+    /// `performance.mark` records a `PerformanceMark` with the spec shape;
+    /// `performance.measure` records a `PerformanceMeasure` whose duration
+    /// is derived from the named marks.
+    #[test]
+    fn e2e_performance_mark_and_measure_user_timing() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                const m = performance.mark('a');                         \
+                if (!(m instanceof PerformanceMark)) return false;       \
+                if (!(m instanceof PerformanceEntry)) return false;      \
+                if (m.name !== 'a' || m.entryType !== 'mark') return false; \
+                if (typeof m.startTime !== 'number') return false;       \
+                if (m.duration !== 0) return false;                      \
+                performance.mark('b');                                   \
+                const ms = performance.measure('m', 'a', 'b');           \
+                if (!(ms instanceof PerformanceMeasure)) return false;   \
+                if (!(ms instanceof PerformanceEntry)) return false;     \
+                if (ms.name !== 'm' || ms.entryType !== 'measure') return false; \
+                if (ms.duration < 0) return false;                       \
+                return true;                                             \
+            })()",
+        );
+    }
+
+    /// `performance.mark(name, { startTime, detail })` honors the options
+    /// bag and `performance.getEntries*` filters by name and type.
+    #[test]
+    fn e2e_performance_mark_options_and_get_entries() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                const m = performance.mark('x', { startTime: 42, detail: { k: 1 } }); \
+                if (m.startTime !== 42) return false;                    \
+                if (!m.detail || m.detail.k !== 1) return false;         \
+                performance.mark('y', { startTime: 10 });                \
+                const all = performance.getEntries();                    \
+                if (!Array.isArray(all) || all.length !== 2) return false; \
+                if (all[0].name !== 'y' || all[1].name !== 'x') return false; \
+                const byName = performance.getEntriesByName('x');        \
+                if (byName.length !== 1 || byName[0].name !== 'x') return false; \
+                const byType = performance.getEntriesByType('mark');     \
+                if (byType.length !== 2) return false;                   \
+                return true;                                             \
+            })()",
+        );
+    }
+
+    /// `clearMarks(name)` and `clearMeasures(name)` remove only the named
+    /// entries; the no-arg form removes all of that type.
+    #[test]
+    fn e2e_performance_clear_marks_and_measures() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                performance.mark('a'); performance.mark('b'); performance.mark('a'); \
+                performance.clearMarks('a');                             \
+                if (performance.getEntriesByName('a').length !== 0) return false; \
+                if (performance.getEntriesByName('b').length !== 1) return false; \
+                performance.clearMarks();                                \
+                if (performance.getEntries().length !== 0) return false; \
+                performance.mark('s'); performance.mark('e');            \
+                performance.measure('m1', 's', 'e');                     \
+                performance.measure('m2', 's', 'e');                     \
+                performance.clearMeasures('m1');                         \
+                if (performance.getEntriesByType('measure').length !== 1) return false; \
+                performance.clearMeasures();                             \
+                if (performance.getEntriesByType('measure').length !== 0) return false; \
+                return true;                                             \
+            })()",
+        );
+    }
+
+    /// `performance.measure` accepts an options bag with `start`/`end`/
+    /// `duration` and rejects all three or unknown mark names.
+    #[test]
+    fn e2e_performance_measure_options_bag() {
+        assert_eval_true(
+            "(function () {                                              \
+                performance.clearMarks(); performance.clearMeasures();   \
+                const m = performance.measure('m', { start: 10, duration: 5 }); \
+                if (m.startTime !== 10 || m.duration !== 5) return false; \
+                const m2 = performance.measure('m2', { start: 1, end: 4 }); \
+                if (m2.duration !== 3) return false;                     \
+                return true;                                             \
+            })()",
+        );
+        assert_eval_true(
+            "(function () {                                              \
+                try { performance.measure('x', { start: 1, end: 2, duration: 1 }); } \
+                catch (e) { return e instanceof SyntaxError; }           \
+                return false;                                            \
+            })()",
+        );
+        assert_eval_true(
+            "(function () {                                              \
+                try { performance.measure('x', 'nope'); }                \
+                catch (e) { return e instanceof SyntaxError; }           \
+                return false;                                            \
+            })()",
+        );
+    }
+
+    /// `getEntriesByType` returns empty arrays for entry types that have
+    /// no host integration in standalone Stator (no fake resource or
+    /// navigation entries are fabricated).
+    #[test]
+    fn e2e_performance_unsupported_entry_types_are_empty() {
+        for ty in ["resource", "navigation", "paint", "longtask", "event"] {
+            assert_eval_true(&format!(
+                "Array.isArray(performance.getEntriesByType('{ty}')) && performance.getEntriesByType('{ty}').length === 0"
+            ));
+        }
+    }
+
+    /// `PerformanceMark` is a callable constructor per spec; `Performance`,
+    /// `PerformanceEntry` and `PerformanceMeasure` are illegal constructors.
+    #[test]
+    fn e2e_performance_mark_constructor_works() {
+        assert_eval_true(
+            "(function () {                                              \
+                const m = new PerformanceMark('hello', { startTime: 7, detail: 42 }); \
+                return m instanceof PerformanceMark                      \
+                    && m instanceof PerformanceEntry                     \
+                    && m.name === 'hello'                                \
+                    && m.entryType === 'mark'                            \
+                    && m.startTime === 7                                 \
+                    && m.duration === 0                                  \
+                    && m.detail === 42;                                  \
+            })()",
+        );
+        assert_eval_type_error("new Performance()");
+        assert_eval_type_error("new PerformanceEntry()");
+        assert_eval_type_error("new PerformanceMeasure()");
+    }
+
+    /// `Performance.prototype.*` methods brand-check their receiver.
+    #[test]
+    fn e2e_performance_prototype_methods_require_branded_receiver() {
+        for expr in [
+            "Performance.prototype.now.call({})",
+            "Performance.prototype.mark.call({}, 'x')",
+            "Performance.prototype.measure.call({}, 'x')",
+            "Performance.prototype.getEntries.call({})",
+            "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(performance), 'timeOrigin').get.call({})",
+        ] {
+            assert_eval_type_error(expr);
+        }
+    }
+
+    /// Host-integrated performance surfaces remain absent or fail-closed:
+    /// `PerformanceObserver` cannot be constructed, and the legacy
+    /// `performance.timing` / `performance.navigation` / `performance.memory`
+    /// extensions are not exposed.
+    #[test]
+    fn e2e_performance_host_integrations_stay_fail_closed() {
+        assert_eval_type_error("new PerformanceObserver(function () {})");
+        assert_eval_true("typeof performance.timing === 'undefined'");
+        assert_eval_true("typeof performance.navigation === 'undefined'");
+        assert_eval_true("typeof performance.memory === 'undefined'");
+        assert_eval_true("typeof performance.onresourcetimingbufferfull === 'undefined'");
     }
 
     /// Browser self-reference globals (`window`, `self`, `frames`, `parent`,
