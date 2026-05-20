@@ -8528,12 +8528,14 @@ fn handle_lda_import_meta(
 /// `export * from "…"`.
 ///
 /// Namespace objects are published into the shared global environment under
-/// the key `__mod_ns:{specifier}` by the module evaluator before the
-/// importing module runs.  When no namespace has been published (because
-/// the importer is being executed as a standalone script in tests, or
-/// because the host did not run the linked dependency), this falls back to
-/// a fresh empty `PlainObject` so direct interpreter use of the opcode does
-/// not crash.
+/// the key `__mod_ns:{specifier}` by the host's module-graph linker (e.g.
+/// the FFI `stator_publish_module_namespace` entry point) before the
+/// importing module runs.  When no namespace has been published this fails
+/// closed with a `ReferenceError`: returning a fabricated empty namespace
+/// would let the importing script believe the dependency loaded with no
+/// exports, which is strictly worse than throwing — silent fake-success
+/// would mask missing host-side module resolution, import-map rewrites,
+/// fetch errors, or CSP/Trusted-Types denials.
 #[cold]
 fn handle_get_module_namespace(
     ctx: &mut DispatchContext,
@@ -8552,8 +8554,11 @@ fn handle_get_module_namespace(
     };
     let key = format!("__mod_ns:{specifier}");
     let value = ctx.frame.global_env.borrow().get(&key).cloned();
-    ctx.frame.accumulator =
-        value.unwrap_or_else(|| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))));
+    ctx.frame.accumulator = value.ok_or_else(|| {
+        StatorError::ReferenceError(format!(
+            "module namespace for '{specifier}' has not been published by the host loader"
+        ))
+    })?;
     Ok(DispatchAction::Continue)
 }
 
@@ -9994,9 +9999,14 @@ mod tests {
         assert_eq!(result, JsValue::Smi(99));
     }
 
-    /// `GetModuleNamespace` must produce an object (not crash).
+    /// `GetModuleNamespace` must fail closed when the host loader has not
+    /// published a namespace for the requested specifier. Returning a
+    /// fabricated empty namespace would let the importing script believe
+    /// the dependency loaded with no exports — a strictly worse fake
+    /// success that would mask missing host-side module resolution,
+    /// import-map rewrites, fetch errors, or CSP/Trusted-Types denials.
     #[test]
-    fn test_get_module_namespace_returns_object() {
+    fn test_get_module_namespace_throws_reference_error_when_not_published() {
         use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
         use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
         use crate::bytecode::feedback::FeedbackMetadata;
@@ -10020,11 +10030,56 @@ mod tests {
         )
         .with_module_flag(true);
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
-        let result = Interpreter::run(&mut frame).unwrap();
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        let msg = format!("{err}");
         assert!(
-            matches!(result, JsValue::PlainObject(_)),
-            "GetModuleNamespace should produce a PlainObject"
+            msg.contains("module namespace for './foo.js' has not been published"),
+            "expected fail-closed ReferenceError, got: {msg}"
         );
+    }
+
+    /// When the host loader *has* published a namespace under the
+    /// canonical `__mod_ns:{specifier}` key, `GetModuleNamespace` must
+    /// return that exact value — no copy, no wrapper.
+    #[test]
+    fn test_get_module_namespace_returns_published_namespace() {
+        use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+        use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::GetModuleNamespace,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![ConstantPoolEntry::String("./foo.js".to_string())],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let mut ns = PropertyMap::new();
+        ns.insert("x".into(), JsValue::Smi(42));
+        let ns_value = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
+        frame
+            .global_env
+            .borrow_mut()
+            .insert("__mod_ns:./foo.js".to_string(), ns_value);
+        let result = Interpreter::run(&mut frame).unwrap();
+        let JsValue::PlainObject(map) = result else {
+            panic!("expected PlainObject namespace, got {result:?}")
+        };
+        assert_eq!(map.borrow().get("x"), Some(&JsValue::Smi(42)));
     }
 
     // ── for-in prototype chain & internal key filtering ─────────────
