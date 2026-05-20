@@ -32962,6 +32962,35 @@ mod tests {
     }
 
     #[test]
+    fn e2e_web_storage_is_in_memory_and_not_quota_backed() {
+        assert_eval_true(
+            "
+            localStorage.clear();
+            sessionStorage.clear();
+            localStorage.setItem('shared', 'local');
+            sessionStorage.setItem('shared', 'session');
+            localStorage !== sessionStorage &&
+            localStorage.getItem('shared') === 'local' &&
+            sessionStorage.getItem('shared') === 'session' &&
+            localStorage.length === 1 &&
+            sessionStorage.length === 1
+            ",
+        );
+        assert_eval_true(
+            "
+            typeof Storage.prototype.persist === 'undefined' &&
+            typeof Storage.prototype.persisted === 'undefined' &&
+            typeof Storage.prototype.estimate === 'undefined' &&
+            typeof Storage.prototype.getDirectory === 'undefined' &&
+            typeof localStorage.cookieStore === 'undefined' &&
+            typeof localStorage.indexedDB === 'undefined' &&
+            typeof localStorage.caches === 'undefined' &&
+            typeof onstorage === 'undefined'
+            ",
+        );
+    }
+
+    #[test]
     fn e2e_database_storage_constructors_exist_but_fail_closed() {
         for name in [
             "IDBFactory",
@@ -33039,9 +33068,13 @@ mod tests {
         assert_eval_type_error("Cache.prototype.put.call({}, 'https://example.test/', {})");
         assert_eval_type_error("CookieStore.prototype.get.call({}, 'sid')");
         assert_eval_type_error("CookieStoreManager.prototype.subscribe.call({}, [])");
+        assert_eval_type_error("StorageManager.prototype.persist.call({})");
+        assert_eval_type_error("StorageManager.prototype.persisted.call({})");
         assert_eval_type_error("StorageManager.prototype.estimate.call({})");
         assert_eval_type_error("StorageManager.prototype.getDirectory.call({})");
         assert_eval_type_error("StorageBucket.prototype.persist.call({})");
+        assert_eval_type_error("StorageBucket.prototype.estimate.call({})");
+        assert_eval_type_error("StorageBucket.prototype.getDirectory.call({})");
         assert_eval_type_error("StorageBucketManager.prototype.open.call({}, 'b')");
     }
 
@@ -33059,6 +33092,13 @@ mod tests {
         assert_eval_type_error("caches.has('edge-stator-v1')");
         assert_eval_type_error("caches.delete('edge-stator-v1')");
         assert_eval_type_error("caches.keys()");
+        assert_eval_true(
+            "
+            typeof cookieStore === 'undefined' &&
+            typeof storageBuckets === 'undefined' &&
+            typeof originPrivateFileSystem === 'undefined'
+            ",
+        );
     }
 
     /// `navigator` itself is intentionally not preinstalled by the standalone
