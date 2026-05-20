@@ -30848,6 +30848,27 @@ mod tests {
     }
 
     #[test]
+    fn e2e_file_and_blob_data_apis_do_not_expose_filesystem_handles() {
+        // File/Blob are real in-memory data containers only. Path-like names
+        // remain opaque names and do not unlock host filesystem handles.
+        assert_eval_true(
+            "var f = new File(['x'], 'C:\\\\Users\\\\alice\\\\secret.txt'); \
+             f.name === 'C:\\\\Users\\\\alice\\\\secret.txt' && f.webkitRelativePath === ''",
+        );
+        for expr in [
+            "typeof Blob.prototype.getFile === 'undefined'",
+            "typeof Blob.prototype.getAsFileSystemHandle === 'undefined'",
+            "typeof File.prototype.getFile === 'undefined'",
+            "typeof File.prototype.getAsFileSystemHandle === 'undefined'",
+            "typeof File.prototype.createWritable === 'undefined'",
+            "typeof File.prototype.queryPermission === 'undefined'",
+            "typeof File.prototype.requestPermission === 'undefined'",
+        ] {
+            assert_eval_true(expr);
+        }
+    }
+
+    #[test]
     fn e2e_file_reader_sync_constructor_and_brand_checks() {
         assert_eval_true(
             "typeof FileReaderSync === 'function' && FileReaderSync.name === 'FileReaderSync'",
@@ -34521,6 +34542,83 @@ mod tests {
 
         assert_eval_true("typeof launchQueue === 'object' && launchQueue !== null");
         assert_eval_type_error("launchQueue.setConsumer(function () {})");
+    }
+
+    #[test]
+    fn e2e_file_system_access_prototypes_do_not_fabricate_handles() {
+        // Constructor globals and picker functions exist only for fail-closed
+        // feature detection. Their prototypes intentionally expose no methods
+        // that would imply a real file/directory handle or permission prompt.
+        for (ctor, member) in [
+            ("FileSystemHandle", "kind"),
+            ("FileSystemHandle", "name"),
+            ("FileSystemHandle", "isSameEntry"),
+            ("FileSystemHandle", "queryPermission"),
+            ("FileSystemHandle", "requestPermission"),
+            ("FileSystemFileHandle", "getFile"),
+            ("FileSystemFileHandle", "createWritable"),
+            ("FileSystemDirectoryHandle", "getFileHandle"),
+            ("FileSystemDirectoryHandle", "getDirectoryHandle"),
+            ("FileSystemDirectoryHandle", "removeEntry"),
+            ("FileSystemDirectoryHandle", "resolve"),
+            ("FileSystemDirectoryHandle", "entries"),
+            ("FileSystemDirectoryHandle", "keys"),
+            ("FileSystemDirectoryHandle", "values"),
+            ("FileSystemWritableFileStream", "write"),
+            ("FileSystemWritableFileStream", "seek"),
+            ("FileSystemWritableFileStream", "truncate"),
+            ("FileSystemWritableFileStream", "close"),
+            ("FileSystemSyncAccessHandle", "read"),
+            ("FileSystemSyncAccessHandle", "write"),
+            ("FileSystemSyncAccessHandle", "truncate"),
+            ("FileSystemSyncAccessHandle", "flush"),
+            ("FileSystemSyncAccessHandle", "close"),
+            ("FileSystemSyncAccessHandle", "getSize"),
+        ] {
+            assert_eval_true(&format!("typeof {ctor}.prototype.{member} === 'undefined'"));
+        }
+
+        assert_eval_type_error("Reflect.construct(FileSystemHandle, [])");
+        assert_eval_type_error("Reflect.construct(FileSystemFileHandle, [])");
+        assert_eval_type_error("Reflect.construct(FileSystemDirectoryHandle, [])");
+    }
+
+    #[test]
+    fn e2e_platform_service_methods_do_not_fabricate_host_results() {
+        for (ctor, member) in [
+            ("PaymentRequest", "show"),
+            ("PaymentRequest", "abort"),
+            ("PaymentRequest", "canMakePayment"),
+            ("PaymentRequest", "hasEnrolledInstrument"),
+            ("PaymentResponse", "complete"),
+            ("PaymentResponse", "retry"),
+            ("CredentialsContainer", "get"),
+            ("CredentialsContainer", "create"),
+            ("CredentialsContainer", "store"),
+            ("CredentialsContainer", "preventSilentAccess"),
+            ("LockManager", "request"),
+            ("LockManager", "query"),
+            ("WakeLock", "request"),
+            ("WakeLockSentinel", "release"),
+            ("IdleDetector", "start"),
+            ("ContactsManager", "select"),
+            ("ContactsManager", "getProperties"),
+            ("EyeDropper", "open"),
+            ("LaunchQueue", "setConsumer"),
+        ] {
+            assert_eval_true(&format!("typeof {ctor}.prototype.{member} === 'undefined'"));
+        }
+
+        assert_eval_true("typeof IdleDetector.requestPermission === 'undefined'");
+        assert_eval_true(
+            "typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'undefined'",
+        );
+        assert_eval_true(
+            "typeof PublicKeyCredential.isConditionalMediationAvailable === 'undefined'",
+        );
+        assert_eval_true("typeof setAppBadge === 'undefined'");
+        assert_eval_true("typeof clearAppBadge === 'undefined'");
+        assert_eval_true("typeof share === 'undefined'");
     }
 
     /// `navigator` itself is intentionally not preinstalled, so platform
