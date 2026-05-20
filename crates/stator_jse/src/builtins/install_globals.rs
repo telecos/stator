@@ -23897,6 +23897,10 @@ fn make_dom_point_builtin(kind: DomGeometryKind) -> JsValue {
                 );
             }
             proto.insert("toJSON".into(), builtin_fn("toJSON", 0, dom_point_to_json));
+            proto.insert(
+                "matrixTransform".into(),
+                builtin_fn("matrixTransform", 1, dom_point_matrix_transform_method),
+            );
             proto.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("DOMPointReadOnly".into()),
@@ -24049,6 +24053,1081 @@ fn make_dom_rect_builtin(kind: DomGeometryKind) -> JsValue {
         PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
     );
     ctor
+}
+
+// ── DOMMatrix / DOMMatrixReadOnly ───────────────────────────────────────────
+//
+// Conservative real implementation of the WebIDL geometry matrix data object.
+// The matrix is stored as 16 column-major `f64` slots in the order
+// `[m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42,
+// m43, m44]` (matches `toFloat32Array`/`toFloat64Array` and the 16-element
+// constructor input) and an `is2D` boolean. The `a..f` accessors are spec
+// aliases for `m11, m12, m21, m22, m41, m42`.
+//
+// Implemented surface (standalone, no CSS/SVG/canvas integration):
+// * Default-identity, 6-element-sequence (2D) and 16-element-sequence (3D)
+//   constructors. String/CSS transform input throws `TypeError`.
+// * Static `fromMatrix`, `fromFloat32Array`, `fromFloat64Array`.
+// * Read-only accessors `a, b, c, d, e, f`, `m11..m44`, `is2D`, `isIdentity`.
+// * Mutable setters for the same names on `DOMMatrix` (the readonly subclass
+//   has none); 3D-element setters flip `is2D` to false per spec.
+// * Pure-math methods: `multiply`, `translate`, `scale`, `rotate`,
+//   `inverse`, `transformPoint`, returning a fresh mutable `DOMMatrix`.
+// * Mutable self-variants `multiplySelf`, `preMultiplySelf`, `translateSelf`,
+//   `scaleSelf`, `rotateSelf`, `invertSelf` returning `this`.
+// * Serialization: `toJSON`, `toFloat32Array`, `toFloat64Array`.
+// * `DOMPoint.prototype.matrixTransform(matrix)` wired to real multiplication.
+//
+// `setMatrixValue` and `toString` remain fail-closed because they require
+// CSS transform parsing/serialization that the standalone engine cannot
+// perform correctly. `DOMQuad` also stays fail-closed.
+
+const DOM_MATRIX_READONLY_BRAND: &str = "__is_dom_matrix_readonly__";
+const DOM_MATRIX_MUTABLE_BRAND: &str = "__is_dom_matrix__";
+const DOM_MATRIX_ELEMENTS_SLOT: &str = "__dom_matrix_elements__";
+const DOM_MATRIX_IS_2D_SLOT: &str = "__dom_matrix_is_2d__";
+
+thread_local! {
+    static DOM_MATRIX_READONLY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static DOM_MATRIX_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Mapping of the six 2D aliases to indices in the 16-element column-major
+/// storage. `a, b, c, d, e, f` correspond to `m11, m12, m21, m22, m41, m42`.
+const DOM_MATRIX_2D_ALIASES: &[(&str, usize)] =
+    &[("a", 0), ("b", 1), ("c", 4), ("d", 5), ("e", 12), ("f", 13)];
+
+/// Mapping of `mIJ` names (I = column, J = row, both 1-based) to indices in
+/// the 16-element column-major storage. Index = (I-1)*4 + (J-1).
+const DOM_MATRIX_M_NAMES: &[(&str, usize)] = &[
+    ("m11", 0),
+    ("m12", 1),
+    ("m13", 2),
+    ("m14", 3),
+    ("m21", 4),
+    ("m22", 5),
+    ("m23", 6),
+    ("m24", 7),
+    ("m31", 8),
+    ("m32", 9),
+    ("m33", 10),
+    ("m34", 11),
+    ("m41", 12),
+    ("m42", 13),
+    ("m43", 14),
+    ("m44", 15),
+];
+
+/// Indices in `DOM_MATRIX_M_NAMES` of the 3D-only entries plus the diagonal
+/// (m33, m44) entries used to detect whether storage matches a 2D matrix.
+const DOM_MATRIX_3D_ZERO_INDICES: &[usize] = &[2, 3, 6, 7, 8, 9, 11, 14];
+const DOM_MATRIX_3D_ONE_INDICES: &[usize] = &[10, 15];
+
+fn dom_matrix_identity_elements() -> [f64; 16] {
+    let mut e = [0.0f64; 16];
+    e[0] = 1.0;
+    e[5] = 1.0;
+    e[10] = 1.0;
+    e[15] = 1.0;
+    e
+}
+
+/// Return true iff `elements` are bit-identical to the 2D-safe layout: every
+/// "3D-only" slot is zero and `m33`/`m44` are exactly `1.0`. Used to validate
+/// dictionary inputs that explicitly set `is2D = true`.
+fn dom_matrix_elements_are_2d_compatible(elements: &[f64; 16]) -> bool {
+    for &idx in DOM_MATRIX_3D_ZERO_INDICES {
+        if elements[idx] != 0.0 {
+            return false;
+        }
+    }
+    for &idx in DOM_MATRIX_3D_ONE_INDICES {
+        if elements[idx] != 1.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn dom_matrix_is_identity(elements: &[f64; 16]) -> bool {
+    for (i, &v) in elements.iter().enumerate() {
+        let expected = if matches!(i, 0 | 5 | 10 | 15) {
+            1.0
+        } else {
+            0.0
+        };
+        if v != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn dom_matrix_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn lookup_dom_matrix(
+    value: &JsValue,
+    marker: &str,
+    display_name: &str,
+) -> StatorResult<Rc<RefCell<PropertyMap>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(dom_matrix_type_error(format!(
+            "{display_name}: called on incompatible receiver"
+        )));
+    };
+    if !matches!(map.borrow().get(marker), Some(JsValue::Boolean(true))) {
+        return Err(dom_matrix_type_error(format!(
+            "{display_name}: called on incompatible receiver"
+        )));
+    }
+    Ok(Rc::clone(map))
+}
+
+fn dom_matrix_elements_of(map: &Rc<RefCell<PropertyMap>>) -> [f64; 16] {
+    let mut out = [0.0f64; 16];
+    if let Some(JsValue::Array(items)) = map.borrow().get(DOM_MATRIX_ELEMENTS_SLOT) {
+        let borrow = items.borrow();
+        for (i, slot) in out.iter_mut().enumerate() {
+            if let Some(v) = borrow.get(i) {
+                *slot = v.to_number().unwrap_or(0.0);
+            }
+        }
+    }
+    out
+}
+
+fn dom_matrix_is_2d_of(map: &Rc<RefCell<PropertyMap>>) -> bool {
+    matches!(
+        map.borrow().get(DOM_MATRIX_IS_2D_SLOT),
+        Some(JsValue::Boolean(true))
+    )
+}
+
+fn dom_matrix_store_elements(map: &Rc<RefCell<PropertyMap>>, elements: &[f64; 16], is_2d: bool) {
+    let arr: Vec<JsValue> = elements.iter().copied().map(num).collect();
+    let mut borrow = map.borrow_mut();
+    borrow.insert_with_attrs(
+        DOM_MATRIX_ELEMENTS_SLOT.into(),
+        JsValue::Array(Rc::new(RefCell::new(arr))),
+        PropertyAttributes::empty(),
+    );
+    borrow.insert_with_attrs(
+        DOM_MATRIX_IS_2D_SLOT.into(),
+        JsValue::Boolean(is_2d),
+        PropertyAttributes::empty(),
+    );
+}
+
+fn dom_matrix_resolve_receiver(args: &[JsValue], marker: &str) -> (JsValue, Vec<JsValue>) {
+    // Prefer the receiver published by the bytecode method-dispatch path
+    // (e.g. `m.method(other)`). Only fall back to args[0] when that receiver
+    // is not branded — handling `Function.prototype.call/apply/bind`, whose
+    // implementations prepend `this` as args[0]. DOMMatrix methods routinely
+    // take another DOMMatrix as their first argument, so the more permissive
+    // "branded args[0] wins" heuristic used for DOMPoint/DOMRect getters
+    // would misidentify the operand as the receiver.
+    let env_this = current_global_env().and_then(|env| env.borrow().get_this().cloned());
+    if let Some(this) = env_this.clone()
+        && let JsValue::PlainObject(map) = &this
+        && matches!(map.borrow().get(marker), Some(JsValue::Boolean(true)))
+    {
+        return (this, args.to_vec());
+    }
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(marker), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    (env_this.unwrap_or(JsValue::Undefined), args.to_vec())
+}
+
+fn build_dom_matrix_instance(elements: [f64; 16], is_2d: bool, mutable: bool) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            DOM_MATRIX_READONLY_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if mutable {
+            props.insert_with_attrs(
+                DOM_MATRIX_MUTABLE_BRAND.into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+        }
+        let proto = if mutable {
+            DOM_MATRIX_PROTO.with(|p| p.borrow().clone())
+        } else {
+            DOM_MATRIX_READONLY_PROTO.with(|p| p.borrow().clone())
+        };
+        if let Some(proto) = proto {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    dom_matrix_store_elements(&inst, &elements, is_2d);
+    JsValue::PlainObject(inst)
+}
+
+/// Multiply two column-major 4x4 matrices: `result = a * b`.
+fn dom_matrix_multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+    let mut result = [0.0f64; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut sum = 0.0f64;
+            for k in 0..4 {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            result[col * 4 + row] = sum;
+        }
+    }
+    result
+}
+
+fn dom_matrix_translation(tx: f64, ty: f64, tz: f64) -> [f64; 16] {
+    let mut t = dom_matrix_identity_elements();
+    t[12] = tx;
+    t[13] = ty;
+    t[14] = tz;
+    t
+}
+
+fn dom_matrix_scaling(sx: f64, sy: f64, sz: f64) -> [f64; 16] {
+    let mut s = dom_matrix_identity_elements();
+    s[0] = sx;
+    s[5] = sy;
+    s[10] = sz;
+    s
+}
+
+fn dom_matrix_rot_z(angle_deg: f64) -> [f64; 16] {
+    let rad = angle_deg.to_radians();
+    let (c, s) = (rad.cos(), rad.sin());
+    let mut m = dom_matrix_identity_elements();
+    m[0] = c;
+    m[1] = s;
+    m[4] = -s;
+    m[5] = c;
+    m
+}
+
+fn dom_matrix_rot_y(angle_deg: f64) -> [f64; 16] {
+    let rad = angle_deg.to_radians();
+    let (c, s) = (rad.cos(), rad.sin());
+    let mut m = dom_matrix_identity_elements();
+    m[0] = c;
+    m[2] = -s;
+    m[8] = s;
+    m[10] = c;
+    m
+}
+
+fn dom_matrix_rot_x(angle_deg: f64) -> [f64; 16] {
+    let rad = angle_deg.to_radians();
+    let (c, s) = (rad.cos(), rad.sin());
+    let mut m = dom_matrix_identity_elements();
+    m[5] = c;
+    m[6] = s;
+    m[9] = -s;
+    m[10] = c;
+    m
+}
+
+/// Apply `result = self * point` where `point = [x, y, z, w]` is the column
+/// vector and `self` is column-major. Returns `(x', y', z', w')`.
+fn dom_matrix_transform_point_xyzw(m: &[f64; 16], x: f64, y: f64, z: f64, w: f64) -> [f64; 4] {
+    let mut out = [0.0f64; 4];
+    for row in 0..4 {
+        out[row] = m[row] * x + m[4 + row] * y + m[8 + row] * z + m[12 + row] * w;
+    }
+    out
+}
+
+/// Invert a column-major 4x4 matrix. Returns `None` if singular.
+fn dom_matrix_invert(m: &[f64; 16]) -> Option<[f64; 16]> {
+    // Adapted from the well-known MESA gluInvertMatrix routine (MIT licensed).
+    let mut inv = [0.0f64; 16];
+
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+        + m[9] * m[7] * m[14]
+        + m[13] * m[6] * m[11]
+        - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+        - m[8] * m[7] * m[14]
+        - m[12] * m[6] * m[11]
+        + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+        + m[8] * m[7] * m[13]
+        + m[12] * m[5] * m[11]
+        - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+        - m[8] * m[6] * m[13]
+        - m[12] * m[5] * m[10]
+        + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+        - m[9] * m[3] * m[14]
+        - m[13] * m[2] * m[11]
+        + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+        + m[8] * m[3] * m[14]
+        + m[12] * m[2] * m[11]
+        - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+        - m[8] * m[3] * m[13]
+        - m[12] * m[1] * m[11]
+        + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+        + m[8] * m[2] * m[13]
+        + m[12] * m[1] * m[10]
+        - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+        + m[5] * m[3] * m[14]
+        + m[13] * m[2] * m[7]
+        - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+        - m[4] * m[3] * m[14]
+        - m[12] * m[2] * m[7]
+        + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+        + m[4] * m[3] * m[13]
+        + m[12] * m[1] * m[7]
+        - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+        - m[4] * m[2] * m[13]
+        - m[12] * m[1] * m[6]
+        + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+        - m[5] * m[3] * m[10]
+        - m[9] * m[2] * m[7]
+        + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+        + m[4] * m[3] * m[10]
+        + m[8] * m[2] * m[7]
+        - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+        - m[4] * m[3] * m[9]
+        - m[8] * m[1] * m[7]
+        + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+        + m[4] * m[2] * m[9]
+        + m[8] * m[1] * m[6]
+        - m[8] * m[2] * m[5];
+
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if !det.is_finite() || det == 0.0 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    for v in inv.iter_mut() {
+        *v *= inv_det;
+    }
+    Some(inv)
+}
+
+/// Read `length` finite numbers from an array-like or typed-array `value`. If
+/// `length` does not equal 6 or 16, or any element is not a finite-ish (per
+/// `to_number`) number, returns `Err`.
+fn dom_matrix_read_sequence(value: &JsValue) -> StatorResult<([f64; 16], bool)> {
+    let len = array_like_length(value)?;
+    let elements = (0..len)
+        .map(|i| {
+            let v = array_like_get_index(value, i);
+            v.to_number()
+        })
+        .collect::<StatorResult<Vec<f64>>>()?;
+    dom_matrix_elements_from_numbers(&elements)
+}
+
+fn dom_matrix_elements_from_numbers(values: &[f64]) -> StatorResult<([f64; 16], bool)> {
+    match values.len() {
+        6 => {
+            let mut e = dom_matrix_identity_elements();
+            e[0] = values[0];
+            e[1] = values[1];
+            e[4] = values[2];
+            e[5] = values[3];
+            e[12] = values[4];
+            e[13] = values[5];
+            Ok((e, true))
+        }
+        16 => {
+            let mut e = [0.0f64; 16];
+            for (i, &v) in values.iter().enumerate() {
+                e[i] = v;
+            }
+            Ok((e, false))
+        }
+        n => Err(dom_matrix_type_error(format!(
+            "DOMMatrix: sequence must have 6 or 16 elements, got {n}"
+        ))),
+    }
+}
+
+/// Try to extract `[f64; 16]` + `is2D` from a `DOMMatrixInit`-style dictionary
+/// or a `DOMMatrixReadOnly` instance. Performs the spec consistency checks for
+/// `a..f` ↔ `m11, m12, m21, m22, m41, m42` and the 3D-vs-`is2D` invariant.
+fn dom_matrix_from_init(value: &JsValue) -> StatorResult<([f64; 16], bool)> {
+    if let JsValue::PlainObject(map) = value
+        && matches!(
+            map.borrow().get(DOM_MATRIX_READONLY_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        let elements = dom_matrix_elements_of(map);
+        let is_2d = dom_matrix_is_2d_of(map);
+        return Ok((elements, is_2d));
+    }
+    if !matches!(value, JsValue::PlainObject(_)) {
+        return Err(dom_matrix_type_error(
+            "DOMMatrix init: expected dictionary or matrix",
+        ));
+    }
+    let mut elements = dom_matrix_identity_elements();
+    let mut had_3d_value = false;
+
+    // Pull a..f aliases first; they default to the corresponding mIJ later.
+    let mut alias_values: [Option<f64>; 6] = [None; 6];
+    for (i, &(name, _)) in DOM_MATRIX_2D_ALIASES.iter().enumerate() {
+        let v = dispatch_get_property_value(value, JsValue::String(name.into()))?;
+        if !matches!(v, JsValue::Undefined) {
+            alias_values[i] = Some(v.to_number()?);
+        }
+    }
+    // Pull mIJ values.
+    let mut m_values: [Option<f64>; 16] = [None; 16];
+    for (i, &(name, _)) in DOM_MATRIX_M_NAMES.iter().enumerate() {
+        let v = dispatch_get_property_value(value, JsValue::String(name.into()))?;
+        if !matches!(v, JsValue::Undefined) {
+            m_values[i] = Some(v.to_number()?);
+        }
+    }
+    // Spec consistency: a..f must equal m11/m12/m21/m22/m41/m42 if both given.
+    for (alias_idx, &(_, storage_idx)) in DOM_MATRIX_2D_ALIASES.iter().enumerate() {
+        match (alias_values[alias_idx], m_values[storage_idx]) {
+            (Some(av), Some(mv)) => {
+                let consistent = (av.is_nan() && mv.is_nan()) || av == mv;
+                if !consistent {
+                    return Err(dom_matrix_type_error(format!(
+                        "DOMMatrix init: {} and {} must be equal",
+                        DOM_MATRIX_2D_ALIASES[alias_idx].0, DOM_MATRIX_M_NAMES[storage_idx].0,
+                    )));
+                }
+            }
+            (Some(av), None) => {
+                m_values[storage_idx] = Some(av);
+            }
+            _ => {}
+        }
+    }
+    for (i, slot) in elements.iter_mut().enumerate() {
+        if let Some(v) = m_values[i] {
+            *slot = v;
+        }
+    }
+    for &idx in DOM_MATRIX_3D_ZERO_INDICES {
+        if let Some(v) = m_values[idx]
+            && v != 0.0
+        {
+            had_3d_value = true;
+        }
+    }
+    for &idx in DOM_MATRIX_3D_ONE_INDICES {
+        if let Some(v) = m_values[idx]
+            && v != 1.0
+        {
+            had_3d_value = true;
+        }
+    }
+
+    // Spec is2D: undefined → derive; true → must be 2D-compatible; false → as-is.
+    let is_2d_prop = dispatch_get_property_value(value, JsValue::String("is2D".into()))?;
+    let is_2d = match is_2d_prop {
+        JsValue::Undefined => !had_3d_value,
+        JsValue::Boolean(true) => {
+            if !dom_matrix_elements_are_2d_compatible(&elements) {
+                return Err(dom_matrix_type_error(
+                    "DOMMatrix init: is2D is true but the matrix has 3D components",
+                ));
+            }
+            true
+        }
+        JsValue::Boolean(false) => false,
+        other => other.to_boolean(),
+    };
+    Ok((elements, is_2d))
+}
+
+/// Read a `Float32Array` or `Float64Array` of exactly 6 or 16 finite-ish
+/// numbers. Rejects other typed-array kinds and array-likes.
+fn dom_matrix_from_float_array(
+    value: &JsValue,
+    expected_kind: TypedArrayKind,
+    name: &str,
+) -> StatorResult<([f64; 16], bool)> {
+    let ta = extract_typed_array(value)
+        .ok_or_else(|| dom_matrix_type_error(format!("{name}: argument must be a typed array")))?;
+    let borrow = ta.borrow();
+    if borrow.kind != expected_kind {
+        return Err(dom_matrix_type_error(format!(
+            "{name}: argument must be a {expected_kind:?} typed array"
+        )));
+    }
+    let len = borrow.effective_length();
+    let mut values = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = crate::builtins::typed_array::typed_array_get(&borrow, i);
+        values.push(v.to_number()?);
+    }
+    drop(borrow);
+    dom_matrix_elements_from_numbers(&values)
+}
+
+fn dom_matrix_make_getter(
+    name: &'static str,
+    marker: &'static str,
+    display_name: &'static str,
+) -> JsValue {
+    native(move |args| {
+        let (recv, _) = dom_matrix_resolve_receiver(&args, marker);
+        let map = lookup_dom_matrix(&recv, marker, display_name)?;
+        let elements = dom_matrix_elements_of(&map);
+        let value = match name {
+            "a" => elements[0],
+            "b" => elements[1],
+            "c" => elements[4],
+            "d" => elements[5],
+            "e" => elements[12],
+            "f" => elements[13],
+            "is2D" => return Ok(JsValue::Boolean(dom_matrix_is_2d_of(&map))),
+            "isIdentity" => return Ok(JsValue::Boolean(dom_matrix_is_identity(&elements))),
+            other => {
+                let idx = DOM_MATRIX_M_NAMES
+                    .iter()
+                    .find(|(n, _)| *n == other)
+                    .map(|(_, i)| *i)
+                    .unwrap_or(0);
+                elements[idx]
+            }
+        };
+        Ok(num(value))
+    })
+}
+
+fn dom_matrix_make_setter(
+    name: &'static str,
+    marker: &'static str,
+    display_name: &'static str,
+) -> JsValue {
+    native(move |args| {
+        let (recv, rest) = dom_matrix_resolve_receiver(&args, marker);
+        let value = rest.first().unwrap_or(&JsValue::Undefined).to_number()?;
+        let map = lookup_dom_matrix(&recv, marker, display_name)?;
+        let mut elements = dom_matrix_elements_of(&map);
+        let mut is_2d = dom_matrix_is_2d_of(&map);
+        let idx = match name {
+            "a" => 0,
+            "b" => 1,
+            "c" => 4,
+            "d" => 5,
+            "e" => 12,
+            "f" => 13,
+            other => DOM_MATRIX_M_NAMES
+                .iter()
+                .find(|(n, _)| *n == other)
+                .map(|(_, i)| *i)
+                .unwrap_or(0),
+        };
+        elements[idx] = value;
+        // Sticky 3D detection per spec: if this assignment makes the matrix
+        // diverge from the 2D-safe layout, is2D becomes false.
+        if is_2d && !dom_matrix_elements_are_2d_compatible(&elements) {
+            is_2d = false;
+        }
+        dom_matrix_store_elements(&map, &elements, is_2d);
+        Ok(JsValue::Undefined)
+    })
+}
+
+fn dom_matrix_register_accessor(proto: &mut PropertyMap, name: &str, getter: JsValue) {
+    proto.insert_with_attrs(
+        format!("__get_{name}__"),
+        getter,
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+fn dom_matrix_register_setter(proto: &mut PropertyMap, name: &str, setter: JsValue) {
+    proto.insert_with_attrs(
+        format!("__set_{name}__"),
+        setter,
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+/// Read a `DOMMatrixInit`/`DOMMatrix` argument or default to identity for
+/// methods like `multiply(other?)`.
+fn dom_matrix_optional_other(args: &[JsValue]) -> StatorResult<([f64; 16], bool)> {
+    match args.first() {
+        None | Some(JsValue::Undefined) => Ok((dom_matrix_identity_elements(), true)),
+        Some(v) => dom_matrix_from_init(v),
+    }
+}
+
+fn dom_matrix_optional_number(args: &[JsValue], index: usize, default: f64) -> StatorResult<f64> {
+    match args.get(index) {
+        Some(v) if !matches!(v, JsValue::Undefined) => v.to_number(),
+        _ => Ok(default),
+    }
+}
+
+fn dom_matrix_translate_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.translate")?;
+    let tx = dom_matrix_optional_number(&rest, 0, 0.0)?;
+    let ty = dom_matrix_optional_number(&rest, 1, 0.0)?;
+    let tz = dom_matrix_optional_number(&rest, 2, 0.0)?;
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map) && tz == 0.0;
+    let t = dom_matrix_translation(tx, ty, tz);
+    Ok((dom_matrix_multiply(&elements, &t), is_2d))
+}
+
+fn dom_matrix_scale_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.scale")?;
+    let sx = dom_matrix_optional_number(&rest, 0, 1.0)?;
+    let sy = dom_matrix_optional_number(&rest, 1, sx)?;
+    let sz = dom_matrix_optional_number(&rest, 2, 1.0)?;
+    let ox = dom_matrix_optional_number(&rest, 3, 0.0)?;
+    let oy = dom_matrix_optional_number(&rest, 4, 0.0)?;
+    let oz = dom_matrix_optional_number(&rest, 5, 0.0)?;
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map) && sz == 1.0 && oz == 0.0;
+    let t1 = dom_matrix_translation(ox, oy, oz);
+    let s = dom_matrix_scaling(sx, sy, sz);
+    let t2 = dom_matrix_translation(-ox, -oy, -oz);
+    let combined = dom_matrix_multiply(&dom_matrix_multiply(&t1, &s), &t2);
+    Ok((dom_matrix_multiply(&elements, &combined), is_2d))
+}
+
+fn dom_matrix_rotate_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.rotate")?;
+    // Spec: if only one argument is provided, it is treated as a 2D rotation
+    // around Z. Otherwise rotX, rotY default to undefined→0 and rotZ defaults
+    // to undefined→0.
+    let provided = rest
+        .iter()
+        .filter(|v| !matches!(v, JsValue::Undefined))
+        .count();
+    let (rot_x, rot_y, rot_z) = if provided <= 1 && rest.len() <= 1 {
+        let rz = dom_matrix_optional_number(&rest, 0, 0.0)?;
+        (0.0, 0.0, rz)
+    } else {
+        let rx = dom_matrix_optional_number(&rest, 0, 0.0)?;
+        let ry = dom_matrix_optional_number(&rest, 1, 0.0)?;
+        let rz = dom_matrix_optional_number(&rest, 2, 0.0)?;
+        (rx, ry, rz)
+    };
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map) && rot_x == 0.0 && rot_y == 0.0;
+    let mut combined = dom_matrix_rot_z(rot_z);
+    combined = dom_matrix_multiply(&combined, &dom_matrix_rot_y(rot_y));
+    combined = dom_matrix_multiply(&combined, &dom_matrix_rot_x(rot_x));
+    Ok((dom_matrix_multiply(&elements, &combined), is_2d))
+}
+
+fn dom_matrix_multiply_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.multiply")?;
+    let (other, other_is_2d) = dom_matrix_optional_other(&rest)?;
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map) && other_is_2d;
+    Ok((dom_matrix_multiply(&elements, &other), is_2d))
+}
+
+fn dom_matrix_pre_multiply_self_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(
+        &recv,
+        DOM_MATRIX_READONLY_BRAND,
+        "DOMMatrix.preMultiplySelf",
+    )?;
+    let (other, other_is_2d) = dom_matrix_optional_other(&rest)?;
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map) && other_is_2d;
+    Ok((dom_matrix_multiply(&other, &elements), is_2d))
+}
+
+fn dom_matrix_inverse_op(args: Vec<JsValue>) -> StatorResult<([f64; 16], bool)> {
+    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.inverse")?;
+    let elements = dom_matrix_elements_of(&map);
+    let is_2d = dom_matrix_is_2d_of(&map);
+    match dom_matrix_invert(&elements) {
+        Some(inv) => Ok((inv, is_2d)),
+        None => Ok(([f64::NAN; 16], false)),
+    }
+}
+
+/// Type alias for matrix-producing op closures: takes the call arguments and
+/// returns `(elements, is2D)` for the resulting matrix.
+type DomMatrixOpFn = fn(Vec<JsValue>) -> StatorResult<([f64; 16], bool)>;
+
+fn make_dom_matrix_readonly_method(op: DomMatrixOpFn) -> JsValue {
+    native(move |args| {
+        let (elements, is_2d) = op(args)?;
+        Ok(build_dom_matrix_instance(elements, is_2d, true))
+    })
+}
+
+fn dom_matrix_transform_point_method(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, rest) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.transformPoint")?;
+    let (x, y, z, w) = point_init_from_value(rest.first())?;
+    let elements = dom_matrix_elements_of(&map);
+    let [nx, ny, nz, nw] = dom_matrix_transform_point_xyzw(&elements, x, y, z, w);
+    Ok(build_dom_point_instance(nx, ny, nz, nw, true))
+}
+
+fn dom_matrix_to_json_method(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, "DOMMatrix.toJSON")?;
+    let elements = dom_matrix_elements_of(&map);
+    let mut out = PropertyMap::new();
+    for &(name, idx) in DOM_MATRIX_2D_ALIASES {
+        out.insert(name.into(), num(elements[idx]));
+    }
+    for &(name, idx) in DOM_MATRIX_M_NAMES {
+        out.insert(name.into(), num(elements[idx]));
+    }
+    out.insert("is2D".into(), JsValue::Boolean(dom_matrix_is_2d_of(&map)));
+    out.insert(
+        "isIdentity".into(),
+        JsValue::Boolean(dom_matrix_is_identity(&elements)),
+    );
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+}
+
+fn dom_matrix_to_float_array(
+    args: Vec<JsValue>,
+    kind: TypedArrayKind,
+    name: &'static str,
+) -> StatorResult<JsValue> {
+    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_READONLY_BRAND);
+    let map = lookup_dom_matrix(&recv, DOM_MATRIX_READONLY_BRAND, name)?;
+    let elements = dom_matrix_elements_of(&map);
+    let ta = crate::builtins::typed_array::typed_array_new_from_length(kind, 16);
+    for (i, &v) in elements.iter().enumerate() {
+        crate::builtins::typed_array::typed_array_set(&ta, i, &num(v))?;
+    }
+    let inner = Rc::new(RefCell::new(ta));
+    Ok(make_typed_array_instance(kind, inner, None))
+}
+
+fn dom_matrix_set_matrix_value(_: Vec<JsValue>) -> StatorResult<JsValue> {
+    Err(dom_matrix_type_error(
+        "DOMMatrix.setMatrixValue: CSS transform string parsing is not implemented",
+    ))
+}
+
+fn make_dom_matrix_constructor(mutable: bool) -> JsValue {
+    let type_name = if mutable {
+        "DOMMatrix"
+    } else {
+        "DOMMatrixReadOnly"
+    };
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(move |args| {
+            let (elements, is_2d) = match args.first() {
+                None | Some(JsValue::Undefined) => (dom_matrix_identity_elements(), true),
+                Some(JsValue::String(_)) => {
+                    return Err(dom_matrix_type_error(format!(
+                        "{type_name}: CSS transform string parsing is not implemented"
+                    )));
+                }
+                Some(v) => {
+                    if is_js_array(v)? || extract_typed_array(v).is_some() {
+                        dom_matrix_read_sequence(v)?
+                    } else {
+                        return Err(dom_matrix_type_error(format!(
+                            "{type_name}: argument must be a sequence of 6 or 16 numbers"
+                        )));
+                    }
+                }
+            };
+            Ok(build_dom_matrix_instance(elements, is_2d, mutable))
+        }),
+    );
+
+    props.insert(
+        "fromMatrix".into(),
+        builtin_fn("fromMatrix", 1, move |args| {
+            let (elements, is_2d) = match args.first() {
+                None | Some(JsValue::Undefined) => (dom_matrix_identity_elements(), true),
+                Some(v) => dom_matrix_from_init(v)?,
+            };
+            Ok(build_dom_matrix_instance(elements, is_2d, mutable))
+        }),
+    );
+    props.insert(
+        "fromFloat32Array".into(),
+        builtin_fn("fromFloat32Array", 1, move |args| {
+            let v = args
+                .first()
+                .ok_or_else(|| dom_matrix_type_error("fromFloat32Array: missing argument"))?;
+            let (elements, is_2d) =
+                dom_matrix_from_float_array(v, TypedArrayKind::Float32, "fromFloat32Array")?;
+            Ok(build_dom_matrix_instance(elements, is_2d, mutable))
+        }),
+    );
+    props.insert(
+        "fromFloat64Array".into(),
+        builtin_fn("fromFloat64Array", 1, move |args| {
+            let v = args
+                .first()
+                .ok_or_else(|| dom_matrix_type_error("fromFloat64Array: missing argument"))?;
+            let (elements, is_2d) =
+                dom_matrix_from_float_array(v, TypedArrayKind::Float64, "fromFloat64Array")?;
+            Ok(build_dom_matrix_instance(elements, is_2d, mutable))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+        if mutable {
+            if let Some(parent) = DOM_MATRIX_READONLY_PROTO.with(|p| p.borrow().clone()) {
+                proto.insert_with_attrs(
+                    INTERNAL_PROTO_PROPERTY_KEY.into(),
+                    JsValue::PlainObject(parent),
+                    PropertyAttributes::empty(),
+                );
+            }
+            // Mutable setters for the 2D aliases and all m11..m44 entries.
+            for &(name, _) in DOM_MATRIX_2D_ALIASES {
+                let setter =
+                    dom_matrix_make_setter(name, DOM_MATRIX_MUTABLE_BRAND, "DOMMatrix setter");
+                dom_matrix_register_setter(&mut proto, name, setter);
+            }
+            for &(name, _) in DOM_MATRIX_M_NAMES {
+                let setter =
+                    dom_matrix_make_setter(name, DOM_MATRIX_MUTABLE_BRAND, "DOMMatrix setter");
+                dom_matrix_register_setter(&mut proto, name, setter);
+            }
+            // Mutable-only methods.
+            proto.insert(
+                "multiplySelf".into(),
+                builtin_fn("multiplySelf", 1, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map = lookup_dom_matrix(
+                        &recv,
+                        DOM_MATRIX_MUTABLE_BRAND,
+                        "DOMMatrix.multiplySelf",
+                    )?;
+                    let (elements, is_2d) = dom_matrix_multiply_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "preMultiplySelf".into(),
+                builtin_fn("preMultiplySelf", 1, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map = lookup_dom_matrix(
+                        &recv,
+                        DOM_MATRIX_MUTABLE_BRAND,
+                        "DOMMatrix.preMultiplySelf",
+                    )?;
+                    let (elements, is_2d) = dom_matrix_pre_multiply_self_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "translateSelf".into(),
+                builtin_fn("translateSelf", 3, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map = lookup_dom_matrix(
+                        &recv,
+                        DOM_MATRIX_MUTABLE_BRAND,
+                        "DOMMatrix.translateSelf",
+                    )?;
+                    let (elements, is_2d) = dom_matrix_translate_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "scaleSelf".into(),
+                builtin_fn("scaleSelf", 6, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map =
+                        lookup_dom_matrix(&recv, DOM_MATRIX_MUTABLE_BRAND, "DOMMatrix.scaleSelf")?;
+                    let (elements, is_2d) = dom_matrix_scale_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "rotateSelf".into(),
+                builtin_fn("rotateSelf", 3, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map =
+                        lookup_dom_matrix(&recv, DOM_MATRIX_MUTABLE_BRAND, "DOMMatrix.rotateSelf")?;
+                    let (elements, is_2d) = dom_matrix_rotate_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "invertSelf".into(),
+                builtin_fn("invertSelf", 0, move |args| {
+                    let (recv, _) = dom_matrix_resolve_receiver(&args, DOM_MATRIX_MUTABLE_BRAND);
+                    let map =
+                        lookup_dom_matrix(&recv, DOM_MATRIX_MUTABLE_BRAND, "DOMMatrix.invertSelf")?;
+                    let (elements, is_2d) = dom_matrix_inverse_op(args)?;
+                    dom_matrix_store_elements(&map, &elements, is_2d);
+                    Ok(recv)
+                }),
+            );
+            proto.insert(
+                "setMatrixValue".into(),
+                builtin_fn("setMatrixValue", 1, dom_matrix_set_matrix_value),
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("DOMMatrix".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        } else {
+            // Read-only getters for the 2D aliases and all m11..m44 entries.
+            for &(name, _) in DOM_MATRIX_2D_ALIASES {
+                let getter = dom_matrix_make_getter(
+                    name,
+                    DOM_MATRIX_READONLY_BRAND,
+                    "DOMMatrixReadOnly getter",
+                );
+                dom_matrix_register_accessor(&mut proto, name, getter);
+            }
+            for &(name, _) in DOM_MATRIX_M_NAMES {
+                let getter = dom_matrix_make_getter(
+                    name,
+                    DOM_MATRIX_READONLY_BRAND,
+                    "DOMMatrixReadOnly getter",
+                );
+                dom_matrix_register_accessor(&mut proto, name, getter);
+            }
+            for name in ["is2D", "isIdentity"] {
+                let getter = dom_matrix_make_getter(
+                    name,
+                    DOM_MATRIX_READONLY_BRAND,
+                    "DOMMatrixReadOnly getter",
+                );
+                dom_matrix_register_accessor(&mut proto, name, getter);
+            }
+            // Methods that return a fresh mutable DOMMatrix.
+            proto.insert(
+                "multiply".into(),
+                make_dom_matrix_readonly_method(dom_matrix_multiply_op),
+            );
+            proto.insert(
+                "translate".into(),
+                make_dom_matrix_readonly_method(dom_matrix_translate_op),
+            );
+            proto.insert(
+                "scale".into(),
+                make_dom_matrix_readonly_method(dom_matrix_scale_op),
+            );
+            proto.insert(
+                "rotate".into(),
+                make_dom_matrix_readonly_method(dom_matrix_rotate_op),
+            );
+            proto.insert(
+                "inverse".into(),
+                make_dom_matrix_readonly_method(dom_matrix_inverse_op),
+            );
+            proto.insert(
+                "transformPoint".into(),
+                builtin_fn("transformPoint", 1, dom_matrix_transform_point_method),
+            );
+            proto.insert(
+                "toJSON".into(),
+                builtin_fn("toJSON", 0, dom_matrix_to_json_method),
+            );
+            proto.insert(
+                "toFloat32Array".into(),
+                builtin_fn("toFloat32Array", 0, |args| {
+                    dom_matrix_to_float_array(args, TypedArrayKind::Float32, "toFloat32Array")
+                }),
+            );
+            proto.insert(
+                "toFloat64Array".into(),
+                builtin_fn("toFloat64Array", 0, |args| {
+                    dom_matrix_to_float_array(args, TypedArrayKind::Float64, "toFloat64Array")
+                }),
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("DOMMatrixReadOnly".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        if mutable {
+            DOM_MATRIX_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        } else {
+            DOM_MATRIX_READONLY_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        }
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    // The fromMatrix-style statics always build the kind matching this
+    // constructor by closing over `mutable`.
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// `DOMPointReadOnly.prototype.matrixTransform(matrix)` — multiplies the
+/// implicit point by `matrix` and returns a fresh mutable `DOMPoint`.
+fn dom_point_matrix_transform_method(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, rest) = resolve_dom_geometry_receiver(&args, DOM_POINT_READONLY_BRAND);
+    let map = lookup_dom_geometry(
+        &recv,
+        DOM_POINT_READONLY_BRAND,
+        "DOMPointReadOnly.matrixTransform",
+    )?;
+    let x = geometry_slot_number(&map, DOM_POINT_X_SLOT);
+    let y = geometry_slot_number(&map, DOM_POINT_Y_SLOT);
+    let z = geometry_slot_number(&map, DOM_POINT_Z_SLOT);
+    let w = geometry_slot_number(&map, DOM_POINT_W_SLOT);
+    let (matrix, _) = match rest.first() {
+        None | Some(JsValue::Undefined) => (dom_matrix_identity_elements(), true),
+        Some(v) => dom_matrix_from_init(v)?,
+    };
+    let [nx, ny, nz, nw] = dom_matrix_transform_point_xyzw(&matrix, x, y, z, w);
+    Ok(build_dom_point_instance(nx, ny, nz, nw, true))
 }
 
 // ── ImageData ────────────────────────────────────────────────────────────────
@@ -26807,39 +27886,14 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "DOMRect".into(),
             finalize_ctor(make_dom_rect_builtin(DomGeometryKind::Rect), "DOMRect"),
         );
-        for (name, methods) in [
-            (
-                "DOMMatrixReadOnly",
-                &[
-                    ("multiply", 1),
-                    ("translate", 3),
-                    ("scale", 6),
-                    ("rotate", 3),
-                    ("toJSON", 0),
-                ][..],
-            ),
-            (
-                "DOMMatrix",
-                &[
-                    ("multiplySelf", 1),
-                    ("preMultiplySelf", 1),
-                    ("translateSelf", 3),
-                    ("scaleSelf", 6),
-                    ("rotateSelf", 3),
-                    ("invertSelf", 0),
-                    ("setMatrixValue", 1),
-                    ("toJSON", 0),
-                ][..],
-            ),
-        ] {
-            globals.insert(
-                name.into(),
-                finalize_ctor(
-                    make_unsupported_web_constructor_with_prototype(name, methods, &[][..]),
-                    name,
-                ),
-            );
-        }
+        globals.insert(
+            "DOMMatrixReadOnly".into(),
+            finalize_ctor(make_dom_matrix_constructor(false), "DOMMatrixReadOnly"),
+        );
+        globals.insert(
+            "DOMMatrix".into(),
+            finalize_ctor(make_dom_matrix_constructor(true), "DOMMatrix"),
+        );
 
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
@@ -30090,15 +31144,13 @@ mod tests {
 
     #[test]
     fn e2e_geometry_constructors_exist_but_fail_closed() {
-        for name in ["DOMMatrix", "DOMMatrixReadOnly", "DOMQuad"] {
+        for name in ["DOMQuad"] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
             ));
             assert_eval_type_error(&format!("{name}()"));
             assert_eval_type_error(&format!("new {name}()"));
         }
-
-        assert_eval_type_error("new DOMMatrix([1, 0, 0, 1, 0, 0])");
     }
 
     #[test]
@@ -31388,14 +32440,185 @@ mod tests {
     }
 
     #[test]
-    fn e2e_dom_matrix_and_host_geometry_surfaces_remain_fail_closed() {
+    fn e2e_dom_matrix_constructors_and_accessors() {
+        // Identity defaults.
         assert_eval_true(
             "typeof DOMMatrixReadOnly === 'function' && DOMMatrixReadOnly.name === 'DOMMatrixReadOnly'",
         );
         assert_eval_true("typeof DOMMatrix === 'function' && DOMMatrix.name === 'DOMMatrix'");
-        assert_eval_type_error("new DOMMatrixReadOnly()");
-        assert_eval_type_error("new DOMMatrix()");
-        assert_eval_true("typeof DOMPointReadOnly.prototype.matrixTransform === 'undefined'");
+        assert_eval_true(
+            "var m = new DOMMatrix(); m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.e === 0 && m.f === 0",
+        );
+        assert_eval_true("new DOMMatrix().is2D === true");
+        assert_eval_true("new DOMMatrix().isIdentity === true");
+        assert_eval_true("new DOMMatrixReadOnly().is2D === true");
+        assert_eval_true("new DOMMatrixReadOnly().isIdentity === true");
+
+        // 6-element sequence constructor → 2D.
+        assert_eval_true(
+            "var m = new DOMMatrix([1, 2, 3, 4, 5, 6]); m.a === 1 && m.b === 2 && m.c === 3 && m.d === 4 && m.e === 5 && m.f === 6 && m.is2D === true",
+        );
+        // 16-element sequence constructor → always is2D=false per spec.
+        assert_eval_true(
+            "var ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; var m = new DOMMatrix(ident); m.is2D === false && m.isIdentity === true && m.m11 === 1 && m.m44 === 1",
+        );
+        // Bad sequence length.
+        assert_eval_type_error("new DOMMatrix([1,2,3])");
+        // String constructor unsupported.
+        assert_eval_type_error("new DOMMatrix('matrix(1,0,0,1,0,0)')");
+
+        // a..f are aliases for m11, m12, m21, m22, m41, m42.
+        assert_eval_true(
+            "var m = new DOMMatrix([1,2,3,4,5,6]); m.m11 === 1 && m.m12 === 2 && m.m21 === 3 && m.m22 === 4 && m.m41 === 5 && m.m42 === 6",
+        );
+
+        // instanceof chain and prototype identity.
+        assert_eval_true("new DOMMatrix() instanceof DOMMatrix");
+        assert_eval_true("new DOMMatrix() instanceof DOMMatrixReadOnly");
+        assert_eval_true("new DOMMatrixReadOnly() instanceof DOMMatrixReadOnly");
+        assert_eval_true("!(new DOMMatrixReadOnly() instanceof DOMMatrix)");
+        assert_eval_true("DOMMatrix.prototype.constructor === DOMMatrix");
+        assert_eval_true("DOMMatrixReadOnly.prototype.constructor === DOMMatrixReadOnly");
+        assert_eval_true(
+            "Object.prototype.toString.call(new DOMMatrix()) === '[object DOMMatrix]'",
+        );
+        assert_eval_true(
+            "Object.prototype.toString.call(new DOMMatrixReadOnly()) === '[object DOMMatrixReadOnly]'",
+        );
+
+        // Brand checks on getters and methods.
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(DOMMatrixReadOnly.prototype, 'a').get.call({})",
+        );
+        assert_eval_type_error("DOMMatrixReadOnly.prototype.multiply.call({})");
+        assert_eval_type_error("DOMMatrix.prototype.translateSelf.call({}, 1, 2)");
+
+        // Read-only variant must not expose setters.
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(DOMMatrixReadOnly.prototype, 'a').set === undefined",
+        );
+        assert_eval_true("var m = new DOMMatrixReadOnly([1,2,3,4,5,6]); m.a = 99; m.a === 1");
+        // Mutable setters work and update is2D when 3D entries change.
+        assert_eval_true("var m = new DOMMatrix(); m.a = 7; m.e = 10; m.a === 7 && m.e === 10");
+        assert_eval_true("var m = new DOMMatrix(); m.m13 = 0.5; m.is2D === false");
+        assert_eval_true("var m = new DOMMatrix(); m.m33 = 2; m.is2D === false");
+    }
+
+    #[test]
+    fn e2e_dom_matrix_static_factories_and_typed_arrays() {
+        // fromMatrix from a DOMMatrix instance preserves elements and is2D.
+        assert_eval_true(
+            "var src = new DOMMatrix([1,2,3,4,5,6]); var m = DOMMatrix.fromMatrix(src); m.a === 1 && m.f === 6 && m.is2D === true",
+        );
+        // fromMatrix from a dictionary; explicit is2D=true forbids 3D entries.
+        assert_eval_true(
+            "var m = DOMMatrix.fromMatrix({ a: 2, d: 3, e: 4, f: 5 }); m.a === 2 && m.d === 3 && m.e === 4 && m.f === 5 && m.is2D === true",
+        );
+        assert_eval_type_error("DOMMatrix.fromMatrix({ is2D: true, m13: 1 })");
+        // Inconsistent alias/mIJ values throw.
+        assert_eval_type_error("DOMMatrix.fromMatrix({ a: 1, m11: 2 })");
+        // Empty dictionary becomes identity.
+        assert_eval_true("DOMMatrix.fromMatrix({}).isIdentity === true");
+
+        // Float32Array / Float64Array static factories.
+        assert_eval_true(
+            "var m = DOMMatrix.fromFloat32Array(new Float32Array([1,2,3,4,5,6])); m.a === 1 && m.f === 6 && m.is2D === true",
+        );
+        assert_eval_true(
+            "var m = DOMMatrix.fromFloat64Array(new Float64Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])); m.isIdentity === true && m.is2D === false",
+        );
+        assert_eval_type_error("DOMMatrix.fromFloat32Array(new Float64Array(6))");
+        assert_eval_type_error("DOMMatrix.fromFloat32Array([1,2,3,4,5,6])");
+        assert_eval_type_error("DOMMatrix.fromFloat32Array(new Float32Array(5))");
+
+        // toFloat32Array / toFloat64Array return typed arrays with the 16-
+        // element column-major layout.
+        assert_eval_true(
+            "var m = new DOMMatrix([1,2,3,4,5,6]); var a = m.toFloat32Array(); a instanceof Float32Array && a.length === 16 && a[0] === 1 && a[1] === 2 && a[4] === 3 && a[5] === 4 && a[12] === 5 && a[13] === 6",
+        );
+        assert_eval_true("new DOMMatrix().toFloat64Array() instanceof Float64Array");
+
+        // toJSON serializes all fields.
+        assert_eval_true(
+            "var j = new DOMMatrix([1,2,3,4,5,6]).toJSON(); j.a === 1 && j.m11 === 1 && j.m22 === 4 && j.is2D === true && j.isIdentity === false",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_matrix_operations_and_transform_point() {
+        // translate / scale / rotate return new DOMMatrix instances.
+        assert_eval_true(
+            "var m = new DOMMatrix().translate(10, 20); m instanceof DOMMatrix && m.e === 10 && m.f === 20 && m.is2D === true",
+        );
+        // Original is unchanged.
+        assert_eval_true("var m = new DOMMatrix(); m.translate(10, 20); m.e === 0 && m.f === 0");
+        // Non-zero z translation flips is2D off.
+        assert_eval_true("new DOMMatrix().translate(0, 0, 5).is2D === false");
+        // scale(sx) defaults sy=sx.
+        assert_eval_true(
+            "var m = new DOMMatrix().scale(2); m.a === 2 && m.d === 2 && m.is2D === true",
+        );
+        // 2D rotation around Z; rotate(90) sends (1,0) to (0,1).
+        assert_eval_true(
+            "var p = new DOMMatrix().rotate(90).transformPoint({ x: 1, y: 0 }); Math.abs(p.x) < 1e-9 && Math.abs(p.y - 1) < 1e-9",
+        );
+        // 3D rotation flips is2D off when rotX/rotY are nonzero.
+        assert_eval_true("new DOMMatrix().rotate(10, 20, 30).is2D === false");
+
+        // multiply returns this * other; translate then scale stacks in order.
+        assert_eval_true(
+            "var m = new DOMMatrix().translate(10, 20).scale(2, 3); var p = m.transformPoint({ x: 1, y: 1 }); p.x === 12 && p.y === 23",
+        );
+        assert_eval_true(
+            "var m = new DOMMatrix().multiply(new DOMMatrix().translate(5, 0)); m.e === 5 && m.f === 0",
+        );
+
+        // inverse round-trip on a translation.
+        assert_eval_true(
+            "var m = new DOMMatrix().translate(10, 20).scale(2, 4); var inv = m.inverse(); var prod = m.multiply(inv); Math.abs(prod.a - 1) < 1e-9 && Math.abs(prod.d - 1) < 1e-9 && Math.abs(prod.e) < 1e-9 && Math.abs(prod.f) < 1e-9",
+        );
+        // Singular matrix inversion yields NaN-filled matrix per spec.
+        assert_eval_true(
+            "var s = new DOMMatrix([0,0,0,0,0,0]); var inv = s.inverse(); Number.isNaN(inv.a) && inv.is2D === false",
+        );
+
+        // Mutable self variants return `this`.
+        assert_eval_true(
+            "var m = new DOMMatrix(); m.translateSelf(3, 4) === m && m.e === 3 && m.f === 4",
+        );
+        assert_eval_true(
+            "var m = new DOMMatrix().translateSelf(5, 0); m.invertSelf(); Math.abs(m.e - -5) < 1e-9",
+        );
+        assert_eval_true(
+            "var m = new DOMMatrix(); m.multiplySelf(new DOMMatrix().scale(2)); m.a === 2 && m.d === 2",
+        );
+        // Read-only variant has no *Self mutators.
+        assert_eval_true("typeof DOMMatrixReadOnly.prototype.translateSelf === 'undefined'");
+        assert_eval_true("typeof DOMMatrixReadOnly.prototype.invertSelf === 'undefined'");
+
+        // DOMPoint.prototype.matrixTransform uses real multiplication.
+        assert_eval_true("typeof DOMPointReadOnly.prototype.matrixTransform === 'function'");
+        assert_eval_true(
+            "var p = new DOMPoint(1, 2).matrixTransform(new DOMMatrix().scale(3)); p instanceof DOMPoint && p.x === 3 && p.y === 6",
+        );
+        assert_eval_true(
+            "var p = new DOMPointReadOnly(1, 2).matrixTransform(new DOMMatrix().translate(10, 20)); p.x === 11 && p.y === 22",
+        );
+        // matrixTransform with no arg = identity transform.
+        assert_eval_true("var p = new DOMPoint(7, 8).matrixTransform(); p.x === 7 && p.y === 8");
+        // Brand check.
+        assert_eval_type_error(
+            "DOMPointReadOnly.prototype.matrixTransform.call({}, new DOMMatrix())",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_matrix_and_host_geometry_surfaces_remain_fail_closed() {
+        // DOMQuad and the surrounding host surfaces stay fail-closed even now
+        // that DOMMatrix/DOMMatrixReadOnly are real, because they depend on
+        // layout/style/canvas integration the standalone engine does not have.
+        assert_eval_true("typeof DOMQuad === 'function' && DOMQuad.name === 'DOMQuad'");
+        assert_eval_type_error("new DOMQuad()");
         assert_eval_true("typeof document === 'undefined'");
         assert_eval_true("typeof window === 'undefined'");
         assert_eval_true("typeof getComputedStyle === 'undefined'");
@@ -31403,6 +32626,11 @@ mod tests {
         assert_eval_type_error("new Path2D()");
         assert_eval_true("typeof Range.prototype.getBoundingClientRect === 'function'");
         assert_eval_type_error("Range.prototype.getBoundingClientRect.call({})");
+        // CSS transform string parsing into DOMMatrix is unsupported: the
+        // string constructor and setMatrixValue must throw rather than fake.
+        assert_eval_type_error("new DOMMatrix('translate(10px, 20px)')");
+        assert_eval_type_error("new DOMMatrixReadOnly('translate(10px, 20px)')");
+        assert_eval_type_error("new DOMMatrix().setMatrixValue('translate(10px,20px)')");
     }
 
     /// `ImageData` is a pure data container, so it is implemented for real:
