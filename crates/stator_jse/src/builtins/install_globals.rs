@@ -23494,6 +23494,563 @@ fn make_typed_array_instance(
     instance_value
 }
 
+// ── DOM geometry data objects ────────────────────────────────────────────────
+//
+// DOMPoint(ReadOnly) and DOMRect(ReadOnly) are pure numeric geometry data
+// containers. They do not require layout, style, rendering, DOM nodes, or host
+// integration, so the standalone engine can implement them without fabricating
+// browser state. DOMMatrix remains fail-closed below because implementing a
+// sound matrix transform subset is a larger surface than this data-only slice.
+
+const DOM_POINT_READONLY_BRAND: &str = "__is_dom_point_readonly__";
+const DOM_POINT_MUTABLE_BRAND: &str = "__is_dom_point__";
+const DOM_POINT_X_SLOT: &str = "__dom_point_x__";
+const DOM_POINT_Y_SLOT: &str = "__dom_point_y__";
+const DOM_POINT_Z_SLOT: &str = "__dom_point_z__";
+const DOM_POINT_W_SLOT: &str = "__dom_point_w__";
+
+const DOM_RECT_READONLY_BRAND: &str = "__is_dom_rect_readonly__";
+const DOM_RECT_MUTABLE_BRAND: &str = "__is_dom_rect__";
+const DOM_RECT_X_SLOT: &str = "__dom_rect_x__";
+const DOM_RECT_Y_SLOT: &str = "__dom_rect_y__";
+const DOM_RECT_WIDTH_SLOT: &str = "__dom_rect_width__";
+const DOM_RECT_HEIGHT_SLOT: &str = "__dom_rect_height__";
+
+thread_local! {
+    static DOM_POINT_READONLY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static DOM_POINT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static DOM_RECT_READONLY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static DOM_RECT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+enum DomGeometryKind {
+    PointReadOnly,
+    Point,
+    RectReadOnly,
+    Rect,
+}
+
+fn dom_geometry_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn dom_dictionary_number(value: &JsValue, property: &str, default_value: f64) -> StatorResult<f64> {
+    if matches!(value, JsValue::Undefined | JsValue::Null) {
+        return Ok(default_value);
+    }
+    let property_value = dispatch_get_property_value(value, JsValue::String(property.into()))?;
+    if matches!(property_value, JsValue::Undefined) {
+        Ok(default_value)
+    } else {
+        property_value.to_number()
+    }
+}
+
+fn point_init_from_value(value: Option<&JsValue>) -> StatorResult<(f64, f64, f64, f64)> {
+    let init = value.unwrap_or(&JsValue::Undefined);
+    Ok((
+        dom_dictionary_number(init, "x", 0.0)?,
+        dom_dictionary_number(init, "y", 0.0)?,
+        dom_dictionary_number(init, "z", 0.0)?,
+        dom_dictionary_number(init, "w", 1.0)?,
+    ))
+}
+
+fn rect_init_from_value(value: Option<&JsValue>) -> StatorResult<(f64, f64, f64, f64)> {
+    let init = value.unwrap_or(&JsValue::Undefined);
+    Ok((
+        dom_dictionary_number(init, "x", 0.0)?,
+        dom_dictionary_number(init, "y", 0.0)?,
+        dom_dictionary_number(init, "width", 0.0)?,
+        dom_dictionary_number(init, "height", 0.0)?,
+    ))
+}
+
+fn optional_geometry_number_arg(
+    args: &[JsValue],
+    index: usize,
+    default_value: f64,
+) -> StatorResult<f64> {
+    match args.get(index) {
+        Some(value) if !matches!(value, JsValue::Undefined) => value.to_number(),
+        _ => Ok(default_value),
+    }
+}
+
+fn lookup_dom_geometry(
+    value: &JsValue,
+    marker: &str,
+    display_name: &str,
+) -> StatorResult<Rc<RefCell<PropertyMap>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(dom_geometry_type_error(format!(
+            "{display_name}: called on incompatible receiver"
+        )));
+    };
+    if !matches!(map.borrow().get(marker), Some(JsValue::Boolean(true))) {
+        return Err(dom_geometry_type_error(format!(
+            "{display_name}: called on incompatible receiver"
+        )));
+    }
+    Ok(Rc::clone(map))
+}
+
+fn resolve_dom_geometry_receiver(args: &[JsValue], marker: &str) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(map.borrow().get(marker), Some(JsValue::Boolean(true)))
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+fn geometry_slot_value(map: &Rc<RefCell<PropertyMap>>, slot: &str) -> JsValue {
+    map.borrow().get(slot).cloned().unwrap_or(JsValue::Smi(0))
+}
+
+fn geometry_slot_number(map: &Rc<RefCell<PropertyMap>>, slot: &str) -> f64 {
+    geometry_slot_value(map, slot).to_number().unwrap_or(0.0)
+}
+
+fn make_geometry_getter(
+    marker: &'static str,
+    display_name: &'static str,
+    slot: &'static str,
+) -> JsValue {
+    native(move |args| {
+        let (recv, _) = resolve_dom_geometry_receiver(&args, marker);
+        let map = lookup_dom_geometry(&recv, marker, display_name)?;
+        Ok(geometry_slot_value(&map, slot))
+    })
+}
+
+fn make_geometry_setter(
+    marker: &'static str,
+    display_name: &'static str,
+    slot: &'static str,
+) -> JsValue {
+    native(move |args| {
+        let (recv, rest) = resolve_dom_geometry_receiver(&args, marker);
+        let value = rest.first().unwrap_or(&JsValue::Undefined).to_number()?;
+        let map = lookup_dom_geometry(&recv, marker, display_name)?;
+        map.borrow_mut()
+            .insert_with_attrs(slot.into(), num(value), PropertyAttributes::empty());
+        Ok(JsValue::Undefined)
+    })
+}
+
+fn register_geometry_getter(
+    proto: &mut PropertyMap,
+    name: &str,
+    marker: &'static str,
+    display_name: &'static str,
+    slot: &'static str,
+) {
+    proto.insert_with_attrs(
+        format!("__get_{name}__"),
+        make_geometry_getter(marker, display_name, slot),
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+fn register_geometry_setter(
+    proto: &mut PropertyMap,
+    name: &str,
+    marker: &'static str,
+    display_name: &'static str,
+    slot: &'static str,
+) {
+    proto.insert_with_attrs(
+        format!("__set_{name}__"),
+        make_geometry_setter(marker, display_name, slot),
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+fn build_dom_point_instance(x: f64, y: f64, z: f64, w: f64, mutable: bool) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            DOM_POINT_READONLY_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if mutable {
+            props.insert_with_attrs(
+                DOM_POINT_MUTABLE_BRAND.into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+        }
+        props.insert_with_attrs(DOM_POINT_X_SLOT.into(), num(x), PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_POINT_Y_SLOT.into(), num(y), PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_POINT_Z_SLOT.into(), num(z), PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_POINT_W_SLOT.into(), num(w), PropertyAttributes::empty());
+        for (name, slot) in [
+            ("x", DOM_POINT_X_SLOT),
+            ("y", DOM_POINT_Y_SLOT),
+            ("z", DOM_POINT_Z_SLOT),
+            ("w", DOM_POINT_W_SLOT),
+        ] {
+            props.insert_with_attrs(
+                format!("__get_{name}__"),
+                make_geometry_getter(DOM_POINT_READONLY_BRAND, "DOMPointReadOnly", slot),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            if mutable {
+                props.insert_with_attrs(
+                    format!("__set_{name}__"),
+                    make_geometry_setter(DOM_POINT_MUTABLE_BRAND, "DOMPoint", slot),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+        }
+        let proto = if mutable {
+            DOM_POINT_PROTO.with(|p| p.borrow().clone())
+        } else {
+            DOM_POINT_READONLY_PROTO.with(|p| p.borrow().clone())
+        };
+        if let Some(proto) = proto {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    JsValue::PlainObject(inst)
+}
+
+fn build_dom_rect_instance(x: f64, y: f64, width: f64, height: f64, mutable: bool) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            DOM_RECT_READONLY_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if mutable {
+            props.insert_with_attrs(
+                DOM_RECT_MUTABLE_BRAND.into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+        }
+        props.insert_with_attrs(DOM_RECT_X_SLOT.into(), num(x), PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_RECT_Y_SLOT.into(), num(y), PropertyAttributes::empty());
+        props.insert_with_attrs(
+            DOM_RECT_WIDTH_SLOT.into(),
+            num(width),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            DOM_RECT_HEIGHT_SLOT.into(),
+            num(height),
+            PropertyAttributes::empty(),
+        );
+        for (name, slot) in [
+            ("x", DOM_RECT_X_SLOT),
+            ("y", DOM_RECT_Y_SLOT),
+            ("width", DOM_RECT_WIDTH_SLOT),
+            ("height", DOM_RECT_HEIGHT_SLOT),
+        ] {
+            props.insert_with_attrs(
+                format!("__get_{name}__"),
+                make_geometry_getter(DOM_RECT_READONLY_BRAND, "DOMRectReadOnly", slot),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            if mutable {
+                props.insert_with_attrs(
+                    format!("__set_{name}__"),
+                    make_geometry_setter(DOM_RECT_MUTABLE_BRAND, "DOMRect", slot),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+        }
+        for name in ["top", "right", "bottom", "left"] {
+            props.insert_with_attrs(
+                format!("__get_{name}__"),
+                make_rect_edge_getter(name),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        let proto = if mutable {
+            DOM_RECT_PROTO.with(|p| p.borrow().clone())
+        } else {
+            DOM_RECT_READONLY_PROTO.with(|p| p.borrow().clone())
+        };
+        if let Some(proto) = proto {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    JsValue::PlainObject(inst)
+}
+
+fn dom_point_to_json(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, _) = resolve_dom_geometry_receiver(&args, DOM_POINT_READONLY_BRAND);
+    let map = lookup_dom_geometry(&recv, DOM_POINT_READONLY_BRAND, "DOMPointReadOnly.toJSON")?;
+    let mut out = PropertyMap::new();
+    out.insert("x".into(), geometry_slot_value(&map, DOM_POINT_X_SLOT));
+    out.insert("y".into(), geometry_slot_value(&map, DOM_POINT_Y_SLOT));
+    out.insert("z".into(), geometry_slot_value(&map, DOM_POINT_Z_SLOT));
+    out.insert("w".into(), geometry_slot_value(&map, DOM_POINT_W_SLOT));
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+}
+
+fn dom_rect_to_json(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, _) = resolve_dom_geometry_receiver(&args, DOM_RECT_READONLY_BRAND);
+    let map = lookup_dom_geometry(&recv, DOM_RECT_READONLY_BRAND, "DOMRectReadOnly.toJSON")?;
+    let x = geometry_slot_number(&map, DOM_RECT_X_SLOT);
+    let y = geometry_slot_number(&map, DOM_RECT_Y_SLOT);
+    let width = geometry_slot_number(&map, DOM_RECT_WIDTH_SLOT);
+    let height = geometry_slot_number(&map, DOM_RECT_HEIGHT_SLOT);
+    let mut out = PropertyMap::new();
+    out.insert("x".into(), num(x));
+    out.insert("y".into(), num(y));
+    out.insert("width".into(), num(width));
+    out.insert("height".into(), num(height));
+    out.insert("top".into(), num(y.min(y + height)));
+    out.insert("right".into(), num(x.max(x + width)));
+    out.insert("bottom".into(), num(y.max(y + height)));
+    out.insert("left".into(), num(x.min(x + width)));
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+}
+
+fn make_dom_point_builtin(kind: DomGeometryKind) -> JsValue {
+    let mutable = matches!(kind, DomGeometryKind::Point);
+    let type_name = if mutable {
+        "DOMPoint"
+    } else {
+        "DOMPointReadOnly"
+    };
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(move |args| {
+            let x = optional_geometry_number_arg(&args, 0, 0.0)?;
+            let y = optional_geometry_number_arg(&args, 1, 0.0)?;
+            let z = optional_geometry_number_arg(&args, 2, 0.0)?;
+            let w = optional_geometry_number_arg(&args, 3, 1.0)?;
+            Ok(build_dom_point_instance(x, y, z, w, mutable))
+        }),
+    );
+    props.insert(
+        "fromPoint".into(),
+        builtin_fn("fromPoint", 1, move |args| {
+            let (x, y, z, w) = point_init_from_value(args.first())?;
+            Ok(build_dom_point_instance(x, y, z, w, mutable))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+        if mutable {
+            if let Some(parent) = DOM_POINT_READONLY_PROTO.with(|p| p.borrow().clone()) {
+                proto.insert_with_attrs(
+                    INTERNAL_PROTO_PROPERTY_KEY.into(),
+                    JsValue::PlainObject(parent),
+                    PropertyAttributes::empty(),
+                );
+            }
+            for (name, slot) in [
+                ("x", DOM_POINT_X_SLOT),
+                ("y", DOM_POINT_Y_SLOT),
+                ("z", DOM_POINT_Z_SLOT),
+                ("w", DOM_POINT_W_SLOT),
+            ] {
+                register_geometry_setter(
+                    &mut proto,
+                    name,
+                    DOM_POINT_MUTABLE_BRAND,
+                    "DOMPoint",
+                    slot,
+                );
+            }
+        } else {
+            for (name, slot) in [
+                ("x", DOM_POINT_X_SLOT),
+                ("y", DOM_POINT_Y_SLOT),
+                ("z", DOM_POINT_Z_SLOT),
+                ("w", DOM_POINT_W_SLOT),
+            ] {
+                register_geometry_getter(
+                    &mut proto,
+                    name,
+                    DOM_POINT_READONLY_BRAND,
+                    "DOMPointReadOnly",
+                    slot,
+                );
+            }
+            proto.insert("toJSON".into(), builtin_fn("toJSON", 0, dom_point_to_json));
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("DOMPointReadOnly".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        if mutable {
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String(type_name.into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        if mutable {
+            DOM_POINT_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        } else {
+            DOM_POINT_READONLY_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        }
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+fn make_rect_edge_getter(name: &'static str) -> JsValue {
+    native(move |args| {
+        let (recv, _) = resolve_dom_geometry_receiver(&args, DOM_RECT_READONLY_BRAND);
+        let map = lookup_dom_geometry(&recv, DOM_RECT_READONLY_BRAND, name)?;
+        let x = geometry_slot_number(&map, DOM_RECT_X_SLOT);
+        let y = geometry_slot_number(&map, DOM_RECT_Y_SLOT);
+        let width = geometry_slot_number(&map, DOM_RECT_WIDTH_SLOT);
+        let height = geometry_slot_number(&map, DOM_RECT_HEIGHT_SLOT);
+        let value = match name {
+            "top" => y.min(y + height),
+            "right" => x.max(x + width),
+            "bottom" => y.max(y + height),
+            "left" => x.min(x + width),
+            _ => 0.0,
+        };
+        Ok(num(value))
+    })
+}
+
+fn make_dom_rect_builtin(kind: DomGeometryKind) -> JsValue {
+    let mutable = matches!(kind, DomGeometryKind::Rect);
+    let type_name = if mutable {
+        "DOMRect"
+    } else {
+        "DOMRectReadOnly"
+    };
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(move |args| {
+            let x = optional_geometry_number_arg(&args, 0, 0.0)?;
+            let y = optional_geometry_number_arg(&args, 1, 0.0)?;
+            let width = optional_geometry_number_arg(&args, 2, 0.0)?;
+            let height = optional_geometry_number_arg(&args, 3, 0.0)?;
+            Ok(build_dom_rect_instance(x, y, width, height, mutable))
+        }),
+    );
+    props.insert(
+        "fromRect".into(),
+        builtin_fn("fromRect", 1, move |args| {
+            let (x, y, width, height) = rect_init_from_value(args.first())?;
+            Ok(build_dom_rect_instance(x, y, width, height, mutable))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+        if mutable {
+            if let Some(parent) = DOM_RECT_READONLY_PROTO.with(|p| p.borrow().clone()) {
+                proto.insert_with_attrs(
+                    INTERNAL_PROTO_PROPERTY_KEY.into(),
+                    JsValue::PlainObject(parent),
+                    PropertyAttributes::empty(),
+                );
+            }
+            for (name, slot) in [
+                ("x", DOM_RECT_X_SLOT),
+                ("y", DOM_RECT_Y_SLOT),
+                ("width", DOM_RECT_WIDTH_SLOT),
+                ("height", DOM_RECT_HEIGHT_SLOT),
+            ] {
+                register_geometry_setter(&mut proto, name, DOM_RECT_MUTABLE_BRAND, "DOMRect", slot);
+            }
+        } else {
+            for (name, slot) in [
+                ("x", DOM_RECT_X_SLOT),
+                ("y", DOM_RECT_Y_SLOT),
+                ("width", DOM_RECT_WIDTH_SLOT),
+                ("height", DOM_RECT_HEIGHT_SLOT),
+            ] {
+                register_geometry_getter(
+                    &mut proto,
+                    name,
+                    DOM_RECT_READONLY_BRAND,
+                    "DOMRectReadOnly",
+                    slot,
+                );
+            }
+            for name in ["top", "right", "bottom", "left"] {
+                proto.insert_with_attrs(
+                    format!("__get_{name}__"),
+                    make_rect_edge_getter(name),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+            proto.insert("toJSON".into(), builtin_fn("toJSON", 0, dom_rect_to_json));
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("DOMRectReadOnly".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        if mutable {
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String(type_name.into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        if mutable {
+            DOM_RECT_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        } else {
+            DOM_RECT_READONLY_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        }
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 // ── ImageData ────────────────────────────────────────────────────────────────
 //
 // `ImageData` (HTML Living Standard §4.12.5.10) is a pure pixel-buffer data
@@ -26183,10 +26740,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // Extensions (`MediaSource`, `SourceBuffer`), the MediaStream Recording
         // API (`MediaRecorder`), and the off-screen Canvas / imaging surface
         // (`OffscreenCanvas`, `CanvasRenderingContext2D`,
-        // `OffscreenCanvasRenderingContext2D`, `ImageBitmap`, `ImageData`,
-        // `Path2D`, `createImageBitmap`) all require host integration with a
-        // graphics pipeline, audio/video decoder, capture device, or DOM
-        // element. The standalone engine has none of that, so product code
+        // `OffscreenCanvasRenderingContext2D`, `ImageBitmap`, `Path2D`,
+        // `createImageBitmap`) all require host integration with a graphics
+        // pipeline, audio/video decoder, capture device, or DOM element.
+        // The standalone engine has none of that, so product code
         // that probes these globals sees a real constructor / function (so
         // `typeof === 'function'` succeeds) but every construction or
         // invocation fails closed with a `TypeError` rather than returning a
@@ -26228,6 +26785,61 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "ImageData".into(),
             finalize_ctor(make_image_data_builtin(), "ImageData"),
         );
+        globals.insert(
+            "DOMPointReadOnly".into(),
+            finalize_ctor(
+                make_dom_point_builtin(DomGeometryKind::PointReadOnly),
+                "DOMPointReadOnly",
+            ),
+        );
+        globals.insert(
+            "DOMPoint".into(),
+            finalize_ctor(make_dom_point_builtin(DomGeometryKind::Point), "DOMPoint"),
+        );
+        globals.insert(
+            "DOMRectReadOnly".into(),
+            finalize_ctor(
+                make_dom_rect_builtin(DomGeometryKind::RectReadOnly),
+                "DOMRectReadOnly",
+            ),
+        );
+        globals.insert(
+            "DOMRect".into(),
+            finalize_ctor(make_dom_rect_builtin(DomGeometryKind::Rect), "DOMRect"),
+        );
+        for (name, methods) in [
+            (
+                "DOMMatrixReadOnly",
+                &[
+                    ("multiply", 1),
+                    ("translate", 3),
+                    ("scale", 6),
+                    ("rotate", 3),
+                    ("toJSON", 0),
+                ][..],
+            ),
+            (
+                "DOMMatrix",
+                &[
+                    ("multiplySelf", 1),
+                    ("preMultiplySelf", 1),
+                    ("translateSelf", 3),
+                    ("scaleSelf", 6),
+                    ("rotateSelf", 3),
+                    ("invertSelf", 0),
+                    ("setMatrixValue", 1),
+                    ("toJSON", 0),
+                ][..],
+            ),
+        ] {
+            globals.insert(
+                name.into(),
+                finalize_ctor(
+                    make_unsupported_web_constructor_with_prototype(name, methods, &[][..]),
+                    name,
+                ),
+            );
+        }
 
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
@@ -29478,15 +30090,7 @@ mod tests {
 
     #[test]
     fn e2e_geometry_constructors_exist_but_fail_closed() {
-        for name in [
-            "DOMRect",
-            "DOMRectReadOnly",
-            "DOMPoint",
-            "DOMPointReadOnly",
-            "DOMMatrix",
-            "DOMMatrixReadOnly",
-            "DOMQuad",
-        ] {
+        for name in ["DOMMatrix", "DOMMatrixReadOnly", "DOMQuad"] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
             ));
@@ -29494,8 +30098,6 @@ mod tests {
             assert_eval_type_error(&format!("new {name}()"));
         }
 
-        assert_eval_type_error("new DOMRect(0, 0, 1, 1)");
-        assert_eval_type_error("new DOMPoint(1, 2, 3, 4)");
         assert_eval_type_error("new DOMMatrix([1, 0, 0, 1, 0, 0])");
     }
 
@@ -30692,6 +31294,115 @@ mod tests {
             "typeof createImageBitmap === 'function' && createImageBitmap.name === 'createImageBitmap'",
         );
         assert_eval_type_error("createImageBitmap({})");
+    }
+
+    #[test]
+    fn e2e_dom_point_constructors_defaults_and_from_point() {
+        assert_eval_true(
+            "typeof DOMPointReadOnly === 'function' && DOMPointReadOnly.name === 'DOMPointReadOnly'",
+        );
+        assert_eval_true("typeof DOMPoint === 'function' && DOMPoint.name === 'DOMPoint'");
+        assert_eval_true(
+            "var p = new DOMPointReadOnly(); p.x === 0 && p.y === 0 && p.z === 0 && p.w === 1",
+        );
+        assert_eval_true(
+            "var p = new DOMPoint(1, 2, 3, 4); p.x === 1 && p.y === 2 && p.z === 3 && p.w === 4",
+        );
+        assert_eval_true(
+            "var p = DOMPointReadOnly.fromPoint({ x: '5', y: 6 }); p.x === 5 && p.y === 6 && p.z === 0 && p.w === 1",
+        );
+        assert_eval_true(
+            "var p = DOMPoint.fromPoint({ z: 7, w: 8 }); p.x === 0 && p.y === 0 && p.z === 7 && p.w === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_point_mutable_readonly_brand_and_json() {
+        assert_eval_true("new DOMPoint() instanceof DOMPoint");
+        assert_eval_true("new DOMPoint() instanceof DOMPointReadOnly");
+        assert_eval_true("new DOMPointReadOnly() instanceof DOMPointReadOnly");
+        assert_eval_true("!(new DOMPointReadOnly() instanceof DOMPoint)");
+        assert_eval_true("DOMPoint.prototype.constructor === DOMPoint");
+        assert_eval_true("DOMPointReadOnly.prototype.constructor === DOMPointReadOnly");
+        assert_eval_true(
+            "var p = new DOMPoint(1, 2, 3, 4); p.x = 9; p.y = 10; p.x === 9 && p.y === 10",
+        );
+        assert_eval_true("var p = new DOMPointReadOnly(1, 2, 3, 4); p.x = 9; p.x === 1");
+        assert_eval_true(
+            "var j = new DOMPoint(1, 2, 3, 4).toJSON(); j.x === 1 && j.y === 2 && j.z === 3 && j.w === 4",
+        );
+        assert_eval_true(
+            "Object.prototype.toString.call(new DOMPoint(1, 2)) === '[object DOMPoint]'",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(DOMPointReadOnly.prototype, 'x').get.call({})",
+        );
+        assert_eval_type_error("DOMPointReadOnly.prototype.toJSON.call({})");
+    }
+
+    #[test]
+    fn e2e_dom_rect_constructors_edges_and_from_rect() {
+        assert_eval_true(
+            "typeof DOMRectReadOnly === 'function' && DOMRectReadOnly.name === 'DOMRectReadOnly'",
+        );
+        assert_eval_true("typeof DOMRect === 'function' && DOMRect.name === 'DOMRect'");
+        assert_eval_true(
+            "var r = new DOMRectReadOnly(); r.x === 0 && r.y === 0 && r.width === 0 && r.height === 0",
+        );
+        assert_eval_true(
+            "var r = new DOMRect(1, 2, 3, 4); r.x === 1 && r.y === 2 && r.width === 3 && r.height === 4",
+        );
+        assert_eval_true(
+            "var r = DOMRectReadOnly.fromRect({ x: '5', y: 6, width: 7 }); r.x === 5 && r.y === 6 && r.width === 7 && r.height === 0",
+        );
+        assert_eval_true(
+            "var r = new DOMRect(10, 20, -3, -4); r.left === 7 && r.right === 10 && r.top === 16 && r.bottom === 20",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_rect_mutable_readonly_brand_and_json() {
+        assert_eval_true("new DOMRect() instanceof DOMRect");
+        assert_eval_true("new DOMRect() instanceof DOMRectReadOnly");
+        assert_eval_true("new DOMRectReadOnly() instanceof DOMRectReadOnly");
+        assert_eval_true("!(new DOMRectReadOnly() instanceof DOMRect)");
+        assert_eval_true("DOMRect.prototype.constructor === DOMRect");
+        assert_eval_true("DOMRectReadOnly.prototype.constructor === DOMRectReadOnly");
+        assert_eval_true(
+            "var r = new DOMRect(1, 2, 3, 4); r.x = 9; r.width = -5; r.x === 9 && r.width === -5 && r.left === 4 && r.right === 9",
+        );
+        assert_eval_true("var r = new DOMRectReadOnly(1, 2, 3, 4); r.width = 9; r.width === 3");
+        assert_eval_true(
+            "var j = new DOMRect(10, 20, -3, -4).toJSON(); j.x === 10 && j.y === 20 && j.width === -3 && j.height === -4 && j.left === 7 && j.top === 16",
+        );
+        assert_eval_true(
+            "Object.prototype.toString.call(new DOMRect(1, 2)) === '[object DOMRect]'",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, 'x').get.call({})",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, 'left').get.call({})",
+        );
+        assert_eval_type_error("DOMRectReadOnly.prototype.toJSON.call({})");
+    }
+
+    #[test]
+    fn e2e_dom_matrix_and_host_geometry_surfaces_remain_fail_closed() {
+        assert_eval_true(
+            "typeof DOMMatrixReadOnly === 'function' && DOMMatrixReadOnly.name === 'DOMMatrixReadOnly'",
+        );
+        assert_eval_true("typeof DOMMatrix === 'function' && DOMMatrix.name === 'DOMMatrix'");
+        assert_eval_type_error("new DOMMatrixReadOnly()");
+        assert_eval_type_error("new DOMMatrix()");
+        assert_eval_true("typeof DOMPointReadOnly.prototype.matrixTransform === 'undefined'");
+        assert_eval_true("typeof document === 'undefined'");
+        assert_eval_true("typeof window === 'undefined'");
+        assert_eval_true("typeof getComputedStyle === 'undefined'");
+        assert_eval_type_error("new OffscreenCanvas(64, 64)");
+        assert_eval_type_error("new Path2D()");
+        assert_eval_true("typeof Range.prototype.getBoundingClientRect === 'function'");
+        assert_eval_type_error("Range.prototype.getBoundingClientRect.call({})");
     }
 
     /// `ImageData` is a pure data container, so it is implemented for real:
