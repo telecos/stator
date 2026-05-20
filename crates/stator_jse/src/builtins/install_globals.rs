@@ -12371,6 +12371,79 @@ fn make_unsupported_web_object(name: &'static str, methods: &[(&'static str, i32
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+/// Implement the [CSSOM `CSS.escape(ident)` algorithm][css-escape] as a pure
+/// string transform. The algorithm only inspects the input's Unicode code
+/// points, so it is safe to expose in the standalone runtime — no CSS parser,
+/// stylesheet, style engine, or DOM is required.
+///
+/// [css-escape]: https://drafts.csswg.org/cssom/#serialize-an-identifier
+fn css_escape_ident(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let first_is_hyphen = chars.first() == Some(&'-');
+    let single_hyphen = chars.len() == 1 && first_is_hyphen;
+    for (i, &c) in chars.iter().enumerate() {
+        let cp = c as u32;
+        if cp == 0 {
+            out.push('\u{FFFD}');
+        } else if (0x0001..=0x001F).contains(&cp)
+            || cp == 0x007F
+            || (i == 0 && (0x0030..=0x0039).contains(&cp))
+            || (i == 1 && (0x0030..=0x0039).contains(&cp) && first_is_hyphen)
+        {
+            out.push('\\');
+            out.push_str(&format!("{cp:x}"));
+            out.push(' ');
+        } else if i == 0 && single_hyphen {
+            out.push('\\');
+            out.push('-');
+        } else if cp >= 0x0080
+            || cp == 0x002D
+            || cp == 0x005F
+            || (0x0030..=0x0039).contains(&cp)
+            || (0x0041..=0x005A).contains(&cp)
+            || (0x0061..=0x007A).contains(&cp)
+        {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Build the `CSS` namespace object. `CSS.escape` is implemented per the
+/// CSSOM serialize-an-identifier algorithm; `CSS.supports` and
+/// `CSS.registerProperty` remain fail-closed because they require a CSS
+/// parser and property registry that the standalone engine does not provide.
+/// The object is a plain namespace (no `__call__` / `__construct__` slots),
+/// matching browser behavior where `new CSS()` is not permitted.
+fn make_css_namespace() -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "escape".into(),
+        builtin_fn("escape", 1, |args| {
+            let ident = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::Undefined)
+                .to_js_string()?;
+            Ok(JsValue::String(css_escape_ident(&ident).into()))
+        }),
+    );
+    props.insert(
+        "supports".into(),
+        make_unsupported_web_function("CSS.supports", 1),
+    );
+    props.insert(
+        "registerProperty".into(),
+        make_unsupported_web_function("CSS.registerProperty", 1),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Format 16 bytes as a lowercase RFC 4122 / 9562 UUID string
 /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Caller is responsible
 /// for setting the version and variant bits in `bytes`.
@@ -28075,13 +28148,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // the Chromium globals page scripts commonly probe, but reject all
         // construction/invocation rather than returning fake style, geometry,
         // timeline, font, media-query, screen, or orientation data.
-        globals.insert(
-            "CSS".into(),
-            make_unsupported_web_object(
-                "CSS",
-                &[("supports", 1), ("escape", 1), ("registerProperty", 1)],
-            ),
-        );
+        globals.insert("CSS".into(), make_css_namespace());
         for name in [
             "CSSStyleSheet",
             "CSSRule",
@@ -32341,10 +32408,102 @@ mod tests {
         assert_eval_true("typeof CSS === 'object' && CSS !== null");
         assert_eval_type_error("CSS.supports('display', 'grid')");
         assert_eval_type_error("CSS.supports('display: grid')");
-        assert_eval_type_error("CSS.escape('edge stator')");
         assert_eval_type_error(
             "CSS.registerProperty({ name: '--x', syntax: '<length>', inherits: false, initialValue: '0px' })",
         );
+        // CSS is a namespace object, not a constructor or function.
+        assert_eval_true("typeof CSS !== 'function'");
+        assert_eval_type_error("new CSS()");
+        assert_eval_type_error("CSS()");
+        // Other CSS typed-OM / parser surfaces remain unavailable.
+        assert_eval_true("typeof CSS.paintWorklet === 'undefined'");
+        assert_eval_true("typeof CSSStyleValue === 'undefined'");
+        assert_eval_true("typeof CSSUnitValue === 'undefined'");
+        assert_eval_true("typeof StylePropertyMap === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_css_escape_is_a_real_function() {
+        assert_eval_true("typeof CSS.escape === 'function'");
+        assert_eval_true("CSS.escape.name === 'escape'");
+        assert_eval_true("CSS.escape.length === 1");
+    }
+
+    #[test]
+    fn e2e_css_escape_empty_string() {
+        assert_eval_true("CSS.escape('') === ''");
+    }
+
+    #[test]
+    fn e2e_css_escape_leading_digit() {
+        // Leading ASCII digit must be hex-escaped: '1' (U+0031) -> '\31 '
+        assert_eval_true("CSS.escape('1') === '\\\\31 '");
+        assert_eval_true("CSS.escape('123abc') === '\\\\31 23abc'");
+        // Digit in non-leading position is preserved.
+        assert_eval_true("CSS.escape('a1') === 'a1'");
+    }
+
+    #[test]
+    fn e2e_css_escape_hyphen_digit_second_char() {
+        // Second char is a digit and first char is '-': digit is escaped.
+        assert_eval_true("CSS.escape('-1') === '-\\\\31 '");
+        assert_eval_true("CSS.escape('-9abc') === '-\\\\39 abc'");
+    }
+
+    #[test]
+    fn e2e_css_escape_single_hyphen() {
+        // A single '-' must be escaped as '\-'.
+        assert_eval_true("CSS.escape('-') === '\\\\-'");
+        // Two hyphens, however, is a valid custom-property-style ident start.
+        assert_eval_true("CSS.escape('--') === '--'");
+        assert_eval_true("CSS.escape('--foo') === '--foo'");
+    }
+
+    #[test]
+    fn e2e_css_escape_null_replaced_with_fffd() {
+        // U+0000 becomes U+FFFD REPLACEMENT CHARACTER.
+        assert_eval_true("CSS.escape('a\\0b') === 'a\\uFFFDb'");
+        assert_eval_true("CSS.escape('\\0') === '\\uFFFD'");
+    }
+
+    #[test]
+    fn e2e_css_escape_control_chars() {
+        // U+0001..U+001F and U+007F are written as `\<hex> `.
+        assert_eval_true("CSS.escape('\\x01') === '\\\\1 '");
+        assert_eval_true("CSS.escape('\\x1F') === '\\\\1f '");
+        assert_eval_true("CSS.escape('\\x7F') === '\\\\7f '");
+        assert_eval_true("CSS.escape('a\\x02b') === 'a\\\\2 b'");
+    }
+
+    #[test]
+    fn e2e_css_escape_ascii_punctuation() {
+        // ASCII punctuation outside the allowed identifier set is escaped with a
+        // single backslash before the character.
+        assert_eval_true("CSS.escape('a.b') === 'a\\\\.b'");
+        assert_eval_true("CSS.escape('a b') === 'a\\\\ b'");
+        assert_eval_true("CSS.escape('#id') === '\\\\#id'");
+        assert_eval_true("CSS.escape('foo:bar') === 'foo\\\\:bar'");
+        // '_', '-', digits and ASCII letters in interior positions are preserved.
+        assert_eval_true("CSS.escape('a_b-c0') === 'a_b-c0'");
+    }
+
+    #[test]
+    fn e2e_css_escape_non_ascii_preserved() {
+        // Code points >= U+0080 are emitted as-is.
+        assert_eval_true("CSS.escape('café') === 'café'");
+        assert_eval_true("CSS.escape('\\u00A0') === '\\u00A0'");
+        assert_eval_true("CSS.escape('🦀') === '🦀'");
+    }
+
+    #[test]
+    fn e2e_css_escape_coerces_non_string_arguments() {
+        assert_eval_true("CSS.escape(123) === '\\\\31 23'");
+        assert_eval_true("CSS.escape(true) === 'true'");
+        assert_eval_true("CSS.escape(false) === 'false'");
+        assert_eval_true("CSS.escape(null) === 'null'");
+        assert_eval_true("CSS.escape(undefined) === 'undefined'");
+        // Missing argument coerces to undefined -> "undefined".
+        assert_eval_true("CSS.escape() === 'undefined'");
     }
 
     #[test]
