@@ -23494,6 +23494,359 @@ fn make_typed_array_instance(
     instance_value
 }
 
+// ── ImageData ────────────────────────────────────────────────────────────────
+//
+// `ImageData` (HTML Living Standard §4.12.5.10) is a pure pixel-buffer data
+// container. It has no rendering, decoding, or canvas-host behaviour, so the
+// standalone engine can implement it correctly without faking any media or
+// graphics surface. Every instance owns a `Uint8ClampedArray` of length
+// `width * height * 4` (RGBA bytes), exposes `width`/`height`/`data`/
+// `colorSpace` accessors, and supports `instanceof ImageData`.
+
+/// Hidden brand placed on every `ImageData` instance for receiver checks.
+const IMAGE_DATA_BRAND: &str = "__is_image_data__";
+/// Hidden slot storing the instance's width (positive integer).
+const IMAGE_DATA_WIDTH_SLOT: &str = "__image_data_width__";
+/// Hidden slot storing the instance's height (positive integer).
+const IMAGE_DATA_HEIGHT_SLOT: &str = "__image_data_height__";
+/// Hidden slot storing the backing `Uint8ClampedArray` object.
+const IMAGE_DATA_DATA_SLOT: &str = "__image_data_data__";
+/// Hidden slot storing the instance's `PredefinedColorSpace` string.
+const IMAGE_DATA_COLOR_SPACE_SLOT: &str = "__image_data_color_space__";
+
+thread_local! {
+    static IMAGE_DATA_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn image_data_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn image_data_range_error(message: impl Into<String>) -> StatorError {
+    StatorError::RangeError(message.into())
+}
+
+fn lookup_image_data(value: &JsValue, op: &str) -> StatorResult<Rc<RefCell<PropertyMap>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(image_data_type_error(format!(
+            "ImageData.{op}: called on non-ImageData receiver"
+        )));
+    };
+    if !matches!(
+        map.borrow().get(IMAGE_DATA_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(image_data_type_error(format!(
+            "ImageData.{op}: called on non-ImageData receiver"
+        )));
+    }
+    Ok(Rc::clone(map))
+}
+
+fn resolve_image_data_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(IMAGE_DATA_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+/// Coerce a JS argument to a positive integer width/height. Mirrors the
+/// WebIDL `[EnforceRange] unsigned long` plus the HTML rule that zero
+/// dimensions are rejected.
+fn image_data_dim(value: &JsValue, name: &str) -> StatorResult<usize> {
+    let n = value.to_number()?;
+    if !n.is_finite() {
+        return Err(image_data_range_error(format!(
+            "ImageData: {name} must be a finite positive integer"
+        )));
+    }
+    let truncated = n.trunc();
+    if truncated <= 0.0 || truncated > (u32::MAX as f64) {
+        return Err(image_data_range_error(format!(
+            "ImageData: {name} must be a positive integer"
+        )));
+    }
+    Ok(truncated as usize)
+}
+
+/// Validate a `PredefinedColorSpace` enum value. The HTML/CSS-Color-4 spec
+/// defines exactly `"srgb"` and `"display-p3"`; any other value is rejected.
+fn parse_image_data_color_space(value: Option<&JsValue>) -> StatorResult<&'static str> {
+    match value {
+        None | Some(JsValue::Undefined) => Ok("srgb"),
+        Some(JsValue::String(s)) => match s.as_ref() {
+            "srgb" => Ok("srgb"),
+            "display-p3" => Ok("display-p3"),
+            other => Err(image_data_type_error(format!(
+                "ImageData: colorSpace '{other}' is not a valid PredefinedColorSpace value"
+            ))),
+        },
+        Some(_) => Err(image_data_type_error(
+            "ImageData: colorSpace must be a string".to_string(),
+        )),
+    }
+}
+
+/// Parse the optional `ImageDataSettings` dictionary argument.
+fn parse_image_data_settings(value: Option<&JsValue>) -> StatorResult<&'static str> {
+    match value {
+        None | Some(JsValue::Undefined) | Some(JsValue::Null) => Ok("srgb"),
+        Some(JsValue::PlainObject(map)) => {
+            let cs = map.borrow().get("colorSpace").cloned();
+            parse_image_data_color_space(cs.as_ref())
+        }
+        Some(_) => Err(image_data_type_error(
+            "ImageData: settings must be an object".to_string(),
+        )),
+    }
+}
+
+/// Build a fresh `ImageData` instance from already-validated state.
+fn build_image_data_instance(
+    width: usize,
+    height: usize,
+    data: JsValue,
+    color_space: &'static str,
+) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            IMAGE_DATA_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            IMAGE_DATA_WIDTH_SLOT.into(),
+            JsValue::Smi(width as i32),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            IMAGE_DATA_HEIGHT_SLOT.into(),
+            JsValue::Smi(height as i32),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            IMAGE_DATA_DATA_SLOT.into(),
+            data,
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            IMAGE_DATA_COLOR_SPACE_SLOT.into(),
+            JsValue::String(color_space.into()),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = IMAGE_DATA_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    JsValue::PlainObject(inst)
+}
+
+/// Build the real `ImageData` constructor.
+#[inline(never)]
+fn make_image_data_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    // ── Constructor ─────────────────────────────────────────────────────
+    //
+    // Two overloads (HTML §4.12.5.10):
+    //   new ImageData(sw, sh, settings?)
+    //   new ImageData(data, sw, sh?, settings?)  // data is Uint8ClampedArray
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let first = args.first().cloned().unwrap_or(JsValue::Undefined);
+
+            // ── Data constructor ─────────────────────────────────────
+            if let Some(ta) = extract_typed_array(&first) {
+                if ta.borrow().kind != TypedArrayKind::Uint8Clamped {
+                    return Err(image_data_type_error(
+                        "ImageData: data must be a Uint8ClampedArray".to_string(),
+                    ));
+                }
+                let sw_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                if matches!(sw_arg, JsValue::Undefined) {
+                    return Err(image_data_type_error(
+                        "ImageData: width argument is required".to_string(),
+                    ));
+                }
+                let sw = image_data_dim(&sw_arg, "width")?;
+                let length = ta.borrow().effective_length();
+                if length == 0 || length % 4 != 0 {
+                    return Err(image_data_range_error(
+                        "ImageData: data length must be a positive multiple of 4".to_string(),
+                    ));
+                }
+                let pixels = length / 4;
+                if pixels % sw != 0 {
+                    return Err(image_data_range_error(
+                        "ImageData: data length is not a multiple of (width * 4)".to_string(),
+                    ));
+                }
+                let computed_sh = pixels / sw;
+                let sh = match args.get(2) {
+                    Some(v) if !matches!(v, JsValue::Undefined) => {
+                        let sh = image_data_dim(v, "height")?;
+                        if sh != computed_sh {
+                            return Err(image_data_range_error(
+                                "ImageData: data length does not match width * height * 4"
+                                    .to_string(),
+                            ));
+                        }
+                        sh
+                    }
+                    _ => computed_sh,
+                };
+                let color_space = parse_image_data_settings(args.get(3))?;
+                // Preserve identity: the `data` accessor returns the very
+                // same typed-array object that was passed in.
+                return Ok(build_image_data_instance(sw, sh, first, color_space));
+            }
+
+            // ── Allocation constructor ──────────────────────────────
+            if matches!(first, JsValue::Undefined) {
+                return Err(image_data_type_error(
+                    "ImageData: width argument is required".to_string(),
+                ));
+            }
+            let sw = image_data_dim(&first, "width")?;
+            let sh_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if matches!(sh_arg, JsValue::Undefined) {
+                return Err(image_data_type_error(
+                    "ImageData: height argument is required".to_string(),
+                ));
+            }
+            let sh = image_data_dim(&sh_arg, "height")?;
+            let color_space = parse_image_data_settings(args.get(2))?;
+
+            let pixels = sw.checked_mul(sh).ok_or_else(|| {
+                image_data_range_error("ImageData: width*height overflows".to_string())
+            })?;
+            let length = pixels.checked_mul(4).ok_or_else(|| {
+                image_data_range_error("ImageData: allocation size overflows".to_string())
+            })?;
+            // Cap at the typed-array byte-length limit used elsewhere in the
+            // engine to avoid attempting an obviously oversized allocation.
+            if length > (i32::MAX as usize) {
+                return Err(image_data_range_error(
+                    "ImageData: allocation size exceeds engine limit".to_string(),
+                ));
+            }
+
+            let inner = Rc::new(RefCell::new(typed_array_new_from_length(
+                TypedArrayKind::Uint8Clamped,
+                length,
+            )));
+            let data = make_typed_array_instance(TypedArrayKind::Uint8Clamped, inner, None);
+            Ok(build_image_data_instance(sw, sh, data, color_space))
+        }),
+    );
+
+    // ── Prototype ───────────────────────────────────────────────────────
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        fn register_getter(proto: &mut PropertyMap, name: &str, getter: JsValue) {
+            proto.insert_with_attrs(
+                format!("__get_{name}__"),
+                getter,
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+
+        register_getter(
+            &mut proto,
+            "width",
+            native(|args| {
+                let (recv, _) = resolve_image_data_receiver(&args);
+                let map = lookup_image_data(&recv, "width")?;
+                Ok(map
+                    .borrow()
+                    .get(IMAGE_DATA_WIDTH_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Smi(0)))
+            }),
+        );
+        register_getter(
+            &mut proto,
+            "height",
+            native(|args| {
+                let (recv, _) = resolve_image_data_receiver(&args);
+                let map = lookup_image_data(&recv, "height")?;
+                Ok(map
+                    .borrow()
+                    .get(IMAGE_DATA_HEIGHT_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Smi(0)))
+            }),
+        );
+        register_getter(
+            &mut proto,
+            "data",
+            native(|args| {
+                let (recv, _) = resolve_image_data_receiver(&args);
+                let map = lookup_image_data(&recv, "data")?;
+                Ok(map
+                    .borrow()
+                    .get(IMAGE_DATA_DATA_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined))
+            }),
+        );
+        register_getter(
+            &mut proto,
+            "colorSpace",
+            native(|args| {
+                let (recv, _) = resolve_image_data_receiver(&args);
+                let map = lookup_image_data(&recv, "colorSpace")?;
+                Ok(map
+                    .borrow()
+                    .get(IMAGE_DATA_COLOR_SPACE_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::String("srgb".into())))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("ImageData".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        IMAGE_DATA_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Build the `ShadowRealm` constructor.
@@ -25855,7 +26208,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "CanvasRenderingContext2D",
             "OffscreenCanvasRenderingContext2D",
             "ImageBitmap",
-            "ImageData",
             "Path2D",
         ] {
             globals.insert(
@@ -25866,6 +26218,15 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "createImageBitmap".into(),
             make_unsupported_web_function("createImageBitmap", 1),
+        );
+
+        // `ImageData` is a pure data container (width/height/data/colorSpace)
+        // — it has no rendering or decoding behaviour, so it can be
+        // implemented correctly in the standalone engine without faking any
+        // canvas, decoder, or graphics pipeline.
+        globals.insert(
+            "ImageData".into(),
+            finalize_ctor(make_image_data_builtin(), "ImageData"),
         );
 
         // ── Error constructors ────────────────────────────────────────────────
@@ -30306,7 +30667,6 @@ mod tests {
             "CanvasRenderingContext2D",
             "OffscreenCanvasRenderingContext2D",
             "ImageBitmap",
-            "ImageData",
             "Path2D",
         ] {
             assert_eval_true(&format!(
@@ -30323,7 +30683,6 @@ mod tests {
         assert_eval_type_error("new MediaStream()");
         assert_eval_type_error("new MediaRecorder({})");
         assert_eval_type_error("new OffscreenCanvas(64, 64)");
-        assert_eval_type_error("new ImageData(8, 8)");
         assert_eval_type_error("new Path2D()");
     }
 
@@ -30333,6 +30692,116 @@ mod tests {
             "typeof createImageBitmap === 'function' && createImageBitmap.name === 'createImageBitmap'",
         );
         assert_eval_type_error("createImageBitmap({})");
+    }
+
+    /// `ImageData` is a pure data container, so it is implemented for real:
+    /// every accessor and the construction overloads behave per the HTML
+    /// Living Standard §4.12.5.10 — but the surrounding canvas/decoder/
+    /// rendering surfaces (`ImageBitmap`, `createImageBitmap`, canvas
+    /// contexts, OffscreenCanvas rendering, `ImageDecoder`, `VideoFrame`,
+    /// `Path2D`, `DOMMatrix`, …) intentionally stay fail-closed.
+    #[test]
+    fn e2e_image_data_allocation_constructor() {
+        assert_eval_true("typeof ImageData === 'function' && ImageData.name === 'ImageData'");
+        assert_eval_true("ImageData.prototype.constructor === ImageData");
+        assert_eval_true("new ImageData(8, 8) instanceof ImageData");
+        assert_eval_true("new ImageData(2, 3).width === 2");
+        assert_eval_true("new ImageData(2, 3).height === 3");
+        assert_eval_true("new ImageData(2, 3).data instanceof Uint8ClampedArray");
+        assert_eval_true("new ImageData(2, 3).data.length === 24");
+        assert_eval_true(
+            "(function(){var d=new ImageData(2,3).data; for(var i=0;i<d.length;i++) if(d[i]!==0) return false; return true;})()",
+        );
+        assert_eval_true("new ImageData(8, 8).colorSpace === 'srgb'");
+        assert_eval_true(
+            "Object.prototype.toString.call(new ImageData(1, 1)) === '[object ImageData]'",
+        );
+    }
+
+    #[test]
+    fn e2e_image_data_same_backing_data_object_identity() {
+        assert_eval_true(
+            "(function(){var img=new ImageData(4,4); return img.data === img.data;})()",
+        );
+        assert_eval_true(
+            "(function(){var src=new Uint8ClampedArray(16); var img=new ImageData(src, 2, 2); return img.data === src;})()",
+        );
+        assert_eval_true(
+            "(function(){var img=new ImageData(2,2); img.data[0]=255; return img.data[0]===255;})()",
+        );
+    }
+
+    #[test]
+    fn e2e_image_data_data_constructor() {
+        assert_eval_true("new ImageData(new Uint8ClampedArray(16), 2) instanceof ImageData");
+        assert_eval_true("new ImageData(new Uint8ClampedArray(16), 2).width === 2");
+        assert_eval_true("new ImageData(new Uint8ClampedArray(16), 2).height === 2");
+        assert_eval_true("new ImageData(new Uint8ClampedArray(16), 2, 2).height === 2");
+        assert_eval_true("new ImageData(new Uint8ClampedArray(24), 2, 3).height === 3");
+        assert_eval_true(
+            "new ImageData(new Uint8ClampedArray(16), 2, 2, { colorSpace: 'srgb' }).colorSpace === 'srgb'",
+        );
+        assert_eval_true(
+            "new ImageData(new Uint8ClampedArray(16), 2, 2, { colorSpace: 'display-p3' }).colorSpace === 'display-p3'",
+        );
+    }
+
+    #[test]
+    fn e2e_image_data_rejects_invalid_dimensions() {
+        assert_eval_range_error("new ImageData(0, 8)");
+        assert_eval_range_error("new ImageData(8, 0)");
+        assert_eval_range_error("new ImageData(-1, 8)");
+        assert_eval_range_error("new ImageData(8, -1)");
+        assert_eval_range_error("new ImageData(NaN, 8)");
+        assert_eval_range_error("new ImageData(8, Infinity)");
+    }
+
+    #[test]
+    fn e2e_image_data_rejects_missing_arguments() {
+        assert_eval_type_error("new ImageData()");
+        assert_eval_type_error("new ImageData(8)");
+        assert_eval_type_error("new ImageData(new Uint8ClampedArray(16))");
+    }
+
+    #[test]
+    fn e2e_image_data_rejects_non_clamped_data() {
+        assert_eval_type_error("new ImageData(new Uint8Array(16), 2)");
+        assert_eval_type_error("new ImageData(new Int8Array(16), 2)");
+        assert_eval_type_error("new ImageData(new Uint16Array(8), 2)");
+    }
+
+    #[test]
+    fn e2e_image_data_rejects_invalid_data_length() {
+        // Length not a positive multiple of 4.
+        assert_eval_range_error("new ImageData(new Uint8ClampedArray(0), 1)");
+        assert_eval_range_error("new ImageData(new Uint8ClampedArray(6), 1)");
+        // Pixels not a multiple of width.
+        assert_eval_range_error("new ImageData(new Uint8ClampedArray(12), 2)");
+        // Explicit height mismatches data length.
+        assert_eval_range_error("new ImageData(new Uint8ClampedArray(16), 2, 3)");
+    }
+
+    #[test]
+    fn e2e_image_data_rejects_unsupported_color_space() {
+        assert_eval_type_error("new ImageData(8, 8, { colorSpace: 'rec2020' })");
+        assert_eval_type_error("new ImageData(8, 8, { colorSpace: 'SRGB' })");
+        assert_eval_type_error(
+            "new ImageData(new Uint8ClampedArray(16), 2, 2, { colorSpace: 'cmyk' })",
+        );
+        assert_eval_type_error("new ImageData(8, 8, { colorSpace: 42 })");
+    }
+
+    #[test]
+    fn e2e_image_data_accessors_brand_check() {
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ImageData.prototype, 'width').get.call({})",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ImageData.prototype, 'data').get.call(null)",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ImageData.prototype, 'colorSpace').get.call({width:1,height:1})",
+        );
     }
 
     /// `navigator.mediaDevices` and friends remain absent because `navigator`
