@@ -8413,7 +8413,7 @@ struct RequestState {
     bytes: Vec<u8>,
     /// Whether the body is conceptually null.
     body_null: bool,
-    /// Has the body been consumed by `text/json/blob/arrayBuffer`?
+    /// Has the body been consumed by `text/json/blob/arrayBuffer/formData`?
     body_used: bool,
     /// Shared `Headers` list.
     headers_list: Rc<RefCell<HeaderList>>,
@@ -8576,6 +8576,39 @@ fn request_take_body(state: &Rc<RefCell<RequestState>>) -> StatorResult<Vec<u8>>
 
 fn request_content_type(state: &Rc<RefCell<RequestState>>) -> String {
     list_get_combined(&state.borrow().headers_list.borrow(), "content-type").unwrap_or_default()
+}
+
+fn body_content_type_essence(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn body_form_data_from_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    api_name: &str,
+) -> StatorResult<JsValue> {
+    let essence = body_content_type_essence(content_type);
+    if essence == "application/x-www-form-urlencoded" {
+        let decoded = String::from_utf8_lossy(bytes);
+        let entries = parse_query_pairs(&decoded)
+            .into_iter()
+            .map(|(name, value)| (name, JsValue::String(value.into())))
+            .collect();
+        return build_form_data_instance(entries);
+    }
+    if essence == "multipart/form-data" {
+        return Err(response_type_error(format!(
+            "{api_name}: multipart/form-data parsing is not implemented"
+        )));
+    }
+    Err(response_type_error(format!(
+        "{api_name}: only application/x-www-form-urlencoded FormData parsing is implemented"
+    )))
 }
 
 fn build_request_instance(state: RequestState) -> JsValue {
@@ -8963,6 +8996,23 @@ fn make_request_builtin() -> JsValue {
                     vec![JsValue::String(text.into())],
                 ) {
                     Ok(v) => Ok(blob_resolved_promise(v)),
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+
+        proto.insert(
+            "formData".into(),
+            native(|args| {
+                let (recv, _) = resolve_request_receiver(&args);
+                let state = lookup_request_state(&recv)?;
+                let content_type = request_content_type(&state);
+                let bytes = match request_take_body(&state) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(response_rejected_promise(e)),
+                };
+                match body_form_data_from_bytes(&bytes, &content_type, "Request.formData") {
+                    Ok(form) => Ok(blob_resolved_promise(form)),
                     Err(e) => Ok(response_rejected_promise(e)),
                 }
             }),
@@ -11532,7 +11582,7 @@ fn make_abort_controller_builtin() -> JsValue {
 // ── Response (WHATWG Fetch §6) ───────────────────────────────────────────────
 //
 // Standalone in-memory `Response` implementation. The constructor, body
-// methods (`text`/`arrayBuffer`/`blob`/`json`), and the
+// methods (`text`/`arrayBuffer`/`blob`/`json`/`formData`), and the
 // `Response.error()` / `Response.redirect()` / `Response.json()` static
 // methods are real; however, this engine does **not** implement `fetch`,
 // network/Cache integration, service workers, or real `ReadableStream` byte
@@ -11574,7 +11624,7 @@ struct ResponseState {
     url: String,
     /// Whether this response was produced by following a redirect.
     redirected: bool,
-    /// Has the body been consumed by `text/json/blob/arrayBuffer`?
+    /// Has the body been consumed by `text/json/blob/arrayBuffer/formData`?
     body_used: bool,
     /// Shared `Headers` list (also referenced by the cached headers JS object).
     headers_list: Rc<RefCell<HeaderList>>,
@@ -12187,6 +12237,23 @@ fn make_response_builtin() -> JsValue {
                     vec![JsValue::String(text.into())],
                 ) {
                     Ok(v) => Ok(blob_resolved_promise(v)),
+                    Err(e) => Ok(response_rejected_promise(e)),
+                }
+            }),
+        );
+
+        proto.insert(
+            "formData".into(),
+            native(|args| {
+                let (recv, _) = resolve_response_receiver(&args);
+                let state = lookup_response_state(&recv)?;
+                let content_type = response_content_type(&state);
+                let bytes = match response_take_body(&state) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(response_rejected_promise(e)),
+                };
+                match body_form_data_from_bytes(&bytes, &content_type, "Response.formData") {
+                    Ok(form) => Ok(blob_resolved_promise(form)),
                     Err(e) => Ok(response_rejected_promise(e)),
                 }
             }),
@@ -30566,6 +30633,10 @@ mod tests {
             "var requestJsonGot = null; var q = new Request('https://example.test/', { method: 'POST', body: '{\"a\":1}' }); q.json().then(function(v){ requestJsonGot = v; });",
             "requestJsonGot !== null && requestJsonGot.a === 1",
         );
+        assert_eval_true_after_microtasks(
+            "var requestFormGot = null; var q = new Request('https://example.test/', { method: 'POST', body: 'a=1&b=hello+world&a=2', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' } }); q.formData().then(function(v){ requestFormGot = v; });",
+            "requestFormGot instanceof FormData && requestFormGot.get('a') === '1' && requestFormGot.getAll('a').length === 2 && requestFormGot.get('b') === 'hello world'",
+        );
         assert_eval_true(
             "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); var c = q.clone(); q.text(); c.bodyUsed === false && c.method === 'POST' && c.url === q.url",
         );
@@ -30575,6 +30646,14 @@ mod tests {
         assert_eval_true_after_microtasks(
             "var requestReuseRejected = false; var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); q.text().then(function(){}, function(){ requestReuseRejected = true; });",
             "requestReuseRejected === true",
+        );
+        assert_eval_true_after_microtasks(
+            "var requestFormReuseRejected = false; var q = new Request('https://example.test/', { method: 'POST', body: 'a=1', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }); q.formData(); q.text().then(function(){}, function(){ requestFormReuseRejected = true; });",
+            "requestFormReuseRejected === true && q.bodyUsed === true",
+        );
+        assert_eval_true_after_microtasks(
+            "var requestMultipartRejected = false; var q = new Request('https://example.test/', { method: 'POST', body: '--x', headers: { 'Content-Type': 'multipart/form-data; boundary=x' } }); q.formData().then(function(){}, function(){ requestMultipartRejected = true; });",
+            "requestMultipartRejected === true && q.bodyUsed === true",
         );
     }
 
@@ -31405,6 +31484,11 @@ mod tests {
             "var responseJsonGot = null; (new Response('{\"a\":1}')).json().then(function(v){ responseJsonGot = v; });",
             "responseJsonGot !== null && responseJsonGot.a === 1",
         );
+        // formData() parses only real application/x-www-form-urlencoded bodies.
+        assert_eval_true_after_microtasks(
+            "var responseFormGot = null; (new Response('a=1&b=hello+world&a=2', { headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' } })).formData().then(function(v){ responseFormGot = v; });",
+            "responseFormGot instanceof FormData && responseFormGot.get('a') === '1' && responseFormGot.getAll('a').length === 2 && responseFormGot.get('b') === 'hello world'",
+        );
     }
 
     #[test]
@@ -31417,6 +31501,14 @@ mod tests {
         assert_eval_true_after_microtasks(
             "var responseReuseRejected = false; var r = new Response('x'); r.text(); r.text().then(function(){}, function(){ responseReuseRejected = true; });",
             "responseReuseRejected === true",
+        );
+        assert_eval_true_after_microtasks(
+            "var responseFormReuseRejected = false; var r = new Response('a=1', { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }); r.formData(); r.text().then(function(){}, function(){ responseFormReuseRejected = true; });",
+            "responseFormReuseRejected === true && r.bodyUsed === true",
+        );
+        assert_eval_true_after_microtasks(
+            "var responseMultipartRejected = false; var r = new Response('--x', { headers: { 'Content-Type': 'multipart/form-data; boundary=x' } }); r.formData().then(function(){}, function(){ responseMultipartRejected = true; });",
+            "responseMultipartRejected === true && r.bodyUsed === true",
         );
         // clone() before consume gives an independent body.
         assert_eval_true(
