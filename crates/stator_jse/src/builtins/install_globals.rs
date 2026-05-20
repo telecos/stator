@@ -32593,6 +32593,185 @@ mod tests {
         assert_eval_true("typeof getSelection === 'undefined'");
     }
 
+    /// DOM tree node constructors that require a live document — `Text`,
+    /// `Comment`, `CharacterData`, `ProcessingInstruction`, `CDATASection`,
+    /// `DOMImplementation`, `AbstractRange`, `HTMLDocument`, `XMLDocument` —
+    /// must remain entirely absent. Exposing even a fail-closed stub would
+    /// imply standalone DOM-tree identity (constructor.name probes,
+    /// `instanceof` checks against host-supplied nodes) that the engine cannot
+    /// honor without a real DOM backend.
+    #[test]
+    fn e2e_dom_tree_node_constructors_remain_absent() {
+        for name in [
+            "Text",
+            "Comment",
+            "CharacterData",
+            "ProcessingInstruction",
+            "CDATASection",
+            "DOMImplementation",
+            "AbstractRange",
+            "HTMLDocument",
+            "XMLDocument",
+        ] {
+            assert_eval_true(&format!("typeof {name} === 'undefined'"));
+        }
+    }
+
+    /// Observer constructors are intentionally exposed with bare prototypes;
+    /// `MutationObserver`, `IntersectionObserver`, `ResizeObserver`, and
+    /// `PerformanceObserver` must NOT grow fake `observe`/`disconnect`/
+    /// `takeRecords` methods because delivering records requires a live DOM,
+    /// layout pipeline, and host event loop. This regression prevents a
+    /// future change from silently installing success-shaped stubs that page
+    /// code would mistake for a working observer.
+    #[test]
+    fn e2e_observer_prototypes_do_not_expose_fake_methods() {
+        for name in [
+            "MutationObserver",
+            "IntersectionObserver",
+            "ResizeObserver",
+            "PerformanceObserver",
+        ] {
+            for method in ["observe", "disconnect", "takeRecords"] {
+                assert_eval_true(&format!("typeof {name}.prototype.{method} === 'undefined'"));
+            }
+        }
+    }
+
+    /// `MutationRecord`, `IntersectionObserverEntry`, `ResizeObserverEntry`,
+    /// `PerformanceObserverEntryList`, and `ResizeObserverSize` represent
+    /// observation payloads that only a live DOM/layout/host event loop can
+    /// produce. They must stay fail-closed constructors with no fabricated
+    /// `target`/`addedNodes`/`removedNodes`/`contentRect`/`borderBoxSize`
+    /// accessors on their prototypes.
+    #[test]
+    fn e2e_observer_record_prototypes_do_not_expose_fake_accessors() {
+        for (name, accessors) in [
+            (
+                "MutationRecord",
+                &[
+                    "type",
+                    "target",
+                    "addedNodes",
+                    "removedNodes",
+                    "previousSibling",
+                    "nextSibling",
+                    "attributeName",
+                    "attributeNamespace",
+                    "oldValue",
+                ][..],
+            ),
+            (
+                "IntersectionObserverEntry",
+                &[
+                    "boundingClientRect",
+                    "intersectionRatio",
+                    "intersectionRect",
+                    "isIntersecting",
+                    "rootBounds",
+                    "target",
+                    "time",
+                ][..],
+            ),
+            (
+                "ResizeObserverEntry",
+                &[
+                    "target",
+                    "contentRect",
+                    "borderBoxSize",
+                    "contentBoxSize",
+                    "devicePixelContentBoxSize",
+                ][..],
+            ),
+            (
+                "PerformanceObserverEntryList",
+                &["getEntries", "getEntriesByName", "getEntriesByType"][..],
+            ),
+            ("ResizeObserverSize", &["inlineSize", "blockSize"][..]),
+        ] {
+            for accessor in accessors {
+                assert_eval_true(&format!(
+                    "typeof {name}.prototype.{accessor} === 'undefined'"
+                ));
+            }
+        }
+    }
+
+    /// Web Components / Shadow DOM / collection constructors are exposed
+    /// fail-closed but must NOT advertise fake instance-shape getters on
+    /// their prototypes. Properties like `ShadowRoot.prototype.host`,
+    /// `DOMTokenList.prototype.length`, `NodeList.prototype.length`,
+    /// `HTMLCollection.prototype.length`, and `Attr.prototype.name` require
+    /// a live host element / live collection / live attribute owner that
+    /// the standalone engine cannot supply.
+    #[test]
+    fn e2e_dom_collection_prototypes_do_not_expose_fake_accessors() {
+        for (name, accessors) in [
+            (
+                "ShadowRoot",
+                &[
+                    "host",
+                    "mode",
+                    "delegatesFocus",
+                    "slotAssignment",
+                    "innerHTML",
+                ][..],
+            ),
+            ("DOMTokenList", &["length", "value"][..]),
+            ("NodeList", &["length"][..]),
+            ("HTMLCollection", &["length"][..]),
+            ("NamedNodeMap", &["length"][..]),
+            ("DOMStringMap", &["length"][..]),
+            (
+                "Attr",
+                &["name", "value", "namespaceURI", "ownerElement"][..],
+            ),
+            ("HTMLSlotElement", &["name", "assignedSlot"][..]),
+            (
+                "Selection",
+                &[
+                    "anchorNode",
+                    "anchorOffset",
+                    "focusNode",
+                    "focusOffset",
+                    "isCollapsed",
+                    "rangeCount",
+                    "type",
+                ][..],
+            ),
+            (
+                "Range",
+                &[
+                    "startContainer",
+                    "startOffset",
+                    "endContainer",
+                    "endOffset",
+                    "collapsed",
+                    "commonAncestorContainer",
+                ][..],
+            ),
+            ("CaretPosition", &["offsetNode", "offset"][..]),
+            (
+                "VisualViewport",
+                &[
+                    "offsetLeft",
+                    "offsetTop",
+                    "pageLeft",
+                    "pageTop",
+                    "width",
+                    "height",
+                    "scale",
+                ][..],
+            ),
+        ] {
+            for accessor in accessors {
+                assert_eval_true(&format!(
+                    "typeof {name}.prototype.{accessor} === 'undefined'"
+                ));
+            }
+        }
+    }
+
     #[test]
     fn e2e_fetch_global_exists_but_fails_closed() {
         assert_eval_true("typeof fetch === 'function' && fetch.name === 'fetch'");
