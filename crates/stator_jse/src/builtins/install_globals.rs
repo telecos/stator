@@ -28230,47 +28230,12 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
 
-        // ── Navigation (location / history, fail-closed) ────────────────────
-        // `location` and `history` are host-integrated browser globals that
-        // mutate the navigation state of a hosting document. This standalone
-        // engine has no document, URL, or session-history backing store, so
-        // expose the probed constructors and global objects but fail every
-        // side-effecting operation with a `TypeError`. Property accessors
-        // (e.g. `location.href`, `history.state`) are intentionally absent
-        // rather than faked, matching the Web Storage slice.
-        globals.insert(
-            "Location".into(),
-            finalize_ctor(make_unsupported_web_constructor("Location"), "Location"),
-        );
-        globals.insert(
-            "History".into(),
-            finalize_ctor(make_unsupported_web_constructor("History"), "History"),
-        );
-        globals.insert(
-            "location".into(),
-            make_unsupported_web_object(
-                "location",
-                &[
-                    ("assign", 1),
-                    ("replace", 1),
-                    ("reload", 0),
-                    ("toString", 0),
-                ],
-            ),
-        );
-        globals.insert(
-            "history".into(),
-            make_unsupported_web_object(
-                "history",
-                &[
-                    ("back", 0),
-                    ("forward", 0),
-                    ("go", 1),
-                    ("pushState", 3),
-                    ("replaceState", 3),
-                ],
-            ),
-        );
+        // ── Browser navigation state (absent) ───────────────────────────────
+        // `Location`, `History`, `location`, and `history` are tied to a
+        // hosting document's URL and session-history backend. The standalone
+        // engine has neither, so these entry points remain absent rather than
+        // exposing fake objects or methods that could imply mutable browser
+        // navigation state.
 
         // ── Observers / frame & idle scheduling (fail-closed) ───────────────
         //
@@ -29159,21 +29124,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         ] {
             globals.insert(name.into(), make_unsupported_web_function(name, 0));
         }
-        globals.insert(
-            "navigation".into(),
-            make_unsupported_web_object(
-                "navigation",
-                &[
-                    ("entries", 0),
-                    ("navigate", 1),
-                    ("reload", 0),
-                    ("traverseTo", 1),
-                    ("back", 0),
-                    ("forward", 0),
-                    ("updateCurrentEntry", 1),
-                ],
-            ),
-        );
+        // The `navigation` singleton is intentionally absent: without a real
+        // navigation-controller backend, even fail-closed instance methods
+        // would advertise fake browser navigation state. Constructors/types
+        // above remain exposed only as non-constructible feature probes.
         globals.insert(
             "launchQueue".into(),
             make_unsupported_web_object("launchQueue", &[("setConsumer", 1)]),
@@ -29972,7 +29926,6 @@ mod tests {
         assert!(globals.contains_key("NavigationTransition"));
         assert!(globals.contains_key("NavigateEvent"));
         assert!(globals.contains_key("NavigationCurrentEntryChangeEvent"));
-        assert!(globals.contains_key("navigation"));
         assert!(globals.contains_key("WakeLock"));
         assert!(globals.contains_key("WakeLockSentinel"));
         assert!(globals.contains_key("IdleDetector"));
@@ -29981,10 +29934,10 @@ mod tests {
         assert!(globals.contains_key("LaunchQueue"));
         assert!(globals.contains_key("LaunchParams"));
         assert!(globals.contains_key("launchQueue"));
-        assert!(globals.contains_key("Location"));
-        assert!(globals.contains_key("History"));
-        assert!(globals.contains_key("location"));
-        assert!(globals.contains_key("history"));
+        assert!(!globals.contains_key("Location"));
+        assert!(!globals.contains_key("History"));
+        assert!(!globals.contains_key("location"));
+        assert!(!globals.contains_key("history"));
         assert!(globals.contains_key("MutationObserver"));
         assert!(globals.contains_key("MutationRecord"));
         assert!(globals.contains_key("Range"));
@@ -31536,8 +31489,8 @@ mod tests {
         assert_eval_true(
             "var s = { page: 1 }; var e = new PopStateEvent('popstate', { state: s }); e.state === s",
         );
-        assert_eval_type_error("new History()");
-        assert_eval_type_error("new Location()");
+        assert_eval_true("typeof History === 'undefined'");
+        assert_eval_true("typeof Location === 'undefined'");
     }
 
     #[test]
@@ -31788,6 +31741,26 @@ mod tests {
              t.addEventListener('popstate', function (e) { seen = e; e.preventDefault(); }); \
              var s = { n: 1 }; var ev = new PopStateEvent('popstate', { state: s, cancelable: true }); \
              t.dispatchEvent(ev) === false && seen === ev && seen.state === s && ev.target === t",
+        );
+    }
+
+    #[test]
+    fn e2e_navigation_lifecycle_events_do_not_auto_dispatch_or_install_handlers() {
+        for name in ["onpopstate", "onhashchange", "onpageshow", "onpagehide"] {
+            assert_eval_true(&format!("typeof {name} === 'undefined'"));
+        }
+
+        assert_eval_true(
+            "var fired = false; \
+             globalThis.onpopstate = function () { fired = true; }; \
+             globalThis.onhashchange = function () { fired = true; }; \
+             globalThis.onpageshow = function () { fired = true; }; \
+             globalThis.onpagehide = function () { fired = true; }; \
+             new PopStateEvent('popstate'); \
+             new HashChangeEvent('hashchange'); \
+             new PageTransitionEvent('pageshow'); \
+             new PageTransitionEvent('pagehide'); \
+             fired === false",
         );
     }
 
@@ -32919,37 +32892,10 @@ mod tests {
     }
 
     #[test]
-    fn e2e_location_constructor_exists_but_fails_closed() {
-        assert_eval_true("typeof Location === 'function' && Location.name === 'Location'");
-        assert_eval_type_error("Location()");
-        assert_eval_type_error("new Location()");
-    }
-
-    #[test]
-    fn e2e_history_constructor_exists_but_fails_closed() {
-        assert_eval_true("typeof History === 'function' && History.name === 'History'");
-        assert_eval_type_error("History()");
-        assert_eval_type_error("new History()");
-    }
-
-    #[test]
-    fn e2e_location_global_exists_but_operations_fail_closed() {
-        assert_eval_true("typeof location === 'object' && location !== null");
-        assert_eval_type_error("location.assign('https://example.test/')");
-        assert_eval_type_error("location.replace('https://example.test/')");
-        assert_eval_type_error("location.reload()");
-        assert_eval_type_error("location.toString()");
-    }
-
-    #[test]
-    fn e2e_history_global_exists_but_operations_fail_closed() {
-        assert_eval_true("typeof history === 'object' && history !== null");
-        assert_eval_true("location !== history");
-        assert_eval_type_error("history.back()");
-        assert_eval_type_error("history.forward()");
-        assert_eval_type_error("history.go(-1)");
-        assert_eval_type_error("history.pushState({}, '', '/x')");
-        assert_eval_type_error("history.replaceState({}, '', '/x')");
+    fn e2e_location_history_entry_points_remain_absent() {
+        for name in ["Location", "History", "location", "history"] {
+            assert_eval_true(&format!("typeof {name} === 'undefined'"));
+        }
     }
 
     #[test]
@@ -33369,10 +33315,21 @@ mod tests {
     /// for feature detection.
     #[test]
     fn e2e_visual_host_entry_points_remain_absent() {
-        assert_eval_true("typeof document === 'undefined'");
-        assert_eval_true("typeof window === 'undefined'");
-        assert_eval_true("typeof screen === 'undefined'");
-        assert_eval_true("typeof matchMedia === 'undefined'");
+        for name in [
+            "document",
+            "window",
+            "location",
+            "history",
+            "customElements",
+            "frames",
+            "top",
+            "parent",
+            "screen",
+            "visualViewport",
+            "matchMedia",
+        ] {
+            assert_eval_true(&format!("typeof {name} === 'undefined'"));
+        }
     }
 
     /// Performance timeline subclasses that require a browser timeline,
@@ -34557,14 +34514,7 @@ mod tests {
         assert_eval_type_error("showSaveFilePicker()");
         assert_eval_type_error("showDirectoryPicker()");
 
-        assert_eval_true("typeof navigation === 'object' && navigation !== null");
-        assert_eval_type_error("navigation.entries()");
-        assert_eval_type_error("navigation.navigate('/next')");
-        assert_eval_type_error("navigation.reload()");
-        assert_eval_type_error("navigation.traverseTo('key')");
-        assert_eval_type_error("navigation.back()");
-        assert_eval_type_error("navigation.forward()");
-        assert_eval_type_error("navigation.updateCurrentEntry({ state: {} })");
+        assert_eval_true("typeof navigation === 'undefined'");
 
         assert_eval_true("typeof launchQueue === 'object' && launchQueue !== null");
         assert_eval_type_error("launchQueue.setConsumer(function () {})");
