@@ -30129,8 +30129,9 @@ mod tests {
             "var b = new Blob(['hello']); var p = b.arrayBuffer(); typeof p === 'object' && typeof p.then === 'function'",
         );
         // Decoded contents propagate via .then() once microtasks drain.
-        assert_eval_true(
-            "var b = new Blob(['hi']); var seen = ''; b.text().then(function(v){ seen = v; }); Promise.resolve().then(function(){}); seen === 'hi' || seen === ''",
+        assert_eval_true_after_microtasks(
+            "var blobTextSeen = ''; (new Blob(['hi'])).text().then(function(v){ blobTextSeen = v; });",
+            "blobTextSeen === 'hi'",
         );
     }
 
@@ -30473,8 +30474,9 @@ mod tests {
         assert_eval_true(
             "var q = new Request('https://example.test/', { method: 'POST', body: 'hi' }); var p = q.text(); typeof p === 'object' && typeof p.then === 'function' && q.bodyUsed === true",
         );
-        assert_eval_true(
-            "var q = new Request('https://example.test/', { method: 'POST', body: '{\"a\":1}' }); var got = null; q.json().then(function(v){ got = v; }); Promise.resolve().then(function(){}); got === null || got.a === 1",
+        assert_eval_true_after_microtasks(
+            "var requestJsonGot = null; var q = new Request('https://example.test/', { method: 'POST', body: '{\"a\":1}' }); q.json().then(function(v){ requestJsonGot = v; });",
+            "requestJsonGot !== null && requestJsonGot.a === 1",
         );
         assert_eval_true(
             "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); var c = q.clone(); q.text(); c.bodyUsed === false && c.method === 'POST' && c.url === q.url",
@@ -30482,8 +30484,9 @@ mod tests {
         assert_eval_type_error(
             "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); q.clone()",
         );
-        assert_eval_true(
-            "var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); var rejected = false; q.text().then(function(){}, function(){ rejected = true; }); Promise.resolve().then(function(){}); rejected === false || rejected === true",
+        assert_eval_true_after_microtasks(
+            "var requestReuseRejected = false; var q = new Request('https://example.test/', { method: 'POST', body: 'x' }); q.text(); q.text().then(function(){}, function(){ requestReuseRejected = true; });",
+            "requestReuseRejected === true",
         );
     }
 
@@ -31296,20 +31299,23 @@ mod tests {
         assert_eval_true(
             "var r = new Response('hi'); var p = r.text(); typeof p === 'object' && typeof p.then === 'function'",
         );
-        assert_eval_true(
-            "var r = new Response('hi'); var seen = ''; r.text().then(function(v){ seen = v; }); Promise.resolve().then(function(){}); seen === 'hi' || seen === ''",
+        assert_eval_true_after_microtasks(
+            "var responseTextSeen = ''; (new Response('hi')).text().then(function(v){ responseTextSeen = v; });",
+            "responseTextSeen === 'hi'",
         );
         // arrayBuffer()
         assert_eval_true(
             "var r = new Response('hi'); var p = r.arrayBuffer(); typeof p === 'object' && typeof p.then === 'function'",
         );
         // blob() resolves to a Blob whose type matches Content-Type.
-        assert_eval_true(
-            "var r = new Response('hi'); var got = null; r.blob().then(function(b){ got = b; }); Promise.resolve().then(function(){}); got === null || (got instanceof Blob && got.type === 'text/plain;charset=utf-8' && got.size === 2)",
+        assert_eval_true_after_microtasks(
+            "var responseBlobGot = null; (new Response('hi')).blob().then(function(b){ responseBlobGot = b; });",
+            "responseBlobGot instanceof Blob && responseBlobGot.type === 'text/plain;charset=utf-8' && responseBlobGot.size === 2",
         );
         // json() parses the body.
-        assert_eval_true(
-            "var r = new Response('{\"a\":1}'); var got = null; r.json().then(function(v){ got = v; }); Promise.resolve().then(function(){}); got === null || got.a === 1",
+        assert_eval_true_after_microtasks(
+            "var responseJsonGot = null; (new Response('{\"a\":1}')).json().then(function(v){ responseJsonGot = v; });",
+            "responseJsonGot !== null && responseJsonGot.a === 1",
         );
     }
 
@@ -31320,8 +31326,9 @@ mod tests {
             "var r = new Response('x'); r.bodyUsed === false && (r.text(), r.bodyUsed === true)",
         );
         // Second consume rejects with a TypeError (returned via Promise).
-        assert_eval_true(
-            "var r = new Response('x'); r.text(); var rejected = false; r.text().then(function(){}, function(){ rejected = true; }); Promise.resolve().then(function(){}); rejected === false || rejected === true",
+        assert_eval_true_after_microtasks(
+            "var responseReuseRejected = false; var r = new Response('x'); r.text(); r.text().then(function(){}, function(){ responseReuseRejected = true; });",
+            "responseReuseRejected === true",
         );
         // clone() before consume gives an independent body.
         assert_eval_true(
@@ -31370,8 +31377,9 @@ mod tests {
             "var r = Response.json({a: 1}, { headers: { 'Content-Type': 'application/problem+json' } }); r.headers.get('content-type') === 'application/problem+json'",
         );
         // The body matches the stringified data.
-        assert_eval_true(
-            "var r = Response.json({a: 1, b: 'x'}); var seen = ''; r.text().then(function(v){ seen = v; }); Promise.resolve().then(function(){}); seen === '' || seen === '{\"a\":1,\"b\":\"x\"}'",
+        assert_eval_true_after_microtasks(
+            "var responseStaticJsonSeen = ''; Response.json({a: 1, b: 'x'}).text().then(function(v){ responseStaticJsonSeen = v; });",
+            "responseStaticJsonSeen === '{\"a\":1,\"b\":\"x\"}'",
         );
         // undefined has no JSON representation.
         assert_eval_type_error("Response.json(undefined)");
@@ -31829,6 +31837,37 @@ mod tests {
         assert_eval_type_error("new TextDecoderStream('utf-8')");
         assert_eval_type_error("new CompressionStream('gzip')");
         assert_eval_type_error("new DecompressionStream('gzip')");
+    }
+
+    #[test]
+    fn e2e_web_streams_and_body_stream_surfaces_remain_fail_closed() {
+        assert_eval_type_error("new ReadableStream({ type: 'bytes', pull: function () {} })");
+        assert_eval_type_error("new WritableStream({ write: function () {} })");
+        assert_eval_type_error("new TransformStream({ transform: function () {} })");
+        assert_eval_type_error("new ReadableStreamDefaultReader({})");
+        assert_eval_type_error("new ReadableStreamBYOBReader({})");
+        assert_eval_type_error("new ReadableStreamDefaultController()");
+        assert_eval_type_error("new ReadableByteStreamController()");
+        assert_eval_type_error("new ReadableStreamBYOBRequest()");
+        assert_eval_type_error("new WritableStreamDefaultWriter({})");
+        assert_eval_type_error("new WritableStreamDefaultController()");
+        assert_eval_type_error("new TransformStreamDefaultController()");
+        assert_eval_type_error("new TextEncoderStream()");
+        assert_eval_type_error("new TextDecoderStream('utf-8')");
+        assert_eval_type_error("new CompressionStream('gzip')");
+        assert_eval_type_error("new DecompressionStream('gzip')");
+
+        assert_eval_type_error("(new Blob(['x'])).stream()");
+        assert_eval_type_error("(new Blob(['x'])).bytes()");
+        assert_eval_true(
+            "new Request('https://example.test/', { method: 'POST', body: 'x' }).body === null",
+        );
+        assert_eval_true("new Response('x').body === null");
+        assert_eval_true("new Response().body === null");
+        assert_eval_type_error("new Response(Object.create(ReadableStream.prototype))");
+        assert_eval_type_error(
+            "new Request('https://example.test/', { method: 'POST', body: Object.create(ReadableStream.prototype) })",
+        );
     }
 
     #[test]
