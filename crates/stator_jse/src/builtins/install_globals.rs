@@ -5375,7 +5375,8 @@ fn lookup_urlsp_state(value: &JsValue) -> StatorResult<Rc<RefCell<QueryPairs>>> 
 
 /// Drain a JS value into a `Vec<(String, String)>` for
 /// `URLSearchParams` construction. Accepts: undefined/null (empty),
-/// a string (parsed as query string with optional `?` prefix), a JS
+/// another `URLSearchParams` instance (pairs are deep-copied), a
+/// string (parsed as query string with optional `?` prefix), a JS
 /// array of `[k, v]` pair arrays, or a plain object (record).
 fn url_sp_init_from_value(value: &JsValue) -> StatorResult<QueryPairs> {
     match value {
@@ -5404,6 +5405,15 @@ fn url_sp_init_from_value(value: &JsValue) -> StatorResult<QueryPairs> {
             Ok(out)
         }
         JsValue::PlainObject(map) => {
+            // If the init is another URLSearchParams instance, copy its
+            // (name, value) pair list directly rather than treating it as
+            // an opaque record (its pairs live in a side table, not as
+            // own enumerable properties).
+            if matches!(map.borrow().get(URLSP_BRAND), Some(JsValue::Boolean(true)))
+                && let Ok(state_rc) = lookup_urlsp_state(value)
+            {
+                return Ok(state_rc.borrow().clone());
+            }
             let mut out = Vec::new();
             for (k, v, attrs) in map.borrow().iter_with_attrs() {
                 if !attrs.contains(PropertyAttributes::ENUMERABLE) {
@@ -29750,6 +29760,41 @@ mod tests {
 
         // get returns null for missing.
         assert_eval_true("(new URLSearchParams('a=1')).get('z') === null");
+    }
+
+    #[test]
+    fn e2e_url_search_params_copies_from_other_instance() {
+        // Constructing from another URLSearchParams copies its pair list,
+        // including duplicates and order. The copy must be independent of
+        // the source after construction.
+        assert_eval_true(
+            "var a = new URLSearchParams('a=1&a=2&b=3'); \
+             var b = new URLSearchParams(a); \
+             b.toString() === 'a=1&a=2&b=3' && b.size === 3",
+        );
+        assert_eval_true(
+            "var a = new URLSearchParams('x=1'); \
+             var b = new URLSearchParams(a); \
+             a.append('x','2'); \
+             b.toString() === 'x=1' && a.toString() === 'x=1&x=2'",
+        );
+        // Empty source yields empty target.
+        assert_eval_true("new URLSearchParams(new URLSearchParams()).toString() === ''");
+        // Percent-encoded values survive the copy.
+        assert_eval_true(
+            "var a = new URLSearchParams([['a b','1+2']]); \
+             new URLSearchParams(a).toString() === 'a+b=1%2B2'",
+        );
+    }
+
+    #[test]
+    fn e2e_url_object_url_helpers_remain_fail_closed() {
+        // Regression: object URL lifetime is host-owned, so these stay
+        // fail-closed even though their function objects exist.
+        assert_eval_true("typeof URL.createObjectURL === 'function'");
+        assert_eval_true("typeof URL.revokeObjectURL === 'function'");
+        assert_eval_type_error("URL.createObjectURL({})");
+        assert_eval_type_error("URL.revokeObjectURL('blob:https://example.test/id')");
     }
 
     #[test]
