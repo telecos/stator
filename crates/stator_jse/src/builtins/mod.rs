@@ -75,8 +75,9 @@ pub mod url_pattern;
 pub(crate) mod util;
 /// WebAssembly JavaScript API built-ins:
 /// `WebAssembly.compile`, `WebAssembly.instantiate`, `WebAssembly.validate`,
-/// and the `WebAssembly.Module`, `WebAssembly.Instance`, `WebAssembly.Memory`,
-/// `WebAssembly.Table`, and `WebAssembly.Global` constructors.
+/// and function-only `WebAssembly.Module` / `WebAssembly.Instance` support.
+/// Memory, table, global, streaming, exception, and error-constructor surfaces
+/// are exposed fail-closed where host bridges are not implemented.
 pub mod wasm;
 /// ECMAScript §24.3 `WeakMap` built-in — object-keyed weak map with ephemeron GC semantics.
 pub mod weak_map;

@@ -14,9 +14,6 @@
 //! | `WebAssembly.instantiate(src, imports?)` | [`wasm_instantiate`]     |
 //! | `new WebAssembly.Module(bytes)`          | [`wasm_module_ctor`]     |
 //! | `new WebAssembly.Instance(mod, imp?)`    | [`wasm_instance_ctor`]   |
-//! | `new WebAssembly.Memory({initial, …})`   | [`wasm_memory_ctor`]     |
-//! | `new WebAssembly.Table({element, …})`    | [`wasm_table_ctor`]      |
-//! | `new WebAssembly.Global({value, …}, v?)` | [`wasm_global_ctor`]     |
 //!
 //! # Fail-closed surface
 //!
@@ -29,6 +26,9 @@
 //! |-------------------------------------|-----------------------------------------|
 //! | `WebAssembly.compileStreaming`      | Requires `Response`/`fetch` integration |
 //! | `WebAssembly.instantiateStreaming`  | Requires `Response`/`fetch` integration |
+//! | `new WebAssembly.Memory(...)`       | Wasm memory/ArrayBuffer bridge not implemented |
+//! | `new WebAssembly.Table(...)`        | Wasm table/reference bridge not implemented |
+//! | `new WebAssembly.Global(...)`       | Wasm global/import bridge not implemented |
 //! | `new WebAssembly.Tag(...)`          | Wasm exception-handling not implemented |
 //! | `new WebAssembly.Exception(...)`    | Wasm exception-handling not implemented |
 //! | `new WebAssembly.CompileError(...)` | Real Error subclassing not available    |
@@ -66,9 +66,6 @@
 //! |--------------------------|----------------------------------------------|
 //! | `"WebAssembly.Module"`   | `exports` (Array of descriptors), `__wasm_bytes__` |
 //! | `"WebAssembly.Instance"` | `exports` (PlainObject of callable exports)  |
-//! | `"WebAssembly.Memory"`   | `buffer` (Undefined), `grow` (NativeFunction) |
-//! | `"WebAssembly.Table"`    | `length`, `get`, `set`, `grow`               |
-//! | `"WebAssembly.Global"`   | `value`, `valueOf`                           |
 //!
 //! [WebAssembly JavaScript API]: https://webassembly.github.io/spec/js-api/
 
@@ -304,13 +301,38 @@ fn extract_bytes_from_module(module_obj: &JsValue) -> StatorResult<Vec<u8>> {
 /// [`JsValue::NativeFunction`] that, when called, invokes that export on the
 /// live Wasmtime instance.
 ///
-/// Non-function exports (memories, tables, globals) are currently omitted from
-/// the `exports` map.
+/// Modules with imports or non-function exports (memories, tables, globals)
+/// fail closed because the corresponding host bridges are not implemented.
 ///
 /// # Errors
 ///
-/// Returns [`StatorError::WasmError`] if instantiation fails.
+/// Returns [`StatorError::TypeError`] for unsupported imports/non-function
+/// exports, or [`StatorError::WasmError`] if Wasmtime instantiation fails.
 fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResult<JsValue> {
+    if let Some(import) = module.inner().imports().next() {
+        return Err(StatorError::TypeError(format!(
+            "WebAssembly.Instance: imports are not implemented (missing {}.{})",
+            import.module(),
+            import.name()
+        )));
+    }
+    if let Some(export) = module
+        .inner()
+        .exports()
+        .find(|export| !matches!(export.ty(), wasmtime::ExternType::Func(_)))
+    {
+        return Err(StatorError::TypeError(format!(
+            "WebAssembly.Instance: {} export '{}' is not implemented",
+            match export.ty() {
+                wasmtime::ExternType::Memory(_) => "memory",
+                wasmtime::ExternType::Table(_) => "table",
+                wasmtime::ExternType::Global(_) => "global",
+                _ => "non-function",
+            },
+            export.name()
+        )));
+    }
+
     // Collect (name, is_func) pairs *before* consuming `module` in
     // WasmInstance::new, so that the borrow checker is happy.
     let export_info: Vec<(String, bool)> = module
@@ -531,317 +553,22 @@ pub fn wasm_instance_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     make_instance_object(&module, &engine)
 }
 
-/// `new WebAssembly.Memory({initial, maximum?})` — ECMAScript WebAssembly API §9.
-///
-/// Creates a `WebAssembly.Memory` object representing a resizable linear memory.
-///
-/// - `descriptor.initial` (required) — initial size in 64 KiB pages.
-/// - `descriptor.maximum` (optional) — ignored in this implementation.
-///
-/// The returned object exposes:
-/// - `grow(delta)` — grows by `delta` pages; returns the previous page count
-///   or `-1` if the growth would exceed 65 536 pages.
-/// - `buffer` — `Undefined` (no `ArrayBuffer` in this engine).
-///
-/// # Errors
-///
-/// Returns [`StatorError::TypeError`] when the descriptor is missing or
-/// `initial` is absent / not a number.
-///
-/// # Examples
-///
-/// ```
-/// use stator_jse::objects::property_map::PropertyMap;
-/// use std::cell::RefCell;
-/// use std::rc::Rc;
-/// use stator_jse::builtins::wasm::wasm_memory_ctor;
-/// use stator_jse::objects::value::JsValue;
-///
-/// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-/// desc.borrow_mut().insert("initial".to_string(), JsValue::Smi(1));
-/// let mem = wasm_memory_ctor(vec![JsValue::PlainObject(desc)]).unwrap();
-/// assert!(matches!(mem, JsValue::PlainObject(_)));
-/// ```
-pub fn wasm_memory_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
-    let descriptor = args.into_iter().next().unwrap_or(JsValue::Undefined);
-    let initial_pages = match &descriptor {
-        JsValue::PlainObject(map) => match map.borrow().get("initial").cloned() {
-            Some(JsValue::Smi(n)) => n as u32,
-            Some(JsValue::HeapNumber(f)) => f as u32,
-            _ => {
-                return Err(StatorError::TypeError(
-                    "WebAssembly.Memory: 'initial' property is required and must be a number"
-                        .to_string(),
-                ));
-            }
-        },
-        _ => {
-            return Err(StatorError::TypeError(
-                "WebAssembly.Memory: descriptor must be an object".to_string(),
-            ));
-        }
-    };
-
-    // Shared page counter so that `grow()` updates it.
-    let pages: Rc<RefCell<u32>> = Rc::new(RefCell::new(initial_pages));
-    let pages_for_grow = Rc::clone(&pages);
-    const MAX_PAGES: u32 = 65_536; // 2^16
-
-    let grow_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
-        let delta: u32 = match args.first() {
-            Some(JsValue::Smi(n)) => *n as u32,
-            Some(JsValue::HeapNumber(f)) => *f as u32,
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Memory.grow: expected a numeric delta".to_string(),
-                ));
-            }
-        };
-        let current = *pages_for_grow.borrow();
-        let new_pages = current.checked_add(delta).filter(|&p| p <= MAX_PAGES);
-        match new_pages {
-            Some(np) => {
-                *pages_for_grow.borrow_mut() = np;
-                Ok(JsValue::Smi(current as i32))
-            }
-            None => Ok(JsValue::Smi(-1)),
-        }
-    });
-
-    let memory_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    memory_map.borrow_mut().insert(
-        "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Memory".to_string().into()),
-    );
-    memory_map
-        .borrow_mut()
-        .insert("grow".to_string(), JsValue::NativeFunction(grow_fn));
-    // `buffer` is Undefined: this engine has no ArrayBuffer.
-    memory_map
-        .borrow_mut()
-        .insert("buffer".to_string(), JsValue::Undefined);
-
-    Ok(JsValue::PlainObject(memory_map))
+/// `new WebAssembly.Memory(...)` — fail closed until the memory/ArrayBuffer
+/// bridge is implemented.
+pub fn wasm_memory_ctor(_args: Vec<JsValue>) -> StatorResult<JsValue> {
+    Err(wasm_unsupported_error("Memory"))
 }
 
-/// `new WebAssembly.Table({element, initial, maximum?})` — ECMAScript WebAssembly API §11.
-///
-/// Creates a `WebAssembly.Table` object backed by an in-engine `Vec`.
-///
-/// - `descriptor.element` (required) — element type string, e.g. `"anyfunc"`.
-/// - `descriptor.initial` (required) — initial capacity (number of slots).
-/// - `descriptor.maximum` (optional) — ignored in this implementation.
-///
-/// The returned object exposes:
-/// - `length` — number of slots (updated by `grow`).
-/// - `get(index)` → stored value (or `null` if uninitialised).
-/// - `set(index, value)` → `undefined`; raises `RangeError` out-of-bounds.
-/// - `grow(delta, initValue?)` → previous length; extends the table.
-///
-/// # Errors
-///
-/// Returns [`StatorError::TypeError`] when the descriptor or required properties
-/// are missing / of the wrong type.
-pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
-    let descriptor = args.into_iter().next().unwrap_or(JsValue::Undefined);
-    let (initial, _element_type) =
-        match &descriptor {
-            JsValue::PlainObject(map) => {
-                let initial: u32 = match map.borrow().get("initial").cloned() {
-                    Some(JsValue::Smi(n)) => n as u32,
-                    Some(JsValue::HeapNumber(f)) => f as u32,
-                    _ => return Err(StatorError::TypeError(
-                        "WebAssembly.Table: 'initial' property is required and must be a number"
-                            .to_string(),
-                    )),
-                };
-                let element: String = match map.borrow().get("element").cloned() {
-                    Some(JsValue::String(s)) => s.to_string(),
-                    _ => return Err(StatorError::TypeError(
-                        "WebAssembly.Table: 'element' property is required and must be a string"
-                            .to_string(),
-                    )),
-                };
-                (initial, element)
-            }
-            _ => {
-                return Err(StatorError::TypeError(
-                    "WebAssembly.Table: descriptor must be an object".to_string(),
-                ));
-            }
-        };
-
-    let entries: Rc<RefCell<Vec<JsValue>>> =
-        Rc::new(RefCell::new(vec![JsValue::Null; initial as usize]));
-    let entries_get = Rc::clone(&entries);
-    let entries_set = Rc::clone(&entries);
-    let entries_grow = Rc::clone(&entries);
-
-    // `table_map` is built after the closures but shared with `grow_fn` so that
-    // grow() can update the `length` property to reflect the new size.
-    let table_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    let table_map_for_grow = Rc::clone(&table_map);
-
-    let get_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
-        let idx: usize = match args.first() {
-            Some(JsValue::Smi(n)) => (*n).max(0) as usize,
-            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(*f),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Table.get: expected a numeric index".to_string(),
-                ));
-            }
-        };
-        Ok(entries_get
-            .borrow()
-            .get(idx)
-            .cloned()
-            .unwrap_or(JsValue::Null))
-    });
-
-    let set_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
-        let mut it = args.into_iter();
-        let idx: usize = match it.next() {
-            Some(JsValue::Smi(n)) => n.max(0) as usize,
-            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(f),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Table.set: expected a numeric index".to_string(),
-                ));
-            }
-        };
-        let val = it.next().unwrap_or(JsValue::Null);
-        let mut tbl = entries_set.borrow_mut();
-        if idx < tbl.len() {
-            tbl[idx] = val;
-            Ok(JsValue::Undefined)
-        } else {
-            Err(StatorError::RangeError(format!(
-                "Table.set: index {idx} out of bounds (length {})",
-                tbl.len()
-            )))
-        }
-    });
-
-    let grow_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
-        let mut it = args.into_iter();
-        let delta: usize = match it.next() {
-            Some(JsValue::Smi(n)) => n.max(0) as usize,
-            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(f),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Table.grow: expected a numeric delta".to_string(),
-                ));
-            }
-        };
-        let init_val = it.next().unwrap_or(JsValue::Null);
-        let mut tbl = entries_grow.borrow_mut();
-        let prev_len = tbl.len() as i32;
-        tbl.extend(std::iter::repeat_n(init_val, delta));
-        let new_len = tbl.len() as i32;
-        // Update the `length` property on the table object.
-        table_map_for_grow
-            .borrow_mut()
-            .insert("length".to_string(), JsValue::Smi(new_len));
-        Ok(JsValue::Smi(prev_len))
-    });
-    table_map.borrow_mut().insert(
-        "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Table".to_string().into()),
-    );
-    table_map
-        .borrow_mut()
-        .insert("length".to_string(), JsValue::Smi(initial as i32));
-    table_map
-        .borrow_mut()
-        .insert("get".to_string(), JsValue::NativeFunction(get_fn));
-    table_map
-        .borrow_mut()
-        .insert("set".to_string(), JsValue::NativeFunction(set_fn));
-    table_map
-        .borrow_mut()
-        .insert("grow".to_string(), JsValue::NativeFunction(grow_fn));
-
-    Ok(JsValue::PlainObject(table_map))
+/// `new WebAssembly.Table(...)` — fail closed until the table/reference bridge
+/// is implemented.
+pub fn wasm_table_ctor(_args: Vec<JsValue>) -> StatorResult<JsValue> {
+    Err(wasm_unsupported_error("Table"))
 }
 
-/// `new WebAssembly.Global({value, mutable?}, initValue?)` — ECMAScript WebAssembly API §12.
-///
-/// Creates a `WebAssembly.Global` object wrapping a single mutable or immutable
-/// value.
-///
-/// - `descriptor.value` (required) — value type string, e.g. `"i32"`, `"f64"`.
-/// - `descriptor.mutable` (optional, default `false`) — whether the value can
-///   be updated via the `value` setter.
-/// - `initValue` (optional, default `0`) — initial value.
-///
-/// The returned object exposes:
-/// - `value` — the current value (read only in this implementation).
-/// - `valueOf()` — returns the current value.
-///
-/// # Errors
-///
-/// Returns [`StatorError::TypeError`] when the descriptor is missing or `value`
-/// type is absent.
-///
-/// # Examples
-///
-/// ```
-/// use stator_jse::objects::property_map::PropertyMap;
-/// use std::cell::RefCell;
-/// use std::rc::Rc;
-/// use stator_jse::builtins::wasm::wasm_global_ctor;
-/// use stator_jse::objects::value::JsValue;
-///
-/// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-/// desc.borrow_mut().insert("value".to_string(), JsValue::String("i32".to_string().into()));
-/// desc.borrow_mut().insert("mutable".to_string(), JsValue::Boolean(true));
-/// let global = wasm_global_ctor(vec![JsValue::PlainObject(desc), JsValue::Smi(42)]).unwrap();
-/// assert!(matches!(global, JsValue::PlainObject(_)));
-/// ```
-pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
-    let mut iter = args.into_iter();
-    let descriptor = iter.next().unwrap_or(JsValue::Undefined);
-    let init_value = iter.next().unwrap_or(JsValue::Smi(0));
-
-    match &descriptor {
-        JsValue::PlainObject(map) => {
-            match map.borrow().get("value").cloned() {
-                Some(JsValue::String(_)) => {} // value type string is present
-                _ => {
-                    return Err(StatorError::TypeError(
-                        "WebAssembly.Global: 'value' type string is required".to_string(),
-                    ));
-                }
-            }
-        }
-        _ => {
-            return Err(StatorError::TypeError(
-                "WebAssembly.Global: descriptor must be an object".to_string(),
-            ));
-        }
-    }
-
-    let current_val: Rc<RefCell<JsValue>> = Rc::new(RefCell::new(init_value.clone()));
-    let current_for_valueof = Rc::clone(&current_val);
-
-    let valueof_fn: NativeFn =
-        Rc::new(move |_args: Vec<JsValue>| Ok(current_for_valueof.borrow().clone()));
-
-    let global_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    global_map.borrow_mut().insert(
-        "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Global".to_string().into()),
-    );
-    // Expose the initial value directly; callers should use valueOf() for reads.
-    global_map
-        .borrow_mut()
-        .insert("value".to_string(), init_value);
-    global_map
-        .borrow_mut()
-        .insert("valueOf".to_string(), JsValue::NativeFunction(valueof_fn));
-
-    Ok(JsValue::PlainObject(global_map))
+/// `new WebAssembly.Global(...)` — fail closed until the global/import bridge
+/// is implemented.
+pub fn wasm_global_ctor(_args: Vec<JsValue>) -> StatorResult<JsValue> {
+    Err(wasm_unsupported_error("Global"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -858,9 +585,7 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// - `instantiate` → [`wasm_instantiate`]
 /// - `Module` → [`wasm_module_ctor`]
 /// - `Instance` → [`wasm_instance_ctor`]
-/// - `Memory` → [`wasm_memory_ctor`]
-/// - `Table` → [`wasm_table_ctor`]
-/// - `Global` → [`wasm_global_ctor`]
+/// - `Memory`/`Table`/`Global` → fail-closed until their host bridges exist
 ///
 /// Install this value as the `"WebAssembly"` key in the interpreter's global
 /// environment to expose the full WebAssembly JS API to executing scripts.
@@ -882,21 +607,21 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// feature-detection succeeds, but calling or constructing it never returns a
 /// plausible-looking fake object.
 fn make_wasm_unsupported(name: &'static str) -> JsValue {
-    let f: NativeFn = Rc::new(move |_args: Vec<JsValue>| {
-        Err(StatorError::TypeError(format!("{name}: not implemented")))
-    });
+    let f: NativeFn = Rc::new(move |_args: Vec<JsValue>| Err(wasm_unsupported_error(name)));
     JsValue::NativeFunction(f)
+}
+
+fn wasm_unsupported_error(name: &str) -> StatorError {
+    StatorError::TypeError(format!("WebAssembly.{name}: not implemented"))
 }
 
 /// Build the `WebAssembly` namespace object.
 ///
 /// Real implementations are wired for `validate`, `compile`, `instantiate`,
-/// and the `Module`/`Instance`/`Memory`/`Table`/`Global` constructors.  The
-/// remaining modern-browser surface (`compileStreaming`,
-/// `instantiateStreaming`, `Tag`, `Exception`, `CompileError`, `LinkError`,
-/// `RuntimeError`) is exposed as fail-closed entries that throw `TypeError`
-/// because Stator does not implement the underlying semantics; see the module
-/// docs.
+/// and function-only `Module`/`Instance` use. The remaining modern-browser and
+/// bridge-dependent surface is exposed as fail-closed entries that throw
+/// `TypeError` because Stator does not implement the underlying semantics; see
+/// the module docs.
 pub fn make_webassembly_object() -> JsValue {
     let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
@@ -922,21 +647,11 @@ pub fn make_webassembly_object() -> JsValue {
             "Instance".to_string(),
             JsValue::NativeFunction(Rc::new(wasm_instance_ctor)),
         );
-        m.insert(
-            "Memory".to_string(),
-            JsValue::NativeFunction(Rc::new(wasm_memory_ctor)),
-        );
-        m.insert(
-            "Table".to_string(),
-            JsValue::NativeFunction(Rc::new(wasm_table_ctor)),
-        );
-        m.insert(
-            "Global".to_string(),
-            JsValue::NativeFunction(Rc::new(wasm_global_ctor)),
-        );
-
         // Fail-closed entries: see module-level docs.
         for name in [
+            "Memory",
+            "Table",
+            "Global",
             "compileStreaming",
             "instantiateStreaming",
             "Tag",
@@ -993,6 +708,18 @@ mod tests {
             (func $noop (export "noop"))
             (func $identity (export "identity") (param i32) (result i32)
                 local.get 0))
+    "#;
+
+    const IMPORTED_FUNC_WAT: &str = r#"
+        (module
+            (import "env" "f" (func $f))
+            (func (export "call_import")
+                call $f))
+    "#;
+
+    const EXPORTED_MEMORY_WAT: &str = r#"
+        (module
+            (memory (export "memory") 1))
     "#;
 
     /// Helper: convert a WAT string to a `JsValue::String`.
@@ -1516,231 +1243,61 @@ mod tests {
         assert!(matches!(err, StatorError::TypeError(_)));
     }
 
-    // ── wasm_memory_ctor ──────────────────────────────────────────────────────
-
     #[test]
-    fn test_memory_ctor_returns_plain_object() {
-        let desc = descriptor(&[("initial", JsValue::Smi(1))]);
-        let mem = wasm_memory_ctor(vec![desc]).unwrap();
-        assert!(matches!(mem, JsValue::PlainObject(_)));
-    }
-
-    #[test]
-    fn test_memory_ctor_has_grow_and_buffer() {
-        let desc = descriptor(&[("initial", JsValue::Smi(1))]);
-        let mem = wasm_memory_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = mem {
-            assert!(matches!(
-                map.borrow().get("grow"),
-                Some(JsValue::NativeFunction(_))
-            ));
-            assert!(map.borrow().contains_key("buffer"));
-        } else {
-            panic!("expected PlainObject");
-        }
-    }
-
-    #[test]
-    fn test_memory_grow_returns_previous_page_count() {
-        let desc = descriptor(&[("initial", JsValue::Smi(2))]);
-        let mem = wasm_memory_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = mem {
-            if let Some(JsValue::NativeFunction(grow)) = map.borrow().get("grow").cloned() {
-                let prev = grow(vec![JsValue::Smi(3)]).unwrap();
-                assert_eq!(prev, JsValue::Smi(2)); // was 2 pages
+    fn test_instance_ctor_fails_closed_for_imports() {
+        let module = wasm_module_ctor(vec![wat_val(IMPORTED_FUNC_WAT)]).unwrap();
+        let err = wasm_instance_ctor(vec![module, descriptor(&[])]).unwrap_err();
+        match err {
+            StatorError::TypeError(msg) => {
+                assert!(msg.contains("imports are not implemented"));
+                assert!(msg.contains("env.f"));
             }
+            other => panic!("expected TypeError, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_memory_grow_negative_one_on_overflow() {
-        let desc = descriptor(&[("initial", JsValue::Smi(65_536))]);
-        let mem = wasm_memory_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = mem {
-            if let Some(JsValue::NativeFunction(grow)) = map.borrow().get("grow").cloned() {
-                let result = grow(vec![JsValue::Smi(1)]).unwrap();
-                assert_eq!(result, JsValue::Smi(-1));
+    fn test_instantiate_fails_closed_for_non_function_exports() {
+        let err = wasm_instantiate(vec![wat_val(EXPORTED_MEMORY_WAT)]).unwrap_err();
+        match err {
+            StatorError::TypeError(msg) => {
+                assert!(msg.contains("memory export"));
+                assert!(msg.contains("not implemented"));
             }
+            other => panic!("expected TypeError, got {other:?}"),
         }
     }
 
+    // ── Wasm constructors that require missing host bridges ───────────────────
+
     #[test]
-    fn test_memory_ctor_missing_initial_returns_error() {
-        let desc = descriptor(&[]);
+    fn test_memory_ctor_fails_closed_without_fake_buffer() {
+        let desc = descriptor(&[("initial", JsValue::Smi(1))]);
         let err = wasm_memory_ctor(vec![desc]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
+        assert!(
+            matches!(err, StatorError::TypeError(msg) if msg.contains("WebAssembly.Memory") && msg.contains("not implemented"))
+        );
     }
 
     #[test]
-    fn test_memory_ctor_non_object_returns_error() {
-        let err = wasm_memory_ctor(vec![JsValue::Smi(1)]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
-    }
-
-    // ── wasm_table_ctor ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_table_ctor_returns_plain_object() {
+    fn test_table_ctor_fails_closed_without_fake_slots() {
         let desc = descriptor(&[
             ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(4)),
         ]);
-        let tbl = wasm_table_ctor(vec![desc]).unwrap();
-        assert!(matches!(tbl, JsValue::PlainObject(_)));
-    }
-
-    #[test]
-    fn test_table_ctor_has_get_set_grow_length() {
-        let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string().into())),
-            ("initial", JsValue::Smi(4)),
-        ]);
-        let tbl = wasm_table_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = tbl {
-            assert!(matches!(
-                map.borrow().get("get"),
-                Some(JsValue::NativeFunction(_))
-            ));
-            assert!(matches!(
-                map.borrow().get("set"),
-                Some(JsValue::NativeFunction(_))
-            ));
-            assert!(matches!(
-                map.borrow().get("grow"),
-                Some(JsValue::NativeFunction(_))
-            ));
-            assert_eq!(map.borrow().get("length").cloned(), Some(JsValue::Smi(4)));
-        }
-    }
-
-    #[test]
-    fn test_table_get_set_roundtrip() {
-        let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string().into())),
-            ("initial", JsValue::Smi(4)),
-        ]);
-        let tbl = wasm_table_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = tbl {
-            let get_fn = match map.borrow().get("get").cloned() {
-                Some(JsValue::NativeFunction(f)) => f,
-                _ => panic!("expected get NativeFunction"),
-            };
-            let set_fn = match map.borrow().get("set").cloned() {
-                Some(JsValue::NativeFunction(f)) => f,
-                _ => panic!("expected set NativeFunction"),
-            };
-            // Slot 0 starts null.
-            assert_eq!(get_fn(vec![JsValue::Smi(0)]).unwrap(), JsValue::Null);
-            // Set slot 2.
-            set_fn(vec![JsValue::Smi(2), JsValue::Smi(99)]).unwrap();
-            assert_eq!(get_fn(vec![JsValue::Smi(2)]).unwrap(), JsValue::Smi(99));
-        }
-    }
-
-    #[test]
-    fn test_table_set_out_of_bounds_error() {
-        let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string().into())),
-            ("initial", JsValue::Smi(2)),
-        ]);
-        let tbl = wasm_table_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = tbl {
-            if let Some(JsValue::NativeFunction(set_fn)) = map.borrow().get("set").cloned() {
-                let err = set_fn(vec![JsValue::Smi(5), JsValue::Smi(1)]).unwrap_err();
-                assert!(matches!(err, StatorError::RangeError(_)));
-            }
-        }
-    }
-
-    #[test]
-    fn test_table_grow_extends_length() {
-        let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string().into())),
-            ("initial", JsValue::Smi(2)),
-        ]);
-        let tbl = wasm_table_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = tbl {
-            let grow_fn = match map.borrow().get("grow").cloned() {
-                Some(JsValue::NativeFunction(f)) => f,
-                _ => panic!("expected grow NativeFunction"),
-            };
-            let get_fn = match map.borrow().get("get").cloned() {
-                Some(JsValue::NativeFunction(f)) => f,
-                _ => panic!("expected get NativeFunction"),
-            };
-            let prev = grow_fn(vec![JsValue::Smi(3)]).unwrap();
-            assert_eq!(prev, JsValue::Smi(2)); // previous length
-            // New slot 4 should be accessible and null.
-            assert_eq!(get_fn(vec![JsValue::Smi(4)]).unwrap(), JsValue::Null);
-            // `length` property on the table object must be updated to 5.
-            assert_eq!(map.borrow().get("length").cloned(), Some(JsValue::Smi(5)));
-        }
-    }
-
-    #[test]
-    fn test_table_ctor_missing_element_returns_error() {
-        let desc = descriptor(&[("initial", JsValue::Smi(1))]);
         let err = wasm_table_ctor(vec![desc]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
+        assert!(
+            matches!(err, StatorError::TypeError(msg) if msg.contains("WebAssembly.Table") && msg.contains("not implemented"))
+        );
     }
 
     #[test]
-    fn test_table_ctor_missing_initial_returns_error() {
-        let desc = descriptor(&[("element", JsValue::String("anyfunc".to_string().into()))]);
-        let err = wasm_table_ctor(vec![desc]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
-    }
-
-    // ── wasm_global_ctor ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_global_ctor_returns_plain_object() {
+    fn test_global_ctor_fails_closed_without_fake_mutability() {
         let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
-        let g = wasm_global_ctor(vec![desc, JsValue::Smi(42)]).unwrap();
-        assert!(matches!(g, JsValue::PlainObject(_)));
-    }
-
-    #[test]
-    fn test_global_ctor_value_property() {
-        let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
-        let g = wasm_global_ctor(vec![desc, JsValue::Smi(42)]).unwrap();
-        if let JsValue::PlainObject(map) = g {
-            assert_eq!(map.borrow().get("value").cloned(), Some(JsValue::Smi(42)));
-        }
-    }
-
-    #[test]
-    fn test_global_valueof_returns_init() {
-        let desc = descriptor(&[("value", JsValue::String("f64".to_string().into()))]);
-        let g = wasm_global_ctor(vec![desc, JsValue::HeapNumber(3.14)]).unwrap();
-        if let JsValue::PlainObject(map) = g {
-            if let Some(JsValue::NativeFunction(valueof)) = map.borrow().get("valueOf").cloned() {
-                let v = valueof(vec![]).unwrap();
-                assert_eq!(v, JsValue::HeapNumber(3.14));
-            }
-        }
-    }
-
-    #[test]
-    fn test_global_default_init_is_zero() {
-        let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
-        let g = wasm_global_ctor(vec![desc]).unwrap();
-        if let JsValue::PlainObject(map) = g {
-            assert_eq!(map.borrow().get("value").cloned(), Some(JsValue::Smi(0)));
-        }
-    }
-
-    #[test]
-    fn test_global_ctor_missing_value_type_error() {
-        let desc = descriptor(&[]);
-        let err = wasm_global_ctor(vec![desc]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
-    }
-
-    #[test]
-    fn test_global_ctor_non_object_descriptor_error() {
-        let err = wasm_global_ctor(vec![JsValue::Smi(1)]).unwrap_err();
-        assert!(matches!(err, StatorError::TypeError(_)));
+        let err = wasm_global_ctor(vec![desc, JsValue::Smi(42)]).unwrap_err();
+        assert!(
+            matches!(err, StatorError::TypeError(msg) if msg.contains("WebAssembly.Global") && msg.contains("not implemented"))
+        );
     }
 
     // ── make_webassembly_object ───────────────────────────────────────────────
@@ -1831,6 +1388,9 @@ mod tests {
     // ── fail-closed surface ──────────────────────────────────────────────────
 
     const UNSUPPORTED_NAMES: &[&str] = &[
+        "Memory",
+        "Table",
+        "Global",
         "compileStreaming",
         "instantiateStreaming",
         "Tag",
@@ -1900,8 +1460,9 @@ mod tests {
 
     #[test]
     fn test_webassembly_failclosed_does_not_shadow_real_apis() {
-        // Adding the fail-closed entries must not remove or replace any of the
-        // real APIs that already work.
+        // Adding fail-closed entries must not remove or replace any of the real
+        // APIs that already work, and should keep explicit placeholders for
+        // bridge-dependent constructors.
         let wasm = make_webassembly_object();
         let JsValue::PlainObject(map) = wasm else {
             panic!("expected PlainObject");
@@ -1916,7 +1477,10 @@ mod tests {
             "Table",
             "Global",
         ] {
-            assert!(map.borrow().contains_key(key), "lost real API key: {key}");
+            assert!(
+                map.borrow().contains_key(key),
+                "lost WebAssembly key: {key}"
+            );
         }
         // Spot-check that the real APIs still actually work.
         let v = wasm_validate(vec![wat_val(EMPTY_WAT)]).unwrap();

@@ -27095,6 +27095,24 @@ fn atomics_value_equals(a: &JsValue, b: &JsValue) -> bool {
     }
 }
 
+fn atomics_wait_timeout_is_zero(timeout: Option<&JsValue>) -> StatorResult<bool> {
+    let Some(timeout) = timeout else {
+        return Ok(false);
+    };
+    let timeout = timeout.to_number()?;
+    if timeout.is_nan() {
+        return Ok(false);
+    }
+    Ok(timeout <= 0.0)
+}
+
+fn atomics_wait_result(value: &'static str) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert("async".into(), JsValue::Boolean(false));
+    props.insert("value".into(), JsValue::String(value.into()));
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Build the `Atomics` namespace object.
 ///
 /// Since stator is single-threaded, all atomic operations are plain
@@ -27235,40 +27253,60 @@ fn make_atomics() -> JsValue {
         }),
     );
 
-    // Atomics.wait — single-threaded, always returns "not-equal" or "timed-out"
+    // Atomics.wait — single-threaded safe subset. Immediate "not-equal" and
+    // zero-timeout "timed-out" results are spec-observable without blocking;
+    // positive/infinite waits fail closed instead of pretending a wait elapsed.
     props.insert(
         "wait".into(),
         builtin_fn("wait", 4, |args| {
             let (ta, index) = atomics_extract_waitable_ta(&args)?;
             let kind = ta.borrow().kind;
-            let current = atomics_read(&ta.borrow(), index);
             let expected = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let current = atomics_read(&ta.borrow(), index);
             if !atomics_value_equals(&current, &expected) {
                 Ok(JsValue::String("not-equal".into()))
-            } else {
+            } else if atomics_wait_timeout_is_zero(args.get(3))? {
                 Ok(JsValue::String("timed-out".into()))
+            } else {
+                Err(StatorError::TypeError(
+                    "Atomics.wait: blocking waits are not supported in this single-threaded runtime"
+                        .into(),
+                ))
             }
         }),
     );
 
-    // Atomics.notify — single-threaded no-op, returns 0
+    // Atomics.notify — single-threaded no-op, returns 0 after validating args.
     props.insert(
         "notify".into(),
         builtin_fn("notify", 3, |args| {
             let _ = atomics_extract_waitable_ta(&args)?;
+            if let Some(count) = args.get(2) {
+                let _ = count.to_integer_or_infinity()?;
+            }
             Ok(JsValue::Smi(0))
         }),
     );
 
-    // Atomics.waitAsync — returns { async: false, value: "timed-out" }
+    // Atomics.waitAsync — same safe synchronous subset as Atomics.wait. It never
+    // fabricates a Promise for an asynchronous cross-agent wakeup.
     props.insert(
         "waitAsync".into(),
         builtin_fn("waitAsync", 4, |args| {
-            let _ = atomics_extract_waitable_ta(&args)?;
-            let mut props = PropertyMap::new();
-            props.insert("async".into(), JsValue::Boolean(false));
-            props.insert("value".into(), JsValue::String("timed-out".into()));
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+            let (ta, index) = atomics_extract_waitable_ta(&args)?;
+            let kind = ta.borrow().kind;
+            let expected = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
+            let current = atomics_read(&ta.borrow(), index);
+            if !atomics_value_equals(&current, &expected) {
+                Ok(atomics_wait_result("not-equal"))
+            } else if atomics_wait_timeout_is_zero(args.get(3))? {
+                Ok(atomics_wait_result("timed-out"))
+            } else {
+                Err(StatorError::TypeError(
+                    "Atomics.waitAsync: asynchronous waits are not supported in this single-threaded runtime"
+                        .into(),
+                ))
+            }
         }),
     );
 
@@ -61896,10 +61934,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_atomics_wait_returns_timed_out_when_value_matches() {
+    fn e2e_atomics_wait_returns_timed_out_for_zero_timeout() {
         assert_eval_true(
-            "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 1; Atomics.wait(ta, 0, 1) === 'timed-out'",
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 1; Atomics.wait(ta, 0, 1, 0) === 'timed-out'",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_fails_closed_for_blocking_wait() {
+        assert_eval_true(
+            "try { var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 1; Atomics.wait(ta, 0, 1); false; } catch (e) { e instanceof TypeError; }",
         );
     }
 
@@ -61911,9 +61955,23 @@ mod tests {
     }
 
     #[test]
-    fn e2e_atomics_wait_async_returns_sync_result_object() {
+    fn e2e_atomics_wait_async_returns_sync_timed_out_for_zero_timeout() {
         assert_eval_true(
-            "var ta = new Int32Array(new SharedArrayBuffer(4)); var r = Atomics.waitAsync(ta, 0, 0); r.async === false && r.value === 'timed-out'",
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); var r = Atomics.waitAsync(ta, 0, 0, 0); r.async === false && r.value === 'timed-out'",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_async_returns_sync_not_equal_when_value_differs() {
+        assert_eval_true(
+            "var ta = new Int32Array(new SharedArrayBuffer(4)); ta[0] = 1; var r = Atomics.waitAsync(ta, 0, 2); r.async === false && r.value === 'not-equal'",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_wait_async_fails_closed_for_async_wait() {
+        assert_eval_true(
+            "try { var ta = new Int32Array(new SharedArrayBuffer(4)); Atomics.waitAsync(ta, 0, 0); false; } catch (e) { e instanceof TypeError; }",
         );
     }
 
