@@ -69,6 +69,8 @@ pub mod temporal;
 pub mod typed_array;
 /// WHATWG `URL` parser and `URLSearchParams` data model.
 pub mod url;
+/// WHATWG `URLPattern` pattern compiler and matcher.
+pub mod url_pattern;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
 pub(crate) mod util;
 /// WebAssembly JavaScript API built-ins:

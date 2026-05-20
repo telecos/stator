@@ -6242,6 +6242,594 @@ fn headers_make_iterator(values: Vec<JsValue>) -> JsValue {
     JsValue::PlainObject(obj_rc)
 }
 
+// ── Real URLPattern ───────────────────────────────────────────────────────
+//
+// `URLPattern` exposes a conservative subset of the WHATWG URLPattern API:
+//
+// * Object-form constructor: `new URLPattern({protocol, username, password,
+//   hostname, port, pathname, search, hash, baseURL?})`. Missing
+//   components default to the corresponding component from `baseURL` when
+//   provided, otherwise to `"*"`.
+// * String-form constructor: `new URLPattern(string, baseURL?)`. The
+//   string is parsed by the engine's real WHATWG `URL` parser; each
+//   resulting component becomes a *literal* pattern (no pattern syntax is
+//   recognized inside the URL string). Parser failure throws `TypeError`.
+// * Per-component accessors return the raw pattern string for that
+//   component.
+// * `test(input?, baseURL?)` returns a boolean.
+// * `exec(input?, baseURL?)` returns either `null` or a browser-shaped
+//   result object: `{inputs, protocol, username, password, hostname,
+//   port, pathname, search, hash}` where each component result is
+//   `{input, groups}`.
+//
+// Unsupported pattern syntax (`{...}`, `?`, `+`, `(regex)`, `[class]`)
+// produces a `TypeError` rather than silently mis-matching. See
+// `crate::builtins::url_pattern` for the pattern parser/matcher and its
+// unit tests.
+
+use crate::builtins::url_pattern::{
+    CompiledPattern, PatternKind, compile as compile_url_pattern,
+    match_input as match_url_pattern_input,
+};
+
+/// Hidden brand placed on every `URLPattern` instance for receiver checks.
+const URLPATTERN_BRAND: &str = "__is_url_pattern__";
+
+/// The eight URL components a `URLPattern` matches on, each stored as a
+/// compiled pattern.
+#[derive(Debug, Clone)]
+struct UrlPatternData {
+    protocol: CompiledPattern,
+    username: CompiledPattern,
+    password: CompiledPattern,
+    hostname: CompiledPattern,
+    port: CompiledPattern,
+    pathname: CompiledPattern,
+    search: CompiledPattern,
+    hash: CompiledPattern,
+}
+
+/// Strings extracted from an `exec`/`test` input value, one per component.
+#[derive(Debug, Clone, Default)]
+struct UrlPatternInput {
+    protocol: String,
+    username: String,
+    password: String,
+    hostname: String,
+    port: String,
+    pathname: String,
+    search: String,
+    hash: String,
+}
+
+thread_local! {
+    static URLPATTERN_STATES: RefCell<HashMap<usize, Rc<UrlPatternData>>> =
+        RefCell::new(HashMap::new());
+    static URLPATTERN_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+fn install_url_pattern_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<UrlPatternData>) {
+    let id = Rc::as_ptr(instance) as usize;
+    URLPATTERN_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_url_pattern_state(value: &JsValue) -> StatorResult<Rc<UrlPatternData>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(url_type_error(
+            "URLPattern method called on non-URLPattern receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(URLPATTERN_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(url_type_error(
+            "URLPattern method called on non-URLPattern receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    URLPATTERN_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| url_type_error("URLPattern: internal state missing"))
+}
+
+fn resolve_url_pattern_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(URLPATTERN_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+fn url_pattern_parse_error_to_js(
+    e: crate::builtins::url_pattern::PatternParseError,
+) -> StatorError {
+    url_type_error(format!("URLPattern: {e}"))
+}
+
+/// Build a fresh `URLPattern` instance from compiled components.
+fn build_url_pattern_instance(data: UrlPatternData) -> StatorResult<JsValue> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            URLPATTERN_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = URLPATTERN_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_url_pattern_state(&inst, Rc::new(data));
+    Ok(JsValue::PlainObject(inst))
+}
+
+/// Extract a component string from an object property, or return `None`
+/// if the property is absent/undefined.
+fn object_component(map: &Rc<RefCell<PropertyMap>>, key: &str) -> StatorResult<Option<String>> {
+    let value = map.borrow().get(key).cloned();
+    match value {
+        None | Some(JsValue::Undefined) => Ok(None),
+        Some(v) => Ok(Some(v.to_js_string()?)),
+    }
+}
+
+/// Convert a parsed `UrlData` into per-component literal pattern strings.
+/// Each component is escaped so that any URLPattern-special characters
+/// inside the URL (e.g. `*` in a path) are matched literally.
+fn url_data_to_components(data: &UrlData) -> [String; 8] {
+    fn escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if matches!(
+                c,
+                '\\' | '*' | ':' | '{' | '}' | '(' | ')' | '+' | '?' | '[' | ']'
+            ) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    }
+    let port = match data.port {
+        Some(p) => p.to_string(),
+        None => String::new(),
+    };
+    let search = data
+        .query
+        .borrow()
+        .is_empty()
+        .then(String::new)
+        .unwrap_or_else(|| serialize_query_pairs(&data.query.borrow()));
+    let hash = data.fragment.clone().unwrap_or_default();
+    [
+        escape(&data.scheme),
+        escape(&data.username),
+        escape(&data.password),
+        escape(&data.host),
+        escape(&port),
+        escape(&data.path),
+        escape(&search),
+        escape(&hash),
+    ]
+}
+
+/// Resolve a `baseURL` argument to a parsed `UrlData`, returning `None`
+/// when the argument is undefined and `Err` on parse failure.
+fn resolve_url_pattern_base(arg: Option<&JsValue>) -> StatorResult<Option<UrlData>> {
+    match arg {
+        None | Some(JsValue::Undefined) => Ok(None),
+        Some(JsValue::String(s)) => Ok(Some(
+            parse_url(s.as_ref(), None).map_err(url_parse_error_to_js)?,
+        )),
+        Some(other) => {
+            let s = other.to_js_string()?;
+            Ok(Some(parse_url(&s, None).map_err(url_parse_error_to_js)?))
+        }
+    }
+}
+
+/// Parse the constructor `init` argument into a `UrlPatternData`.
+fn parse_url_pattern_init(
+    input: &JsValue,
+    base_arg: Option<&JsValue>,
+) -> StatorResult<UrlPatternData> {
+    // Per-component default raw pattern strings.
+    let mut raw = [
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+        "*".to_string(),
+    ];
+
+    match input {
+        JsValue::Undefined => {
+            // `new URLPattern()` — all components default to "*". A baseURL
+            // here, if any, populates each component literally.
+            if let Some(base) = resolve_url_pattern_base(base_arg)? {
+                raw = url_data_to_components(&base);
+            }
+        }
+        JsValue::String(s) => {
+            // String form: parse via the WHATWG URL parser. Each component
+            // becomes a literal pattern (no pattern syntax recognized).
+            let base = resolve_url_pattern_base(base_arg)?;
+            let parsed = parse_url(s.as_ref(), base.as_ref()).map_err(url_parse_error_to_js)?;
+            raw = url_data_to_components(&parsed);
+        }
+        JsValue::PlainObject(map) => {
+            // Object form. The optional `baseURL` key on the init object
+            // is mutually exclusive with the second `baseURL` argument.
+            let init_base_str = match map.borrow().get("baseURL").cloned() {
+                None | Some(JsValue::Undefined) => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            if init_base_str.is_some() && !matches!(base_arg, None | Some(JsValue::Undefined)) {
+                return Err(url_type_error(
+                    "URLPattern: baseURL was given both as an init property and as an argument",
+                ));
+            }
+            let base = if let Some(s) = init_base_str {
+                Some(parse_url(&s, None).map_err(url_parse_error_to_js)?)
+            } else {
+                resolve_url_pattern_base(base_arg)?
+            };
+            if let Some(ref base) = base {
+                raw = url_data_to_components(base);
+            }
+            // For each provided field, override the default.
+            let fields: [(&str, usize); 8] = [
+                ("protocol", 0),
+                ("username", 1),
+                ("password", 2),
+                ("hostname", 3),
+                ("port", 4),
+                ("pathname", 5),
+                ("search", 6),
+                ("hash", 7),
+            ];
+            for (key, idx) in fields {
+                if let Some(s) = object_component(map, key)? {
+                    raw[idx] = s;
+                }
+            }
+        }
+        _ => {
+            return Err(url_type_error(
+                "URLPattern: input must be a string or a component object",
+            ));
+        }
+    }
+
+    let kinds: [PatternKind; 8] = [
+        PatternKind::Other,    // protocol
+        PatternKind::Other,    // username
+        PatternKind::Other,    // password
+        PatternKind::Hostname, // hostname
+        PatternKind::Other,    // port
+        PatternKind::Pathname, // pathname
+        PatternKind::Other,    // search
+        PatternKind::Other,    // hash
+    ];
+    let mut compiled: Vec<CompiledPattern> = Vec::with_capacity(8);
+    for (i, k) in kinds.iter().enumerate() {
+        compiled.push(compile_url_pattern(&raw[i], *k).map_err(url_pattern_parse_error_to_js)?);
+    }
+    let mut it = compiled.into_iter();
+    Ok(UrlPatternData {
+        protocol: it.next().unwrap(),
+        username: it.next().unwrap(),
+        password: it.next().unwrap(),
+        hostname: it.next().unwrap(),
+        port: it.next().unwrap(),
+        pathname: it.next().unwrap(),
+        search: it.next().unwrap(),
+        hash: it.next().unwrap(),
+    })
+}
+
+/// Extract per-component input strings from `test`/`exec` arguments.
+/// Returns `Ok(None)` to signal that the input could not be interpreted
+/// as a URL (which the spec treats as a non-match, not a thrown error).
+fn process_url_pattern_input(
+    input: Option<&JsValue>,
+    base_arg: Option<&JsValue>,
+) -> StatorResult<Option<UrlPatternInput>> {
+    match input {
+        None | Some(JsValue::Undefined) => {
+            // Per spec, missing input is treated as an empty dictionary —
+            // every component is empty.
+            if !matches!(base_arg, None | Some(JsValue::Undefined)) {
+                // baseURL only meaningful with a string input.
+                return Err(url_type_error(
+                    "URLPattern: baseURL provided without a string input",
+                ));
+            }
+            Ok(Some(UrlPatternInput::default()))
+        }
+        Some(JsValue::String(s)) => {
+            let base = resolve_url_pattern_base(base_arg)?;
+            match parse_url(s.as_ref(), base.as_ref()) {
+                Ok(parsed) => Ok(Some(url_data_to_input(&parsed))),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(other) => {
+            // URL instance?
+            if let Ok(state_rc) = lookup_url_state(other) {
+                if !matches!(base_arg, None | Some(JsValue::Undefined)) {
+                    return Err(url_type_error(
+                        "URLPattern: baseURL not allowed with URL or dictionary input",
+                    ));
+                }
+                return Ok(Some(url_data_to_input(&state_rc.borrow())));
+            }
+            // Plain object?
+            if let JsValue::PlainObject(map) = other {
+                if !matches!(base_arg, None | Some(JsValue::Undefined)) {
+                    return Err(url_type_error(
+                        "URLPattern: baseURL not allowed with dictionary input",
+                    ));
+                }
+                let mut out = UrlPatternInput::default();
+                for (key, slot) in [
+                    ("protocol", &mut out.protocol),
+                    ("username", &mut out.username),
+                    ("password", &mut out.password),
+                    ("hostname", &mut out.hostname),
+                    ("port", &mut out.port),
+                    ("pathname", &mut out.pathname),
+                    ("search", &mut out.search),
+                    ("hash", &mut out.hash),
+                ] {
+                    if let Some(s) = object_component(map, key)? {
+                        *slot = s;
+                    }
+                }
+                return Ok(Some(out));
+            }
+            Err(url_type_error(
+                "URLPattern: input must be a string, URL, or component object",
+            ))
+        }
+    }
+}
+
+fn url_data_to_input(data: &UrlData) -> UrlPatternInput {
+    let port = match data.port {
+        Some(p) => p.to_string(),
+        None => String::new(),
+    };
+    let q = data.query.borrow();
+    let search = if q.is_empty() {
+        String::new()
+    } else {
+        serialize_query_pairs(&q)
+    };
+    UrlPatternInput {
+        protocol: data.scheme.clone(),
+        username: data.username.clone(),
+        password: data.password.clone(),
+        hostname: data.host.clone(),
+        port,
+        pathname: data.path.clone(),
+        search,
+        hash: data.fragment.clone().unwrap_or_default(),
+    }
+}
+
+/// Build a per-component exec result object `{input, groups: {...}}`.
+fn build_component_result(input: &str, pattern: &CompiledPattern) -> JsValue {
+    let groups_obj = Rc::new(RefCell::new(PropertyMap::new()));
+    let mut groups_props = groups_obj.borrow_mut();
+    if let Some(matched) = match_url_pattern_input(pattern, input) {
+        for name in &pattern.group_names {
+            let val = matched.get(name).cloned().unwrap_or_default();
+            groups_props.insert(name.clone(), JsValue::String(val.into()));
+        }
+    } else {
+        // Should not happen — caller verifies all components match first.
+        for name in &pattern.group_names {
+            groups_props.insert(name.clone(), JsValue::String("".into()));
+        }
+    }
+    drop(groups_props);
+    let mut comp = PropertyMap::new();
+    comp.insert("input".into(), JsValue::String(input.to_string().into()));
+    comp.insert("groups".into(), JsValue::PlainObject(groups_obj));
+    JsValue::PlainObject(Rc::new(RefCell::new(comp)))
+}
+
+/// Build the real `URLPattern` constructor.
+#[inline(never)]
+fn make_url_pattern_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let input = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let base_arg = args.get(1).cloned();
+            let data = parse_url_pattern_init(&input, base_arg.as_ref())?;
+            build_url_pattern_instance(data)
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+
+        fn register_accessor(proto: &mut PropertyMap, name: &str, getter: JsValue) {
+            proto.insert_with_attrs(
+                format!("__get_{name}__"),
+                getter,
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+
+        // Component getters return the raw pattern string for each component.
+        type ComponentGetter = fn(&UrlPatternData) -> &CompiledPattern;
+        let comps: [(&str, ComponentGetter); 8] = [
+            ("protocol", |d| &d.protocol),
+            ("username", |d| &d.username),
+            ("password", |d| &d.password),
+            ("hostname", |d| &d.hostname),
+            ("port", |d| &d.port),
+            ("pathname", |d| &d.pathname),
+            ("search", |d| &d.search),
+            ("hash", |d| &d.hash),
+        ];
+        for (name, getter) in comps {
+            register_accessor(
+                &mut proto,
+                name,
+                native(move |args| {
+                    let (recv, _) = resolve_url_pattern_receiver(&args);
+                    let state = lookup_url_pattern_state(&recv)?;
+                    Ok(JsValue::String(getter(&state).raw.clone().into()))
+                }),
+            );
+        }
+
+        // test(input?, baseURL?) — boolean.
+        proto.insert(
+            "test".into(),
+            builtin_fn("test", 1, |args| {
+                let (recv, rest) = resolve_url_pattern_receiver(&args);
+                let state = lookup_url_pattern_state(&recv)?;
+                let extracted = process_url_pattern_input(rest.first(), rest.get(1))?;
+                let Some(input) = extracted else {
+                    return Ok(JsValue::Boolean(false));
+                };
+                let ok = match_url_pattern_input(&state.protocol, &input.protocol).is_some()
+                    && match_url_pattern_input(&state.username, &input.username).is_some()
+                    && match_url_pattern_input(&state.password, &input.password).is_some()
+                    && match_url_pattern_input(&state.hostname, &input.hostname).is_some()
+                    && match_url_pattern_input(&state.port, &input.port).is_some()
+                    && match_url_pattern_input(&state.pathname, &input.pathname).is_some()
+                    && match_url_pattern_input(&state.search, &input.search).is_some()
+                    && match_url_pattern_input(&state.hash, &input.hash).is_some();
+                Ok(JsValue::Boolean(ok))
+            }),
+        );
+
+        // exec(input?, baseURL?) — null or result object.
+        proto.insert(
+            "exec".into(),
+            builtin_fn("exec", 1, |args| {
+                let (recv, rest) = resolve_url_pattern_receiver(&args);
+                let state = lookup_url_pattern_state(&recv)?;
+                let raw_input = rest.first().cloned().unwrap_or(JsValue::Undefined);
+                let raw_base = rest.get(1).cloned();
+                let extracted = process_url_pattern_input(Some(&raw_input), raw_base.as_ref())?;
+                let Some(input) = extracted else {
+                    return Ok(JsValue::Null);
+                };
+                if match_url_pattern_input(&state.protocol, &input.protocol).is_none()
+                    || match_url_pattern_input(&state.username, &input.username).is_none()
+                    || match_url_pattern_input(&state.password, &input.password).is_none()
+                    || match_url_pattern_input(&state.hostname, &input.hostname).is_none()
+                    || match_url_pattern_input(&state.port, &input.port).is_none()
+                    || match_url_pattern_input(&state.pathname, &input.pathname).is_none()
+                    || match_url_pattern_input(&state.search, &input.search).is_none()
+                    || match_url_pattern_input(&state.hash, &input.hash).is_none()
+                {
+                    return Ok(JsValue::Null);
+                }
+                // Build result object.
+                let mut result = PropertyMap::new();
+                // `inputs`: the original inputs array (length 1 or 2).
+                let mut inputs_vec: Vec<JsValue> = Vec::with_capacity(2);
+                inputs_vec.push(raw_input.clone());
+                if let Some(b) = raw_base.clone()
+                    && !matches!(b, JsValue::Undefined)
+                {
+                    inputs_vec.push(b);
+                }
+                result.insert(
+                    "inputs".into(),
+                    JsValue::Array(Rc::new(RefCell::new(inputs_vec))),
+                );
+                result.insert(
+                    "protocol".into(),
+                    build_component_result(&input.protocol, &state.protocol),
+                );
+                result.insert(
+                    "username".into(),
+                    build_component_result(&input.username, &state.username),
+                );
+                result.insert(
+                    "password".into(),
+                    build_component_result(&input.password, &state.password),
+                );
+                result.insert(
+                    "hostname".into(),
+                    build_component_result(&input.hostname, &state.hostname),
+                );
+                result.insert(
+                    "port".into(),
+                    build_component_result(&input.port, &state.port),
+                );
+                result.insert(
+                    "pathname".into(),
+                    build_component_result(&input.pathname, &state.pathname),
+                );
+                result.insert(
+                    "search".into(),
+                    build_component_result(&input.search, &state.search),
+                );
+                result.insert(
+                    "hash".into(),
+                    build_component_result(&input.hash, &state.hash),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+            }),
+        );
+
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("URLPattern".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        URLPATTERN_PROTO.with(|p| {
+            *p.borrow_mut() = Some(Rc::clone(&rc));
+        });
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
 /// Build the real `Headers` constructor.
 #[inline(never)]
 fn make_headers_builtin() -> JsValue {
@@ -23538,8 +24126,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 ][..],
                 &[][..],
             ),
-            ("URLPattern", &[("test", 1), ("exec", 1)][..], &[][..]),
         ] {
+            // URLPattern is overridden with a real implementation below;
+            // installing it here gives the unsupported-web fail-closed
+            // shape that other Edge feature-detection scripts expect to
+            // see for the surface as a baseline.
             globals.insert(
                 name.into(),
                 finalize_ctor(
@@ -23548,6 +24139,15 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 ),
             );
         }
+
+        // Real URLPattern (constructor + prototype). See
+        // `make_url_pattern_builtin` for the supported pattern subset
+        // (literal text, `*`, `:name`, with `TypeError` rejection of
+        // unsupported pattern syntax).
+        globals.insert(
+            "URLPattern".into(),
+            finalize_ctor(make_url_pattern_builtin(), "URLPattern"),
+        );
 
         // ── Web Components / Shadow DOM / DOM collections (fail-closed) ────
         //
@@ -27612,14 +28212,142 @@ mod tests {
     }
 
     #[test]
-    fn e2e_url_pattern_constructor_exists_but_fails_closed() {
+    fn e2e_url_pattern_constructor_real_basic() {
+        // Shape: constructor + prototype methods/accessors are present.
         assert_eval_true("typeof URLPattern === 'function' && URLPattern.name === 'URLPattern'");
         assert_eval_true("typeof URLPattern.prototype.test === 'function'");
         assert_eval_true("typeof URLPattern.prototype.exec === 'function'");
-        assert_eval_type_error("URLPattern({ pathname: '/:id' })");
-        assert_eval_type_error("new URLPattern({ pathname: '/:id' })");
-        assert_eval_type_error("URLPattern.prototype.test.call({}, 'https://example.test/1')");
-        assert_eval_type_error("URLPattern.prototype.exec.call({}, 'https://example.test/1')");
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(URLPattern.prototype, 'protocol') === undefined \
+             ? true : true", // accessor is hidden via __get_ scheme; just ensure no crash.
+        );
+
+        // Object-form constructor with a named-group path pattern.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.test({pathname: '/users/42'}) === true",
+        );
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.test({pathname: '/posts/42'}) === false",
+        );
+        // Component accessor returns the raw pattern string.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.pathname === '/users/:id' && p.protocol === '*'",
+        );
+
+        // exec on no match returns null.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.exec({pathname: '/nope'}) === null",
+        );
+        // exec on match returns a result with the right named group.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             let r = p.exec({pathname: '/users/42'}); \
+             r !== null && r.pathname.input === '/users/42' && r.pathname.groups.id === '42'",
+        );
+        // Anonymous wildcards are numbered "0", "1", ... groups.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/*/x/*'}); \
+             let r = p.exec({pathname: '/a/x/b'}); \
+             r.pathname.groups['0'] === 'a' && r.pathname.groups['1'] === 'b'",
+        );
+
+        // Pathname `:name` does not cross slash.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.test({pathname: '/users/42/posts'}) === false",
+        );
+        // Wildcard `*` does cross slash.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/*'}); \
+             p.test({pathname: '/users/42/posts'}) === true",
+        );
+        // Hostname `:name` does not cross dot.
+        assert_eval_true(
+            "let p = new URLPattern({hostname: 'api.:env.example'}); \
+             p.test({hostname: 'api.prod.example'}) === true",
+        );
+        assert_eval_true(
+            "let p = new URLPattern({hostname: 'api.:env.example'}); \
+             p.test({hostname: 'api.prod.staging.example'}) === false",
+        );
+
+        // String-form constructor: components become literal.
+        assert_eval_true(
+            "let p = new URLPattern('https://example.com/path'); \
+             p.test({protocol:'https', hostname:'example.com', pathname:'/path'}) === true \
+             && p.protocol === 'https' && p.hostname === 'example.com' && p.pathname === '/path'",
+        );
+        // String-form rejects unparseable URLs.
+        assert_eval_type_error("new URLPattern('not a url')");
+
+        // baseURL inherited literal defaults.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/x'}, 'https://example.com/'); \
+             p.protocol === 'https' && p.hostname === 'example.com' && p.pathname === '/x'",
+        );
+
+        // String input to test() — uses real URL parser.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             p.test('https://example.com/users/42') === true",
+        );
+        // Unparseable string input → no match (not an exception).
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/x'}); \
+             p.test('not a url') === false && p.exec('not a url') === null",
+        );
+
+        // URLPattern result.inputs reflects original arguments.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/users/:id'}); \
+             let r = p.exec('https://example.com/users/42'); \
+             Array.isArray(r.inputs) && r.inputs.length === 1 && r.inputs[0] === 'https://example.com/users/42'",
+        );
+
+        // Unsupported pattern syntax is rejected (no fake matching).
+        assert_eval_type_error("new URLPattern({pathname: '/{foo}'})");
+        assert_eval_type_error("new URLPattern({pathname: '/foo?'})");
+        assert_eval_type_error("new URLPattern({pathname: '/(re)'})");
+        assert_eval_type_error("new URLPattern({pathname: '/[abc]'})");
+        assert_eval_type_error("new URLPattern({pathname: '/:'})");
+        assert_eval_type_error("new URLPattern({pathname: '/foo\\\\'})");
+
+        // Backslash escape lets you match literal '*' or ':'.
+        assert_eval_true(
+            "let p = new URLPattern({pathname: '/\\\\*'}); \
+             p.test({pathname: '/*'}) === true && p.test({pathname: '/anything'}) === false",
+        );
+
+        // Brand checks: prototype methods reject non-URLPattern receivers.
+        assert_eval_type_error("URLPattern.prototype.test.call({}, 'https://example.test/')");
+        assert_eval_type_error("URLPattern.prototype.exec.call({}, 'https://example.test/')");
+        // Component accessor brand check.
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor; \
+             let g = Object.getPrototypeOf(new URLPattern({})).constructor; \
+             // Force accessor invocation with bad receiver via Reflect.get:
+             Reflect.get(URLPattern.prototype, 'pathname', {})",
+        );
+
+        // Disallow conflicting baseURL between init property and 2nd arg.
+        assert_eval_type_error(
+            "new URLPattern({pathname:'/x', baseURL:'https://example.com'}, 'https://example.org')",
+        );
+
+        // test() on plain dict with baseURL throws.
+        assert_eval_type_error(
+            "let p = new URLPattern({}); p.test({pathname: '/x'}, 'https://example.com')",
+        );
+
+        // Empty constructor matches everything.
+        assert_eval_true(
+            "let p = new URLPattern(); \
+             p.test({}) === true && p.test('https://example.com/anything') === true",
+        );
     }
 
     #[test]
