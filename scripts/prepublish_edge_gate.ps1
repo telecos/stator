@@ -162,5 +162,6 @@ $report = [ordered]@{
 }
 
 $reportPath = Join-Path $outputPath "edge-prepublish-gate-metadata.json"
-$report | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $reportPath
+[System.IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
 Write-Host "Wrote release candidate metadata: $reportPath"
+
