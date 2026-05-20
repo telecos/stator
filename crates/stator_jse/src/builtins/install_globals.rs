@@ -29091,6 +29091,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "PresentationRequest",
             "PresentationConnection",
             "PresentationAvailability",
+            "UserActivation",
         ] {
             globals.insert(
                 name.into(),
@@ -29917,6 +29918,7 @@ mod tests {
         assert!(globals.contains_key("PresentationRequest"));
         assert!(globals.contains_key("PresentationConnection"));
         assert!(globals.contains_key("PresentationAvailability"));
+        assert!(globals.contains_key("UserActivation"));
         assert!(globals.contains_key("PaymentRequest"));
         assert!(globals.contains_key("PaymentResponse"));
         assert!(globals.contains_key("PaymentMethodChangeEvent"));
@@ -34301,6 +34303,7 @@ mod tests {
             "PresentationRequest",
             "PresentationConnection",
             "PresentationAvailability",
+            "UserActivation",
         ] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
@@ -34325,6 +34328,75 @@ mod tests {
         assert_eval_type_error("new HIDDevice()");
         assert_eval_type_error("new SerialPort()");
         assert_eval_type_error("new PresentationRequest('/p')");
+        assert_eval_type_error("new UserActivation()");
+    }
+
+    /// Regression: clipboard, permissions, notifications, user activation,
+    /// geolocation, and device entry points must never fabricate permission
+    /// grants, prompt results, clipboard contents, sensor readings, or
+    /// activation state. Static helpers that browsers expose for permission
+    /// prompts (`Notification.requestPermission`, `Notification.permission`)
+    /// and instance methods that browsers expose for clipboard / permission
+    /// queries (`Clipboard.prototype.readText` / `writeText`,
+    /// `Permissions.prototype.query`) are intentionally absent so callers
+    /// cannot observe a fake resolved promise, fake `"granted"` / `"denied"`
+    /// state, or fake clipboard payload. Navigator-only entry points
+    /// (`navigator.clipboard`, `navigator.permissions`, `navigator.userActivation`,
+    /// `navigator.geolocation`, `navigator.credentials`, `navigator.mediaDevices`)
+    /// remain absent because the standalone engine does not preinstall
+    /// `navigator`.
+    #[test]
+    fn e2e_clipboard_permission_activation_surfaces_never_fabricate_state() {
+        // No fabricated permission prompt static surface.
+        assert_eval_true("typeof Notification.requestPermission === 'undefined'");
+        assert_eval_true("typeof Notification.permission === 'undefined'");
+        assert_eval_true("typeof Notification.maxActions === 'undefined'");
+
+        // No fabricated clipboard read/write or permission query methods on
+        // the prototype. The constructors exist for feature detection only.
+        assert_eval_true("typeof Clipboard.prototype.readText === 'undefined'");
+        assert_eval_true("typeof Clipboard.prototype.writeText === 'undefined'");
+        assert_eval_true("typeof Clipboard.prototype.read === 'undefined'");
+        assert_eval_true("typeof Clipboard.prototype.write === 'undefined'");
+        assert_eval_true("typeof ClipboardItem.prototype.getType === 'undefined'");
+        assert_eval_true("typeof ClipboardItem.supports === 'undefined'");
+        assert_eval_true("typeof Permissions.prototype.query === 'undefined'");
+        assert_eval_true("typeof Permissions.prototype.request === 'undefined'");
+        assert_eval_true("typeof Permissions.prototype.revoke === 'undefined'");
+        assert_eval_true("typeof PermissionStatus.prototype.state === 'undefined'");
+
+        // No fabricated geolocation accessors.
+        assert_eval_true("typeof Geolocation.prototype.getCurrentPosition === 'undefined'");
+        assert_eval_true("typeof Geolocation.prototype.watchPosition === 'undefined'");
+
+        // No fabricated user-activation accessors. Browsers expose
+        // `hasBeenActive` / `isActive` on `navigator.userActivation`; both
+        // must remain absent so callers cannot read a fake activation state.
+        assert_eval_true("typeof UserActivation.prototype.hasBeenActive === 'undefined'");
+        assert_eval_true("typeof UserActivation.prototype.isActive === 'undefined'");
+
+        // No fabricated WebAuthn / credential prompts.
+        assert_eval_true("typeof CredentialsContainer.prototype.get === 'undefined'");
+        assert_eval_true("typeof CredentialsContainer.prototype.create === 'undefined'");
+        assert_eval_true("typeof CredentialsContainer.prototype.store === 'undefined'");
+        assert_eval_true(
+            "typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'undefined'",
+        );
+        assert_eval_true(
+            "typeof PublicKeyCredential.isConditionalMediationAvailable === 'undefined'",
+        );
+
+        // Constructors themselves remain non-callable (no fake instance).
+        assert_eval_type_error("Notification('hi')");
+        assert_eval_type_error("Clipboard()");
+        assert_eval_type_error("Permissions()");
+        assert_eval_type_error("UserActivation()");
+        assert_eval_type_error("Geolocation()");
+        assert_eval_type_error("CredentialsContainer()");
+
+        // Navigator entry points remain absent: no fake `navigator.clipboard`,
+        // `navigator.permissions`, `navigator.userActivation`, etc.
+        assert_eval_true("typeof navigator === 'undefined'");
     }
 
     /// `navigator` itself is intentionally not preinstalled by the standalone
