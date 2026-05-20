@@ -3439,12 +3439,30 @@ fn resolve_text_decoder_receiver(
     Err(incompatible_receiver(display_name))
 }
 
-/// Return whether a `TextDecoder` constructor label is Stator's supported UTF-8 label.
+/// Return whether a `TextDecoder` constructor label is one of the WHATWG
+/// Encoding Standard aliases that map to the UTF-8 decoder.
+///
+/// Per the WHATWG Encoding §4.2 "get an encoding" algorithm, labels are first
+/// stripped of leading/trailing ASCII whitespace (TAB, LF, FF, CR, SPACE) and
+/// then matched case-insensitively against the alias table.  Stator only
+/// implements UTF-8, so we accept the six labels that map to UTF-8 and
+/// fail closed for everything else.
 fn text_decoder_label_is_utf8(label: Option<&JsValue>) -> StatorResult<bool> {
     let Some(label) = label.filter(|value| !value.is_undefined()) else {
         return Ok(true);
     };
-    Ok(label.to_js_string()?.eq_ignore_ascii_case("utf-8"))
+    let raw = label.to_js_string()?;
+    let trimmed = raw.trim_matches(|c: char| matches!(c, '\t' | '\n' | '\u{C}' | '\r' | ' '));
+    let lower = trimmed.to_ascii_lowercase();
+    Ok(matches!(
+        lower.as_str(),
+        "utf-8"
+            | "utf8"
+            | "unicode-1-1-utf-8"
+            | "unicode11utf8"
+            | "unicode20utf8"
+            | "x-unicode20utf8"
+    ))
 }
 
 /// Extract bytes accepted by `TextDecoder.prototype.decode`.
@@ -3567,6 +3585,15 @@ fn make_text_decoder() -> JsValue {
                 receiver.borrow().get("__text_decoder_ignore_bom__"),
                 Some(JsValue::Boolean(true))
             );
+            if let Some(options) = args.get(base + 1).filter(|value| !value.is_undefined())
+                && dispatch_get_property_value(options, JsValue::String("stream".into()))?
+                    .to_boolean()
+            {
+                return Err(StatorError::TypeError(
+                    "TextDecoder.prototype.decode: streaming decode ({ stream: true }) is not supported in Stator"
+                        .into(),
+                ));
+            }
             let bytes = text_decoder_input_bytes(args.get(base))?;
             let mut decoded = if fatal {
                 std::str::from_utf8(&bytes)
@@ -28092,6 +28119,36 @@ mod tests {
             "Object.getOwnPropertyDescriptor(
                 Object.getPrototypeOf(new TextDecoder()), 'encoding').get.call({})",
         );
+    }
+
+    #[test]
+    fn e2e_text_decoder_accepts_utf8_label_aliases() {
+        assert_eval_true(
+            "(() => {
+                const labels = [
+                    'utf-8', 'UTF-8', 'utf8', 'UTF8',
+                    'unicode-1-1-utf-8', 'unicode11utf8',
+                    'unicode20utf8', 'x-unicode20utf8',
+                    '  utf-8\\t', '\\nUTF-8\\r'
+                ];
+                return labels.every(l => new TextDecoder(l).encoding === 'utf-8');
+            })()",
+        );
+        assert_eval_range_error("new TextDecoder('utf-7')");
+        assert_eval_range_error("new TextDecoder('windows-1252')");
+    }
+
+    #[test]
+    fn e2e_text_decoder_rejects_stream_option() {
+        assert_eval_type_error(
+            "new TextDecoder().decode(new Uint8Array([0x41]), { stream: true })",
+        );
+        // stream: false and omitted options are accepted.
+        assert_eval_true(
+            "new TextDecoder().decode(new Uint8Array([0x41]), { stream: false }) === 'A'",
+        );
+        assert_eval_true("new TextDecoder().decode(new Uint8Array([0x41]), {}) === 'A'");
+        assert_eval_true("new TextDecoder().decode(new Uint8Array([0x41]), undefined) === 'A'");
     }
 
     #[test]
