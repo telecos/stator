@@ -7005,8 +7005,9 @@ fn make_request_builtin() -> JsValue {
 // there is no capture/bubble propagation beyond the target itself, and
 // `composedPath()` intentionally remains an empty array.
 //
-// Every other `XxxEvent` constructor, `AbortController`, and `AbortSignal`
-// remains fail-closed.
+// Every other `XxxEvent` constructor remains fail-closed. `AbortController`
+// and `AbortSignal` are standalone EventTarget-backed abort primitives; they
+// do not integrate with host fetch, streams, timers, or task cancellation.
 //
 // Reference: https://dom.spec.whatwg.org/#interface-event
 
@@ -7019,6 +7020,12 @@ const CUSTOM_EVENT_BRAND: &str = "__is_custom_event__";
 
 /// Hidden brand placed on every `EventTarget` instance for receiver checks.
 const EVENT_TARGET_BRAND: &str = "__is_event_target__";
+
+/// Hidden brand placed on every `AbortController` instance.
+const ABORT_CONTROLLER_BRAND: &str = "__is_abort_controller__";
+
+/// Hidden brand placed on every `AbortSignal` instance.
+const ABORT_SIGNAL_BRAND: &str = "__is_abort_signal__";
 
 #[derive(Clone)]
 struct EventListenerEntry {
@@ -7034,6 +7041,15 @@ struct EventListenerEntry {
 struct EventTargetState {
     listeners: Vec<EventListenerEntry>,
     next_listener_id: u64,
+}
+
+struct AbortControllerState {
+    signal: JsValue,
+}
+
+struct AbortSignalState {
+    aborted: bool,
+    reason: JsValue,
 }
 
 /// Mutable internal state of an `Event` / `CustomEvent` instance.
@@ -7079,6 +7095,14 @@ thread_local! {
         RefCell::new(HashMap::new());
     static EVENT_TARGET_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
+    static ABORT_CONTROLLER_STATES: RefCell<HashMap<usize, Rc<RefCell<AbortControllerState>>>> =
+        RefCell::new(HashMap::new());
+    static ABORT_SIGNAL_STATES: RefCell<HashMap<usize, Rc<RefCell<AbortSignalState>>>> =
+        RefCell::new(HashMap::new());
+    static ABORT_CONTROLLER_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static ABORT_SIGNAL_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
 }
 
 fn event_type_error(message: impl Into<String>) -> StatorError {
@@ -7098,6 +7122,26 @@ fn install_event_target_state(
 ) {
     let id = Rc::as_ptr(instance) as usize;
     EVENT_TARGET_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn install_abort_controller_state(
+    instance: &Rc<RefCell<PropertyMap>>,
+    state: Rc<RefCell<AbortControllerState>>,
+) {
+    let id = Rc::as_ptr(instance) as usize;
+    ABORT_CONTROLLER_STATES.with(|s| {
+        s.borrow_mut().insert(id, state);
+    });
+}
+
+fn install_abort_signal_state(
+    instance: &Rc<RefCell<PropertyMap>>,
+    state: Rc<RefCell<AbortSignalState>>,
+) {
+    let id = Rc::as_ptr(instance) as usize;
+    ABORT_SIGNAL_STATES.with(|s| {
         s.borrow_mut().insert(id, state);
     });
 }
@@ -7145,6 +7189,56 @@ fn resolve_event_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
 
 fn resolve_event_target_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
     resolve_branded_receiver(args, EVENT_TARGET_BRAND)
+}
+
+fn resolve_abort_controller_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, ABORT_CONTROLLER_BRAND)
+}
+
+fn resolve_abort_signal_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    resolve_branded_receiver(args, ABORT_SIGNAL_BRAND)
+}
+
+fn lookup_abort_controller_state(
+    value: &JsValue,
+) -> StatorResult<Rc<RefCell<AbortControllerState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(event_type_error(
+            "AbortController method called on non-AbortController receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(ABORT_CONTROLLER_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(event_type_error(
+            "AbortController method called on non-AbortController receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    ABORT_CONTROLLER_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| event_type_error("AbortController: internal state missing"))
+}
+
+fn lookup_abort_signal_state(value: &JsValue) -> StatorResult<Rc<RefCell<AbortSignalState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(event_type_error(
+            "AbortSignal method called on non-AbortSignal receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(ABORT_SIGNAL_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(event_type_error(
+            "AbortSignal method called on non-AbortSignal receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    ABORT_SIGNAL_STATES
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| event_type_error("AbortSignal: internal state missing"))
 }
 
 fn set_event_canceled(state: &mut EventState) {
@@ -7684,6 +7778,75 @@ fn mark_event_dispatch_finished(event_state: &Rc<RefCell<EventState>>) {
     event.in_passive_listener = false;
 }
 
+fn dispatch_event_on_target(recv: &JsValue, event_value: JsValue) -> StatorResult<JsValue> {
+    let state = lookup_event_target_state(recv)?;
+    let event_state = lookup_event_state(&event_value)?;
+    {
+        let mut event = event_state.borrow_mut();
+        if event.dispatching {
+            return Err(event_type_error(
+                "EventTarget: cannot redispatch an event while it is dispatching",
+            ));
+        }
+        event.dispatching = true;
+        event.target = recv.clone();
+        event.current_target = recv.clone();
+        event.event_phase = 2;
+        event.stop_propagation = false;
+        event.stop_immediate_propagation = false;
+        event.in_passive_listener = false;
+    }
+
+    let event_type = event_state.borrow().type_.clone();
+    let snapshot: Vec<EventListenerEntry> = state
+        .borrow()
+        .listeners
+        .iter()
+        .filter(|entry| !entry.removed && entry.type_ == event_type)
+        .cloned()
+        .collect();
+
+    for entry in snapshot {
+        if !state
+            .borrow()
+            .listeners
+            .iter()
+            .any(|current| current.id == entry.id && !current.removed)
+        {
+            continue;
+        }
+        if entry.once {
+            for current in &mut state.borrow_mut().listeners {
+                if current.id == entry.id {
+                    current.removed = true;
+                    break;
+                }
+            }
+        }
+        {
+            let mut event = event_state.borrow_mut();
+            event.in_passive_listener = entry.passive;
+        }
+        if let Err(err) = invoke_event_listener(&entry.callback, recv, &event_value) {
+            mark_event_dispatch_finished(&event_state);
+            state.borrow_mut().listeners.retain(|entry| !entry.removed);
+            return Err(err);
+        }
+        {
+            let mut event = event_state.borrow_mut();
+            event.in_passive_listener = false;
+            if event.stop_immediate_propagation || event.stop_propagation {
+                break;
+            }
+        }
+    }
+
+    let canceled = event_state.borrow().canceled && event_state.borrow().cancelable;
+    mark_event_dispatch_finished(&event_state);
+    state.borrow_mut().listeners.retain(|entry| !entry.removed);
+    Ok(JsValue::Boolean(!canceled))
+}
+
 fn make_event_target_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -7801,73 +7964,8 @@ fn make_event_target_builtin() -> JsValue {
         "dispatchEvent".into(),
         builtin_fn("dispatchEvent", 1, |args| {
             let (recv, rest) = resolve_event_target_receiver(&args);
-            let state = lookup_event_target_state(&recv)?;
             let event_value = rest.first().cloned().unwrap_or(JsValue::Undefined);
-            let event_state = lookup_event_state(&event_value)?;
-            {
-                let mut event = event_state.borrow_mut();
-                if event.dispatching {
-                    return Err(event_type_error(
-                        "EventTarget: cannot redispatch an event while it is dispatching",
-                    ));
-                }
-                event.dispatching = true;
-                event.target = recv.clone();
-                event.current_target = recv.clone();
-                event.event_phase = 2;
-                event.stop_propagation = false;
-                event.stop_immediate_propagation = false;
-                event.in_passive_listener = false;
-            }
-
-            let event_type = event_state.borrow().type_.clone();
-            let snapshot: Vec<EventListenerEntry> = state
-                .borrow()
-                .listeners
-                .iter()
-                .filter(|entry| !entry.removed && entry.type_ == event_type)
-                .cloned()
-                .collect();
-
-            for entry in snapshot {
-                if !state
-                    .borrow()
-                    .listeners
-                    .iter()
-                    .any(|current| current.id == entry.id && !current.removed)
-                {
-                    continue;
-                }
-                if entry.once {
-                    for current in &mut state.borrow_mut().listeners {
-                        if current.id == entry.id {
-                            current.removed = true;
-                            break;
-                        }
-                    }
-                }
-                {
-                    let mut event = event_state.borrow_mut();
-                    event.in_passive_listener = entry.passive;
-                }
-                if let Err(err) = invoke_event_listener(&entry.callback, &recv, &event_value) {
-                    mark_event_dispatch_finished(&event_state);
-                    state.borrow_mut().listeners.retain(|entry| !entry.removed);
-                    return Err(err);
-                }
-                {
-                    let mut event = event_state.borrow_mut();
-                    event.in_passive_listener = false;
-                    if event.stop_immediate_propagation || event.stop_propagation {
-                        break;
-                    }
-                }
-            }
-
-            let canceled = event_state.borrow().canceled && event_state.borrow().cancelable;
-            mark_event_dispatch_finished(&event_state);
-            state.borrow_mut().listeners.retain(|entry| !entry.removed);
-            Ok(JsValue::Boolean(!canceled))
+            dispatch_event_on_target(&recv, event_value)
         }),
     );
     proto.insert_with_attrs(
@@ -7879,6 +7977,286 @@ fn make_event_target_builtin() -> JsValue {
 
     let proto_rc = Rc::new(RefCell::new(proto));
     EVENT_TARGET_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+fn make_default_abort_reason() -> StatorResult<JsValue> {
+    let reason = make_dom_exception_instance(vec![
+        JsValue::String("signal is aborted without reason".into()),
+        JsValue::String("AbortError".into()),
+    ])?;
+    attach_constructor_prototype(&reason, "DOMException")?;
+    Ok(reason)
+}
+
+fn build_abort_signal_instance(aborted: bool, reason: JsValue) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            EVENT_TARGET_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            ABORT_SIGNAL_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = ABORT_SIGNAL_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_event_target_state(
+        &inst,
+        Rc::new(RefCell::new(EventTargetState {
+            listeners: Vec::new(),
+            next_listener_id: 0,
+        })),
+    );
+    install_abort_signal_state(
+        &inst,
+        Rc::new(RefCell::new(AbortSignalState { aborted, reason })),
+    );
+    JsValue::PlainObject(inst)
+}
+
+fn abort_signal(signal: &JsValue, reason: JsValue) -> StatorResult<()> {
+    let state = lookup_abort_signal_state(signal)?;
+    {
+        let mut signal_state = state.borrow_mut();
+        if signal_state.aborted {
+            return Ok(());
+        }
+        signal_state.aborted = true;
+        signal_state.reason = reason;
+    }
+
+    let proto = EVENT_PROTO.with(|p| p.borrow().clone());
+    let event = build_event_instance(
+        EventState {
+            type_: "abort".into(),
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+            canceled: false,
+            stop_propagation: false,
+            stop_immediate_propagation: false,
+            time_stamp: current_time_millis(),
+            detail: JsValue::Null,
+            target: JsValue::Null,
+            current_target: JsValue::Null,
+            event_phase: 0,
+            dispatching: false,
+            in_passive_listener: false,
+        },
+        proto,
+        false,
+    );
+    dispatch_event_on_target(signal, event)?;
+    Ok(())
+}
+
+fn abort_reason_arg(rest: &[JsValue]) -> StatorResult<JsValue> {
+    match rest.first() {
+        Some(value) if !matches!(value, JsValue::Undefined) => Ok(value.clone()),
+        _ => make_default_abort_reason(),
+    }
+}
+
+fn make_abort_signal_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+    let illegal_constructor = native(|_| {
+        Err(event_type_error(
+            "Class constructor AbortSignal cannot be invoked without 'new'",
+        ))
+    });
+    props.insert("__call__".into(), illegal_constructor.clone());
+    props.insert("__construct__".into(), illegal_constructor);
+    props.insert(
+        "abort".into(),
+        builtin_fn("abort", 0, |args| {
+            let reason = abort_reason_arg(&args)?;
+            Ok(build_abort_signal_instance(true, reason))
+        }),
+    );
+    props.insert(
+        "any".into(),
+        builtin_fn("any", 1, |args| {
+            let signals = collect_iterable_values(args.first().unwrap_or(&JsValue::Undefined))?;
+            let output = build_abort_signal_instance(false, JsValue::Undefined);
+            for signal in signals {
+                let source_state = lookup_abort_signal_state(&signal)?;
+                if source_state.borrow().aborted {
+                    abort_signal(&output, source_state.borrow().reason.clone())?;
+                    break;
+                }
+                let output_signal = output.clone();
+                let source_signal = signal.clone();
+                let callback = JsValue::NativeFunction(Rc::new(move |_args| {
+                    let reason = lookup_abort_signal_state(&source_signal)?
+                        .borrow()
+                        .reason
+                        .clone();
+                    abort_signal(&output_signal, reason)?;
+                    Ok(JsValue::Undefined)
+                }));
+                dispatch_call_with_this(
+                    &dispatch_get_property_value(
+                        &signal,
+                        JsValue::String("addEventListener".into()),
+                    )?,
+                    signal,
+                    vec![
+                        JsValue::String("abort".into()),
+                        callback,
+                        JsValue::PlainObject(Rc::new(RefCell::new({
+                            let mut opts = PropertyMap::new();
+                            opts.insert("once".into(), JsValue::Boolean(true));
+                            opts
+                        }))),
+                    ],
+                )?;
+            }
+            Ok(output)
+        }),
+    );
+
+    let mut proto = PropertyMap::new();
+    if let Some(event_target_proto) = EVENT_TARGET_PROTO.with(|p| p.borrow().clone()) {
+        proto.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            JsValue::PlainObject(event_target_proto),
+            PropertyAttributes::empty(),
+        );
+    }
+    proto.insert_with_attrs(
+        "__get_aborted__".into(),
+        native(|args| {
+            let (recv, _) = resolve_abort_signal_receiver(&args);
+            let state = lookup_abort_signal_state(&recv)?;
+            Ok(JsValue::Boolean(state.borrow().aborted))
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "__get_reason__".into(),
+        native(|args| {
+            let (recv, _) = resolve_abort_signal_receiver(&args);
+            let state = lookup_abort_signal_state(&recv)?;
+            Ok(state.borrow().reason.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("AbortSignal".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let proto_rc = Rc::new(RefCell::new(proto));
+    ABORT_SIGNAL_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+fn make_abort_controller_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_| {
+            Err(event_type_error(
+                "Class constructor AbortController cannot be invoked without 'new'",
+            ))
+        }),
+    );
+    props.insert(
+        "__construct__".into(),
+        native(|_args| {
+            let signal = build_abort_signal_instance(false, JsValue::Undefined);
+            let inst = Rc::new(RefCell::new(PropertyMap::new()));
+            {
+                let mut props = inst.borrow_mut();
+                props.insert_with_attrs(
+                    ABORT_CONTROLLER_BRAND.into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
+                );
+                if let Some(proto) = ABORT_CONTROLLER_PROTO.with(|p| p.borrow().clone()) {
+                    props.insert_with_attrs(
+                        INTERNAL_PROTO_PROPERTY_KEY.into(),
+                        JsValue::PlainObject(proto),
+                        PropertyAttributes::empty(),
+                    );
+                }
+            }
+            install_abort_controller_state(
+                &inst,
+                Rc::new(RefCell::new(AbortControllerState { signal })),
+            );
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "__get_signal__".into(),
+        native(|args| {
+            let (recv, _) = resolve_abort_controller_receiver(&args);
+            let state = lookup_abort_controller_state(&recv)?;
+            Ok(state.borrow().signal.clone())
+        }),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert(
+        "abort".into(),
+        builtin_fn("abort", 0, |args| {
+            let (recv, rest) = resolve_abort_controller_receiver(&args);
+            let state = lookup_abort_controller_state(&recv)?;
+            let reason = abort_reason_arg(&rest)?;
+            abort_signal(&state.borrow().signal, reason)?;
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("AbortController".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let proto_rc = Rc::new(RefCell::new(proto));
+    ABORT_CONTROLLER_PROTO.with(|p| {
         *p.borrow_mut() = Some(Rc::clone(&proto_rc));
     });
     props.insert(
@@ -22231,9 +22609,9 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // no host event loop, no trusted events, no default actions, and no
         // capture/bubble propagation beyond the target listener list.
         //
-        // `AbortController` and `AbortSignal` remain fail-closed: they expose
-        // constructor names for feature detection but reject construction so
-        // product code never relies on a fake abort surface.
+        // `AbortController` and `AbortSignal` are standalone EventTarget-backed
+        // abort primitives. They intentionally do not unlock fetch/network,
+        // stream, timer, or host-task cancellation.
         globals.insert("Event".into(), finalize_ctor(make_event_builtin(), "Event"));
         globals.insert(
             "CustomEvent".into(),
@@ -22244,18 +22622,12 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_event_target_builtin(), "EventTarget"),
         );
         globals.insert(
-            "AbortController".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("AbortController"),
-                "AbortController",
-            ),
+            "AbortSignal".into(),
+            finalize_ctor(make_abort_signal_builtin(), "AbortSignal"),
         );
         globals.insert(
-            "AbortSignal".into(),
-            finalize_ctor(
-                make_unsupported_web_constructor("AbortSignal"),
-                "AbortSignal",
-            ),
+            "AbortController".into(),
+            finalize_ctor(make_abort_controller_builtin(), "AbortController"),
         );
 
         // ── DOM UI / input / pointer / drag / touch / lifecycle event
@@ -24687,20 +25059,97 @@ mod tests {
     #[test]
     fn e2e_event_target_abort_signal_option_is_fail_closed() {
         assert_eval_type_error(
-            "(new EventTarget()).addEventListener('x', function() {}, { signal: {} })",
+            "(new EventTarget()).addEventListener('x', function() {}, { signal: (new AbortController()).signal })",
         );
     }
 
     #[test]
-    fn e2e_abort_remains_fail_closed() {
-        // Constructors still exist as functions for feature detection.
-        assert_eval_true("typeof EventTarget === 'function'");
+    fn e2e_abort_controller_and_signal_construct_and_brand() {
         assert_eval_true("typeof AbortController === 'function'");
         assert_eval_true("typeof AbortSignal === 'function'");
-        // EventTarget is now real; abort types still throw.
-        assert_eval_true("new EventTarget() instanceof EventTarget");
-        assert_eval_type_error("new AbortController()");
+        assert_eval_true(
+            "var c = new AbortController(); \
+             c instanceof AbortController && c.signal instanceof AbortSignal && \
+             c.signal instanceof EventTarget && Object.prototype.toString.call(c.signal) === '[object AbortSignal]'",
+        );
+        assert_eval_true("var c = new AbortController(); c.signal === c.signal");
+        assert_eval_type_error("AbortController()");
         assert_eval_type_error("new AbortSignal()");
+    }
+
+    #[test]
+    fn e2e_abort_controller_abort_state_reason_and_default_reason() {
+        assert_eval_true(
+            "var c = new AbortController(); var reason = { why: 1 }; \
+             c.abort(reason); c.signal.aborted === true && c.signal.reason === reason",
+        );
+        assert_eval_true(
+            "var c = new AbortController(); c.abort(); \
+             c.signal.aborted === true && c.signal.reason instanceof DOMException && \
+             c.signal.reason.name === 'AbortError'",
+        );
+        assert_eval_true(
+            "var c = new AbortController(); c.abort('first'); c.abort('second'); \
+             c.signal.reason === 'first'",
+        );
+    }
+
+    #[test]
+    fn e2e_abort_signal_dispatches_abort_event_once_with_eventtarget_semantics() {
+        assert_eval_true(
+            "var c = new AbortController(); var seen = ''; \
+             c.signal.addEventListener('abort', function(e) { \
+                 seen += e.type + ':' + (e.target === c.signal) + ':' + e.bubbles + ':'; \
+             }); \
+             c.abort('x'); c.abort('y'); seen === 'abort:true:false:'",
+        );
+        assert_eval_true(
+            "var c = new AbortController(); var seen = ''; \
+             c.signal.addEventListener('abort', function() { seen += 'a'; }, { once: true }); \
+             c.signal.addEventListener('abort', function() { seen += 'b'; }); \
+             c.abort(); c.abort(); seen === 'ab'",
+        );
+    }
+
+    #[test]
+    fn e2e_abort_signal_static_helpers_without_timers() {
+        assert_eval_true(
+            "var reason = { r: 1 }; var s = AbortSignal.abort(reason); \
+             s instanceof AbortSignal && s.aborted === true && s.reason === reason",
+        );
+        assert_eval_true(
+            "var c = new AbortController(); var s = AbortSignal.any([c.signal]); \
+             var seen = 0; s.addEventListener('abort', function() { seen += 1; }); \
+             c.abort('late'); s.aborted === true && s.reason === 'late' && seen === 1",
+        );
+        assert_eval_true(
+            "var a = AbortSignal.abort('now'); var s = AbortSignal.any([a]); \
+             s.aborted === true && s.reason === 'now'",
+        );
+        assert_eval_true("typeof AbortSignal.timeout === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_abort_receiver_brand_checks_and_omitted_onabort() {
+        assert_eval_type_error("AbortController.prototype.abort.call({})");
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(AbortController.prototype, 'signal').get.call({})",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get.call({})",
+        );
+        assert_eval_type_error("AbortSignal.any([{}])");
+        assert_eval_true("!('onabort' in AbortSignal.prototype)");
+    }
+
+    #[test]
+    fn e2e_abort_does_not_unlock_fetch_timers_or_streams() {
+        assert_eval_type_error(
+            "fetch('https://example.test/', { signal: (new AbortController()).signal })",
+        );
+        assert_eval_type_error("setTimeout(function () {}, 0)");
+        assert_eval_type_error("new ReadableStream({ start() {} })");
+        assert_eval_true("new Request('https://example.test/').signal === null");
     }
 
     #[test]
@@ -25822,19 +26271,20 @@ mod tests {
     }
 
     #[test]
-    fn e2e_abort_controller_constructor_exists_but_fails_closed() {
+    fn e2e_abort_controller_constructor_is_real_and_constructs() {
         assert_eval_true(
             "typeof AbortController === 'function' && AbortController.name === 'AbortController'",
         );
         assert_eval_type_error("AbortController()");
-        assert_eval_type_error("new AbortController()");
+        assert_eval_true("new AbortController() instanceof AbortController");
     }
 
     #[test]
-    fn e2e_abort_signal_constructor_exists_but_fails_closed() {
+    fn e2e_abort_signal_constructor_exists_but_is_illegal() {
         assert_eval_true("typeof AbortSignal === 'function' && AbortSignal.name === 'AbortSignal'");
         assert_eval_type_error("AbortSignal()");
         assert_eval_type_error("new AbortSignal()");
+        assert_eval_true("(new AbortController()).signal instanceof AbortSignal");
     }
 
     #[test]
