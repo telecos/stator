@@ -94,6 +94,64 @@ fn test_abi_version_function_matches_constant() {
     assert_eq!(stator_jse_ffi::stator_ffi_abi_version_patch(), patch);
 }
 
+/// Parse the integer value of a `#define <name> <int-literal>` line from the
+/// generated header, returning `None` if the macro is missing or its value is
+/// not a bare decimal integer.  Only the simple `#define NAME N` shape used
+/// for the ABI version components is recognised; the packed
+/// `STATOR_FFI_ABI_VERSION` macro uses an expression and is handled
+/// separately.
+fn parse_define_u32(header: &str, name: &str) -> Option<u32> {
+    for line in header.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("#define") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(after_name) = rest.strip_prefix(name) else {
+            continue;
+        };
+        let value = after_name.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if let Ok(v) = value.parse::<u32>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_header_abi_version_macros_match_rust_constants() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+
+    let header_major = parse_define_u32(&header, "STATOR_FFI_ABI_VERSION_MAJOR")
+        .expect("generated stator.h must define STATOR_FFI_ABI_VERSION_MAJOR as a decimal integer");
+    let header_minor = parse_define_u32(&header, "STATOR_FFI_ABI_VERSION_MINOR")
+        .expect("generated stator.h must define STATOR_FFI_ABI_VERSION_MINOR as a decimal integer");
+    let header_patch = parse_define_u32(&header, "STATOR_FFI_ABI_VERSION_PATCH")
+        .expect("generated stator.h must define STATOR_FFI_ABI_VERSION_PATCH as a decimal integer");
+
+    assert_eq!(
+        header_major,
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_MAJOR,
+        "stator.h STATOR_FFI_ABI_VERSION_MAJOR ({header_major}) drifted from Rust constant ({}); regenerate the header by running `cargo build -p stator_jse_ffi`",
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_MAJOR,
+    );
+    assert_eq!(
+        header_minor,
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_MINOR,
+        "stator.h STATOR_FFI_ABI_VERSION_MINOR ({header_minor}) drifted from Rust constant ({}); regenerate the header by running `cargo build -p stator_jse_ffi`",
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_MINOR,
+    );
+    assert_eq!(
+        header_patch,
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_PATCH,
+        "stator.h STATOR_FFI_ABI_VERSION_PATCH ({header_patch}) drifted from Rust constant ({}); regenerate the header by running `cargo build -p stator_jse_ffi`",
+        stator_jse_ffi::STATOR_FFI_ABI_VERSION_PATCH,
+    );
+}
+
 #[test]
 fn test_header_contains_abi_version_markers() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
