@@ -7265,9 +7265,11 @@ fn make_headers_builtin() -> JsValue {
 /// Hidden brand placed on every `FormData` instance for receiver checks.
 const FORM_DATA_BRAND: &str = "__is_form_data__";
 
-/// Standalone `FormData` entry list. This engine only supports string values;
-/// Blob/File-backed entries and multipart/body integration remain unsupported.
-type FormDataList = Vec<(String, String)>;
+/// Standalone `FormData` entry list. Each entry value is either a
+/// `JsValue::String` (string entry) or a `JsValue::PlainObject` that carries
+/// the `File` brand. Multipart serialization / fetch / Request / Response
+/// body integration intentionally remains unsupported and fail-closed.
+type FormDataList = Vec<(String, JsValue)>;
 
 thread_local! {
     static FORM_DATA_STATES: RefCell<HashMap<usize, Rc<RefCell<FormDataList>>>> =
@@ -7322,40 +7324,63 @@ fn resolve_form_data_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
     (env_this, args.to_vec())
 }
 
-fn global_constructor_prototype(name: &str) -> Option<JsValue> {
-    current_global_env()
-        .and_then(|env| env.borrow().get(name).cloned())
-        .and_then(|ctor| {
-            dispatch_get_property_value(&ctor, JsValue::String("prototype".into())).ok()
-        })
+fn form_data_has_brand(value: &JsValue, brand: &str) -> bool {
+    matches!(value, JsValue::PlainObject(map)
+        if matches!(map.borrow().get(brand), Some(JsValue::Boolean(true))))
 }
 
-fn is_blob_or_file_like(value: &JsValue) -> bool {
-    ["Blob", "File"]
-        .into_iter()
-        .filter_map(global_constructor_prototype)
-        .any(|prototype| value == &prototype || has_prototype_in_chain(value, &prototype))
-}
-
-fn form_data_string_pair(
+/// Coerce an `append` / `set` (name, value, filename?) tuple into the entry
+/// form mandated by the WHATWG XHR "create an entry" algorithm:
+///   * If `value` is a real `Blob` (branded), wrap it into a `File` entry per
+///     spec: Blob without filename becomes a File named `"blob"`; Blob with
+///     filename becomes a File with that name; File without filename is
+///     preserved as-is; File with an explicit filename is wrapped into a new
+///     File with the overridden name (bytes/type/lastModified copied).
+///   * Otherwise the value is stringified per WebIDL overload resolution and
+///     the `filename` argument is ignored (matching browser behavior — only
+///     the `Blob`/`File` overload uses `filename`).
+fn form_data_coerce_entry(
     name: &JsValue,
     value: &JsValue,
     filename: Option<&JsValue>,
-) -> StatorResult<(String, String)> {
-    if filename.is_some() {
-        return Err(form_data_type_error(
-            "FormData: Blob/File filename entries are not supported",
-        ));
+) -> StatorResult<(String, JsValue)> {
+    let name = name.to_js_string()?;
+    let filename_arg = match filename {
+        None | Some(JsValue::Undefined) => None,
+        Some(v) => Some(v.to_js_string()?),
+    };
+    if !form_data_has_brand(value, BLOB_BRAND) {
+        // Non-Blob path: stringify value; `filename` is ignored per WebIDL
+        // overload resolution (the filename overload only applies to Blob).
+        let s = value.to_js_string()?;
+        return Ok((name, JsValue::String(s.into())));
     }
-    if is_blob_or_file_like(value) {
-        return Err(form_data_type_error(
-            "FormData: Blob/File values are not supported",
-        ));
-    }
-    Ok((name.to_js_string()?, value.to_js_string()?))
+    // Blob/File path: derive bytes and MIME from the branded Blob state and
+    // build a File entry per the create-an-entry algorithm.
+    let blob_state = lookup_blob_state(value)?;
+    let is_file = form_data_has_brand(value, FILE_BRAND);
+    let entry_value = match (is_file, filename_arg) {
+        (true, None) => value.clone(),
+        (true, Some(fname)) => {
+            let last_modified = lookup_file_state(value)?.last_modified;
+            build_file_instance(
+                blob_state.bytes.clone(),
+                blob_state.mime.clone(),
+                fname,
+                last_modified,
+            )
+        }
+        (false, fname) => build_file_instance(
+            blob_state.bytes.clone(),
+            blob_state.mime.clone(),
+            fname.unwrap_or_else(|| "blob".to_string()),
+            current_time_millis(),
+        ),
+    };
+    Ok((name, entry_value))
 }
 
-fn form_data_set(list: &mut FormDataList, name: String, value: String) {
+fn form_data_set(list: &mut FormDataList, name: String, value: JsValue) {
     if let Some(first_index) = list.iter().position(|(k, _)| k == &name) {
         list[first_index] = (name.clone(), value);
         let mut seen_first = false;
@@ -7403,10 +7428,7 @@ fn build_form_data_instance(list: FormDataList) -> StatorResult<JsValue> {
                     .borrow()
                     .iter()
                     .map(|(k, v)| {
-                        JsValue::new_array(vec![
-                            JsValue::String(k.clone().into()),
-                            JsValue::String(v.clone().into()),
-                        ])
+                        JsValue::new_array(vec![JsValue::String(k.clone().into()), v.clone()])
                     })
                     .collect();
                 Ok(form_data_make_iterator(values))
@@ -7447,7 +7469,7 @@ fn make_form_data_builtin() -> JsValue {
                 let state = lookup_form_data_state(&recv)?;
                 let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
                 let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (name, value) = form_data_string_pair(&name, &value, rest.get(2))?;
+                let (name, value) = form_data_coerce_entry(&name, &value, rest.get(2))?;
                 state.borrow_mut().push((name, value));
                 Ok(JsValue::Undefined)
             }),
@@ -7482,7 +7504,7 @@ fn make_form_data_builtin() -> JsValue {
                     .borrow()
                     .iter()
                     .find(|(k, _)| k == &name)
-                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .map(|(_, v)| v.clone())
                     .unwrap_or(JsValue::Null))
             }),
         );
@@ -7501,7 +7523,7 @@ fn make_form_data_builtin() -> JsValue {
                     .borrow()
                     .iter()
                     .filter(|(k, _)| k == &name)
-                    .map(|(_, v)| JsValue::String(v.clone().into()))
+                    .map(|(_, v)| v.clone())
                     .collect();
                 Ok(JsValue::new_array(values))
             }),
@@ -7530,7 +7552,7 @@ fn make_form_data_builtin() -> JsValue {
                 let state = lookup_form_data_state(&recv)?;
                 let name = rest.first().cloned().unwrap_or(JsValue::Undefined);
                 let value = rest.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (name, value) = form_data_string_pair(&name, &value, rest.get(2))?;
+                let (name, value) = form_data_coerce_entry(&name, &value, rest.get(2))?;
                 form_data_set(&mut state.borrow_mut(), name, value);
                 Ok(JsValue::Undefined)
             }),
@@ -7548,11 +7570,7 @@ fn make_form_data_builtin() -> JsValue {
                     dispatch_call_with_this(
                         &cb,
                         this_arg.clone(),
-                        vec![
-                            JsValue::String(v.into()),
-                            JsValue::String(k.into()),
-                            recv.clone(),
-                        ],
+                        vec![v, JsValue::String(k.into()), recv.clone()],
                     )?;
                 }
                 Ok(JsValue::Undefined)
@@ -7566,10 +7584,7 @@ fn make_form_data_builtin() -> JsValue {
                 .borrow()
                 .iter()
                 .map(|(k, v)| {
-                    JsValue::new_array(vec![
-                        JsValue::String(k.clone().into()),
-                        JsValue::String(v.clone().into()),
-                    ])
+                    JsValue::new_array(vec![JsValue::String(k.clone().into()), v.clone()])
                 })
                 .collect();
             Ok(form_data_make_iterator(values))
@@ -7595,11 +7610,7 @@ fn make_form_data_builtin() -> JsValue {
             native(|args| {
                 let (recv, _) = resolve_form_data_receiver(&args);
                 let state = lookup_form_data_state(&recv)?;
-                let values = state
-                    .borrow()
-                    .iter()
-                    .map(|(_, v)| JsValue::String(v.clone().into()))
-                    .collect();
+                let values = state.borrow().iter().map(|(_, v)| v.clone()).collect();
                 Ok(form_data_make_iterator(values))
             }),
         );
@@ -30026,14 +30037,83 @@ mod tests {
     }
 
     #[test]
-    fn e2e_form_data_rejects_file_and_blob_paths() {
-        assert_eval_type_error("(new FormData()).append('a', 'b', 'file.txt')");
-        assert_eval_type_error("(new FormData()).set('a', 'b', 'file.txt')");
-        assert_eval_type_error("(new FormData()).append('blob', new Blob(['x']))");
-        assert_eval_type_error("(new FormData()).append('blob', Object.create(Blob.prototype))");
-        assert_eval_type_error("(new FormData()).append('file', Object.create(File.prototype))");
-        assert_eval_type_error("(new FormData()).append('blob-proto', Blob.prototype)");
-        assert_eval_type_error("(new FormData()).append('file', new File(['body'], 'body.txt'))");
+    fn e2e_form_data_blob_value_wraps_into_file_named_blob() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('b', new Blob(['hello'], { type: 'text/plain' })); var v = f.get('b'); v instanceof File && v instanceof Blob && v.name === 'blob' && v.size === 5 && v.type === 'text/plain'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_blob_value_with_filename_uses_provided_name() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('b', new Blob(['hi']), 'note.txt'); var v = f.get('b'); v instanceof File && v.name === 'note.txt' && v.size === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_file_value_preserves_identity_and_name() {
+        assert_eval_true(
+            "var f = new FormData(); var file = new File(['body'], 'body.txt'); f.append('f', file); var v = f.get('f'); v === file && v.name === 'body.txt'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_file_value_with_filename_override_creates_new_file() {
+        assert_eval_true(
+            "var f = new FormData(); var file = new File(['body'], 'body.txt', { type: 'text/plain', lastModified: 12345 }); f.append('f', file, 'override.txt'); var v = f.get('f'); v !== file && v instanceof File && v.name === 'override.txt' && v.size === 4 && v.type === 'text/plain' && v.lastModified === 12345",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_set_blob_replaces_in_place_with_file_entry() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('x','1'); f.append('a', new Blob(['old'])); f.append('a', 'b'); f.set('a', new Blob(['new']), 'new.bin'); var all = f.getAll('a'); all.length === 1 && all[0] instanceof File && all[0].name === 'new.bin' && all[0].size === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_blob_entries_iterate_as_file_objects() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', new Blob(['x'])); f.append('b', 'plain'); var seen = []; for (var e of f) seen.push(e[0] + ':' + (e[1] instanceof File ? 'F' : typeof e[1])); seen.join('|') === 'a:F|b:string'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', new Blob(['x'])); var vs = []; for (var v of f.values()) vs.push(v instanceof File); vs.length === 1 && vs[0] === true",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_blob_for_each_passes_file_value() {
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', new Blob(['x']), 'a.txt'); var seen; f.forEach(function(v,k,o){ seen = (v instanceof File) && v.name === 'a.txt' && k === 'a' && o === f; }); seen === true",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_filename_is_ignored_for_string_values() {
+        // Per WebIDL overload resolution: filename only applies to the Blob
+        // overload. With a string value, the third argument is ignored.
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', 'b', 'file.txt'); f.get('a') === 'b'",
+        );
+        assert_eval_true("var f = new FormData(); f.set('a', 'b', 'file.txt'); f.get('a') === 'b'");
+    }
+
+    #[test]
+    fn e2e_form_data_non_branded_blob_prototype_is_stringified() {
+        // A plain object whose prototype chain reaches Blob.prototype is NOT a
+        // real Blob (no internal brand) and per WebIDL is treated as a string.
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', Object.create(Blob.prototype)); typeof f.get('a') === 'string'",
+        );
+        assert_eval_true(
+            "var f = new FormData(); f.append('a', Blob.prototype); typeof f.get('a') === 'string'",
+        );
+    }
+
+    #[test]
+    fn e2e_form_data_rejects_symbol_in_blob_path() {
+        // Symbol filename still throws via ToString coercion.
+        assert_eval_type_error("(new FormData()).append('a', new Blob(['x']), Symbol('s'))");
     }
 
     #[test]
@@ -30045,6 +30125,14 @@ mod tests {
         // FormData bodies are explicitly rejected by the standalone Response
         // because no real multipart serializer exists in this engine.
         assert_eval_type_error("new Response(new FormData())");
+        // Even with Blob/File entries populated, FormData bodies still fail
+        // closed — no multipart serialization is implemented.
+        assert_eval_type_error(
+            "var f = new FormData(); f.append('a', new Blob(['x'])); new Response(f)",
+        );
+        assert_eval_type_error(
+            "var f = new FormData(); f.append('a', new File(['x'], 'x.txt')); new Request('https://example.test/', { method: 'POST', body: f })",
+        );
     }
 
     #[test]
