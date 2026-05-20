@@ -9154,6 +9154,15 @@ const POP_STATE_EVENT_BRAND: &str = "__is_pop_state_event__";
 /// Hidden brand placed on every `StorageEvent` instance.
 const STORAGE_EVENT_BRAND: &str = "__is_storage_event__";
 
+/// Hidden brand placed on every `AnimationEvent` instance.
+const ANIMATION_EVENT_BRAND: &str = "__is_animation_event__";
+
+/// Hidden brand placed on every `TransitionEvent` instance.
+const TRANSITION_EVENT_BRAND: &str = "__is_transition_event__";
+
+/// Hidden brand placed on every `ToggleEvent` instance.
+const TOGGLE_EVENT_BRAND: &str = "__is_toggle_event__";
+
 #[derive(Clone)]
 struct EventListenerEntry {
     id: u64,
@@ -9266,6 +9275,18 @@ thread_local! {
         RefCell::new(HashMap::new());
     static STORAGE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
+    static ANIMATION_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<AnimationEventData>>>> =
+        RefCell::new(HashMap::new());
+    static ANIMATION_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static TRANSITION_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<TransitionEventData>>>> =
+        RefCell::new(HashMap::new());
+    static TRANSITION_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static TOGGLE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<ToggleEventData>>>> =
+        RefCell::new(HashMap::new());
+    static TOGGLE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
 }
 
 /// Immutable data carried by a `ProgressEvent` instance.
@@ -9329,6 +9350,32 @@ struct StorageEventData {
     new_value: JsValue,
     url: String,
     storage_area: JsValue,
+}
+
+/// Immutable data carried by an `AnimationEvent` instance. No CSS animation
+/// engine is wired up — the constructor only stores the WebIDL init dictionary
+/// values verbatim.
+struct AnimationEventData {
+    animation_name: String,
+    elapsed_time: f64,
+    pseudo_element: String,
+}
+
+/// Immutable data carried by a `TransitionEvent` instance. No CSS transition
+/// engine is wired up — the constructor only stores the WebIDL init dictionary
+/// values verbatim.
+struct TransitionEventData {
+    property_name: String,
+    elapsed_time: f64,
+    pseudo_element: String,
+}
+
+/// Immutable data carried by a `ToggleEvent` instance. No popover/details
+/// lifecycle is wired up — the constructor only stores the WebIDL init
+/// dictionary values verbatim.
+struct ToggleEventData {
+    old_state: String,
+    new_state: String,
 }
 
 fn event_type_error(message: impl Into<String>) -> StatorError {
@@ -10767,6 +10814,306 @@ fn make_page_transition_event_builtin() -> JsValue {
         proto.make_all_non_enumerable();
     }
     PAGE_TRANSITION_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `AnimationEvent` constructor.
+///
+/// Stores the WebIDL `AnimationEventInit` dictionary values
+/// (`animationName`, `elapsedTime`, `pseudoElement`) on a real `Event`
+/// subtype instance. No CSS animation engine is wired up: the engine never
+/// dispatches `animationstart` / `animationend` / `animationiteration` /
+/// `animationcancel` events on its own, and the constructor is provided
+/// purely as a data container that flows correctly through `EventTarget`.
+fn make_animation_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error(
+                    "AnimationEvent: type argument is required",
+                ));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let animation_name = dict_field_string(&init, "animationName")?.unwrap_or_default();
+            let elapsed_time = dict_field_number(&init, "elapsedTime")?.unwrap_or(0.0);
+            let pseudo_element = dict_field_string(&init, "pseudoElement")?.unwrap_or_default();
+            let proto = ANIMATION_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, ANIMATION_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(AnimationEventData {
+                animation_name,
+                elapsed_time,
+                pseudo_element,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            ANIMATION_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("AnimationEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_animationName__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ANIMATION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ANIMATION_EVENT_BRAND,
+                    &ANIMATION_EVENT_STATES,
+                    "AnimationEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().animation_name.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_elapsedTime__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ANIMATION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ANIMATION_EVENT_BRAND,
+                    &ANIMATION_EVENT_STATES,
+                    "AnimationEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().elapsed_time))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_pseudoElement__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ANIMATION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ANIMATION_EVENT_BRAND,
+                    &ANIMATION_EVENT_STATES,
+                    "AnimationEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().pseudo_element.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    ANIMATION_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `TransitionEvent` constructor.
+///
+/// Stores the WebIDL `TransitionEventInit` dictionary values
+/// (`propertyName`, `elapsedTime`, `pseudoElement`) on a real `Event`
+/// subtype instance. No CSS transition engine is wired up: the engine never
+/// dispatches `transitionrun` / `transitionstart` / `transitionend` /
+/// `transitioncancel` events on its own, and the constructor is provided
+/// purely as a data container that flows correctly through `EventTarget`.
+fn make_transition_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error(
+                    "TransitionEvent: type argument is required",
+                ));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let property_name = dict_field_string(&init, "propertyName")?.unwrap_or_default();
+            let elapsed_time = dict_field_number(&init, "elapsedTime")?.unwrap_or(0.0);
+            let pseudo_element = dict_field_string(&init, "pseudoElement")?.unwrap_or_default();
+            let proto = TRANSITION_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, TRANSITION_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(TransitionEventData {
+                property_name,
+                elapsed_time,
+                pseudo_element,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            TRANSITION_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("TransitionEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_propertyName__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, TRANSITION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    TRANSITION_EVENT_BRAND,
+                    &TRANSITION_EVENT_STATES,
+                    "TransitionEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().property_name.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_elapsedTime__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, TRANSITION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    TRANSITION_EVENT_BRAND,
+                    &TRANSITION_EVENT_STATES,
+                    "TransitionEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().elapsed_time))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_pseudoElement__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, TRANSITION_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    TRANSITION_EVENT_BRAND,
+                    &TRANSITION_EVENT_STATES,
+                    "TransitionEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().pseudo_element.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    TRANSITION_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `ToggleEvent` constructor.
+///
+/// Stores the WebIDL `ToggleEventInit` dictionary values
+/// (`oldState`, `newState`) on a real `Event` subtype instance. No popover
+/// or `<details>` lifecycle is wired up: the engine never dispatches
+/// `toggle` / `beforetoggle` events on its own, and the constructor is
+/// provided purely as a data container that flows correctly through
+/// `EventTarget`.
+fn make_toggle_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("ToggleEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let old_state = dict_field_string(&init, "oldState")?.unwrap_or_default();
+            let new_state = dict_field_string(&init, "newState")?.unwrap_or_default();
+            let proto = TOGGLE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, TOGGLE_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(ToggleEventData {
+                old_state,
+                new_state,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            TOGGLE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("ToggleEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_oldState__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, TOGGLE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    TOGGLE_EVENT_BRAND,
+                    &TOGGLE_EVENT_STATES,
+                    "ToggleEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().old_state.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_newState__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, TOGGLE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    TOGGLE_EVENT_BRAND,
+                    &TOGGLE_EVENT_STATES,
+                    "ToggleEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().new_state.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    TOGGLE_EVENT_PROTO.with(|p| {
         *p.borrow_mut() = Some(Rc::clone(&proto_rc));
     });
     props.insert(
@@ -28390,6 +28737,18 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "StorageEvent".into(),
             finalize_ctor(make_storage_event_builtin(), "StorageEvent"),
         );
+        globals.insert(
+            "AnimationEvent".into(),
+            finalize_ctor(make_animation_event_builtin(), "AnimationEvent"),
+        );
+        globals.insert(
+            "TransitionEvent".into(),
+            finalize_ctor(make_transition_event_builtin(), "TransitionEvent"),
+        );
+        globals.insert(
+            "ToggleEvent".into(),
+            finalize_ctor(make_toggle_event_builtin(), "ToggleEvent"),
+        );
 
         // ── DOM UI / input / pointer / drag / touch / lifecycle event
         //    constructor globals (fail-closed) ───────────────────────────────
@@ -28421,9 +28780,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "TouchList",
             "CompositionEvent",
             "SubmitEvent",
-            "ToggleEvent",
-            "AnimationEvent",
-            "TransitionEvent",
             "SecurityPolicyViolationEvent",
         ] {
             globals.insert(
@@ -31160,6 +31516,166 @@ mod tests {
     }
 
     #[test]
+    fn e2e_animation_transition_toggle_event_constructor_defaults_and_init() {
+        // AnimationEvent — type required, init defaults match WebIDL.
+        assert_eval_true(
+            "typeof AnimationEvent === 'function' && AnimationEvent.name === 'AnimationEvent'",
+        );
+        assert_eval_true("new AnimationEvent('animationstart') instanceof AnimationEvent");
+        assert_eval_true("new AnimationEvent('animationstart') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(AnimationEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new AnimationEvent()");
+        assert_eval_true(
+            "var e = new AnimationEvent('animationstart'); \
+             e.animationName === '' && e.elapsedTime === 0 && e.pseudoElement === '' && \
+             e.bubbles === false && e.cancelable === false && e.type === 'animationstart'",
+        );
+        assert_eval_true(
+            "var e = new AnimationEvent('animationend', \
+                 { animationName: 1, elapsedTime: '2.5', pseudoElement: '::before', bubbles: true }); \
+             e.animationName === '1' && e.elapsedTime === 2.5 && e.pseudoElement === '::before' && \
+             e.bubbles === true && e.type === 'animationend'",
+        );
+        assert_eval_type_error("new AnimationEvent('a', 1)");
+
+        // TransitionEvent — type required, init defaults match WebIDL.
+        assert_eval_true(
+            "typeof TransitionEvent === 'function' && TransitionEvent.name === 'TransitionEvent'",
+        );
+        assert_eval_true("new TransitionEvent('transitionend') instanceof TransitionEvent");
+        assert_eval_true("new TransitionEvent('transitionend') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(TransitionEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new TransitionEvent()");
+        assert_eval_true(
+            "var e = new TransitionEvent('transitionend'); \
+             e.propertyName === '' && e.elapsedTime === 0 && e.pseudoElement === ''",
+        );
+        assert_eval_true(
+            "var e = new TransitionEvent('transitionend', \
+                 { propertyName: 'opacity', elapsedTime: 0.5, pseudoElement: '::after', cancelable: true }); \
+             e.propertyName === 'opacity' && e.elapsedTime === 0.5 && \
+             e.pseudoElement === '::after' && e.cancelable === true",
+        );
+        assert_eval_type_error("new TransitionEvent('t', 1)");
+
+        // ToggleEvent — type required, init defaults match WebIDL.
+        assert_eval_true("typeof ToggleEvent === 'function' && ToggleEvent.name === 'ToggleEvent'");
+        assert_eval_true("new ToggleEvent('toggle') instanceof ToggleEvent");
+        assert_eval_true("new ToggleEvent('toggle') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(ToggleEvent.prototype) === Event.prototype");
+        assert_eval_type_error("new ToggleEvent()");
+        assert_eval_true(
+            "var e = new ToggleEvent('toggle'); e.oldState === '' && e.newState === ''",
+        );
+        assert_eval_true(
+            "var e = new ToggleEvent('beforetoggle', \
+                 { oldState: 'closed', newState: 'open', cancelable: true }); \
+             e.oldState === 'closed' && e.newState === 'open' && e.cancelable === true && \
+             e.type === 'beforetoggle'",
+        );
+        assert_eval_type_error("new ToggleEvent('t', 1)");
+    }
+
+    #[test]
+    fn e2e_animation_transition_toggle_event_prototype_brand_checks() {
+        // Each accessor is a getter-only own property of the subtype prototype
+        // and rejects foreign receivers per WebIDL brand checks.
+        for (ctor, prop) in [
+            ("AnimationEvent", "animationName"),
+            ("AnimationEvent", "elapsedTime"),
+            ("AnimationEvent", "pseudoElement"),
+            ("TransitionEvent", "propertyName"),
+            ("TransitionEvent", "elapsedTime"),
+            ("TransitionEvent", "pseudoElement"),
+            ("ToggleEvent", "oldState"),
+            ("ToggleEvent", "newState"),
+        ] {
+            assert_eval_true(&format!(
+                "var d = Object.getOwnPropertyDescriptor({ctor}.prototype, '{prop}'); \
+                 typeof d.get === 'function' && d.set === undefined"
+            ));
+            assert_eval_type_error(&format!(
+                "Object.getOwnPropertyDescriptor({ctor}.prototype, '{prop}').get.call({{}})"
+            ));
+            assert_eval_type_error(&format!(
+                "Object.getOwnPropertyDescriptor({ctor}.prototype, '{prop}').get.call(new Event('x'))"
+            ));
+        }
+
+        // Cross-type accessors reject sibling subtype receivers.
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(AnimationEvent.prototype, 'animationName')\
+             .get.call(new TransitionEvent('t'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(TransitionEvent.prototype, 'propertyName')\
+             .get.call(new AnimationEvent('a'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ToggleEvent.prototype, 'oldState')\
+             .get.call(new AnimationEvent('a'))",
+        );
+
+        // Distinct prototypes / constructor identity.
+        assert_eval_true("AnimationEvent.prototype !== Event.prototype");
+        assert_eval_true("TransitionEvent.prototype !== Event.prototype");
+        assert_eval_true("ToggleEvent.prototype !== Event.prototype");
+        assert_eval_true("AnimationEvent.prototype !== TransitionEvent.prototype");
+        assert_eval_true("AnimationEvent.prototype.constructor === AnimationEvent");
+        assert_eval_true("TransitionEvent.prototype.constructor === TransitionEvent");
+        assert_eval_true("ToggleEvent.prototype.constructor === ToggleEvent");
+    }
+
+    #[test]
+    fn e2e_animation_transition_toggle_event_dispatch_through_event_target() {
+        // Subtype instances flow correctly through EventTarget.dispatchEvent and
+        // inherit Event behaviour (target/currentTarget/preventDefault).
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = null; \
+             t.addEventListener('animationend', function (e) { seen = e; }); \
+             var ev = new AnimationEvent('animationend', \
+                 { animationName: 'fade', elapsedTime: 1.25, pseudoElement: '::before' }); \
+             t.dispatchEvent(ev); \
+             seen === ev && seen.animationName === 'fade' && seen.elapsedTime === 1.25 && \
+             seen.pseudoElement === '::before' && seen.target === t",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = null; \
+             t.addEventListener('transitionend', function (e) { seen = e; e.preventDefault(); }); \
+             var ev = new TransitionEvent('transitionend', \
+                 { propertyName: 'color', elapsedTime: 0.5, cancelable: true }); \
+             t.dispatchEvent(ev) === false && seen === ev && seen.propertyName === 'color' && \
+             ev.target === t",
+        );
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = null; \
+             t.addEventListener('toggle', function (e) { seen = e; }); \
+             var ev = new ToggleEvent('toggle', { oldState: 'closed', newState: 'open' }); \
+             t.dispatchEvent(ev); \
+             seen === ev && seen.oldState === 'closed' && seen.newState === 'open' && \
+             seen.target === t",
+        );
+    }
+
+    #[test]
+    fn e2e_security_policy_violation_event_remains_fail_closed() {
+        // SecurityPolicyViolationEvent requires a reporting/CSP context that the
+        // standalone engine does not provide. The constructor stays fail-closed
+        // to avoid fabricating a fake violation report.
+        assert_eval_true(
+            "typeof SecurityPolicyViolationEvent === 'function' && \
+             SecurityPolicyViolationEvent.name === 'SecurityPolicyViolationEvent'",
+        );
+        assert_eval_type_error("new SecurityPolicyViolationEvent()");
+        assert_eval_type_error("new SecurityPolicyViolationEvent('securitypolicyviolation')");
+        assert_eval_type_error(
+            "new SecurityPolicyViolationEvent('securitypolicyviolation', \
+                 { documentURI: '', effectiveDirective: '', violatedDirective: '', \
+                   originalPolicy: '', disposition: 'enforce', statusCode: 0 })",
+        );
+    }
+
+    #[test]
     fn e2e_data_event_subtype_prototype_chains_are_distinct() {
         // Each subtype has its own prototype, distinct from Event.prototype.
         assert_eval_true("ProgressEvent.prototype !== Event.prototype");
@@ -31229,6 +31745,9 @@ mod tests {
         assert_eval_type_error("new PopStateEvent('p', 1)");
         assert_eval_type_error("new StorageEvent('s', 1)");
         assert_eval_type_error("new PromiseRejectionEvent('p', 1)");
+        assert_eval_type_error("new AnimationEvent('a', 1)");
+        assert_eval_type_error("new TransitionEvent('t', 1)");
+        assert_eval_type_error("new ToggleEvent('t', 1)");
     }
 
     #[test]
@@ -31451,9 +31970,6 @@ mod tests {
             "TouchEvent",
             "CompositionEvent",
             "SubmitEvent",
-            "ToggleEvent",
-            "AnimationEvent",
-            "TransitionEvent",
             "SecurityPolicyViolationEvent",
             "BeforeUnloadEvent",
         ] {
@@ -33491,16 +34007,16 @@ mod tests {
     /// globals (`UIEvent`, `MouseEvent`, `PointerEvent`, `KeyboardEvent`,
     /// `InputEvent`, `BeforeUnloadEvent`, `FocusEvent`, `WheelEvent`,
     /// `DragEvent`, `Touch`, `TouchEvent`, `TouchList`, `CompositionEvent`,
-    /// `SubmitEvent`, `ToggleEvent`, `PopStateEvent`, `HashChangeEvent`,
-    /// `PageTransitionEvent`, `StorageEvent`,
-    /// `PromiseRejectionEvent`, `AnimationEvent`, `TransitionEvent`,
-    /// `SecurityPolicyViolationEvent`) are exposed so Edge page scripts can
-    /// `typeof`/`instanceof`-probe them, but construction fails closed with
-    /// a clear `TypeError`. The engine has no DOM, no view/window, no input
-    /// device, no drag data store, no touch lists, no storage areas, no CSS
-    /// animation/transition pipeline, no session-history navigation, and no
-    /// security-policy context — fabricating events would mislead product
-    /// code into assuming a real DOM event source/target exists.
+    /// `SubmitEvent`, `SecurityPolicyViolationEvent`) are exposed so Edge page
+    /// scripts can `typeof`/`instanceof`-probe them, but construction fails
+    /// closed with a clear `TypeError`. The engine has no DOM, no view/window,
+    /// no input device, no drag data store, no touch lists, and no
+    /// security-policy reporting context — fabricating events would mislead
+    /// product code into assuming a real DOM event source/target exists.
+    /// Real data-event constructors (`PopStateEvent`, `HashChangeEvent`,
+    /// `PageTransitionEvent`, `StorageEvent`, `PromiseRejectionEvent`,
+    /// `AnimationEvent`, `TransitionEvent`, `ToggleEvent`) still require their
+    /// `type` argument, so calling them without arguments also throws.
     #[test]
     fn e2e_dom_ui_input_event_constructors_exist_but_fail_closed() {
         for name in [
@@ -33518,15 +34034,15 @@ mod tests {
             "TouchList",
             "CompositionEvent",
             "SubmitEvent",
-            "ToggleEvent",
             "PopStateEvent",
             "HashChangeEvent",
             "PageTransitionEvent",
             "StorageEvent",
             "PromiseRejectionEvent",
+            "SecurityPolicyViolationEvent",
             "AnimationEvent",
             "TransitionEvent",
-            "SecurityPolicyViolationEvent",
+            "ToggleEvent",
         ] {
             assert_eval_true(&format!(
                 "typeof {name} === 'function' && {name}.name === '{name}'"
@@ -33549,9 +34065,6 @@ mod tests {
         assert_eval_type_error("new TouchList()");
         assert_eval_type_error("new CompositionEvent('compositionstart')");
         assert_eval_type_error("new SubmitEvent('submit')");
-        assert_eval_type_error("new ToggleEvent('toggle')");
-        assert_eval_type_error("new AnimationEvent('animationstart')");
-        assert_eval_type_error("new TransitionEvent('transitionend')");
         assert_eval_type_error("new SecurityPolicyViolationEvent('securitypolicyviolation')");
     }
 
