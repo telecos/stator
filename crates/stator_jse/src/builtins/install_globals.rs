@@ -45,11 +45,9 @@ use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
 };
 use crate::builtins::finalization_registry::{
-    TokenKey, finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
-    finalization_registry_register_plain_with_token_key,
-    finalization_registry_register_with_token_key, finalization_registry_sweep_plain,
-    finalization_registry_unregister, finalization_registry_unregister_by_key,
-    finalization_registry_unregister_plain,
+    TokenKey, finalization_registry_new, finalization_registry_register_plain_with_token_key,
+    finalization_registry_register_with_token_key, finalization_registry_unregister,
+    finalization_registry_unregister_by_key, finalization_registry_unregister_plain,
 };
 use crate::builtins::function::{
     function_apply, function_bound_name, function_call, function_constructor,
@@ -19168,7 +19166,6 @@ fn make_finalization_registry_builtin() -> JsValue {
             }
 
             let inner = Rc::new(RefCell::new(finalization_registry_new()));
-            let callback = Rc::new(callback);
             let mut obj = PropertyMap::new();
 
             obj.insert_with_attrs(
@@ -19287,56 +19284,6 @@ fn make_finalization_registry_builtin() -> JsValue {
                 );
             }
 
-            // cleanupSome() — sweep plain targets, then drain the queue
-            {
-                let inner = Rc::clone(&inner);
-                let cb = Rc::clone(&callback);
-                obj.insert(
-                    "__finalization_registry_cleanup_some__".into(),
-                    native(move |_a| {
-                        finalization_registry_sweep_plain(&mut inner.borrow_mut());
-                        let held_values = finalization_registry_drain(&mut inner.borrow_mut());
-                        for held in held_values {
-                            dispatch_call_value(cb.as_ref(), vec![held])?;
-                        }
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-
-            // __notify__ — internal GC hook exposed for testing
-            {
-                let inner = Rc::clone(&inner);
-                let cb = Rc::clone(&callback);
-                obj.insert(
-                    "__finalization_registry_notify__".into(),
-                    native(move |a| {
-                        let target = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = target {
-                            finalization_registry_notify(&mut inner.borrow_mut(), *ptr);
-                            let registry = Rc::clone(&inner);
-                            let callback = Rc::clone(&cb);
-                            if !crate::builtins::promise::enqueue_active_microtask(Box::new(
-                                move || {
-                                    let held_values =
-                                        finalization_registry_drain(&mut registry.borrow_mut());
-                                    for held in held_values {
-                                        let _ = dispatch_call_value(callback.as_ref(), vec![held]);
-                                    }
-                                },
-                            )) {
-                                let held_values =
-                                    finalization_registry_drain(&mut inner.borrow_mut());
-                                for held in held_values {
-                                    let _ = dispatch_call_value(cb.as_ref(), vec![held]);
-                                }
-                            }
-                        }
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-
             obj.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("FinalizationRegistry".into()),
@@ -19354,8 +19301,6 @@ fn make_finalization_registry_builtin() -> JsValue {
         for (method_name, hidden_name) in [
             ("register", "__finalization_registry_register__"),
             ("unregister", "__finalization_registry_unregister__"),
-            ("cleanupSome", "__finalization_registry_cleanup_some__"),
-            ("__notify__", "__finalization_registry_notify__"),
         ] {
             let name = method_name.to_string();
             let hidden = hidden_name.to_string();
@@ -19374,6 +19319,14 @@ fn make_finalization_registry_builtin() -> JsValue {
                 }),
             );
         }
+        proto.insert(
+            "cleanupSome".into(),
+            native(|_args| {
+                Err(StatorError::TypeError(
+                    "FinalizationRegistry cleanup callback delivery is not supported".into(),
+                ))
+            }),
+        );
         proto.insert("constructor".into(), JsValue::Undefined);
         proto.insert_with_attrs(
             "@@toStringTag".into(),
@@ -41810,7 +41763,8 @@ mod tests {
                     ));
                     assert!(inst.contains_key("__finalization_registry_register__"));
                     assert!(inst.contains_key("__finalization_registry_unregister__"));
-                    assert!(inst.contains_key("__finalization_registry_cleanup_some__"));
+                    assert!(!inst.contains_key("__finalization_registry_cleanup_some__"));
+                    assert!(!inst.contains_key("__finalization_registry_notify__"));
                     assert!(!inst.contains_key("register"));
                 } else {
                     panic!("FinalizationRegistry() should return a PlainObject");
@@ -42269,6 +42223,49 @@ mod tests {
             } catch (e) {
                 true;
             }
+            "#,
+        );
+    }
+
+    /// `FinalizationRegistry.prototype.cleanupSome` fails closed because Stator
+    /// does not expose deterministic cleanup callback delivery.
+    #[test]
+    fn test_e2e_finalization_registry_cleanup_some_fails_closed() {
+        assert_eval_type_error("FinalizationRegistry.prototype.cleanupSome.call({})");
+        assert_eval_type_error("new FinalizationRegistry(function() {}).cleanupSome()");
+        assert_eval_true(
+            r#"
+            let called = false;
+            const registry = new FinalizationRegistry(function() { called = true; });
+            try {
+                registry.cleanupSome();
+            } catch (e) {}
+            called === false;
+            "#,
+        );
+    }
+
+    /// Internal GC hooks must not be exposed as JavaScript-callable lifecycle
+    /// controls.
+    #[test]
+    fn test_e2e_finalization_registry_notify_hook_is_absent() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            typeof registry.__notify__ === "undefined"
+                && typeof FinalizationRegistry.prototype.__notify__ === "undefined";
+            "#,
+        );
+    }
+
+    /// Registration never synchronously delivers cleanup callbacks.
+    #[test]
+    fn test_e2e_finalization_registry_register_does_not_deliver_callbacks() {
+        assert_eval_true(
+            r#"
+            let called = false;
+            new FinalizationRegistry(function() { called = true; });
+            called === false;
             "#,
         );
     }
@@ -56159,6 +56156,36 @@ mod tests {
     #[test]
     fn e2e_structured_clone_rejects_branded_objects_without_correct_clone() {
         assert_eval_data_clone_error("structuredClone(new Date(0))");
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_regexp_until_clone_semantics_are_implemented() {
+        assert_eval_data_clone_error("structuredClone(/edge/g)");
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_collection_and_lifecycle_objects() {
+        for expression in [
+            "new Map()",
+            "new Set()",
+            "new WeakMap()",
+            "new WeakSet()",
+            "new WeakRef({})",
+            "new FinalizationRegistry(function() {})",
+        ] {
+            assert_eval_data_clone_error(&format!("structuredClone({expression})"));
+        }
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_promise_and_proxy_objects() {
+        assert_eval_data_clone_error("structuredClone(Promise.resolve(1))");
+        assert_eval_data_clone_error("structuredClone(new Proxy({}, {}))");
+    }
+
+    #[test]
+    fn e2e_temporal_global_remains_absent_without_full_api_support() {
+        assert_eval_true("typeof Temporal === 'undefined'");
     }
 
     #[test]
