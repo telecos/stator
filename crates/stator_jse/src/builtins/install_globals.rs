@@ -5054,17 +5054,230 @@ fn make_unsupported_idb_key_range_constructor() -> JsValue {
     ctor
 }
 
-fn make_unsupported_storage_object(name: &'static str) -> JsValue {
-    make_unsupported_web_object(
-        name,
-        &[
-            ("getItem", 1),
-            ("setItem", 2),
-            ("removeItem", 1),
-            ("clear", 0),
-            ("key", 1),
-        ],
-    )
+// ── In-memory Web Storage ──────────────────────────────────────────────────
+//
+// This implements only the synchronous `Storage` object surface that can be
+// correct in a standalone engine: per-global, in-memory key/value lists for
+// `localStorage` and `sessionStorage`. There is intentionally no durability,
+// origin integration, quota, storage events, or cross-context sharing.
+
+const STORAGE_BRAND: &str = "__is_storage__";
+
+#[derive(Debug, Default)]
+struct StorageState {
+    entries: Vec<(String, String)>,
+}
+
+thread_local! {
+    static STORAGE_STATES: RefCell<HashMap<usize, Rc<RefCell<StorageState>>>> =
+        RefCell::new(HashMap::new());
+    static STORAGE_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> = const { RefCell::new(None) };
+}
+
+fn storage_type_error(message: impl Into<String>) -> StatorError {
+    StatorError::TypeError(message.into())
+}
+
+fn storage_js_number(value: usize) -> JsValue {
+    i32::try_from(value).map_or(JsValue::HeapNumber(value as f64), JsValue::Smi)
+}
+
+fn storage_find_index(state: &StorageState, key: &str) -> Option<usize> {
+    state
+        .entries
+        .iter()
+        .position(|(entry_key, _)| entry_key == key)
+}
+
+fn storage_sync_length_property(receiver: &JsValue, len: usize) {
+    if let JsValue::PlainObject(map) = receiver {
+        map.borrow_mut().insert_with_attrs(
+            "length".into(),
+            storage_js_number(len),
+            PropertyAttributes::empty(),
+        );
+    }
+}
+
+fn install_storage_state(instance: &Rc<RefCell<PropertyMap>>, state: Rc<RefCell<StorageState>>) {
+    let id = Rc::as_ptr(instance) as usize;
+    STORAGE_STATES.with(|states| {
+        states.borrow_mut().insert(id, state);
+    });
+}
+
+fn lookup_storage_state(value: &JsValue) -> StatorResult<Rc<RefCell<StorageState>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(storage_type_error(
+            "Storage method called on non-Storage receiver",
+        ));
+    };
+    if !matches!(
+        map.borrow().get(STORAGE_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(storage_type_error(
+            "Storage method called on non-Storage receiver",
+        ));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    STORAGE_STATES
+        .with(|states| states.borrow().get(&id).cloned())
+        .ok_or_else(|| storage_type_error("Storage: internal state missing"))
+}
+
+fn resolve_storage_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(STORAGE_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    let env_this = current_global_env()
+        .and_then(|env| env.borrow().get_this().cloned())
+        .unwrap_or(JsValue::Undefined);
+    (env_this, args.to_vec())
+}
+
+fn storage_key_argument(args: &[JsValue]) -> StatorResult<String> {
+    args.first().unwrap_or(&JsValue::Undefined).to_js_string()
+}
+
+fn storage_length_getter() -> JsValue {
+    builtin_fn("get length", 0, |args| {
+        let (receiver, _) = resolve_storage_receiver(&args);
+        let state = lookup_storage_state(&receiver)?;
+        Ok(storage_js_number(state.borrow().entries.len()))
+    })
+}
+
+fn make_storage_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|_args| Err(storage_type_error("Storage: illegal constructor"))),
+    );
+
+    let mut proto = PropertyMap::new();
+    proto.insert("__get_length__".into(), storage_length_getter());
+    proto.insert(
+        "key".into(),
+        builtin_fn("key", 1, |args| {
+            let (receiver, method_args) = resolve_storage_receiver(&args);
+            let index = method_args
+                .first()
+                .unwrap_or(&JsValue::Undefined)
+                .to_uint32()? as usize;
+            let state = lookup_storage_state(&receiver)?;
+            Ok(state
+                .borrow()
+                .entries
+                .get(index)
+                .map(|(key, _)| JsValue::String(key.clone().into()))
+                .unwrap_or(JsValue::Null))
+        }),
+    );
+    proto.insert(
+        "getItem".into(),
+        builtin_fn("getItem", 1, |args| {
+            let (receiver, method_args) = resolve_storage_receiver(&args);
+            let key = storage_key_argument(&method_args)?;
+            let state = lookup_storage_state(&receiver)?;
+            Ok(storage_find_index(&state.borrow(), &key)
+                .map(|index| JsValue::String(state.borrow().entries[index].1.clone().into()))
+                .unwrap_or(JsValue::Null))
+        }),
+    );
+    proto.insert(
+        "setItem".into(),
+        builtin_fn("setItem", 2, |args| {
+            let (receiver, method_args) = resolve_storage_receiver(&args);
+            let key = storage_key_argument(&method_args)?;
+            let value = method_args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_js_string()?;
+            let state = lookup_storage_state(&receiver)?;
+            let mut state = state.borrow_mut();
+            if let Some(index) = storage_find_index(&state, &key) {
+                state.entries[index].1 = value;
+            } else {
+                state.entries.push((key, value));
+            }
+            storage_sync_length_property(&receiver, state.entries.len());
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "removeItem".into(),
+        builtin_fn("removeItem", 1, |args| {
+            let (receiver, method_args) = resolve_storage_receiver(&args);
+            let key = storage_key_argument(&method_args)?;
+            let state = lookup_storage_state(&receiver)?;
+            let mut state = state.borrow_mut();
+            if let Some(index) = storage_find_index(&state, &key) {
+                state.entries.remove(index);
+            }
+            storage_sync_length_property(&receiver, state.entries.len());
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert(
+        "clear".into(),
+        builtin_fn("clear", 0, |args| {
+            let (receiver, _) = resolve_storage_receiver(&args);
+            let state = lookup_storage_state(&receiver)?;
+            state.borrow_mut().entries.clear();
+            storage_sync_length_property(&receiver, 0);
+            Ok(JsValue::Undefined)
+        }),
+    );
+    proto.insert_with_attrs(
+        format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+        JsValue::String("Storage".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.make_all_non_enumerable();
+
+    let proto_rc = Rc::new(RefCell::new(proto));
+    STORAGE_PROTO.with(|storage_proto| {
+        *storage_proto.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_storage_object() -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            STORAGE_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            "length".into(),
+            JsValue::Smi(0),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = STORAGE_PROTO.with(|storage_proto| storage_proto.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_storage_state(&inst, Rc::new(RefCell::new(StorageState::default())));
+    JsValue::PlainObject(inst)
 }
 
 // ── Real URL / URLSearchParams ────────────────────────────────────────────
@@ -24482,22 +24695,17 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             );
         }
 
-        // ── Web Storage (fail-closed) ───────────────────────────────────────
-        // Storage is host-integrated and this standalone engine has no backing
-        // origin, persistence, quota, or lifetime model. Expose the probed
-        // globals, but fail every operation instead of pretending to store data.
+        // ── Web Storage (in-memory) ─────────────────────────────────────────
+        // `Storage`, `localStorage`, and `sessionStorage` expose only safe
+        // standalone behavior: separate per-global in-memory key/value lists.
+        // They deliberately do not model persistence, quota, origins, privacy
+        // partitioning, storage events, or cross-context sharing.
         globals.insert(
             "Storage".into(),
-            finalize_ctor(make_unsupported_web_constructor("Storage"), "Storage"),
+            finalize_ctor(make_storage_builtin(), "Storage"),
         );
-        globals.insert(
-            "localStorage".into(),
-            make_unsupported_storage_object("localStorage"),
-        );
-        globals.insert(
-            "sessionStorage".into(),
-            make_unsupported_storage_object("sessionStorage"),
-        );
+        globals.insert("localStorage".into(), make_storage_object());
+        globals.insert("sessionStorage".into(), make_storage_object());
 
         // ── Storage / database / cache / cookies (fail-closed) ──────────────
         //
@@ -28583,27 +28791,101 @@ mod tests {
     }
 
     #[test]
-    fn e2e_storage_constructor_exists_but_fails_closed() {
+    fn e2e_storage_constructor_exists_but_is_illegal() {
         assert_eval_true("typeof Storage === 'function' && Storage.name === 'Storage'");
+        assert_eval_true("typeof Storage.prototype === 'object'");
+        assert_eval_true("typeof Storage.prototype.key === 'function'");
+        assert_eval_true("typeof Storage.prototype.getItem === 'function'");
+        assert_eval_true("typeof Storage.prototype.setItem === 'function'");
+        assert_eval_true("typeof Storage.prototype.removeItem === 'function'");
+        assert_eval_true("typeof Storage.prototype.clear === 'function'");
         assert_eval_type_error("Storage()");
         assert_eval_type_error("new Storage()");
     }
 
     #[test]
-    fn e2e_web_storage_globals_exist_but_operations_fail_closed() {
+    fn e2e_web_storage_length_key_order_and_mutation() {
         assert_eval_true("typeof localStorage === 'object' && localStorage !== null");
         assert_eval_true("typeof sessionStorage === 'object' && sessionStorage !== null");
         assert_eval_true("localStorage !== sessionStorage");
-        assert_eval_type_error("localStorage.getItem('edge-stator')");
-        assert_eval_type_error("localStorage.setItem('edge-stator', 'value')");
-        assert_eval_type_error("localStorage.removeItem('edge-stator')");
-        assert_eval_type_error("localStorage.clear()");
-        assert_eval_type_error("localStorage.key(0)");
-        assert_eval_type_error("sessionStorage.getItem('edge-stator')");
-        assert_eval_type_error("sessionStorage.setItem('edge-stator', 'value')");
-        assert_eval_type_error("sessionStorage.removeItem('edge-stator')");
-        assert_eval_type_error("sessionStorage.clear()");
-        assert_eval_type_error("sessionStorage.key(0)");
+        assert_eval_true("localStorage instanceof Storage");
+        assert_eval_true("sessionStorage instanceof Storage");
+        assert_eval_true(
+            "
+            localStorage.clear();
+            localStorage.length === 0 &&
+            localStorage.key(0) === null &&
+            localStorage.getItem('missing') === null
+            ",
+        );
+        assert_eval_true(
+            "
+            localStorage.clear();
+            localStorage.setItem('b', '2');
+            localStorage.setItem('a', '1');
+            localStorage.setItem('b', '22');
+            localStorage.length === 2 &&
+            localStorage.key(0) === 'b' &&
+            localStorage.key(1) === 'a' &&
+            localStorage.key(2) === null &&
+            localStorage.getItem('b') === '22'
+            ",
+        );
+        assert_eval_true(
+            "
+            localStorage.removeItem('b');
+            localStorage.length === 1 &&
+            localStorage.key(0) === 'a' &&
+            localStorage.getItem('b') === null
+            ",
+        );
+        assert_eval_true(
+            "
+            localStorage.clear();
+            localStorage.length === 0 &&
+            localStorage.key(0) === null
+            ",
+        );
+    }
+
+    #[test]
+    fn e2e_web_storage_string_coercion_and_separate_maps() {
+        assert_eval_true(
+            "
+            localStorage.clear();
+            sessionStorage.clear();
+            localStorage.setItem(7, false);
+            localStorage.setItem(undefined, null);
+            sessionStorage.setItem(7, 'session');
+            localStorage.getItem('7') === 'false' &&
+            localStorage.getItem('undefined') === 'null' &&
+            localStorage.getItem() === 'null' &&
+            sessionStorage.getItem('7') === 'session' &&
+            sessionStorage.getItem('undefined') === null &&
+            localStorage.length === 2 &&
+            sessionStorage.length === 1
+            ",
+        );
+    }
+
+    #[test]
+    fn e2e_web_storage_brand_checks_and_method_only_limitation() {
+        assert_eval_type_error("Storage.prototype.getItem.call({}, 'x')");
+        assert_eval_type_error("Storage.prototype.setItem.call({}, 'x', 'y')");
+        assert_eval_type_error("Storage.prototype.removeItem.call({}, 'x')");
+        assert_eval_type_error("Storage.prototype.clear.call({})");
+        assert_eval_type_error("Storage.prototype.key.call({}, 0)");
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(Storage.prototype, 'length').get.call({})",
+        );
+        assert_eval_true(
+            "
+            localStorage.clear();
+            localStorage.setItem('named', 'value');
+            localStorage.named === undefined &&
+            Object.keys(localStorage).length === 0
+            ",
+        );
     }
 
     #[test]
