@@ -3075,8 +3075,216 @@ fn is_callable_value(value: &JsValue) -> bool {
     )
 }
 
-/// Deep-clone a `JsValue`, recursing into plain objects and arrays.
-fn structured_clone(val: &JsValue) -> StatorResult<JsValue> {
+#[derive(Default)]
+struct StructuredCloneState {
+    values: HashMap<usize, JsValue>,
+    buffers: HashMap<usize, Rc<RefCell<JsArrayBuffer>>>,
+}
+
+fn structured_clone_data_clone_error(message: impl Into<String>) -> StatorError {
+    StatorError::Error(format!("DataCloneError: {}", message.into()))
+}
+
+fn structured_clone_unsupported(type_name: &str) -> StatorError {
+    structured_clone_data_clone_error(format!("{type_name} value is not cloneable"))
+}
+
+fn validate_structured_clone_options(args: &[JsValue]) -> StatorResult<()> {
+    let Some(options) = args.get(1) else {
+        return Ok(());
+    };
+    if matches!(options, JsValue::Undefined) {
+        return Ok(());
+    }
+    if matches!(options, JsValue::Null) || !options.is_object_like() {
+        return Err(StatorError::TypeError(
+            "structuredClone: options must be an object".into(),
+        ));
+    }
+
+    let transfer = dispatch_get_property_value(options, JsValue::String("transfer".into()))?;
+    if matches!(transfer, JsValue::Undefined) {
+        return Ok(());
+    }
+    match transfer {
+        JsValue::Array(items) if items.borrow().is_empty() => Ok(()),
+        JsValue::Array(_) => Err(structured_clone_data_clone_error(
+            "transfer lists are not supported by this runtime",
+        )),
+        _ => Err(StatorError::TypeError(
+            "structuredClone: options.transfer must be an array when present".into(),
+        )),
+    }
+}
+
+fn structured_clone_array_buffer(
+    source: &Rc<RefCell<JsArrayBuffer>>,
+    state: &mut StructuredCloneState,
+) -> StatorResult<Rc<RefCell<JsArrayBuffer>>> {
+    let key = Rc::as_ptr(source) as usize;
+    if let Some(cloned) = state.buffers.get(&key) {
+        return Ok(Rc::clone(cloned));
+    }
+
+    let source_ref = source.borrow();
+    if source_ref.detached {
+        return Err(structured_clone_data_clone_error(
+            "detached ArrayBuffer is not cloneable",
+        ));
+    }
+    let cloned = if source_ref.shared {
+        Rc::clone(source)
+    } else {
+        Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: source_ref.max_byte_length,
+            detached: false,
+            data: source_ref.data.clone(),
+        }))
+    };
+    drop(source_ref);
+    state.buffers.insert(key, Rc::clone(&cloned));
+    Ok(cloned)
+}
+
+fn structured_clone_typed_array(
+    source: &Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
+    state: &mut StructuredCloneState,
+    wrap: bool,
+    source_buffer_object: Option<JsValue>,
+) -> StatorResult<JsValue> {
+    let source_ref = source.borrow();
+    let cloned_buffer = structured_clone_array_buffer(&source_ref.buffer, state)?;
+    let cloned = crate::builtins::typed_array::JsTypedArray {
+        buffer: Rc::clone(&cloned_buffer),
+        kind: source_ref.kind,
+        byte_offset: source_ref.byte_offset,
+        length: source_ref.length,
+        auto_length: source_ref.auto_length,
+    };
+    let kind = source_ref.kind;
+    drop(source_ref);
+    let cloned_rc = Rc::new(RefCell::new(cloned));
+    if wrap {
+        let buffer_object = match source_buffer_object {
+            Some(object) => structured_clone_value(&object, state)?,
+            None => make_buffer_instance(cloned_buffer),
+        };
+        Ok(make_typed_array_instance(
+            kind,
+            cloned_rc,
+            Some(buffer_object),
+        ))
+    } else {
+        Ok(JsValue::TypedArray(cloned_rc))
+    }
+}
+
+fn structured_clone_dataview(
+    source: &Rc<RefCell<crate::builtins::typed_array::JsDataView>>,
+    state: &mut StructuredCloneState,
+    wrap: bool,
+    source_buffer_object: Option<JsValue>,
+) -> StatorResult<JsValue> {
+    let source_ref = source.borrow();
+    let cloned_buffer = structured_clone_array_buffer(&source_ref.buffer, state)?;
+    let cloned = crate::builtins::typed_array::JsDataView {
+        buffer: Rc::clone(&cloned_buffer),
+        byte_offset: source_ref.byte_offset,
+        byte_length: source_ref.byte_length,
+        auto_length: source_ref.auto_length,
+    };
+    drop(source_ref);
+    let cloned_rc = Rc::new(RefCell::new(cloned));
+    if wrap {
+        let buffer_object = match source_buffer_object {
+            Some(object) => structured_clone_value(&object, state)?,
+            None => make_buffer_instance(cloned_buffer),
+        };
+        Ok(make_dataview_instance(cloned_rc, buffer_object))
+    } else {
+        Ok(JsValue::DataView(cloned_rc))
+    }
+}
+
+fn structured_clone_plain_object(
+    map: &Rc<RefCell<PropertyMap>>,
+    state: &mut StructuredCloneState,
+) -> StatorResult<JsValue> {
+    if is_callable_value(&JsValue::PlainObject(Rc::clone(map))) {
+        return Err(structured_clone_unsupported("Function"));
+    }
+
+    let key = Rc::as_ptr(map) as usize;
+    if let Some(cloned) = state.values.get(&key) {
+        return Ok(cloned.clone());
+    }
+
+    let entries: Vec<(String, JsValue)> = {
+        let borrowed = map.borrow();
+        if borrowed.keys().any(|key| {
+            let key = key.as_ref();
+            key.starts_with("__is_")
+                || matches!(
+                    key,
+                    "#dom_exception"
+                        | "__promise__"
+                        | "__weak_map__"
+                        | "__weak_set__"
+                        | "__proxy__"
+                        | "__url_state__"
+                        | "__headers_list__"
+                        | "__form_data_entries__"
+                        | "__blob_parts__"
+                        | "__file_bits__"
+                        | "__event_state__"
+                        | "__performance_entry__"
+                )
+        }) {
+            return Err(structured_clone_unsupported("branded object"));
+        }
+        borrowed
+            .enumerable_iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect()
+    };
+
+    let cloned_rc = Rc::new(RefCell::new(PropertyMap::new()));
+    let cloned_value = JsValue::PlainObject(Rc::clone(&cloned_rc));
+    state.values.insert(key, cloned_value.clone());
+    for (property, value) in entries {
+        let cloned_property = structured_clone_value(&value, state)?;
+        cloned_rc.borrow_mut().insert(property, cloned_property);
+    }
+    Ok(cloned_value)
+}
+
+fn structured_clone_array(
+    arr: &Rc<RefCell<Vec<JsValue>>>,
+    state: &mut StructuredCloneState,
+) -> StatorResult<JsValue> {
+    let key = Rc::as_ptr(arr) as usize;
+    if let Some(cloned) = state.values.get(&key) {
+        return Ok(cloned.clone());
+    }
+
+    let source = arr.borrow().clone();
+    let cloned_rc = Rc::new(RefCell::new(vec![JsValue::TheHole; source.len()]));
+    let cloned_value = JsValue::Array(Rc::clone(&cloned_rc));
+    state.values.insert(key, cloned_value.clone());
+    for (index, value) in source.iter().enumerate() {
+        if matches!(value, JsValue::TheHole) {
+            continue;
+        }
+        cloned_rc.borrow_mut()[index] = structured_clone_value(value, state)?;
+    }
+    Ok(cloned_value)
+}
+
+fn structured_clone_value(
+    val: &JsValue,
+    state: &mut StructuredCloneState,
+) -> StatorResult<JsValue> {
     match val {
         JsValue::Undefined
         | JsValue::Null
@@ -3085,26 +3293,61 @@ fn structured_clone(val: &JsValue) -> StatorResult<JsValue> {
         | JsValue::HeapNumber(_)
         | JsValue::String(_)
         | JsValue::BigInt(_) => Ok(val.clone()),
-        JsValue::Symbol(_) | JsValue::Function(_) | JsValue::NativeFunction(_) => Err(
-            StatorError::TypeError("structuredClone: value is not cloneable".into()),
-        ),
+        JsValue::TheHole => Ok(JsValue::TheHole),
+        JsValue::Symbol(_) => Err(structured_clone_unsupported("Symbol")),
+        JsValue::Function(_) | JsValue::NativeFunction(_) => {
+            Err(structured_clone_unsupported("Function"))
+        }
+        JsValue::Array(arr) => structured_clone_array(arr, state),
+        JsValue::ArrayBuffer(buf) => {
+            structured_clone_array_buffer(buf, state).map(JsValue::ArrayBuffer)
+        }
+        JsValue::TypedArray(typed_array) => {
+            structured_clone_typed_array(typed_array, state, false, None)
+        }
+        JsValue::DataView(dataview) => structured_clone_dataview(dataview, state, false, None),
         JsValue::PlainObject(map) => {
-            let mut cloned = PropertyMap::new();
-            for (k, v) in map.borrow().iter() {
-                cloned.insert(k.to_string(), structured_clone(v)?);
+            let object_key = Rc::as_ptr(map) as usize;
+            if let Some(cloned) = state.values.get(&object_key) {
+                return Ok(cloned.clone());
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(cloned))))
+            if let Some(typed_array) = extract_typed_array(val) {
+                let source_buffer_object = map.borrow().get("__buffer_object__").cloned();
+                let cloned =
+                    structured_clone_typed_array(&typed_array, state, true, source_buffer_object)?;
+                state.values.insert(object_key, cloned.clone());
+                return Ok(cloned);
+            }
+            if let Some(dataview) = extract_dataview(val) {
+                let source_buffer_object = map.borrow().get("__buffer_object__").cloned();
+                let cloned =
+                    structured_clone_dataview(&dataview, state, true, source_buffer_object)?;
+                state.values.insert(object_key, cloned.clone());
+                return Ok(cloned);
+            }
+            if let Some(buffer) = extract_arraybuffer(val) {
+                let cloned_buffer = structured_clone_array_buffer(&buffer, state)?;
+                let cloned = make_buffer_instance(cloned_buffer);
+                state.values.insert(object_key, cloned.clone());
+                return Ok(cloned);
+            }
+            structured_clone_plain_object(map, state)
         }
-        JsValue::Array(arr) => {
-            let cloned: StatorResult<Vec<JsValue>> =
-                arr.borrow().iter().map(structured_clone).collect();
-            Ok(JsValue::new_array(cloned?))
-        }
-        JsValue::Error(e) => Ok(JsValue::Error(Rc::new(JsError::clone(e)))),
-        _ => Err(StatorError::TypeError(
-            "structuredClone: value is not cloneable".into(),
-        )),
+        JsValue::Proxy(_) => Err(structured_clone_unsupported("Proxy")),
+        JsValue::Promise(_) => Err(structured_clone_unsupported("Promise")),
+        JsValue::Object(_)
+        | JsValue::Generator(_)
+        | JsValue::Iterator(_)
+        | JsValue::Error(_)
+        | JsValue::ModuleBinding(_)
+        | JsValue::Context(_) => Err(structured_clone_unsupported("object")),
     }
+}
+
+fn structured_clone(args: &[JsValue]) -> StatorResult<JsValue> {
+    validate_structured_clone_options(args)?;
+    let val = args.first().unwrap_or(&JsValue::Undefined);
+    structured_clone_value(val, &mut StructuredCloneState::default())
 }
 
 fn fill_crypto_random_bytes(bytes: &mut [u8]) -> StatorResult<()> {
@@ -25050,10 +25293,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // ── structuredClone(value) ──────────────────────────────────────────
         globals.insert(
             "structuredClone".into(),
-            native(|args| {
-                let val = args.first().unwrap_or(&JsValue::Undefined);
-                structured_clone(val)
-            }),
+            builtin_fn("structuredClone", 1, |args| structured_clone(&args)),
         );
 
         // ── queueMicrotask(callback) ────────────────────────────────────────
@@ -25172,6 +25412,13 @@ mod tests {
         assert!(matches!(
             global_eval(script),
             Err(StatorError::TypeError(_))
+        ));
+    }
+
+    fn assert_eval_data_clone_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::Error(message)) if message.contains("DataCloneError")
         ));
     }
 
@@ -49436,22 +49683,90 @@ mod tests {
 
     #[test]
     fn e2e_structured_clone_rejects_function() {
-        assert_eval_type_error("structuredClone(function () {})");
+        assert_eval_data_clone_error("structuredClone(function () {})");
     }
 
     #[test]
     fn e2e_structured_clone_rejects_nested_function() {
-        assert_eval_type_error("structuredClone({ fn: function () {} })");
+        assert_eval_data_clone_error("structuredClone({ fn: function () {} })");
     }
 
     #[test]
     fn e2e_structured_clone_rejects_symbol() {
-        assert_eval_type_error("structuredClone(Symbol('x'))");
+        assert_eval_data_clone_error("structuredClone(Symbol('x'))");
     }
 
     #[test]
     fn e2e_structured_clone_rejects_nested_symbol() {
-        assert_eval_type_error("structuredClone({ value: Symbol('x') })");
+        assert_eval_data_clone_error("structuredClone({ value: Symbol('x') })");
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_cycles() {
+        assert_eval_true(
+            "var source = {}; source.self = source; var clone = structuredClone(source); clone !== source && clone.self === clone",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_repeated_references() {
+        assert_eval_true(
+            "var shared = { value: 1 }; var clone = structuredClone({ a: shared, b: shared }); clone.a === clone.b && clone.a.value === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_array_holes() {
+        assert_eval_true(
+            "var source = []; source.length = 2; source[1] = 7; var clone = structuredClone(source); clone.length === 2 && !(0 in clone) && clone[1] === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_copies_only_enumerable_object_properties() {
+        assert_eval_true(
+            "var source = {}; Object.defineProperty(source, 'hidden', { value: 1, enumerable: false }); source.visible = 2; var clone = structuredClone(source); clone.visible === 2 && !Object.hasOwn(clone, 'hidden')",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_copies_array_buffer_bytes() {
+        assert_eval_true(
+            "var source = new Uint8Array([1, 2, 3]).buffer; var clone = structuredClone(source); clone !== source && clone.byteLength === 3 && new Uint8Array(clone)[1] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_copies_typed_array_view() {
+        assert_eval_true(
+            "var source = new Uint8Array([4, 5, 6]); var clone = structuredClone(source); clone !== source && clone.buffer !== source.buffer && clone.length === 3 && clone[1] === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_cloned_buffer_aliasing() {
+        assert_eval_true(
+            "var view = new Uint8Array([8, 9]); var source = { buffer: view.buffer, view: view }; var clone = structuredClone(source); clone.buffer === clone.view.buffer && clone.view[1] === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_allows_empty_transfer_list() {
+        assert_eval_true(
+            "var source = new ArrayBuffer(2); var clone = structuredClone(source, { transfer: [] }); clone !== source && clone.byteLength === 2 && source.byteLength === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_non_empty_transfer_list() {
+        assert_eval_data_clone_error(
+            "structuredClone(new ArrayBuffer(2), { transfer: [new ArrayBuffer(1)] })",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_branded_objects_without_correct_clone() {
+        assert_eval_data_clone_error("structuredClone(new Date(0))");
     }
 
     #[test]
