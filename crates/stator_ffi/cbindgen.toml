@@ -27,6 +27,14 @@ cpp_compat = true
 # ever added.
 [export]
 include = [
+    "STATOR_FFI_ABI_VERSION",
+    "STATOR_FFI_ABI_VERSION_MAJOR",
+    "STATOR_FFI_ABI_VERSION_MINOR",
+    "STATOR_FFI_ABI_VERSION_PATCH",
+    "stator_ffi_abi_version",
+    "stator_ffi_abi_version_major",
+    "stator_ffi_abi_version_minor",
+    "stator_ffi_abi_version_patch",
     "StatorIsolate",
     "StatorContext",
     "StatorValue",

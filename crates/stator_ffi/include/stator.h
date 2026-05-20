@@ -12,6 +12,46 @@
 #include <stdlib.h>
 
 /**
+ * Major version of the Stator FFI C ABI.
+ *
+ * Incremented on breaking changes to existing exported types or function
+ * signatures.  Embedders should refuse to load a Stator build whose major
+ * version differs from the one they were compiled against.
+ */
+#define STATOR_FFI_ABI_VERSION_MAJOR 1
+
+/**
+ * Minor version of the Stator FFI C ABI.
+ *
+ * Incremented for additive, backwards-compatible changes such as new
+ * exported functions or new enum variants appended at the end of an
+ * existing enum.
+ */
+#define STATOR_FFI_ABI_VERSION_MINOR 0
+
+/**
+ * Patch version of the Stator FFI C ABI.
+ *
+ * Incremented for non-ABI changes (documentation, comments, internal
+ * refactors) that nevertheless ship as a new released artefact.
+ */
+#define STATOR_FFI_ABI_VERSION_PATCH 0
+
+/**
+ * Packed Stator FFI ABI version: `(major << 16) | (minor << 8) | patch`.
+ *
+ * Embedders may compare this constant to the value returned by
+ * [`stator_ffi_abi_version`] to detect a header/library skew at runtime:
+ *
+ * ```c
+ * if (stator_ffi_abi_version() != STATOR_FFI_ABI_VERSION) {
+ *     /* header and shared library disagree — refuse to proceed. */
+ * }
+ * ```
+ */
+#define STATOR_FFI_ABI_VERSION (((STATOR_FFI_ABI_VERSION_MAJOR << 16) | (STATOR_FFI_ABI_VERSION_MINOR << 8)) | STATOR_FFI_ABI_VERSION_PATCH)
+
+/**
  * Result returned by a host module resolver callback.
  */
 typedef enum StatorResolveStatus {
@@ -1635,6 +1675,35 @@ typedef enum StatorStatus (*StatorDomIndexedLengthCb)(void *data, uint32_t *out_
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Return the packed Stator FFI ABI version compiled into this library.
+ *
+ * The returned value uses the same encoding as the
+ * [`STATOR_FFI_ABI_VERSION`] header constant: `(major << 16) | (minor << 8)
+ * | patch`.  Embedders use this to detect ABI skew between the header they
+ * compiled against and the shared/static library they are actually linking.
+ */
+uint32_t stator_ffi_abi_version(void);
+
+/**
+ * Return the major component of the Stator FFI ABI version.
+ *
+ * Equivalent to `stator_ffi_abi_version() >> 16` but provided as a separate
+ * symbol so embedders can perform a single-field compatibility check without
+ * shifting bits in their host language.
+ */
+uint32_t stator_ffi_abi_version_major(void);
+
+/**
+ * Return the minor component of the Stator FFI ABI version.
+ */
+uint32_t stator_ffi_abi_version_minor(void);
+
+/**
+ * Return the patch component of the Stator FFI ABI version.
+ */
+uint32_t stator_ffi_abi_version_patch(void);
 
 /**
  * Create a new isolate.

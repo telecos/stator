@@ -48,6 +48,84 @@ use stator_jse::wasm::{
     WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
 };
 
+// ── Stator FFI ABI version contract ──────────────────────────────────────────
+//
+// The constants and function below form the externally visible ABI version
+// marker for the `stator_jse_ffi` C surface.  They exist so embedders (and
+// release-time CI gates) can detect ABI drift before linking against a new
+// Stator build.  The numbers describe the **C ABI**, not the crate version:
+// bump the major component on any breaking change to exported types or
+// function signatures, the minor component on additive changes (new
+// functions or enum variants appended at the end), and the patch component
+// for documentation-only or non-ABI fixes.
+
+/// Major version of the Stator FFI C ABI.
+///
+/// Incremented on breaking changes to existing exported types or function
+/// signatures.  Embedders should refuse to load a Stator build whose major
+/// version differs from the one they were compiled against.
+pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
+
+/// Minor version of the Stator FFI C ABI.
+///
+/// Incremented for additive, backwards-compatible changes such as new
+/// exported functions or new enum variants appended at the end of an
+/// existing enum.
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 0;
+
+/// Patch version of the Stator FFI C ABI.
+///
+/// Incremented for non-ABI changes (documentation, comments, internal
+/// refactors) that nevertheless ship as a new released artefact.
+pub const STATOR_FFI_ABI_VERSION_PATCH: u32 = 0;
+
+/// Packed Stator FFI ABI version: `(major << 16) | (minor << 8) | patch`.
+///
+/// Embedders may compare this constant to the value returned by
+/// [`stator_ffi_abi_version`] to detect a header/library skew at runtime:
+///
+/// ```c
+/// if (stator_ffi_abi_version() != STATOR_FFI_ABI_VERSION) {
+///     /* header and shared library disagree — refuse to proceed. */
+/// }
+/// ```
+pub const STATOR_FFI_ABI_VERSION: u32 = (STATOR_FFI_ABI_VERSION_MAJOR << 16)
+    | (STATOR_FFI_ABI_VERSION_MINOR << 8)
+    | STATOR_FFI_ABI_VERSION_PATCH;
+
+/// Return the packed Stator FFI ABI version compiled into this library.
+///
+/// The returned value uses the same encoding as the
+/// [`STATOR_FFI_ABI_VERSION`] header constant: `(major << 16) | (minor << 8)
+/// | patch`.  Embedders use this to detect ABI skew between the header they
+/// compiled against and the shared/static library they are actually linking.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_ffi_abi_version() -> u32 {
+    STATOR_FFI_ABI_VERSION
+}
+
+/// Return the major component of the Stator FFI ABI version.
+///
+/// Equivalent to `stator_ffi_abi_version() >> 16` but provided as a separate
+/// symbol so embedders can perform a single-field compatibility check without
+/// shifting bits in their host language.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_ffi_abi_version_major() -> u32 {
+    STATOR_FFI_ABI_VERSION_MAJOR
+}
+
+/// Return the minor component of the Stator FFI ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_ffi_abi_version_minor() -> u32 {
+    STATOR_FFI_ABI_VERSION_MINOR
+}
+
+/// Return the patch component of the Stator FFI ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_ffi_abi_version_patch() -> u32 {
+    STATOR_FFI_ABI_VERSION_PATCH
+}
+
 /// An opaque isolate handle.
 ///
 /// An isolate is an independent instance of the Stator engine with its own
