@@ -3121,6 +3121,8 @@ fn fill_crypto_random_bytes(bytes: &mut [u8]) -> StatorResult<()> {
 /// exceeding this fail closed with a `QuotaExceededError` (currently
 /// modelled here as a `RangeError` rather than a host-thrown `DOMException`).
 const CRYPTO_GET_RANDOM_VALUES_QUOTA: usize = 65_536;
+const CRYPTO_BRAND: &str = "__is_crypto__";
+const SUBTLE_CRYPTO_BRAND: &str = "__is_subtle_crypto__";
 
 /// Returns `true` for the integer TypedArray kinds accepted by
 /// `crypto.getRandomValues`.
@@ -3143,97 +3145,242 @@ fn crypto_kind_is_integer(kind: TypedArrayKind) -> bool {
     )
 }
 
-#[inline(never)]
-fn make_crypto() -> JsValue {
-    let mut props = PropertyMap::new();
-    props.insert(
-        "getRandomValues".into(),
-        builtin_fn("getRandomValues", 1, |args| {
-            let target = args.first().unwrap_or(&JsValue::Undefined);
-            if extract_dataview(target).is_some() {
-                return Err(StatorError::TypeError(
-                    "crypto.getRandomValues: argument must be an integer TypedArray".into(),
-                ));
-            }
-            let typed_array_rc = extract_typed_array(target).ok_or_else(|| {
-                StatorError::TypeError(
-                    "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+fn illegal_web_crypto_constructor(name: &'static str) -> JsValue {
+    native(move |_args| {
+        Err(StatorError::TypeError(format!(
+            "{name}: illegal constructor"
+        )))
+    })
+}
+
+fn resolve_crypto_receiver(args: &[JsValue], display_name: &str) -> StatorResult<Vec<JsValue>> {
+    let (receiver, user_args) = resolve_branded_receiver(args, CRYPTO_BRAND);
+    let JsValue::PlainObject(map) = receiver else {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    };
+    if !matches!(map.borrow().get(CRYPTO_BRAND), Some(JsValue::Boolean(true))) {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    }
+    Ok(user_args)
+}
+
+fn resolve_subtle_crypto_receiver(args: &[JsValue], display_name: &str) -> StatorResult<()> {
+    let (receiver, _) = resolve_branded_receiver(args, SUBTLE_CRYPTO_BRAND);
+    let JsValue::PlainObject(map) = receiver else {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    };
+    if !matches!(
+        map.borrow().get(SUBTLE_CRYPTO_BRAND),
+        Some(JsValue::Boolean(true))
+    ) {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    }
+    Ok(())
+}
+
+fn crypto_get_random_values(user_args: &[JsValue]) -> StatorResult<JsValue> {
+    let target = user_args.first().unwrap_or(&JsValue::Undefined);
+    if extract_dataview(target).is_some() {
+        return Err(StatorError::TypeError(
+            "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+        ));
+    }
+    let typed_array_rc = extract_typed_array(target).ok_or_else(|| {
+        StatorError::TypeError(
+            "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+        )
+    })?;
+
+    let (byte_offset, byte_len) = {
+        let ta = typed_array_rc.borrow();
+        if !crypto_kind_is_integer(ta.kind) {
+            return Err(StatorError::TypeError(
+                "crypto.getRandomValues: argument must be an integer TypedArray".into(),
+            ));
+        }
+        let bpe = ta.kind.bytes_per_element();
+        let buf = ta.buffer.borrow();
+        if buf.detached {
+            return Err(StatorError::TypeError(
+                "crypto.getRandomValues: backing ArrayBuffer is detached".into(),
+            ));
+        }
+        let buf_len = buf.data.len();
+        if ta.byte_offset > buf_len {
+            return Err(StatorError::TypeError(
+                "crypto.getRandomValues: TypedArray is out of bounds".into(),
+            ));
+        }
+        let byte_len = if ta.auto_length {
+            (buf_len - ta.byte_offset) / bpe * bpe
+        } else {
+            let needed = ta.length.checked_mul(bpe).ok_or_else(|| {
+                StatorError::RangeError(
+                    "crypto.getRandomValues: TypedArray byte length overflow".into(),
                 )
             })?;
-
-            let (byte_offset, byte_len) = {
-                let ta = typed_array_rc.borrow();
-                if !crypto_kind_is_integer(ta.kind) {
-                    return Err(StatorError::TypeError(
-                        "crypto.getRandomValues: argument must be an integer TypedArray".into(),
-                    ));
-                }
-                let bpe = ta.kind.bytes_per_element();
-                let buf = ta.buffer.borrow();
-                if buf.detached {
-                    return Err(StatorError::TypeError(
-                        "crypto.getRandomValues: backing ArrayBuffer is detached".into(),
-                    ));
-                }
-                let buf_len = buf.data.len();
-                if ta.byte_offset > buf_len {
-                    return Err(StatorError::TypeError(
-                        "crypto.getRandomValues: TypedArray is out of bounds".into(),
-                    ));
-                }
-                let byte_len = if ta.auto_length {
-                    (buf_len - ta.byte_offset) / bpe * bpe
-                } else {
-                    let needed = ta.length.checked_mul(bpe).ok_or_else(|| {
-                        StatorError::RangeError(
-                            "crypto.getRandomValues: TypedArray byte length overflow".into(),
-                        )
-                    })?;
-                    let end = ta.byte_offset.checked_add(needed).ok_or_else(|| {
-                        StatorError::RangeError(
-                            "crypto.getRandomValues: TypedArray byte length overflow".into(),
-                        )
-                    })?;
-                    if end > buf_len {
-                        return Err(StatorError::TypeError(
-                            "crypto.getRandomValues: TypedArray is out of bounds".into(),
-                        ));
-                    }
-                    needed
-                };
-                if byte_len > CRYPTO_GET_RANDOM_VALUES_QUOTA {
-                    return Err(StatorError::RangeError(format!(
-                        "crypto.getRandomValues: byteLength {byte_len} exceeds quota of {CRYPTO_GET_RANDOM_VALUES_QUOTA} bytes"
-                    )));
-                }
-                (ta.byte_offset, byte_len)
-            };
-
-            if byte_len > 0 {
-                let mut random_bytes = vec![0; byte_len];
-                fill_crypto_random_bytes(&mut random_bytes)?;
-                let ta = typed_array_rc.borrow();
-                let mut buf = ta.buffer.borrow_mut();
-                buf.data[byte_offset..byte_offset + byte_len].copy_from_slice(&random_bytes);
+            let end = ta.byte_offset.checked_add(needed).ok_or_else(|| {
+                StatorError::RangeError(
+                    "crypto.getRandomValues: TypedArray byte length overflow".into(),
+                )
+            })?;
+            if end > buf_len {
+                return Err(StatorError::TypeError(
+                    "crypto.getRandomValues: TypedArray is out of bounds".into(),
+                ));
             }
-            Ok(target.clone())
-        }),
+            needed
+        };
+        if byte_len > CRYPTO_GET_RANDOM_VALUES_QUOTA {
+            return Err(StatorError::RangeError(format!(
+                "crypto.getRandomValues: byteLength {byte_len} exceeds quota of {CRYPTO_GET_RANDOM_VALUES_QUOTA} bytes"
+            )));
+        }
+        (ta.byte_offset, byte_len)
+    };
+
+    if byte_len > 0 {
+        let mut random_bytes = vec![0; byte_len];
+        fill_crypto_random_bytes(&mut random_bytes)?;
+        let ta = typed_array_rc.borrow();
+        let mut buf = ta.buffer.borrow_mut();
+        buf.data[byte_offset..byte_offset + byte_len].copy_from_slice(&random_bytes);
+    }
+    Ok(target.clone())
+}
+
+fn crypto_random_uuid() -> StatorResult<JsValue> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| {
+        StatorError::Error(format!(
+            "crypto.randomUUID: secure random source failed: {err}"
+        ))
+    })?;
+    // RFC 4122 / 9562 version 4 + variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(JsValue::String(Rc::from(format_uuid_v4(&bytes))))
+}
+
+fn subtle_crypto_unsupported(method: &'static str, args: Vec<JsValue>) -> StatorResult<JsValue> {
+    resolve_subtle_crypto_receiver(&args, method)?;
+    Err(StatorError::TypeError(format!(
+        "SubtleCrypto.{method}: cryptographic operation is not implemented in standalone Stator"
+    )))
+}
+
+#[inline(never)]
+fn make_subtle_crypto_constructor() -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("SubtleCrypto".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    for (method, length) in [
+        ("encrypt", 3),
+        ("decrypt", 3),
+        ("sign", 3),
+        ("verify", 4),
+        ("digest", 2),
+        ("generateKey", 3),
+        ("deriveKey", 5),
+        ("deriveBits", 3),
+        ("importKey", 5),
+        ("exportKey", 2),
+        ("wrapKey", 4),
+        ("unwrapKey", 7),
+    ] {
+        proto.insert(
+            method.into(),
+            builtin_fn(method, length, move |args| {
+                subtle_crypto_unsupported(method, args)
+            }),
+        );
+    }
+    proto.make_all_non_enumerable();
+
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        illegal_web_crypto_constructor("SubtleCrypto"),
     );
     props.insert(
-        "randomUUID".into(),
-        builtin_fn("randomUUID", 0, |_args| {
-            let mut bytes = [0u8; 16];
-            getrandom::fill(&mut bytes).map_err(|err| {
-                StatorError::Error(format!(
-                    "crypto.randomUUID: secure random source failed: {err}"
-                ))
-            })?;
-            // RFC 4122 / 9562 version 4 + variant bits.
-            bytes[6] = (bytes[6] & 0x0f) | 0x40;
-            bytes[8] = (bytes[8] & 0x3f) | 0x80;
-            Ok(JsValue::String(Rc::from(format_uuid_v4(&bytes))))
+        "__construct__".into(),
+        illegal_web_crypto_constructor("SubtleCrypto"),
+    );
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_subtle_crypto_instance(subtle_proto: JsValue) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(SUBTLE_CRYPTO_BRAND.into(), JsValue::Boolean(true));
+    props.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), subtle_proto);
+    props.insert(
+        "@@toStringTag".into(),
+        JsValue::String("SubtleCrypto".into()),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+#[inline(never)]
+fn make_crypto_constructor() -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Crypto".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    proto.insert(
+        "getRandomValues".into(),
+        builtin_fn("getRandomValues", 1, |args| {
+            let user_args = resolve_crypto_receiver(&args, "Crypto.prototype.getRandomValues")?;
+            crypto_get_random_values(&user_args)
         }),
     );
+    proto.insert(
+        "randomUUID".into(),
+        builtin_fn("randomUUID", 0, |args| {
+            resolve_crypto_receiver(&args, "Crypto.prototype.randomUUID")?;
+            crypto_random_uuid()
+        }),
+    );
+    proto.make_all_non_enumerable();
+
+    let mut props = PropertyMap::new();
+    props.insert("__call__".into(), illegal_web_crypto_constructor("Crypto"));
+    props.insert(
+        "__construct__".into(),
+        illegal_web_crypto_constructor("Crypto"),
+    );
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_crypto_instance(crypto_proto: JsValue, subtle: JsValue) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(CRYPTO_BRAND.into(), JsValue::Boolean(true));
+    props.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), crypto_proto);
+    props.insert("subtle".into(), subtle);
+    props.insert("@@toStringTag".into(), JsValue::String("Crypto".into()));
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -24141,7 +24288,30 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "clearInterval".into(),
             make_unsupported_web_function("clearInterval", 1),
         );
-        globals.insert("crypto".into(), make_crypto());
+        let subtle_crypto_ctor = finalize_ctor(make_subtle_crypto_constructor(), "SubtleCrypto");
+        let subtle_crypto_proto = match &subtle_crypto_ctor {
+            JsValue::PlainObject(map) => map
+                .borrow()
+                .get("prototype")
+                .cloned()
+                .unwrap_or(JsValue::Null),
+            _ => JsValue::Null,
+        };
+        let subtle_crypto = make_subtle_crypto_instance(subtle_crypto_proto);
+        globals.insert("SubtleCrypto".into(), subtle_crypto_ctor);
+
+        let crypto_ctor = finalize_ctor(make_crypto_constructor(), "Crypto");
+        let crypto_proto = match &crypto_ctor {
+            JsValue::PlainObject(map) => map
+                .borrow()
+                .get("prototype")
+                .cloned()
+                .unwrap_or(JsValue::Null),
+            _ => JsValue::Null,
+        };
+        let crypto = make_crypto_instance(crypto_proto, subtle_crypto);
+        globals.insert("Crypto".into(), crypto_ctor);
+        globals.insert("crypto".into(), crypto);
 
         // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
         // `globalThis` is a self-referential property of the global object.
@@ -48442,6 +48612,17 @@ mod tests {
     }
 
     #[test]
+    fn e2e_crypto_constructor_shape() {
+        assert_eval_true("typeof Crypto === 'function' && crypto instanceof Crypto");
+    }
+
+    #[test]
+    fn e2e_crypto_constructor_is_illegal() {
+        assert_eval_type_error("new Crypto()");
+        assert_eval_type_error("Crypto()");
+    }
+
+    #[test]
     fn e2e_crypto_get_random_values_returns_same_typed_array() {
         assert_eval_true(
             "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes) === bytes && bytes.length === 4",
@@ -48543,9 +48724,35 @@ mod tests {
     }
 
     #[test]
-    fn e2e_crypto_no_subtle_property() {
-        // Subtle crypto is not implemented; absence is acceptable fail-closed behavior.
-        assert_eval_true("typeof crypto.subtle === 'undefined'");
+    fn e2e_crypto_get_random_values_rejects_wrong_receiver() {
+        assert_eval_type_error("crypto.getRandomValues.call({}, new Uint8Array(1))");
+    }
+
+    #[test]
+    fn e2e_crypto_subtle_fail_closed_shape() {
+        assert_eval_true(
+            "typeof SubtleCrypto === 'function' && \
+             typeof crypto.subtle === 'object' && \
+             crypto.subtle instanceof SubtleCrypto && \
+             typeof crypto.subtle.digest === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_subtle_constructor_is_illegal() {
+        assert_eval_type_error("new SubtleCrypto()");
+        assert_eval_type_error("SubtleCrypto()");
+    }
+
+    #[test]
+    fn e2e_crypto_subtle_methods_throw_unsupported() {
+        assert_eval_type_error("crypto.subtle.digest('SHA-256', new Uint8Array(0))");
+        assert_eval_type_error("crypto.subtle.encrypt({}, {}, new Uint8Array(0))");
+    }
+
+    #[test]
+    fn e2e_crypto_subtle_methods_reject_wrong_receiver() {
+        assert_eval_type_error("crypto.subtle.digest.call({}, 'SHA-256', new Uint8Array(0))");
     }
 
     #[test]
