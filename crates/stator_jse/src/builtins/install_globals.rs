@@ -7027,6 +7027,18 @@ const ABORT_CONTROLLER_BRAND: &str = "__is_abort_controller__";
 /// Hidden brand placed on every `AbortSignal` instance.
 const ABORT_SIGNAL_BRAND: &str = "__is_abort_signal__";
 
+/// Hidden brand placed on every `ProgressEvent` instance.
+const PROGRESS_EVENT_BRAND: &str = "__is_progress_event__";
+
+/// Hidden brand placed on every `ErrorEvent` instance.
+const ERROR_EVENT_BRAND: &str = "__is_error_event__";
+
+/// Hidden brand placed on every `CloseEvent` instance.
+const CLOSE_EVENT_BRAND: &str = "__is_close_event__";
+
+/// Hidden brand placed on every `MessageEvent` instance.
+const MESSAGE_EVENT_BRAND: &str = "__is_message_event__";
+
 #[derive(Clone)]
 struct EventListenerEntry {
     id: u64,
@@ -7103,6 +7115,54 @@ thread_local! {
         const { RefCell::new(None) };
     static ABORT_SIGNAL_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
+    static PROGRESS_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<ProgressEventData>>>> =
+        RefCell::new(HashMap::new());
+    static PROGRESS_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static ERROR_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<ErrorEventData>>>> =
+        RefCell::new(HashMap::new());
+    static ERROR_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static CLOSE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<CloseEventData>>>> =
+        RefCell::new(HashMap::new());
+    static CLOSE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static MESSAGE_EVENT_STATES: RefCell<HashMap<usize, Rc<RefCell<MessageEventData>>>> =
+        RefCell::new(HashMap::new());
+    static MESSAGE_EVENT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Immutable data carried by a `ProgressEvent` instance.
+struct ProgressEventData {
+    length_computable: bool,
+    loaded: f64,
+    total: f64,
+}
+
+/// Immutable data carried by an `ErrorEvent` instance.
+struct ErrorEventData {
+    message: String,
+    filename: String,
+    lineno: u32,
+    colno: u32,
+    error: JsValue,
+}
+
+/// Immutable data carried by a `CloseEvent` instance.
+struct CloseEventData {
+    was_clean: bool,
+    code: u16,
+    reason: String,
+}
+
+/// Immutable data carried by a `MessageEvent` instance. `source` is always
+/// `null` and `ports` is always an empty list: this engine has no
+/// MessagePort / Window / ServiceWorker host identities to attach.
+struct MessageEventData {
+    data: JsValue,
+    origin: String,
+    last_event_id: String,
 }
 
 fn event_type_error(message: impl Into<String>) -> StatorError {
@@ -7735,6 +7795,651 @@ fn make_custom_event_builtin() -> JsValue {
     );
 
     install_event_phase_constants(&mut props);
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+// ── Data-only subtype Event constructors ────────────────────────────────────
+//
+// `ProgressEvent`, `ErrorEvent`, `CloseEvent`, and `MessageEvent` are
+// implemented as real subtypes of `Event`: each instance carries the
+// `EVENT_BRAND` (so the inherited `Event` accessors work) plus its own
+// subtype brand, and its `[[Prototype]]` is the subtype's prototype, which
+// in turn chains to `Event.prototype` so `instanceof Event` succeeds.
+//
+// These constructors deliberately do **not** plug into any host pipeline:
+// no global error reporting, no WebSocket close handshake, no
+// MessagePort/Window/Worker `source`, no port transfer, no trusted-event
+// flag, and no dispatch by the engine. They are purely standalone data
+// objects, faithful to the WebIDL-visible shape and constructor coercion
+// semantics.
+
+fn dict_field(init: &JsValue, name: &str) -> StatorResult<Option<JsValue>> {
+    if matches!(init, JsValue::Undefined | JsValue::Null) {
+        return Ok(None);
+    }
+    if !matches!(init, JsValue::PlainObject(_)) {
+        return Err(event_type_error("Event: eventInitDict must be an object"));
+    }
+    let value = dispatch_get_property_value(init, JsValue::String(name.to_string().into()))?;
+    if matches!(value, JsValue::Undefined) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn dict_field_string(init: &JsValue, name: &str) -> StatorResult<Option<String>> {
+    match dict_field(init, name)? {
+        Some(v) => Ok(Some(v.to_js_string()?.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn dict_field_number(init: &JsValue, name: &str) -> StatorResult<Option<f64>> {
+    match dict_field(init, name)? {
+        Some(v) => Ok(Some(v.to_number()?)),
+        None => Ok(None),
+    }
+}
+
+fn dict_field_uint32(init: &JsValue, name: &str) -> StatorResult<u32> {
+    match dict_field(init, name)? {
+        Some(v) => v.to_uint32(),
+        None => Ok(0),
+    }
+}
+
+fn dict_field_uint16(init: &JsValue, name: &str) -> StatorResult<u16> {
+    // WebIDL `unsigned short` uses ToUint16: same bit pattern as `(ToUint32 & 0xFFFF)`.
+    match dict_field(init, name)? {
+        Some(v) => Ok((v.to_uint32()? & 0xFFFF) as u16),
+        None => Ok(0),
+    }
+}
+
+fn dict_field_any(init: &JsValue, name: &str) -> StatorResult<JsValue> {
+    Ok(dict_field(init, name)?.unwrap_or(JsValue::Null))
+}
+
+fn build_event_state_for_subtype(type_: String, init: &JsValue) -> StatorResult<EventState> {
+    let bubbles = event_init_bool(init, "bubbles")?;
+    let cancelable = event_init_bool(init, "cancelable")?;
+    let composed = event_init_bool(init, "composed")?;
+    Ok(EventState {
+        type_,
+        bubbles,
+        cancelable,
+        composed,
+        canceled: false,
+        stop_propagation: false,
+        stop_immediate_propagation: false,
+        time_stamp: current_time_millis(),
+        detail: JsValue::Null,
+        target: JsValue::Null,
+        current_target: JsValue::Null,
+        event_phase: 0,
+        dispatching: false,
+        in_passive_listener: false,
+    })
+}
+
+/// Allocate a subtype-of-Event instance: sets `EVENT_BRAND`, the subtype
+/// brand, the subtype prototype slot, and registers the inner `EventState`
+/// so all inherited Event accessors work.
+fn build_event_subtype_instance(
+    state: EventState,
+    proto: Option<Rc<RefCell<PropertyMap>>>,
+    extra_brand: &str,
+) -> Rc<RefCell<PropertyMap>> {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            EVENT_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(
+            extra_brand.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        if let Some(proto) = proto {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    install_event_state(&inst, Rc::new(RefCell::new(state)));
+    inst
+}
+
+fn subtype_proto(brand_name: &'static str) -> Rc<RefCell<PropertyMap>> {
+    let mut proto = PropertyMap::new();
+    if let Some(event_proto) = EVENT_PROTO.with(|p| p.borrow().clone()) {
+        proto.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            JsValue::PlainObject(event_proto),
+            PropertyAttributes::empty(),
+        );
+    }
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(brand_name.into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    Rc::new(RefCell::new(proto))
+}
+
+/// Type alias for a thread-local subtype state map keyed by instance
+/// pointer. Factored out so `lookup_subtype_state` doesn't trip the
+/// `clippy::type_complexity` lint.
+type SubtypeStateKey<T> = std::thread::LocalKey<RefCell<HashMap<usize, Rc<RefCell<T>>>>>;
+
+fn lookup_subtype_state<T: 'static>(
+    value: &JsValue,
+    brand: &str,
+    states: &'static SubtypeStateKey<T>,
+    type_name: &str,
+) -> StatorResult<Rc<RefCell<T>>> {
+    let JsValue::PlainObject(map) = value else {
+        return Err(event_type_error(format!(
+            "{type_name}: method called on non-{type_name} receiver"
+        )));
+    };
+    if !matches!(map.borrow().get(brand), Some(JsValue::Boolean(true))) {
+        return Err(event_type_error(format!(
+            "{type_name}: method called on non-{type_name} receiver"
+        )));
+    }
+    let id = Rc::as_ptr(map) as usize;
+    states
+        .with(|s| s.borrow().get(&id).cloned())
+        .ok_or_else(|| event_type_error(format!("{type_name}: internal state missing")))
+}
+
+/// Build the `ProgressEvent` constructor.
+fn make_progress_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("ProgressEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let length_computable = event_init_bool(&init, "lengthComputable")?;
+            let loaded = dict_field_number(&init, "loaded")?.unwrap_or(0.0);
+            let total = dict_field_number(&init, "total")?.unwrap_or(0.0);
+            let proto = PROGRESS_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, PROGRESS_EVENT_BRAND);
+            let data = Rc::new(RefCell::new(ProgressEventData {
+                length_computable,
+                loaded,
+                total,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            PROGRESS_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, data);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("ProgressEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_lengthComputable__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PROGRESS_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PROGRESS_EVENT_BRAND,
+                    &PROGRESS_EVENT_STATES,
+                    "ProgressEvent",
+                )?;
+                Ok(JsValue::Boolean(s.borrow().length_computable))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_loaded__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PROGRESS_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PROGRESS_EVENT_BRAND,
+                    &PROGRESS_EVENT_STATES,
+                    "ProgressEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().loaded))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_total__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, PROGRESS_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    PROGRESS_EVENT_BRAND,
+                    &PROGRESS_EVENT_STATES,
+                    "ProgressEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().total))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    PROGRESS_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `ErrorEvent` constructor.
+fn make_error_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("ErrorEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let message = dict_field_string(&init, "message")?.unwrap_or_default();
+            let filename = dict_field_string(&init, "filename")?.unwrap_or_default();
+            let lineno = dict_field_uint32(&init, "lineno")?;
+            let colno = dict_field_uint32(&init, "colno")?;
+            let error = dict_field_any(&init, "error")?;
+            let proto = ERROR_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, ERROR_EVENT_BRAND);
+            let data = Rc::new(RefCell::new(ErrorEventData {
+                message,
+                filename,
+                lineno,
+                colno,
+                error,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            ERROR_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, data);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("ErrorEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_message__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ERROR_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ERROR_EVENT_BRAND,
+                    &ERROR_EVENT_STATES,
+                    "ErrorEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().message.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_filename__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ERROR_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ERROR_EVENT_BRAND,
+                    &ERROR_EVENT_STATES,
+                    "ErrorEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().filename.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_lineno__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ERROR_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ERROR_EVENT_BRAND,
+                    &ERROR_EVENT_STATES,
+                    "ErrorEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().lineno as f64))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_colno__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ERROR_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ERROR_EVENT_BRAND,
+                    &ERROR_EVENT_STATES,
+                    "ErrorEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().colno as f64))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_error__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, ERROR_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    ERROR_EVENT_BRAND,
+                    &ERROR_EVENT_STATES,
+                    "ErrorEvent",
+                )?;
+                Ok(s.borrow().error.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    ERROR_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `CloseEvent` constructor. The constructor does not validate
+/// `code` / `reason` ranges: WebSocket-level validation happens in
+/// `WebSocket.close()`, not the bare `CloseEvent` constructor (matches
+/// browsers).
+fn make_close_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("CloseEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let was_clean = event_init_bool(&init, "wasClean")?;
+            let code = dict_field_uint16(&init, "code")?;
+            let reason = dict_field_string(&init, "reason")?.unwrap_or_default();
+            let proto = CLOSE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, CLOSE_EVENT_BRAND);
+            let data = Rc::new(RefCell::new(CloseEventData {
+                was_clean,
+                code,
+                reason,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            CLOSE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, data);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("CloseEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_wasClean__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, CLOSE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    CLOSE_EVENT_BRAND,
+                    &CLOSE_EVENT_STATES,
+                    "CloseEvent",
+                )?;
+                Ok(JsValue::Boolean(s.borrow().was_clean))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_code__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, CLOSE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    CLOSE_EVENT_BRAND,
+                    &CLOSE_EVENT_STATES,
+                    "CloseEvent",
+                )?;
+                Ok(JsValue::HeapNumber(s.borrow().code as f64))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_reason__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, CLOSE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    CLOSE_EVENT_BRAND,
+                    &CLOSE_EVENT_STATES,
+                    "CloseEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().reason.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    CLOSE_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
+}
+
+/// Build the `MessageEvent` constructor.
+///
+/// `data`, `origin`, and `lastEventId` are honored from the init dict.
+/// `source` and `ports` are intentionally fixed at `null` / `[]`: this
+/// engine has no `MessagePort`, `Window`, `WindowProxy`, or
+/// `ServiceWorker` host identities to attach. Supplying a non-null
+/// `source` or a non-empty `ports` array throws `TypeError` rather than
+/// silently dropping the value.
+fn make_message_event_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let type_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(type_arg, JsValue::Undefined) {
+                return Err(event_type_error("MessageEvent: type argument is required"));
+            }
+            let type_ = type_arg.to_js_string()?.to_string();
+            let init = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let event_state = build_event_state_for_subtype(type_, &init)?;
+            let data = dict_field_any(&init, "data")?;
+            let origin = dict_field_string(&init, "origin")?.unwrap_or_default();
+            let last_event_id = dict_field_string(&init, "lastEventId")?.unwrap_or_default();
+
+            // `source` must be null/undefined — no host identities available.
+            if let Some(source) = dict_field(&init, "source")?
+                && !matches!(source, JsValue::Null)
+            {
+                return Err(event_type_error(
+                    "MessageEvent: source is not implemented (Window/MessagePort/ServiceWorker unavailable)",
+                ));
+            }
+            // `ports` must be undefined/null or an empty array — MessagePort transfer is unimplemented.
+            if let Some(ports) = dict_field(&init, "ports")? {
+                let (_, len) = try_to_array_like_elements(&ports)?;
+                if len > 0 {
+                    return Err(event_type_error(
+                        "MessageEvent: non-empty ports is not implemented (MessagePort unavailable)",
+                    ));
+                }
+            }
+
+            let proto = MESSAGE_EVENT_PROTO.with(|p| p.borrow().clone());
+            let inst = build_event_subtype_instance(event_state, proto, MESSAGE_EVENT_BRAND);
+            let state = Rc::new(RefCell::new(MessageEventData {
+                data,
+                origin,
+                last_event_id,
+            }));
+            let id = Rc::as_ptr(&inst) as usize;
+            MESSAGE_EVENT_STATES.with(|s| {
+                s.borrow_mut().insert(id, state);
+            });
+            Ok(JsValue::PlainObject(inst))
+        }),
+    );
+
+    let proto_rc = subtype_proto("MessageEvent");
+    {
+        let mut proto = proto_rc.borrow_mut();
+        proto.insert_with_attrs(
+            "__get_data__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, MESSAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    MESSAGE_EVENT_BRAND,
+                    &MESSAGE_EVENT_STATES,
+                    "MessageEvent",
+                )?;
+                Ok(s.borrow().data.clone())
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_origin__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, MESSAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    MESSAGE_EVENT_BRAND,
+                    &MESSAGE_EVENT_STATES,
+                    "MessageEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().origin.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_lastEventId__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, MESSAGE_EVENT_BRAND);
+                let s = lookup_subtype_state(
+                    &recv,
+                    MESSAGE_EVENT_BRAND,
+                    &MESSAGE_EVENT_STATES,
+                    "MessageEvent",
+                )?;
+                Ok(JsValue::String(s.borrow().last_event_id.clone().into()))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        // `source` is always null and `ports` is always an empty array:
+        // this engine has no host MessagePort/Window/ServiceWorker
+        // identities to attach. Returning a fresh empty array per call
+        // matches the WebIDL `FrozenArray` shape closely enough for
+        // feature detection while remaining honest about the lack of
+        // transferable ports.
+        proto.insert_with_attrs(
+            "__get_source__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, MESSAGE_EVENT_BRAND);
+                lookup_subtype_state(
+                    &recv,
+                    MESSAGE_EVENT_BRAND,
+                    &MESSAGE_EVENT_STATES,
+                    "MessageEvent",
+                )?;
+                Ok(JsValue::Null)
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.insert_with_attrs(
+            "__get_ports__".into(),
+            native(|args| {
+                let (recv, _) = resolve_branded_receiver(&args, MESSAGE_EVENT_BRAND);
+                lookup_subtype_state(
+                    &recv,
+                    MESSAGE_EVENT_BRAND,
+                    &MESSAGE_EVENT_STATES,
+                    "MessageEvent",
+                )?;
+                Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+            }),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+    }
+    MESSAGE_EVENT_PROTO.with(|p| {
+        *p.borrow_mut() = Some(Rc::clone(&proto_rc));
+    });
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::clone(&proto_rc)),
+    );
 
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
@@ -22630,6 +23335,36 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_abort_controller_builtin(), "AbortController"),
         );
 
+        // ── Standalone data-event subtype constructors ──────────────────────
+        //
+        // These are real subtypes of `Event`: each instance carries the
+        // `Event` brand plus its own subtype brand, with a prototype that
+        // chains to `Event.prototype` so `instanceof Event` succeeds. They
+        // expose only init-dict-derived data and inherit `preventDefault`,
+        // `stopPropagation`, `composedPath`, etc. from `Event.prototype`.
+        //
+        // No host plumbing is hooked up: `ErrorEvent` does not feed
+        // global error reporting, `CloseEvent` does not run a WebSocket
+        // closing handshake, and `MessageEvent.source` / `ports` reject
+        // non-null / non-empty values because no `Window`, `MessagePort`,
+        // or `ServiceWorker` host identities exist in this engine.
+        globals.insert(
+            "ProgressEvent".into(),
+            finalize_ctor(make_progress_event_builtin(), "ProgressEvent"),
+        );
+        globals.insert(
+            "ErrorEvent".into(),
+            finalize_ctor(make_error_event_builtin(), "ErrorEvent"),
+        );
+        globals.insert(
+            "CloseEvent".into(),
+            finalize_ctor(make_close_event_builtin(), "CloseEvent"),
+        );
+        globals.insert(
+            "MessageEvent".into(),
+            finalize_ctor(make_message_event_builtin(), "MessageEvent"),
+        );
+
         // ── DOM UI / input / pointer / drag / touch / lifecycle event
         //    constructor globals (fail-closed) ───────────────────────────────
         //
@@ -22665,8 +23400,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "HashChangeEvent",
             "PageTransitionEvent",
             "StorageEvent",
-            "ProgressEvent",
-            "ErrorEvent",
             "PromiseRejectionEvent",
             "AnimationEvent",
             "TransitionEvent",
@@ -22688,7 +23421,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // objects.
         for name in [
             "WebSocket",
-            "CloseEvent",
             "EventSource",
             "Worker",
             "SharedWorker",
@@ -23670,6 +24402,7 @@ mod tests {
         assert!(globals.contains_key("MessageChannel"));
         assert!(globals.contains_key("MessagePort"));
         assert!(globals.contains_key("BroadcastChannel"));
+        assert!(globals.contains_key("MessageEvent"));
         assert!(globals.contains_key("ReportingObserver"));
         assert!(globals.contains_key("Report"));
         assert!(globals.contains_key("ReportBody"));
@@ -24947,6 +25680,197 @@ mod tests {
         assert_eval_type_error("new CustomEvent()");
     }
 
+    // ── Data-event subtypes (ProgressEvent / ErrorEvent / CloseEvent /
+    //    MessageEvent) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_progress_event_constructor_defaults_and_init() {
+        assert_eval_true(
+            "typeof ProgressEvent === 'function' && ProgressEvent.name === 'ProgressEvent'",
+        );
+        // instanceof brand + inheritance from Event.
+        assert_eval_true("new ProgressEvent('p') instanceof ProgressEvent");
+        assert_eval_true("new ProgressEvent('p') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(ProgressEvent.prototype) === Event.prototype");
+        assert_eval_true(
+            "Object.prototype.toString.call(new ProgressEvent('p')) === '[object ProgressEvent]'",
+        );
+        // Type argument required.
+        assert_eval_type_error("new ProgressEvent()");
+        // Defaults.
+        assert_eval_true(
+            "var e = new ProgressEvent('p'); \
+             e.type === 'p' && \
+             e.lengthComputable === false && \
+             e.loaded === 0 && e.total === 0 && \
+             e.bubbles === false && e.cancelable === false",
+        );
+        // Init dict coercion: ToBoolean for lengthComputable, ToNumber for loaded/total.
+        assert_eval_true(
+            "var e = new ProgressEvent('p', { lengthComputable: 1, loaded: '12', total: 100 }); \
+             e.lengthComputable === true && e.loaded === 12 && e.total === 100",
+        );
+        // Inherited Event behavior.
+        assert_eval_true(
+            "var e = new ProgressEvent('p', { cancelable: true }); \
+             e.preventDefault(); e.defaultPrevented === true",
+        );
+        // The data fields are exposed as accessors on the prototype, not as
+        // own data properties on the instance (browser-compatible shape).
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(ProgressEvent.prototype, 'loaded'); \
+             typeof d.get === 'function' && d.set === undefined",
+        );
+        // Brand check on inherited methods rejects foreign receivers.
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ProgressEvent.prototype, 'loaded').get.call({})",
+        );
+    }
+
+    #[test]
+    fn e2e_error_event_constructor_defaults_and_init() {
+        assert_eval_true("typeof ErrorEvent === 'function' && ErrorEvent.name === 'ErrorEvent'");
+        assert_eval_true("new ErrorEvent('error') instanceof ErrorEvent");
+        assert_eval_true("new ErrorEvent('error') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(ErrorEvent.prototype) === Event.prototype");
+        assert_eval_true(
+            "Object.prototype.toString.call(new ErrorEvent('e')) === '[object ErrorEvent]'",
+        );
+        assert_eval_type_error("new ErrorEvent()");
+        // Defaults.
+        assert_eval_true(
+            "var e = new ErrorEvent('error'); \
+             e.message === '' && e.filename === '' && \
+             e.lineno === 0 && e.colno === 0 && e.error === null",
+        );
+        // Init dict coercion: ToString for message/filename, ToUint32 for lineno/colno,
+        // any for error (object identity preserved).
+        assert_eval_true(
+            "var err = new Error('boom'); \
+             var e = new ErrorEvent('error', { message: 'm', filename: 'f.js', \
+                                                lineno: 42, colno: 7, error: err }); \
+             e.message === 'm' && e.filename === 'f.js' && \
+             e.lineno === 42 && e.colno === 7 && e.error === err",
+        );
+        // Numbers are coerced; `1.7` truncates to `1` via ToUint32.
+        assert_eval_true("var e = new ErrorEvent('e', { lineno: 1.7 }); e.lineno === 1");
+        // Properties are accessors on the prototype.
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(ErrorEvent.prototype, 'message'); typeof d.get === 'function' && d.set === undefined",
+        );
+        // Constructing an ErrorEvent does NOT dispatch into a global error handler.
+        assert_eval_true("typeof onerror === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_close_event_constructor_defaults_and_init() {
+        assert_eval_true("typeof CloseEvent === 'function' && CloseEvent.name === 'CloseEvent'");
+        assert_eval_true("new CloseEvent('close') instanceof CloseEvent");
+        assert_eval_true("new CloseEvent('close') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(CloseEvent.prototype) === Event.prototype");
+        assert_eval_true(
+            "Object.prototype.toString.call(new CloseEvent('c')) === '[object CloseEvent]'",
+        );
+        assert_eval_type_error("new CloseEvent()");
+        // Defaults.
+        assert_eval_true(
+            "var e = new CloseEvent('close'); \
+             e.wasClean === false && e.code === 0 && e.reason === ''",
+        );
+        // Init dict coercion: ToBoolean / ToUint16 / ToString.
+        assert_eval_true(
+            "var e = new CloseEvent('close', { wasClean: 1, code: 1000, reason: 'bye' }); \
+             e.wasClean === true && e.code === 1000 && e.reason === 'bye'",
+        );
+        // Per the bare CloseEvent constructor (matches browsers), out-of-range
+        // codes are NOT validated — WebSocket.close() does that. ToUint16
+        // wraps the value.
+        assert_eval_true("var e = new CloseEvent('close', { code: 0x1ABCD }); e.code === 0xABCD");
+        // Constructing a CloseEvent does NOT initiate a WebSocket close handshake.
+        assert_eval_true("typeof WebSocket === 'function'");
+        assert_eval_type_error("new WebSocket('wss://example.test/')");
+    }
+
+    #[test]
+    fn e2e_message_event_constructor_defaults_and_init() {
+        assert_eval_true(
+            "typeof MessageEvent === 'function' && MessageEvent.name === 'MessageEvent'",
+        );
+        assert_eval_true("new MessageEvent('message') instanceof MessageEvent");
+        assert_eval_true("new MessageEvent('message') instanceof Event");
+        assert_eval_true("Object.getPrototypeOf(MessageEvent.prototype) === Event.prototype");
+        assert_eval_true(
+            "Object.prototype.toString.call(new MessageEvent('m')) === '[object MessageEvent]'",
+        );
+        assert_eval_type_error("new MessageEvent()");
+        // Defaults.
+        assert_eval_true(
+            "var e = new MessageEvent('message'); \
+             e.data === null && e.origin === '' && e.lastEventId === '' && \
+             e.source === null && Array.isArray(e.ports) && e.ports.length === 0",
+        );
+        // Init dict honored for safe fields. Object identity preserved for `data`.
+        assert_eval_true(
+            "var d = { a: 1 }; \
+             var e = new MessageEvent('message', { data: d, origin: 'https://x.test', lastEventId: '42' }); \
+             e.data === d && e.origin === 'https://x.test' && e.lastEventId === '42'",
+        );
+        // Explicit null source / empty ports are accepted.
+        assert_eval_true(
+            "var e = new MessageEvent('m', { source: null, ports: [] }); \
+             e.source === null && e.ports.length === 0",
+        );
+        // Non-null source rejected (no Window/MessagePort/ServiceWorker host identity).
+        assert_eval_type_error("new MessageEvent('m', { source: {} })");
+        // Non-empty ports rejected (no MessagePort transfer).
+        assert_eval_type_error("new MessageEvent('m', { ports: [{}] })");
+    }
+
+    #[test]
+    fn e2e_data_event_subtype_prototype_chains_are_distinct() {
+        // Each subtype has its own prototype, distinct from Event.prototype.
+        assert_eval_true("ProgressEvent.prototype !== Event.prototype");
+        assert_eval_true("ErrorEvent.prototype !== Event.prototype");
+        assert_eval_true("CloseEvent.prototype !== Event.prototype");
+        assert_eval_true("MessageEvent.prototype !== Event.prototype");
+        assert_eval_true("ProgressEvent.prototype.constructor === ProgressEvent");
+        assert_eval_true("ErrorEvent.prototype.constructor === ErrorEvent");
+        assert_eval_true("CloseEvent.prototype.constructor === CloseEvent");
+        assert_eval_true("MessageEvent.prototype.constructor === MessageEvent");
+        // Cross-type brand checks reject foreign receivers on subtype accessors.
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ProgressEvent.prototype, 'loaded').get.call(new Event('x'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(ErrorEvent.prototype, 'message').get.call(new ProgressEvent('p'))",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(CloseEvent.prototype, 'code').get.call(new MessageEvent('m'))",
+        );
+    }
+
+    #[test]
+    fn e2e_data_event_subtypes_dispatch_through_event_target() {
+        // Subtype instances flow correctly through EventTarget.dispatchEvent and
+        // inherit Event behavior (target/currentTarget/preventDefault).
+        assert_eval_true(
+            "var t = new EventTarget(); var seen = null; \
+             t.addEventListener('progress', function (e) { seen = e; }); \
+             var pe = new ProgressEvent('progress', { loaded: 50, total: 100 }); \
+             t.dispatchEvent(pe); \
+             seen === pe && seen.loaded === 50 && seen.target === t",
+        );
+    }
+
+    #[test]
+    fn e2e_data_event_init_dict_rejects_non_object() {
+        // Per WebIDL, an init that is neither undefined/null nor an object throws.
+        assert_eval_type_error("new ProgressEvent('p', 42)");
+        assert_eval_type_error("new ErrorEvent('e', 'oops')");
+        assert_eval_type_error("new CloseEvent('c', true)");
+        assert_eval_type_error("new MessageEvent('m', 7)");
+    }
+
     #[test]
     fn e2e_event_target_add_remove_and_dispatch() {
         assert_eval_true("typeof EventTarget === 'function' && EventTarget.name === 'EventTarget'");
@@ -25171,13 +26095,10 @@ mod tests {
             "HashChangeEvent",
             "PageTransitionEvent",
             "StorageEvent",
-            "ProgressEvent",
-            "ErrorEvent",
             "PromiseRejectionEvent",
             "AnimationEvent",
             "TransitionEvent",
             "SecurityPolicyViolationEvent",
-            "CloseEvent",
             "BeforeUnloadEvent",
         ] {
             assert_eval_true(&format!("typeof {ctor} === 'function'"));
@@ -26291,7 +27212,6 @@ mod tests {
     fn e2e_realtime_worker_messaging_constructors_exist_but_fail_closed() {
         for name in [
             "WebSocket",
-            "CloseEvent",
             "EventSource",
             "Worker",
             "SharedWorker",
@@ -26308,7 +27228,6 @@ mod tests {
         }
 
         assert_eval_type_error("new WebSocket('wss://example.test/socket')");
-        assert_eval_type_error("new CloseEvent('close')");
         assert_eval_type_error("new EventSource('/events')");
         assert_eval_type_error("new Worker('/worker.js')");
         assert_eval_type_error("new SharedWorker('/shared-worker.js')");
@@ -26615,7 +27534,7 @@ mod tests {
     /// `InputEvent`, `BeforeUnloadEvent`, `FocusEvent`, `WheelEvent`,
     /// `DragEvent`, `Touch`, `TouchEvent`, `TouchList`, `CompositionEvent`,
     /// `SubmitEvent`, `ToggleEvent`, `PopStateEvent`, `HashChangeEvent`,
-    /// `PageTransitionEvent`, `StorageEvent`, `ProgressEvent`, `ErrorEvent`,
+    /// `PageTransitionEvent`, `StorageEvent`,
     /// `PromiseRejectionEvent`, `AnimationEvent`, `TransitionEvent`,
     /// `SecurityPolicyViolationEvent`) are exposed so Edge page scripts can
     /// `typeof`/`instanceof`-probe them, but construction fails closed with
@@ -26646,8 +27565,6 @@ mod tests {
             "HashChangeEvent",
             "PageTransitionEvent",
             "StorageEvent",
-            "ProgressEvent",
-            "ErrorEvent",
             "PromiseRejectionEvent",
             "AnimationEvent",
             "TransitionEvent",
@@ -26679,8 +27596,6 @@ mod tests {
         assert_eval_type_error("new HashChangeEvent('hashchange')");
         assert_eval_type_error("new PageTransitionEvent('pageshow')");
         assert_eval_type_error("new StorageEvent('storage')");
-        assert_eval_type_error("new ProgressEvent('progress')");
-        assert_eval_type_error("new ErrorEvent('error', { message: 'boom' })");
         assert_eval_type_error(
             "new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(), reason: 0 })",
         );
