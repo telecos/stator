@@ -23496,11 +23496,10 @@ fn make_typed_array_instance(
 
 // ── DOM geometry data objects ────────────────────────────────────────────────
 //
-// DOMPoint(ReadOnly) and DOMRect(ReadOnly) are pure numeric geometry data
-// containers. They do not require layout, style, rendering, DOM nodes, or host
-// integration, so the standalone engine can implement them without fabricating
-// browser state. DOMMatrix remains fail-closed below because implementing a
-// sound matrix transform subset is a larger surface than this data-only slice.
+// DOMPoint(ReadOnly), DOMRect(ReadOnly), DOMQuad, and DOMMatrix(ReadOnly) are
+// pure numeric geometry data containers. They do not require layout, style,
+// rendering, DOM nodes, or host integration, so the standalone engine can
+// implement them without fabricating browser state.
 
 const DOM_POINT_READONLY_BRAND: &str = "__is_dom_point_readonly__";
 const DOM_POINT_MUTABLE_BRAND: &str = "__is_dom_point__";
@@ -23516,6 +23515,12 @@ const DOM_RECT_Y_SLOT: &str = "__dom_rect_y__";
 const DOM_RECT_WIDTH_SLOT: &str = "__dom_rect_width__";
 const DOM_RECT_HEIGHT_SLOT: &str = "__dom_rect_height__";
 
+const DOM_QUAD_BRAND: &str = "__is_dom_quad__";
+const DOM_QUAD_P1_SLOT: &str = "__dom_quad_p1__";
+const DOM_QUAD_P2_SLOT: &str = "__dom_quad_p2__";
+const DOM_QUAD_P3_SLOT: &str = "__dom_quad_p3__";
+const DOM_QUAD_P4_SLOT: &str = "__dom_quad_p4__";
+
 thread_local! {
     static DOM_POINT_READONLY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
@@ -23524,6 +23529,8 @@ thread_local! {
     static DOM_RECT_READONLY_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
     static DOM_RECT_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
+        const { RefCell::new(None) };
+    static DOM_QUAD_PROTO: RefCell<Option<Rc<RefCell<PropertyMap>>>> =
         const { RefCell::new(None) };
 }
 
@@ -23801,6 +23808,103 @@ fn build_dom_rect_instance(x: f64, y: f64, width: f64, height: f64, mutable: boo
     JsValue::PlainObject(inst)
 }
 
+fn point_object_from_init(value: Option<&JsValue>) -> StatorResult<JsValue> {
+    let (x, y, z, w) = point_init_from_value(value)?;
+    Ok(build_dom_point_instance(x, y, z, w, true))
+}
+
+fn dom_quad_points_from_init(
+    value: Option<&JsValue>,
+) -> StatorResult<(JsValue, JsValue, JsValue, JsValue)> {
+    match value {
+        None | Some(JsValue::Undefined) | Some(JsValue::Null) => Ok((
+            point_object_from_init(None)?,
+            point_object_from_init(None)?,
+            point_object_from_init(None)?,
+            point_object_from_init(None)?,
+        )),
+        Some(init) => {
+            if let JsValue::PlainObject(map) = init
+                && matches!(
+                    map.borrow().get(DOM_QUAD_BRAND),
+                    Some(JsValue::Boolean(true))
+                )
+            {
+                let borrow = map.borrow();
+                let p1 = borrow
+                    .get(DOM_QUAD_P1_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let p2 = borrow
+                    .get(DOM_QUAD_P2_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let p3 = borrow
+                    .get(DOM_QUAD_P3_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let p4 = borrow
+                    .get(DOM_QUAD_P4_SLOT)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                drop(borrow);
+                return Ok((
+                    point_object_from_init(Some(&p1))?,
+                    point_object_from_init(Some(&p2))?,
+                    point_object_from_init(Some(&p3))?,
+                    point_object_from_init(Some(&p4))?,
+                ));
+            }
+            let p1 = dispatch_get_property_value(init, JsValue::String("p1".into()))?;
+            let p2 = dispatch_get_property_value(init, JsValue::String("p2".into()))?;
+            let p3 = dispatch_get_property_value(init, JsValue::String("p3".into()))?;
+            let p4 = dispatch_get_property_value(init, JsValue::String("p4".into()))?;
+            Ok((
+                point_object_from_init(Some(&p1))?,
+                point_object_from_init(Some(&p2))?,
+                point_object_from_init(Some(&p3))?,
+                point_object_from_init(Some(&p4))?,
+            ))
+        }
+    }
+}
+
+fn build_dom_quad_instance(p1: JsValue, p2: JsValue, p3: JsValue, p4: JsValue) -> JsValue {
+    let inst = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut props = inst.borrow_mut();
+        props.insert_with_attrs(
+            DOM_QUAD_BRAND.into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+        props.insert_with_attrs(DOM_QUAD_P1_SLOT.into(), p1, PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_QUAD_P2_SLOT.into(), p2, PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_QUAD_P3_SLOT.into(), p3, PropertyAttributes::empty());
+        props.insert_with_attrs(DOM_QUAD_P4_SLOT.into(), p4, PropertyAttributes::empty());
+        for (name, slot) in [
+            ("p1", DOM_QUAD_P1_SLOT),
+            ("p2", DOM_QUAD_P2_SLOT),
+            ("p3", DOM_QUAD_P3_SLOT),
+            ("p4", DOM_QUAD_P4_SLOT),
+        ] {
+            props.insert_with_attrs(
+                format!("__get_{name}__"),
+                make_dom_quad_point_getter(slot),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        if let Some(proto) = DOM_QUAD_PROTO.with(|p| p.borrow().clone()) {
+            props.insert_with_attrs(
+                INTERNAL_PROTO_PROPERTY_KEY.into(),
+                JsValue::PlainObject(proto),
+                PropertyAttributes::empty(),
+            );
+        }
+    }
+    JsValue::PlainObject(inst)
+}
+
 fn dom_point_to_json(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let (recv, _) = resolve_dom_geometry_receiver(&args, DOM_POINT_READONLY_BRAND);
     let map = lookup_dom_geometry(&recv, DOM_POINT_READONLY_BRAND, "DOMPointReadOnly.toJSON")?;
@@ -23829,6 +23933,185 @@ fn dom_rect_to_json(args: Vec<JsValue>) -> StatorResult<JsValue> {
     out.insert("bottom".into(), num(y.max(y + height)));
     out.insert("left".into(), num(x.min(x + width)));
     Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+}
+
+fn lookup_dom_quad(value: &JsValue, display_name: &str) -> StatorResult<Rc<RefCell<PropertyMap>>> {
+    lookup_dom_geometry(value, DOM_QUAD_BRAND, display_name)
+}
+
+fn resolve_dom_quad_receiver(args: &[JsValue]) -> (JsValue, Vec<JsValue>) {
+    let env_this = current_global_env().and_then(|env| env.borrow().get_this().cloned());
+    if let Some(this) = env_this.clone()
+        && let JsValue::PlainObject(map) = &this
+        && matches!(
+            map.borrow().get(DOM_QUAD_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (this, args.to_vec());
+    }
+    if let Some(first) = args.first()
+        && let JsValue::PlainObject(map) = first
+        && matches!(
+            map.borrow().get(DOM_QUAD_BRAND),
+            Some(JsValue::Boolean(true))
+        )
+    {
+        return (first.clone(), args.get(1..).unwrap_or(&[]).to_vec());
+    }
+    (env_this.unwrap_or(JsValue::Undefined), args.to_vec())
+}
+
+fn make_dom_quad_point_getter(slot: &'static str) -> JsValue {
+    native(move |args| {
+        let (recv, _) = resolve_dom_quad_receiver(&args);
+        let map = lookup_dom_quad(&recv, "DOMQuad getter")?;
+        Ok(map
+            .borrow()
+            .get(slot)
+            .cloned()
+            .unwrap_or(JsValue::Undefined))
+    })
+}
+
+fn dom_quad_point_xy(map: &Rc<RefCell<PropertyMap>>, slot: &str) -> StatorResult<(f64, f64)> {
+    let point = map
+        .borrow()
+        .get(slot)
+        .cloned()
+        .unwrap_or(JsValue::Undefined);
+    let (x, y, _, _) = point_init_from_value(Some(&point))?;
+    Ok((x, y))
+}
+
+fn dom_quad_to_json(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, _) = resolve_dom_quad_receiver(&args);
+    let map = lookup_dom_quad(&recv, "DOMQuad.toJSON")?;
+    let mut out = PropertyMap::new();
+    for (name, slot) in [
+        ("p1", DOM_QUAD_P1_SLOT),
+        ("p2", DOM_QUAD_P2_SLOT),
+        ("p3", DOM_QUAD_P3_SLOT),
+        ("p4", DOM_QUAD_P4_SLOT),
+    ] {
+        let point = map
+            .borrow()
+            .get(slot)
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        let (x, y, z, w) = point_init_from_value(Some(&point))?;
+        let mut point_out = PropertyMap::new();
+        point_out.insert("x".into(), num(x));
+        point_out.insert("y".into(), num(y));
+        point_out.insert("z".into(), num(z));
+        point_out.insert("w".into(), num(w));
+        out.insert(
+            name.into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(point_out))),
+        );
+    }
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(out))))
+}
+
+fn dom_quad_get_bounds(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let (recv, _) = resolve_dom_quad_receiver(&args);
+    let map = lookup_dom_quad(&recv, "DOMQuad.getBounds")?;
+    let points = [
+        dom_quad_point_xy(&map, DOM_QUAD_P1_SLOT)?,
+        dom_quad_point_xy(&map, DOM_QUAD_P2_SLOT)?,
+        dom_quad_point_xy(&map, DOM_QUAD_P3_SLOT)?,
+        dom_quad_point_xy(&map, DOM_QUAD_P4_SLOT)?,
+    ];
+    let min_x = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = points.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
+    let max_y = points
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    Ok(build_dom_rect_instance(
+        min_x,
+        min_y,
+        max_x - min_x,
+        max_y - min_y,
+        true,
+    ))
+}
+
+fn make_dom_quad_builtin() -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let p1 = point_object_from_init(args.first())?;
+            let p2 = point_object_from_init(args.get(1))?;
+            let p3 = point_object_from_init(args.get(2))?;
+            let p4 = point_object_from_init(args.get(3))?;
+            Ok(build_dom_quad_instance(p1, p2, p3, p4))
+        }),
+    );
+    props.insert(
+        "fromRect".into(),
+        builtin_fn("fromRect", 1, |args| {
+            let (x, y, width, height) = rect_init_from_value(args.first())?;
+            Ok(build_dom_quad_instance(
+                build_dom_point_instance(x, y, 0.0, 1.0, true),
+                build_dom_point_instance(x + width, y, 0.0, 1.0, true),
+                build_dom_point_instance(x + width, y + height, 0.0, 1.0, true),
+                build_dom_point_instance(x, y + height, 0.0, 1.0, true),
+            ))
+        }),
+    );
+    props.insert(
+        "fromQuad".into(),
+        builtin_fn("fromQuad", 1, |args| {
+            let (p1, p2, p3, p4) = dom_quad_points_from_init(args.first())?;
+            Ok(build_dom_quad_instance(p1, p2, p3, p4))
+        }),
+    );
+
+    let proto_rc = {
+        let mut proto = PropertyMap::new();
+        for (name, slot) in [
+            ("p1", DOM_QUAD_P1_SLOT),
+            ("p2", DOM_QUAD_P2_SLOT),
+            ("p3", DOM_QUAD_P3_SLOT),
+            ("p4", DOM_QUAD_P4_SLOT),
+        ] {
+            proto.insert_with_attrs(
+                format!("__get_{name}__"),
+                make_dom_quad_point_getter(slot),
+                PropertyAttributes::CONFIGURABLE,
+            );
+        }
+        proto.insert(
+            "getBounds".into(),
+            builtin_fn("getBounds", 0, dom_quad_get_bounds),
+        );
+        proto.insert("toJSON".into(), builtin_fn("toJSON", 0, dom_quad_to_json));
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("DOMQuad".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        let rc = Rc::new(RefCell::new(proto));
+        DOM_QUAD_PROTO.with(|p| *p.borrow_mut() = Some(Rc::clone(&rc)));
+        props.insert("prototype".into(), JsValue::PlainObject(Rc::clone(&rc)));
+        rc
+    };
+
+    props.make_all_non_enumerable();
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 fn make_dom_point_builtin(kind: DomGeometryKind) -> JsValue {
@@ -27894,6 +28177,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "DOMMatrix".into(),
             finalize_ctor(make_dom_matrix_constructor(true), "DOMMatrix"),
         );
+        globals.insert(
+            "DOMQuad".into(),
+            finalize_ctor(make_dom_quad_builtin(), "DOMQuad"),
+        );
 
         // ── Error constructors ────────────────────────────────────────────────
         install_error_constructors(globals);
@@ -31143,14 +31430,9 @@ mod tests {
     }
 
     #[test]
-    fn e2e_geometry_constructors_exist_but_fail_closed() {
-        for name in ["DOMQuad"] {
-            assert_eval_true(&format!(
-                "typeof {name} === 'function' && {name}.name === '{name}'"
-            ));
-            assert_eval_type_error(&format!("{name}()"));
-            assert_eval_type_error(&format!("new {name}()"));
-        }
+    fn e2e_geometry_host_dependent_constructors_stay_fail_closed() {
+        assert_eval_true("typeof DOMQuad === 'function' && DOMQuad.name === 'DOMQuad'");
+        assert_eval_true("new DOMQuad() instanceof DOMQuad");
     }
 
     #[test]
@@ -32613,12 +32895,74 @@ mod tests {
     }
 
     #[test]
+    fn e2e_dom_quad_constructor_shape_defaults_and_points() {
+        assert_eval_true("typeof DOMQuad === 'function' && DOMQuad.name === 'DOMQuad'");
+        assert_eval_true("DOMQuad.prototype.constructor === DOMQuad");
+        assert_eval_true("new DOMQuad() instanceof DOMQuad");
+        assert_eval_true("Object.prototype.toString.call(new DOMQuad()) === '[object DOMQuad]'");
+        assert_eval_true(
+            "var q = new DOMQuad(); q.p1 instanceof DOMPoint && q.p2 instanceof DOMPoint && q.p3 instanceof DOMPoint && q.p4 instanceof DOMPoint",
+        );
+        assert_eval_true(
+            "var q = new DOMQuad(); q.p1.x === 0 && q.p1.y === 0 && q.p1.z === 0 && q.p1.w === 1 && q.p4.w === 1",
+        );
+        assert_eval_true(
+            "var q = new DOMQuad({ x: 1, y: 2, z: 3, w: 4 }, new DOMPoint(5, 6), { x: 7 }, { y: 8 }); q.p1.x === 1 && q.p1.y === 2 && q.p1.z === 3 && q.p1.w === 4 && q.p2.x === 5 && q.p2.y === 6 && q.p3.x === 7 && q.p3.y === 0 && q.p4.x === 0 && q.p4.y === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_quad_accessors_are_stable_mutable_points() {
+        assert_eval_true("var q = new DOMQuad({ x: 1, y: 2 }); q.p1 === q.p1");
+        assert_eval_true(
+            "var q = new DOMQuad({ x: 1, y: 2 }, { x: 3, y: 4 }); q.p1.x = -5; q.p1.x === -5 && q.p2.x === 3",
+        );
+        assert_eval_true(
+            "var q = new DOMQuad({ x: 1, y: 2 }); q.p1 = new DOMPoint(9, 9); q.p1.x === 1 && q.p1.y === 2",
+        );
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(DOMQuad.prototype, 'p1').set === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_quad_from_rect_from_quad_and_bounds() {
+        assert_eval_true(
+            "var q = DOMQuad.fromRect({ x: -2, y: 3, width: 5, height: -7 }); q.p1.x === -2 && q.p1.y === 3 && q.p2.x === 3 && q.p2.y === 3 && q.p3.x === 3 && q.p3.y === -4 && q.p4.x === -2 && q.p4.y === -4",
+        );
+        assert_eval_true(
+            "var b = DOMQuad.fromRect({ x: -2, y: 3, width: 5, height: -7 }).getBounds(); b instanceof DOMRect && b.x === -2 && b.y === -4 && b.width === 5 && b.height === 7",
+        );
+        assert_eval_true(
+            "var q = DOMQuad.fromQuad({ p1: { x: -1, y: 2 }, p2: { x: 4, y: 3 }, p3: { x: 2, y: -6 }, p4: { x: -3, y: 5 } }); var b = q.getBounds(); b.x === -3 && b.y === -6 && b.width === 7 && b.height === 11",
+        );
+        assert_eval_true(
+            "var q1 = new DOMQuad({ x: 1, y: 2 }); var q2 = DOMQuad.fromQuad(q1); q1.p1.x = 99; q2.p1.x === 1 && q2.p1 !== q1.p1",
+        );
+        assert_eval_true(
+            "var q = DOMQuad.fromQuad(); q.p1.x === 0 && q.p2.y === 0 && q.p4.w === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_dom_quad_to_json_and_brand_checks() {
+        assert_eval_true(
+            "var j = new DOMQuad({ x: 1, y: 2, z: 3, w: 4 }, { x: 5 }, { y: 6 }, {}).toJSON(); j.p1.x === 1 && j.p1.y === 2 && j.p1.z === 3 && j.p1.w === 4 && j.p2.x === 5 && j.p2.y === 0 && j.p3.x === 0 && j.p3.y === 6 && j.p4.w === 1",
+        );
+        assert_eval_type_error(
+            "Object.getOwnPropertyDescriptor(DOMQuad.prototype, 'p1').get.call({})",
+        );
+        assert_eval_type_error("DOMQuad.prototype.getBounds.call({})");
+        assert_eval_type_error("DOMQuad.prototype.toJSON.call({})");
+    }
+
+    #[test]
     fn e2e_dom_matrix_and_host_geometry_surfaces_remain_fail_closed() {
-        // DOMQuad and the surrounding host surfaces stay fail-closed even now
-        // that DOMMatrix/DOMMatrixReadOnly are real, because they depend on
+        // Host geometry/layout surfaces stay fail-closed even now that
+        // DOMQuad/DOMMatrix are real data objects, because they depend on
         // layout/style/canvas integration the standalone engine does not have.
         assert_eval_true("typeof DOMQuad === 'function' && DOMQuad.name === 'DOMQuad'");
-        assert_eval_type_error("new DOMQuad()");
+        assert_eval_true("new DOMQuad() instanceof DOMQuad");
         assert_eval_true("typeof document === 'undefined'");
         assert_eval_true("typeof window === 'undefined'");
         assert_eval_true("typeof getComputedStyle === 'undefined'");
