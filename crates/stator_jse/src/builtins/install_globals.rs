@@ -2820,6 +2820,16 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Error".into(), error_ctor.clone());
 
     let error_proto_val = JsValue::PlainObject(error_proto_rc);
+    if let Some(JsValue::PlainObject(dom_exception_ctor)) = globals.get("DOMException")
+        && let Some(JsValue::PlainObject(dom_exception_proto)) =
+            dom_exception_ctor.borrow().get("prototype").cloned()
+    {
+        dom_exception_proto.borrow_mut().insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            error_proto_val.clone(),
+            PropertyAttributes::empty(),
+        );
+    }
 
     globals.insert(
         "TypeError".into(),
@@ -2997,6 +3007,13 @@ fn make_dom_exception_constructor() -> JsValue {
             (*constant).into(),
             JsValue::Smi(*value),
             PropertyAttributes::ENUMERABLE,
+        );
+    }
+    if let Some(error_proto) = constructor_prototype("Error") {
+        proto.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.into(),
+            error_proto,
+            PropertyAttributes::empty(),
         );
     }
     let proto_rc = Rc::new(RefCell::new(proto));
@@ -29714,6 +29731,8 @@ mod tests {
             "var e = new DOMException('x', 'NotAStandardName'); e.name === 'NotAStandardName' && e.code === 0",
         );
         assert_eval_true("new DOMException('x', 'AbortError') instanceof DOMException");
+        assert_eval_true("new DOMException('x', 'AbortError') instanceof Error");
+        assert_eval_true("Object.getPrototypeOf(DOMException.prototype) === Error.prototype");
         assert_eval_true(
             "Object.prototype.toString.call(new DOMException('x')) === '[object DOMException]'",
         );
@@ -31351,7 +31370,8 @@ mod tests {
         assert_eval_true(
             "var c = new AbortController(); c.abort(); \
              c.signal.aborted === true && c.signal.reason instanceof DOMException && \
-             c.signal.reason.name === 'AbortError'",
+             c.signal.reason instanceof Error && c.signal.reason.name === 'AbortError' && \
+             c.signal.reason.code === DOMException.ABORT_ERR",
         );
         assert_eval_true(
             "var c = new AbortController(); c.abort('first'); c.abort('second'); \
