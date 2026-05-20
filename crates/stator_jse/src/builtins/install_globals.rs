@@ -21925,7 +21925,13 @@ fn make_intl() -> JsValue {
         ("Collator", &[("compare", 2), ("resolvedOptions", 0)][..]),
         (
             "DateTimeFormat",
-            &[("format", 1), ("formatToParts", 1), ("resolvedOptions", 0)][..],
+            &[
+                ("format", 1),
+                ("formatToParts", 1),
+                ("formatRange", 2),
+                ("formatRangeToParts", 2),
+                ("resolvedOptions", 0),
+            ][..],
         ),
         ("DisplayNames", &[("of", 1), ("resolvedOptions", 0)][..]),
         (
@@ -35130,6 +35136,29 @@ mod tests {
         assert_eval_type_error("Intl.Collator.prototype.compare('a', 'b')");
         assert_eval_true("typeof Intl.Locale.prototype.maximize === 'function'");
         assert_eval_type_error("Intl.Locale.prototype.maximize()");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_range_methods_fail_closed() {
+        assert_eval_true("typeof Intl.DateTimeFormat.prototype.formatRange === 'function'");
+        assert_eval_true("typeof Intl.DateTimeFormat.prototype.formatRangeToParts === 'function'");
+        assert_eval_type_error("Intl.DateTimeFormat.prototype.formatRange(0, 1)");
+        assert_eval_type_error("Intl.DateTimeFormat.prototype.formatRangeToParts(0, 1)");
+    }
+
+    #[test]
+    fn e2e_intl_never_returns_fake_en_us_formatting() {
+        // Constructing any Intl service must throw rather than yield a fake
+        // formatter that hard-codes English/Latin defaults.
+        assert_eval_type_error("new Intl.NumberFormat('en-US').format(1234567.89)");
+        assert_eval_type_error("new Intl.DateTimeFormat('en-US').format(new Date(0))");
+        assert_eval_type_error("new Intl.Collator('en-US').compare('a', 'b')");
+        assert_eval_type_error("new Intl.ListFormat('en-US').format(['a', 'b'])");
+        assert_eval_type_error("new Intl.PluralRules('en-US').select(1)");
+        assert_eval_type_error("new Intl.RelativeTimeFormat('en-US').format(1, 'day')");
+        assert_eval_type_error("new Intl.DisplayNames(['en-US'], { type: 'region' }).of('US')");
+        assert_eval_type_error("new Intl.Segmenter('en-US').segment('hello')");
+        assert_eval_type_error("new Intl.Locale('en-US').toString()");
     }
 
     /// Verify that the `Math` object has the expected properties.
