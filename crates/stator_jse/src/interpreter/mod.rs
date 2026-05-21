@@ -1316,8 +1316,42 @@ static TEST_JIT_POLL_COUNTDOWN: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(-1);
 
 #[cfg(test)]
+thread_local! {
+    /// Thread-local override for the JIT poll thunk.
+    ///
+    /// When set to a non-negative value, the override consumes one count per
+    /// poll on **this thread only** and returns `Some(1)` once the count hits
+    /// zero — and continues to return `Some(1)` until the override is cleared
+    /// (does not transition back to `None`).  This makes per-thread "terminate
+    /// after N polls" deterministic even when other test threads concurrently
+    /// invoke the thunk through the same shared poll site, which is required
+    /// for tests that exercise tight JIT loops on a dedicated thread.
+    static TEST_JIT_POLL_COUNTDOWN_LOCAL: std::cell::Cell<i32> =
+        const { std::cell::Cell::new(-1) };
+}
+
+#[cfg(test)]
 fn test_jit_poll_terminated_override() -> Option<u32> {
     use std::sync::atomic::Ordering;
+
+    // Thread-local override takes precedence.  Once the per-thread countdown
+    // reaches zero we latch on `Some(1)` (no further decrement) so that
+    // subsequent polls on the same thread continue to observe termination
+    // until the override is explicitly cleared.
+    let local_done = TEST_JIT_POLL_COUNTDOWN_LOCAL.with(|cell| {
+        let prev = cell.get();
+        if prev < 0 {
+            return None;
+        }
+        if prev == 0 {
+            return Some(1u32);
+        }
+        cell.set(prev - 1);
+        Some(0u32)
+    });
+    if let Some(v) = local_done {
+        return Some(v);
+    }
 
     let prev = TEST_JIT_POLL_COUNTDOWN.load(Ordering::SeqCst);
     if prev < 0 {
@@ -1338,6 +1372,22 @@ pub(crate) fn set_test_jit_poll_terminated_countdown(polls_before_termination: i
 #[cfg(test)]
 pub(crate) fn clear_test_jit_poll_terminated_countdown() {
     TEST_JIT_POLL_COUNTDOWN.store(-1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install a **thread-local** countdown for the JIT poll thunk override.
+///
+/// Counts polls performed on this thread only; ignores the process-wide
+/// global countdown.  Call [`clear_test_jit_poll_terminated_countdown_local`]
+/// to remove the override.
+#[cfg(test)]
+pub(crate) fn set_test_jit_poll_terminated_countdown_local(polls_before_termination: i32) {
+    TEST_JIT_POLL_COUNTDOWN_LOCAL.with(|c| c.set(polls_before_termination));
+}
+
+/// Clear the thread-local JIT poll thunk override on this thread.
+#[cfg(test)]
+pub(crate) fn clear_test_jit_poll_terminated_countdown_local() {
+    TEST_JIT_POLL_COUNTDOWN_LOCAL.with(|c| c.set(-1));
 }
 
 /// Address of the [`stator_jit_poll_terminated`] thunk as a raw integer,

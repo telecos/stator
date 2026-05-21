@@ -88,9 +88,15 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::bytecode::feedback::FeedbackVector;
-use crate::compiler::baseline::compiler::JIT_DEOPT;
+use crate::compiler::baseline::compiler::{JIT_DEOPT, JIT_DEOPT_TERMINATED};
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::error::{StatorError, StatorResult};
+
+/// External name used for the termination polling thunk.
+///
+/// Resolved by [`JITBuilder::symbol`] to the address of
+/// [`crate::interpreter::stator_jit_poll_terminated`].
+const POLL_TERMINATED_SYMBOL: &str = "stator_jit_poll_terminated";
 
 /// Pre-CLIF type-specialisation passes (type narrowing, call-site
 /// specialisation, load/store elimination, escape analysis, GVN,
@@ -237,7 +243,9 @@ impl TurbofanCompiledCode {
             f(regs.as_mut_ptr())
         };
 
-        if result == JIT_DEOPT {
+        if result == JIT_DEOPT_TERMINATED {
+            Err(crate::interpreter::script_terminated_error())
+        } else if result == JIT_DEOPT {
             Err(StatorError::Internal("turbofan deopt".into()))
         } else {
             Ok(result)
@@ -287,6 +295,10 @@ impl TurbofanCompiledCode {
             let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(fn_ptr);
             f(regs.as_mut_ptr())
         };
+
+        if result == JIT_DEOPT_TERMINATED {
+            return Err(crate::interpreter::script_terminated_error());
+        }
 
         if result == JIT_DEOPT {
             // The JIT stored the deopt-site index into the trailing slot.
@@ -382,13 +394,19 @@ struct TurbofanCodegen {
 impl TurbofanCodegen {
     /// Create a new code generator backed by a fresh [`JITModule`].
     fn new(param_count: u32) -> StatorResult<Self> {
-        let module = JITModule::new(
-            JITBuilder::with_flags(
-                &[("opt_level", "speed")],
-                cranelift_module::default_libcall_names(),
-            )
-            .map_err(|e| StatorError::Internal(format!("cranelift JITBuilder: {e}")))?,
+        let mut jit_builder = JITBuilder::with_flags(
+            &[("opt_level", "speed")],
+            cranelift_module::default_libcall_names(),
+        )
+        .map_err(|e| StatorError::Internal(format!("cranelift JITBuilder: {e}")))?;
+        // Register the termination polling thunk so Cranelift-generated calls
+        // to `stator_jit_poll_terminated` resolve to the in-process Rust
+        // function rather than relying on a platform-specific symbol search.
+        jit_builder.symbol(
+            POLL_TERMINATED_SYMBOL,
+            crate::interpreter::stator_jit_poll_terminated_addr() as *const u8,
         );
+        let module = JITModule::new(jit_builder);
         Ok(Self {
             module,
             param_count,
@@ -410,11 +428,27 @@ impl TurbofanCodegen {
             .declare_function("turbofan_fn", Linkage::Local, &sig)
             .map_err(|e| StatorError::Internal(format!("declare_function: {e}")))?;
 
+        // Declare the termination polling thunk as an imported function so the
+        // generated body can call it from entry and loop headers.  The thunk
+        // signature is `extern "C" fn() -> u32`.
+        let mut poll_sig = Signature::new(call_conv);
+        poll_sig.returns.push(AbiParam::new(I32));
+        let poll_func_id = self
+            .module
+            .declare_function(POLL_TERMINATED_SYMBOL, Linkage::Import, &poll_sig)
+            .map_err(|e| StatorError::Internal(format!("declare poll thunk: {e}")))?;
+
         let mut ctx = self.module.make_context();
         ctx.func = Function::with_name_signature(
             cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
             sig,
         );
+
+        // Import the poll thunk into this function's IR so it can be called via
+        // `builder.ins().call(poll_func_ref, &[])`.
+        let poll_func_ref = self
+            .module
+            .declare_func_in_func(poll_func_id, &mut ctx.func);
 
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut deopt_points: Vec<DeoptPoint> = Vec::new();
@@ -427,6 +461,7 @@ impl TurbofanCodegen {
                 self.param_count,
                 &mut deopt_points,
                 pointer_type,
+                poll_func_ref,
             );
             lowering.lower()?;
             builder.finalize();
@@ -478,6 +513,14 @@ struct Lowering<'a, 'b> {
     /// The body stores the index into the trailing register-file slot (at
     /// byte offset `register_file_slots × 8`) and returns [`JIT_DEOPT`].
     deopt_block: Option<Block>,
+    /// Termination epilogue block (lazily created).
+    ///
+    /// Reached when a termination poll returns a non-zero result; the body
+    /// returns [`JIT_DEOPT_TERMINATED`], which the runtime entry points map
+    /// to the canonical `script execution terminated` error.
+    terminated_block: Option<Block>,
+    /// Imported [`FuncRef`] for [`crate::interpreter::stator_jit_poll_terminated`].
+    poll_func_ref: cranelift_codegen::ir::FuncRef,
     /// Next deopt-point index.
     deopt_index: u32,
     /// Number of user-visible register-file slots (= `param_count`).
@@ -495,6 +538,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         param_count: u32,
         deopt_points: &'b mut Vec<DeoptPoint>,
         pointer_type: cranelift_codegen::ir::Type,
+        poll_func_ref: cranelift_codegen::ir::FuncRef,
     ) -> Self {
         // declare_var(ty) allocates a new SSA variable and returns its ID.
         let regs_var = builder.declare_var(pointer_type);
@@ -506,6 +550,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
             block_map: HashMap::new(),
             regs_var,
             deopt_block: None,
+            terminated_block: None,
+            poll_func_ref,
             deopt_index: 0,
             register_file_slots: param_count,
         }
@@ -532,6 +578,11 @@ impl<'a, 'b> Lowering<'a, 'b> {
         let regs_ptr = self.builder.block_params(entry_clif)[0];
         self.builder.def_var(self.regs_var, regs_ptr);
 
+        // Entry-point termination poll: matches the baseline/Maglev JIT
+        // contract that optimised code observes the published interrupt flag
+        // at function entry before doing any user-visible work.
+        self.emit_termination_poll();
+
         // Lower each Maglev basic block in order.
         for block_idx in 0..graph.blocks().len() {
             let maglev_block = &graph.blocks()[block_idx];
@@ -539,6 +590,14 @@ impl<'a, 'b> Lowering<'a, 'b> {
 
             if block_idx > 0 {
                 self.builder.switch_to_block(clif_block);
+                // Loop-header polling: every block that is the target of at
+                // least one back-edge (`is_loop_header == true`) issues a poll
+                // before executing its body.  This bounds the worst-case time
+                // between poll observations to a single loop iteration of
+                // optimised code, matching the baseline/Maglev contract.
+                if maglev_block.is_loop_header {
+                    self.emit_termination_poll();
+                }
             }
 
             // Lower value nodes.  `node` borrows from `graph` (lifetime 'a)
@@ -571,6 +630,16 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 .ins()
                 .store(MemFlags::new(), idx_i64, regs, slot_offset);
             let sentinel = self.builder.ins().iconst(I64, JIT_DEOPT);
+            self.builder.ins().return_(&[sentinel]);
+        }
+
+        // Emit the termination epilogue if any poll site referenced it.  This
+        // block simply returns the `JIT_DEOPT_TERMINATED` sentinel; the runtime
+        // entry points map it to the canonical script-termination error.
+        if let Some(terminated_block) = self.terminated_block {
+            self.builder.switch_to_block(terminated_block);
+            self.builder.seal_block(terminated_block);
+            let sentinel = self.builder.ins().iconst(I64, JIT_DEOPT_TERMINATED);
             self.builder.ins().return_(&[sentinel]);
         }
 
@@ -891,6 +960,52 @@ impl<'a, 'b> Lowering<'a, 'b> {
         b
     }
 
+    /// Get-or-create the shared termination epilogue block.
+    ///
+    /// The block takes no parameters; the body returns
+    /// [`JIT_DEOPT_TERMINATED`].  Runtime entry points
+    /// ([`TurbofanCompiledCode::execute`] and
+    /// [`TurbofanCompiledCode::execute_with_deopt`]) translate this sentinel
+    /// into [`crate::interpreter::script_terminated_error`], matching the
+    /// baseline/Maglev JIT contract.
+    fn get_or_create_terminated_block(&mut self) -> Block {
+        if let Some(b) = self.terminated_block {
+            return b;
+        }
+        let b = self.builder.create_block();
+        self.terminated_block = Some(b);
+        b
+    }
+
+    /// Emit a call to [`crate::interpreter::stator_jit_poll_terminated`] and
+    /// branch to the termination epilogue when it returns a non-zero value.
+    ///
+    /// The thunk returns `u32` (`1` ⇒ the embedder requested termination on
+    /// this thread, `0` otherwise).  Cranelift represents that result as an
+    /// `I32`; we widen the test through an explicit `icmp ne` for the
+    /// `brif` instruction.  When the flag is clear, the cost of the poll is
+    /// a single function call returning zero, matching the bound documented
+    /// in [`docs/termination_polling_gap_matrix.md`].
+    fn emit_termination_poll(&mut self) {
+        let call = self.builder.ins().call(self.poll_func_ref, &[]);
+        let results = self.builder.inst_results(call);
+        debug_assert_eq!(
+            results.len(),
+            1,
+            "stator_jit_poll_terminated must return exactly one I32 value"
+        );
+        let result_i32 = results[0];
+        let terminated_block = self.get_or_create_terminated_block();
+        let continue_block = self.builder.create_block();
+        let zero = self.builder.ins().iconst(I32, 0);
+        let cond = self.builder.ins().icmp(IntCC::NotEqual, result_i32, zero);
+        self.builder
+            .ins()
+            .brif(cond, terminated_block, &[], continue_block, &[]);
+        self.builder.switch_to_block(continue_block);
+        self.builder.seal_block(continue_block);
+    }
+
     /// Emit a checked Smi add with overflow deopt.
     fn lower_checked_smi_add(&mut self, left: NodeId, right: NodeId) -> StatorResult<Value> {
         let (l_i32, r_i32) = self.untag_smi_pair(left, right)?;
@@ -1190,5 +1305,131 @@ mod tests {
         assert_eq!(JsType::Uint32.to_cranelift(), I32);
         assert_eq!(JsType::Float64.to_cranelift(), F64);
         assert_eq!(JsType::Bool.to_cranelift(), I8);
+    }
+
+    // ── Termination polling ───────────────────────────────────────────────────
+    //
+    // These tests use the **thread-local** countdown override on the shared
+    // `stator_jit_poll_terminated` thunk so we deterministically force the
+    // poll site to observe a "terminate" result after a fixed number of
+    // calls on a dedicated worker thread.  Running each test body on its
+    // own thread isolates the override from concurrent test threads that
+    // may also be executing JIT-compiled code (which now polls the same
+    // thunk on every entry/loop-header), and avoids wall-clock sleeps.
+
+    /// Run `body` on a freshly-spawned worker thread.  The thread-local JIT
+    /// poll override is scoped to that thread, so concurrent test threads
+    /// cannot decrement our countdown.
+    fn run_isolated<F, T>(body: F) -> T
+    where
+        F: Send + 'static + FnOnce() -> T,
+        T: Send + 'static,
+    {
+        std::thread::spawn(body)
+            .join()
+            .expect("isolated termination-test thread panicked")
+    }
+
+    fn assert_script_terminated(err: &StatorError) {
+        let s = format!("{err}");
+        assert!(
+            s.contains("script execution terminated"),
+            "expected script-termination error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_entry_poll_returns_script_terminated_error() {
+        let result = run_isolated(|| {
+            // Countdown 0 ⇒ the very first poll on this thread (the entry
+            // poll) latches on `Some(1)` (terminate).  Generated code must
+            // branch to the termination epilogue before evaluating the
+            // user-visible Return.
+            crate::interpreter::set_test_jit_poll_terminated_countdown_local(0);
+
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let c = block.push_value(ValueNode::Int32Constant { value: 42 });
+            block.set_control(ControlNode::Return { value: c });
+            graph.add_block(block);
+
+            let compiled = compile(&graph, 0).expect("turbofan compile failed");
+            // SAFETY: compiled from a well-formed graph in this unit test.
+            let r = unsafe { compiled.execute(&[]) };
+            crate::interpreter::clear_test_jit_poll_terminated_countdown_local();
+            r
+        });
+        let err = result.expect_err("entry poll must terminate before Return");
+        assert_script_terminated(&err);
+    }
+
+    #[test]
+    fn test_entry_poll_clear_executes_normally() {
+        // No override installed: the override returns `None`, so the real
+        // (clear) interrupt flag is observed and the function runs to
+        // completion, returning the user value.
+        let result = run_isolated(|| {
+            crate::interpreter::clear_test_jit_poll_terminated_countdown_local();
+
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let c = block.push_value(ValueNode::Int32Constant { value: 99 });
+            block.set_control(ControlNode::Return { value: c });
+            graph.add_block(block);
+
+            let compiled = compile(&graph, 0).expect("turbofan compile failed");
+            // SAFETY: compiled from a well-formed graph in this unit test.
+            unsafe { compiled.execute(&[]) }
+        });
+        let value = result.expect("must succeed when flag clear");
+        assert_eq!(value, 99);
+    }
+
+    #[test]
+    fn test_loop_header_poll_interrupts_infinite_loop() {
+        // Build an otherwise-infinite loop:
+        //   block 0: jump → block 1
+        //   block 1 (loop header): branch (true) → block 1, else → block 2
+        //   block 2: return 7
+        //
+        // Without loop-header polling, this would loop forever inside the
+        // generated Cranelift code.  With polling, the third poll on this
+        // thread (entry + two loop iterations) latches on `Some(1)`, the
+        // generated code returns `JIT_DEOPT_TERMINATED`, and the runtime
+        // entry point surfaces the canonical script-termination error.
+        let result = run_isolated(|| {
+            crate::interpreter::set_test_jit_poll_terminated_countdown_local(2);
+
+            let mut graph = MaglevGraph::new(0);
+
+            let mut b0 = BasicBlock::new(0);
+            b0.set_control(ControlNode::Jump { target: 1 });
+            graph.add_block(b0);
+
+            let mut b1 = BasicBlock::new(1);
+            b1.is_loop_header = true;
+            b1.predecessors = vec![0, 1];
+            let cond = b1.push_value(ValueNode::TrueConstant);
+            b1.set_control(ControlNode::Branch {
+                condition: cond,
+                if_true: 1,
+                if_false: 2,
+            });
+            graph.add_block(b1);
+
+            let mut b2 = BasicBlock::new(2);
+            b2.predecessors = vec![1];
+            let v = b2.push_value(ValueNode::Int32Constant { value: 7 });
+            b2.set_control(ControlNode::Return { value: v });
+            graph.add_block(b2);
+
+            let compiled = compile(&graph, 0).expect("turbofan compile failed");
+            // SAFETY: compiled from a well-formed graph in this unit test.
+            let r = unsafe { compiled.execute(&[]) };
+            crate::interpreter::clear_test_jit_poll_terminated_countdown_local();
+            r
+        });
+        let err = result.expect_err("loop must be interrupted by termination poll");
+        assert_script_terminated(&err);
     }
 }
