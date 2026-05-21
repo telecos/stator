@@ -10,6 +10,9 @@
 //! `_create` functions and must release them with the corresponding `_destroy`
 //! function.
 
+/// Canonical code-cache key construction for Edge-managed artifacts.
+pub mod code_cache_key;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};

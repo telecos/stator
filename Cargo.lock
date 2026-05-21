@@ -1706,7 +1706,9 @@ dependencies = [
  "cbindgen",
  "log",
  "serde_json",
+ "sha2",
  "stator_jse",
+ "thiserror 2.0.18",
  "wat",
 ]
 

@@ -27,6 +27,15 @@ fn main() {
     let crate_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
 
+    let stator_jse_manifest = crate_dir.join("..").join("stator_jse").join("Cargo.toml");
+    let stator_jse_manifest =
+        std::fs::read_to_string(stator_jse_manifest).expect("failed to read stator_jse Cargo.toml");
+    let stator_jse_version = stator_jse_manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+        .expect("failed to find stator_jse package version");
+    println!("cargo::rustc-env=STATOR_JSE_CRATE_VERSION={stator_jse_version}");
+
     let include_dir = crate_dir.join("include");
     std::fs::create_dir_all(&include_dir).expect("failed to create include/ directory");
 
