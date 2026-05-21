@@ -493,6 +493,50 @@ Each Edge vendored Stator drop must ship a manifest next to `stator.h` and the S
 
 Edge must clear or partition persisted cache storage when the manifest changes in any key field. Release automation should reject vendoring if the manifest and generated header disagree on ABI or cache format versions.
 
+## Release manifest validation contract
+
+Release automation MUST validate every Edge code-cache release manifest with a
+schema gate that fails closed on any missing or mismatched field. The
+authoritative validator and its mutation test matrix live in
+`crates/stator_ffi/tests/release_manifest.rs` and run as part of
+`cargo test --workspace`. The schema is:
+
+- `schema_id` (string): must equal `stator-edge-code-cache-release-manifest`.
+- `schema_version` (uint): must equal `1`. Older or newer schema versions
+  fail closed; bump the constant and add a migration when the schema evolves.
+- `generated_at_utc` (string): non-empty ISO-8601 UTC timestamp.
+- `stator.commit` (string): non-empty Stator source commit hash.
+- `stator.crates[]`: must contain at least entries for `stator_jse`,
+  `stator_jse_ffi`, and `st8`, each with a non-empty `version` string.
+- `ffi_abi.{major,minor,patch,packed}` (uint): present, non-negative, and
+  internally consistent (`packed == (major<<16) | (minor<<8) | patch`).
+- `ffi_abi.c_header_generation_id` (string): non-empty digest or build id
+  identifying the vendored `stator.h`.
+- `cache_formats.{cache_schema_version, script_cache_format_version,
+  module_cache_format_version, bytecode_format_version,
+  baseline_code_format_version, jit_code_format_version,
+  snapshot_format_version}` (uint): all required.
+- `key_schema.key_schema_version` (uint) and
+  `key_schema.canonical_key_hash_algorithm` (enum: `sha256`).
+- `artifacts[]`: at least one entry. Each entry requires `artifact_type`
+  (one of `script-bytecode`, `module-bytecode`, `baseline-code`,
+  `jit-code`, `snapshot-reference`), `target_triple`, `target_os`,
+  `target_arch`, `cargo_profile`, `size_bytes`, `digest_algorithm`
+  (`sha256`/`sha384`/`sha512`), `digest_hex` (even-length lower-case hex),
+  and a `signature` object with non-empty `algorithm` and lower-case hex
+  `value_hex`.
+- `telemetry.diagnostic_codes[]`: must include every code listed in
+  "Cache restore telemetry" above so Edge privacy review and counter
+  aggregation stay in sync with the engine's emitted codes.
+- `telemetry.field_allowlist[]`: required array describing the privacy-
+  approved low-cardinality fields permitted in telemetry payloads.
+
+The validator collects every error rather than failing on the first
+mismatch so release automation can surface a single, actionable report.
+Any change to the manifest schema MUST be accompanied by a corresponding
+change to the constants and mutation tests in
+`crates/stator_ffi/tests/release_manifest.rs`.
+
 ## Test plan
 
 1. Unit-test canonical serialization with golden key records for each artifact type and prove field ordering is stable.
