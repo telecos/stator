@@ -8837,6 +8837,18 @@ impl BytecodeGenerator {
         program: &Program,
         source: Option<&str>,
     ) -> StatorResult<BytecodeArray> {
+        crate::compiler::compile_counters::record(
+            crate::compiler::compile_counters::CompileTier::Interpreter,
+            || Self::compile_program_with_source_impl(program, source),
+        )
+    }
+
+    /// Inner implementation of [`Self::compile_program_with_source`]
+    /// without diagnostic counter instrumentation.
+    fn compile_program_with_source_impl(
+        program: &Program,
+        source: Option<&str>,
+    ) -> StatorResult<BytecodeArray> {
         let mut compiler = FunctionCompiler::new(&[])?;
         compiler.source_text = source.map(Rc::<str>::from);
         compiler.is_program = true;
@@ -8919,6 +8931,18 @@ impl BytecodeGenerator {
     /// Compile an eval [`Program`] while optionally preserving the original
     /// source text for nested callable `toString()` results.
     pub fn compile_eval_program_with_source(
+        program: &Program,
+        source: Option<&str>,
+    ) -> StatorResult<BytecodeArray> {
+        crate::compiler::compile_counters::record(
+            crate::compiler::compile_counters::CompileTier::Interpreter,
+            || Self::compile_eval_program_with_source_impl(program, source),
+        )
+    }
+
+    /// Inner implementation of [`Self::compile_eval_program_with_source`]
+    /// without diagnostic counter instrumentation.
+    fn compile_eval_program_with_source_impl(
         program: &Program,
         source: Option<&str>,
     ) -> StatorResult<BytecodeArray> {

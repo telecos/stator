@@ -41,6 +41,9 @@ pub mod abi_x64;
 pub mod background;
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;
+/// Always-on diagnostic counters for compile attempts, successes, and
+/// failures broken down by compilation tier.
+pub mod compile_counters;
 /// Maglev optimising compiler tier.
 pub mod maglev;
 /// On-Stack Replacement: mid-execution tier-up for hot loops.

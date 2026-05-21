@@ -325,7 +325,10 @@ impl TurbofanCompiledCode {
 /// Returns [`StatorError::Internal`] if Cranelift code generation fails or
 /// the ISA cannot be initialised.
 pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<TurbofanCompiledCode> {
-    TurbofanCodegen::new(param_count)?.compile(graph)
+    crate::compiler::compile_counters::record(
+        crate::compiler::compile_counters::CompileTier::Turbofan,
+        || TurbofanCodegen::new(param_count)?.compile(graph),
+    )
 }
 
 /// Compile a [`MaglevGraph`] to native machine code via Cranelift, running the
@@ -350,13 +353,18 @@ pub fn compile_with_feedback(
     param_count: u32,
     fv: Option<&FeedbackVector>,
 ) -> StatorResult<TurbofanCompiledCode> {
-    if fv.is_some() {
-        let mut specialised = graph.clone();
-        specialize::run_pre_clif_passes(&mut specialised, fv);
-        TurbofanCodegen::new(param_count)?.compile(&specialised)
-    } else {
-        TurbofanCodegen::new(param_count)?.compile(graph)
-    }
+    crate::compiler::compile_counters::record(
+        crate::compiler::compile_counters::CompileTier::Turbofan,
+        || {
+            if fv.is_some() {
+                let mut specialised = graph.clone();
+                specialize::run_pre_clif_passes(&mut specialised, fv);
+                TurbofanCodegen::new(param_count)?.compile(&specialised)
+            } else {
+                TurbofanCodegen::new(param_count)?.compile(graph)
+            }
+        },
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

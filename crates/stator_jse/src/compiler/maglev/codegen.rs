@@ -569,6 +569,15 @@ fn phys_reg(n: u32) -> Reg64 {
 /// Returns [`StatorError::Internal`] when the code buffer would exceed 4 GiB
 /// (which cannot occur in practice with well-formed graphs).
 pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevCompiledCode> {
+    crate::compiler::compile_counters::record(
+        crate::compiler::compile_counters::CompileTier::Maglev,
+        || compile_impl(graph, param_count),
+    )
+}
+
+/// Inner implementation of [`compile`] without diagnostic
+/// counter instrumentation.
+fn compile_impl(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevCompiledCode> {
     // Count direct-call-0 sites to decide whether to reserve R15.
     let mono_call_sites: i32 = count_mono_call_sites(graph);
     let has_keyed = has_keyed_access_sites(graph);

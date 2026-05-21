@@ -12693,7 +12693,21 @@ impl<'a> BaselineCompiler<'a> {
     /// associated metadata.  The safepoint and deopt tables are serialized and
     /// appended to the code buffer after the native instructions; a 12-byte
     /// footer records the table start offsets and [`METADATA_MAGIC`].
+    ///
+    /// Updates the always-on
+    /// [`crate::compiler::compile_counters`] counters for the
+    /// [`CompileTier::Baseline`][`crate::compiler::compile_counters::CompileTier::Baseline`]
+    /// tier on entry and on completion.
     pub fn compile(bytecode: &'a BytecodeArray) -> StatorResult<CompiledCode> {
+        crate::compiler::compile_counters::record(
+            crate::compiler::compile_counters::CompileTier::Baseline,
+            || Self::compile_impl(bytecode),
+        )
+    }
+
+    /// Inner implementation of [`Self::compile`] without diagnostic
+    /// counter instrumentation.
+    fn compile_impl(bytecode: &'a BytecodeArray) -> StatorResult<CompiledCode> {
         let mut c = Self {
             bytecode,
             masm: MacroAssembler::new(),
