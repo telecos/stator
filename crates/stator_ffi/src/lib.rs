@@ -74,7 +74,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 4;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 5;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -13735,6 +13735,10 @@ pub struct StatorDomObjectWrap {
     /// from internal fields so embedders can tag the canonical native object
     /// without consuming an internal-field slot.
     native_ptr: *mut c_void,
+    /// Borrowed outgoing Oilpan-style traced edges reported from this wrapper.
+    /// The wrapper does not own or root these slots; embedders must remove an
+    /// edge before disposing the corresponding `StatorTraced` handle.
+    outgoing_traced_edges: Vec<*mut StatorTraced>,
     /// Cached JS-visible wrapper object.  Reused by globals, named getters,
     /// and method returns so repeated conversions preserve object identity.
     materialized: RefCell<Option<Rc<RefCell<PropertyMap>>>>,
@@ -13771,6 +13775,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
         has_named_setter: false,
         class_id: 0,
         native_ptr: std::ptr::null_mut(),
+        outgoing_traced_edges: Vec::new(),
         materialized: RefCell::new(None),
         alive: Rc::new(Cell::new(true)),
     }))
@@ -14200,6 +14205,109 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_native_ptr(
     }
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { (*wrap).native_ptr }
+}
+
+/// Register an outgoing traced edge on a DOM wrapper.
+///
+/// The wrapper stores only the borrowed traced-slot pointer: it does not own,
+/// reset, dispose, or strongly root the edge. Embedders must remove the edge
+/// before disposing `traced`.
+///
+/// Returns `false` when `wrap` or `traced` is null, the wrapper has been
+/// invalidated, or the traced slot belongs to a different isolate.
+///
+/// # Safety
+/// - `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `traced` must be null or a valid, live [`StatorTraced`] pointer that has
+///   not yet been passed to [`stator_traced_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_add_traced_edge(
+    wrap: *mut StatorDomObjectWrap,
+    traced: *mut StatorTraced,
+) -> bool {
+    if wrap.is_null() || traced.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees both pointers are valid and live.
+    let (wrap_isolate, alive) = unsafe { ((*wrap).isolate, (*wrap).alive.get()) };
+    let slot = traced as *mut StatorTracedSlot;
+    // SAFETY: caller guarantees `traced` is a live slot pointer.
+    let traced_isolate = unsafe { (*slot).isolate };
+    if !alive || wrap_isolate.is_null() || traced_isolate != wrap_isolate {
+        return false;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and uniquely mutable for this
+    // FFI call.
+    let edges = unsafe { &mut (*wrap).outgoing_traced_edges };
+    if !edges.contains(&traced) {
+        edges.push(traced);
+    }
+    true
+}
+
+/// Remove a previously registered outgoing traced edge from a DOM wrapper.
+///
+/// Returns `true` if the edge was present and removed, `false` for null inputs
+/// or when the edge was not registered on `wrap`.
+///
+/// # Safety
+/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_remove_traced_edge(
+    wrap: *mut StatorDomObjectWrap,
+    traced: *mut StatorTraced,
+) -> bool {
+    if wrap.is_null() || traced.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and uniquely mutable for this
+    // FFI call.
+    let edges = unsafe { &mut (*wrap).outgoing_traced_edges };
+    let Some(pos) = edges.iter().position(|edge| *edge == traced) else {
+        return false;
+    };
+    edges.swap_remove(pos);
+    true
+}
+
+/// Remove every outgoing traced edge registered on a DOM wrapper.
+///
+/// Returns the number of edges removed. Passing null removes nothing.
+///
+/// # Safety
+/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_clear_traced_edges(
+    wrap: *mut StatorDomObjectWrap,
+) -> usize {
+    if wrap.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and uniquely mutable for this
+    // FFI call.
+    let edges = unsafe { &mut (*wrap).outgoing_traced_edges };
+    let removed = edges.len();
+    edges.clear();
+    removed
+}
+
+/// Return the number of outgoing traced edges currently registered on `wrap`.
+///
+/// Empty traced slots may still be present until the embedder removes or clears
+/// them; [`stator_traced_visit_outgoing`] filters empty slots at visitation time.
+/// Passing null returns zero.
+///
+/// # Safety
+/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_traced_edge_count(
+    wrap: *const StatorDomObjectWrap,
+) -> usize {
+    if wrap.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).outgoing_traced_edges.len() }
 }
 
 // ── V2 callback signatures (explicit-length keys + StatorStatus) ──────────
@@ -16571,26 +16679,22 @@ pub unsafe extern "C" fn stator_traced_visitor_visit(
 
 /// Walk outgoing `TracedReference` edges from a single JS host object.
 ///
-/// This is the JS→C++ direction of the cross-heap tracing protocol: it
-/// lets an embedder (typically Oilpan) discover every traced edge a JS
-/// host object holds without poking at engine internals.  The current
-/// JS object model does not store [`StatorTraced`] slots on host
-/// objects, so this entry point is documented as a **fail-closed stub**:
-/// it always reports zero outgoing edges, mirroring the safe default
-/// described in `docs/handles.md` §"Traced blocker".
+/// This is the JS→C++ direction of the cross-heap tracing protocol: it lets an
+/// embedder (typically Oilpan) discover every live traced edge a JS host object
+/// holds without poking at engine internals. DOM wrapper values created by
+/// [`stator_dom_object_wrap_as_value`] expose the borrowed edges registered via
+/// [`stator_dom_object_wrap_add_traced_edge`]. Ordinary JS values, invalidated
+/// wrappers, cross-isolate values, null arguments, and empty traced slots fail
+/// closed by reporting zero edges.
 ///
-/// The function is still exported so embedders can link against the
-/// surface and so future host objects that *do* expose traced fields
-/// can be plumbed through here without breaking the ABI.
-///
-/// Null-tolerant: any null pointer makes the call a no-op.
+/// The callback receives each borrowed `StatorTraced` pointer at most once per
+/// call and must not reset or dispose it.
 ///
 /// # Safety
 /// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
-/// - `host` must be null or a valid, live [`StatorValue`] pointer
-///   belonging to `isolate`.
-/// - `callback` (if non-`None`) and `userdata` lifetimes are entirely
-///   the embedder's responsibility.
+/// - `host` must be null or a valid, live [`StatorValue`] pointer.
+/// - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
+///   embedder's responsibility.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_visit_outgoing(
     isolate: *mut StatorIsolate,
@@ -16598,12 +16702,47 @@ pub unsafe extern "C" fn stator_traced_visit_outgoing(
     callback: StatorTracedEdgeCallback,
     userdata: *mut c_void,
 ) {
-    let _ = (isolate, host, callback, userdata);
-    // Current host object representations carry no `StatorTraced` fields,
-    // so emit zero edges.  This is the strictest safe behaviour: it
-    // never falsely claims an edge that does not exist.  The stub stays
-    // in place until host objects gain explicit traced edges; the FFI
-    // signature is the same one that more capable engines will use.
+    if isolate.is_null() || host.is_null() {
+        return;
+    }
+    let Some(callback) = callback else {
+        return;
+    };
+    // SAFETY: caller guarantees `host` is valid.
+    if unsafe { (*host).isolate } != isolate {
+        return;
+    }
+    // SAFETY: caller guarantees `host` is valid for this read.
+    let (wrap, alive) = match unsafe { &(*host).inner } {
+        StatorValueInner::DomWrapHandle { wrap, alive, .. } => (*wrap, Rc::clone(alive)),
+        _ => return,
+    };
+    if wrap.is_null() || !alive.get() {
+        return;
+    }
+    // SAFETY: DOM wrapper values only carry pointers produced by
+    // `stator_dom_object_wrap_as_value`; `alive` guards stale materializations.
+    if unsafe { (*wrap).isolate } != isolate {
+        return;
+    }
+    // Snapshot first so callbacks cannot perturb iteration by adding/removing
+    // edges on the same wrapper.
+    // SAFETY: `wrap` was validated above and is live while `alive` is true.
+    let edges = unsafe { (*wrap).outgoing_traced_edges.clone() };
+    for edge in edges {
+        if edge.is_null() {
+            continue;
+        }
+        let slot = edge as *mut StatorTracedSlot;
+        // SAFETY: registered edges must be live traced slots until removed.
+        let edge_isolate = unsafe { (*slot).isolate };
+        if edge_isolate != isolate || unsafe { stator_traced_is_empty(edge) } {
+            continue;
+        }
+        // SAFETY: callback was supplied by the embedder for this synchronous
+        // visitation and receives a borrowed, live edge pointer.
+        unsafe { callback(userdata, edge) };
+    }
 }
 
 /// Run the embedder traced-root visitor for `isolate` and clear the
@@ -33080,33 +33219,194 @@ mod tests {
         unsafe { stator_traced_dispose(traced) };
     }
 
+    unsafe extern "C" fn collect_traced_edge_cb(userdata: *mut c_void, edge: *mut StatorTraced) {
+        // SAFETY: `userdata` is the address of a `Vec<*mut StatorTraced>`
+        // leaked by the calling test and kept alive for this synchronous call.
+        unsafe { (*(userdata as *mut Vec<*mut StatorTraced>)).push(edge) };
+    }
+
     #[test]
-    fn test_traced_visit_outgoing_is_fail_closed_stub() {
-        // Stub must invoke the callback zero times regardless of inputs.
-        struct Counter {
-            calls: usize,
-        }
-        unsafe extern "C" fn cb(userdata: *mut c_void, _edge: *mut StatorTraced) {
-            // SAFETY: `userdata` is a leaked `Counter` from this test.
-            unsafe {
-                (*(userdata as *mut Counter)).calls += 1;
-            }
-        }
+    fn test_dom_wrapper_traced_edges_register_enumerate_and_remove() {
         let iso = IsolateGuard::new();
         let ctx = ContextGuard::new(iso.as_ptr());
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let host = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let obj1 = unsafe { stator_object_new(iso.as_ptr()) };
+        let val1 = unsafe { stator_object_as_value(obj1) };
+        let edge1 = unsafe { stator_traced_new(ctx.as_ptr(), val1) };
+        let obj2 = unsafe { stator_object_new(iso.as_ptr()) };
+        let val2 = unsafe { stator_object_as_value(obj2) };
+        let edge2 = unsafe { stator_traced_new(ctx.as_ptr(), val2) };
+        assert!(!edge1.is_null());
+        assert!(!edge2.is_null());
+
+        assert!(unsafe { stator_dom_object_wrap_add_traced_edge(wrap, edge1) });
+        assert!(unsafe { stator_dom_object_wrap_add_traced_edge(wrap, edge1) });
+        assert!(unsafe { stator_dom_object_wrap_add_traced_edge(wrap, edge2) });
+        assert_eq!(unsafe { stator_dom_object_wrap_traced_edge_count(wrap) }, 2);
+
+        let seen = Box::into_raw(Box::new(Vec::<*mut StatorTraced>::new()));
+        unsafe {
+            stator_traced_visit_outgoing(
+                iso.as_ptr(),
+                host,
+                Some(collect_traced_edge_cb),
+                seen as *mut c_void,
+            )
+        };
+        let seen = unsafe { Box::from_raw(seen) };
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&edge1));
+        assert!(seen.contains(&edge2));
+
+        assert!(unsafe { stator_dom_object_wrap_remove_traced_edge(wrap, edge1) });
+        assert!(!unsafe { stator_dom_object_wrap_remove_traced_edge(wrap, edge1) });
+        assert_eq!(unsafe { stator_dom_object_wrap_traced_edge_count(wrap) }, 1);
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_clear_traced_edges(wrap) },
+            1
+        );
+        assert_eq!(unsafe { stator_dom_object_wrap_traced_edge_count(wrap) }, 0);
+
+        unsafe {
+            stator_traced_dispose(edge1);
+            stator_traced_dispose(edge2);
+            stator_value_destroy(host);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(val1);
+            stator_object_destroy(obj1);
+            stator_value_destroy(val2);
+            stator_object_destroy(obj2);
+        }
+    }
+
+    #[test]
+    fn test_dom_wrapper_traced_edges_fail_closed_for_null_invalid_and_empty() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let host = unsafe { stator_dom_object_wrap_as_value(wrap) };
         let obj = unsafe { stator_object_new(iso.as_ptr()) };
         let val = unsafe { stator_object_as_value(obj) };
-        let counter = Box::into_raw(Box::new(Counter { calls: 0 }));
+        let edge = unsafe { stator_traced_new(ctx.as_ptr(), val) };
+        assert!(!edge.is_null());
+
+        assert!(!unsafe { stator_dom_object_wrap_add_traced_edge(std::ptr::null_mut(), edge) });
+        assert!(!unsafe { stator_dom_object_wrap_add_traced_edge(wrap, std::ptr::null_mut()) });
+        assert!(!unsafe { stator_dom_object_wrap_remove_traced_edge(wrap, std::ptr::null_mut()) });
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_clear_traced_edges(std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_traced_edge_count(std::ptr::null()) },
+            0
+        );
+
+        let other_iso = IsolateGuard::new();
+        let other_ctx = ContextGuard::new(other_iso.as_ptr());
+        let other_obj = unsafe { stator_object_new(other_iso.as_ptr()) };
+        let other_val = unsafe { stator_object_as_value(other_obj) };
+        let other_edge = unsafe { stator_traced_new(other_ctx.as_ptr(), other_val) };
+        assert!(!other_edge.is_null());
+        assert!(!unsafe { stator_dom_object_wrap_add_traced_edge(wrap, other_edge) });
+
+        assert!(unsafe { stator_dom_object_wrap_add_traced_edge(wrap, edge) });
+        unsafe { stator_traced_reset(edge) };
+        let seen = Box::into_raw(Box::new(Vec::<*mut StatorTraced>::new()));
         unsafe {
-            stator_traced_visit_outgoing(iso.as_ptr(), val, Some(cb), counter as *mut c_void)
+            stator_traced_visit_outgoing(
+                iso.as_ptr(),
+                host,
+                Some(collect_traced_edge_cb),
+                seen as *mut c_void,
+            )
         };
-        // SAFETY: counter still alive.
-        assert_eq!(unsafe { (*counter).calls }, 0);
-        let _ = ctx;
-        unsafe { stator_value_destroy(val) };
-        unsafe { stator_object_destroy(obj) };
-        // SAFETY: pointer was returned by `Box::into_raw` above.
-        drop(unsafe { Box::from_raw(counter) });
+        let seen = unsafe { Box::from_raw(seen) };
+        assert!(seen.is_empty(), "empty traced slots are not reported");
+
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        let seen_after_invalidate = Box::into_raw(Box::new(Vec::<*mut StatorTraced>::new()));
+        unsafe {
+            stator_traced_visit_outgoing(
+                iso.as_ptr(),
+                host,
+                Some(collect_traced_edge_cb),
+                seen_after_invalidate as *mut c_void,
+            )
+        };
+        let seen_after_invalidate = unsafe { Box::from_raw(seen_after_invalidate) };
+        assert!(seen_after_invalidate.is_empty());
+
+        let ordinary = unsafe { stator_object_new(iso.as_ptr()) };
+        let ordinary_val = unsafe { stator_object_as_value(ordinary) };
+        let seen_ordinary = Box::into_raw(Box::new(Vec::<*mut StatorTraced>::new()));
+        unsafe {
+            stator_traced_visit_outgoing(
+                iso.as_ptr(),
+                ordinary_val,
+                Some(collect_traced_edge_cb),
+                seen_ordinary as *mut c_void,
+            )
+        };
+        let seen_ordinary = unsafe { Box::from_raw(seen_ordinary) };
+        assert!(seen_ordinary.is_empty());
+
+        unsafe {
+            stator_dom_object_wrap_clear_traced_edges(wrap);
+            stator_traced_dispose(edge);
+            stator_traced_dispose(other_edge);
+            stator_value_destroy(host);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+            stator_value_destroy(other_val);
+            stator_object_destroy(other_obj);
+            stator_value_destroy(ordinary_val);
+            stator_object_destroy(ordinary);
+        }
+    }
+
+    #[test]
+    fn test_dom_wrapper_traced_edges_do_not_create_hidden_roots() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let host = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let edge = unsafe { stator_traced_new(ctx.as_ptr(), val) };
+        assert!(!edge.is_null());
+        assert!(unsafe { stator_dom_object_wrap_add_traced_edge(wrap, edge) });
+
+        unsafe {
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+            stator_isolate_gc(iso.as_ptr());
+        }
+        assert!(
+            unsafe { stator_traced_is_empty(edge) },
+            "DOM outgoing edge registration must not strongly root traced slots"
+        );
+
+        let seen = Box::into_raw(Box::new(Vec::<*mut StatorTraced>::new()));
+        unsafe {
+            stator_traced_visit_outgoing(
+                iso.as_ptr(),
+                host,
+                Some(collect_traced_edge_cb),
+                seen as *mut c_void,
+            )
+        };
+        let seen = unsafe { Box::from_raw(seen) };
+        assert!(seen.is_empty(), "collected edges are not reported");
+
+        unsafe {
+            stator_dom_object_wrap_clear_traced_edges(wrap);
+            stator_traced_dispose(edge);
+            stator_value_destroy(host);
+            stator_dom_object_wrap_destroy(wrap);
+        }
     }
 
     #[test]

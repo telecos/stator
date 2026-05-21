@@ -161,11 +161,12 @@ Semantics:
 - Movable like `Persistent`: the slot is rewritten in place.
 - May be cleared by either side; clearing is observable to the other
   side on the next visit.
-- Concrete API exposes a *visitor protocol*: the engine calls
-  `stator_traced_visitor_begin/visit/end` on the embedder, and the
-  embedder responds with the live set. Symmetrically, the engine
-  exposes `stator_traced_visit_outgoing(host, visitor)` so Oilpan can
-  walk JS→C++ edges.
+- Concrete API exposes a *visitor protocol*: the engine calls the
+  registered traced-root visitor on the embedder, and the embedder
+  responds with the live set via `stator_traced_visitor_visit`.
+  Symmetrically, the engine exposes
+  `stator_traced_visit_outgoing(host, callback)` so Oilpan can walk
+  JS→C++ edges registered on DOM wrappers.
 
 Backing storage: a `TracedRoots` table owned by the `Isolate`. Unlike
 `PersistentRoots` this table is *re-validated* each cycle: every slot
@@ -264,11 +265,24 @@ void stator_traced_visitor_visit(stator_traced_visitor_t*, stator_traced_t*);
  * JS host object. The callback is invoked once per outgoing
  * TracedReference. */
 typedef void (*stator_traced_edge_callback)(void* userdata, stator_traced_t* edge);
+bool stator_dom_object_wrap_add_traced_edge(stator_dom_object_wrap_t*,
+                                            stator_traced_t*);
+bool stator_dom_object_wrap_remove_traced_edge(stator_dom_object_wrap_t*,
+                                               stator_traced_t*);
+size_t stator_dom_object_wrap_clear_traced_edges(stator_dom_object_wrap_t*);
+size_t stator_dom_object_wrap_traced_edge_count(const stator_dom_object_wrap_t*);
 void stator_traced_visit_outgoing(stator_isolate_t*,
                                   stator_local_t* host,
                                   stator_traced_edge_callback,
                                   void* userdata);
 ```
+
+DOM wrapper outgoing edges are borrowed registrations: the wrapper does
+not own, reset, dispose, or strongly root the `stator_traced_t` slot.
+Edge/Blink must remove an edge before disposing the corresponding
+`TracedReference`. `stator_traced_visit_outgoing` fails closed for null
+arguments, non-DOM hosts, invalidated wrappers, cross-isolate values,
+and empty traced slots by reporting zero edges.
 
 ### 3.5 Root iteration (engine internal, exposed for tests)
 

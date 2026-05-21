@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 4
+#define STATOR_FFI_ABI_VERSION_MINOR 5
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1321,6 +1321,19 @@ typedef bool (*StatorDomIndexedSetterCb)(uint32_t index, const struct StatorValu
 typedef void (*StatorDomWeakCb)(void *data);
 
 /**
+ * Opaque traced-handle slot exposed to the embedder.
+ *
+ * The pointer returned by [`stator_traced_new`] is the address of a
+ * stable, isolate-owned slot.  Its address does not change until the slot
+ * is freed by [`stator_traced_dispose`].  The bytes pointed at are
+ * implementation-defined and must not be inspected or mutated by the
+ * embedder.
+ */
+typedef struct StatorTraced {
+  uint8_t _opaque[0];
+} StatorTraced;
+
+/**
  * POD bundle of named-property interceptors, installed in one call by
  * [`stator_dom_object_wrap_install_named_handler`].
  *
@@ -1503,19 +1516,6 @@ typedef struct StatorWeakCallbackInfo {
  * the (now-dead) wrapper's contents.
  */
 typedef void (*StatorWeakCallback)(const struct StatorWeakCallbackInfo *info);
-
-/**
- * Opaque traced-handle slot exposed to the embedder.
- *
- * The pointer returned by [`stator_traced_new`] is the address of a
- * stable, isolate-owned slot.  Its address does not change until the slot
- * is freed by [`stator_traced_dispose`].  The bytes pointed at are
- * implementation-defined and must not be inspected or mutated by the
- * embedder.
- */
-typedef struct StatorTraced {
-  uint8_t _opaque[0];
-} StatorTraced;
 
 /**
  * Opaque traced-root visitor token passed to the embedder root visitor.
@@ -5207,6 +5207,58 @@ void stator_dom_object_wrap_set_native_ptr(struct StatorDomObjectWrap *wrap, voi
 void *stator_dom_object_wrap_get_native_ptr(const struct StatorDomObjectWrap *wrap);
 
 /**
+ * Register an outgoing traced edge on a DOM wrapper.
+ *
+ * The wrapper stores only the borrowed traced-slot pointer: it does not own,
+ * reset, dispose, or strongly root the edge. Embedders must remove the edge
+ * before disposing `traced`.
+ *
+ * Returns `false` when `wrap` or `traced` is null, the wrapper has been
+ * invalidated, or the traced slot belongs to a different isolate.
+ *
+ * # Safety
+ * - `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `traced` must be null or a valid, live [`StatorTraced`] pointer that has
+ *   not yet been passed to [`stator_traced_dispose`].
+ */
+bool stator_dom_object_wrap_add_traced_edge(struct StatorDomObjectWrap *wrap,
+                                            struct StatorTraced *traced);
+
+/**
+ * Remove a previously registered outgoing traced edge from a DOM wrapper.
+ *
+ * Returns `true` if the edge was present and removed, `false` for null inputs
+ * or when the edge was not registered on `wrap`.
+ *
+ * # Safety
+ * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+bool stator_dom_object_wrap_remove_traced_edge(struct StatorDomObjectWrap *wrap,
+                                               struct StatorTraced *traced);
+
+/**
+ * Remove every outgoing traced edge registered on a DOM wrapper.
+ *
+ * Returns the number of edges removed. Passing null removes nothing.
+ *
+ * # Safety
+ * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+size_t stator_dom_object_wrap_clear_traced_edges(struct StatorDomObjectWrap *wrap);
+
+/**
+ * Return the number of outgoing traced edges currently registered on `wrap`.
+ *
+ * Empty traced slots may still be present until the embedder removes or clears
+ * them; [`stator_traced_visit_outgoing`] filters empty slots at visitation time.
+ * Passing null returns zero.
+ *
+ * # Safety
+ * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+size_t stator_dom_object_wrap_traced_edge_count(const struct StatorDomObjectWrap *wrap);
+
+/**
  * Append a UTF-8 name to a [`StatorDomNameBuffer`].
  *
  * Returns:
@@ -5866,26 +5918,22 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
 /**
  * Walk outgoing `TracedReference` edges from a single JS host object.
  *
- * This is the JS→C++ direction of the cross-heap tracing protocol: it
- * lets an embedder (typically Oilpan) discover every traced edge a JS
- * host object holds without poking at engine internals.  The current
- * JS object model does not store [`StatorTraced`] slots on host
- * objects, so this entry point is documented as a **fail-closed stub**:
- * it always reports zero outgoing edges, mirroring the safe default
- * described in `docs/handles.md` §"Traced blocker".
+ * This is the JS→C++ direction of the cross-heap tracing protocol: it lets an
+ * embedder (typically Oilpan) discover every live traced edge a JS host object
+ * holds without poking at engine internals. DOM wrapper values created by
+ * [`stator_dom_object_wrap_as_value`] expose the borrowed edges registered via
+ * [`stator_dom_object_wrap_add_traced_edge`]. Ordinary JS values, invalidated
+ * wrappers, cross-isolate values, null arguments, and empty traced slots fail
+ * closed by reporting zero edges.
  *
- * The function is still exported so embedders can link against the
- * surface and so future host objects that *do* expose traced fields
- * can be plumbed through here without breaking the ABI.
- *
- * Null-tolerant: any null pointer makes the call a no-op.
+ * The callback receives each borrowed `StatorTraced` pointer at most once per
+ * call and must not reset or dispose it.
  *
  * # Safety
  * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
- * - `host` must be null or a valid, live [`StatorValue`] pointer
- *   belonging to `isolate`.
- * - `callback` (if non-`None`) and `userdata` lifetimes are entirely
- *   the embedder's responsibility.
+ * - `host` must be null or a valid, live [`StatorValue`] pointer.
+ * - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
+ *   embedder's responsibility.
  */
 void stator_traced_visit_outgoing(struct StatorIsolate *isolate,
                                   struct StatorValue *host,
