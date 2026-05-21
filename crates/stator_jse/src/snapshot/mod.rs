@@ -126,6 +126,10 @@ use crate::error::{StatorError, StatorResult};
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
+pub mod manifest;
+
+pub use manifest::{MANIFEST_DIGEST_LEN, ManifestDigest, SnapshotCallbackManifest};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,11 +137,22 @@ use crate::objects::value::JsValue;
 /// Magic bytes that identify a Stator Startup Snapshot blob.
 const MAGIC: [u8; 4] = *b"STSS";
 
+/// Magic bytes that identify a manifest-aware startup snapshot blob.
+///
+/// Produced by [`serialize_globals_with_manifest`] and consumed by
+/// [`reinstall_globals_with_manifest`].  Distinct from [`MAGIC`] so
+/// that legacy `STSS` blobs and manifest-aware `STSM` blobs cannot be
+/// mistakenly fed into the other loader.
+const MAGIC_MANIFEST: [u8; 4] = *b"STSM";
+
 /// Format version; increment when the layout changes in an incompatible way.
 ///
 /// **v2** added: `DefineRef`/`BackRef` tags for shared and circular references,
 /// and a 4-byte FNV-1a checksum footer.
 const SNAPSHOT_VERSION: u32 = 2;
+
+/// Format version of the manifest-aware (`STSM`) snapshot layout.
+const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
 
 // JsValue tag bytes
 const TAG_UNDEFINED: u8 = 0x00;
@@ -465,6 +480,186 @@ pub fn deserialize_globals(bytes: &[u8]) -> StatorResult<HashMap<String, JsValue
     Ok(globals)
 }
 
+/// Serialize globals into a manifest-aware [`StartupSnapshot`].
+///
+/// This is the strict, fail-closed entry point for warm-context
+/// snapshots that depend on native host callbacks.  Every reachable
+/// [`JsValue::NativeFunction`] must be registered in `manifest`; the
+/// emitted snapshot stores the callback's manifest id (a `str32`)
+/// rather than any function-pointer or closure address, and the
+/// header captures the manifest digest plus its sorted id list so the
+/// loader can verify compatibility before reinstalling anything.
+///
+/// In addition to [`serialize_globals_strict`]'s rejection rules, this
+/// function fails with
+/// [`StatorError::SnapshotUnsupportedValue`] (class `"NativeFunction"`)
+/// when it encounters a native function whose `Rc` allocation is not
+/// present in `manifest`.  No raw function pointers are ever written
+/// to the snapshot bytes.
+///
+/// Binary layout (manifest-aware `STSM` v1):
+///
+/// ```text
+/// magic          : [u8; 4]  = b"STSM"
+/// version        : u32 LE   = 1
+/// manifest_hash  : [u8; 32] (in-process digest, see SnapshotCallbackManifest::digest)
+/// id_count       : u32 LE
+/// ids            : str32 * id_count   (sorted lexicographically)
+/// count          : u32 LE             (globals entries)
+/// entries        : (str32 key, JsValue value) * count
+/// checksum       : u32 LE             (FNV-1a over all preceding bytes)
+/// ```
+///
+/// # Errors
+///
+/// - [`StatorError::SnapshotUnsupportedValue`] for any unsupported
+///   value class (see [`serialize_globals_strict`]) or for any
+///   `NativeFunction` not present in `manifest`.
+pub fn serialize_globals_with_manifest(
+    globals: &HashMap<String, JsValue>,
+    manifest: &SnapshotCallbackManifest,
+) -> StatorResult<StartupSnapshot> {
+    let mut buf = Vec::new();
+    let mut ctx = SerContext::new();
+    write_magic_header_manifest(&mut buf);
+    let digest = manifest.digest();
+    buf.extend_from_slice(&digest);
+    let ids = manifest.sorted_ids();
+    write_u32(&mut buf, ids.len() as u32);
+    for id in &ids {
+        write_str32(&mut buf, id);
+    }
+    write_u32(&mut buf, globals.len() as u32);
+    let mut keys: Vec<&String> = globals.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &globals[key];
+        write_str32(&mut buf, key);
+        let path = format!("globals.{key}");
+        write_jsvalue_with_manifest(&mut buf, value, &mut ctx, manifest, &path)?;
+    }
+    let checksum = fnv1a_32(&buf);
+    write_u32(&mut buf, checksum);
+    Ok(StartupSnapshot { data: buf })
+}
+
+/// Deserialize a manifest-aware snapshot and reinstall every native
+/// callback referenced by the snapshot using the load-time `manifest`.
+///
+/// Steps:
+/// 1. Validate the `STSM` magic, version, and FNV-1a checksum footer.
+/// 2. Compare the stored manifest digest and sorted id list with
+///    `manifest.digest()` / `manifest.sorted_ids()`.  If either differs
+///    (any missing or extra id), return
+///    [`StatorError::SnapshotManifestMismatch`].  v1 has no
+///    `allow_extra` escape hatch — load is fail-closed.
+/// 3. Decode every `JsValue`, restoring `NativeFunction` placeholders
+///    by looking up their id in `manifest` and cloning the
+///    corresponding `Rc`.  An id present in the snapshot but missing
+///    from the load-time manifest is impossible after step 2 and
+///    triggers an internal error if it ever occurs.
+///
+/// # Errors
+///
+/// - [`StatorError::Internal`] for malformed blobs (truncation, bad
+///   magic, bad checksum, unknown tag).
+/// - [`StatorError::SnapshotManifestMismatch`] when the load-time
+///   manifest does not match the snapshot's recorded manifest.
+pub fn reinstall_globals_with_manifest(
+    bytes: &[u8],
+    manifest: &SnapshotCallbackManifest,
+) -> StatorResult<HashMap<String, JsValue>> {
+    // Minimum: 8 (header) + 32 (digest) + 4 (id_count) + 4 (count) + 4 (checksum).
+    if bytes.len() < 52 {
+        return Err(StatorError::Internal(
+            "snapshot: manifest-aware blob too small".into(),
+        ));
+    }
+
+    let mut cursor = 0usize;
+    read_magic_header_manifest(bytes, &mut cursor)?;
+    verify_checksum(bytes)?;
+    let body = &bytes[..bytes.len() - 4];
+
+    let mut stored_digest = [0u8; MANIFEST_DIGEST_LEN];
+    need(body, cursor, MANIFEST_DIGEST_LEN)?;
+    stored_digest.copy_from_slice(&body[cursor..cursor + MANIFEST_DIGEST_LEN]);
+    cursor += MANIFEST_DIGEST_LEN;
+
+    let id_count = read_u32(body, &mut cursor)? as usize;
+    let mut stored_ids: Vec<String> = Vec::with_capacity(id_count);
+    for _ in 0..id_count {
+        stored_ids.push(read_str32(body, &mut cursor)?);
+    }
+    // Snapshots are written with ids in sorted order; reject mutated blobs
+    // up-front so digest comparison stays meaningful.
+    if !stored_ids.windows(2).all(|w| w[0] < w[1]) {
+        return Err(StatorError::Internal(
+            "snapshot: manifest id table is not sorted/unique".into(),
+        ));
+    }
+
+    // Verify the stored digest matches the canonical digest of the ids
+    // actually serialized — guards against header tampering.
+    let recomputed = manifest::manifest_digest_from_ids(stored_ids.iter().map(String::as_str));
+    if recomputed != stored_digest {
+        return Err(StatorError::Internal(format!(
+            "snapshot: stored manifest digest ({}) does not match the digest of \
+             the serialized id list ({}); snapshot blob is corrupt",
+            hex_lower(&stored_digest),
+            hex_lower(&recomputed),
+        )));
+    }
+
+    let load_digest = manifest.digest();
+    let load_ids: Vec<String> = manifest
+        .sorted_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if load_digest != stored_digest || load_ids != stored_ids {
+        let stored_set: std::collections::BTreeSet<&str> =
+            stored_ids.iter().map(String::as_str).collect();
+        let load_set: std::collections::BTreeSet<&str> =
+            load_ids.iter().map(String::as_str).collect();
+        let missing_ids: Vec<String> = stored_set
+            .difference(&load_set)
+            .map(|s| (*s).to_owned())
+            .collect();
+        let extra_ids: Vec<String> = load_set
+            .difference(&stored_set)
+            .map(|s| (*s).to_owned())
+            .collect();
+        return Err(StatorError::SnapshotManifestMismatch {
+            expected: hex_lower(&stored_digest),
+            found: hex_lower(&load_digest),
+            missing_ids,
+            extra_ids,
+        });
+    }
+
+    let mut ctx = DeserContext::new();
+    let count = read_u32(body, &mut cursor)?;
+    let mut globals = HashMap::with_capacity(count as usize);
+    for _ in 0..count {
+        let key = read_str32(body, &mut cursor)?;
+        let value = read_jsvalue_with_manifest(body, &mut cursor, &mut ctx, manifest)?;
+        globals.insert(key, value);
+    }
+    Ok(globals)
+}
+
+/// Lowercase hex encoding of a byte slice (used for manifest diagnostics).
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 /// Serialize a single [`BytecodeArray`] (and its constant pool, including any
 /// nested function templates) into a self-contained byte buffer.
 ///
@@ -494,6 +689,11 @@ pub fn deserialize_bytecode_array(bytes: &[u8], cursor: &mut usize) -> StatorRes
 fn write_magic_header(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&MAGIC);
     write_u32(buf, SNAPSHOT_VERSION);
+}
+
+fn write_magic_header_manifest(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&MAGIC_MANIFEST);
+    write_u32(buf, SNAPSHOT_MANIFEST_VERSION);
 }
 
 fn write_u8(buf: &mut Vec<u8>, v: u8) {
@@ -822,6 +1022,88 @@ fn write_jsvalue_strict(
     }
 }
 
+/// Manifest-aware counterpart of [`write_jsvalue_strict`].
+///
+/// Behaves exactly like the strict serializer except that a
+/// [`JsValue::NativeFunction`] whose `Rc` is registered in `manifest`
+/// is emitted as `TAG_NATIVE_FUNCTION + str32(id)`.  Unregistered
+/// native functions are still rejected with
+/// [`StatorError::SnapshotUnsupportedValue`].
+fn write_jsvalue_with_manifest(
+    buf: &mut Vec<u8>,
+    value: &JsValue,
+    ctx: &mut SerContext,
+    manifest: &SnapshotCallbackManifest,
+    path: &str,
+) -> StatorResult<()> {
+    match value {
+        JsValue::ModuleBinding(cell) => {
+            write_jsvalue_with_manifest(buf, &cell.read(), ctx, manifest, path)
+        }
+        JsValue::NativeFunction(_) => {
+            if let Some(id) = manifest.id_for_value(value) {
+                write_u8(buf, TAG_NATIVE_FUNCTION);
+                write_str32(buf, id);
+                Ok(())
+            } else {
+                Err(StatorError::SnapshotUnsupportedValue {
+                    class: "NativeFunction",
+                    path: path.to_owned(),
+                    reason: Some(
+                        "native callback is not registered in the snapshot manifest; \
+                         add it via SnapshotCallbackManifest::register before serializing",
+                    ),
+                })
+            }
+        }
+        JsValue::Array(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+                Ok(())
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ARRAY);
+                let borrow = rc.borrow();
+                write_u32(buf, borrow.len() as u32);
+                for (i, item) in borrow.iter().enumerate() {
+                    let child_path = format!("{path}[{i}]");
+                    write_jsvalue_with_manifest(buf, item, ctx, manifest, &child_path)?;
+                }
+                Ok(())
+            }
+        }
+        JsValue::PlainObject(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+                Ok(())
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                let borrow = rc.borrow();
+                write_u8(buf, TAG_PLAIN_OBJECT);
+                write_u32(buf, borrow.len() as u32);
+                let mut entries: Vec<(&Rc<str>, &JsValue)> = borrow.iter().collect();
+                entries.sort_by(|(l, _), (r, _)| l.as_ref().cmp(r.as_ref()));
+                for (k, v) in entries {
+                    write_str32(buf, k);
+                    let child_path = format!("{path}.{}", k.as_ref());
+                    write_jsvalue_with_manifest(buf, v, ctx, manifest, &child_path)?;
+                }
+                Ok(())
+            }
+        }
+        // Every other case is identical to the strict serializer; defer.
+        _ => write_jsvalue_strict(buf, value, ctx, path),
+    }
+}
+
 fn write_bytecode_array(buf: &mut Vec<u8>, ba: &BytecodeArray) {
     // bytecodes
     let bc = ba.bytecodes();
@@ -975,6 +1257,25 @@ fn read_magic_header(bytes: &[u8], cursor: &mut usize) -> StatorResult<()> {
     if version != SNAPSHOT_VERSION {
         return Err(StatorError::Internal(format!(
             "snapshot: unsupported version {version} (expected {SNAPSHOT_VERSION})"
+        )));
+    }
+    Ok(())
+}
+
+fn read_magic_header_manifest(bytes: &[u8], cursor: &mut usize) -> StatorResult<()> {
+    need(bytes, *cursor, 8)?;
+    let magic = &bytes[*cursor..*cursor + 4];
+    if magic != MAGIC_MANIFEST {
+        return Err(StatorError::Internal(format!(
+            "snapshot: invalid manifest-aware magic bytes {magic:?} (expected {MAGIC_MANIFEST:?})"
+        )));
+    }
+    *cursor += 4;
+    let version = read_u32(bytes, cursor)?;
+    if version != SNAPSHOT_MANIFEST_VERSION {
+        return Err(StatorError::Internal(format!(
+            "snapshot: unsupported manifest-aware version {version} \
+             (expected {SNAPSHOT_MANIFEST_VERSION})"
         )));
     }
     Ok(())
@@ -1199,6 +1500,96 @@ fn read_jsvalue_by_tag(
     }
 }
 
+/// Manifest-aware counterpart of [`read_jsvalue`].
+///
+/// Identical to [`read_jsvalue`] except that `TAG_NATIVE_FUNCTION`
+/// records contain a manifest id (not the legacy `"<native>"`
+/// placeholder), and the id is looked up in `manifest` to install the
+/// host callback `Rc`.
+fn read_jsvalue_with_manifest(
+    bytes: &[u8],
+    cursor: &mut usize,
+    ctx: &mut DeserContext,
+    manifest: &SnapshotCallbackManifest,
+) -> StatorResult<JsValue> {
+    let tag = read_u8(bytes, cursor)?;
+    match tag {
+        TAG_DEFINE_REF => {
+            let ref_id = read_u32(bytes, cursor)?;
+            let inner_tag = read_u8(bytes, cursor)?;
+            read_defined_ref_with_manifest(bytes, cursor, ctx, manifest, ref_id, inner_tag)
+        }
+        TAG_BACK_REF => {
+            let ref_id = read_u32(bytes, cursor)?;
+            ctx.lookup(ref_id)
+        }
+        TAG_NATIVE_FUNCTION => {
+            let id = read_str32(bytes, cursor)?;
+            match manifest.callback(&id) {
+                Some(cb) => Ok(JsValue::NativeFunction(Rc::clone(cb))),
+                None => Err(StatorError::Internal(format!(
+                    "snapshot: native callback id `{id}` is missing from the load-time manifest \
+                     (digest check should have caught this earlier)"
+                ))),
+            }
+        }
+        TAG_ARRAY => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(read_jsvalue_with_manifest(bytes, cursor, ctx, manifest)?);
+            }
+            Ok(JsValue::new_array(items))
+        }
+        TAG_PLAIN_OBJECT => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let mut map = PropertyMap::with_capacity(count);
+            for _ in 0..count {
+                let k = read_str32(bytes, cursor)?;
+                let v = read_jsvalue_with_manifest(bytes, cursor, ctx, manifest)?;
+                map.insert(k, v);
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
+        }
+        other => read_jsvalue_by_tag(bytes, cursor, ctx, other),
+    }
+}
+
+fn read_defined_ref_with_manifest(
+    bytes: &[u8],
+    cursor: &mut usize,
+    ctx: &mut DeserContext,
+    manifest: &SnapshotCallbackManifest,
+    ref_id: u32,
+    inner_tag: u8,
+) -> StatorResult<JsValue> {
+    match inner_tag {
+        TAG_PLAIN_OBJECT => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let map = Rc::new(RefCell::new(PropertyMap::with_capacity(count)));
+            let value = JsValue::PlainObject(Rc::clone(&map));
+            ctx.register(ref_id, value.clone());
+            for _ in 0..count {
+                let k = read_str32(bytes, cursor)?;
+                let v = read_jsvalue_with_manifest(bytes, cursor, ctx, manifest)?;
+                map.borrow_mut().insert(k, v);
+            }
+            Ok(value)
+        }
+        TAG_ARRAY => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(read_jsvalue_with_manifest(bytes, cursor, ctx, manifest)?);
+            }
+            let value = JsValue::new_array(items);
+            ctx.register(ref_id, value.clone());
+            Ok(value)
+        }
+        _ => read_defined_ref(bytes, cursor, ctx, ref_id, inner_tag),
+    }
+}
+
 fn read_bytecode_array(bytes: &[u8], cursor: &mut usize) -> StatorResult<BytecodeArray> {
     // bytecodes
     let bc_len = read_u32(bytes, cursor)? as usize;
@@ -1404,7 +1795,7 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
     use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
-    use crate::objects::value::JsValue;
+    use crate::objects::value::{JsValue, NativeFn};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -2145,5 +2536,227 @@ mod tests {
             msg.contains("NativeFunction") && msg.contains("globals.cb"),
             "diagnostic should mention class and path: {msg}"
         );
+    }
+
+    // ── manifest-aware snapshot tests ────────────────────────────────────────
+
+    fn make_cb(tag: i32) -> NativeFn {
+        Rc::new(move |_args| Ok(JsValue::Smi(tag)))
+    }
+
+    /// Registered callbacks serialize as ids, and reinstall_globals_with_manifest
+    /// restores them to the load-time `Rc` so invoking the returned value
+    /// yields the load-time behavior.
+    #[test]
+    fn test_manifest_round_trip_registered_callback() {
+        let cb = make_cb(7);
+        let mut manifest = SnapshotCallbackManifest::new();
+        manifest.register("edge.foo", cb.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("foo".to_string(), JsValue::NativeFunction(cb.clone()));
+        g.insert("x".to_string(), JsValue::Smi(42));
+
+        let snap = serialize_globals_with_manifest(&g, &manifest).expect("serialize");
+        // Header validates as a manifest blob, not a legacy STSS blob.
+        assert!(deserialize_globals(snap.as_bytes()).is_err());
+
+        let restored = reinstall_globals_with_manifest(snap.as_bytes(), &manifest).expect("load");
+        assert_eq!(restored.get("x"), Some(&JsValue::Smi(42)));
+        let restored_cb = match restored.get("foo") {
+            Some(JsValue::NativeFunction(rc)) => rc.clone(),
+            other => panic!("expected NativeFunction, got {other:?}"),
+        };
+        assert!(
+            Rc::ptr_eq(&restored_cb, &cb),
+            "reinstalled callback should be the load-time Rc"
+        );
+        // Invoking the callback should hit the load-time closure.
+        assert_eq!(restored_cb(vec![]).unwrap(), JsValue::Smi(7));
+    }
+
+    /// Native functions not present in the manifest cause strict
+    /// serialization to fail closed.
+    #[test]
+    fn test_manifest_rejects_unregistered_callback() {
+        let known = make_cb(1);
+        let unknown = make_cb(2);
+        let mut manifest = SnapshotCallbackManifest::new();
+        manifest.register("edge.known", known.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("k".to_string(), JsValue::NativeFunction(known));
+        g.insert("u".to_string(), JsValue::NativeFunction(unknown));
+        let err = serialize_globals_with_manifest(&g, &manifest).unwrap_err();
+        assert_unsupported(err, "NativeFunction", "globals.u");
+    }
+
+    /// Native functions nested through arrays / objects are also rejected.
+    #[test]
+    fn test_manifest_rejects_unregistered_nested_callback() {
+        let manifest = SnapshotCallbackManifest::new();
+        let mut map = PropertyMap::new();
+        map.insert("onclick".to_string(), JsValue::NativeFunction(make_cb(0)));
+        let mut g = HashMap::new();
+        g.insert(
+            "window".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(map))),
+        );
+        let err = serialize_globals_with_manifest(&g, &manifest).unwrap_err();
+        assert_unsupported(err, "NativeFunction", "globals.window.onclick");
+    }
+
+    /// Loading a snapshot with a manifest that is missing ids is a
+    /// fatal `SnapshotManifestMismatch`.
+    #[test]
+    fn test_manifest_load_missing_id_rejected() {
+        let cb = make_cb(1);
+        let mut create_manifest = SnapshotCallbackManifest::new();
+        create_manifest.register("edge.foo", cb.clone()).unwrap();
+        create_manifest.register("edge.bar", make_cb(2)).unwrap();
+        let mut g = HashMap::new();
+        g.insert("foo".to_string(), JsValue::NativeFunction(cb));
+        let snap = serialize_globals_with_manifest(&g, &create_manifest).unwrap();
+
+        // Load manifest is missing "edge.bar".
+        let mut load_manifest = SnapshotCallbackManifest::new();
+        load_manifest.register("edge.foo", make_cb(99)).unwrap();
+        let err = reinstall_globals_with_manifest(snap.as_bytes(), &load_manifest).unwrap_err();
+        match err {
+            StatorError::SnapshotManifestMismatch {
+                missing_ids,
+                extra_ids,
+                ..
+            } => {
+                assert_eq!(missing_ids, vec!["edge.bar".to_string()]);
+                assert!(extra_ids.is_empty(), "no extras: {extra_ids:?}");
+            }
+            other => panic!("expected SnapshotManifestMismatch, got {other:?}"),
+        }
+    }
+
+    /// Loading with an extra id in the manifest (forward-compat scenario)
+    /// is also rejected in v1 — fail closed.
+    #[test]
+    fn test_manifest_load_extra_id_rejected() {
+        let cb = make_cb(1);
+        let mut create_manifest = SnapshotCallbackManifest::new();
+        create_manifest.register("edge.foo", cb.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("foo".to_string(), JsValue::NativeFunction(cb));
+        let snap = serialize_globals_with_manifest(&g, &create_manifest).unwrap();
+
+        let mut load_manifest = SnapshotCallbackManifest::new();
+        load_manifest.register("edge.foo", make_cb(99)).unwrap();
+        load_manifest.register("edge.extra", make_cb(2)).unwrap();
+        let err = reinstall_globals_with_manifest(snap.as_bytes(), &load_manifest).unwrap_err();
+        match err {
+            StatorError::SnapshotManifestMismatch {
+                missing_ids,
+                extra_ids,
+                ..
+            } => {
+                assert!(missing_ids.is_empty(), "no missing: {missing_ids:?}");
+                assert_eq!(extra_ids, vec!["edge.extra".to_string()]);
+            }
+            other => panic!("expected SnapshotManifestMismatch, got {other:?}"),
+        }
+    }
+
+    /// Loading with a renamed id is rejected (digest changes).
+    #[test]
+    fn test_manifest_load_renamed_id_rejected() {
+        let cb = make_cb(1);
+        let mut create_manifest = SnapshotCallbackManifest::new();
+        create_manifest.register("edge.foo", cb.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("foo".to_string(), JsValue::NativeFunction(cb));
+        let snap = serialize_globals_with_manifest(&g, &create_manifest).unwrap();
+
+        let mut load_manifest = SnapshotCallbackManifest::new();
+        load_manifest.register("edge.foo2", make_cb(99)).unwrap();
+        let err = reinstall_globals_with_manifest(snap.as_bytes(), &load_manifest).unwrap_err();
+        assert!(matches!(err, StatorError::SnapshotManifestMismatch { .. }));
+    }
+
+    /// Deterministic byte output for the same globals and the same manifest.
+    #[test]
+    fn test_manifest_serialization_is_deterministic() {
+        let cb1 = make_cb(1);
+        let cb2 = make_cb(2);
+        let mut manifest = SnapshotCallbackManifest::new();
+        manifest.register("a", cb1.clone()).unwrap();
+        manifest.register("b", cb2.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("p".to_string(), JsValue::NativeFunction(cb1));
+        g.insert("q".to_string(), JsValue::NativeFunction(cb2));
+        let s1 = serialize_globals_with_manifest(&g, &manifest).unwrap();
+        let s2 = serialize_globals_with_manifest(&g, &manifest).unwrap();
+        assert_eq!(s1.as_bytes(), s2.as_bytes());
+    }
+
+    /// Manifest hash is independent of registration order.
+    #[test]
+    fn test_manifest_digest_is_order_independent() {
+        let mut a = SnapshotCallbackManifest::new();
+        a.register("alpha", make_cb(1)).unwrap();
+        a.register("beta", make_cb(2)).unwrap();
+        let mut b = SnapshotCallbackManifest::new();
+        b.register("beta", make_cb(3)).unwrap();
+        b.register("alpha", make_cb(4)).unwrap();
+        assert_eq!(a.digest(), b.digest());
+    }
+
+    /// Loading a manifest-aware blob that has been corrupted (digest no
+    /// longer matches the id list) is rejected before any callback is
+    /// reinstalled.
+    #[test]
+    fn test_manifest_load_rejects_tampered_digest() {
+        let cb = make_cb(1);
+        let mut manifest = SnapshotCallbackManifest::new();
+        manifest.register("edge.foo", cb.clone()).unwrap();
+        let mut g = HashMap::new();
+        g.insert("foo".to_string(), JsValue::NativeFunction(cb));
+        let snap = serialize_globals_with_manifest(&g, &manifest).unwrap();
+        let mut tampered = snap.as_bytes().to_vec();
+        // Flip a bit inside the manifest digest (right after 8-byte header).
+        tampered[8] ^= 0xff;
+        // Also fix the checksum so we hit the digest check, not the
+        // outer checksum check.
+        let new_checksum = fnv1a_32(&tampered[..tampered.len() - 4]);
+        let n = tampered.len();
+        tampered[n - 4..].copy_from_slice(&new_checksum.to_le_bytes());
+        let err = reinstall_globals_with_manifest(&tampered, &manifest).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match") || msg.contains("corrupt"),
+            "expected digest-mismatch diagnostic, got: {msg}"
+        );
+    }
+
+    /// `serialize_globals_with_manifest` should still reject non-callback
+    /// unsupported values (Promise, ArrayBuffer, etc.) — manifest mode does
+    /// not weaken the strict serializer.
+    #[test]
+    fn test_manifest_still_rejects_other_unsupported_classes() {
+        let manifest = SnapshotCallbackManifest::new();
+        let mut g = HashMap::new();
+        g.insert("h".to_string(), JsValue::TheHole);
+        let err = serialize_globals_with_manifest(&g, &manifest).unwrap_err();
+        assert_unsupported(err, "TheHole", "globals.h");
+    }
+
+    /// Legacy `serialize_globals` / `deserialize_globals` path is untouched.
+    #[test]
+    fn test_legacy_snapshot_path_still_works_for_native_function() {
+        let mut g = HashMap::new();
+        g.insert(
+            "nf".to_string(),
+            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Smi(1)))),
+        );
+        let snap = serialize_globals(&g);
+        let restored = deserialize_globals(snap.as_bytes()).unwrap();
+        match restored.get("nf") {
+            Some(JsValue::NativeFunction(_)) => {}
+            other => panic!("expected NativeFunction stub, got {other:?}"),
+        }
     }
 }

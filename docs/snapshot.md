@@ -418,6 +418,26 @@ implementation slices must hit.
 
 ### Rust (engine-internal)
 
+> **v1 implementation status (in tree):** the in-process Rust API
+> below is implemented today in `crates/stator_jse/src/snapshot/`:
+> [`SnapshotCallbackManifest`](../crates/stator_jse/src/snapshot/manifest.rs)
+> plus
+> [`serialize_globals_with_manifest`](../crates/stator_jse/src/snapshot/mod.rs)
+> and
+> [`reinstall_globals_with_manifest`](../crates/stator_jse/src/snapshot/mod.rs).
+> The implemented blob uses the magic `STSM` and embeds a 32-byte
+> deterministic manifest digest (four domain-separated FNV-1a-64
+> folds) plus the sorted id list directly in the header.  Load is
+> strictly fail-closed: any mismatch — missing id, extra id, renamed
+> id, tampered digest — produces
+> [`StatorError::SnapshotManifestMismatch`] before any callback is
+> reinstalled.  An `allow_extra` mode is not implemented in v1.  The
+> Edge release-bundle BLAKE3 digests described in §7 and §10 layer
+> on top of this in-process digest at the file/bundle level.
+>
+> The full `Isolate` / `Context` constructor surface described in
+> the pseudo-Rust block below remains a future work item.
+
 ```text
 pub struct SnapshotCallbackManifest { … }
 impl SnapshotCallbackManifest {

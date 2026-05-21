@@ -111,6 +111,33 @@ pub enum StatorError {
         /// serialize for warm-context snapshots.
         reason: Option<&'static str>,
     },
+
+    /// A manifest-aware snapshot was loaded with a callback manifest
+    /// whose digest does not match the digest captured at snapshot
+    /// create time.
+    ///
+    /// Emitted by
+    /// [`crate::snapshot::reinstall_globals_with_manifest`] when the
+    /// load-time [`crate::snapshot::SnapshotCallbackManifest`] does not
+    /// exactly match (by digest and id set) the manifest that produced
+    /// the snapshot.  v1 does not implement an `allow_extra` mode; any
+    /// id present on one side but not the other is fatal.
+    #[error(
+        "snapshot: callback manifest mismatch (expected digest {expected}, found {found}; \
+         missing_ids={missing_ids:?}, extra_ids={extra_ids:?})"
+    )]
+    SnapshotManifestMismatch {
+        /// Hex-encoded digest captured in the snapshot header.
+        expected: String,
+        /// Hex-encoded digest of the load-time manifest.
+        found: String,
+        /// Ids present in the snapshot header but absent from the
+        /// load-time manifest.
+        missing_ids: Vec<String>,
+        /// Ids present in the load-time manifest but absent from the
+        /// snapshot header.
+        extra_ids: Vec<String>,
+    },
 }
 
 /// Convenient `Result` alias for fallible engine operations.

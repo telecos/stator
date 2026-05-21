@@ -12321,7 +12321,8 @@ impl Interpreter {
             | StatorError::Internal(_)
             | StatorError::DebuggerPaused { .. }
             | StatorError::SandboxViolation { .. }
-            | StatorError::SnapshotUnsupportedValue { .. } => None,
+            | StatorError::SnapshotUnsupportedValue { .. }
+            | StatorError::SnapshotManifestMismatch { .. } => None,
         }
     }
 
