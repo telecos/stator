@@ -78,15 +78,23 @@ typedef enum StatorScriptCacheDiagnostic {
 } StatorScriptCacheDiagnostic;
 
 typedef struct StatorScriptCompileOptions {
-  /* Stable script URL/resource name; copied by Stator during the call. */
-  const char *resource_name;
-  size_t resource_name_len;
+  /* Canonical script URL/resource name; copied by Stator during the call. */
+  const char *resource_url;
+  size_t resource_url_len;
   /* Serialized origin or opaque-origin token supplied by the embedder. */
   const char *source_origin;
   size_t source_origin_len;
-  /* Optional //# sourceURL= override when it differs from resource_name. */
+  /* Optional //# sourceURL= override when it differs from resource_url. */
   const char *source_url;
   size_t source_url_len;
+  const char *base_url;
+  size_t base_url_len;
+  const char *referrer_url;
+  size_t referrer_url_len;
+  const char *integrity_metadata;
+  size_t integrity_metadata_len;
+  uint32_t credentials_mode;
+  uint32_t referrer_policy;
   int32_t line_offset;
   int32_t column_offset;
   const char *source_map_url;
@@ -94,9 +102,11 @@ typedef struct StatorScriptCompileOptions {
   /*
    * Embedder-defined compile-affecting options. Stator treats the byte sequence
    * as opaque key material and stores only its digest in diagnostics.
-   */
+  */
   const uint8_t *host_defined_options;
   size_t host_defined_options_len;
+  const uint8_t *compile_options;
+  size_t compile_options_len;
   uint64_t parser_feature_bits;
   uint64_t bytecode_feature_bits;
   uint32_t strict_mode_policy;
@@ -209,6 +219,43 @@ Keys are serialized as deterministic UTF-8 records before hashing or embedding i
 
 The same canonical record must also be stored, or be reproducible from stored metadata, so rejection diagnostics can identify the first mismatched field.
 
+Canonical values are encoded as follows:
+
+- Strings are UTF-8 byte strings after Edge canonicalization. URL fields use the
+  browser's canonical URL serializer, including punycode, percent-encoding, and
+  opaque-origin serialization. `source_url` and `source_map_url` comments are
+  trimmed exactly as the parser recognizes the directive, then serialized as
+  strings without additional path resolution unless Edge has already resolved
+  them.
+- Enums are lowercase ASCII tokens. Booleans are one byte (`0` or `1`). Integers
+  are unsigned little-endian except `line_offset` and `column_offset`, which are
+  signed little-endian because embedders may represent wrapper offsets relative
+  to generated source.
+- Byte fields store the digest bytes, not hex text. Raw source, raw URLs, raw
+  integrity metadata, import-attribute values, and host compile option bytes must
+  not appear in telemetry.
+- Sorted string lists are length-prefixed item sequences sorted by UTF-8 bytes.
+  Maps are length-prefixed key/value item sequences sorted by key bytes; duplicate
+  keys, invalid UTF-8, invalid enum tokens, or unknown non-nullable values reject
+  the artifact as `corrupt_payload`.
+
+Optional fields are never omitted from the canonical record. An absent pointer,
+missing browser concept, or intentionally inapplicable field is encoded as
+`null`. An empty string, empty list, empty map, or zero-length digest is distinct
+from `null` and must match exactly. Producers must reject inputs that cannot be
+canonicalized instead of silently omitting them. Consumers that read an older
+payload missing a field required by the active schema must report the field's
+specific `rejected_*` code when the payload is otherwise well-formed, or
+`corrupt_payload` when the record cannot be decoded.
+
+Script-bytecode and module-bytecode caches use the same source-metadata contract:
+the key must include source origin, line/column offsets, resource URL, base URL,
+referrer URL, integrity metadata, credentials mode, referrer policy, import
+attributes/policy, source map URL, sourceURL comment, and all parser/compiler
+compile options that can affect observable behavior or diagnostics. Classic
+scripts encode module-only fields as `null`; modules encode script-only wrapper
+fields as `null` only when the host genuinely has no value.
+
 ## Required key fields
 
 ### 1. Artifact identity
@@ -246,18 +293,19 @@ The same canonical record must also be stored, or be reproducible from stored me
 | `source_hash` | bytes | Hash of the exact UTF-8/UTF-16 source bytes supplied to Stator after network decoding but before parser normalization. |
 | `source_length_bytes` | u64 | Exact byte length of source input. |
 | `source_encoding` | enum | `utf8`, `utf16le`, `utf16be`, or `latin1`. |
-| `resource_url` | string/null | Canonical script/module URL. |
-| `source_url` | string/null | `//# sourceURL=` override, if distinct from `resource_url`. |
-| `source_origin` | string/null | Serialized origin or opaque-origin token supplied by Edge. |
-| `base_url` | string/null | Base URL used for relative module specifier resolution. |
-| `referrer_url` | string/null | Referrer used by fetch/compile policy. |
-| `integrity_metadata` | string/null | Subresource Integrity metadata string. |
-| `credentials_mode` | enum/null | `omit`, `same-origin`, or `include`. |
+| `resource_url` | string/null | Canonical script/module URL used as the resource name. Required for network-backed script and module caches; `null` only for anonymous/eval/internal sources. |
+| `source_url` | string/null | `//# sourceURL=` comment after parser directive handling. Distinct from `resource_url`; encode `null` when no directive is present. |
+| `source_origin` | string/null | Serialized origin or opaque-origin token supplied by Edge. Must preserve opaque-origin identity and must not be derived from `resource_url` by Stator. |
+| `base_url` | string/null | Base URL used for relative script metadata or module specifier resolution before import-map processing. |
+| `referrer_url` | string/null | Referrer used by fetch/compile policy after browser policy trimming. |
+| `integrity_metadata` | string/null | Canonical Subresource Integrity metadata string after browser parsing, or `null` when no integrity constraint applied. |
+| `credentials_mode` | enum/null | `omit`, `same-origin`, or `include`; `null` only when no fetch credential policy exists for the artifact type. |
 | `referrer_policy` | enum/null | Edge/Blink referrer policy used at fetch time. |
-| `line_offset` | u32 | Initial line offset for diagnostics and source positions. |
-| `column_offset` | u32 | Initial column offset. |
-| `source_map_url` | string/null | `//# sourceMappingURL=` or embedder-provided source map URL. |
-| `host_defined_options_hash` | bytes/null | Hash of host-defined compile options that can affect semantics. |
+| `line_offset` | i32 | Initial line offset for diagnostics, stack traces, source positions, and source map lookup. |
+| `column_offset` | i32 | Initial column offset. |
+| `source_map_url` | string/null | `//# sourceMappingURL=` comment or embedder-provided source map URL after directive parsing. Must be keyed even when source text and bytecode are unchanged because diagnostics/devtools behavior changes. |
+| `host_defined_options_hash` | bytes/null | Hash of opaque host-defined compile options that can affect semantics, diagnostics, instrumentation, or embedder policy. |
+| `compile_options_hash` | bytes/null | Hash of structured Stator/Edge compile options not represented elsewhere, including parser goal overrides, code-generation mode, inspector/coverage/debug settings, source wrapping, and future flags. |
 
 ### 4. Module and import metadata
 
@@ -267,6 +315,7 @@ The same canonical record must also be stored, or be reproducible from stored me
 | `module_request_count` | u32/null | Number of static module requests encoded in the artifact. |
 | `module_requests_hash` | bytes/null | Hash of canonical specifier, assertion, and attribute records. |
 | `import_attributes_hash` | bytes/null | Hash of top-level import attributes supplied by Edge. |
+| `import_policy_hash` | bytes/null | Hash of import policy inputs that can change resolution or validation, including assertion policy, import-attributes feature mode, import maps, CSP/module policy tokens, and host allow/deny decisions. |
 | `import_map_epoch` | string/null | Edge-provided import map/version token if resolution can vary. |
 | `resolution_base_url` | string/null | Base URL used by the resolver after import map processing. |
 
@@ -344,6 +393,91 @@ Restore APIs must return a coarse status plus a structured code. Telemetry must 
 | `unsupported_native_code` | Native-code artifact was valid but cannot be mapped safely on this platform or sandbox. |
 
 Counters should aggregate by artifact type, subtype/tier, accepted/miss/rejected status, and rejection code. High-cardinality fields must be bucketed or omitted.
+
+When a cache payload is decodable but cannot be accepted, restore must compare
+the canonical record in section order and emit the telemetry code for the first
+mismatched field. Corruption, duplicate fields, duplicate map keys, invalid enum
+tokens, bad lengths, or non-canonical encodings use `corrupt_payload` instead of
+a mismatch code.
+
+| Field | Telemetry code |
+|---|---|
+| `artifact_type` | `rejected_artifact_type` |
+| `artifact_scope` | `rejected_artifact_type` |
+| `artifact_subtype` | `rejected_artifact_type` |
+| `cache_producer` | `rejected_release_artifact` |
+| `cache_schema_version` | `rejected_schema_version` |
+| `stator_jse_crate_version` | `rejected_engine_version` |
+| `stator_jse_ffi_crate_version` | `rejected_engine_version` |
+| `stator_ffi_abi_version` | `rejected_engine_version` |
+| `bytecode_format_version` | `rejected_format_version` |
+| `module_cache_format_version` | `rejected_format_version` |
+| `script_cache_format_version` | `rejected_format_version` |
+| `baseline_code_format_version` | `rejected_format_version` |
+| `jit_code_format_version` | `rejected_format_version` |
+| `snapshot_format_version` | `rejected_format_version` |
+| `parser_ast_format_version` | `rejected_format_version` |
+| `compiler_ir_format_version` | `rejected_format_version` |
+| `c_header_generation_id` | `rejected_release_artifact` |
+| `source_hash_algorithm` | `rejected_source_identity` |
+| `source_hash` | `rejected_source_identity` |
+| `source_length_bytes` | `rejected_source_identity` |
+| `source_encoding` | `rejected_source_identity` |
+| `resource_url` | `rejected_source_identity` |
+| `source_url` | `rejected_source_identity` |
+| `source_origin` | `rejected_source_identity` |
+| `base_url` | `rejected_source_identity` |
+| `referrer_url` | `rejected_embedder_policy` |
+| `integrity_metadata` | `rejected_embedder_policy` |
+| `credentials_mode` | `rejected_embedder_policy` |
+| `referrer_policy` | `rejected_embedder_policy` |
+| `line_offset` | `rejected_source_identity` |
+| `column_offset` | `rejected_source_identity` |
+| `source_map_url` | `rejected_source_identity` |
+| `host_defined_options_hash` | `rejected_embedder_policy` |
+| `compile_options_hash` | `rejected_compiler_flags` |
+| `module_type` | `rejected_parser_flags` |
+| `module_request_count` | `rejected_source_identity` |
+| `module_requests_hash` | `rejected_source_identity` |
+| `import_attributes_hash` | `rejected_embedder_policy` |
+| `import_policy_hash` | `rejected_embedder_policy` |
+| `import_map_epoch` | `rejected_embedder_policy` |
+| `resolution_base_url` | `rejected_source_identity` |
+| `strict_mode_policy` | `rejected_parser_flags` |
+| `script_kind` | `rejected_parser_flags` |
+| `language_mode` | `rejected_parser_flags` |
+| `parse_goal` | `rejected_parser_flags` |
+| `enable_top_level_await` | `rejected_parser_flags` |
+| `enable_import_meta` | `rejected_parser_flags` |
+| `parser_feature_bits` | `rejected_parser_flags` |
+| `bytecode_feature_bits` | `rejected_compiler_flags` |
+| `compiler_feature_bits` | `rejected_compiler_flags` |
+| `jit_enabled` | `rejected_compiler_flags` |
+| `tiering_mode` | `rejected_compiler_flags` |
+| `optimization_level` | `rejected_compiler_flags` |
+| `debug_instrumentation` | `rejected_compiler_flags` |
+| `profiling_instrumentation` | `rejected_compiler_flags` |
+| `sandbox_mode` | `rejected_embedder_policy` |
+| `target_arch` | `rejected_platform` |
+| `target_os` | `rejected_platform` |
+| `target_env` | `rejected_platform` |
+| `target_pointer_width` | `rejected_platform` |
+| `endianness` | `rejected_platform` |
+| `cpu_vendor` | `rejected_platform` |
+| `cpu_family_model_stepping` | `rejected_platform` |
+| `cpu_feature_set` | `rejected_platform` |
+| `rustc_version` | `rejected_build_features` |
+| `llvm_version` | `rejected_build_features` |
+| `cargo_profile` | `rejected_build_features` |
+| `build_feature_set` | `rejected_build_features` |
+| `link_time_optimization` | `rejected_build_features` |
+| `panic_strategy` | `rejected_build_features` |
+| `edge_channel` | `rejected_release_artifact` |
+| `edge_build_id` | `rejected_release_artifact` |
+| `snapshot_digest` | `rejected_snapshot` |
+| `snapshot_build_id` | `rejected_snapshot` |
+| `snapshot_feature_set` | `rejected_snapshot` |
+| `snapshot_context_kind` | `rejected_snapshot` |
 
 ## Edge release and vendoring expectations
 
