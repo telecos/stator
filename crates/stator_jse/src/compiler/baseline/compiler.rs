@@ -12465,7 +12465,9 @@ impl CompiledCode {
         // `mem` is dropped here, releasing the executable region.
         drop(mem);
 
-        if jit_runtime::is_jit_deopt(result) {
+        if result == JIT_DEOPT_TERMINATED {
+            Err(crate::interpreter::script_terminated_error())
+        } else if jit_runtime::is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)
@@ -12602,7 +12604,9 @@ impl CachedExecutableCode {
 
         let result = (self.func)(regs.as_mut_ptr());
 
-        if jit_runtime::is_jit_deopt(result) {
+        if result == JIT_DEOPT_TERMINATED {
+            Err(crate::interpreter::script_terminated_error())
+        } else if jit_runtime::is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)
@@ -12638,6 +12642,10 @@ pub struct BaselineCompiler<'a> {
     labels: Vec<Label>,
     /// Label for the shared deopt epilogue.
     deopt_label: Label,
+    /// Label for embedder-requested termination.
+    terminated_label: Label,
+    /// Marks bytecode indices that are backward-branch targets.
+    loop_headers: Vec<bool>,
     /// Promoted global variables: `(name_idx, flat_slot_index)` pairs.
     ///
     /// During compilation, `LdaGlobal`/`StaGlobal` for these `name_idx` values
@@ -12716,6 +12724,8 @@ impl<'a> BaselineCompiler<'a> {
             deopt_entries: Vec::new(),
             labels: Vec::new(),
             deopt_label: Label::new(),
+            terminated_label: Label::new(),
+            loop_headers: Vec::new(),
             promoted_globals: Vec::new(),
             promoted_extra_slots: 0,
             #[cfg(any(
@@ -12965,6 +12975,49 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.mov_ri(Reg64::R12, JIT_DEOPT);
         self.emit_normal_epilogue();
     }
+
+    /// Emit the termination epilogue.
+    fn emit_terminated_epilogue(&mut self) {
+        self.masm.bind_label(&mut self.terminated_label);
+        self.masm.mov_ri(Reg64::R12, JIT_DEOPT_TERMINATED);
+        self.emit_normal_epilogue();
+    }
+
+    /// Emit a call to the shared interrupt polling thunk.
+    ///
+    /// The thunk returns non-zero when the embedder has requested termination.
+    /// In that case the generated code returns [`JIT_DEOPT_TERMINATED`], which
+    /// callers map to the canonical script-termination error.
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn emit_termination_poll(&mut self) {
+        let need_pad = self.cache_map.len() % 2 == 1;
+        if need_pad {
+            self.masm.push(Reg64::R11);
+        }
+
+        let addr = crate::interpreter::stator_jit_poll_terminated_addr() as i64;
+        self.masm.mov_ri(Reg64::R11, addr);
+        let adj = self.emit_helper_call_pre_adjust();
+        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
+
+        if need_pad {
+            self.masm.pop(Reg64::R11);
+        }
+
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm
+            .jcc(CondCode::NotEqual, &mut self.terminated_label);
+    }
+
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
+    fn emit_termination_poll(&mut self) {}
 
     // ── Register-file helpers ────────────────────────────────────────────────
 
@@ -13391,6 +13444,100 @@ impl<'a> BaselineCompiler<'a> {
             })
     }
 
+    /// Return every instruction index that can be reached by a backward jump.
+    fn find_loop_headers(
+        instructions: &[Instruction],
+        byte_offsets: &[usize],
+        instr_count: usize,
+    ) -> StatorResult<Vec<bool>> {
+        let mut headers = vec![false; instr_count];
+        for (idx, instr) in instructions.iter().enumerate() {
+            let delta = match instr.opcode {
+                Opcode::Jump
+                | Opcode::JumpLoop
+                | Opcode::JumpIfTrue
+                | Opcode::JumpIfFalse
+                | Opcode::JumpIfToBooleanTrue
+                | Opcode::JumpIfToBooleanFalse
+                | Opcode::JumpIfNull
+                | Opcode::JumpIfNotNull
+                | Opcode::JumpIfUndefined
+                | Opcode::JumpIfNotUndefined
+                | Opcode::JumpIfUndefinedOrNull => {
+                    let Operand::JumpOffset(delta) = *instr.operand(0) else {
+                        continue;
+                    };
+                    delta
+                }
+                _ => continue,
+            };
+            let target_byte = jump_target_byte(idx, delta, byte_offsets);
+            if target_byte <= byte_offsets[idx] {
+                let target = Self::resolve_target(target_byte, byte_offsets, instr_count)?;
+                headers[target] = true;
+            }
+        }
+        Ok(headers)
+    }
+
+    /// Return true when an opcode crosses a generated/runtime call boundary.
+    fn is_runtime_boundary_opcode(opcode: Opcode) -> bool {
+        matches!(
+            opcode,
+            Opcode::LdaGlobal
+                | Opcode::LdaGlobalStar
+                | Opcode::LdaTheHole
+                | Opcode::StaGlobal
+                | Opcode::LdaLookupSlot
+                | Opcode::LdaContextSlot
+                | Opcode::LdaImmutableContextSlot
+                | Opcode::LdaCurrentContextSlot
+                | Opcode::LdaImmutableCurrentContextSlot
+                | Opcode::StaContextSlot
+                | Opcode::StaCurrentContextSlot
+                | Opcode::LdaNamedProperty
+                | Opcode::LdaKeyedProperty
+                | Opcode::StaNamedProperty
+                | Opcode::StaKeyedProperty
+                | Opcode::StaInArrayLiteral
+                | Opcode::ToString
+                | Opcode::TypeOf
+                | Opcode::ShiftLeft
+                | Opcode::ShiftRight
+                | Opcode::ShiftRightLogical
+                | Opcode::TestTypeOf
+                | Opcode::TestInstanceOf
+                | Opcode::TestIn
+                | Opcode::ThrowReferenceErrorIfHole
+                | Opcode::ToNumber
+                | Opcode::ToNumeric
+                | Opcode::CreateClosure
+                | Opcode::CreateFunctionContext
+                | Opcode::PushContext
+                | Opcode::PopContext
+                | Opcode::Div
+                | Opcode::Mod
+                | Opcode::CallAnyReceiver
+                | Opcode::CallProperty
+                | Opcode::CallProperty0
+                | Opcode::CallProperty1
+                | Opcode::CallProperty2
+                | Opcode::CallUndefinedReceiver0
+                | Opcode::CallUndefinedReceiver1
+                | Opcode::CallUndefinedReceiver2
+                | Opcode::CallWithSpread
+                | Opcode::CallRuntime
+                | Opcode::CallRuntimeForPair
+                | Opcode::CallJSRuntime
+                | Opcode::InvokeIntrinsic
+                | Opcode::CallDirectEval
+                | Opcode::TailCall
+                | Opcode::Construct
+                | Opcode::ConstructWithSpread
+                | Opcode::ConstructForwardAllArgs
+        )
+    }
+
     /// Emit an unconditional JMP to the instruction at `target_idx`.
     fn emit_jump(&mut self, target_idx: usize) {
         self.masm.jmp(&mut self.labels[target_idx]);
@@ -13794,6 +13941,10 @@ impl<'a> BaselineCompiler<'a> {
                 .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
             self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT_TERMINATED);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            self.masm.je(&mut self.terminated_label);
+
             // Deopt check: RAX >= i32::MIN means valid result.
             self.masm.cmp_ri(Reg64::Rax, i32::MIN);
             self.masm.jcc(CondCode::GreaterEq, &mut done_label);
@@ -13877,6 +14028,10 @@ impl<'a> BaselineCompiler<'a> {
             let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
             self.masm.mov_ri(Reg64::R11, finish_addr as i64);
             self.masm.call_reg(Reg64::R11);
+
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT_TERMINATED);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            self.masm.je(&mut self.terminated_label);
 
             // Cache caller's BA for future cache hits.
             {
@@ -14434,6 +14589,7 @@ impl<'a> BaselineCompiler<'a> {
 
         // Pre-create one label per instruction.
         self.labels = (0..n).map(|_| Label::new()).collect();
+        self.loop_headers = Self::find_loop_headers(&instructions, &byte_offsets, n)?;
 
         // Analyse register usage in loop bodies and set up the cache map
         // before emitting the prologue (which pushes the cache registers).
@@ -14470,6 +14626,7 @@ impl<'a> BaselineCompiler<'a> {
         }
 
         self.emit_prologue();
+        self.emit_termination_poll();
 
         // Load all promoted globals into their register-file slots (once).
         self.emit_promoted_global_loads();
@@ -14482,6 +14639,9 @@ impl<'a> BaselineCompiler<'a> {
 
             // Bind the label for this instruction to the current code position.
             self.masm.bind_label(&mut self.labels[idx]);
+            if self.loop_headers.get(idx).copied().unwrap_or(false) {
+                self.emit_termination_poll();
+            }
 
             // Safepoint at every instruction.
             self.safepoints.push(SafepointEntry {
@@ -14490,6 +14650,11 @@ impl<'a> BaselineCompiler<'a> {
                 gc_map: 0,
             });
 
+            let is_runtime_boundary = Self::is_runtime_boundary_opcode(instr.opcode);
+            if is_runtime_boundary {
+                self.emit_termination_poll();
+            }
+
             let extra = self.compile_instruction(
                 idx,
                 &instructions,
@@ -14497,6 +14662,10 @@ impl<'a> BaselineCompiler<'a> {
                 instr,
                 byte_offsets[idx] as u32,
             )?;
+
+            if is_runtime_boundary {
+                self.emit_termination_poll();
+            }
 
             // Bind labels and record safepoints for any fused (skipped)
             // instructions so that jump targets into them still resolve.
@@ -14515,6 +14684,7 @@ impl<'a> BaselineCompiler<'a> {
 
         // Emit the deopt epilogue after the normal instruction stream.
         self.emit_deopt_epilogue();
+        self.emit_terminated_epilogue();
 
         Ok(())
     }
@@ -16125,6 +16295,95 @@ mod tests {
     fn jit_run(ba: &BytecodeArray, args: &[i64]) -> i64 {
         let cc = BaselineCompiler::compile(ba).expect("compile failed");
         unsafe { cc.execute(args).expect("jit execute failed") }
+    }
+
+    fn with_backedge_delta(
+        mut instrs: Vec<Instruction>,
+        jump_idx: usize,
+        target_idx: usize,
+    ) -> Vec<Instruction> {
+        let bytes = encode(&instrs);
+        let (_, byte_offsets) = decode_with_byte_offsets(&bytes).expect("decode failed");
+        let delta = byte_offsets[target_idx] as i32 - byte_offsets[jump_idx + 1] as i32;
+        *instrs[jump_idx].operand_mut(0) = Operand::JumpOffset(delta);
+        instrs
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_baseline_loop_header_poll_terminates_jit_execution() {
+        use crate::interpreter::{
+            SCRIPT_TERMINATED_MESSAGE, clear_test_jit_poll_terminated_countdown,
+            set_test_jit_poll_terminated_countdown,
+        };
+
+        let instrs = with_backedge_delta(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::JumpLoop,
+                    vec![
+                        Operand::JumpOffset(0),
+                        Operand::Immediate(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+            ],
+            1,
+            0,
+        );
+        let ba = bytecode(instrs);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+
+        set_test_jit_poll_terminated_countdown(1);
+        // SAFETY: code was emitted by the baseline compiler from valid bytecode.
+        let result = unsafe { cc.execute(&[]) };
+        clear_test_jit_poll_terminated_countdown();
+
+        assert!(
+            matches!(result, Err(StatorError::Internal(ref msg)) if msg == SCRIPT_TERMINATED_MESSAGE),
+            "baseline JIT loop poll must map to canonical termination error; got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_baseline_loop_compilation_embeds_entry_and_loop_polls() {
+        let instrs = with_backedge_delta(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::JumpLoop,
+                    vec![
+                        Operand::JumpOffset(0),
+                        Operand::Immediate(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+            ],
+            1,
+            0,
+        );
+        let ba = bytecode(instrs);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+        let addr = crate::interpreter::stator_jit_poll_terminated_addr() as u64;
+        let addr_bytes = addr.to_le_bytes();
+        let poll_sites = cc
+            .code
+            .windows(addr_bytes.len())
+            .filter(|window| *window == addr_bytes)
+            .count();
+
+        assert!(
+            poll_sites >= 2,
+            "baseline JIT should poll at entry and loop header; found {poll_sites} sites"
+        );
     }
 
     #[test]

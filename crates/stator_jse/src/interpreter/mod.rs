@@ -1302,7 +1302,42 @@ pub fn script_terminated_error() -> StatorError {
 /// flag through [`set_interrupt_flag`].
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_jit_poll_terminated() -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(result) = test_jit_poll_terminated_override() {
+            return result;
+        }
+    }
     if check_interrupt_flag() { 1 } else { 0 }
+}
+
+#[cfg(test)]
+static TEST_JIT_POLL_COUNTDOWN: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(test)]
+fn test_jit_poll_terminated_override() -> Option<u32> {
+    use std::sync::atomic::Ordering;
+
+    let prev = TEST_JIT_POLL_COUNTDOWN.load(Ordering::SeqCst);
+    if prev < 0 {
+        return None;
+    }
+    TEST_JIT_POLL_COUNTDOWN.fetch_sub(1, Ordering::SeqCst);
+    Some(u32::from(prev == 0))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_jit_poll_terminated_countdown(polls_before_termination: i32) {
+    TEST_JIT_POLL_COUNTDOWN.store(
+        polls_before_termination,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_jit_poll_terminated_countdown() {
+    TEST_JIT_POLL_COUNTDOWN.store(-1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Address of the [`stator_jit_poll_terminated`] thunk as a raw integer,
