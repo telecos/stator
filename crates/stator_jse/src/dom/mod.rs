@@ -345,6 +345,57 @@ impl IndexedPropertyHandlerConfigBuilder {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Access-check (security) callback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Operation being attempted on a DOM wrapper, passed to an
+/// [`AccessCheckCallback`] so the embedder can apply a policy decision
+/// (e.g. cross-origin allow/deny) before the engine consults the
+/// interceptor or the wrapper's own properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessCheckOperation {
+    /// Named-property read (e.g. `element.id`).
+    NamedGet,
+    /// Named-property write (e.g. `element.id = "x"`).
+    NamedSet,
+    /// Named-property `in`/has query (e.g. `"id" in element`).
+    NamedQuery,
+    /// Named-property `delete` (e.g. `delete element.id`).
+    NamedDelete,
+    /// Named-property enumeration (e.g. `for-in`, `Object.keys`).
+    NamedEnumerate,
+    /// Indexed-property read (e.g. `nodeList[0]`).
+    IndexedGet,
+    /// Indexed-property write (e.g. `nodeList[0] = x`).
+    IndexedSet,
+    /// Indexed-property query.
+    IndexedQuery,
+    /// Indexed-collection length query.
+    IndexedLength,
+}
+
+/// Key associated with an [`AccessCheckOperation`].
+#[derive(Debug, Clone, Copy)]
+pub enum AccessCheckKey<'a> {
+    /// No specific key — used for [`AccessCheckOperation::NamedEnumerate`]
+    /// and [`AccessCheckOperation::IndexedLength`].
+    None,
+    /// A named property key.
+    Named(&'a str),
+    /// An indexed property key.
+    Indexed(u32),
+}
+
+/// Embedder callback that decides whether a DOM wrapper property
+/// operation should be allowed.
+///
+/// The third argument is the embedder data pointer captured when the
+/// access check was installed.  The callback **must** return `true` to
+/// allow the operation, and `false` to deny it (fail closed).
+pub type AccessCheckCallback =
+    Box<dyn Fn(AccessCheckOperation, AccessCheckKey<'_>, *mut c_void) -> bool>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DomObjectWrap
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,6 +445,13 @@ pub struct DomObjectWrap {
     named_handler: Option<NamedPropertyHandlerConfig>,
     /// Optional indexed-property interceptor configuration.
     indexed_handler: Option<IndexedPropertyHandlerConfig>,
+    /// Optional access-check (security) callback.  When installed, every
+    /// property operation on this wrapper consults the callback *before*
+    /// the interceptor or own-property paths; a `false` return short-
+    /// circuits the operation in a fail-closed manner (reads observe
+    /// `undefined`, writes/deletes/queries report failure, enumeration
+    /// yields the empty list).
+    access_check: Option<AccessCheckCallback>,
 }
 
 // SAFETY: `DomObjectWrap` holds raw `*mut c_void` pointers in
@@ -419,6 +477,7 @@ impl DomObjectWrap {
             internal_fields: vec![std::ptr::null_mut(); field_count],
             named_handler: None,
             indexed_handler: None,
+            access_check: None,
         }
     }
 
@@ -463,13 +522,30 @@ impl DomObjectWrap {
             .unwrap_or(std::ptr::null_mut())
     }
 
-    /// Read a named property, consulting the interceptor first.
+    /// Run the installed access-check callback for `op`/`key`.  Returns
+    /// `true` when access is allowed (the default when no callback is
+    /// installed) and `false` when the embedder denies the operation.
+    pub fn check_access(&self, op: AccessCheckOperation, key: AccessCheckKey<'_>) -> bool {
+        match &self.access_check {
+            Some(cb) => cb(op, key, self.data_ptr()),
+            None => true,
+        }
+    }
+
+    /// Read a named property, consulting the access-check callback first,
+    /// then the interceptor, then own properties.
     ///
     /// Resolution order:
-    /// 1. Named-property interceptor getter (if installed).
-    /// 2. Own properties on this wrapper.
-    /// 3. `JsValue::Undefined`.
+    /// 1. Access-check callback (if installed).  A denial returns
+    ///    `JsValue::Undefined` without consulting either the interceptor
+    ///    or own properties.
+    /// 2. Named-property interceptor getter (if installed).
+    /// 3. Own properties on this wrapper.
+    /// 4. `JsValue::Undefined`.
     pub fn get_property(&self, key: &str) -> JsValue {
+        if !self.check_access(AccessCheckOperation::NamedGet, AccessCheckKey::Named(key)) {
+            return JsValue::Undefined;
+        }
         // 1. Interceptor
         if let Some(cfg) = &self.named_handler
             && let Some(getter) = cfg.getter()
@@ -485,11 +561,17 @@ impl DomObjectWrap {
             .unwrap_or(JsValue::Undefined)
     }
 
-    /// Write a named property, consulting the interceptor first.
+    /// Write a named property, consulting the access-check callback first,
+    /// then the interceptor.
     ///
-    /// If the interceptor handles the write (returns `true`), the value is
-    /// *not* stored in the own-property map.
+    /// If the access check denies the write, the value is *silently
+    /// discarded* (fail-closed); the wrapper's own-property map is not
+    /// mutated.  Otherwise, if the interceptor handles the write it short-
+    /// circuits the own-property store as before.
     pub fn set_property(&mut self, key: &str, value: JsValue) {
+        if !self.check_access(AccessCheckOperation::NamedSet, AccessCheckKey::Named(key)) {
+            return;
+        }
         if let Some(cfg) = &self.named_handler
             && let Some(setter) = cfg.setter()
             && setter(key, &value, self.data_ptr())
@@ -501,10 +583,17 @@ impl DomObjectWrap {
 
     /// Attempt to write a named property through the interceptor only.
     ///
-    /// Returns `true` when an installed setter handled the write.  Unlike
-    /// [`set_property`][Self::set_property], this helper never falls through to
-    /// the own-property map when the interceptor declines the write.
+    /// Returns `true` when an installed setter handled the write or when
+    /// the access check denied the write (the write is silently dropped
+    /// and the engine treats the operation as handled so it does not fall
+    /// through to a generic store).  Returns `false` when no setter is
+    /// installed and access was allowed.
     pub fn set_intercepted_property(&self, key: &str, value: JsValue) -> bool {
+        if !self.check_access(AccessCheckOperation::NamedSet, AccessCheckKey::Named(key)) {
+            // Access denied: treat as handled so the caller does not fall
+            // through to an own-property store.
+            return true;
+        }
         if let Some(cfg) = &self.named_handler
             && let Some(setter) = cfg.setter()
         {
@@ -513,8 +602,12 @@ impl DomObjectWrap {
         false
     }
 
-    /// Query whether a named property exists, consulting the interceptor.
+    /// Query whether a named property exists, consulting the access-check
+    /// callback first.  A denial reports the property as absent.
     pub fn has_property(&self, key: &str) -> bool {
+        if !self.check_access(AccessCheckOperation::NamedQuery, AccessCheckKey::Named(key)) {
+            return false;
+        }
         if let Some(cfg) = &self.named_handler
             && let Some(query) = cfg.query()
             && query(key, self.data_ptr()).is_some()
@@ -524,8 +617,15 @@ impl DomObjectWrap {
         self.properties.borrow().contains_key(key)
     }
 
-    /// Delete a named property, consulting the interceptor first.
+    /// Delete a named property, consulting the access-check callback
+    /// first.  A denial returns `false` and leaves the property in place.
     pub fn delete_property(&mut self, key: &str) -> bool {
+        if !self.check_access(
+            AccessCheckOperation::NamedDelete,
+            AccessCheckKey::Named(key),
+        ) {
+            return false;
+        }
         if let Some(cfg) = &self.named_handler
             && let Some(deleter) = cfg.deleter()
             && deleter(key, self.data_ptr())
@@ -535,9 +635,13 @@ impl DomObjectWrap {
         self.properties.borrow_mut().remove(key).is_some()
     }
 
-    /// Enumerate own property names, including those reported by the
-    /// interceptor.
+    /// Enumerate own property names, consulting the access-check callback
+    /// first.  A denial returns an empty list — neither interceptor names
+    /// nor own-property names are reported.
     pub fn property_names(&self) -> Vec<String> {
+        if !self.check_access(AccessCheckOperation::NamedEnumerate, AccessCheckKey::None) {
+            return Vec::new();
+        }
         let mut names: Vec<String> = Vec::new();
         // Interceptor-reported names come first.
         if let Some(cfg) = &self.named_handler
@@ -561,9 +665,16 @@ impl DomObjectWrap {
 
     /// Read an indexed property via the interceptor.
     ///
-    /// Returns `JsValue::Undefined` if no indexed-property interceptor is
-    /// installed or the interceptor does not handle this index.
+    /// Returns `JsValue::Undefined` if the access-check callback denies
+    /// the read, if no indexed-property interceptor is installed, or if
+    /// the interceptor does not handle this index.
     pub fn get_indexed(&self, index: u32) -> JsValue {
+        if !self.check_access(
+            AccessCheckOperation::IndexedGet,
+            AccessCheckKey::Indexed(index),
+        ) {
+            return JsValue::Undefined;
+        }
         if let Some(cfg) = &self.indexed_handler
             && let Some(getter) = cfg.getter()
             && let Some(val) = getter(index, self.data_ptr())
@@ -575,8 +686,17 @@ impl DomObjectWrap {
 
     /// Write an indexed property via the interceptor.
     ///
-    /// Returns `true` if the interceptor handled the write.
+    /// Returns `true` when the interceptor handled the write *or* when the
+    /// access check denied it (the write is silently discarded and the
+    /// engine treats the operation as handled).  Returns `false` when no
+    /// setter is installed and access was allowed.
     pub fn set_indexed(&mut self, index: u32, value: &JsValue) -> bool {
+        if !self.check_access(
+            AccessCheckOperation::IndexedSet,
+            AccessCheckKey::Indexed(index),
+        ) {
+            return true;
+        }
         if let Some(cfg) = &self.indexed_handler
             && let Some(setter) = cfg.setter()
         {
@@ -587,8 +707,12 @@ impl DomObjectWrap {
 
     /// Query the length of the indexed collection via the interceptor.
     ///
-    /// Returns `0` if no length callback is installed.
+    /// Returns `0` when the access-check callback denies the query or
+    /// when no length callback is installed.
     pub fn indexed_length(&self) -> u32 {
+        if !self.check_access(AccessCheckOperation::IndexedLength, AccessCheckKey::None) {
+            return 0;
+        }
         if let Some(cfg) = &self.indexed_handler
             && let Some(length_cb) = cfg.length()
         {
@@ -619,6 +743,30 @@ impl DomObjectWrap {
         self.indexed_handler.is_some()
     }
 
+    // ── access-check installation ────────────────────────────────────────
+
+    /// Install a fail-closed access-check callback.
+    ///
+    /// The callback is invoked before every property operation on this
+    /// wrapper (named and indexed get/set/query/delete, enumeration, and
+    /// indexed length).  Returning `true` allows the operation to
+    /// proceed; returning `false` denies it.  Replaces any previously
+    /// installed access-check callback.
+    pub fn set_access_check(&mut self, callback: AccessCheckCallback) {
+        self.access_check = Some(callback);
+    }
+
+    /// Remove any installed access-check callback.  Returns `true` if a
+    /// callback was previously installed.
+    pub fn clear_access_check(&mut self) -> bool {
+        self.access_check.take().is_some()
+    }
+
+    /// Return `true` if an access-check callback is installed.
+    pub fn has_access_check(&self) -> bool {
+        self.access_check.is_some()
+    }
+
     // ── conversion ───────────────────────────────────────────────────────
 
     /// Return a [`JsValue::PlainObject`] view of the wrapper's own properties.
@@ -639,6 +787,7 @@ impl std::fmt::Debug for DomObjectWrap {
             .field("property_count", &self.properties.borrow().len())
             .field("has_named_handler", &self.named_handler.is_some())
             .field("has_indexed_handler", &self.indexed_handler.is_some())
+            .field("has_access_check", &self.access_check.is_some())
             .finish()
     }
 }
@@ -968,6 +1117,161 @@ mod tests {
         let wrap = DomObjectWrap::new(0);
         assert_eq!(wrap.get_indexed(0), JsValue::Undefined);
         assert_eq!(wrap.indexed_length(), 0);
+    }
+
+    // ── DomObjectWrap — access-check callback ────────────────────────────
+
+    #[test]
+    fn test_wrap_access_check_default_allows_all() {
+        let wrap = DomObjectWrap::new(0);
+        assert!(!wrap.has_access_check());
+        assert!(wrap.check_access(AccessCheckOperation::NamedGet, AccessCheckKey::Named("x")));
+        assert!(wrap.check_access(AccessCheckOperation::IndexedGet, AccessCheckKey::Indexed(0)));
+        assert!(wrap.check_access(AccessCheckOperation::NamedEnumerate, AccessCheckKey::None));
+    }
+
+    #[test]
+    fn test_wrap_access_check_allow_lets_interceptor_run() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|name, _data| {
+                    if name == "id" {
+                        Some(JsValue::String("ok".into()))
+                    } else {
+                        None
+                    }
+                })
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| true));
+        assert!(wrap.has_access_check());
+        assert_eq!(wrap.get_property("id"), JsValue::String("ok".into()));
+    }
+
+    #[test]
+    fn test_wrap_access_check_deny_named_get_fails_closed() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(42));
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|_name, _data| Some(JsValue::String("intercepted".into())))
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, _key, _data| {
+            !matches!(op, AccessCheckOperation::NamedGet)
+        }));
+        // Denied: neither interceptor nor own-property is observed.
+        assert_eq!(wrap.get_property("x"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_wrap_access_check_deny_named_set_discards_write() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_access_check(Box::new(|op, _key, _data| {
+            !matches!(op, AccessCheckOperation::NamedSet)
+        }));
+        wrap.set_property("x", JsValue::Smi(99));
+        // The write was silently discarded.
+        assert_eq!(wrap.get_property("x"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_wrap_access_check_deny_query_and_delete() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(1));
+        wrap.set_access_check(Box::new(|op, _key, _data| {
+            !matches!(
+                op,
+                AccessCheckOperation::NamedQuery | AccessCheckOperation::NamedDelete
+            )
+        }));
+        assert!(!wrap.has_property("x"));
+        assert!(!wrap.delete_property("x"));
+    }
+
+    #[test]
+    fn test_wrap_access_check_deny_enumerate_returns_empty() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("a", JsValue::Smi(1));
+        wrap.set_property("b", JsValue::Smi(2));
+        wrap.set_access_check(Box::new(|op, _key, _data| {
+            !matches!(op, AccessCheckOperation::NamedEnumerate)
+        }));
+        assert!(wrap.property_names().is_empty());
+    }
+
+    #[test]
+    fn test_wrap_access_check_deny_indexed_operations() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .getter(|_idx, _data| Some(JsValue::Smi(7)))
+                .setter(|_idx, _val, _data| true)
+                .length(|_data| 3)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, _key, _data| {
+            !matches!(
+                op,
+                AccessCheckOperation::IndexedGet
+                    | AccessCheckOperation::IndexedSet
+                    | AccessCheckOperation::IndexedLength
+            )
+        }));
+        assert_eq!(wrap.get_indexed(0), JsValue::Undefined);
+        assert!(wrap.set_indexed(0, &JsValue::Smi(1))); // handled (silently dropped)
+        assert_eq!(wrap.indexed_length(), 0);
+    }
+
+    #[test]
+    fn test_wrap_access_check_receives_key_and_embedder_data() {
+        let observed: Rc<RefCell<Vec<(AccessCheckOperation, String, usize)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&observed);
+
+        let sentinel: usize = 0xBADC_0FFE;
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_internal_field(0, sentinel as *mut c_void);
+        wrap.set_access_check(Box::new(move |op, key, data| {
+            let key_str = match key {
+                AccessCheckKey::Named(name) => name.to_string(),
+                AccessCheckKey::Indexed(i) => format!("[{i}]"),
+                AccessCheckKey::None => String::new(),
+            };
+            log.borrow_mut().push((op, key_str, data as usize));
+            true
+        }));
+
+        let _ = wrap.get_property("foo");
+        let _ = wrap.get_indexed(7);
+        let _ = wrap.property_names();
+
+        let entries = observed.borrow();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, AccessCheckOperation::NamedGet);
+        assert_eq!(entries[0].1, "foo");
+        assert_eq!(entries[0].2, sentinel);
+        assert_eq!(entries[1].0, AccessCheckOperation::IndexedGet);
+        assert_eq!(entries[1].1, "[7]");
+        assert_eq!(entries[1].2, sentinel);
+        assert_eq!(entries[2].0, AccessCheckOperation::NamedEnumerate);
+        assert_eq!(entries[2].1, "");
+    }
+
+    #[test]
+    fn test_wrap_clear_access_check_restores_default_allow() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(5));
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        assert!(wrap.has_access_check());
+        assert_eq!(wrap.get_property("x"), JsValue::Undefined);
+
+        assert!(wrap.clear_access_check());
+        assert!(!wrap.has_access_check());
+        assert_eq!(wrap.get_property("x"), JsValue::Smi(5));
+        // clear is idempotent
+        assert!(!wrap.clear_access_check());
     }
 
     // ── DomObjectWrap — as_js_value ──────────────────────────────────────

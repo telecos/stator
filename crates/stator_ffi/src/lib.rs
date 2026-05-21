@@ -30,7 +30,10 @@ use stator_jse::compiler::baseline::compiler::{
     first_deopt_counts, reset_first_deopt_counts, reset_stub_deopt_counts, stub_call_counts,
     stub_deopt_counts,
 };
-use stator_jse::dom::{DomObjectWrap, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig};
+use stator_jse::dom::{
+    AccessCheckKey, AccessCheckOperation, DomObjectWrap, IndexedPropertyHandlerConfig,
+    NamedPropertyHandlerConfig,
+};
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostImportMeta, HostModuleLoader};
 use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
@@ -72,7 +75,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 5;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 6;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -14891,6 +14894,263 @@ pub unsafe extern "C" fn stator_dom_object_wrap_traced_edge_count(
     }
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { (*wrap).outgoing_traced_edges.len() }
+}
+
+// ── DOM wrapper access-check (security) callback ────────────────────────────
+//
+// The access-check surface lets embedders gate every property access on a
+// DOM wrapper with a fail-closed policy decision (e.g. cross-origin
+// allow/deny).  When installed, the callback is invoked **before** any
+// interceptor or own-property dispatch.  Returning `true` allows the
+// operation to proceed normally; returning `false` denies it, in which
+// case getters observe `undefined`, setters and deletes silently drop,
+// queries report the property as absent, and enumeration yields the empty
+// list.
+//
+// The callback receives:
+// * the operation kind (named or indexed get/set/query/delete, named
+//   enumerate, or indexed length),
+// * the key context (a UTF-8 byte range for named ops, a `u32` for
+//   indexed ops, or none for enumerate/length),
+// * the wrapper's embedder-assigned `class_id` and `native_ptr` (both
+//   read from the wrapper at invocation time, so they reflect the
+//   current values even if they were re-assigned after install),
+// * the opaque embedder `data` pointer supplied at install time.
+//
+// ### Invalidate-vs-destroy semantics
+//
+// The hook itself stores no liveness state of its own.  It captures the
+// wrapper's existing `alive` flag (the same flag flipped by
+// [`stator_dom_object_wrap_invalidate`]) and short-circuits to a *deny*
+// decision once the wrapper is invalidated or destroyed.  This preserves
+// the existing fail-closed contract for stale JS aliases described in
+// `docs/handles.md` §7.1.
+//
+// ### Current limitations
+//
+// * Access checks are installed per wrapper instance, not per template.
+//   Stator does not yet expose `ObjectTemplate`-style cross-wrapper
+//   policy registration; embedders therefore mirror the policy on every
+//   wrapper they create.
+// * The callback is informational with respect to *throwing*: a deny
+//   decision short-circuits the operation but does not raise a JS-visible
+//   exception.  Embedders that want to throw on denied access should
+//   record a pending exception themselves before returning `false`; the
+//   FFI accessor thunks already drain pending DOM-interceptor exceptions
+//   on the next script step.
+
+/// Operation being attempted on a DOM wrapper when its installed
+/// access-check callback is invoked.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorDomAccessCheckOperation {
+    /// Named-property read (e.g. `element.id`).
+    StatorDomAccessCheckOperationNamedGet = 0,
+    /// Named-property write (e.g. `element.id = "x"`).
+    StatorDomAccessCheckOperationNamedSet = 1,
+    /// Named-property `in`/has query (e.g. `"id" in element`).
+    StatorDomAccessCheckOperationNamedQuery = 2,
+    /// Named-property `delete` (e.g. `delete element.id`).
+    StatorDomAccessCheckOperationNamedDelete = 3,
+    /// Named-property enumeration (e.g. `Object.keys(element)`).
+    StatorDomAccessCheckOperationNamedEnumerate = 4,
+    /// Indexed-property read (e.g. `nodeList[0]`).
+    StatorDomAccessCheckOperationIndexedGet = 5,
+    /// Indexed-property write (e.g. `nodeList[0] = x`).
+    StatorDomAccessCheckOperationIndexedSet = 6,
+    /// Indexed-property query.
+    StatorDomAccessCheckOperationIndexedQuery = 7,
+    /// Indexed-collection length query.
+    StatorDomAccessCheckOperationIndexedLength = 8,
+}
+
+/// C-callable access-check (security) callback for a DOM wrapper.
+///
+/// The callback **must** return `true` to allow the operation and `false`
+/// to deny it (fail closed).  The engine never dereferences `native_ptr`
+/// or `data`; both are forwarded verbatim from the wrapper.
+///
+/// * `op` — the operation kind being attempted.
+/// * `name_utf8` / `name_len` — UTF-8 byte range of the property name for
+///   named operations, or `(null, 0)` for indexed and no-key operations.
+///   The pointer is borrowed for the duration of the callback only.
+/// * `index` — the property index for indexed operations, `0` otherwise.
+/// * `native_ptr` — the wrapper's embedder-assigned native-object
+///   identity pointer, as previously set via
+///   [`stator_dom_object_wrap_set_native_ptr`].
+/// * `class_id` — the wrapper's embedder-assigned class identifier.
+/// * `data` — the opaque pointer supplied to
+///   [`stator_dom_object_wrap_set_access_check`] at install time.
+///
+/// # Safety
+/// The pointer arguments are only valid for the duration of the call.
+/// `name_utf8` is not null-terminated; embedders must copy it if they
+/// need to retain the name.
+pub type StatorDomAccessCheckCb = unsafe extern "C" fn(
+    op: StatorDomAccessCheckOperation,
+    name_utf8: *const c_char,
+    name_len: usize,
+    index: u32,
+    native_ptr: *mut c_void,
+    class_id: u32,
+    data: *mut c_void,
+) -> bool;
+
+fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
+    match op {
+        AccessCheckOperation::NamedGet => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedGet
+        }
+        AccessCheckOperation::NamedSet => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedSet
+        }
+        AccessCheckOperation::NamedQuery => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedQuery
+        }
+        AccessCheckOperation::NamedDelete => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedDelete
+        }
+        AccessCheckOperation::NamedEnumerate => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedEnumerate
+        }
+        AccessCheckOperation::IndexedGet => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedGet
+        }
+        AccessCheckOperation::IndexedSet => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedSet
+        }
+        AccessCheckOperation::IndexedQuery => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedQuery
+        }
+        AccessCheckOperation::IndexedLength => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedLength
+        }
+    }
+}
+
+/// Install a fail-closed access-check callback on `wrap`.
+///
+/// The callback is consulted before every named- or indexed-property
+/// operation on the wrapper, including operations that route through the
+/// installed [`StatorDomNamedHandler`] / [`StatorDomIndexedHandler`].  A
+/// `true` return allows the operation to proceed; a `false` return denies
+/// it (reads observe `undefined`, writes/deletes silently drop, queries
+/// report absent, enumeration yields the empty list).
+///
+/// The hook also short-circuits to a deny decision once the wrapper has
+/// been invalidated (see [`stator_dom_object_wrap_invalidate`]) or
+/// destroyed, so stale JS aliases never observe a callback dispatch.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the callback was installed.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `cb` is
+///   null.
+///
+/// # Safety
+/// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+/// - `cb` must remain valid for the lifetime of the wrapper or until
+///   replaced/cleared.
+/// - `data` is treated as opaque by the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_set_access_check(
+    wrap: *mut StatorDomObjectWrap,
+    cb: Option<
+        unsafe extern "C" fn(
+            op: StatorDomAccessCheckOperation,
+            name_utf8: *const c_char,
+            name_len: usize,
+            index: u32,
+            native_ptr: *mut c_void,
+            class_id: u32,
+            data: *mut c_void,
+        ) -> bool,
+    >,
+    data: *mut c_void,
+) -> StatorStatus {
+    if wrap.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let Some(cb) = cb else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+
+    let wrap_addr = wrap as usize;
+    // SAFETY: caller guarantees `wrap` is valid for this call.  We capture
+    // its liveness flag so a later invalidate/destroy short-circuits the
+    // callback before it ever runs.
+    let alive = unsafe { Rc::clone(&(*wrap).alive) };
+    let user_data_addr = data as usize;
+
+    let callback: stator_jse::dom::AccessCheckCallback = Box::new(move |op, key, _data_field0| {
+        if !alive.get() {
+            // Wrapper has been invalidated or destroyed; fail closed.
+            return false;
+        }
+        let wrap = wrap_addr as *mut StatorDomObjectWrap;
+        if wrap.is_null() {
+            return false;
+        }
+        // SAFETY: the `alive` check above guarantees the wrap pointer is
+        // still allocated and uniquely owned by the engine on this thread.
+        let (native_ptr, class_id) = unsafe { ((*wrap).native_ptr, (*wrap).class_id) };
+        let (name_ptr, name_len, index) = match key {
+            AccessCheckKey::Named(name) => (name.as_ptr() as *const c_char, name.len(), 0u32),
+            AccessCheckKey::Indexed(i) => (std::ptr::null::<c_char>(), 0usize, i),
+            AccessCheckKey::None => (std::ptr::null::<c_char>(), 0usize, 0u32),
+        };
+        let data = user_data_addr as *mut c_void;
+        // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+        unsafe {
+            cb(
+                access_op_to_ffi(op),
+                name_ptr,
+                name_len,
+                index,
+                native_ptr,
+                class_id,
+                data,
+            )
+        }
+    });
+
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_access_check(callback) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Remove any access-check callback previously installed on `wrap`.
+///
+/// Returns `true` when a callback was previously installed (and has now
+/// been removed), `false` otherwise.  Passing a null `wrap` returns
+/// `false`.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_clear_access_check(
+    wrap: *mut StatorDomObjectWrap,
+) -> bool {
+    if wrap.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.clear_access_check() }
+}
+
+/// Return `true` when `wrap` has an installed access-check callback.
+/// Passing a null `wrap` returns `false`.
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_has_access_check(
+    wrap: *const StatorDomObjectWrap,
+) -> bool {
+    if wrap.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.has_access_check() }
 }
 
 // ── V2 callback signatures (explicit-length keys + StatorStatus) ──────────
@@ -31474,6 +31734,396 @@ mod tests {
             JsValue::Undefined
         ));
         assert_eq!(unsafe { (*wrap).inner.indexed_length() }, 3);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    // ── DOM wrapper access-check (security) callback ───────────────────────
+
+    /// Recorded access-check invocation for assertions.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedAccessCheck {
+        op: StatorDomAccessCheckOperation,
+        name: Option<String>,
+        index: u32,
+        native_ptr: usize,
+        class_id: u32,
+        data: usize,
+    }
+
+    thread_local! {
+        static ACCESS_CHECK_LOG: RefCell<Vec<RecordedAccessCheck>> = const {
+            RefCell::new(Vec::new())
+        };
+        static ACCESS_CHECK_DECISION: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(true)
+        };
+    }
+
+    unsafe extern "C" fn access_check_recording(
+        op: StatorDomAccessCheckOperation,
+        name_utf8: *const c_char,
+        name_len: usize,
+        index: u32,
+        native_ptr: *mut c_void,
+        class_id: u32,
+        data: *mut c_void,
+    ) -> bool {
+        let name = if name_utf8.is_null() {
+            None
+        } else {
+            // SAFETY: the caller guarantees `(name_utf8, name_len)` is a
+            // valid UTF-8 byte range borrowed for this call.
+            let slice = unsafe { std::slice::from_raw_parts(name_utf8 as *const u8, name_len) };
+            Some(std::str::from_utf8(slice).unwrap().to_string())
+        };
+        ACCESS_CHECK_LOG.with(|log| {
+            log.borrow_mut().push(RecordedAccessCheck {
+                op,
+                name,
+                index,
+                native_ptr: native_ptr as usize,
+                class_id,
+                data: data as usize,
+            })
+        });
+        ACCESS_CHECK_DECISION.with(|c| c.get())
+    }
+
+    unsafe extern "C" fn access_check_always_allow(
+        _op: StatorDomAccessCheckOperation,
+        _name_utf8: *const c_char,
+        _name_len: usize,
+        _index: u32,
+        _native_ptr: *mut c_void,
+        _class_id: u32,
+        _data: *mut c_void,
+    ) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn access_check_always_deny(
+        _op: StatorDomAccessCheckOperation,
+        _name_utf8: *const c_char,
+        _name_len: usize,
+        _index: u32,
+        _native_ptr: *mut c_void,
+        _class_id: u32,
+        _data: *mut c_void,
+    ) -> bool {
+        false
+    }
+
+    fn reset_access_check_state() {
+        ACCESS_CHECK_LOG.with(|log| log.borrow_mut().clear());
+        ACCESS_CHECK_DECISION.with(|c| c.set(true));
+    }
+
+    #[test]
+    fn test_dom_access_check_rejects_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        // Null wrap: invalid.
+        let status = unsafe {
+            stator_dom_object_wrap_set_access_check(
+                std::ptr::null_mut(),
+                Some(access_check_always_allow),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+
+        // Null callback: invalid.
+        let status =
+            unsafe { stator_dom_object_wrap_set_access_check(wrap, None, std::ptr::null_mut()) };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+
+        // has/clear on null wrap is null-safe.
+        assert!(!unsafe { stator_dom_object_wrap_has_access_check(std::ptr::null()) });
+        assert!(!unsafe { stator_dom_object_wrap_clear_access_check(std::ptr::null_mut()) });
+
+        // No callback installed by the failed calls.
+        assert!(!unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_access_check_install_query_clear_roundtrip() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert!(!unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+
+        let status = unsafe {
+            stator_dom_object_wrap_set_access_check(
+                wrap,
+                Some(access_check_always_allow),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert!(unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+
+        assert!(unsafe { stator_dom_object_wrap_clear_access_check(wrap) });
+        assert!(!unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+        // Clear is idempotent.
+        assert!(!unsafe { stator_dom_object_wrap_clear_access_check(wrap) });
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_access_check_allow_lets_property_access_succeed() {
+        use stator_jse::objects::value::JsValue;
+
+        reset_access_check_state();
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let sentinel: usize = 0x1234_5678;
+        let data_sentinel: usize = 0xAA00_BB11;
+        unsafe {
+            stator_dom_object_wrap_set_class_id(wrap, 17);
+            stator_dom_object_wrap_set_native_ptr(wrap, sentinel as *mut c_void);
+        }
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(access_check_recording),
+                    data_sentinel as *mut c_void,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Allowed access: the interceptor still fires and returns 99.
+        match unsafe { (*wrap).inner.get_property("id") } {
+            JsValue::Smi(n) => assert_eq!(n, 99),
+            other => panic!("expected Smi(99), got {other:?}"),
+        }
+
+        let recorded = ACCESS_CHECK_LOG.with(|log| log.borrow().clone());
+        assert_eq!(recorded.len(), 1);
+        let entry = &recorded[0];
+        assert_eq!(
+            entry.op,
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedGet
+        );
+        assert_eq!(entry.name.as_deref(), Some("id"));
+        assert_eq!(entry.index, 0);
+        assert_eq!(entry.native_ptr, sentinel);
+        assert_eq!(entry.class_id, 17);
+        assert_eq!(entry.data, data_sentinel);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_access_check_deny_fails_closed_for_named_and_indexed() {
+        use stator_jse::objects::value::JsValue;
+
+        reset_access_check_state();
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        let named = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: Some(named_query_id),
+            deleter: Some(named_delete_id),
+            enumerator: Some(named_enumerate_ab),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &named) },
+            StatorStatus::StatorStatusOk
+        );
+        let indexed = StatorDomIndexedHandler {
+            getter: Some(indexed_get_zero),
+            setter: None,
+            query: None,
+            length: Some(indexed_length_three),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &indexed) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(access_check_always_deny),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Every gated operation must observe the fail-closed default.
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_property("id") },
+            JsValue::Undefined
+        ));
+        assert!(!unsafe { (*wrap).inner.has_property("id") });
+        // set_intercepted_property reports the write as handled-and-dropped
+        // so the engine does not fall back to a generic store.
+        assert!(unsafe {
+            (*wrap)
+                .inner
+                .set_intercepted_property("id", JsValue::Smi(1))
+        });
+        // delete must report "not deleted" so script sees TypeError-equivalent.
+        assert!(!unsafe { (*wrap).inner.delete_property("id") });
+        // Enumeration yields the empty list.
+        assert!(unsafe { (*wrap).inner.property_names().is_empty() });
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_indexed(0) },
+            JsValue::Undefined
+        ));
+        // set_indexed is treated as handled-and-dropped.
+        assert!(unsafe { (*wrap).inner.set_indexed(0, &JsValue::Smi(2)) });
+        assert_eq!(unsafe { (*wrap).inner.indexed_length() }, 0);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_access_check_missing_callback_uses_default_allow() {
+        use stator_jse::objects::value::JsValue;
+
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        // No access check installed: access is allowed (legacy behaviour).
+        assert!(!unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+        match unsafe { (*wrap).inner.get_property("id") } {
+            JsValue::Smi(n) => assert_eq!(n, 99),
+            other => panic!("expected Smi(99), got {other:?}"),
+        }
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_access_check_invalidated_wrapper_fails_closed() {
+        use stator_jse::objects::value::JsValue;
+
+        reset_access_check_state();
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(access_check_recording),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Invalidate the wrapper: subsequent access checks must fail closed
+        // *without* dispatching the embedder callback (the captured `alive`
+        // flag short-circuits before user code runs).
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_property("id") },
+            JsValue::Undefined
+        ));
+        let recorded = ACCESS_CHECK_LOG.with(|log| log.borrow().clone());
+        assert!(
+            recorded.is_empty(),
+            "invalidated wrapper must not dispatch access-check callbacks; got {recorded:?}"
+        );
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_access_check_replaces_previous_callback() {
+        reset_access_check_state();
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        // Install permissive first, then replace with recording.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(access_check_always_allow),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(unsafe { stator_dom_object_wrap_has_access_check(wrap) });
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(access_check_recording),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let _ = unsafe { (*wrap).inner.has_property("k") };
+        let recorded = ACCESS_CHECK_LOG.with(|log| log.borrow().clone());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].op,
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedQuery
+        );
+        assert_eq!(recorded[0].name.as_deref(), Some("k"));
 
         unsafe { stator_dom_object_wrap_destroy(wrap) };
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));

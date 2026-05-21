@@ -496,6 +496,51 @@ Rules:
   unreachable. They may destroy Edge bookkeeping but must not inspect the
   invalidated payload or call back into script (§4.6).
 
+### 7.2 DOM wrapper access-check callbacks
+
+Blink/V8 expose a per-template `AccessCheckCallback` that gates every
+cross-origin or security-sensitive property access on a wrapper. Stator
+mirrors that contract per `StatorDomObjectWrap` instance:
+
+- `stator_dom_object_wrap_set_access_check(wrap, cb, data)` installs a
+  callback that is invoked before every property access. `cb` receives
+  the operation (`StatorDomAccessCheckOperation`), the key (UTF-8 name +
+  length, or a `u32` index — exactly one of the two is meaningful), the
+  wrapper's native pointer and class id, and the embedder `data`.
+- Returning `true` means "allow"; returning `false` means "deny".
+- `stator_dom_object_wrap_clear_access_check` removes the callback.
+- `stator_dom_object_wrap_has_access_check` reports whether one is set.
+
+Fail-closed semantics on deny (chosen to match the invalidate contract
+in §7.1 — a denied access must never leak a payload through a different
+code path):
+
+| Operation | Denied behavior |
+|-----------|-----------------|
+| `NamedGet`, `IndexedGet` | Property read returns `undefined`. |
+| `NamedSet`, `IndexedSet` | Write is silently dropped; the engine treats it as handled so it does not fall through to the own-property store. |
+| `NamedQuery`, `IndexedQuery` | `has` reports `false`. |
+| `NamedDelete` | `delete` reports `false`. |
+| `NamedEnumerate` | Enumeration returns no names (neither interceptor names nor own-property names). |
+| `IndexedLength` | Length reports `0`. |
+
+Lifetime / invalidate interaction: the installed callback closure
+captures the wrapper's `alive` flag (the same one flipped by
+`stator_dom_object_wrap_invalidate`). After invalidation, the access
+check **short-circuits to deny without dispatching the embedder
+callback**, so a stale native pointer is never handed back to embedder
+code. Dropping the wrapper drops the boxed closure and any embedder
+state it owned through captures.
+
+Current limitations (Stator does **not** match V8 exactly here):
+- Access checks are stored per `DomObjectWrap` instance, not on an
+  underlying template. New wrappers do not inherit a default check.
+- A denied access does not auto-throw a `SecurityError`; the embedder
+  is free to install its own thrower interceptor on top if it wants
+  exception semantics rather than silent-deny semantics.
+- The callback runs synchronously on the script thread; it must not
+  re-enter Stator or call back into JS.
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.

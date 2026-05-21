@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 5
+#define STATOR_FFI_ABI_VERSION_MINOR 6
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -476,6 +476,49 @@ enum StatorWasmValueKind
 #ifndef __cplusplus
 typedef uint32_t StatorWasmValueKind;
 #endif // __cplusplus
+
+/**
+ * Operation being attempted on a DOM wrapper when its installed
+ * access-check callback is invoked.
+ */
+typedef enum StatorDomAccessCheckOperation {
+  /**
+   * Named-property read (e.g. `element.id`).
+   */
+  StatorDomAccessCheckOperationNamedGet = 0,
+  /**
+   * Named-property write (e.g. `element.id = "x"`).
+   */
+  StatorDomAccessCheckOperationNamedSet = 1,
+  /**
+   * Named-property `in`/has query (e.g. `"id" in element`).
+   */
+  StatorDomAccessCheckOperationNamedQuery = 2,
+  /**
+   * Named-property `delete` (e.g. `delete element.id`).
+   */
+  StatorDomAccessCheckOperationNamedDelete = 3,
+  /**
+   * Named-property enumeration (e.g. `Object.keys(element)`).
+   */
+  StatorDomAccessCheckOperationNamedEnumerate = 4,
+  /**
+   * Indexed-property read (e.g. `nodeList[0]`).
+   */
+  StatorDomAccessCheckOperationIndexedGet = 5,
+  /**
+   * Indexed-property write (e.g. `nodeList[0] = x`).
+   */
+  StatorDomAccessCheckOperationIndexedSet = 6,
+  /**
+   * Indexed-property query.
+   */
+  StatorDomAccessCheckOperationIndexedQuery = 7,
+  /**
+   * Indexed-collection length query.
+   */
+  StatorDomAccessCheckOperationIndexedLength = 8,
+} StatorDomAccessCheckOperation;
 
 /**
  * Host-visible Promise rejection event kind.
@@ -5384,6 +5427,62 @@ size_t stator_dom_object_wrap_clear_traced_edges(struct StatorDomObjectWrap *wra
  * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
  */
 size_t stator_dom_object_wrap_traced_edge_count(const struct StatorDomObjectWrap *wrap);
+
+/**
+ * Install a fail-closed access-check callback on `wrap`.
+ *
+ * The callback is consulted before every named- or indexed-property
+ * operation on the wrapper, including operations that route through the
+ * installed [`StatorDomNamedHandler`] / [`StatorDomIndexedHandler`].  A
+ * `true` return allows the operation to proceed; a `false` return denies
+ * it (reads observe `undefined`, writes/deletes silently drop, queries
+ * report absent, enumeration yields the empty list).
+ *
+ * The hook also short-circuits to a deny decision once the wrapper has
+ * been invalidated (see [`stator_dom_object_wrap_invalidate`]) or
+ * destroyed, so stale JS aliases never observe a callback dispatch.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] when the callback was installed.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `cb` is
+ *   null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid for the lifetime of the wrapper or until
+ *   replaced/cleared.
+ * - `data` is treated as opaque by the engine.
+ */
+enum StatorStatus stator_dom_object_wrap_set_access_check(struct StatorDomObjectWrap *wrap,
+                                                          bool (*cb)(enum StatorDomAccessCheckOperation op,
+                                                                     const char *name_utf8,
+                                                                     size_t name_len,
+                                                                     uint32_t index,
+                                                                     void *native_ptr,
+                                                                     uint32_t class_id,
+                                                                     void *data),
+                                                          void *data);
+
+/**
+ * Remove any access-check callback previously installed on `wrap`.
+ *
+ * Returns `true` when a callback was previously installed (and has now
+ * been removed), `false` otherwise.  Passing a null `wrap` returns
+ * `false`.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+bool stator_dom_object_wrap_clear_access_check(struct StatorDomObjectWrap *wrap);
+
+/**
+ * Return `true` when `wrap` has an installed access-check callback.
+ * Passing a null `wrap` returns `false`.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+bool stator_dom_object_wrap_has_access_check(const struct StatorDomObjectWrap *wrap);
 
 /**
  * Append a UTF-8 name to a [`StatorDomNameBuffer`].
