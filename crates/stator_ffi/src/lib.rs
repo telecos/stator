@@ -51,7 +51,10 @@ use stator_jse::parser::ast::{
     ImportAttribute, ImportSpecifier, ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program,
     ProgramItem, Stmt,
 };
-use stator_jse::snapshot::{deserialize_bytecode_array, serialize_bytecode_array};
+use stator_jse::snapshot::{
+    SnapshotCallbackManifest, StwcBuildBinding, deserialize_bytecode_array, deserialize_globals,
+    load_globals_stwc, reinstall_globals_with_manifest, serialize_bytecode_array,
+};
 use stator_jse::wasm::{
     HostFunc, HostFuncCallback, HostGlobal, HostMemory, HostVal, HostValKind, WasmEngine,
     WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
@@ -80,7 +83,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 12;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 13;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -10393,7 +10396,7 @@ pub unsafe extern "C" fn stator_module_pending_evaluation_reject(
 /// It must return either a new [`StatorValue`] (caller must free it) or a
 /// null pointer (treated as `undefined` unless the isolate has a pending
 /// exception, in which case script execution fails).
-type StatorNativeCallback = unsafe extern "C" fn(
+pub type StatorNativeCallback = unsafe extern "C" fn(
     ctx: *mut StatorContext,
     args: *const *const StatorValue,
     argc: i32,
@@ -11949,7 +11952,7 @@ pub unsafe extern "C" fn stator_register_native_function(
 /// owns it and frees it automatically) or a null pointer (treated as
 /// `undefined` unless the isolate has a pending exception, in which case script
 /// execution fails).
-type StatorFunctionTemplateCallback =
+pub type StatorFunctionTemplateCallback =
     unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue;
 
 /// Call-site information passed to a function-template callback.
@@ -12736,6 +12739,964 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
                 ))
             }
         }
+    }
+}
+
+// ── Snapshot blob FFI ─────────────────────────────────────────────────────────
+
+/// Stable classification of a snapshot blob's outer envelope.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StatorSnapshotKind {
+    /// The blob is absent, too short, or has unrecognized magic bytes.
+    StatorSnapshotKindUnknown = 0,
+    /// Legacy globals-only startup snapshot (`STSS` v2).
+    StatorSnapshotKindStss = 1,
+    /// Manifest-aware globals snapshot (`STSM` v1).
+    StatorSnapshotKindStsm = 2,
+    /// Warm-context envelope (`STWC` v1) with build and manifest binding.
+    StatorSnapshotKindStwc = 3,
+}
+
+/// Stable FFI-visible reason for snapshot validation or load failure.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StatorSnapshotErrorKind {
+    /// No error occurred.
+    StatorSnapshotErrorNone = 0,
+    /// A required pointer was null or the byte range was empty.
+    StatorSnapshotErrorInvalidArg = 1,
+    /// The blob magic bytes are not a supported snapshot envelope.
+    StatorSnapshotErrorUnknownMagic = 2,
+    /// The blob magic does not match the loader selected by its envelope.
+    StatorSnapshotErrorMagicMismatch = 3,
+    /// The snapshot format or bytecode version is unsupported.
+    StatorSnapshotErrorVersionMismatch = 4,
+    /// STWC build, ABI, platform, feature, or payload compatibility failed.
+    StatorSnapshotErrorCompatibilityMismatch = 5,
+    /// A checksum or digest mismatch was detected.
+    StatorSnapshotErrorDigestMismatch = 6,
+    /// STSM/STWC callback manifest digest or id set did not match.
+    StatorSnapshotErrorManifestMismatch = 7,
+    /// The blob asks for heap state this FFI/API slice cannot apply.
+    StatorSnapshotErrorUnsupported = 8,
+    /// The blob is malformed or truncated.
+    StatorSnapshotErrorMalformed = 9,
+    /// Full isolate/realm restoration is intentionally not claimed by this API.
+    StatorSnapshotErrorUnsupportedRuntimeHook = 10,
+}
+
+/// Mutable callback manifest used by STSM/STWC snapshot load and apply APIs.
+pub struct StatorSnapshotManifest {
+    inner: SnapshotCallbackManifest,
+}
+
+/// STWC build/ABI binding used to fail closed on incompatible warm-context blobs.
+pub struct StatorSnapshotBuildBinding {
+    inner: StwcBuildBinding,
+}
+
+/// Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StatorSnapshotBuildHashField {
+    /// Engine build fingerprint.
+    StatorSnapshotBuildHashBuildId = 0,
+    /// Cargo feature/cfg fingerprint.
+    StatorSnapshotBuildHashBuildFeatures = 1,
+    /// JIT/tiering configuration fingerprint.
+    StatorSnapshotBuildHashJitTiering = 2,
+    /// Required CPU feature fingerprint.
+    StatorSnapshotBuildHashCpuFeatures = 3,
+    /// Edge release metadata fingerprint.
+    StatorSnapshotBuildHashEdgeRelease = 4,
+}
+
+/// Owned result details for snapshot classification, validation, and application.
+pub struct StatorSnapshotReport {
+    kind: StatorSnapshotKind,
+    error_kind: StatorSnapshotErrorKind,
+    field: CString,
+    message: CString,
+    applied_global_count: usize,
+}
+
+fn snapshot_cstring(s: impl AsRef<str>) -> CString {
+    let mut bytes = s.as_ref().as_bytes().to_vec();
+    for b in &mut bytes {
+        if *b == 0 {
+            *b = b'?';
+        }
+    }
+    CString::new(bytes).unwrap_or_else(|_| c"snapshot error".into())
+}
+
+fn snapshot_report(
+    kind: StatorSnapshotKind,
+    error_kind: StatorSnapshotErrorKind,
+    field: impl AsRef<str>,
+    message: impl AsRef<str>,
+    applied_global_count: usize,
+) -> StatorSnapshotReport {
+    StatorSnapshotReport {
+        kind,
+        error_kind,
+        field: snapshot_cstring(field),
+        message: snapshot_cstring(message),
+        applied_global_count,
+    }
+}
+
+unsafe fn write_snapshot_report(out: *mut *mut StatorSnapshotReport, report: StatorSnapshotReport) {
+    if !out.is_null() {
+        // SAFETY: caller supplied a valid out-pointer for this FFI call.
+        unsafe { *out = Box::into_raw(Box::new(report)) };
+    }
+}
+
+unsafe fn snapshot_bytes<'a>(
+    data: *const u8,
+    len: usize,
+) -> Result<&'a [u8], StatorSnapshotReport> {
+    if data.is_null() || len == 0 {
+        return Err(snapshot_report(
+            StatorSnapshotKind::StatorSnapshotKindUnknown,
+            StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg,
+            "input",
+            "snapshot: input blob pointer is null or length is zero",
+            0,
+        ));
+    }
+    // SAFETY: caller guarantees `data` is readable for `len` bytes.
+    Ok(unsafe { std::slice::from_raw_parts(data, len) })
+}
+
+fn classify_snapshot_bytes(bytes: &[u8]) -> (StatorSnapshotKind, StatorSnapshotErrorKind, String) {
+    if bytes.len() < 4 {
+        return (
+            StatorSnapshotKind::StatorSnapshotKindUnknown,
+            StatorSnapshotErrorKind::StatorSnapshotErrorMalformed,
+            "snapshot: blob too small for magic bytes".to_owned(),
+        );
+    }
+    match &bytes[0..4] {
+        b"STSS" => (
+            StatorSnapshotKind::StatorSnapshotKindStss,
+            StatorSnapshotErrorKind::StatorSnapshotErrorNone,
+            String::new(),
+        ),
+        b"STSM" => (
+            StatorSnapshotKind::StatorSnapshotKindStsm,
+            StatorSnapshotErrorKind::StatorSnapshotErrorNone,
+            String::new(),
+        ),
+        b"STWC" => (
+            StatorSnapshotKind::StatorSnapshotKindStwc,
+            StatorSnapshotErrorKind::StatorSnapshotErrorNone,
+            String::new(),
+        ),
+        other => (
+            StatorSnapshotKind::StatorSnapshotKindUnknown,
+            StatorSnapshotErrorKind::StatorSnapshotErrorUnknownMagic,
+            format!("snapshot: unsupported magic bytes {other:?}"),
+        ),
+    }
+}
+
+fn map_snapshot_error(
+    kind: StatorSnapshotKind,
+    error: &stator_jse::error::StatorError,
+) -> StatorSnapshotReport {
+    let message = error.to_string();
+    match error {
+        stator_jse::error::StatorError::SnapshotManifestMismatch { .. } => snapshot_report(
+            kind,
+            StatorSnapshotErrorKind::StatorSnapshotErrorManifestMismatch,
+            "manifest",
+            message,
+            0,
+        ),
+        stator_jse::error::StatorError::SnapshotCompatibilityMismatch { field, .. } => {
+            snapshot_report(
+                kind,
+                StatorSnapshotErrorKind::StatorSnapshotErrorCompatibilityMismatch,
+                *field,
+                message,
+                0,
+            )
+        }
+        stator_jse::error::StatorError::SnapshotDigestMismatch { .. } => snapshot_report(
+            kind,
+            StatorSnapshotErrorKind::StatorSnapshotErrorDigestMismatch,
+            "digest",
+            message,
+            0,
+        ),
+        stator_jse::error::StatorError::SnapshotUnsupportedValue { path, .. } => snapshot_report(
+            kind,
+            StatorSnapshotErrorKind::StatorSnapshotErrorUnsupported,
+            path,
+            message,
+            0,
+        ),
+        stator_jse::error::StatorError::Internal(_) => {
+            let lower = message.to_ascii_lowercase();
+            let (error_kind, field) = if lower.contains("magic") {
+                (
+                    StatorSnapshotErrorKind::StatorSnapshotErrorMagicMismatch,
+                    "magic",
+                )
+            } else if lower.contains("version") {
+                (
+                    StatorSnapshotErrorKind::StatorSnapshotErrorVersionMismatch,
+                    "version",
+                )
+            } else if lower.contains("checksum") || lower.contains("digest") {
+                (
+                    StatorSnapshotErrorKind::StatorSnapshotErrorDigestMismatch,
+                    "digest",
+                )
+            } else if lower.contains("manifest") {
+                (
+                    StatorSnapshotErrorKind::StatorSnapshotErrorManifestMismatch,
+                    "manifest",
+                )
+            } else {
+                (
+                    StatorSnapshotErrorKind::StatorSnapshotErrorMalformed,
+                    "blob",
+                )
+            };
+            snapshot_report(kind, error_kind, field, message, 0)
+        }
+        _ => snapshot_report(
+            kind,
+            StatorSnapshotErrorKind::StatorSnapshotErrorMalformed,
+            "blob",
+            message,
+            0,
+        ),
+    }
+}
+
+fn current_snapshot_binding() -> StwcBuildBinding {
+    let mut binding = StwcBuildBinding::current_engine_defaults();
+    binding.ffi_crate_ver = env!("CARGO_PKG_VERSION").to_owned();
+    binding.ffi_abi_version = STATOR_FFI_ABI_VERSION;
+    binding
+}
+
+unsafe fn manifest_ref<'a>(
+    manifest: *const StatorSnapshotManifest,
+) -> Option<&'a SnapshotCallbackManifest> {
+    if manifest.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `manifest` is valid when non-null.
+        Some(unsafe { &(*manifest).inner })
+    }
+}
+
+unsafe fn binding_ref(binding: *const StatorSnapshotBuildBinding) -> StwcBuildBinding {
+    if binding.is_null() {
+        current_snapshot_binding()
+    } else {
+        // SAFETY: caller guarantees `binding` is valid when non-null.
+        unsafe { (*binding).inner.clone() }
+    }
+}
+
+unsafe fn load_snapshot_globals(
+    bytes: &[u8],
+    manifest: *const StatorSnapshotManifest,
+    binding: *const StatorSnapshotBuildBinding,
+) -> Result<(StatorSnapshotKind, HashMap<String, JsValue>), StatorSnapshotReport> {
+    let (kind, classify_error, classify_message) = classify_snapshot_bytes(bytes);
+    if classify_error != StatorSnapshotErrorKind::StatorSnapshotErrorNone {
+        return Err(snapshot_report(
+            kind,
+            classify_error,
+            "magic",
+            classify_message,
+            0,
+        ));
+    }
+    match kind {
+        StatorSnapshotKind::StatorSnapshotKindStss => deserialize_globals(bytes)
+            .map(|globals| (kind, globals))
+            .map_err(|err| map_snapshot_error(kind, &err)),
+        StatorSnapshotKind::StatorSnapshotKindStsm => {
+            let Some(manifest) = (unsafe { manifest_ref(manifest) }) else {
+                return Err(snapshot_report(
+                    kind,
+                    StatorSnapshotErrorKind::StatorSnapshotErrorManifestMismatch,
+                    "manifest",
+                    "snapshot: STSM blobs require a non-null callback manifest",
+                    0,
+                ));
+            };
+            reinstall_globals_with_manifest(bytes, manifest)
+                .map(|globals| (kind, globals))
+                .map_err(|err| map_snapshot_error(kind, &err))
+        }
+        StatorSnapshotKind::StatorSnapshotKindStwc => {
+            let Some(manifest) = (unsafe { manifest_ref(manifest) }) else {
+                return Err(snapshot_report(
+                    kind,
+                    StatorSnapshotErrorKind::StatorSnapshotErrorManifestMismatch,
+                    "manifest",
+                    "snapshot: STWC blobs require a non-null callback manifest",
+                    0,
+                ));
+            };
+            let binding = unsafe { binding_ref(binding) };
+            load_globals_stwc(bytes, manifest, &binding)
+                .map(|globals| (kind, globals))
+                .map_err(|err| map_snapshot_error(kind, &err))
+        }
+        StatorSnapshotKind::StatorSnapshotKindUnknown => Err(snapshot_report(
+            kind,
+            StatorSnapshotErrorKind::StatorSnapshotErrorUnknownMagic,
+            "magic",
+            "snapshot: unsupported magic bytes",
+            0,
+        )),
+    }
+}
+
+fn apply_globals_to_context(ctx: *mut StatorContext, globals: HashMap<String, JsValue>) -> usize {
+    let count = globals.len();
+    // SAFETY: caller guarantees `ctx` is valid.
+    let env = unsafe { Rc::clone(&(*ctx).globals) };
+    *env.borrow_mut() = GlobalEnv::new();
+    for (key, value) in globals {
+        env.borrow_mut().insert(key, value);
+    }
+    count
+}
+
+/// Create an empty snapshot callback manifest.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_snapshot_manifest_create() -> *mut StatorSnapshotManifest {
+    Box::into_raw(Box::new(StatorSnapshotManifest {
+        inner: SnapshotCallbackManifest::new(),
+    }))
+}
+
+/// Destroy a snapshot callback manifest. Passing null is a no-op.
+///
+/// # Safety
+/// `manifest` must be null or a pointer returned by [`stator_snapshot_manifest_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_manifest_destroy(manifest: *mut StatorSnapshotManifest) {
+    if !manifest.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        unsafe { drop(Box::from_raw(manifest)) };
+    }
+}
+
+/// Register a callback id in a manifest using the function-template callback ABI.
+///
+/// `ctx` may be null for validation-only manifests; callbacks restored from such
+/// a manifest return `undefined` if invoked. STSM/STWC runtime application should
+/// pass the target context so callbacks are reinstalled against that isolate.
+///
+/// # Safety
+/// `manifest` must be valid, `id` must point to `id_len` bytes, and `callback`
+/// must remain callable while loaded snapshot globals may invoke it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_manifest_register_native_function(
+    manifest: *mut StatorSnapshotManifest,
+    ctx: *mut StatorContext,
+    id: *const c_char,
+    id_len: usize,
+    callback: Option<StatorFunctionTemplateCallback>,
+) -> StatorStatus {
+    if manifest.is_null() || id.is_null() || id_len == 0 {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `id` points to `id_len` readable bytes.
+    let id_bytes = unsafe { std::slice::from_raw_parts(id as *const u8, id_len) };
+    let Ok(id_str) = std::str::from_utf8(id_bytes) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    let isolate = if ctx.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: caller guarantees `ctx` is valid when non-null.
+        unsafe { (*ctx)._isolate }
+    };
+    let native: NativeFn = if let Some(callback) = callback {
+        Rc::new(move |args: Vec<JsValue>| {
+            let c_vals: Vec<StatorValue> = args
+                .iter()
+                .map(|v| StatorValue {
+                    inner: jsvalue_to_stator_value_inner(v),
+                    isolate: std::ptr::null_mut(),
+                })
+                .collect();
+            let info = StatorFunctionCallbackInfo {
+                args: c_vals,
+                this_value: StatorValue {
+                    inner: stator_jse::interpreter::current_this()
+                        .as_ref()
+                        .map(jsvalue_to_stator_value_inner)
+                        .unwrap_or(StatorValueInner::Undefined),
+                    isolate,
+                },
+                isolate,
+            };
+            let saved_scope = if !isolate.is_null() {
+                // SAFETY: isolate is valid for callbacks registered from a live context.
+                let scope = unsafe { (*isolate).active_handle_scope };
+                unsafe { (*isolate).active_handle_scope = std::ptr::null_mut() };
+                scope
+            } else {
+                std::ptr::null_mut()
+            };
+            // SAFETY: callback is supplied by the embedder and valid per contract.
+            let ret = unsafe { callback(&raw const info) };
+            if !isolate.is_null() {
+                // SAFETY: restore the scope saved from this isolate above.
+                unsafe { (*isolate).active_handle_scope = saved_scope };
+            }
+            if let Some(error) = unsafe { pending_native_callback_error(isolate) } {
+                if !ret.is_null() {
+                    // SAFETY: callback-created values are caller-owned here.
+                    unsafe { stator_value_destroy(ret) };
+                }
+                Err(error)
+            } else if ret.is_null() {
+                Ok(JsValue::Undefined)
+            } else {
+                // SAFETY: callback transferred ownership of `ret` to the wrapper.
+                let owned = unsafe { Box::from_raw(ret) };
+                Ok(stator_value_inner_to_jsvalue(&owned.inner))
+            }
+        })
+    } else {
+        Rc::new(|_| Ok(JsValue::Undefined))
+    };
+    // SAFETY: caller guarantees `manifest` is valid.
+    match unsafe { &mut (*manifest).inner }.register(id_str, native) {
+        Ok(()) => StatorStatus::StatorStatusOk,
+        Err(_) => StatorStatus::StatorStatusInvalidArg,
+    }
+}
+
+/// Return the number of ids registered in `manifest`.
+///
+/// # Safety
+/// `manifest` must be null or a valid manifest pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_manifest_len(
+    manifest: *const StatorSnapshotManifest,
+) -> usize {
+    if manifest.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `manifest` is valid.
+    unsafe { (*manifest).inner.len() }
+}
+
+/// Construct an STWC build binding populated from the current FFI library.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_snapshot_build_binding_create_current() -> *mut StatorSnapshotBuildBinding
+{
+    Box::into_raw(Box::new(StatorSnapshotBuildBinding {
+        inner: current_snapshot_binding(),
+    }))
+}
+
+/// Destroy an STWC build binding. Passing null is a no-op.
+///
+/// # Safety
+/// `binding` must be null or returned by [`stator_snapshot_build_binding_create_current`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_build_binding_destroy(
+    binding: *mut StatorSnapshotBuildBinding,
+) {
+    if !binding.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        unsafe { drop(Box::from_raw(binding)) };
+    }
+}
+
+unsafe fn read_ffi_str<'a>(ptr: *const c_char, len: usize) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `ptr` points to `len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    std::str::from_utf8(bytes).ok()
+}
+
+/// Override a string field in an STWC build binding.
+///
+/// `field` accepts `ffi_crate_ver`, `commit_id`, `target_triple`, `os`, `arch`,
+/// `cargo_profile`, or `engine_crate_ver`.
+///
+/// # Safety
+/// `binding` must be valid and `value` must point to `value_len` UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_build_binding_set_string(
+    binding: *mut StatorSnapshotBuildBinding,
+    field: *const c_char,
+    field_len: usize,
+    value: *const c_char,
+    value_len: usize,
+) -> StatorStatus {
+    if binding.is_null() || field.is_null() || value.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let Some(field) = (unsafe { read_ffi_str(field, field_len) }) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    let Some(value) = (unsafe { read_ffi_str(value, value_len) }) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    // SAFETY: caller guarantees `binding` is valid.
+    let b = unsafe { &mut (*binding).inner };
+    match field {
+        "ffi_crate_ver" => b.ffi_crate_ver = value.to_owned(),
+        "commit_id" => b.commit_id = value.to_owned(),
+        "target_triple" => b.target_triple = value.to_owned(),
+        "os" => b.os = value.to_owned(),
+        "arch" => b.arch = value.to_owned(),
+        "cargo_profile" => b.cargo_profile = value.to_owned(),
+        "engine_crate_ver" => b.engine_crate_ver = value.to_owned(),
+        _ => return StatorStatus::StatorStatusInvalidArg,
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Override the packed FFI ABI version in an STWC build binding.
+///
+/// # Safety
+/// `binding` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_build_binding_set_ffi_abi_version(
+    binding: *mut StatorSnapshotBuildBinding,
+    version: u32,
+) -> StatorStatus {
+    if binding.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `binding` is valid.
+    unsafe { (*binding).inner.ffi_abi_version = version };
+    StatorStatus::StatorStatusOk
+}
+
+/// Override a 32-byte hash field in an STWC build binding.
+///
+/// # Safety
+/// `binding` must be valid and `bytes32` must point to exactly 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_build_binding_set_hash(
+    binding: *mut StatorSnapshotBuildBinding,
+    field: StatorSnapshotBuildHashField,
+    bytes32: *const u8,
+) -> StatorStatus {
+    if binding.is_null() || bytes32.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let mut hash = [0u8; 32];
+    // SAFETY: caller guarantees `bytes32` points to 32 readable bytes.
+    hash.copy_from_slice(unsafe { std::slice::from_raw_parts(bytes32, 32) });
+    // SAFETY: caller guarantees `binding` is valid.
+    let b = unsafe { &mut (*binding).inner };
+    match field {
+        StatorSnapshotBuildHashField::StatorSnapshotBuildHashBuildId => b.build_id = hash,
+        StatorSnapshotBuildHashField::StatorSnapshotBuildHashBuildFeatures => {
+            b.build_features_hash = hash
+        }
+        StatorSnapshotBuildHashField::StatorSnapshotBuildHashJitTiering => {
+            b.jit_tiering_hash = hash
+        }
+        StatorSnapshotBuildHashField::StatorSnapshotBuildHashCpuFeatures => {
+            b.cpu_features_hash = hash
+        }
+        StatorSnapshotBuildHashField::StatorSnapshotBuildHashEdgeRelease => {
+            b.edge_release_hash = hash
+        }
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Classify a snapshot blob by magic bytes without fully decoding it.
+///
+/// # Safety
+/// `data` must point to `len` readable bytes and out-pointers must be valid when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_blob_classify(
+    data: *const u8,
+    len: usize,
+    out_kind: *mut StatorSnapshotKind,
+    out_error: *mut StatorSnapshotErrorKind,
+    out_report: *mut *mut StatorSnapshotReport,
+) -> StatorStatus {
+    if !out_report.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_report = std::ptr::null_mut() };
+    }
+    if !out_kind.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_kind = StatorSnapshotKind::StatorSnapshotKindUnknown };
+    }
+    if !out_error.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_error = StatorSnapshotErrorKind::StatorSnapshotErrorNone };
+    }
+    let bytes = match unsafe { snapshot_bytes(data, len) } {
+        Ok(bytes) => bytes,
+        Err(report) => {
+            if !out_error.is_null() {
+                // SAFETY: caller supplied a valid out-pointer.
+                unsafe { *out_error = report.error_kind };
+            }
+            unsafe { write_snapshot_report(out_report, report) };
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+    };
+    let (kind, error, message) = classify_snapshot_bytes(bytes);
+    if !out_kind.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_kind = kind };
+    }
+    if !out_error.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_error = error };
+    }
+    if error == StatorSnapshotErrorKind::StatorSnapshotErrorNone {
+        unsafe { write_snapshot_report(out_report, snapshot_report(kind, error, "", "", 0)) };
+        StatorStatus::StatorStatusOk
+    } else {
+        unsafe {
+            write_snapshot_report(
+                out_report,
+                snapshot_report(kind, error, "magic", message, 0),
+            )
+        };
+        StatorStatus::StatorStatusFalse
+    }
+}
+
+/// Validate and decode a snapshot blob without mutating runtime state.
+///
+/// STSM and STWC require a matching callback manifest. STWC also requires a
+/// matching build binding; null binding means the current library defaults.
+///
+/// # Safety
+/// Pointers must be valid for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_blob_validate(
+    data: *const u8,
+    len: usize,
+    manifest: *const StatorSnapshotManifest,
+    binding: *const StatorSnapshotBuildBinding,
+    out_report: *mut *mut StatorSnapshotReport,
+) -> StatorStatus {
+    if !out_report.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_report = std::ptr::null_mut() };
+    }
+    let bytes = match unsafe { snapshot_bytes(data, len) } {
+        Ok(bytes) => bytes,
+        Err(report) => {
+            unsafe { write_snapshot_report(out_report, report) };
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+    };
+    match unsafe { load_snapshot_globals(bytes, manifest, binding) } {
+        Ok((kind, globals)) => {
+            unsafe {
+                write_snapshot_report(
+                    out_report,
+                    snapshot_report(
+                        kind,
+                        StatorSnapshotErrorKind::StatorSnapshotErrorNone,
+                        "",
+                        "",
+                        globals.len(),
+                    ),
+                )
+            };
+            StatorStatus::StatorStatusOk
+        }
+        Err(report) => {
+            let status =
+                if report.error_kind == StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg {
+                    StatorStatus::StatorStatusInvalidArg
+                } else {
+                    StatorStatus::StatorStatusFalse
+                };
+            unsafe { write_snapshot_report(out_report, report) };
+            status
+        }
+    }
+}
+
+/// Apply a supported snapshot's globals to an existing context.
+///
+/// This API intentionally restores the implemented globals state only. It does
+/// not claim complete warm-context realm/intrinsics restoration; embedders must
+/// still run the missing runtime hook before using STWC as a full mksnapshot
+/// equivalent.
+///
+/// # Safety
+/// `ctx` must be valid and blob/manifest/binding pointers must remain valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_blob_apply_to_context(
+    ctx: *mut StatorContext,
+    data: *const u8,
+    len: usize,
+    manifest: *const StatorSnapshotManifest,
+    binding: *const StatorSnapshotBuildBinding,
+    out_report: *mut *mut StatorSnapshotReport,
+) -> StatorStatus {
+    if !out_report.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_report = std::ptr::null_mut() };
+    }
+    if ctx.is_null() {
+        unsafe {
+            write_snapshot_report(
+                out_report,
+                snapshot_report(
+                    StatorSnapshotKind::StatorSnapshotKindUnknown,
+                    StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg,
+                    "ctx",
+                    "snapshot: target context is null",
+                    0,
+                ),
+            )
+        };
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let bytes = match unsafe { snapshot_bytes(data, len) } {
+        Ok(bytes) => bytes,
+        Err(report) => {
+            unsafe { write_snapshot_report(out_report, report) };
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+    };
+    match unsafe { load_snapshot_globals(bytes, manifest, binding) } {
+        Ok((kind, globals)) => {
+            let count = apply_globals_to_context(ctx, globals);
+            unsafe {
+                write_snapshot_report(
+                    out_report,
+                    snapshot_report(
+                        kind,
+                        StatorSnapshotErrorKind::StatorSnapshotErrorNone,
+                        "",
+                        "",
+                        count,
+                    ),
+                )
+            };
+            StatorStatus::StatorStatusOk
+        }
+        Err(report) => {
+            let status =
+                if report.error_kind == StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg {
+                    StatorStatus::StatorStatusInvalidArg
+                } else {
+                    StatorStatus::StatorStatusFalse
+                };
+            unsafe { write_snapshot_report(out_report, report) };
+            status
+        }
+    }
+}
+
+/// Create a context and apply a supported snapshot blob's globals to it.
+///
+/// Full warm-context realm creation remains unsupported; see the returned report
+/// and `docs/snapshot.md` for the missing runtime hook. On failure no context is
+/// returned.
+///
+/// # Safety
+/// `isolate` must be valid and out/blob pointers must be valid when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_new_from_snapshot_blob(
+    isolate: *mut StatorIsolate,
+    data: *const u8,
+    len: usize,
+    manifest: *const StatorSnapshotManifest,
+    binding: *const StatorSnapshotBuildBinding,
+    out_context: *mut *mut StatorContext,
+    out_report: *mut *mut StatorSnapshotReport,
+) -> StatorStatus {
+    if !out_context.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_context = std::ptr::null_mut() };
+    }
+    if isolate.is_null() || out_context.is_null() {
+        unsafe {
+            write_snapshot_report(
+                out_report,
+                snapshot_report(
+                    StatorSnapshotKind::StatorSnapshotKindUnknown,
+                    StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg,
+                    "isolate",
+                    "snapshot: isolate or out_context is null",
+                    0,
+                ),
+            )
+        };
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let ctx = unsafe { stator_context_new(isolate) };
+    if ctx.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let status = unsafe {
+        stator_snapshot_blob_apply_to_context(ctx, data, len, manifest, binding, out_report)
+    };
+    if status == StatorStatus::StatorStatusOk {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_context = ctx };
+    } else {
+        // SAFETY: `ctx` was created above and is not returned to the caller.
+        unsafe { stator_context_destroy(ctx) };
+    }
+    status
+}
+
+/// Create an isolate and context, then apply a supported snapshot blob's globals.
+///
+/// `out_context` receives the created context on success. On failure both the
+/// context and isolate are destroyed and null is returned.
+///
+/// # Safety
+/// Blob/manifest/binding/out pointers must be valid when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_new_from_snapshot_blob(
+    data: *const u8,
+    len: usize,
+    manifest: *const StatorSnapshotManifest,
+    binding: *const StatorSnapshotBuildBinding,
+    out_context: *mut *mut StatorContext,
+    out_report: *mut *mut StatorSnapshotReport,
+) -> *mut StatorIsolate {
+    if !out_context.is_null() {
+        // SAFETY: caller supplied a valid out-pointer.
+        unsafe { *out_context = std::ptr::null_mut() };
+    }
+    let isolate = stator_isolate_new();
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut ctx = std::ptr::null_mut();
+    let status = unsafe {
+        stator_context_new_from_snapshot_blob(
+            isolate, data, len, manifest, binding, &mut ctx, out_report,
+        )
+    };
+    if status == StatorStatus::StatorStatusOk {
+        if !out_context.is_null() {
+            // SAFETY: caller supplied a valid out-pointer.
+            unsafe { *out_context = ctx };
+        }
+        isolate
+    } else {
+        // SAFETY: isolate was created by this function and context was not returned.
+        unsafe { stator_isolate_destroy(isolate) };
+        std::ptr::null_mut()
+    }
+}
+
+/// Destroy a snapshot report. Passing null is a no-op.
+///
+/// # Safety
+/// `report` must be null or a pointer returned through a snapshot API out-param.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_destroy(report: *mut StatorSnapshotReport) {
+    if !report.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        unsafe { drop(Box::from_raw(report)) };
+    }
+}
+
+/// Return a report's snapshot kind.
+///
+/// # Safety
+/// `report` must be null or valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_kind(
+    report: *const StatorSnapshotReport,
+) -> StatorSnapshotKind {
+    if report.is_null() {
+        StatorSnapshotKind::StatorSnapshotKindUnknown
+    } else {
+        // SAFETY: caller guarantees `report` is valid.
+        unsafe { (*report).kind }
+    }
+}
+
+/// Return a report's error kind.
+///
+/// # Safety
+/// `report` must be null or valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_error_kind(
+    report: *const StatorSnapshotReport,
+) -> StatorSnapshotErrorKind {
+    if report.is_null() {
+        StatorSnapshotErrorKind::StatorSnapshotErrorNone
+    } else {
+        // SAFETY: caller guarantees `report` is valid.
+        unsafe { (*report).error_kind }
+    }
+}
+
+/// Return the compatibility/error field name, or an empty string.
+///
+/// # Safety
+/// `report` must be null or valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_field(
+    report: *const StatorSnapshotReport,
+) -> *const c_char {
+    if report.is_null() {
+        c"".as_ptr()
+    } else {
+        // SAFETY: caller guarantees `report` is valid.
+        unsafe { (*report).field.as_ptr() }
+    }
+}
+
+/// Return the human-readable error message, or an empty string.
+///
+/// # Safety
+/// `report` must be null or valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_message(
+    report: *const StatorSnapshotReport,
+) -> *const c_char {
+    if report.is_null() {
+        c"".as_ptr()
+    } else {
+        // SAFETY: caller guarantees `report` is valid.
+        unsafe { (*report).message.as_ptr() }
+    }
+}
+
+/// Return how many globals were decoded or applied by the snapshot operation.
+///
+/// # Safety
+/// `report` must be null or valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_snapshot_report_applied_global_count(
+    report: *const StatorSnapshotReport,
+) -> usize {
+    if report.is_null() {
+        0
+    } else {
+        // SAFETY: caller guarantees `report` is valid.
+        unsafe { (*report).applied_global_count }
     }
 }
 
@@ -39136,5 +40097,337 @@ mod tests {
         unsafe { stator_dom_symbol_buffer_destroy(buf) };
         // Destroy null is no-op.
         unsafe { stator_dom_symbol_buffer_destroy(std::ptr::null_mut()) };
+    }
+    unsafe extern "C" fn snapshot_test_callback(
+        info: *const StatorFunctionCallbackInfo,
+    ) -> *mut StatorValue {
+        let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+        unsafe { stator_value_new_number(isolate, 77.0) }
+    }
+
+    fn snapshot_engine_manifest(id: &str, cb: &NativeFn) -> SnapshotCallbackManifest {
+        let mut manifest = SnapshotCallbackManifest::new();
+        manifest.register(id, Rc::clone(cb)).unwrap();
+        manifest
+    }
+
+    fn snapshot_ffi_manifest(ctx: *mut StatorContext, id: &str) -> *mut StatorSnapshotManifest {
+        let manifest = stator_snapshot_manifest_create();
+        let status = unsafe {
+            stator_snapshot_manifest_register_native_function(
+                manifest,
+                ctx,
+                id.as_ptr() as *const c_char,
+                id.len(),
+                Some(snapshot_test_callback),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        manifest
+    }
+
+    unsafe fn report_error_kind(report: *mut StatorSnapshotReport) -> StatorSnapshotErrorKind {
+        let kind = unsafe { stator_snapshot_report_error_kind(report) };
+        unsafe { stator_snapshot_report_destroy(report) };
+        kind
+    }
+
+    #[test]
+    fn test_snapshot_blob_classify_stss_stsm_stwc() {
+        let stss = stator_jse::snapshot::serialize_globals(&HashMap::new());
+        let cb: NativeFn = Rc::new(|_| Ok(JsValue::Smi(1)));
+        let manifest = snapshot_engine_manifest("edge.cb", &cb);
+        let stsm =
+            stator_jse::snapshot::serialize_globals_with_manifest(&HashMap::new(), &manifest)
+                .unwrap();
+        let stwc = stator_jse::snapshot::serialize_globals_stwc(
+            &HashMap::new(),
+            &manifest,
+            &current_snapshot_binding(),
+        )
+        .unwrap();
+        for (blob, expected) in [
+            (stss.as_bytes(), StatorSnapshotKind::StatorSnapshotKindStss),
+            (stsm.as_bytes(), StatorSnapshotKind::StatorSnapshotKindStsm),
+            (stwc.as_bytes(), StatorSnapshotKind::StatorSnapshotKindStwc),
+        ] {
+            let mut kind = StatorSnapshotKind::StatorSnapshotKindUnknown;
+            let mut error = StatorSnapshotErrorKind::StatorSnapshotErrorMalformed;
+            let status = unsafe {
+                stator_snapshot_blob_classify(
+                    blob.as_ptr(),
+                    blob.len(),
+                    &mut kind,
+                    &mut error,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, StatorStatus::StatorStatusOk);
+            assert_eq!(kind, expected);
+            assert_eq!(error, StatorSnapshotErrorKind::StatorSnapshotErrorNone);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_apply_stss_globals_to_context() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let mut globals = HashMap::new();
+        globals.insert("answer".to_owned(), JsValue::Smi(42));
+        let snap = stator_jse::snapshot::serialize_globals(&globals);
+        let mut report = std::ptr::null_mut();
+        let status = unsafe {
+            stator_snapshot_blob_apply_to_context(
+                ctx,
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut report,
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert_eq!(
+            unsafe { stator_snapshot_report_kind(report) },
+            StatorSnapshotKind::StatorSnapshotKindStss
+        );
+        assert_eq!(
+            unsafe { stator_snapshot_report_applied_global_count(report) },
+            1
+        );
+        unsafe { stator_snapshot_report_destroy(report) };
+        let got = unsafe { (*ctx).globals.borrow().get("answer").cloned() };
+        assert_eq!(got, Some(JsValue::Smi(42)));
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_snapshot_apply_stsm_requires_manifest_and_reinstalls_callback() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let cb: NativeFn = Rc::new(|_| Ok(JsValue::Smi(5)));
+        let engine_manifest = snapshot_engine_manifest("edge.cb", &cb);
+        let mut globals = HashMap::new();
+        globals.insert("cb".to_owned(), JsValue::NativeFunction(cb));
+        let snap =
+            stator_jse::snapshot::serialize_globals_with_manifest(&globals, &engine_manifest)
+                .unwrap();
+
+        let mut missing_report = std::ptr::null_mut();
+        let missing = unsafe {
+            stator_snapshot_blob_validate(
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut missing_report,
+            )
+        };
+        assert_eq!(missing, StatorStatus::StatorStatusFalse);
+        assert_eq!(
+            unsafe { report_error_kind(missing_report) },
+            StatorSnapshotErrorKind::StatorSnapshotErrorManifestMismatch
+        );
+
+        let ffi_manifest = snapshot_ffi_manifest(ctx, "edge.cb");
+        let mut report = std::ptr::null_mut();
+        let status = unsafe {
+            stator_snapshot_blob_apply_to_context(
+                ctx,
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                ffi_manifest,
+                std::ptr::null(),
+                &mut report,
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        unsafe { stator_snapshot_report_destroy(report) };
+        match unsafe { (*ctx).globals.borrow().get("cb").cloned() } {
+            Some(JsValue::NativeFunction(f)) => {
+                assert_eq!(f(vec![]).unwrap(), JsValue::Smi(77))
+            }
+            other => panic!("expected native callback, got {other:?}"),
+        }
+        unsafe {
+            stator_snapshot_manifest_destroy(ffi_manifest);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_apply_stwc_success_and_incompatible_binding() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let cb: NativeFn = Rc::new(|_| Ok(JsValue::Smi(3)));
+        let engine_manifest = snapshot_engine_manifest("edge.cb", &cb);
+        let mut globals = HashMap::new();
+        globals.insert("n".to_owned(), JsValue::Smi(9));
+        globals.insert("cb".to_owned(), JsValue::NativeFunction(cb));
+        let binding = current_snapshot_binding();
+        let snap =
+            stator_jse::snapshot::serialize_globals_stwc(&globals, &engine_manifest, &binding)
+                .unwrap();
+        let ffi_manifest = snapshot_ffi_manifest(ctx, "edge.cb");
+
+        let bad_binding = stator_snapshot_build_binding_create_current();
+        assert_eq!(
+            unsafe { stator_snapshot_build_binding_set_ffi_abi_version(bad_binding, 0xdead_beef) },
+            StatorStatus::StatorStatusOk
+        );
+        let mut bad_report = std::ptr::null_mut();
+        let bad = unsafe {
+            stator_snapshot_blob_validate(
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                ffi_manifest,
+                bad_binding,
+                &mut bad_report,
+            )
+        };
+        assert_eq!(bad, StatorStatus::StatorStatusFalse);
+        assert_eq!(
+            unsafe { report_error_kind(bad_report) },
+            StatorSnapshotErrorKind::StatorSnapshotErrorCompatibilityMismatch
+        );
+        unsafe { stator_snapshot_build_binding_destroy(bad_binding) };
+
+        let mut ctx_from_blob = std::ptr::null_mut();
+        let mut report = std::ptr::null_mut();
+        let status = unsafe {
+            stator_context_new_from_snapshot_blob(
+                iso.as_ptr(),
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                ffi_manifest,
+                std::ptr::null(),
+                &mut ctx_from_blob,
+                &mut report,
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        assert!(!ctx_from_blob.is_null());
+        assert_eq!(
+            unsafe { stator_snapshot_report_kind(report) },
+            StatorSnapshotKind::StatorSnapshotKindStwc
+        );
+        unsafe { stator_snapshot_report_destroy(report) };
+        let got = unsafe { (*ctx_from_blob).globals.borrow().get("n").cloned() };
+        assert_eq!(got, Some(JsValue::Smi(9)));
+        unsafe {
+            stator_context_destroy(ctx_from_blob);
+            stator_snapshot_manifest_destroy(ffi_manifest);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_tampered_stwc_digest_and_unknown_magic() {
+        let manifest = SnapshotCallbackManifest::new();
+        let snap = stator_jse::snapshot::serialize_globals_stwc(
+            &HashMap::new(),
+            &manifest,
+            &current_snapshot_binding(),
+        )
+        .unwrap();
+        let mut tampered = snap.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x55;
+        let ffi_manifest = stator_snapshot_manifest_create();
+        let mut report = std::ptr::null_mut();
+        let status = unsafe {
+            stator_snapshot_blob_validate(
+                tampered.as_ptr(),
+                tampered.len(),
+                ffi_manifest,
+                std::ptr::null(),
+                &mut report,
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusFalse);
+        assert_eq!(
+            unsafe { report_error_kind(report) },
+            StatorSnapshotErrorKind::StatorSnapshotErrorDigestMismatch
+        );
+        unsafe { stator_snapshot_manifest_destroy(ffi_manifest) };
+
+        let blob = *b"NOPE";
+        let mut kind = StatorSnapshotKind::StatorSnapshotKindStss;
+        let mut error = StatorSnapshotErrorKind::StatorSnapshotErrorNone;
+        let classify = unsafe {
+            stator_snapshot_blob_classify(
+                blob.as_ptr(),
+                blob.len(),
+                &mut kind,
+                &mut error,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(classify, StatorStatus::StatorStatusFalse);
+        assert_eq!(kind, StatorSnapshotKind::StatorSnapshotKindUnknown);
+        assert_eq!(
+            error,
+            StatorSnapshotErrorKind::StatorSnapshotErrorUnknownMagic
+        );
+    }
+
+    #[test]
+    fn test_snapshot_null_empty_input_handling() {
+        let mut kind = StatorSnapshotKind::StatorSnapshotKindStss;
+        let mut error = StatorSnapshotErrorKind::StatorSnapshotErrorNone;
+        let status = unsafe {
+            stator_snapshot_blob_classify(
+                std::ptr::null(),
+                0,
+                &mut kind,
+                &mut error,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusInvalidArg);
+        assert_eq!(kind, StatorSnapshotKind::StatorSnapshotKindUnknown);
+        assert_eq!(
+            error,
+            StatorSnapshotErrorKind::StatorSnapshotErrorInvalidArg
+        );
+
+        let tiny = [b'S', b'T'];
+        let status = unsafe {
+            stator_snapshot_blob_classify(
+                tiny.as_ptr(),
+                tiny.len(),
+                &mut kind,
+                &mut error,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusFalse);
+        assert_eq!(error, StatorSnapshotErrorKind::StatorSnapshotErrorMalformed);
+    }
+
+    #[test]
+    fn test_snapshot_legacy_native_placeholder_unaffected() {
+        let cb: NativeFn = Rc::new(|_| Ok(JsValue::Smi(123)));
+        let mut globals = HashMap::new();
+        globals.insert("legacy_cb".to_owned(), JsValue::NativeFunction(cb));
+        let snap = stator_jse::snapshot::serialize_globals(&globals);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let status = unsafe {
+            stator_snapshot_blob_apply_to_context(
+                ctx,
+                snap.as_bytes().as_ptr(),
+                snap.as_bytes().len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, StatorStatus::StatorStatusOk);
+        match unsafe { (*ctx).globals.borrow().get("legacy_cb").cloned() } {
+            Some(JsValue::NativeFunction(f)) => assert_eq!(f(vec![]).unwrap(), JsValue::Undefined),
+            other => panic!("expected legacy placeholder native function, got {other:?}"),
+        }
+        unsafe { stator_context_destroy(ctx) };
     }
 }

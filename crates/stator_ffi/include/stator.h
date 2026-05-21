@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 12
+#define STATOR_FFI_ABI_VERSION_MINOR 13
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -628,6 +628,104 @@ typedef enum StatorStatus {
 } StatorStatus;
 
 /**
+ * Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+ */
+typedef enum StatorSnapshotBuildHashField {
+  /**
+   * Engine build fingerprint.
+   */
+  StatorSnapshotBuildHashBuildId = 0,
+  /**
+   * Cargo feature/cfg fingerprint.
+   */
+  StatorSnapshotBuildHashBuildFeatures = 1,
+  /**
+   * JIT/tiering configuration fingerprint.
+   */
+  StatorSnapshotBuildHashJitTiering = 2,
+  /**
+   * Required CPU feature fingerprint.
+   */
+  StatorSnapshotBuildHashCpuFeatures = 3,
+  /**
+   * Edge release metadata fingerprint.
+   */
+  StatorSnapshotBuildHashEdgeRelease = 4,
+} StatorSnapshotBuildHashField;
+
+/**
+ * Stable classification of a snapshot blob's outer envelope.
+ */
+typedef enum StatorSnapshotKind {
+  /**
+   * The blob is absent, too short, or has unrecognized magic bytes.
+   */
+  StatorSnapshotKindUnknown = 0,
+  /**
+   * Legacy globals-only startup snapshot (`STSS` v2).
+   */
+  StatorSnapshotKindStss = 1,
+  /**
+   * Manifest-aware globals snapshot (`STSM` v1).
+   */
+  StatorSnapshotKindStsm = 2,
+  /**
+   * Warm-context envelope (`STWC` v1) with build and manifest binding.
+   */
+  StatorSnapshotKindStwc = 3,
+} StatorSnapshotKind;
+
+/**
+ * Stable FFI-visible reason for snapshot validation or load failure.
+ */
+typedef enum StatorSnapshotErrorKind {
+  /**
+   * No error occurred.
+   */
+  StatorSnapshotErrorNone = 0,
+  /**
+   * A required pointer was null or the byte range was empty.
+   */
+  StatorSnapshotErrorInvalidArg = 1,
+  /**
+   * The blob magic bytes are not a supported snapshot envelope.
+   */
+  StatorSnapshotErrorUnknownMagic = 2,
+  /**
+   * The blob magic does not match the loader selected by its envelope.
+   */
+  StatorSnapshotErrorMagicMismatch = 3,
+  /**
+   * The snapshot format or bytecode version is unsupported.
+   */
+  StatorSnapshotErrorVersionMismatch = 4,
+  /**
+   * STWC build, ABI, platform, feature, or payload compatibility failed.
+   */
+  StatorSnapshotErrorCompatibilityMismatch = 5,
+  /**
+   * A checksum or digest mismatch was detected.
+   */
+  StatorSnapshotErrorDigestMismatch = 6,
+  /**
+   * STSM/STWC callback manifest digest or id set did not match.
+   */
+  StatorSnapshotErrorManifestMismatch = 7,
+  /**
+   * The blob asks for heap state this FFI/API slice cannot apply.
+   */
+  StatorSnapshotErrorUnsupported = 8,
+  /**
+   * The blob is malformed or truncated.
+   */
+  StatorSnapshotErrorMalformed = 9,
+  /**
+   * Full isolate/realm restoration is intentionally not claimed by this API.
+   */
+  StatorSnapshotErrorUnsupportedRuntimeHook = 10,
+} StatorSnapshotErrorKind;
+
+/**
  * C-ABI Wasm value kind used by host-import marshalling.
  *
  * Discriminants are stable and embedders may rely on them.
@@ -746,6 +844,8 @@ typedef enum StatorWeakParameterKind {
 } StatorWeakParameterKind;
 
 typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
+
+typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTemplateCallback;
 
 /**
  * An opaque handle to a CDP WebSocket server.
@@ -1029,6 +1129,21 @@ typedef struct StatorPropertyNames StatorPropertyNames;
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
  */
 typedef struct StatorScript StatorScript;
+
+/**
+ * STWC build/ABI binding used to fail closed on incompatible warm-context blobs.
+ */
+typedef struct StatorSnapshotBuildBinding StatorSnapshotBuildBinding;
+
+/**
+ * Mutable callback manifest used by STSM/STWC snapshot load and apply APIs.
+ */
+typedef struct StatorSnapshotManifest StatorSnapshotManifest;
+
+/**
+ * Owned result details for snapshot classification, validation, and application.
+ */
+typedef struct StatorSnapshotReport StatorSnapshotReport;
 
 /**
  * Owned UTF-8 string handle used by module resolver out-parameters.
@@ -5143,6 +5258,218 @@ void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
 enum StatorStatus stator_context_global_set_dom_object_wrap(struct StatorContext *ctx,
                                                             const char *name,
                                                             struct StatorDomObjectWrap *wrap);
+
+/**
+ * Create an empty snapshot callback manifest.
+ */
+struct StatorSnapshotManifest *stator_snapshot_manifest_create(void);
+
+/**
+ * Destroy a snapshot callback manifest. Passing null is a no-op.
+ *
+ * # Safety
+ * `manifest` must be null or a pointer returned by [`stator_snapshot_manifest_create`].
+ */
+void stator_snapshot_manifest_destroy(struct StatorSnapshotManifest *manifest);
+
+/**
+ * Register a callback id in a manifest using the function-template callback ABI.
+ *
+ * `ctx` may be null for validation-only manifests; callbacks restored from such
+ * a manifest return `undefined` if invoked. STSM/STWC runtime application should
+ * pass the target context so callbacks are reinstalled against that isolate.
+ *
+ * # Safety
+ * `manifest` must be valid, `id` must point to `id_len` bytes, and `callback`
+ * must remain callable while loaded snapshot globals may invoke it.
+ */
+enum StatorStatus stator_snapshot_manifest_register_native_function(struct StatorSnapshotManifest *manifest,
+                                                                    struct StatorContext *ctx,
+                                                                    const char *id,
+                                                                    size_t id_len,
+                                                                    struct Option_StatorFunctionTemplateCallback callback);
+
+/**
+ * Return the number of ids registered in `manifest`.
+ *
+ * # Safety
+ * `manifest` must be null or a valid manifest pointer.
+ */
+size_t stator_snapshot_manifest_len(const struct StatorSnapshotManifest *manifest);
+
+/**
+ * Construct an STWC build binding populated from the current FFI library.
+ */
+struct StatorSnapshotBuildBinding *stator_snapshot_build_binding_create_current(void);
+
+/**
+ * Destroy an STWC build binding. Passing null is a no-op.
+ *
+ * # Safety
+ * `binding` must be null or returned by [`stator_snapshot_build_binding_create_current`].
+ */
+void stator_snapshot_build_binding_destroy(struct StatorSnapshotBuildBinding *binding);
+
+/**
+ * Override a string field in an STWC build binding.
+ *
+ * `field` accepts `ffi_crate_ver`, `commit_id`, `target_triple`, `os`, `arch`,
+ * `cargo_profile`, or `engine_crate_ver`.
+ *
+ * # Safety
+ * `binding` must be valid and `value` must point to `value_len` UTF-8 bytes.
+ */
+enum StatorStatus stator_snapshot_build_binding_set_string(struct StatorSnapshotBuildBinding *binding,
+                                                           const char *field,
+                                                           size_t field_len,
+                                                           const char *value,
+                                                           size_t value_len);
+
+/**
+ * Override the packed FFI ABI version in an STWC build binding.
+ *
+ * # Safety
+ * `binding` must be valid.
+ */
+enum StatorStatus stator_snapshot_build_binding_set_ffi_abi_version(struct StatorSnapshotBuildBinding *binding,
+                                                                    uint32_t version);
+
+/**
+ * Override a 32-byte hash field in an STWC build binding.
+ *
+ * # Safety
+ * `binding` must be valid and `bytes32` must point to exactly 32 readable bytes.
+ */
+enum StatorStatus stator_snapshot_build_binding_set_hash(struct StatorSnapshotBuildBinding *binding,
+                                                         enum StatorSnapshotBuildHashField field,
+                                                         const uint8_t *bytes32);
+
+/**
+ * Classify a snapshot blob by magic bytes without fully decoding it.
+ *
+ * # Safety
+ * `data` must point to `len` readable bytes and out-pointers must be valid when non-null.
+ */
+enum StatorStatus stator_snapshot_blob_classify(const uint8_t *data,
+                                                size_t len,
+                                                enum StatorSnapshotKind *out_kind,
+                                                enum StatorSnapshotErrorKind *out_error,
+                                                struct StatorSnapshotReport **out_report);
+
+/**
+ * Validate and decode a snapshot blob without mutating runtime state.
+ *
+ * STSM and STWC require a matching callback manifest. STWC also requires a
+ * matching build binding; null binding means the current library defaults.
+ *
+ * # Safety
+ * Pointers must be valid for the duration of this call.
+ */
+enum StatorStatus stator_snapshot_blob_validate(const uint8_t *data,
+                                                size_t len,
+                                                const struct StatorSnapshotManifest *manifest,
+                                                const struct StatorSnapshotBuildBinding *binding,
+                                                struct StatorSnapshotReport **out_report);
+
+/**
+ * Apply a supported snapshot's globals to an existing context.
+ *
+ * This API intentionally restores the implemented globals state only. It does
+ * not claim complete warm-context realm/intrinsics restoration; embedders must
+ * still run the missing runtime hook before using STWC as a full mksnapshot
+ * equivalent.
+ *
+ * # Safety
+ * `ctx` must be valid and blob/manifest/binding pointers must remain valid.
+ */
+enum StatorStatus stator_snapshot_blob_apply_to_context(struct StatorContext *ctx,
+                                                        const uint8_t *data,
+                                                        size_t len,
+                                                        const struct StatorSnapshotManifest *manifest,
+                                                        const struct StatorSnapshotBuildBinding *binding,
+                                                        struct StatorSnapshotReport **out_report);
+
+/**
+ * Create a context and apply a supported snapshot blob's globals to it.
+ *
+ * Full warm-context realm creation remains unsupported; see the returned report
+ * and `docs/snapshot.md` for the missing runtime hook. On failure no context is
+ * returned.
+ *
+ * # Safety
+ * `isolate` must be valid and out/blob pointers must be valid when non-null.
+ */
+enum StatorStatus stator_context_new_from_snapshot_blob(struct StatorIsolate *isolate,
+                                                        const uint8_t *data,
+                                                        size_t len,
+                                                        const struct StatorSnapshotManifest *manifest,
+                                                        const struct StatorSnapshotBuildBinding *binding,
+                                                        struct StatorContext **out_context,
+                                                        struct StatorSnapshotReport **out_report);
+
+/**
+ * Create an isolate and context, then apply a supported snapshot blob's globals.
+ *
+ * `out_context` receives the created context on success. On failure both the
+ * context and isolate are destroyed and null is returned.
+ *
+ * # Safety
+ * Blob/manifest/binding/out pointers must be valid when non-null.
+ */
+struct StatorIsolate *stator_isolate_new_from_snapshot_blob(const uint8_t *data,
+                                                            size_t len,
+                                                            const struct StatorSnapshotManifest *manifest,
+                                                            const struct StatorSnapshotBuildBinding *binding,
+                                                            struct StatorContext **out_context,
+                                                            struct StatorSnapshotReport **out_report);
+
+/**
+ * Destroy a snapshot report. Passing null is a no-op.
+ *
+ * # Safety
+ * `report` must be null or a pointer returned through a snapshot API out-param.
+ */
+void stator_snapshot_report_destroy(struct StatorSnapshotReport *report);
+
+/**
+ * Return a report's snapshot kind.
+ *
+ * # Safety
+ * `report` must be null or valid.
+ */
+enum StatorSnapshotKind stator_snapshot_report_kind(const struct StatorSnapshotReport *report);
+
+/**
+ * Return a report's error kind.
+ *
+ * # Safety
+ * `report` must be null or valid.
+ */
+enum StatorSnapshotErrorKind stator_snapshot_report_error_kind(const struct StatorSnapshotReport *report);
+
+/**
+ * Return the compatibility/error field name, or an empty string.
+ *
+ * # Safety
+ * `report` must be null or valid.
+ */
+const char *stator_snapshot_report_field(const struct StatorSnapshotReport *report);
+
+/**
+ * Return the human-readable error message, or an empty string.
+ *
+ * # Safety
+ * `report` must be null or valid.
+ */
+const char *stator_snapshot_report_message(const struct StatorSnapshotReport *report);
+
+/**
+ * Return how many globals were decoded or applied by the snapshot operation.
+ *
+ * # Safety
+ * `report` must be null or valid.
+ */
+size_t stator_snapshot_report_applied_global_count(const struct StatorSnapshotReport *report);
 
 /**
  * Open a new handle scope on `isolate`.

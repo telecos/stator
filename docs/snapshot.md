@@ -4,7 +4,7 @@
 |----------|------------------------------------|
 | Status   | Draft, with strict deterministic `STSS`, manifest-aware `STSM`, and warm-context `STWC` v1 envelope support implemented |
 | Audience | Stator engine + Edge embedder team |
-| Scope    | `crates/stator_jse/src/snapshot/`, `crates/st8`, future `stator_ffi` snapshot FFI |
+| Scope    | `crates/stator_jse/src/snapshot/`, `crates/stator_ffi`, `crates/st8` |
 
 This document specifies the **warm-context startup snapshot** that Stator must
 provide to support Edge's mksnapshot-equivalent embedding flow.  It describes
@@ -62,9 +62,7 @@ The CLI driver (`crates/st8/src/main.rs`) exposes the flow as
    isolate-data version.  A snapshot built for one Stator build can be
    loaded into a structurally incompatible one as long as the format
    version matches.
-5. **No FFI surface.** `stator_ffi` does not expose any
-   snapshot-create / snapshot-load entry points; Edge cannot consume the
-   current capability without linking Rust directly.
+5. **FFI surface is additive and globals-only.** `stator_ffi` now exposes blob classification, fail-closed validation, and globals-state application for `STSS`, `STSM`, and `STWC`. It deliberately does not claim full realm/intrinsics restoration yet; Edge still needs the missing runtime hook described in section 8 before using `STWC` as a complete `mksnapshot` equivalent.
 6. **Legacy determinism is limited.** The legacy `serialize_globals` path keeps
    its lossy compatibility behavior and is not the Edge release-artifact
    contract.  The strict path described below is the deterministic entry point
@@ -469,10 +467,10 @@ created it.
 
 ---
 
-## 8. Proposed FFI / API shape (high level)
+## 8. Implemented FFI / API contract
 
-Final names are pending; this section fixes the *shape* the
-implementation slices must hit.
+This section records the exact additive C ABI surface currently shipped by
+`crates/stator_ffi`. The ABI minor is bumped for these public symbols.
 
 ### Rust (engine-internal)
 
@@ -528,42 +526,116 @@ impl Isolate {
 
 ### C ABI (`stator_ffi`)
 
-Mirroring the conventions in `crates/stator_ffi/src/lib.rs`:
+The implemented surface is intentionally conservative and fail-closed:
 
 ```text
-typedef struct StatorSnapshotManifest StatorSnapshotManifest;
-typedef struct StatorSnapshot         StatorSnapshot;
+typedef enum StatorSnapshotKind {
+  StatorSnapshotKindUnknown = 0,
+  StatorSnapshotKindStss    = 1,
+  StatorSnapshotKindStsm    = 2,
+  StatorSnapshotKindStwc    = 3,
+} StatorSnapshotKind;
+
+typedef enum StatorSnapshotErrorKind {
+  StatorSnapshotErrorNone                   = 0,
+  StatorSnapshotErrorInvalidArg             = 1,
+  StatorSnapshotErrorUnknownMagic           = 2,
+  StatorSnapshotErrorMagicMismatch          = 3,
+  StatorSnapshotErrorVersionMismatch        = 4,
+  StatorSnapshotErrorCompatibilityMismatch  = 5,
+  StatorSnapshotErrorDigestMismatch         = 6,
+  StatorSnapshotErrorManifestMismatch       = 7,
+  StatorSnapshotErrorUnsupported            = 8,
+  StatorSnapshotErrorMalformed              = 9,
+  StatorSnapshotErrorUnsupportedRuntimeHook = 10,
+} StatorSnapshotErrorKind;
 
 StatorSnapshotManifest* stator_snapshot_manifest_create(void);
-void                    stator_snapshot_manifest_destroy(StatorSnapshotManifest*);
-StatorStatus            stator_snapshot_manifest_register(
-                            StatorSnapshotManifest*,
-                            const char* id,
-                            StatorNativeCallback cb,
-                            void* data);
+void stator_snapshot_manifest_destroy(StatorSnapshotManifest*);
+StatorStatus stator_snapshot_manifest_register_native_function(
+    StatorSnapshotManifest*, StatorContext*, const char* id, size_t id_len,
+    StatorFunctionTemplateCallback callback);
+size_t stator_snapshot_manifest_len(const StatorSnapshotManifest*);
 
-StatorStatus            stator_snapshot_create(
-                            StatorIsolate*,
-                            StatorContext*,
-                            const StatorSnapshotManifest*,
-                            StatorSnapshot** out);
-void                    stator_snapshot_destroy(StatorSnapshot*);
+StatorSnapshotBuildBinding* stator_snapshot_build_binding_create_current(void);
+void stator_snapshot_build_binding_destroy(StatorSnapshotBuildBinding*);
+StatorStatus stator_snapshot_build_binding_set_string(
+    StatorSnapshotBuildBinding*, const char* field, size_t field_len,
+    const char* value, size_t value_len);
+StatorStatus stator_snapshot_build_binding_set_ffi_abi_version(
+    StatorSnapshotBuildBinding*, uint32_t version);
+StatorStatus stator_snapshot_build_binding_set_hash(
+    StatorSnapshotBuildBinding*, StatorSnapshotBuildHashField, const uint8_t bytes32[32]);
 
-const uint8_t*          stator_snapshot_bytes(const StatorSnapshot*, size_t* out_len);
-StatorStatus            stator_snapshot_from_bytes(const uint8_t*, size_t, StatorSnapshot** out);
+StatorStatus stator_snapshot_blob_classify(
+    const uint8_t* data, size_t len,
+    StatorSnapshotKind* out_kind,
+    StatorSnapshotErrorKind* out_error,
+    StatorSnapshotReport** out_report);
+StatorStatus stator_snapshot_blob_validate(
+    const uint8_t* data, size_t len,
+    const StatorSnapshotManifest*, const StatorSnapshotBuildBinding*,
+    StatorSnapshotReport** out_report);
+StatorStatus stator_snapshot_blob_apply_to_context(
+    StatorContext*, const uint8_t* data, size_t len,
+    const StatorSnapshotManifest*, const StatorSnapshotBuildBinding*,
+    StatorSnapshotReport** out_report);
+StatorStatus stator_context_new_from_snapshot_blob(
+    StatorIsolate*, const uint8_t* data, size_t len,
+    const StatorSnapshotManifest*, const StatorSnapshotBuildBinding*,
+    StatorContext** out_context, StatorSnapshotReport** out_report);
+StatorIsolate* stator_isolate_new_from_snapshot_blob(
+    const uint8_t* data, size_t len,
+    const StatorSnapshotManifest*, const StatorSnapshotBuildBinding*,
+    StatorContext** out_context, StatorSnapshotReport** out_report);
 
-StatorStatus            stator_isolate_create_with_snapshot(
-                            const StatorSnapshot*,
-                            const StatorSnapshotManifest*,
-                            StatorIsolate** out);
+void stator_snapshot_report_destroy(StatorSnapshotReport*);
+StatorSnapshotKind stator_snapshot_report_kind(const StatorSnapshotReport*);
+StatorSnapshotErrorKind stator_snapshot_report_error_kind(const StatorSnapshotReport*);
+const char* stator_snapshot_report_field(const StatorSnapshotReport*);
+const char* stator_snapshot_report_message(const StatorSnapshotReport*);
+size_t stator_snapshot_report_applied_global_count(const StatorSnapshotReport*);
 ```
 
-All names are prefixed `stator_`, all opaque types use
-`#[repr(C)] _opaque: [u8; 0]`, the header is regenerated by
-`cbindgen`, and `STATOR_FFI_ABI_VERSION` is bumped exactly once when
-this surface lands.  No FFI symbol added here may be called from
-the load path before header validation succeeds.
+Supported modes today:
 
+- `STSS`: classify, validate/decode, apply globals to an existing or newly
+  created context. Legacy lossy native-function placeholder behavior is
+  preserved.
+- `STSM`: classify, validate/decode, and apply globals only when a non-null
+  `StatorSnapshotManifest` has the exact same sorted id set and digest as the
+  blob. Missing or extra ids fail with
+  `StatorSnapshotErrorManifestMismatch` before any globals are installed.
+- `STWC`: classify, validate/decode, and apply globals only when both the
+  callback manifest and `StatorSnapshotBuildBinding` match the blob. Magic,
+  snapshot/bytecode version, FFI ABI version, crate versions, target metadata,
+  build/feature/JIT/CPU/Edge hashes, payload length, digest, and manifest
+  mismatches surface as stable `StatorSnapshotErrorKind` values with
+  `stator_snapshot_report_field()` naming the failed compatibility key.
+
+`stator_context_new_from_snapshot_blob` and
+`stator_isolate_new_from_snapshot_blob` are convenience wrappers around context
+creation plus globals application. They do **not** create a complete warm realm:
+intrinsics/prototype topology, module cache, hidden-class state, and embedder
+realm hooks are still not restored by a runtime hook. Consumers must treat STWC
+through FFI as validated release-artifact globals state, not as full V8-style
+`SnapshotCreator` parity.
+
+#### Edge usage sketch
+
+1. Build a load-time `StatorSnapshotManifest` and register every callback id used
+   by the release artifact, passing the target context to
+   `stator_snapshot_manifest_register_native_function` so callbacks are
+   reinstalled against that isolate.
+2. Create a `StatorSnapshotBuildBinding` from current defaults and override the
+   Edge-provided commit/build/feature/JIT/CPU/release hashes that were stamped at
+   snapshot creation time.
+3. Call `stator_snapshot_blob_classify` for telemetry/routing, then
+   `stator_snapshot_blob_validate` to fail closed before mutating runtime state.
+4. Call `stator_context_new_from_snapshot_blob` or
+   `stator_snapshot_blob_apply_to_context`. On non-`Ok`, inspect
+   `StatorSnapshotReport` and reject the artifact; do not fall back to partial
+   warm-context state.
 ### CLI (`st8`)
 
 Add `st8 --emit-warm-snapshot=<path> [--warmup=<file.js>]` and
