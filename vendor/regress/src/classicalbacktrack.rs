@@ -74,6 +74,16 @@ pub(crate) struct MatchAttempter<'a, Input: InputIndexer> {
     re: &'a CompiledRegex,
     bts: Vec<BacktrackInsn<Input>>,
     s: State<Input::Position>,
+    /// Optional deterministic step budget. `None` means unlimited (the
+    /// default behaviour). When `Some(n)`, the matcher decrements the
+    /// counter on every `try_at_pos` dispatch step and every
+    /// `try_backtrack` iteration. When the counter reaches zero further
+    /// work is suppressed and `budget_exhausted` is set.
+    budget_remaining: Option<u64>,
+    /// Set to `true` when the matcher gave up early because the supplied
+    /// step budget was exhausted. Callers should consult this flag after a
+    /// failed match to distinguish "no match" from "out of budget".
+    budget_exhausted: bool,
 }
 
 impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
@@ -85,7 +95,24 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 loops: vec![LoopData::new(entry); re.loops as usize],
                 groups: vec![GroupData::new(); re.groups as usize],
             },
+            budget_remaining: None,
+            budget_exhausted: false,
         }
+    }
+
+    /// Returns `true` if there is still budget remaining (or the matcher
+    /// has no budget cap), `false` if the budget has just been exhausted.
+    /// Each call costs one budget unit when a budget is in effect.
+    #[inline(always)]
+    fn step_budget(&mut self) -> bool {
+        if let Some(rem) = self.budget_remaining.as_mut() {
+            if *rem == 0 {
+                self.budget_exhausted = true;
+                return false;
+            }
+            *rem -= 1;
+        }
+        true
     }
 
     #[inline(always)]
@@ -509,6 +536,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         _dir: Dir,
     ) -> bool {
         loop {
+            if !self.step_budget() {
+                return false;
+            }
             // We always have a single Exhausted instruction backstopping our stack,
             // so we do not need to check for empty bts.
             debug_assert!(!self.bts.is_empty(), "Backtrack stack should not be empty");
@@ -652,6 +682,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         // to.
         #[allow(clippy::never_loop)]
         'nextinsn: loop {
+            if !self.step_budget() {
+                return None;
+            }
             'backtrack: loop {
                 // Helper macro to either increment ip and go to the next insn, or backtrack.
                 macro_rules! next_or_bt {
@@ -993,8 +1026,12 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             if self.try_backtrack(input, &mut ip, &mut pos, dir) {
                 continue 'nextinsn;
             } else {
-                // We have exhausted the backtracking stack.
-                debug_assert!(self.bts.len() == 1, "Should have exhausted backtrack stack");
+                // We have exhausted the backtracking stack (or the matcher
+                // ran out of step budget — see `step_budget`).
+                debug_assert!(
+                    self.budget_exhausted || self.bts.len() == 1,
+                    "Should have exhausted backtrack stack"
+                );
                 return None;
             }
         }
@@ -1023,6 +1060,26 @@ impl<'r, Input: InputIndexer> BacktrackExecutor<'r, Input> {
 }
 
 impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
+    /// Sets the deterministic step budget for this executor's matcher.
+    ///
+    /// The matcher will give up early once `budget` dispatch steps have
+    /// been consumed without producing a match decision; callers can then
+    /// observe the abort via [`Self::budget_exhausted`]. Calling this
+    /// method also clears any previous `budget_exhausted` flag.
+    #[inline]
+    pub fn set_budget(&mut self, budget: u64) {
+        self.matcher.budget_remaining = Some(budget);
+        self.matcher.budget_exhausted = false;
+    }
+
+    /// Returns `true` if the matcher gave up on the most recent attempt
+    /// because the configured step budget was exhausted (see
+    /// [`Self::set_budget`]).
+    #[inline]
+    pub fn budget_exhausted(&self) -> bool {
+        self.matcher.budget_exhausted
+    }
+
     fn successful_match(&mut self, start: Input::Position, end: Input::Position) -> Match {
         // We want to simultaneously map our groups to offsets, and clear the groups.
         // A for loop is the easiest way to do this while satisfying the borrow checker.

@@ -491,6 +491,10 @@ typedef enum StatorPromiseRejectionEventKind {
   StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
 } StatorPromiseRejectionEventKind;
 
+typedef struct Option_StatorModuleUrlResolverCallback Option_StatorModuleUrlResolverCallback;
+
+typedef struct Option_StatorUserDataFreeCallback Option_StatorUserDataFreeCallback;
+
 /**
  * An opaque handle to a CDP WebSocket server.
  *
@@ -1511,6 +1515,28 @@ typedef enum StatorResolveStatus (*StatorModuleResolverCallback)(struct StatorCo
                                                                  struct StatorString **out_error);
 
 /**
+ * Synchronous host callback used to canonicalise an import specifier to a URL.
+ *
+ * Browser embedders can use this hook for import-map, base-URL, CSP,
+ * credentials, and referrer-policy logic. On success the host writes a
+ * canonical resolved module URL through `out_resolved_url` using a
+ * [`StatorString`] allocated by [`stator_string_new`]. On failure the host
+ * returns a non-`Ok` status and may write an owned diagnostic through
+ * `out_error`. Stator consumes and frees any non-null out strings after the
+ * callback returns.
+ */
+typedef enum StatorResolveStatus (*StatorModuleUrlResolverCallback)(struct StatorContext *ctx,
+                                                                    void *user_data,
+                                                                    const struct StatorModule *referrer,
+                                                                    const struct StatorModuleOrigin *origin,
+                                                                    const char *specifier,
+                                                                    size_t specifier_len,
+                                                                    const struct StatorImportAttribute *attributes,
+                                                                    size_t attributes_len,
+                                                                    struct StatorString **out_resolved_url,
+                                                                    struct StatorString **out_error);
+
+/**
  * Synchronous host-function callback used to fulfil a Wasm import.
  *
  * Invoked synchronously on the thread running the Wasm caller.  Returns
@@ -2138,6 +2164,27 @@ bool stator_context_set_module_resolver(struct StatorContext *ctx,
                                                                              struct StatorString **out_error),
                                         void *user_data,
                                         void (*free_user_data)(void *user_data));
+
+/**
+ * Register, replace, or clear the module URL resolver callback for `ctx`.
+ *
+ * When installed, the callback is invoked before static module resolution,
+ * dynamic `import()`, and `import.meta.resolve`. It must return a canonical
+ * resolved URL or a structured [`StatorResolveStatus`] failure. Failures are
+ * propagated without falling back to the raw specifier or invoking the module
+ * resolver.
+ *
+ * Returns `true` on successful registration or clear, and `false` for a null
+ * context or malformed clear request.
+ *
+ * # Safety
+ * The callback and `user_data` lifetime rules match
+ * [`stator_context_set_module_resolver`].
+ */
+bool stator_context_set_module_url_resolver(struct StatorContext *ctx,
+                                            struct Option_StatorModuleUrlResolverCallback callback,
+                                            void *user_data,
+                                            struct Option_StatorUserDataFreeCallback free_user_data);
 
 /**
  * Create a new number value.

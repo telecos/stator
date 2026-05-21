@@ -278,8 +278,9 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_test);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                // Use exec internally so we can capture match data for statics.
-                let matched = re_test_exec.exec(&input);
+                // Use try_exec internally so we can capture match data for
+                // statics and propagate termination / step-budget exhaustion.
+                let matched = re_test_exec.try_exec(&input)?;
                 if let Some(ref m) = matched {
                     update_regexp_statics(m);
                 }
@@ -298,7 +299,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_exec);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = match re_exec.exec(&input) {
+                let result = match re_exec.try_exec(&input)? {
                     Some(m) => {
                         update_regexp_statics(&m);
                         match_to_js(&m)

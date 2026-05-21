@@ -41,6 +41,72 @@ use crate::builtins::string::{decode_utf16, encode_utf16};
 use crate::error::{StatorError, StatorResult};
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Deterministic per-call regress execution-step budget
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Default deterministic step budget applied to every host-visible regress
+/// matcher invocation.
+///
+/// The budget caps the unbounded backtracking that the `regress` engine
+/// can perform inside a single `find_from` call. Without this cap a
+/// pathological pattern such as `^(a+)+b$` against a long run of `'a'`
+/// could spin in engine-internal backtracking for an unbounded amount
+/// of time, never returning to the Stator interpreter where the
+/// embedder-published termination flag would be observed.
+///
+/// The chosen budget is deliberately generous: well-behaved patterns
+/// finish in a handful of steps and never approach it, while truly
+/// catastrophic patterns exhaust it in well under a second of CPU time.
+/// See `docs/termination_polling_gap_matrix.md`.
+const DEFAULT_REGRESS_STEP_BUDGET: u64 = 10_000_000;
+
+std::thread_local! {
+    /// Per-thread override for [`DEFAULT_REGRESS_STEP_BUDGET`]. `0` means
+    /// "use the default". Tests set this to a tiny value to deterministically
+    /// trigger budget exhaustion without depending on wall-clock timing.
+    static REGRESS_STEP_BUDGET_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn regress_step_budget() -> u64 {
+    let v = REGRESS_STEP_BUDGET_OVERRIDE.with(|c| c.get());
+    if v == 0 {
+        DEFAULT_REGRESS_STEP_BUDGET
+    } else {
+        v
+    }
+}
+
+/// Test/debugging helper: temporarily override the per-thread regress
+/// step budget for the duration of `f`. Restores the previous value
+/// (typically `0`, meaning "use default") even on panic.
+#[doc(hidden)]
+pub fn with_regress_step_budget<R>(budget: u64, f: impl FnOnce() -> R) -> R {
+    let prev = REGRESS_STEP_BUDGET_OVERRIDE.with(|c| c.replace(budget));
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let v = self.0;
+            REGRESS_STEP_BUDGET_OVERRIDE.with(|c| c.set(v));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Result type returned by the internal budgeted-find helper.
+///
+/// `Exhausted` is distinct from `NotFound` so the caller can decide
+/// whether to surface a `script execution terminated` error (when the
+/// caller has a `StatorResult` channel) or just treat the matcher as
+/// having given up (when the caller can only return `Option`).
+enum BudgetedFind {
+    Found(regress::Match),
+    NotFound,
+    Exhausted,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // RegExpFlags
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -351,6 +417,19 @@ impl JsRegExp {
     }
 
     fn exec_inner(&self, input: &str) -> Option<RegExpMatch> {
+        // Budget exhaustion (or a published interrupt) cannot be
+        // surfaced through this `Option`-typed legacy entry point;
+        // treat the matcher as having found no match. The remaining
+        // `try_*` entry points propagate the canonical termination
+        // error.
+        self.try_exec_inner(input).unwrap_or_default()
+    }
+
+    /// Like [`Self::exec_inner`] but propagates termination/budget
+    /// exhaustion as a Stator error instead of silently returning
+    /// `None`. Used by the host-facing `try_exec`/`try_test` entry
+    /// points and by every `try_symbol_*` wrapper.
+    fn try_exec_inner(&self, input: &str) -> StatorResult<Option<RegExpMatch>> {
         let is_stateful = self
             .flags
             .intersects(RegExpFlags::GLOBAL | RegExpFlags::STICKY);
@@ -365,46 +444,95 @@ impl JsRegExp {
             if is_stateful {
                 self.last_index.set(0);
             }
-            return None;
+            return Ok(None);
         }
 
         if self.pattern == "." {
-            return self.exec_dot_pattern(input, start, is_stateful);
+            return Ok(self.exec_dot_pattern(input, start, is_stateful));
         }
 
-        let m = if self.flags.contains(RegExpFlags::STICKY) {
-            // Sticky: only match at exactly `start`.
-            self.compiled
-                .find_from(input, start)
-                .next()
-                .filter(|m| m.start() == start)
-        } else {
-            self.compiled.find_from(input, start).next()
-        };
-
-        match m {
+        let mat = match self.budgeted_find_first(input, start)? {
+            Some(m) => m,
             None => {
                 if is_stateful {
                     self.last_index.set(0);
                 }
-                None
+                return Ok(None);
             }
-            Some(mat) => {
-                if is_stateful {
-                    // For zero-width matches in global/sticky mode, advance
-                    // `lastIndex` past the current position so the next call
-                    // makes progress and we don't loop forever on patterns
-                    // like /(?:)/g or /^/gm (ECMA-262 §22.2.7.2 RegExpBuiltinExec).
-                    self.last_index
-                        .set(advance_after_match(input, mat.start(), mat.end()));
-                }
-                Some(build_match(
-                    input,
-                    &mat,
-                    self.flags.contains(RegExpFlags::HAS_INDICES),
-                ))
+        };
+
+        if self.flags.contains(RegExpFlags::STICKY) && mat.start() != start {
+            if is_stateful {
+                self.last_index.set(0);
             }
+            return Ok(None);
         }
+
+        if is_stateful {
+            // For zero-width matches in global/sticky mode, advance
+            // `lastIndex` past the current position so the next call
+            // makes progress and we don't loop forever on patterns
+            // like /(?:)/g or /^/gm (ECMA-262 §22.2.7.2 RegExpBuiltinExec).
+            self.last_index
+                .set(advance_after_match(input, mat.start(), mat.end()));
+        }
+        Ok(Some(build_match(
+            input,
+            &mat,
+            self.flags.contains(RegExpFlags::HAS_INDICES),
+        )))
+    }
+
+    /// Run the compiled regex once starting at `start`, with the
+    /// configured per-call step budget. On budget exhaustion this
+    /// returns the canonical `script execution terminated` error
+    /// (regardless of whether the embedder has actually requested
+    /// termination — see the rationale on
+    /// [`DEFAULT_REGRESS_STEP_BUDGET`]).
+    ///
+    /// This is the single funnel through which every host-visible
+    /// regress match call flows, so that the engine-internal
+    /// backtracking surface is uniformly bounded.
+    fn budgeted_find_first(
+        &self,
+        input: &str,
+        start: usize,
+    ) -> StatorResult<Option<regress::Match>> {
+        match self.budgeted_find_first_raw(input, start) {
+            BudgetedFind::Found(m) => Ok(Some(m)),
+            BudgetedFind::NotFound => Ok(None),
+            BudgetedFind::Exhausted => Err(crate::interpreter::script_terminated_error()),
+        }
+    }
+
+    /// Lower-level variant that distinguishes budget exhaustion from
+    /// "no match" without yet mapping the result into a Stator error.
+    fn budgeted_find_first_raw(&self, input: &str, start: usize) -> BudgetedFind {
+        let budget = regress_step_budget();
+        match self.compiled.find_from_with_budget(input, start, budget) {
+            Ok(Some(m)) => BudgetedFind::Found(m),
+            Ok(None) => BudgetedFind::NotFound,
+            Err(_) => BudgetedFind::Exhausted,
+        }
+    }
+
+    /// Cancellable counterpart of [`Self::exec`].
+    ///
+    /// Propagates the canonical `script execution terminated` error if
+    /// the host has set the interrupt flag *or* the per-call regress
+    /// step budget was exhausted, otherwise returns the match (or
+    /// `None`) just like [`Self::exec`].
+    pub fn try_exec(&self, input: &str) -> StatorResult<Option<RegExpMatch>> {
+        // Honour an already-published interrupt before doing any work.
+        if crate::interpreter::check_interrupt_flag() {
+            return Err(crate::interpreter::script_terminated_error());
+        }
+        stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || self.try_exec_inner(input))
+    }
+
+    /// Cancellable counterpart of [`Self::test`].
+    pub fn try_test(&self, input: &str) -> StatorResult<bool> {
+        Ok(self.try_exec(input)?.is_some())
     }
 
     fn exec_dot_pattern(
@@ -745,12 +873,10 @@ impl JsRegExp {
                 break;
             }
             let m = if self.flags.contains(RegExpFlags::STICKY) {
-                self.compiled
-                    .find_from(input, start)
-                    .next()
+                self.budgeted_find_first(input, start)?
                     .filter(|m| m.start() == start)
             } else {
-                self.compiled.find_from(input, start).next()
+                self.budgeted_find_first(input, start)?
             };
             match m {
                 None => {
@@ -791,12 +917,10 @@ impl JsRegExp {
                 break;
             }
             let m = if self.flags.contains(RegExpFlags::STICKY) {
-                self.compiled
-                    .find_from(input, start)
-                    .next()
+                self.budgeted_find_first(input, start)?
                     .filter(|m| m.start() == start)
             } else {
-                self.compiled.find_from(input, start).next()
+                self.budgeted_find_first(input, start)?
             };
             match m {
                 None => {
@@ -841,9 +965,7 @@ impl JsRegExp {
         while search_index < input.len() {
             regexp_poll_termination()?;
             let matched = self
-                .compiled
-                .find_from(input, search_index)
-                .next()
+                .budgeted_find_first(input, search_index)?
                 .filter(|mat| mat.start() == search_index);
 
             let Some(mat) = matched else {
@@ -891,12 +1013,10 @@ impl JsRegExp {
                 break;
             }
             let m = if self.flags.contains(RegExpFlags::STICKY) {
-                self.compiled
-                    .find_from(input, start)
-                    .next()
+                self.budgeted_find_first(input, start)?
                     .filter(|m| m.start() == start)
             } else {
-                self.compiled.find_from(input, start).next()
+                self.budgeted_find_first(input, start)?
             };
             match m {
                 None => break,
@@ -2335,5 +2455,97 @@ mod tests {
             assert_eq!(x.matched, y.matched);
             assert_eq!(x.index, y.index);
         }
+    }
+
+    #[test]
+    fn test_try_exec_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_exec(&input).expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE),
+            "expected script-terminated error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_try_test_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_test(&input).expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_try_symbol_match_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "g").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_symbol_match(&input)
+                .expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_try_symbol_replace_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "g").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_symbol_replace(&input, "x")
+                .expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_try_symbol_split_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_symbol_split(&input, None)
+                .expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_try_symbol_match_all_observes_budget_exhaustion() {
+        let re = JsRegExp::new(r"^(a+)+b$", "g").unwrap();
+        let input = "a".repeat(32);
+        let err = with_regress_step_budget(1_000, || {
+            re.try_symbol_match_all(&input)
+                .expect_err("should exhaust budget")
+        });
+        assert!(
+            err.to_string()
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_normal_pattern_unaffected_by_default_budget() {
+        let re = JsRegExp::new(r"hello", "").unwrap();
+        let m = re.try_exec("say hello world").expect("ok");
+        assert!(m.is_some());
+        let m2 = re.try_exec("nothing here").expect("ok");
+        assert!(m2.is_none());
     }
 }

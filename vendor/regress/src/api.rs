@@ -29,6 +29,25 @@ use {
 
 pub use parse::Error;
 
+/// Error returned by [`Regex::find_from_with_budget`] when the regex
+/// engine consumed the supplied deterministic step budget before it
+/// could decide whether a match was present at the requested location.
+///
+/// The error carries no payload because budget exhaustion is intentionally
+/// opaque: callers should treat the result as "this search did not
+/// complete; try again with a larger budget or abort".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BudgetExhausted;
+
+impl fmt::Display for BudgetExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("regress: regex execution-step budget exhausted")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BudgetExhausted {}
+
 /// Flags used to control regex parsing.
 /// The default flags are case-sensitive, not-multiline, and optimizing.
 #[derive(Debug, Copy, Clone, Default)]
@@ -452,6 +471,57 @@ impl Regex {
     #[inline]
     pub fn find_from<'r, 't>(&'r self, text: &'t str, start: usize) -> Matches<'r, 't> {
         backends::find(self, text, start)
+    }
+
+    /// Searches `text` for the next match starting at byte index `start`,
+    /// bounded by a deterministic execution-step budget.
+    ///
+    /// `budget` counts the number of internal dispatch and backtracking
+    /// steps the engine is allowed to take. The exact units are
+    /// implementation-defined but are deterministic for a given
+    /// `(pattern, text, start, budget)` tuple, so the same call always
+    /// either succeeds, returns `Ok(None)`, or returns
+    /// [`Err(BudgetExhausted)`](BudgetExhausted).
+    ///
+    /// This is the supported way to ensure a single regex evaluation
+    /// cannot spend unbounded time inside the matcher when an embedder
+    /// needs to remain responsive to external interrupts. On exhaustion
+    /// the engine returns control immediately without producing a
+    /// partial match.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use regress::{Regex, BudgetExhausted};
+    /// // A classic catastrophic-backtracking pattern.
+    /// let re = Regex::new(r"^(a+)+b$").unwrap();
+    /// let input: String = std::iter::repeat('a').take(28).collect();
+    /// // With a tiny budget the engine bails out instead of looping.
+    /// assert!(matches!(
+    ///     re.find_from_with_budget(&input, 0, 1_000),
+    ///     Err(BudgetExhausted),
+    /// ));
+    /// ```
+    pub fn find_from_with_budget(
+        &self,
+        text: &str,
+        start: usize,
+        budget: u64,
+    ) -> Result<Option<Match>, BudgetExhausted> {
+        use crate::exec::{Executor, MatchProducer};
+        let mut executor =
+            <backends::DefaultExecutor<'_, '_> as Executor<'_, '_>>::new(&self.cr, text);
+        executor.set_budget(budget);
+        let Some(pos) = executor.initial_position(start) else {
+            return Ok(None);
+        };
+        let mut next_start = None;
+        let m = executor.next_match(pos, &mut next_start);
+        if executor.budget_exhausted() {
+            Err(BudgetExhausted)
+        } else {
+            Ok(m)
+        }
     }
 
     /// Searches `text` to find the first match.

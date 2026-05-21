@@ -74,6 +74,10 @@ name = "tests"
 path = "tests/tests.rs"
 
 [[test]]
+name = "budget_tests"
+path = "tests/budget_tests.rs"
+
+[[test]]
 name = "unicode_property_escapes"
 path = "tests/unicode_property_escapes.rs"
 
