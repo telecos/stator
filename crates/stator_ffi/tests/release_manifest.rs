@@ -79,6 +79,97 @@ const REQUIRED_DIAGNOSTIC_CODES: &[&str] = &[
     "unsupported_native_code",
 ];
 
+/// Canonical mapping from every key-schema field documented in
+/// `docs/code_cache.md` ("Rejection diagnostics and telemetry codes") to
+/// the telemetry diagnostic code that restore APIs must emit when that
+/// field is the first mismatch. Edge release manifests and the runtime
+/// cache restore paths must agree on this exact table; corruption,
+/// duplicate fields, duplicate map keys, invalid enum tokens, bad
+/// lengths, or non-canonical encodings must use `corrupt_payload`
+/// instead of any of the codes below.
+///
+/// This list is the authoritative compile-time contract: any change
+/// must be made here and in `docs/code_cache.md` together, and the
+/// `test_field_diagnostic_map_matches_docs` test enforces parity.
+const FIELD_TO_DIAGNOSTIC_CODE: &[(&str, &str)] = &[
+    ("artifact_type", "rejected_artifact_type"),
+    ("artifact_scope", "rejected_artifact_type"),
+    ("artifact_subtype", "rejected_artifact_type"),
+    ("cache_producer", "rejected_release_artifact"),
+    ("cache_schema_version", "rejected_schema_version"),
+    ("stator_jse_crate_version", "rejected_engine_version"),
+    ("stator_jse_ffi_crate_version", "rejected_engine_version"),
+    ("stator_ffi_abi_version", "rejected_engine_version"),
+    ("bytecode_format_version", "rejected_format_version"),
+    ("module_cache_format_version", "rejected_format_version"),
+    ("script_cache_format_version", "rejected_format_version"),
+    ("baseline_code_format_version", "rejected_format_version"),
+    ("jit_code_format_version", "rejected_format_version"),
+    ("snapshot_format_version", "rejected_format_version"),
+    ("parser_ast_format_version", "rejected_format_version"),
+    ("compiler_ir_format_version", "rejected_format_version"),
+    ("c_header_generation_id", "rejected_release_artifact"),
+    ("source_hash_algorithm", "rejected_source_identity"),
+    ("source_hash", "rejected_source_identity"),
+    ("source_length_bytes", "rejected_source_identity"),
+    ("source_encoding", "rejected_source_identity"),
+    ("resource_url", "rejected_source_identity"),
+    ("source_url", "rejected_source_identity"),
+    ("source_origin", "rejected_source_identity"),
+    ("base_url", "rejected_source_identity"),
+    ("referrer_url", "rejected_embedder_policy"),
+    ("integrity_metadata", "rejected_embedder_policy"),
+    ("credentials_mode", "rejected_embedder_policy"),
+    ("referrer_policy", "rejected_embedder_policy"),
+    ("line_offset", "rejected_source_identity"),
+    ("column_offset", "rejected_source_identity"),
+    ("source_map_url", "rejected_source_identity"),
+    ("host_defined_options_hash", "rejected_embedder_policy"),
+    ("compile_options_hash", "rejected_compiler_flags"),
+    ("module_type", "rejected_parser_flags"),
+    ("module_request_count", "rejected_source_identity"),
+    ("module_requests_hash", "rejected_source_identity"),
+    ("import_attributes_hash", "rejected_embedder_policy"),
+    ("import_policy_hash", "rejected_embedder_policy"),
+    ("import_map_epoch", "rejected_embedder_policy"),
+    ("resolution_base_url", "rejected_source_identity"),
+    ("strict_mode_policy", "rejected_parser_flags"),
+    ("script_kind", "rejected_parser_flags"),
+    ("language_mode", "rejected_parser_flags"),
+    ("parse_goal", "rejected_parser_flags"),
+    ("enable_top_level_await", "rejected_parser_flags"),
+    ("enable_import_meta", "rejected_parser_flags"),
+    ("parser_feature_bits", "rejected_parser_flags"),
+    ("bytecode_feature_bits", "rejected_compiler_flags"),
+    ("compiler_feature_bits", "rejected_compiler_flags"),
+    ("jit_enabled", "rejected_compiler_flags"),
+    ("tiering_mode", "rejected_compiler_flags"),
+    ("optimization_level", "rejected_compiler_flags"),
+    ("debug_instrumentation", "rejected_compiler_flags"),
+    ("profiling_instrumentation", "rejected_compiler_flags"),
+    ("sandbox_mode", "rejected_embedder_policy"),
+    ("target_arch", "rejected_platform"),
+    ("target_os", "rejected_platform"),
+    ("target_env", "rejected_platform"),
+    ("target_pointer_width", "rejected_platform"),
+    ("endianness", "rejected_platform"),
+    ("cpu_vendor", "rejected_platform"),
+    ("cpu_family_model_stepping", "rejected_platform"),
+    ("cpu_feature_set", "rejected_platform"),
+    ("rustc_version", "rejected_build_features"),
+    ("llvm_version", "rejected_build_features"),
+    ("cargo_profile", "rejected_build_features"),
+    ("build_feature_set", "rejected_build_features"),
+    ("link_time_optimization", "rejected_build_features"),
+    ("panic_strategy", "rejected_build_features"),
+    ("edge_channel", "rejected_release_artifact"),
+    ("edge_build_id", "rejected_release_artifact"),
+    ("snapshot_digest", "rejected_snapshot"),
+    ("snapshot_build_id", "rejected_snapshot"),
+    ("snapshot_feature_set", "rejected_snapshot"),
+    ("snapshot_context_kind", "rejected_snapshot"),
+];
+
 /// Hash algorithms accepted for canonical key hashing. Per
 /// `docs/code_cache.md` Section "Canonical serialization", the first
 /// supported algorithm is `sha256`; non-cryptographic checksums are not
@@ -639,4 +730,125 @@ fn test_validate_rejects_missing_field_allowlist() {
         .unwrap()
         .remove("field_allowlist");
     assert_err_contains(&m, "telemetry.field_allowlist");
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics contract: ensure the validator's required code list and the
+// field-to-code map stay synchronized with docs/code_cache.md, and that the
+// fail-closed digest/signature checks reject every malformed shape Edge can
+// produce (uppercase hex, odd-length hex, non-hex bytes, missing signature
+// value).
+// ---------------------------------------------------------------------------
+
+/// Path to `docs/code_cache.md` relative to this crate's `CARGO_MANIFEST_DIR`.
+const CODE_CACHE_DOC: &str = "../../docs/code_cache.md";
+
+fn read_code_cache_doc() -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(manifest_dir).join(CODE_CACHE_DOC);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+#[test]
+fn test_field_diagnostic_map_codes_are_all_required() {
+    for (field, code) in FIELD_TO_DIAGNOSTIC_CODE {
+        assert!(
+            REQUIRED_DIAGNOSTIC_CODES.contains(code),
+            "field '{field}' maps to code '{code}' which is not in REQUIRED_DIAGNOSTIC_CODES",
+        );
+    }
+}
+
+#[test]
+fn test_field_diagnostic_map_is_unique() {
+    for (i, (field, _)) in FIELD_TO_DIAGNOSTIC_CODE.iter().enumerate() {
+        for (j, (other, _)) in FIELD_TO_DIAGNOSTIC_CODE.iter().enumerate() {
+            if i != j {
+                assert_ne!(
+                    field, other,
+                    "field '{field}' appears more than once in FIELD_TO_DIAGNOSTIC_CODE",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_required_diagnostic_codes_match_docs() {
+    let doc = read_code_cache_doc();
+    for code in REQUIRED_DIAGNOSTIC_CODES {
+        let needle = format!("`{code}`");
+        assert!(
+            doc.contains(&needle),
+            "REQUIRED_DIAGNOSTIC_CODES entry '{code}' is not documented in docs/code_cache.md",
+        );
+    }
+}
+
+#[test]
+fn test_field_diagnostic_map_matches_docs() {
+    let doc = read_code_cache_doc();
+    for (field, code) in FIELD_TO_DIAGNOSTIC_CODE {
+        let field_tok = format!("`{field}`");
+        let code_tok = format!("`{code}`");
+        let row = doc.lines().find(|line| {
+            line.starts_with('|') && line.contains(&field_tok) && line.contains(&code_tok)
+        });
+        assert!(
+            row.is_some(),
+            "docs/code_cache.md is missing the field-to-code row for ('{field}', '{code}')",
+        );
+    }
+}
+
+#[test]
+fn test_validate_rejects_odd_length_hex_digest() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["digest_hex"] = json!("abc");
+    assert_err_contains(&m, "must be lower-case hexadecimal");
+}
+
+#[test]
+fn test_validate_rejects_uppercase_hex_digest() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["digest_hex"] = json!("AA");
+    assert_err_contains(&m, "must be lower-case hexadecimal");
+}
+
+#[test]
+fn test_validate_rejects_non_hex_signature_value() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["signature"]["value_hex"] = json!("not-hex!");
+    assert_err_contains(&m, "signature.value_hex must be lower-case hexadecimal");
+}
+
+#[test]
+fn test_validate_rejects_missing_signature_value() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["signature"]
+        .as_object_mut()
+        .unwrap()
+        .remove("value_hex");
+    assert_err_contains(&m, "'value_hex' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_signature_algorithm() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["signature"]
+        .as_object_mut()
+        .unwrap()
+        .remove("algorithm");
+    assert_err_contains(&m, "'algorithm' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_size_bytes() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("size_bytes");
+    assert_err_contains(&m, "'size_bytes' is required");
 }
