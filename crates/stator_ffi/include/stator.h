@@ -1838,6 +1838,62 @@ typedef struct StatorModuleOrigin {
    * Parser-metadata classification of the referrer module script.
    */
   enum StatorParserMetadata parser_metadata;
+  /**
+   * Pointer to source URL bytes, or null when absent.
+   */
+  const char *source_url;
+  /**
+   * Number of bytes in `source_url`.
+   */
+  size_t source_url_len;
+  /**
+   * Pointer to browser origin URL bytes, or null when absent.
+   */
+  const char *origin_url;
+  /**
+   * Number of bytes in `origin_url`.
+   */
+  size_t origin_url_len;
+  /**
+   * Pointer to referrer URL bytes, or null when absent.
+   */
+  const char *referrer_url;
+  /**
+   * Number of bytes in `referrer_url`.
+   */
+  size_t referrer_url_len;
+  /**
+   * Pointer to source map URL bytes, or null when absent.
+   */
+  const char *source_map_url;
+  /**
+   * Number of bytes in `source_map_url`.
+   */
+  size_t source_map_url_len;
+  /**
+   * Pointer to source map digest bytes, or null when absent.
+   */
+  const char *source_map_digest;
+  /**
+   * Number of bytes in `source_map_digest`.
+   */
+  size_t source_map_digest_len;
+  /**
+   * Pointer to cache-policy token bytes, or null when absent.
+   */
+  const char *cache_policy;
+  /**
+   * Number of bytes in `cache_policy`.
+   */
+  size_t cache_policy_len;
+  /**
+   * Pointer to opaque Edge cache metadata bytes, or null when absent.
+   */
+  const char *edge_cache_metadata;
+  /**
+   * Number of bytes in `edge_cache_metadata`.
+   */
+  size_t edge_cache_metadata_len;
 } StatorModuleOrigin;
 
 /**
@@ -1906,6 +1962,34 @@ typedef struct StatorImportMetaProperties {
    * Optional `import.meta.parserMetadata` value.
    */
   struct StatorString *parser_metadata;
+  /**
+   * Optional `import.meta.sourceURL` value.
+   */
+  struct StatorString *source_url;
+  /**
+   * Optional `import.meta.originURL` value.
+   */
+  struct StatorString *origin_url;
+  /**
+   * Optional `import.meta.referrerURL` value.
+   */
+  struct StatorString *referrer_url;
+  /**
+   * Optional `import.meta.sourceMapURL` value.
+   */
+  struct StatorString *source_map_url;
+  /**
+   * Optional `import.meta.sourceMapDigest` value.
+   */
+  struct StatorString *source_map_digest;
+  /**
+   * Optional `import.meta.cachePolicy` value.
+   */
+  struct StatorString *cache_policy;
+  /**
+   * Optional `import.meta.edgeCacheMetadata` value.
+   */
+  struct StatorString *edge_cache_metadata;
 } StatorImportMetaProperties;
 
 /**
@@ -2032,6 +2116,77 @@ typedef struct StatorTierRequestResult {
    */
   bool ready;
 } StatorTierRequestResult;
+
+/**
+ * Stable browser-facing source metadata v2 for compiled modules.
+ *
+ * All pointer/length pairs are optional when length is zero. Non-empty fields
+ * are copied by Stator when setting metadata and borrowed from the module when
+ * querying metadata. `source_type` must match the compiled module type so hosts
+ * cannot silently relabel cache identity after compilation.
+ */
+typedef struct StatorModuleSourceMetadataV2 {
+  /**
+   * Source kind this metadata applies to; must match the module type.
+   */
+  enum StatorModuleType source_type;
+  /**
+   * Optional source URL / sourceURL directive bytes.
+   */
+  const char *source_url;
+  /**
+   * Number of bytes in `source_url`.
+   */
+  size_t source_url_len;
+  /**
+   * Optional browser origin URL bytes.
+   */
+  const char *origin_url;
+  /**
+   * Number of bytes in `origin_url`.
+   */
+  size_t origin_url_len;
+  /**
+   * Optional referrer URL bytes.
+   */
+  const char *referrer_url;
+  /**
+   * Number of bytes in `referrer_url`.
+   */
+  size_t referrer_url_len;
+  /**
+   * Optional source map URL bytes.
+   */
+  const char *source_map_url;
+  /**
+   * Number of bytes in `source_map_url`.
+   */
+  size_t source_map_url_len;
+  /**
+   * Optional source map digest bytes.
+   */
+  const char *source_map_digest;
+  /**
+   * Number of bytes in `source_map_digest`.
+   */
+  size_t source_map_digest_len;
+  /**
+   * Optional cache-policy token bytes.
+   */
+  const char *cache_policy;
+  /**
+   * Number of bytes in `cache_policy`.
+   */
+  size_t cache_policy_len;
+  /**
+   * Optional opaque Edge cache metadata bytes.
+   */
+  const char *edge_cache_metadata;
+  /**
+   * Number of bytes in `edge_cache_metadata`.
+   */
+  size_t edge_cache_metadata_len;
+} StatorModuleSourceMetadataV2;
 
 /**
  * C-callable native-function signature.
@@ -4640,6 +4795,36 @@ bool stator_module_set_origin_metadata(struct StatorModule *module,
                                        enum StatorParserMetadata parser_metadata);
 
 /**
+ * Attach source/cache metadata v2 to `module`.
+ *
+ * The metadata's `source_type` must match the compiled module type. Pointer
+ * fields with non-zero lengths must be non-null. On failure the existing
+ * metadata is preserved, so cache identity never silently drops a supplied
+ * field.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - `metadata`, when non-null, must point to a readable
+ *   [`StatorModuleSourceMetadataV2`].
+ * - Every non-null metadata pointer must be valid for its paired length.
+ */
+bool stator_module_set_source_metadata_v2(struct StatorModule *module,
+                                          const struct StatorModuleSourceMetadataV2 *metadata);
+
+/**
+ * Query source/cache metadata v2 currently stored on `module`.
+ *
+ * Borrowed pointers written into `out_metadata` remain valid until the module
+ * is freed or its metadata is overwritten.
+ *
+ * # Safety
+ * - `module` must be either null or a valid, live [`StatorModule`] pointer.
+ * - `out_metadata` must be valid for one struct write.
+ */
+bool stator_module_get_source_metadata_v2(const struct StatorModule *module,
+                                          struct StatorModuleSourceMetadataV2 *out_metadata);
+
+/**
  * Return a pointer to the base-URL bytes previously set on `module`, or null
  * when no base URL is set.
  *
@@ -4822,6 +5007,19 @@ bool stator_dynamic_import_request_reject(struct StatorDynamicImportRequest *req
  * callback and not previously settled.
  */
 bool stator_dynamic_import_request_dispose(struct StatorDynamicImportRequest *request);
+
+/**
+ * Query source/cache metadata carried by a dynamic import request.
+ *
+ * The returned pointers borrow from the request and remain valid until the
+ * request is resolved, rejected, or disposed.
+ *
+ * # Safety
+ * - `request` must be either null or a live [`StatorDynamicImportRequest`].
+ * - `out_metadata` must be valid for one struct write.
+ */
+bool stator_dynamic_import_request_get_source_metadata_v2(const struct StatorDynamicImportRequest *request,
+                                                          struct StatorModuleSourceMetadataV2 *out_metadata);
 
 /**
  * Link a compiled module graph by resolving all static import/re-export requests.

@@ -15,6 +15,7 @@ fn main() {
     // FFI crate can gate on the same predicate without recomputing it at
     // every call site.
     println!("cargo::rustc-check-cfg=cfg(stator_maglev_jit_x86_64)");
+    println!("cargo::rustc-check-cfg=cfg(stator_baseline_jit_x86_64)");
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
     let families: Vec<&str> = target_family.split(',').collect();

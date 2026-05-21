@@ -23,7 +23,7 @@ const TAG_BYTES: u8 = 7;
 const TAG_STRING_LIST: u8 = 8;
 
 /// Current canonical key schema version from `docs/code_cache.md`.
-pub(crate) const CACHE_KEY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CACHE_KEY_SCHEMA_VERSION: u32 = 2;
 /// Current module cache payload format version used by the FFI module cache.
 pub(crate) const MODULE_CACHE_FORMAT_VERSION: u32 = 6;
 /// Current script-cache payload format placeholder for schema construction.
@@ -77,6 +77,9 @@ pub const REQUIRED_KEY_FIELDS: &[&str] = &[
     "line_offset",
     "column_offset",
     "source_map_url",
+    "source_map_digest",
+    "cache_policy",
+    "edge_cache_metadata_hash",
     "host_defined_options_hash",
     "compile_options_hash",
     "module_type",
@@ -464,6 +467,12 @@ pub struct SourceIdentity {
     pub column_offset: i32,
     /// Source map URL after directive parsing.
     pub source_map_url: Option<String>,
+    /// Digest of source map content or host source map identity.
+    pub source_map_digest: Option<Vec<u8>>,
+    /// Browser cache policy token.
+    pub cache_policy: Option<String>,
+    /// Hash of opaque Edge cache metadata.
+    pub edge_cache_metadata_hash: Option<Vec<u8>>,
     /// Hash of opaque host-defined compile options.
     pub host_defined_options_hash: Option<Vec<u8>>,
     /// Hash of structured compile options not represented elsewhere.
@@ -761,6 +770,21 @@ pub fn build_code_cache_key(input: &CodeCacheKeyInput) -> Result<CodeCacheKey, C
         &mut out,
         "source_map_url",
         input.source.source_map_url.as_deref(),
+    )?;
+    push_optional_bytes(
+        &mut out,
+        "source_map_digest",
+        input.source.source_map_digest.as_deref(),
+    )?;
+    push_optional_string(
+        &mut out,
+        "cache_policy",
+        input.source.cache_policy.as_deref(),
+    )?;
+    push_optional_bytes(
+        &mut out,
+        "edge_cache_metadata_hash",
+        input.source.edge_cache_metadata_hash.as_deref(),
     )?;
     push_optional_bytes(
         &mut out,
@@ -1083,6 +1107,9 @@ mod tests {
                 line_offset: 0,
                 column_offset: 0,
                 source_map_url: Some("app.js.map".to_owned()),
+                source_map_digest: Some(sha256_bytes(b"map").to_vec()),
+                cache_policy: Some("http-cache;max-age=60".to_owned()),
+                edge_cache_metadata_hash: Some(sha256_bytes(b"edge-cache").to_vec()),
                 host_defined_options_hash: Some(sha256_bytes(b"host-options").to_vec()),
                 compile_options_hash: Some(sha256_bytes(b"compile-options").to_vec()),
             },
@@ -1438,6 +1465,28 @@ mod tests {
             "source_map_url",
             |input| input.source.source_map_url = Some(String::new()),
             |input| input.source.source_map_url = None,
+        );
+    }
+
+    #[test]
+    fn test_source_map_digest_and_edge_cache_metadata_change_key() {
+        assert_field_mutation_changes_hash("source_map_digest", |input| {
+            input.source.source_map_digest = Some(sha256_bytes(b"other-map-digest").to_vec());
+        });
+        assert_field_mutation_changes_hash("cache_policy", |input| {
+            input.source.cache_policy = Some("no-store".to_owned());
+        });
+        assert_field_mutation_changes_hash("edge_cache_metadata_hash", |input| {
+            input.source.edge_cache_metadata_hash = Some(sha256_bytes(b"other-edge").to_vec());
+        });
+        let mut empty_digest = sample_input();
+        empty_digest.source.source_map_digest = Some(Vec::new());
+        let mut null_digest = sample_input();
+        null_digest.source.source_map_digest = None;
+        assert_ne!(
+            build_code_cache_key(&empty_digest).unwrap().hash,
+            build_code_cache_key(&null_digest).unwrap().hash,
+            "source_map_digest null must differ from present empty digest"
         );
     }
 

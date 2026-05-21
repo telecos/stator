@@ -8614,6 +8614,13 @@ fn handle_lda_import_meta(
         credentials_mode: None,
         referrer_policy: None,
         parser_metadata: None,
+        source_url: None,
+        origin_url: None,
+        referrer_url: None,
+        source_map_url: None,
+        source_map_digest: None,
+        cache_policy: None,
+        edge_cache_metadata: None,
     };
     let meta_fields = match current_loader() {
         Some(loader) => loader
@@ -8650,6 +8657,27 @@ fn handle_lda_import_meta(
     }
     if let Some(value) = meta_fields.parser_metadata {
         meta.insert("parserMetadata".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.source_url {
+        meta.insert("sourceURL".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.origin_url {
+        meta.insert("originURL".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.referrer_url {
+        meta.insert("referrerURL".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.source_map_url {
+        meta.insert("sourceMapURL".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.source_map_digest {
+        meta.insert("sourceMapDigest".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.cache_policy {
+        meta.insert("cachePolicy".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.edge_cache_metadata {
+        meta.insert("edgeCacheMetadata".into(), JsValue::String(value.into()));
     }
     meta.insert(
         "resolve".into(),

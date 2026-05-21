@@ -41,8 +41,28 @@ pub struct HostDynamicImportRequest {
     specifier: String,
     referrer: Option<String>,
     attributes: Vec<HostImportAttribute>,
+    source_metadata: Option<HostModuleSourceMetadata>,
     promise: JsPromise,
     queue: MicrotaskQueue,
+}
+
+/// Host-visible module source identity and cache metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostModuleSourceMetadata {
+    /// Optional source URL / sourceURL directive.
+    pub source_url: Option<String>,
+    /// Optional browser origin URL.
+    pub origin_url: Option<String>,
+    /// Optional referrer URL.
+    pub referrer_url: Option<String>,
+    /// Optional source map URL.
+    pub source_map_url: Option<String>,
+    /// Optional source map digest.
+    pub source_map_digest: Option<String>,
+    /// Optional browser cache-policy token.
+    pub cache_policy: Option<String>,
+    /// Optional opaque Edge cache metadata, encoded by the host.
+    pub edge_cache_metadata: Option<String>,
 }
 
 impl HostDynamicImportRequest {
@@ -58,9 +78,16 @@ impl HostDynamicImportRequest {
             specifier,
             referrer,
             attributes,
+            source_metadata: None,
             promise,
             queue,
         }
+    }
+
+    /// Attach source metadata to this dynamic import request.
+    pub fn with_source_metadata(mut self, metadata: HostModuleSourceMetadata) -> Self {
+        self.source_metadata = Some(metadata);
+        self
     }
 
     /// Requested module specifier after `ToString`.
@@ -76,6 +103,11 @@ impl HostDynamicImportRequest {
     /// Import attributes supplied by `import(specifier, { with: ... })`.
     pub fn attributes(&self) -> &[HostImportAttribute] {
         &self.attributes
+    }
+
+    /// Source/cache metadata inherited from the referrer and URL resolver.
+    pub fn source_metadata(&self) -> Option<&HostModuleSourceMetadata> {
+        self.source_metadata.as_ref()
     }
 
     /// Promise returned to JavaScript for this dynamic import.
@@ -114,6 +146,20 @@ pub struct HostImportMeta {
     pub referrer_policy: Option<String>,
     /// Optional HTML parser-metadata classification.
     pub parser_metadata: Option<String>,
+    /// Optional source URL / sourceURL directive.
+    pub source_url: Option<String>,
+    /// Optional browser origin URL.
+    pub origin_url: Option<String>,
+    /// Optional referrer URL.
+    pub referrer_url: Option<String>,
+    /// Optional source map URL.
+    pub source_map_url: Option<String>,
+    /// Optional source map digest.
+    pub source_map_digest: Option<String>,
+    /// Optional browser cache-policy token.
+    pub cache_policy: Option<String>,
+    /// Optional opaque Edge cache metadata.
+    pub edge_cache_metadata: Option<String>,
 }
 
 /// Embedder hook for resolving dynamic `import()` and `import.meta.resolve`.

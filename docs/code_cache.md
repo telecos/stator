@@ -204,6 +204,26 @@ modules:
   artifacts, if added later, must use separate `baseline-code` or `jit-code`
   artifact types and stricter platform/sandbox validation.
 
+### Module source metadata v2 plumbing
+
+The C ABI exposes `StatorModuleSourceMetadataV2` plus
+`stator_module_set_source_metadata_v2`,
+`stator_module_get_source_metadata_v2`, and
+`stator_dynamic_import_request_get_source_metadata_v2`. The v2 record covers the
+module type, source URL, origin URL, referrer URL, source map URL/digest, cache
+policy, and opaque Edge cache metadata. Static resolver callbacks receive the
+same fields through the trailing fields of `StatorModuleOrigin`; dynamic import
+callbacks receive them through the request query API; `import.meta` defaults
+surface them as `sourceURL`, `originURL`, `referrerURL`, `sourceMapURL`,
+`sourceMapDigest`, `cachePolicy`, and `edgeCacheMetadata`.
+
+Module cache production includes every v2 metadata field in the cache validation
+record. Current `stator_module_compile_cached` has no v2 metadata input, so a
+blob produced with non-empty v2 fields is rejected rather than restored under an
+incomplete identity. Embedders should either pass empty v2 metadata on cacheable
+modules today or treat this as a fail-closed limitation until a restore API with
+v2 metadata input lands.
+
 ## Canonical serialization
 
 Keys are serialized as deterministic UTF-8 records before hashing or embedding in cache payloads. Producers and consumers must use the same order below.
@@ -251,10 +271,11 @@ specific `rejected_*` code when the payload is otherwise well-formed, or
 Script-bytecode and module-bytecode caches use the same source-metadata contract:
 the key must include source origin, line/column offsets, resource URL, base URL,
 referrer URL, integrity metadata, credentials mode, referrer policy, import
-attributes/policy, source map URL, sourceURL comment, and all parser/compiler
-compile options that can affect observable behavior or diagnostics. Classic
-scripts encode module-only fields as `null`; modules encode script-only wrapper
-fields as `null` only when the host genuinely has no value.
+attributes/policy, source map URL, source map digest, sourceURL comment, cache
+policy, opaque Edge cache metadata hash, and all parser/compiler compile options
+that can affect observable behavior or diagnostics. Classic scripts encode
+module-only fields as `null`; modules encode script-only wrapper fields as
+`null` only when the host genuinely has no value.
 
 ## Required key fields
 
@@ -266,7 +287,7 @@ fields as `null` only when the host genuinely has no value.
 | `artifact_scope` | enum | `classic-script`, `module`, `function`, `eval`, `wasm-module`, or `snapshot`. |
 | `artifact_subtype` | string/null | Tier name (`baseline`, `maglev`, `turbofan`) or module type (`javascript`, `json`, `css`, `wasm`). |
 | `cache_producer` | string | `stator_jse`, `stator_jse_ffi`, or Edge build component that emitted the artifact. |
-| `cache_schema_version` | u32 | Version of this key schema. Start at `1`; bump on any incompatible key layout change. |
+| `cache_schema_version` | u32 | Version of this key schema. Current value is `2`; bump on any incompatible key layout change. |
 
 ### 2. Version and format identity
 
@@ -304,6 +325,9 @@ fields as `null` only when the host genuinely has no value.
 | `line_offset` | i32 | Initial line offset for diagnostics, stack traces, source positions, and source map lookup. |
 | `column_offset` | i32 | Initial column offset. |
 | `source_map_url` | string/null | `//# sourceMappingURL=` comment or embedder-provided source map URL after directive parsing. Must be keyed even when source text and bytecode are unchanged because diagnostics/devtools behavior changes. |
+| `source_map_digest` | bytes/null | Digest bytes for source map content or Edge's canonical source-map identity. Required when Edge has already fetched or cached a map; `null` only when no map identity exists. |
+| `cache_policy` | string/null | Canonical browser cache policy token (for example, HTTP cache mode/bucket policy) that can change cache reuse decisions. |
+| `edge_cache_metadata_hash` | bytes/null | Hash of opaque Edge cache metadata that must affect code-cache identity without exposing raw browser cache records to Stator or telemetry. |
 | `host_defined_options_hash` | bytes/null | Hash of opaque host-defined compile options that can affect semantics, diagnostics, instrumentation, or embedder policy. |
 | `compile_options_hash` | bytes/null | Hash of structured Stator/Edge compile options not represented elsewhere, including parser goal overrides, code-generation mode, inspector/coverage/debug settings, source wrapping, and future flags. |
 

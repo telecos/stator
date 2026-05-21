@@ -39,7 +39,9 @@ use stator_jse::dom::{
     NamedPropertyHandlerFlags,
 };
 use stator_jse::gc::heap::Heap;
-use stator_jse::host::{HostDynamicImportRequest, HostImportMeta, HostModuleLoader};
+use stator_jse::host::{
+    HostDynamicImportRequest, HostImportMeta, HostModuleLoader, HostModuleSourceMetadata,
+};
 use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
@@ -3723,6 +3725,20 @@ pub struct StatorModule {
     referrer_policy: StatorReferrerPolicy,
     /// HTML parser-metadata classification carried by this module.
     parser_metadata: StatorParserMetadata,
+    /// Optional sourceURL directive or host-provided source identity URL.
+    source_url: Option<Vec<u8>>,
+    /// Optional browser origin URL for source identity and cache matching.
+    origin_url: Option<Vec<u8>>,
+    /// Optional referrer URL that initiated this module fetch.
+    referrer_url: Option<Vec<u8>>,
+    /// Optional source map URL or directive value.
+    source_map_url: Option<Vec<u8>>,
+    /// Optional digest bytes for source map content/identity.
+    source_map_digest: Option<Vec<u8>>,
+    /// Optional cache policy token supplied by the browser embedder.
+    cache_policy: Option<Vec<u8>>,
+    /// Optional opaque Edge cache metadata that participates in cache matching.
+    edge_cache_metadata: Option<Vec<u8>>,
     /// Cached module namespace exotic object for this module, lazily built
     /// after evaluation by [`publish_module_namespace`].  Reusing a single
     /// cached value preserves identity across importers (per ES §10.4.6.11
@@ -4023,6 +4039,47 @@ pub struct StatorModuleCompileOptions {
     pub parser_metadata: StatorParserMetadata,
 }
 
+/// Stable browser-facing source metadata v2 for compiled modules.
+///
+/// All pointer/length pairs are optional when length is zero. Non-empty fields
+/// are copied by Stator when setting metadata and borrowed from the module when
+/// querying metadata. `source_type` must match the compiled module type so hosts
+/// cannot silently relabel cache identity after compilation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorModuleSourceMetadataV2 {
+    /// Source kind this metadata applies to; must match the module type.
+    pub source_type: StatorModuleType,
+    /// Optional source URL / sourceURL directive bytes.
+    pub source_url: *const c_char,
+    /// Number of bytes in `source_url`.
+    pub source_url_len: usize,
+    /// Optional browser origin URL bytes.
+    pub origin_url: *const c_char,
+    /// Number of bytes in `origin_url`.
+    pub origin_url_len: usize,
+    /// Optional referrer URL bytes.
+    pub referrer_url: *const c_char,
+    /// Number of bytes in `referrer_url`.
+    pub referrer_url_len: usize,
+    /// Optional source map URL bytes.
+    pub source_map_url: *const c_char,
+    /// Number of bytes in `source_map_url`.
+    pub source_map_url_len: usize,
+    /// Optional source map digest bytes.
+    pub source_map_digest: *const c_char,
+    /// Number of bytes in `source_map_digest`.
+    pub source_map_digest_len: usize,
+    /// Optional cache-policy token bytes.
+    pub cache_policy: *const c_char,
+    /// Number of bytes in `cache_policy`.
+    pub cache_policy_len: usize,
+    /// Optional opaque Edge cache metadata bytes.
+    pub edge_cache_metadata: *const c_char,
+    /// Number of bytes in `edge_cache_metadata`.
+    pub edge_cache_metadata_len: usize,
+}
+
 /// Status for module code-cache operations.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4099,6 +4156,34 @@ pub struct StatorModuleOrigin {
     pub referrer_policy: StatorReferrerPolicy,
     /// Parser-metadata classification of the referrer module script.
     pub parser_metadata: StatorParserMetadata,
+    /// Pointer to source URL bytes, or null when absent.
+    pub source_url: *const c_char,
+    /// Number of bytes in `source_url`.
+    pub source_url_len: usize,
+    /// Pointer to browser origin URL bytes, or null when absent.
+    pub origin_url: *const c_char,
+    /// Number of bytes in `origin_url`.
+    pub origin_url_len: usize,
+    /// Pointer to referrer URL bytes, or null when absent.
+    pub referrer_url: *const c_char,
+    /// Number of bytes in `referrer_url`.
+    pub referrer_url_len: usize,
+    /// Pointer to source map URL bytes, or null when absent.
+    pub source_map_url: *const c_char,
+    /// Number of bytes in `source_map_url`.
+    pub source_map_url_len: usize,
+    /// Pointer to source map digest bytes, or null when absent.
+    pub source_map_digest: *const c_char,
+    /// Number of bytes in `source_map_digest`.
+    pub source_map_digest_len: usize,
+    /// Pointer to cache-policy token bytes, or null when absent.
+    pub cache_policy: *const c_char,
+    /// Number of bytes in `cache_policy`.
+    pub cache_policy_len: usize,
+    /// Pointer to opaque Edge cache metadata bytes, or null when absent.
+    pub edge_cache_metadata: *const c_char,
+    /// Number of bytes in `edge_cache_metadata`.
+    pub edge_cache_metadata_len: usize,
 }
 
 /// Result returned by a host module resolver callback.
@@ -4273,6 +4358,20 @@ pub struct StatorImportMetaProperties {
     pub referrer_policy: *mut StatorString,
     /// Optional `import.meta.parserMetadata` value.
     pub parser_metadata: *mut StatorString,
+    /// Optional `import.meta.sourceURL` value.
+    pub source_url: *mut StatorString,
+    /// Optional `import.meta.originURL` value.
+    pub origin_url: *mut StatorString,
+    /// Optional `import.meta.referrerURL` value.
+    pub referrer_url: *mut StatorString,
+    /// Optional `import.meta.sourceMapURL` value.
+    pub source_map_url: *mut StatorString,
+    /// Optional `import.meta.sourceMapDigest` value.
+    pub source_map_digest: *mut StatorString,
+    /// Optional `import.meta.cachePolicy` value.
+    pub cache_policy: *mut StatorString,
+    /// Optional `import.meta.edgeCacheMetadata` value.
+    pub edge_cache_metadata: *mut StatorString,
 }
 
 impl Default for StatorImportMetaProperties {
@@ -4286,6 +4385,13 @@ impl Default for StatorImportMetaProperties {
             credentials_mode: std::ptr::null_mut(),
             referrer_policy: std::ptr::null_mut(),
             parser_metadata: std::ptr::null_mut(),
+            source_url: std::ptr::null_mut(),
+            origin_url: std::ptr::null_mut(),
+            referrer_url: std::ptr::null_mut(),
+            source_map_url: std::ptr::null_mut(),
+            source_map_digest: std::ptr::null_mut(),
+            cache_policy: std::ptr::null_mut(),
+            edge_cache_metadata: std::ptr::null_mut(),
         }
     }
 }
@@ -4666,6 +4772,13 @@ fn module_error_record(
         credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        source_url: None,
+        origin_url: None,
+        referrer_url: None,
+        source_map_url: None,
+        source_map_digest: None,
+        cache_policy: None,
+        edge_cache_metadata: None,
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
@@ -4715,6 +4828,23 @@ fn parser_metadata_name(metadata: StatorParserMetadata) -> &'static str {
         StatorParserMetadata::StatorParserMetadataNotParserInserted => "not-parser-inserted",
         StatorParserMetadata::StatorParserMetadataParserInserted => "parser-inserted",
     }
+}
+
+fn optional_bytes_ptr(bytes: Option<&Vec<u8>>) -> (*const c_char, usize) {
+    match bytes {
+        Some(bytes) if !bytes.is_empty() => (bytes.as_ptr() as *const c_char, bytes.len()),
+        _ => (std::ptr::null(), 0),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn json_value_to_js_value(value: serde_json::Value) -> JsValue {
@@ -4773,6 +4903,13 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+                source_url: None,
+                origin_url: None,
+                referrer_url: None,
+                source_map_url: None,
+                source_map_digest: None,
+                cache_policy: None,
+                edge_cache_metadata: None,
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
@@ -4865,6 +5002,13 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+                source_url: None,
+                origin_url: None,
+                referrer_url: None,
+                source_map_url: None,
+                source_map_digest: None,
+                cache_policy: None,
+                edge_cache_metadata: None,
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
@@ -5265,6 +5409,13 @@ struct ModuleCacheRecord {
     credentials_mode: StatorCredentialsMode,
     referrer_policy: StatorReferrerPolicy,
     parser_metadata: StatorParserMetadata,
+    source_url: Vec<u8>,
+    origin_url: Vec<u8>,
+    referrer_url: Vec<u8>,
+    source_map_url: Vec<u8>,
+    source_map_digest: Vec<u8>,
+    cache_policy: Vec<u8>,
+    edge_cache_metadata: Vec<u8>,
 }
 
 const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
@@ -5291,7 +5442,7 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload`] status,
 /// distinct from metadata/source/options mismatches which keep using
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
-const MODULE_CACHE_FORMAT_VERSION: u32 = 6;
+const MODULE_CACHE_FORMAT_VERSION: u32 = 7;
 
 /// Byte offset, inside a serialized cache blob, at which the corruption
 /// checksum is written. Immediately follows the magic and format version
@@ -5415,6 +5566,13 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
     if !push_bytes(&mut out, &record.resource_name)
         || !push_bytes(&mut out, &record.base_url)
         || !push_bytes(&mut out, &record.integrity_metadata)
+        || !push_bytes(&mut out, &record.source_url)
+        || !push_bytes(&mut out, &record.origin_url)
+        || !push_bytes(&mut out, &record.referrer_url)
+        || !push_bytes(&mut out, &record.source_map_url)
+        || !push_bytes(&mut out, &record.source_map_digest)
+        || !push_bytes(&mut out, &record.cache_policy)
+        || !push_bytes(&mut out, &record.edge_cache_metadata)
     {
         return None;
     }
@@ -6029,6 +6187,27 @@ fn parse_module_cache_blob(
     let integrity_metadata = reader
         .read_bytes()
         .ok_or(ModuleCacheParseError::Malformed)?;
+    let source_url = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let origin_url = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let referrer_url = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let source_map_url = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let source_map_digest = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let cache_policy = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
+    let edge_cache_metadata = reader
+        .read_bytes()
+        .ok_or(ModuleCacheParseError::Malformed)?;
     let payload = parse_module_cache_payload(&mut reader, source_type)
         .ok_or(ModuleCacheParseError::Malformed)?;
     if !reader.is_finished() {
@@ -6044,6 +6223,13 @@ fn parse_module_cache_blob(
             resource_name,
             base_url,
             integrity_metadata,
+            source_url,
+            origin_url,
+            referrer_url,
+            source_map_url,
+            source_map_digest,
+            cache_policy,
+            edge_cache_metadata,
             credentials_mode,
             referrer_policy,
             parser_metadata,
@@ -6245,6 +6431,13 @@ fn module_from_js_cache_payload(
         credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        source_url: None,
+        origin_url: None,
+        referrer_url: None,
+        source_map_url: None,
+        source_map_digest: None,
+        cache_policy: None,
+        edge_cache_metadata: None,
         namespace: None,
         indirect_reexports,
         pending_eval: None,
@@ -6284,6 +6477,13 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
         referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
         parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        source_url: None,
+        origin_url: None,
+        referrer_url: None,
+        source_map_url: None,
+        source_map_digest: None,
+        cache_policy: None,
+        edge_cache_metadata: None,
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
@@ -6385,6 +6585,13 @@ unsafe fn module_cache_record_from_options(
             credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            source_url: Vec::new(),
+            origin_url: Vec::new(),
+            referrer_url: Vec::new(),
+            source_map_url: Vec::new(),
+            source_map_digest: Vec::new(),
+            cache_policy: Vec::new(),
+            edge_cache_metadata: Vec::new(),
         });
     }
     // SAFETY: caller guarantees `options` is valid.
@@ -6411,6 +6618,13 @@ unsafe fn module_cache_record_from_options(
         credentials_mode: options_ref.credentials_mode,
         referrer_policy: options_ref.referrer_policy,
         parser_metadata: options_ref.parser_metadata,
+        source_url: Vec::new(),
+        origin_url: Vec::new(),
+        referrer_url: Vec::new(),
+        source_map_url: Vec::new(),
+        source_map_digest: Vec::new(),
+        cache_policy: Vec::new(),
+        edge_cache_metadata: Vec::new(),
     })
 }
 
@@ -6431,6 +6645,13 @@ fn module_cache_record_from_module(source: &[u8], module: &StatorModule) -> Modu
         credentials_mode: module.credentials_mode,
         referrer_policy: module.referrer_policy,
         parser_metadata: module.parser_metadata,
+        source_url: module.source_url.clone().unwrap_or_default(),
+        origin_url: module.origin_url.clone().unwrap_or_default(),
+        referrer_url: module.referrer_url.clone().unwrap_or_default(),
+        source_map_url: module.source_map_url.clone().unwrap_or_default(),
+        source_map_digest: module.source_map_digest.clone().unwrap_or_default(),
+        cache_policy: module.cache_policy.clone().unwrap_or_default(),
+        edge_cache_metadata: module.edge_cache_metadata.clone().unwrap_or_default(),
     }
 }
 
@@ -6569,6 +6790,13 @@ unsafe fn compile_module_source(
             credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            source_url: None,
+            origin_url: None,
+            referrer_url: None,
+            source_map_url: None,
+            source_map_digest: None,
+            cache_policy: None,
+            edge_cache_metadata: None,
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
@@ -6610,6 +6838,13 @@ unsafe fn compile_module_source(
                 credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+                source_url: None,
+                origin_url: None,
+                referrer_url: None,
+                source_map_url: None,
+                source_map_digest: None,
+                cache_policy: None,
+                edge_cache_metadata: None,
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
@@ -6656,6 +6891,13 @@ unsafe fn compile_module_source(
             credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            source_url: None,
+            origin_url: None,
+            referrer_url: None,
+            source_map_url: None,
+            source_map_digest: None,
+            cache_policy: None,
+            edge_cache_metadata: None,
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
@@ -6705,6 +6947,13 @@ unsafe fn compile_module_source(
                 credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+                source_url: None,
+                origin_url: None,
+                referrer_url: None,
+                source_map_url: None,
+                source_map_digest: None,
+                cache_policy: None,
+                edge_cache_metadata: None,
                 namespace: None,
                 indirect_reexports,
                 pending_eval: None,
@@ -6738,6 +6987,13 @@ unsafe fn compile_module_source(
                 credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
                 referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
                 parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+                source_url: None,
+                origin_url: None,
+                referrer_url: None,
+                source_map_url: None,
+                source_map_digest: None,
+                cache_policy: None,
+                edge_cache_metadata: None,
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
@@ -7801,6 +8057,15 @@ fn module_origin_view(module: &StatorModule) -> StatorModuleOrigin {
         Some(bytes) if !bytes.is_empty() => (bytes.as_ptr() as *const c_char, bytes.len()),
         _ => (std::ptr::null(), 0),
     };
+    let (source_url, source_url_len) = optional_bytes_ptr(module.source_url.as_ref());
+    let (origin_url, origin_url_len) = optional_bytes_ptr(module.origin_url.as_ref());
+    let (referrer_url, referrer_url_len) = optional_bytes_ptr(module.referrer_url.as_ref());
+    let (source_map_url, source_map_url_len) = optional_bytes_ptr(module.source_map_url.as_ref());
+    let (source_map_digest, source_map_digest_len) =
+        optional_bytes_ptr(module.source_map_digest.as_ref());
+    let (cache_policy, cache_policy_len) = optional_bytes_ptr(module.cache_policy.as_ref());
+    let (edge_cache_metadata, edge_cache_metadata_len) =
+        optional_bytes_ptr(module.edge_cache_metadata.as_ref());
     StatorModuleOrigin {
         base_url,
         base_url_len,
@@ -7809,6 +8074,20 @@ fn module_origin_view(module: &StatorModule) -> StatorModuleOrigin {
         credentials_mode: module.credentials_mode,
         referrer_policy: module.referrer_policy,
         parser_metadata: module.parser_metadata,
+        source_url,
+        source_url_len,
+        origin_url,
+        origin_url_len,
+        referrer_url,
+        referrer_url_len,
+        source_map_url,
+        source_map_url_len,
+        source_map_digest,
+        source_map_digest_len,
+        cache_policy,
+        cache_policy_len,
+        edge_cache_metadata,
+        edge_cache_metadata_len,
     }
 }
 
@@ -7887,6 +8166,150 @@ pub unsafe extern "C" fn stator_module_set_origin_metadata(
         (*module).credentials_mode = credentials_mode;
         (*module).referrer_policy = referrer_policy;
         (*module).parser_metadata = parser_metadata;
+    }
+    true
+}
+
+unsafe fn metadata_field(ptr: *const c_char, len: usize) -> Option<Option<Vec<u8>>> {
+    if ptr.is_null() {
+        return (len == 0).then_some(None);
+    }
+    // SAFETY: caller guarantees `ptr` is valid for `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    Some((!bytes.is_empty()).then(|| bytes.to_vec()))
+}
+
+/// Attach source/cache metadata v2 to `module`.
+///
+/// The metadata's `source_type` must match the compiled module type. Pointer
+/// fields with non-zero lengths must be non-null. On failure the existing
+/// metadata is preserved, so cache identity never silently drops a supplied
+/// field.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - `metadata`, when non-null, must point to a readable
+///   [`StatorModuleSourceMetadataV2`].
+/// - Every non-null metadata pointer must be valid for its paired length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_set_source_metadata_v2(
+    module: *mut StatorModule,
+    metadata: *const StatorModuleSourceMetadataV2,
+) -> bool {
+    if module.is_null() || metadata.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `module` and `metadata` are valid.
+    let (module_ref, metadata_ref) = unsafe { (&mut *module, &*metadata) };
+    if metadata_ref.source_type != module_ref.source_type {
+        return false;
+    }
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(source_url) =
+        (unsafe { metadata_field(metadata_ref.source_url, metadata_ref.source_url_len) })
+    else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(origin_url) =
+        (unsafe { metadata_field(metadata_ref.origin_url, metadata_ref.origin_url_len) })
+    else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(referrer_url) =
+        (unsafe { metadata_field(metadata_ref.referrer_url, metadata_ref.referrer_url_len) })
+    else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(source_map_url) =
+        (unsafe { metadata_field(metadata_ref.source_map_url, metadata_ref.source_map_url_len) })
+    else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(source_map_digest) = (unsafe {
+        metadata_field(
+            metadata_ref.source_map_digest,
+            metadata_ref.source_map_digest_len,
+        )
+    }) else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(cache_policy) =
+        (unsafe { metadata_field(metadata_ref.cache_policy, metadata_ref.cache_policy_len) })
+    else {
+        return false;
+    };
+    // SAFETY: validates and copies each pointer/length pair before mutation.
+    let Some(edge_cache_metadata) = (unsafe {
+        metadata_field(
+            metadata_ref.edge_cache_metadata,
+            metadata_ref.edge_cache_metadata_len,
+        )
+    }) else {
+        return false;
+    };
+
+    module_ref.source_url = source_url;
+    module_ref.origin_url = origin_url;
+    module_ref.referrer_url = referrer_url;
+    module_ref.source_map_url = source_map_url;
+    module_ref.source_map_digest = source_map_digest;
+    module_ref.cache_policy = cache_policy;
+    module_ref.edge_cache_metadata = edge_cache_metadata;
+    true
+}
+
+/// Query source/cache metadata v2 currently stored on `module`.
+///
+/// Borrowed pointers written into `out_metadata` remain valid until the module
+/// is freed or its metadata is overwritten.
+///
+/// # Safety
+/// - `module` must be either null or a valid, live [`StatorModule`] pointer.
+/// - `out_metadata` must be valid for one struct write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_get_source_metadata_v2(
+    module: *const StatorModule,
+    out_metadata: *mut StatorModuleSourceMetadataV2,
+) -> bool {
+    if module.is_null() || out_metadata.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let module_ref = unsafe { &*module };
+    let (source_url, source_url_len) = optional_bytes_ptr(module_ref.source_url.as_ref());
+    let (origin_url, origin_url_len) = optional_bytes_ptr(module_ref.origin_url.as_ref());
+    let (referrer_url, referrer_url_len) = optional_bytes_ptr(module_ref.referrer_url.as_ref());
+    let (source_map_url, source_map_url_len) =
+        optional_bytes_ptr(module_ref.source_map_url.as_ref());
+    let (source_map_digest, source_map_digest_len) =
+        optional_bytes_ptr(module_ref.source_map_digest.as_ref());
+    let (cache_policy, cache_policy_len) = optional_bytes_ptr(module_ref.cache_policy.as_ref());
+    let (edge_cache_metadata, edge_cache_metadata_len) =
+        optional_bytes_ptr(module_ref.edge_cache_metadata.as_ref());
+    // SAFETY: caller guarantees `out_metadata` is valid for one write.
+    unsafe {
+        *out_metadata = StatorModuleSourceMetadataV2 {
+            source_type: module_ref.source_type,
+            source_url,
+            source_url_len,
+            origin_url,
+            origin_url_len,
+            referrer_url,
+            referrer_url_len,
+            source_map_url,
+            source_map_url_len,
+            source_map_digest,
+            source_map_digest_len,
+            cache_policy,
+            cache_policy_len,
+            edge_cache_metadata,
+            edge_cache_metadata_len,
+        };
     }
     true
 }
@@ -8499,6 +8922,64 @@ pub unsafe extern "C" fn stator_dynamic_import_request_dispose(
     true
 }
 
+/// Query source/cache metadata carried by a dynamic import request.
+///
+/// The returned pointers borrow from the request and remain valid until the
+/// request is resolved, rejected, or disposed.
+///
+/// # Safety
+/// - `request` must be either null or a live [`StatorDynamicImportRequest`].
+/// - `out_metadata` must be valid for one struct write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dynamic_import_request_get_source_metadata_v2(
+    request: *const StatorDynamicImportRequest,
+    out_metadata: *mut StatorModuleSourceMetadataV2,
+) -> bool {
+    if request.is_null() || out_metadata.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let request_ref = unsafe { &*request };
+    let Some(metadata) = request_ref.inner.source_metadata() else {
+        return false;
+    };
+    fn str_ptr(value: Option<&String>) -> (*const c_char, usize) {
+        match value {
+            Some(value) if !value.is_empty() => (value.as_ptr() as *const c_char, value.len()),
+            _ => (std::ptr::null(), 0),
+        }
+    }
+    let (source_url, source_url_len) = str_ptr(metadata.source_url.as_ref());
+    let (origin_url, origin_url_len) = str_ptr(metadata.origin_url.as_ref());
+    let (referrer_url, referrer_url_len) = str_ptr(metadata.referrer_url.as_ref());
+    let (source_map_url, source_map_url_len) = str_ptr(metadata.source_map_url.as_ref());
+    let (source_map_digest, source_map_digest_len) = str_ptr(metadata.source_map_digest.as_ref());
+    let (cache_policy, cache_policy_len) = str_ptr(metadata.cache_policy.as_ref());
+    let (edge_cache_metadata, edge_cache_metadata_len) =
+        str_ptr(metadata.edge_cache_metadata.as_ref());
+    // SAFETY: caller guarantees `out_metadata` is valid.
+    unsafe {
+        *out_metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url,
+            source_url_len,
+            origin_url,
+            origin_url_len,
+            referrer_url,
+            referrer_url_len,
+            source_map_url,
+            source_map_url_len,
+            source_map_digest,
+            source_map_digest_len,
+            cache_policy,
+            cache_policy_len,
+            edge_cache_metadata,
+            edge_cache_metadata_len,
+        };
+    }
+    true
+}
+
 struct FfiHostModuleLoader {
     ctx: *mut StatorContext,
     referrer: *mut StatorModule,
@@ -8522,7 +9003,83 @@ fn import_meta_defaults_for_module(module: &StatorModule, module_url: String) ->
         credentials_mode: Some(credentials_mode_name(module.credentials_mode).to_string()),
         referrer_policy: Some(referrer_policy_name(module.referrer_policy).to_string()),
         parser_metadata: Some(parser_metadata_name(module.parser_metadata).to_string()),
+        source_url: module
+            .source_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        origin_url: module
+            .origin_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        referrer_url: module
+            .referrer_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        source_map_url: module
+            .source_map_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        source_map_digest: module
+            .source_map_digest
+            .as_ref()
+            .map(|bytes| hex_encode(bytes)),
+        cache_policy: module
+            .cache_policy
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        edge_cache_metadata: module
+            .edge_cache_metadata
+            .as_ref()
+            .map(|bytes| hex_encode(bytes)),
     }
+}
+
+fn host_source_metadata_for_module(module: &StatorModule) -> HostModuleSourceMetadata {
+    HostModuleSourceMetadata {
+        source_url: module
+            .source_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        origin_url: module
+            .origin_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        referrer_url: module
+            .referrer_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        source_map_url: module
+            .source_map_url
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        source_map_digest: module
+            .source_map_digest
+            .as_ref()
+            .map(|bytes| hex_encode(bytes)),
+        cache_policy: module
+            .cache_policy
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+        edge_cache_metadata: module
+            .edge_cache_metadata
+            .as_ref()
+            .map(|bytes| hex_encode(bytes)),
+    }
+}
+
+fn module_has_ffi_import_meta_metadata(module: &StatorModule) -> bool {
+    module.base_url.is_some()
+        || module.integrity_metadata.is_some()
+        || module.credentials_mode != StatorCredentialsMode::StatorCredentialsModeDefault
+        || module.referrer_policy != StatorReferrerPolicy::StatorReferrerPolicyDefault
+        || module.parser_metadata != StatorParserMetadata::StatorParserMetadataNotParserInserted
+        || module.source_url.is_some()
+        || module.origin_url.is_some()
+        || module.referrer_url.is_some()
+        || module.source_map_url.is_some()
+        || module.source_map_digest.is_some()
+        || module.cache_policy.is_some()
+        || module.edge_cache_metadata.is_some()
 }
 
 impl FfiHostModuleLoader {
@@ -8659,7 +9216,10 @@ impl HostModuleLoader for FfiHostModuleLoader {
         };
 
         let ffi_request = Box::into_raw(Box::new(StatorDynamicImportRequest {
-            inner: request,
+            inner: request.with_source_metadata(unsafe {
+                // SAFETY: `referrer` is the live module currently being evaluated.
+                host_source_metadata_for_module(&*self.referrer)
+            }),
             ctx: self.ctx,
             specifier: specifier.clone(),
         }));
@@ -8810,6 +9370,27 @@ impl HostModuleLoader for FfiHostModuleLoader {
         }
         if let Some(value) = take_meta_string!(out_meta.parser_metadata) {
             meta.parser_metadata = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.source_url) {
+            meta.source_url = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.origin_url) {
+            meta.origin_url = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.referrer_url) {
+            meta.referrer_url = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.source_map_url) {
+            meta.source_map_url = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.source_map_digest) {
+            meta.source_map_digest = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.cache_policy) {
+            meta.cache_policy = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.edge_cache_metadata) {
+            meta.edge_cache_metadata = Some(value);
         }
         Ok(meta)
     }
@@ -10199,6 +10780,7 @@ unsafe fn run_module_bytecodes(
                 || (*ctx).module_url_resolver.is_some()
                 || (*ctx).import_meta_populator.is_some()
                 || (*ctx).dynamic_import_resolver.is_some()
+                || module_has_ffi_import_meta_metadata(module_ref)
         };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
@@ -10708,6 +11290,7 @@ where
                 || (*ctx).module_url_resolver.is_some()
                 || (*ctx).import_meta_populator.is_some()
                 || (*ctx).dynamic_import_resolver.is_some()
+                || module_has_ffi_import_meta_metadata(module_ref)
         };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
@@ -22050,6 +22633,20 @@ mod tests {
             credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
             referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
             parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
         };
         // SAFETY: the stored callback and all pointers are valid for this test.
         let status = unsafe {
@@ -22510,6 +23107,118 @@ mod tests {
                 bytes.len(),
             )
         }
+    }
+
+    unsafe fn borrowed_bytes<'a>(ptr: *const c_char, len: usize) -> &'a [u8] {
+        if ptr.is_null() {
+            &[]
+        } else {
+            // SAFETY: test callers pass pointers borrowed from live FFI objects.
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+        }
+    }
+
+    #[test]
+    fn test_module_source_metadata_v2_set_query_and_origin_view() {
+        let module = compile_module_src("export const value = import.meta.sourceMapURL;");
+        let source_url = b"https://example.test/app.js#source";
+        let origin_url = b"https://example.test";
+        let referrer_url = b"https://referrer.test/page";
+        let source_map_url = b"https://example.test/app.js.map";
+        let digest = [0x12_u8, 0x34, 0xab, 0xcd];
+        let cache_policy = b"http-cache;max-age=60";
+        let edge_cache = b"edge-cache-bucket=v2";
+        let metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: source_url.as_ptr() as *const c_char,
+            source_url_len: source_url.len(),
+            origin_url: origin_url.as_ptr() as *const c_char,
+            origin_url_len: origin_url.len(),
+            referrer_url: referrer_url.as_ptr() as *const c_char,
+            referrer_url_len: referrer_url.len(),
+            source_map_url: source_map_url.as_ptr() as *const c_char,
+            source_map_url_len: source_map_url.len(),
+            source_map_digest: digest.as_ptr() as *const c_char,
+            source_map_digest_len: digest.len(),
+            cache_policy: cache_policy.as_ptr() as *const c_char,
+            cache_policy_len: cache_policy.len(),
+            edge_cache_metadata: edge_cache.as_ptr() as *const c_char,
+            edge_cache_metadata_len: edge_cache.len(),
+        };
+        assert!(unsafe { stator_module_set_source_metadata_v2(module, &metadata) });
+
+        let mut queried = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeCss,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        assert!(unsafe { stator_module_get_source_metadata_v2(module, &mut queried) });
+        assert_eq!(
+            queried.source_type,
+            StatorModuleType::StatorModuleTypeJavaScript
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.source_map_url, queried.source_map_url_len) },
+            source_map_url
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.source_map_digest, queried.source_map_digest_len) },
+            digest
+        );
+
+        let origin = unsafe { module_origin_view(&*module) };
+        assert_eq!(
+            unsafe { borrowed_bytes(origin.source_url, origin.source_url_len) },
+            source_url
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(origin.edge_cache_metadata, origin.edge_cache_metadata_len) },
+            edge_cache
+        );
+        unsafe { stator_module_free(module) };
+    }
+
+    #[test]
+    fn test_module_source_metadata_v2_fail_closed_invalid_inputs() {
+        let module = compile_module_src("export default 1;");
+        let bad_type = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJson,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        assert!(!unsafe { stator_module_set_source_metadata_v2(module, &bad_type) });
+        let bad_pointer = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: std::ptr::null(),
+            source_url_len: 1,
+            ..bad_type
+        };
+        assert!(!unsafe { stator_module_set_source_metadata_v2(module, &bad_pointer) });
+        unsafe { stator_module_free(module) };
     }
 
     fn evaluate_module_graph_number(root_src: &str, deps: &[(&str, &str)]) -> Result<f64, String> {
@@ -23633,6 +24342,45 @@ mod tests {
             stator_context_destroy(ctx);
         }
         assert_eq!(data.captured_base_url.as_deref(), Some(base_url.as_ref()));
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_exposes_source_metadata_v2() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let module = compile_module_src("import.meta.sourceMapURL;");
+        let source_map_url = b"https://app.example.test/root.mjs.map";
+        let metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: source_map_url.as_ptr() as *const c_char,
+            source_map_url_len: source_map_url.len(),
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        // SAFETY: module and metadata pointers are valid for this test.
+        unsafe {
+            assert!(stator_module_set_source_metadata_v2(module, &metadata));
+            let result = stator_module_evaluate(module, ctx);
+            assert!(!result.is_null());
+            let exposed = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(exposed, "https://app.example.test/root.mjs.map");
+            stator_value_destroy(result);
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
