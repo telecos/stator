@@ -595,6 +595,51 @@ Current limitations:
   callbacks and the flag bitmask (the freshly-built handler defaults to
   `NONE`).
 
+### 7.4 DOM wrapper class-id registry and type checks
+
+Each isolate owns a DOM wrapper class-id registry. Edge/Blink bindings
+register every native wrapper class before wrappers of that class are
+brand-checked:
+
+- `stator_dom_class_id_register(isolate, class_id, parent_class_id,
+  name, name_len, flags)` registers stable metadata. Class id `0` is
+  reserved for "unassigned" and is rejected. A non-zero parent id must
+  already be registered, which prevents inheritance cycles and keeps
+  derived checks fail-closed. Duplicate ids are rejected even if the
+  metadata matches.
+- `stator_dom_class_id_query` returns a borrowed `StatorDomClassInfo`
+  view containing the id, optional parent id, flags, and UTF-8 debug
+  label. The borrowed label is valid until unregister or isolate
+  teardown.
+- `stator_dom_class_id_unregister` removes a class only when no
+  registered child still names it as a parent.
+
+Wrappers still carry their existing embedder-set `class_id`, but the new
+brand-check APIs only trust ids present in the isolate registry:
+
+- `stator_dom_object_wrap_is_class(wrap, expected, allow_derived)` checks
+  a live wrapper pointer.
+- `stator_value_is_dom_object_wrap_class(isolate, value, expected,
+  allow_derived)` is the preferred script-visible path. It accepts only
+  values produced by `stator_dom_object_wrap_as_value` and fails closed
+  for primitives, ordinary objects, cross-isolate values, unregistered
+  ids, invalidated wrappers, and values whose wrapper was destroyed.
+
+When `allow_derived` is false the check is exact. When true, Stator walks
+the registered parent chain from the wrapper's actual class id to the
+expected id. Because registration requires parents to exist first,
+ancestor checks do not consult embedder payloads or internal fields and
+never infer types from native pointers.
+
+Current limitations:
+
+- Class metadata flags are stored and surfaced but have no engine-defined
+  semantics yet.
+- Direct calls with a raw wrapper pointer after
+  `stator_dom_object_wrap_destroy` remain invalid embedder usage. Use
+  `stator_value_is_dom_object_wrap_class` for stale script values; those
+  fail closed using the wrapper liveness token without dereferencing the
+  destroyed pointer.
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.

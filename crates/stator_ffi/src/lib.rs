@@ -31,8 +31,9 @@ use stator_jse::compiler::baseline::compiler::{
     stub_deopt_counts,
 };
 use stator_jse::dom::{
-    AccessCheckKey, AccessCheckOperation, DomObjectWrap, IndexedPropertyHandlerConfig,
-    IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig, NamedPropertyHandlerFlags,
+    AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
+    IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
+    NamedPropertyHandlerFlags,
 };
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostImportMeta, HostModuleLoader};
@@ -77,7 +78,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 7;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 8;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -234,8 +235,11 @@ pub struct StatorIsolate {
         unsafe extern "C" fn(userdata: *mut c_void, visitor: *mut StatorTracedVisitor),
         *mut c_void,
     )>,
+    /// Isolate-level registry of embedder DOM wrapper class ids used for
+    /// fail-closed wrapper type checks.
+    dom_class_registry: DomClassIdRegistry,
     /// DOM-wrapper weak-callback table.  Each entry is a heap-allocated
-    /// [`StatorDomWeakSlot`] registered by [`stator_dom_weak_ref_new`].  The
+    /// [StatorDomWeakSlot] registered by [stator_dom_weak_ref_new].  The
     /// slot owns the embedder callback metadata and a `std::rc::Weak` snapshot
     /// of the wrapper's `alive` flag so dispatch can detect destroyed wrappers
     /// without dereferencing dangling pointers.  Slots are scanned during the
@@ -275,6 +279,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         traced_slots: Vec::new(),
         traced_roots: stator_jse::gc::handle::TracedRoots::new(),
         traced_visitor: None,
+        dom_class_registry: DomClassIdRegistry::new(),
         dom_weak_slots: Vec::new(),
     }))
 }
@@ -15081,6 +15086,227 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_class_id(
     unsafe { (*wrap).class_id }
 }
 
+/// Borrowed metadata for a registered DOM wrapper class id.
+///
+/// `name` points into the isolate registry and remains valid until the class is
+/// unregistered or the isolate is destroyed.  It is not null-terminated; use
+/// `name_len` to read the UTF-8 debug label.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorDomClassInfo {
+    /// Registered class id.
+    pub class_id: u32,
+    /// Optional registered parent/base class id, or 0 when this is a root.
+    pub parent_class_id: u32,
+    /// Embedder-defined metadata flags.
+    pub flags: u32,
+    /// Borrowed pointer to `name_len` bytes of UTF-8 debug label data.
+    pub name: *const c_char,
+    /// Number of bytes in `name`.
+    pub name_len: usize,
+}
+
+fn stator_dom_class_info_view(info: &DomClassInfo) -> StatorDomClassInfo {
+    StatorDomClassInfo {
+        class_id: info.class_id(),
+        parent_class_id: info.parent_class_id().unwrap_or(0),
+        flags: info.flags(),
+        name: info.name().as_ptr() as *const c_char,
+        name_len: info.name().len(),
+    }
+}
+
+fn dom_class_registry_matches(
+    isolate: *const StatorIsolate,
+    actual_class_id: u32,
+    expected_class_id: u32,
+    allow_derived: bool,
+) -> bool {
+    if isolate.is_null() || actual_class_id == 0 || expected_class_id == 0 {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let registry = unsafe { &(*isolate).dom_class_registry };
+    if allow_derived {
+        registry.is_derived_match(actual_class_id, expected_class_id)
+    } else {
+        registry.is_exact_match(actual_class_id, expected_class_id)
+    }
+}
+
+/// Register DOM wrapper class metadata on an isolate.
+///
+/// Class id 0 is reserved for unassigned wrappers.  A non-zero parent id must
+/// already be registered, so inheritance lookups fail closed and cannot form
+/// cycles.  Duplicate class ids are rejected even if all metadata matches.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] on success,
+/// [`StatorStatus::StatorStatusFalse`] for duplicates/conflicts, and
+/// [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `name` must point to `name_len` bytes when `name_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_class_id_register(
+    isolate: *mut StatorIsolate,
+    class_id: u32,
+    parent_class_id: u32,
+    name: *const c_char,
+    name_len: usize,
+    flags: u32,
+) -> StatorStatus {
+    if isolate.is_null() || class_id == 0 || (name.is_null() && name_len > 0) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let name_string = if name_len == 0 {
+        String::new()
+    } else {
+        // SAFETY: caller supplied a valid pointer to `name_len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(value) => value.to_owned(),
+            Err(_) => return StatorStatus::StatorStatusInvalidArg,
+        }
+    };
+    let parent = if parent_class_id == 0 {
+        None
+    } else {
+        Some(parent_class_id)
+    };
+    // SAFETY: caller guarantees `isolate` is valid.
+    let registry = unsafe { &mut (*isolate).dom_class_registry };
+    match registry.register(DomClassInfo::new(class_id, parent, name_string, flags)) {
+        Ok(()) => StatorStatus::StatorStatusOk,
+        Err(stator_jse::dom::DomClassRegistryError::InvalidClassId)
+        | Err(stator_jse::dom::DomClassRegistryError::InvalidParentClassId) => {
+            StatorStatus::StatorStatusInvalidArg
+        }
+        Err(_) => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Unregister DOM wrapper class metadata from an isolate.
+///
+/// Returns `Ok` when removed, `False` when absent or still referenced by a
+/// registered child, and `InvalidArg` for null isolate or class id 0.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_class_id_unregister(
+    isolate: *mut StatorIsolate,
+    class_id: u32,
+) -> StatorStatus {
+    if isolate.is_null() || class_id == 0 {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    match unsafe { (*isolate).dom_class_registry.unregister(class_id) } {
+        Ok(()) => StatorStatus::StatorStatusOk,
+        Err(_) => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Query registered DOM wrapper class metadata.
+///
+/// On success writes a borrowed metadata view to `out_info`.  On failure the
+/// output is zero-cleared so callers cannot observe stale pointers.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `out_info` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_class_id_query(
+    isolate: *const StatorIsolate,
+    class_id: u32,
+    out_info: *mut StatorDomClassInfo,
+) -> StatorStatus {
+    if isolate.is_null() || out_info.is_null() || class_id == 0 {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `out_info` is valid.
+    unsafe {
+        *out_info = StatorDomClassInfo {
+            class_id: 0,
+            parent_class_id: 0,
+            flags: 0,
+            name: std::ptr::null(),
+            name_len: 0,
+        };
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let registry = unsafe { &(*isolate).dom_class_registry };
+    let Some(info) = registry.get(class_id) else {
+        return StatorStatus::StatorStatusFalse;
+    };
+    // SAFETY: caller guarantees `out_info` is valid.
+    unsafe { *out_info = stator_dom_class_info_view(info) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Test whether a live DOM wrapper has the expected registered class id.
+///
+/// Returns `false` for null wrappers, invalidated wrappers, class id 0,
+/// unregistered actual/expected ids, or inheritance mismatches.
+///
+/// # Safety
+/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_is_class(
+    wrap: *const StatorDomObjectWrap,
+    expected_class_id: u32,
+    allow_derived: bool,
+) -> bool {
+    if wrap.is_null() || expected_class_id == 0 {
+        return false;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let wrap_ref = unsafe { &*wrap };
+    if !wrap_ref.alive.get() {
+        return false;
+    }
+    dom_class_registry_matches(
+        wrap_ref.isolate,
+        wrap_ref.class_id,
+        expected_class_id,
+        allow_derived,
+    )
+}
+
+/// Test whether a value is a DOM wrapper value of the expected registered class.
+///
+/// This is the safe type-check path for script-visible wrapper values.  It
+/// fails closed for primitives, ordinary objects, invalidated wrappers, and
+/// values whose wrapper has already been destroyed.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_dom_object_wrap_class(
+    isolate: *const StatorIsolate,
+    value: *const StatorValue,
+    expected_class_id: u32,
+    allow_derived: bool,
+) -> bool {
+    if isolate.is_null() || value.is_null() || expected_class_id == 0 {
+        return false;
+    }
+    // SAFETY: caller guarantees `value` is valid.
+    let value_ref = unsafe { &*value };
+    if !value_ref.isolate.is_null() && !std::ptr::eq(value_ref.isolate, isolate.cast_mut()) {
+        return false;
+    }
+    match &value_ref.inner {
+        StatorValueInner::DomWrapHandle { wrap, alive, .. } if alive.get() && !wrap.is_null() => {
+            // SAFETY: the alive flag being true is the wrapper validity contract.
+            let actual_class_id = unsafe { (**wrap).class_id };
+            dom_class_registry_matches(isolate, actual_class_id, expected_class_id, allow_derived)
+        }
+        _ => false,
+    }
+}
 /// Store an opaque native-object identity pointer on `wrap`.
 ///
 /// The engine never dereferences this pointer; it is purely an identity tag
@@ -31290,6 +31516,187 @@ mod tests {
         }
     }
 
+    fn register_dom_class(
+        isolate: *mut StatorIsolate,
+        class_id: u32,
+        parent_class_id: u32,
+        name: &str,
+    ) -> StatorStatus {
+        unsafe {
+            stator_dom_class_id_register(
+                isolate,
+                class_id,
+                parent_class_id,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn test_dom_class_id_registry_register_query_and_duplicate_rejection() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 1, 0, "Node"),
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 1, 0, "NodeAgain"),
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 2, 99, "Element"),
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        let mut info = StatorDomClassInfo {
+            class_id: 0,
+            parent_class_id: 0,
+            flags: 0,
+            name: std::ptr::null(),
+            name_len: 0,
+        };
+        assert_eq!(
+            unsafe { stator_dom_class_id_query(iso.as_ptr(), 1, &mut info) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(info.class_id, 1);
+        assert_eq!(info.parent_class_id, 0);
+        let name = unsafe { std::slice::from_raw_parts(info.name as *const u8, info.name_len) };
+        assert_eq!(std::str::from_utf8(name).unwrap(), "Node");
+    }
+
+    #[test]
+    fn test_dom_class_id_registry_rejects_null_and_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            unsafe {
+                stator_dom_class_id_register(std::ptr::null_mut(), 1, 0, std::ptr::null(), 0, 0)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_register(iso.as_ptr(), 0, 0, std::ptr::null(), 0, 0) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_register(iso.as_ptr(), 1, 0, std::ptr::null(), 1, 0) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let mut info = StatorDomClassInfo {
+            class_id: 7,
+            parent_class_id: 7,
+            flags: 7,
+            name: 1 as *const c_char,
+            name_len: 7,
+        };
+        assert_eq!(
+            unsafe { stator_dom_class_id_query(iso.as_ptr(), 9, &mut info) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(info.class_id, 0);
+        assert!(info.name.is_null());
+        assert_eq!(
+            unsafe { stator_dom_class_id_query(std::ptr::null(), 1, &mut info) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_unregister(std::ptr::null_mut(), 1) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+    }
+
+    #[test]
+    fn test_dom_class_id_registry_unregister_rejects_children() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 1, 0, "Node"),
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 2, 1, "Element"),
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_unregister(iso.as_ptr(), 1) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_unregister(iso.as_ptr(), 2) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_dom_class_id_unregister(iso.as_ptr(), 1) },
+            StatorStatus::StatorStatusOk
+        );
+    }
+
+    #[test]
+    fn test_dom_wrapper_typecheck_exact_and_derived() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 1, 0, "Node"),
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 2, 1, "Element"),
+            StatorStatus::StatorStatusOk
+        );
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        unsafe { stator_dom_object_wrap_set_class_id(wrap, 2) };
+
+        assert!(unsafe { stator_dom_object_wrap_is_class(wrap, 2, false) });
+        assert!(!unsafe { stator_dom_object_wrap_is_class(wrap, 1, false) });
+        assert!(unsafe { stator_dom_object_wrap_is_class(wrap, 1, true) });
+        assert!(!unsafe { stator_dom_object_wrap_is_class(wrap, 99, true) });
+
+        let value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 2, false) });
+        assert!(unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 1, true) });
+        assert!(!unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 1, false) });
+
+        unsafe {
+            stator_value_destroy(value);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_wrapper_typecheck_fails_closed_for_unregistered_and_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        unsafe { stator_dom_object_wrap_set_class_id(wrap, 17) };
+        assert!(!unsafe { stator_dom_object_wrap_is_class(wrap, 17, false) });
+        assert!(!unsafe { stator_dom_object_wrap_is_class(std::ptr::null(), 17, false) });
+        assert!(!unsafe { stator_dom_object_wrap_is_class(wrap, 0, false) });
+        assert!(!unsafe {
+            stator_value_is_dom_object_wrap_class(iso.as_ptr(), std::ptr::null(), 17, false)
+        });
+        assert!(!unsafe {
+            stator_value_is_dom_object_wrap_class(std::ptr::null(), std::ptr::null(), 17, false)
+        });
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_wrapper_typecheck_fails_closed_after_invalidate_and_destroy() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            register_dom_class(iso.as_ptr(), 1, 0, "Node"),
+            StatorStatus::StatorStatusOk
+        );
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        unsafe { stator_dom_object_wrap_set_class_id(wrap, 1) };
+        let value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 1, false) });
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert!(!unsafe { stator_dom_object_wrap_is_class(wrap, 1, false) });
+        assert!(!unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 1, false) });
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        assert!(!unsafe { stator_value_is_dom_object_wrap_class(iso.as_ptr(), value, 1, false) });
+        unsafe { stator_value_destroy(value) };
+    }
     #[test]
     fn test_dom_install_named_handler_rejects_null_inputs() {
         let iso = IsolateGuard::new();

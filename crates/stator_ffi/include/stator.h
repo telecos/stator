@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 7
+#define STATOR_FFI_ABI_VERSION_MINOR 8
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1662,6 +1662,36 @@ typedef bool (*StatorDomIndexedSetterCb)(uint32_t index, const struct StatorValu
  * garbage-collected.
  */
 typedef void (*StatorDomWeakCb)(void *data);
+
+/**
+ * Borrowed metadata for a registered DOM wrapper class id.
+ *
+ * `name` points into the isolate registry and remains valid until the class is
+ * unregistered or the isolate is destroyed.  It is not null-terminated; use
+ * `name_len` to read the UTF-8 debug label.
+ */
+typedef struct StatorDomClassInfo {
+  /**
+   * Registered class id.
+   */
+  uint32_t class_id;
+  /**
+   * Optional registered parent/base class id, or 0 when this is a root.
+   */
+  uint32_t parent_class_id;
+  /**
+   * Embedder-defined metadata flags.
+   */
+  uint32_t flags;
+  /**
+   * Borrowed pointer to `name_len` bytes of UTF-8 debug label data.
+   */
+  const char *name;
+  /**
+   * Number of bytes in `name`.
+   */
+  size_t name_len;
+} StatorDomClassInfo;
 
 /**
  * Opaque traced-handle slot exposed to the embedder.
@@ -5662,6 +5692,82 @@ void stator_dom_object_wrap_set_class_id(struct StatorDomObjectWrap *wrap, uint3
  * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
  */
 uint32_t stator_dom_object_wrap_get_class_id(const struct StatorDomObjectWrap *wrap);
+
+/**
+ * Register DOM wrapper class metadata on an isolate.
+ *
+ * Class id 0 is reserved for unassigned wrappers.  A non-zero parent id must
+ * already be registered, so inheritance lookups fail closed and cannot form
+ * cycles.  Duplicate class ids are rejected even if all metadata matches.
+ *
+ * Returns [`StatorStatus::StatorStatusOk`] on success,
+ * [`StatorStatus::StatorStatusFalse`] for duplicates/conflicts, and
+ * [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `name` must point to `name_len` bytes when `name_len > 0`.
+ */
+enum StatorStatus stator_dom_class_id_register(struct StatorIsolate *isolate,
+                                               uint32_t class_id,
+                                               uint32_t parent_class_id,
+                                               const char *name,
+                                               size_t name_len,
+                                               uint32_t flags);
+
+/**
+ * Unregister DOM wrapper class metadata from an isolate.
+ *
+ * Returns `Ok` when removed, `False` when absent or still referenced by a
+ * registered child, and `InvalidArg` for null isolate or class id 0.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ */
+enum StatorStatus stator_dom_class_id_unregister(struct StatorIsolate *isolate, uint32_t class_id);
+
+/**
+ * Query registered DOM wrapper class metadata.
+ *
+ * On success writes a borrowed metadata view to `out_info`.  On failure the
+ * output is zero-cleared so callers cannot observe stale pointers.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `out_info` must be null or valid for writes.
+ */
+enum StatorStatus stator_dom_class_id_query(const struct StatorIsolate *isolate,
+                                            uint32_t class_id,
+                                            struct StatorDomClassInfo *out_info);
+
+/**
+ * Test whether a live DOM wrapper has the expected registered class id.
+ *
+ * Returns `false` for null wrappers, invalidated wrappers, class id 0,
+ * unregistered actual/expected ids, or inheritance mismatches.
+ *
+ * # Safety
+ * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+bool stator_dom_object_wrap_is_class(const struct StatorDomObjectWrap *wrap,
+                                     uint32_t expected_class_id,
+                                     bool allow_derived);
+
+/**
+ * Test whether a value is a DOM wrapper value of the expected registered class.
+ *
+ * This is the safe type-check path for script-visible wrapper values.  It
+ * fails closed for primitives, ordinary objects, invalidated wrappers, and
+ * values whose wrapper has already been destroyed.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_dom_object_wrap_class(const struct StatorIsolate *isolate,
+                                           const struct StatorValue *value,
+                                           uint32_t expected_class_id,
+                                           bool allow_derived);
 
 /**
  * Store an opaque native-object identity pointer on `wrap`.

@@ -16,6 +16,7 @@
 //!   can release the backing DOM node when the JS wrapper is collected.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
@@ -603,6 +604,168 @@ pub enum AccessCheckKey<'a> {
 pub type AccessCheckCallback =
     Box<dyn Fn(AccessCheckOperation, AccessCheckKey<'_>, *mut c_void) -> bool>;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DOM wrapper class-id registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reserved DOM wrapper class id meaning "unassigned".
+pub const DOM_CLASS_ID_UNASSIGNED: u32 = 0;
+
+/// Stable metadata registered for an embedder DOM wrapper class id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomClassInfo {
+    class_id: u32,
+    parent_class_id: Option<u32>,
+    name: String,
+    flags: u32,
+}
+
+impl DomClassInfo {
+    /// Create metadata for a DOM wrapper class id.
+    pub fn new(
+        class_id: u32,
+        parent_class_id: Option<u32>,
+        name: impl Into<String>,
+        flags: u32,
+    ) -> Self {
+        Self {
+            class_id,
+            parent_class_id,
+            name: name.into(),
+            flags,
+        }
+    }
+
+    /// Return this class id.
+    pub fn class_id(&self) -> u32 {
+        self.class_id
+    }
+
+    /// Return the optional parent/base class id.
+    pub fn parent_class_id(&self) -> Option<u32> {
+        self.parent_class_id
+    }
+
+    /// Return the registered debug label.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return embedder-defined metadata flags.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+}
+
+/// Error returned by [`DomClassIdRegistry`] operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DomClassRegistryError {
+    /// Class id 0 is reserved for unassigned wrappers.
+    #[error("DOM class id 0 is reserved")]
+    InvalidClassId,
+    /// The requested class id is already registered.
+    #[error("DOM class id is already registered")]
+    DuplicateClassId,
+    /// The requested parent class id is invalid or unregistered.
+    #[error("DOM parent class id is invalid or unregistered")]
+    InvalidParentClassId,
+    /// The class cannot be unregistered while registered children refer to it.
+    #[error("DOM class id still has registered children")]
+    ClassHasChildren,
+    /// The requested class id is not registered.
+    #[error("DOM class id is not registered")]
+    NotRegistered,
+}
+
+/// Isolate-level registry for DOM wrapper class ids and inheritance metadata.
+#[derive(Debug, Default, Clone)]
+pub struct DomClassIdRegistry {
+    classes: HashMap<u32, DomClassInfo>,
+}
+
+impl DomClassIdRegistry {
+    /// Create an empty DOM class-id registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a class id with optional parent metadata.
+    pub fn register(&mut self, info: DomClassInfo) -> Result<(), DomClassRegistryError> {
+        if info.class_id == DOM_CLASS_ID_UNASSIGNED {
+            return Err(DomClassRegistryError::InvalidClassId);
+        }
+        if self.classes.contains_key(&info.class_id) {
+            return Err(DomClassRegistryError::DuplicateClassId);
+        }
+        if let Some(parent_id) = info.parent_class_id
+            && (parent_id == DOM_CLASS_ID_UNASSIGNED
+                || parent_id == info.class_id
+                || !self.classes.contains_key(&parent_id))
+        {
+            return Err(DomClassRegistryError::InvalidParentClassId);
+        }
+        self.classes.insert(info.class_id, info);
+        Ok(())
+    }
+
+    /// Unregister a class id. Fails if registered children still refer to it.
+    pub fn unregister(&mut self, class_id: u32) -> Result<(), DomClassRegistryError> {
+        if class_id == DOM_CLASS_ID_UNASSIGNED {
+            return Err(DomClassRegistryError::InvalidClassId);
+        }
+        if !self.classes.contains_key(&class_id) {
+            return Err(DomClassRegistryError::NotRegistered);
+        }
+        if self
+            .classes
+            .values()
+            .any(|info| info.parent_class_id == Some(class_id))
+        {
+            return Err(DomClassRegistryError::ClassHasChildren);
+        }
+        self.classes.remove(&class_id);
+        Ok(())
+    }
+
+    /// Return metadata for a registered class id.
+    pub fn get(&self, class_id: u32) -> Option<&DomClassInfo> {
+        if class_id == DOM_CLASS_ID_UNASSIGNED {
+            None
+        } else {
+            self.classes.get(&class_id)
+        }
+    }
+
+    /// Return `true` if `actual_class_id` exactly matches `expected_class_id`.
+    pub fn is_exact_match(&self, actual_class_id: u32, expected_class_id: u32) -> bool {
+        actual_class_id == expected_class_id
+            && self.get(actual_class_id).is_some()
+            && self.get(expected_class_id).is_some()
+    }
+
+    /// Return `true` if `actual_class_id` is `expected_class_id` or derives from it.
+    pub fn is_derived_match(&self, actual_class_id: u32, expected_class_id: u32) -> bool {
+        if self.get(expected_class_id).is_none() {
+            return false;
+        }
+        let mut current = Some(actual_class_id);
+        let mut depth = 0usize;
+        while let Some(class_id) = current {
+            if class_id == expected_class_id {
+                return self.get(class_id).is_some();
+            }
+            let Some(info) = self.get(class_id) else {
+                return false;
+            };
+            current = info.parent_class_id;
+            depth += 1;
+            if depth > self.classes.len() {
+                return false;
+            }
+        }
+        false
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // DomObjectWrap
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1863,6 +2026,68 @@ mod tests {
         );
     }
 
+    // ── DOM class-id registry ─────────────────────────────────────────────
+
+    #[test]
+    fn test_dom_class_registry_rejects_invalid_and_duplicate_ids() {
+        let mut registry = DomClassIdRegistry::new();
+        assert_eq!(
+            registry.register(DomClassInfo::new(0, None, "Invalid", 0)),
+            Err(DomClassRegistryError::InvalidClassId)
+        );
+        registry
+            .register(DomClassInfo::new(1, None, "Node", 0))
+            .expect("register node");
+        assert_eq!(
+            registry.register(DomClassInfo::new(1, None, "Other", 0)),
+            Err(DomClassRegistryError::DuplicateClassId)
+        );
+        assert_eq!(
+            registry.register(DomClassInfo::new(2, Some(99), "Element", 0)),
+            Err(DomClassRegistryError::InvalidParentClassId)
+        );
+    }
+
+    #[test]
+    fn test_dom_class_registry_exact_and_derived_matching() {
+        let mut registry = DomClassIdRegistry::new();
+        registry
+            .register(DomClassInfo::new(1, None, "Node", 0))
+            .expect("register node");
+        registry
+            .register(DomClassInfo::new(2, Some(1), "Element", 0))
+            .expect("register element");
+        registry
+            .register(DomClassInfo::new(3, Some(2), "HTMLDivElement", 0))
+            .expect("register div");
+
+        assert!(registry.is_exact_match(2, 2));
+        assert!(!registry.is_exact_match(3, 2));
+        assert!(registry.is_derived_match(3, 3));
+        assert!(registry.is_derived_match(3, 2));
+        assert!(registry.is_derived_match(3, 1));
+        assert!(!registry.is_derived_match(1, 3));
+        assert!(!registry.is_derived_match(99, 1));
+        assert!(!registry.is_derived_match(3, 99));
+    }
+
+    #[test]
+    fn test_dom_class_registry_unregister_rejects_registered_children() {
+        let mut registry = DomClassIdRegistry::new();
+        registry
+            .register(DomClassInfo::new(1, None, "Node", 0))
+            .expect("register node");
+        registry
+            .register(DomClassInfo::new(2, Some(1), "Element", 0))
+            .expect("register element");
+        assert_eq!(
+            registry.unregister(1),
+            Err(DomClassRegistryError::ClassHasChildren)
+        );
+        registry.unregister(2).expect("unregister child");
+        registry.unregister(1).expect("unregister parent");
+        assert!(!registry.is_exact_match(1, 1));
+    }
     // ── ALL_CAN_READ semantics — named ───────────────────────────────────
 
     #[test]
