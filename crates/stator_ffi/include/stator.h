@@ -267,6 +267,78 @@ typedef enum StatorModuleCacheStatus {
 } StatorModuleCacheStatus;
 
 /**
+ * JIT tier selector for deterministic force/wait APIs.
+ */
+typedef enum StatorJitTier {
+  /**
+   * Non-optimising baseline native-code tier.
+   */
+  Baseline = 1,
+  /**
+   * Mid-tier Maglev native-code tier.
+   */
+  Maglev = 2,
+  /**
+   * Optimising Turbofan native-code tier.
+   */
+  Turbofan = 3,
+} StatorJitTier;
+
+/**
+ * Structured status for deterministic force/wait tier APIs.
+ */
+typedef enum StatorTierRequestStatus {
+  /**
+   * Requested tier was already compiled before the request.
+   */
+  AlreadyReady = 0,
+  /**
+   * Requested tier was compiled by the request.
+   */
+  Compiled = 1,
+  /**
+   * Compilation has been requested but no code is observable yet.
+   */
+  Pending = 2,
+  /**
+   * Requested tier is not supported by this build/target.
+   */
+  UnsupportedTier = 3,
+  /**
+   * JIT execution is disabled for the script/function.
+   */
+  JitDisabled = 4,
+  /**
+   * Compilation was skipped because the tier is deopt-blocked.
+   */
+  DeoptBlocked = 5,
+  /**
+   * Graph construction failed before code generation.
+   */
+  GraphBuildFailed = 6,
+  /**
+   * The compiler produced an always-deoptimising graph.
+   */
+  DegenerateGraph = 7,
+  /**
+   * Native code generation failed.
+   */
+  CompileFailed = 8,
+  /**
+   * Executable-code allocation or finalisation failed.
+   */
+  ExecutableAllocationFailed = 9,
+  /**
+   * Waiting for the requested tier timed out.
+   */
+  TimedOut = 10,
+  /**
+   * The input script/result pointer was null or the script failed to compile.
+   */
+  InvalidScript = 11,
+} StatorTierRequestStatus;
+
+/**
  * Stable classification of a Stator engine error or message.
  *
  * Mirrors the structural categories embedders care about — JavaScript
@@ -1198,6 +1270,24 @@ typedef struct StatorScriptTierStatus {
    */
   bool jit_disabled;
 } StatorScriptTierStatus;
+
+/**
+ * Result record filled by deterministic force/wait tier APIs.
+ */
+typedef struct StatorTierRequestResult {
+  /**
+   * Tier requested by the caller.
+   */
+  enum StatorJitTier requested_tier;
+  /**
+   * Final status of the request/observation.
+   */
+  enum StatorTierRequestStatus status;
+  /**
+   * Whether the requested tier is observable as ready now.
+   */
+  bool ready;
+} StatorTierRequestResult;
 
 /**
  * C-callable native-function signature.
@@ -3315,6 +3405,46 @@ bool stator_script_get_tier_status(const struct StatorScript *script,
  * `script` must be null or a valid, live `StatorScript` pointer.
  */
 bool stator_script_force_maglev_compile(struct StatorScript *script);
+
+/**
+ * Synchronously request compilation of `tier` for `script`.
+ *
+ * Returns `true` only when the requested tier is observable as ready after the
+ * call. `*result` is always filled for non-null pointers and reports
+ * unsupported tiers, disabled JIT, and compile failures without faking success.
+ *
+ * # Safety
+ * - `script` must be null or a valid, live `StatorScript` pointer.
+ * - `result` must be null or valid for writes.
+ */
+bool stator_script_force_tier(struct StatorScript *script,
+                              enum StatorJitTier tier,
+                              struct StatorTierRequestResult *result);
+
+/**
+ * Observe whether `tier` is currently ready for `script` without compiling.
+ *
+ * # Safety
+ * - `script` must be null or a valid, live `StatorScript` pointer.
+ * - `result` must be null or valid for writes.
+ */
+bool stator_script_observe_tier(const struct StatorScript *script,
+                                enum StatorJitTier tier,
+                                struct StatorTierRequestResult *result);
+
+/**
+ * Wait up to `timeout_ms` for `tier` to become ready for `script`.
+ *
+ * Returns `true` only when the tier becomes observable as ready.
+ *
+ * # Safety
+ * - `script` must be null or a valid, live `StatorScript` pointer.
+ * - `result` must be null or valid for writes.
+ */
+bool stator_script_wait_for_tier(const struct StatorScript *script,
+                                 enum StatorJitTier tier,
+                                 uint64_t timeout_ms,
+                                 struct StatorTierRequestResult *result);
 
 /**
  * Disable Maglev/Turbofan tier-up for a compiled script.

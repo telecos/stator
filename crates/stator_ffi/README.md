@@ -46,6 +46,22 @@ stator_isolate_destroy(isolate);
 Always pair handles returned by the API with the matching destroy/free function
 documented in `stator.h`.
 
+## Deterministic JIT tier control
+
+Benchmark harnesses can request or observe a concrete JIT tier without relying on
+warmup timing:
+
+- `stator_script_force_tier` synchronously requests Baseline, Maglev, or
+  Turbofan compilation for a compiled script/function.
+- `stator_script_observe_tier` reports whether a tier is already ready without
+  compiling.
+- `stator_script_wait_for_tier` waits up to a caller-provided timeout for a
+  requested tier to become observable.
+
+All three fill `StatorTierRequestResult`. A `true` return means the requested
+tier is ready; unsupported tiers, disabled JIT, timeouts, and compiler failures
+return `false` with a structured `StatorTierRequestStatus` reason.
+
 ## ABI version contract
 
 The C ABI exposes an explicit, packed version marker so embedders can detect a

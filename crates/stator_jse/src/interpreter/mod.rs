@@ -176,7 +176,7 @@ mod temporal_conformance_tests;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use smallvec::SmallVec;
@@ -1658,6 +1658,175 @@ pub fn jit_tier_stats() -> (u64, u64, u64) {
     )
 }
 
+/// JIT tier requested by deterministic tier-control APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitTier {
+    /// Non-optimising baseline native-code tier.
+    Baseline,
+    /// Mid-tier Maglev native-code tier.
+    Maglev,
+    /// Optimising Turbofan native-code tier.
+    Turbofan,
+}
+
+/// Outcome status for deterministic tier-control APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierRequestStatus {
+    /// Requested tier was already compiled before the request.
+    AlreadyReady,
+    /// Requested tier was compiled by the request.
+    Compiled,
+    /// Compilation has been requested but no code is observable yet.
+    Pending,
+    /// Requested tier is not supported by this build/target.
+    UnsupportedTier,
+    /// JIT execution is disabled for the script/function.
+    JitDisabled,
+    /// Compilation was skipped because the tier is deopt-blocked.
+    DeoptBlocked,
+    /// Graph construction failed before code generation.
+    GraphBuildFailed,
+    /// The compiler produced an always-deoptimising graph.
+    DegenerateGraph,
+    /// Native code generation failed.
+    CompileFailed,
+    /// Executable-code allocation or finalisation failed.
+    ExecutableAllocationFailed,
+    /// Waiting for the requested tier timed out.
+    TimedOut,
+}
+
+/// Structured result returned by deterministic tier-control APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierRequestResult {
+    /// Tier requested by the caller.
+    pub requested_tier: JitTier,
+    /// Final status of the request/observation.
+    pub status: TierRequestStatus,
+    /// Whether the requested tier is observable as ready right now.
+    pub ready: bool,
+}
+
+impl TierRequestResult {
+    fn new(requested_tier: JitTier, status: TierRequestStatus, ready: bool) -> Self {
+        Self {
+            requested_tier,
+            status,
+            ready,
+        }
+    }
+}
+
+/// Observe whether `ba` has completed compilation for `tier`.
+#[must_use]
+pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
+    if ba.jit_disabled() {
+        return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
+    }
+    match tier {
+        JitTier::Baseline => {
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
+            {
+                if ba.has_baseline_jit_code() {
+                    TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true)
+                } else {
+                    TierRequestResult::new(tier, TierRequestStatus::Pending, false)
+                }
+            }
+            #[cfg(not(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            )))]
+            {
+                TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false)
+            }
+        }
+        JitTier::Maglev => {
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
+            {
+                if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
+                    TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true)
+                } else if ba.jit_maglev_has_deopted() {
+                    TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false)
+                } else {
+                    TierRequestResult::new(tier, TierRequestStatus::Pending, false)
+                }
+            }
+            #[cfg(not(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            )))]
+            {
+                TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false)
+            }
+        }
+        JitTier::Turbofan => {
+            #[cfg(all(target_arch = "x86_64", unix))]
+            {
+                if ba.has_turbofan_jit_code() {
+                    TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true)
+                } else {
+                    TierRequestResult::new(tier, TierRequestStatus::Pending, false)
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", unix)))]
+            {
+                TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false)
+            }
+        }
+    }
+}
+
+/// Synchronously request compilation for `tier` and report the actual result.
+///
+/// This API never reports success unless the requested tier is observable as
+/// ready after the call. Unsupported tiers, disabled JIT, and compiler failures
+/// are returned as structured statuses.
+#[must_use]
+pub fn force_tier_sync(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
+    if ba.jit_disabled() {
+        return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
+    }
+    let observed = observe_tier(ba, tier);
+    if observed.ready {
+        return observed;
+    }
+    match tier {
+        JitTier::Baseline => force_baseline_sync(ba),
+        JitTier::Maglev => force_maglev_sync(ba),
+        JitTier::Turbofan => force_turbofan_sync(ba),
+    }
+}
+
+/// Wait until `tier` is observable as ready or `timeout` elapses.
+#[must_use]
+pub fn wait_for_tier(ba: &BytecodeArray, tier: JitTier, timeout: Duration) -> TierRequestResult {
+    let start = Instant::now();
+    loop {
+        let observed = observe_tier(ba, tier);
+        if observed.ready
+            || matches!(
+                observed.status,
+                TierRequestStatus::UnsupportedTier
+                    | TierRequestStatus::JitDisabled
+                    | TierRequestStatus::DeoptBlocked
+            )
+        {
+            return observed;
+        }
+        if start.elapsed() >= timeout {
+            return TierRequestResult::new(tier, TierRequestStatus::TimedOut, false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[allow(dead_code)]
 #[cfg(any(
     stator_maglev_jit_x86_64,
@@ -1745,6 +1914,44 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
         all(target_arch = "x86_64", any(unix, windows))
     )))]
     let _ = ba;
+}
+
+fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
+    let tier = JitTier::Baseline;
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    {
+        use crate::compiler::baseline::compiler::{BaselineCompiler, CachedExecutableCode};
+        if ba.has_baseline_jit_code() {
+            return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
+        }
+        let cc = match BaselineCompiler::compile(ba) {
+            Ok(cc) => cc,
+            Err(_) => return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false),
+        };
+        // SAFETY: `cc.code` was produced by `BaselineCompiler::compile`.
+        match unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) } {
+            Ok(cached) => {
+                ba.store_jit_code(cached);
+                JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(cc.code.len())));
+                TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
+            }
+            Err(_) => {
+                TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false)
+            }
+        }
+    }
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
+    {
+        let _ = ba;
+        TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false)
+    }
 }
 
 /// Build a constant-pool suitable for sending to a background compilation
@@ -2021,11 +2228,19 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
     stator_maglev_jit_x86_64,
     all(target_arch = "x86_64", any(unix, windows))
 ))]
-pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
+fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
     use crate::compiler::maglev::codegen as maglev_codegen;
     use crate::compiler::maglev::graph_builder::GraphBuilder;
     use crate::compiler::maglev::optimizer::optimize;
+
+    let tier = JitTier::Maglev;
+    if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
+        return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
+    }
+    if ba.jit_maglev_has_deopted() {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
 
     // Prevent duplicate compilation via the background path.
     let _ = ba.try_start_maglev_compile();
@@ -2046,18 +2261,22 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
         Ok(mut g) => {
             optimize(&mut g);
             if g.is_degenerate() {
-                return false;
+                MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return TierRequestResult::new(tier, TierRequestStatus::DegenerateGraph, false);
             }
             g
         }
-        Err(_) => return false,
+        Err(_) => {
+            MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return TierRequestResult::new(tier, TierRequestStatus::GraphBuildFailed, false);
+        }
     };
 
     let cc = match maglev_codegen::compile(&graph, param_count) {
         Ok(cc) => cc,
         Err(_) => {
             MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+            return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false);
         }
     };
 
@@ -2078,10 +2297,28 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
             MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MAGLEV_CODE_BYTES.fetch_add(cc.code.len(), std::sync::atomic::Ordering::Relaxed);
-            true
+            TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
         }
-        None => false,
+        None => TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false),
     }
+}
+
+#[cfg(not(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+)))]
+fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
+    let _ = ba;
+    TierRequestResult::new(JitTier::Maglev, TierRequestStatus::UnsupportedTier, false)
+}
+
+/// Compile Maglev JIT code for `ba` synchronously.
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
+pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
+    force_maglev_sync(ba).ready
 }
 
 /// Try to execute `ba` via the cached Maglev JIT code.
@@ -2320,6 +2557,66 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
     }
     #[cfg(not(all(target_arch = "x86_64", unix)))]
     let _ = ba;
+}
+
+fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
+    let tier = JitTier::Turbofan;
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
+        use crate::compiler::maglev::graph_builder::GraphBuilder;
+        use crate::compiler::maglev::optimizer::optimize;
+        use crate::compiler::turbofan;
+
+        if ba.has_turbofan_jit_code() {
+            return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
+        }
+        let _ = ba.try_start_turbofan_compile();
+
+        let mut feedback = FeedbackVector::new(ba.feedback_metadata());
+        for slot in 0..ba.feedback_metadata().slot_count() {
+            if matches!(
+                ba.feedback_metadata().kind_of(slot),
+                Some(FeedbackSlotKind::KeyedLoadProperty | FeedbackSlotKind::KeyedStoreProperty)
+            ) {
+                let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+            }
+        }
+
+        let mut graph = match GraphBuilder::build(ba, &feedback) {
+            Ok(graph) => graph,
+            Err(_) => {
+                return TierRequestResult::new(tier, TierRequestStatus::GraphBuildFailed, false);
+            }
+        };
+        optimize(&mut graph);
+        if graph.is_degenerate() {
+            return TierRequestResult::new(tier, TierRequestStatus::DegenerateGraph, false);
+        }
+        let tc =
+            match turbofan::compile_with_feedback(&graph, ba.parameter_count(), Some(&feedback)) {
+                Ok(tc) => tc,
+                Err(_) => {
+                    return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false);
+                }
+            };
+        let code_size = tc.code_size;
+        if let Ok(mut guard) = ba.turbofan_jit_cache_arc().lock() {
+            *guard = Some(tc);
+            ba.turbofan_jit_code_flag()
+                .store(true, std::sync::atomic::Ordering::Release);
+            TURBOFAN_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TURBOFAN_CODE_BYTES.fetch_add(code_size, std::sync::atomic::Ordering::Relaxed);
+            TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
+        } else {
+            TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false)
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        let _ = ba;
+        TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false)
+    }
 }
 
 /// Try to execute `ba` via the cached Turbofan JIT code.
@@ -22017,6 +22314,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_force_tier_baseline_reports_ready_and_updates_counters() {
+        let add_ba = make_add_bytecode();
+        let (count_before, bytes_before) = jit_stats();
+        let counters_before = crate::compiler::compile_counters::snapshot();
+
+        let result = force_tier_sync(&add_ba, JitTier::Baseline);
+
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        {
+            assert!(result.ready);
+            assert_eq!(result.status, TierRequestStatus::Compiled);
+            assert!(add_ba.has_baseline_jit_code());
+            let (count_after, bytes_after) = jit_stats();
+            assert!(count_after > count_before);
+            assert!(bytes_after > bytes_before);
+            let counters_after = crate::compiler::compile_counters::snapshot();
+            assert!(
+                counters_after.attempts(crate::compiler::compile_counters::CompileTier::Baseline)
+                    > counters_before
+                        .attempts(crate::compiler::compile_counters::CompileTier::Baseline)
+            );
+        }
+        #[cfg(not(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
+        {
+            assert!(!result.ready);
+            assert_eq!(result.status, TierRequestStatus::UnsupportedTier);
+            let (count_after, bytes_after) = jit_stats();
+            assert_eq!(count_after, count_before);
+            assert_eq!(bytes_after, bytes_before);
+            let counters_after = crate::compiler::compile_counters::snapshot();
+            assert_eq!(
+                counters_after.attempts(crate::compiler::compile_counters::CompileTier::Baseline),
+                counters_before.attempts(crate::compiler::compile_counters::CompileTier::Baseline)
+            );
+        }
+    }
+
+    #[test]
+    fn test_force_tier_disabled_reports_jit_disabled() {
+        let add_ba = make_add_bytecode();
+        add_ba.set_jit_disabled(true);
+
+        let result = force_tier_sync(&add_ba, JitTier::Baseline);
+
+        assert!(!result.ready);
+        assert_eq!(result.status, TierRequestStatus::JitDisabled);
+    }
+
+    #[test]
+    fn test_wait_for_tier_reports_observed_status_without_fake_success() {
+        let add_ba = make_add_bytecode();
+
+        let observed = observe_tier(&add_ba, JitTier::Baseline);
+        let waited = wait_for_tier(&add_ba, JitTier::Baseline, Duration::from_millis(0));
+
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        {
+            assert_eq!(observed.status, TierRequestStatus::Pending);
+            assert_eq!(waited.status, TierRequestStatus::TimedOut);
+        }
+        #[cfg(not(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
+        {
+            assert_eq!(observed.status, TierRequestStatus::UnsupportedTier);
+            assert_eq!(waited.status, TierRequestStatus::UnsupportedTier);
+        }
+        assert!(!observed.ready);
+        assert!(!waited.ready);
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    fn test_force_tier_turbofan_reports_unsupported_on_this_target() {
+        let add_ba = make_add_bytecode();
+
+        let result = force_tier_sync(&add_ba, JitTier::Turbofan);
+
+        assert!(!result.ready);
+        assert_eq!(result.status, TierRequestStatus::UnsupportedTier);
+    }
+
     /// Synchronously compile a small callee through Maglev and execute it
     /// via the interpreter on every supported target (x86-64 Unix and
     /// Windows).  Unlike `test_maglev_compiled_after_threshold`, this test
@@ -22028,15 +22418,15 @@ mod tests {
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     fn maglev_jit_compiles_simple_callee_on_supported_targets() {
-        use super::compile_maglev_sync;
-
         let add_ba = make_add_bytecode();
 
         // Synchronously compile the inner function with Maglev.
+        let forced = force_tier_sync(&add_ba, JitTier::Maglev);
         assert!(
-            compile_maglev_sync(&add_ba),
-            "compile_maglev_sync must succeed on a simple add(a, b) callee"
+            forced.ready,
+            "force_tier_sync must ready Maglev: {forced:?}"
         );
+        assert_eq!(forced.status, TierRequestStatus::Compiled);
         // `compile_maglev_sync` writes the executable code directly into
         // the per-BA `Rc<RefCell>` Maglev cache (not the `Arc<Mutex>`
         // tier-up cache that `has_maglev_jit_code` inspects), so check
@@ -22242,7 +22632,6 @@ mod tests {
     /// result.
     #[test]
     fn test_turbofan_compiled_after_threshold() {
-        use super::turbofan_stats;
         use crate::bytecode::bytecode_array::TURBOFAN_TIERING_THRESHOLD;
 
         let add_ba = make_add_bytecode();
@@ -22326,7 +22715,7 @@ mod tests {
 
             // Turbofan or Maglev stats must have been incremented.
             if inner_ba.has_turbofan_jit_code() {
-                let (tf_count, _tf_bytes) = turbofan_stats();
+                let (tf_count, _tf_bytes) = super::turbofan_stats();
                 assert!(
                     tf_count > 0,
                     "turbofan_stats count must be > 0 after Turbofan compilation"

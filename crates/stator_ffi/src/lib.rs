@@ -36,7 +36,9 @@ use stator_jse::dom::{
 };
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostImportMeta, HostModuleLoader};
-use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
+use stator_jse::interpreter::{
+    GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
+};
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::PropertyMap;
@@ -6333,6 +6335,102 @@ pub struct StatorScriptTierStatus {
     pub jit_disabled: bool,
 }
 
+/// JIT tier selector for deterministic force/wait APIs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorJitTier {
+    /// Non-optimising baseline native-code tier.
+    Baseline = 1,
+    /// Mid-tier Maglev native-code tier.
+    Maglev = 2,
+    /// Optimising Turbofan native-code tier.
+    Turbofan = 3,
+}
+
+/// Structured status for deterministic force/wait tier APIs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorTierRequestStatus {
+    /// Requested tier was already compiled before the request.
+    AlreadyReady = 0,
+    /// Requested tier was compiled by the request.
+    Compiled = 1,
+    /// Compilation has been requested but no code is observable yet.
+    Pending = 2,
+    /// Requested tier is not supported by this build/target.
+    UnsupportedTier = 3,
+    /// JIT execution is disabled for the script/function.
+    JitDisabled = 4,
+    /// Compilation was skipped because the tier is deopt-blocked.
+    DeoptBlocked = 5,
+    /// Graph construction failed before code generation.
+    GraphBuildFailed = 6,
+    /// The compiler produced an always-deoptimising graph.
+    DegenerateGraph = 7,
+    /// Native code generation failed.
+    CompileFailed = 8,
+    /// Executable-code allocation or finalisation failed.
+    ExecutableAllocationFailed = 9,
+    /// Waiting for the requested tier timed out.
+    TimedOut = 10,
+    /// The input script/result pointer was null or the script failed to compile.
+    InvalidScript = 11,
+}
+
+/// Result record filled by deterministic force/wait tier APIs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorTierRequestResult {
+    /// Tier requested by the caller.
+    pub requested_tier: StatorJitTier,
+    /// Final status of the request/observation.
+    pub status: StatorTierRequestStatus,
+    /// Whether the requested tier is observable as ready now.
+    pub ready: bool,
+}
+
+fn to_jit_tier(tier: StatorJitTier) -> JitTier {
+    match tier {
+        StatorJitTier::Baseline => JitTier::Baseline,
+        StatorJitTier::Maglev => JitTier::Maglev,
+        StatorJitTier::Turbofan => JitTier::Turbofan,
+    }
+}
+
+fn from_jit_tier(tier: JitTier) -> StatorJitTier {
+    match tier {
+        JitTier::Baseline => StatorJitTier::Baseline,
+        JitTier::Maglev => StatorJitTier::Maglev,
+        JitTier::Turbofan => StatorJitTier::Turbofan,
+    }
+}
+
+fn from_tier_request_status(status: TierRequestStatus) -> StatorTierRequestStatus {
+    match status {
+        TierRequestStatus::AlreadyReady => StatorTierRequestStatus::AlreadyReady,
+        TierRequestStatus::Compiled => StatorTierRequestStatus::Compiled,
+        TierRequestStatus::Pending => StatorTierRequestStatus::Pending,
+        TierRequestStatus::UnsupportedTier => StatorTierRequestStatus::UnsupportedTier,
+        TierRequestStatus::JitDisabled => StatorTierRequestStatus::JitDisabled,
+        TierRequestStatus::DeoptBlocked => StatorTierRequestStatus::DeoptBlocked,
+        TierRequestStatus::GraphBuildFailed => StatorTierRequestStatus::GraphBuildFailed,
+        TierRequestStatus::DegenerateGraph => StatorTierRequestStatus::DegenerateGraph,
+        TierRequestStatus::CompileFailed => StatorTierRequestStatus::CompileFailed,
+        TierRequestStatus::ExecutableAllocationFailed => {
+            StatorTierRequestStatus::ExecutableAllocationFailed
+        }
+        TierRequestStatus::TimedOut => StatorTierRequestStatus::TimedOut,
+    }
+}
+
+fn from_tier_request_result(result: TierRequestResult) -> StatorTierRequestResult {
+    StatorTierRequestResult {
+        requested_tier: from_jit_tier(result.requested_tier),
+        status: from_tier_request_status(result.status),
+        ready: result.ready,
+    }
+}
+
 /// Fill `*status` with tiering state for `script`.
 ///
 /// Returns `false` when either pointer is null or the script failed to compile.
@@ -6379,29 +6477,144 @@ pub unsafe extern "C" fn stator_script_get_tier_status(
 /// `script` must be null or a valid, live `StatorScript` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_script_force_maglev_compile(script: *mut StatorScript) -> bool {
+    let mut result = StatorTierRequestResult {
+        requested_tier: StatorJitTier::Maglev,
+        status: StatorTierRequestStatus::InvalidScript,
+        ready: false,
+    };
+    // SAFETY: forwards the caller's script pointer and a valid stack result.
+    unsafe { stator_script_force_tier(script, StatorJitTier::Maglev, &mut result) }
+}
+
+/// Synchronously request compilation of `tier` for `script`.
+///
+/// Returns `true` only when the requested tier is observable as ready after the
+/// call. `*result` is always filled for non-null pointers and reports
+/// unsupported tiers, disabled JIT, and compile failures without faking success.
+///
+/// # Safety
+/// - `script` must be null or a valid, live `StatorScript` pointer.
+/// - `result` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_force_tier(
+    script: *mut StatorScript,
+    tier: StatorJitTier,
+    result: *mut StatorTierRequestResult,
+) -> bool {
+    if result.is_null() {
+        return false;
+    }
+    let invalid = StatorTierRequestResult {
+        requested_tier: tier,
+        status: StatorTierRequestStatus::InvalidScript,
+        ready: false,
+    };
     if script.is_null() {
+        // SAFETY: `result` was checked non-null and caller guarantees writability.
+        unsafe { *result = invalid };
         return false;
     }
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
         Some(b) => b,
-        None => return false,
+        None => {
+            // SAFETY: `result` was checked non-null and caller guarantees writability.
+            unsafe { *result = invalid };
+            return false;
+        }
     };
-    #[cfg(any(
-        stator_maglev_jit_x86_64,
-        all(target_arch = "x86_64", any(unix, windows))
-    ))]
-    {
-        stator_jse::interpreter::compile_maglev_sync(bytecodes)
+    let request = stator_jse::interpreter::force_tier_sync(bytecodes, to_jit_tier(tier));
+    let ffi_result = from_tier_request_result(request);
+    // SAFETY: `result` was checked non-null and caller guarantees writability.
+    unsafe { *result = ffi_result };
+    ffi_result.ready
+}
+
+/// Observe whether `tier` is currently ready for `script` without compiling.
+///
+/// # Safety
+/// - `script` must be null or a valid, live `StatorScript` pointer.
+/// - `result` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_observe_tier(
+    script: *const StatorScript,
+    tier: StatorJitTier,
+    result: *mut StatorTierRequestResult,
+) -> bool {
+    if result.is_null() {
+        return false;
     }
-    #[cfg(not(any(
-        stator_maglev_jit_x86_64,
-        all(target_arch = "x86_64", any(unix, windows))
-    )))]
-    {
-        let _ = bytecodes;
-        false
+    let invalid = StatorTierRequestResult {
+        requested_tier: tier,
+        status: StatorTierRequestStatus::InvalidScript,
+        ready: false,
+    };
+    if script.is_null() {
+        // SAFETY: `result` was checked non-null and caller guarantees writability.
+        unsafe { *result = invalid };
+        return false;
     }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => {
+            // SAFETY: `result` was checked non-null and caller guarantees writability.
+            unsafe { *result = invalid };
+            return false;
+        }
+    };
+    let request = stator_jse::interpreter::observe_tier(bytecodes, to_jit_tier(tier));
+    let ffi_result = from_tier_request_result(request);
+    // SAFETY: `result` was checked non-null and caller guarantees writability.
+    unsafe { *result = ffi_result };
+    ffi_result.ready
+}
+
+/// Wait up to `timeout_ms` for `tier` to become ready for `script`.
+///
+/// Returns `true` only when the tier becomes observable as ready.
+///
+/// # Safety
+/// - `script` must be null or a valid, live `StatorScript` pointer.
+/// - `result` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_wait_for_tier(
+    script: *const StatorScript,
+    tier: StatorJitTier,
+    timeout_ms: u64,
+    result: *mut StatorTierRequestResult,
+) -> bool {
+    if result.is_null() {
+        return false;
+    }
+    let invalid = StatorTierRequestResult {
+        requested_tier: tier,
+        status: StatorTierRequestStatus::InvalidScript,
+        ready: false,
+    };
+    if script.is_null() {
+        // SAFETY: `result` was checked non-null and caller guarantees writability.
+        unsafe { *result = invalid };
+        return false;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => {
+            // SAFETY: `result` was checked non-null and caller guarantees writability.
+            unsafe { *result = invalid };
+            return false;
+        }
+    };
+    let request = stator_jse::interpreter::wait_for_tier(
+        bytecodes,
+        to_jit_tier(tier),
+        std::time::Duration::from_millis(timeout_ms),
+    );
+    let ffi_result = from_tier_request_result(request);
+    // SAFETY: `result` was checked non-null and caller guarantees writability.
+    unsafe { *result = ffi_result };
+    ffi_result.ready
 }
 
 /// Disable Maglev/Turbofan tier-up for a compiled script.
@@ -27097,6 +27310,75 @@ mod tests {
         {
             let _ = forced;
         }
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_force_tier_reports_structured_status() {
+        let mut result = StatorTierRequestResult {
+            requested_tier: StatorJitTier::Baseline,
+            status: StatorTierRequestStatus::Pending,
+            ready: true,
+        };
+        // SAFETY: null script is accepted and fills a valid result pointer.
+        assert!(!unsafe {
+            stator_script_force_tier(std::ptr::null_mut(), StatorJitTier::Baseline, &mut result)
+        });
+        assert_eq!(result.status, StatorTierRequestStatus::InvalidScript);
+        assert!(!result.ready);
+
+        let script = compile_src("function f(a,b){ return a + b; } f(1,2);");
+        // SAFETY: `script` is non-null and live.
+        let forced =
+            unsafe { stator_script_force_tier(script, StatorJitTier::Baseline, &mut result) };
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        {
+            assert!(forced);
+            assert!(result.ready);
+            assert_eq!(result.status, StatorTierRequestStatus::Compiled);
+        }
+        #[cfg(not(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
+        {
+            assert!(!forced);
+            assert!(!result.ready);
+            assert_eq!(result.status, StatorTierRequestStatus::UnsupportedTier);
+        }
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_wait_and_disabled_tier_statuses() {
+        let script = compile_src("function f(a,b){ return a + b; } f(1,2);");
+        let mut result = StatorTierRequestResult {
+            requested_tier: StatorJitTier::Turbofan,
+            status: StatorTierRequestStatus::Pending,
+            ready: true,
+        };
+
+        // SAFETY: `script` is non-null and result is writable.
+        let waited =
+            unsafe { stator_script_wait_for_tier(script, StatorJitTier::Turbofan, 0, &mut result) };
+        assert!(!waited);
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        assert_eq!(result.status, StatorTierRequestStatus::UnsupportedTier);
+
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_disable_jit(script) };
+        // SAFETY: `script` is non-null and result is writable.
+        let forced =
+            unsafe { stator_script_force_tier(script, StatorJitTier::Baseline, &mut result) };
+        assert!(!forced);
+        assert!(!result.ready);
+        assert_eq!(result.status, StatorTierRequestStatus::JitDisabled);
+
         // SAFETY: `script` is non-null and live.
         unsafe { stator_script_free(script) };
     }
