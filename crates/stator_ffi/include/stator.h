@@ -575,10 +575,23 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
 typedef struct StatorDomObjectWrap StatorDomObjectWrap;
 
 /**
- * An opaque handle to a DOM weak reference.
+ * An opaque handle to a DOM wrapper weak reference.
  *
  * Created by [`stator_dom_weak_ref_new`] and freed by
- * [`stator_dom_weak_ref_destroy`].
+ * [`stator_dom_weak_ref_destroy`].  The reference does **not** keep the
+ * associated DOM wrapper (or its materialized JS value) alive; the embedder
+ * callback registered at creation time fires exactly once when the engine
+ * proves the wrapper unreachable from JS, when the wrapper is invalidated,
+ * or when the wrapper is destroyed.
+ *
+ * Dispatch is driven by the GC: every call to [`stator_isolate_gc`] (or
+ * [`stator_gc_collect`]) walks the isolate's DOM weak table and fires every
+ * eligible slot exactly once.  The legacy [`stator_dom_weak_ref_invoke`]
+ * helper still works for embedders that want to drive the callback
+ * directly, but the GC-driven path is now authoritative.
+ *
+ * The callback must not re-enter the script VM or touch the (now-dead)
+ * wrapper — see `docs/handles.md` §2.3.
  */
 typedef struct StatorDomWeakRef StatorDomWeakRef;
 
@@ -5190,11 +5203,31 @@ void stator_dom_object_wrap_set_indexed_setter(struct StatorDomObjectWrap *wrap,
 /**
  * Create a new weak reference for the given DOM object wrapper.
  *
- * When the weak reference is later invoked (by the GC or explicitly), `cb`
- * will be called with the embedder data pointer from internal field 0.
+ * The returned slot is **non-rooting**: it does not keep the wrapper or
+ * its materialized JS value alive.  The embedder callback `cb` fires
+ * exactly once during the GC's weak-callback dispatch phase (driven by
+ * [`stator_isolate_gc`] / [`stator_gc_collect`]) under any of the
+ * following conditions:
  *
- * Returns a null pointer if `wrap` is null.  The caller must eventually pass
- * the returned pointer to [`stator_dom_weak_ref_destroy`].
+ * * the wrapper has been invalidated via
+ *   [`stator_dom_object_wrap_invalidate`];
+ * * the wrapper has been destroyed via [`stator_dom_object_wrap_destroy`]
+ *   and no `DomWrapHandle` is keeping its alive-flag clone reachable;
+ * * the wrapper has been materialized as a JS value and that value's
+ *   external strong reference count has reached zero (so only the
+ *   wrapper's internal materialization cache still holds the plain
+ *   object).
+ *
+ * The embedder data pointer forwarded to `cb` is snapshotted from the
+ * wrapper's internal field 0 at registration time.  Returns null if
+ * `wrap` is null.  The caller must eventually pass the returned pointer
+ * to [`stator_dom_weak_ref_destroy`] — disposing the slot before the
+ * callback fires permanently suppresses it.
+ *
+ * The legacy [`stator_dom_weak_ref_invoke`] entry point continues to work
+ * (for compatibility with embedders that want to fire the callback
+ * without waiting for the next GC tick) but the GC-driven path is now
+ * authoritative.
  *
  * # Safety
  * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
@@ -5205,7 +5238,8 @@ struct StatorDomWeakRef *stator_dom_weak_ref_new(const struct StatorDomObjectWra
                                                  StatorDomWeakCb cb);
 
 /**
- * Return `true` if the weak reference has not yet been invalidated.
+ * Return `true` if the weak reference has not yet fired its callback or
+ * been cleared.
  *
  * Returns `false` when `weak` is null.
  *
@@ -5215,10 +5249,16 @@ struct StatorDomWeakRef *stator_dom_weak_ref_new(const struct StatorDomObjectWra
 bool stator_dom_weak_ref_is_alive(const struct StatorDomWeakRef *weak);
 
 /**
- * Fire the weak callback and mark the reference as dead.
+ * Fire the weak callback explicitly and mark the reference as dead.
  *
- * This is idempotent: calling it after the callback has already fired is a
- * no-op.  Does nothing when `weak` is null.
+ * This is idempotent: calling it after the callback has already fired (or
+ * after the GC-driven dispatch has fired it) is a no-op.  Does nothing
+ * when `weak` is null.
+ *
+ * The GC-driven dispatch in [`stator_isolate_gc`] / [`stator_gc_collect`]
+ * is the authoritative firing path.  This entry point remains for
+ * embedders that wish to fire the callback without waiting for the next
+ * GC tick (e.g. during synchronous teardown).
  *
  * # Safety
  * `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
@@ -5228,7 +5268,9 @@ void stator_dom_weak_ref_invoke(const struct StatorDomWeakRef *weak);
 /**
  * Reset the weak reference without invoking the callback.
  *
- * Does nothing when `weak` is null.
+ * After this call [`stator_dom_weak_ref_is_alive`] returns `false` and the
+ * GC-driven dispatch will never fire this slot's callback, even if the
+ * wrapper later becomes unreachable.  Does nothing when `weak` is null.
  *
  * # Safety
  * `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
@@ -5238,8 +5280,10 @@ void stator_dom_weak_ref_clear(const struct StatorDomWeakRef *weak);
 /**
  * Destroy a weak reference previously created with [`stator_dom_weak_ref_new`].
  *
- * If the callback has not yet been invoked it will **not** be called; use
- * [`stator_dom_weak_ref_invoke`] first if you need the callback to fire.
+ * If the callback has not yet been invoked it will **not** be called;
+ * destroying the slot before its callback fires permanently suppresses it.
+ * Use [`stator_dom_weak_ref_invoke`] (or wait for the next GC tick) before
+ * destroy if the callback must run.
  *
  * # Safety
  * `weak` must be a non-null pointer returned by [`stator_dom_weak_ref_new`]

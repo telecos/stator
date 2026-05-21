@@ -30,9 +30,7 @@ use stator_jse::compiler::baseline::compiler::{
     first_deopt_counts, reset_first_deopt_counts, reset_stub_deopt_counts, stub_call_counts,
     stub_deopt_counts,
 };
-use stator_jse::dom::{
-    DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
-};
+use stator_jse::dom::{DomObjectWrap, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig};
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostImportMeta, HostModuleLoader};
 use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
@@ -231,6 +229,15 @@ pub struct StatorIsolate {
         unsafe extern "C" fn(userdata: *mut c_void, visitor: *mut StatorTracedVisitor),
         *mut c_void,
     )>,
+    /// DOM-wrapper weak-callback table.  Each entry is a heap-allocated
+    /// [`StatorDomWeakSlot`] registered by [`stator_dom_weak_ref_new`].  The
+    /// slot owns the embedder callback metadata and a `std::rc::Weak` snapshot
+    /// of the wrapper's `alive` flag so dispatch can detect destroyed wrappers
+    /// without dereferencing dangling pointers.  Slots are scanned during the
+    /// dedicated DOM weak-callback dispatch phase driven by
+    /// [`stator_isolate_gc`] / [`stator_gc_collect`].  See
+    /// `docs/handles.md` §7.1.
+    dom_weak_slots: Vec<Option<Box<StatorDomWeakSlot>>>,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -263,6 +270,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         traced_slots: Vec::new(),
         traced_roots: stator_jse::gc::handle::TracedRoots::new(),
         traced_visitor: None,
+        dom_weak_slots: Vec::new(),
     }))
 }
 
@@ -574,6 +582,9 @@ pub unsafe extern "C" fn stator_isolate_gc(isolate: *mut StatorIsolate) {
         // SAFETY: caller guarantees `isolate` is valid; dispatch_weak_callbacks
         // re-borrows the isolate internally and is sound on the owning thread.
         unsafe { dispatch_weak_callbacks(isolate) };
+        // SAFETY: caller guarantees `isolate` is valid; dispatch_dom_weak_callbacks
+        // re-borrows the isolate internally and is sound on the owning thread.
+        unsafe { dispatch_dom_weak_callbacks(isolate) };
     }
 }
 
@@ -2537,6 +2548,8 @@ pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
         unsafe { (*isolate).heap.collect() };
         // SAFETY: caller guarantees `isolate` is valid.
         unsafe { dispatch_weak_callbacks(isolate) };
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe { dispatch_dom_weak_callbacks(isolate) };
     }
 }
 
@@ -14289,24 +14302,208 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_indexed_setter(
     );
 }
 
-/// An opaque handle to a DOM weak reference.
+/// Internal storage backing a [`StatorDomWeakRef`] slot in the isolate's
+/// DOM weak-callback table.
+///
+/// The slot stores enough metadata to dispatch the embedder callback during
+/// the GC's weak-callback phase without dereferencing the wrapper pointer
+/// once the wrapper has been invalidated or destroyed:
+///
+/// * `alive_weak` snapshots the wrapper's `alive` `Rc<Cell<bool>>` as a
+///   non-rooting `std::rc::Weak`.  A failed `upgrade()` means every clone of
+///   the alive cell has been dropped (typically because the wrapper has been
+///   destroyed and no `DomWrapHandle` carries it any more), in which case
+///   the callback fires.
+/// * If `alive_weak.upgrade()` succeeds but the cell value is `false`, the
+///   embedder has invalidated the wrapper — fire the callback.
+/// * If the wrapper is still alive but has been materialized as a JS object
+///   whose external strong-count has reached zero (only the wrapper's
+///   `materialized` cache holds it), GC has proved the JS wrapper
+///   unreachable — fire the callback.
+///
+/// `fired` enforces the one-shot contract from `docs/handles.md` §2.3; once
+/// set, the slot is skipped by future dispatch passes.  `cleared` records an
+/// explicit [`stator_dom_weak_ref_clear`] so dispatch never fires the
+/// callback for that slot.
+struct StatorDomWeakSlot {
+    /// Embedder data pointer captured at registration time (snapshot of the
+    /// wrapper's internal field 0).  Forwarded verbatim to the callback.
+    data: *mut c_void,
+    /// Embedder weak callback to invoke after the wrapper is proved
+    /// unreachable / invalidated / destroyed.  Cleared once fired so the
+    /// slot can never re-enter the callback.
+    callback: Option<StatorDomWeakCb>,
+    /// Raw pointer to the wrapper.  Only dereferenced while `alive_weak`
+    /// upgrades to a cell whose value is `true`.
+    wrap: *mut StatorDomObjectWrap,
+    /// Non-rooting snapshot of the wrapper's `alive` flag.  Failed upgrade
+    /// means the wrapper has been destroyed and no `DomWrapHandle` carries a
+    /// clone of the cell any more; the callback fires without touching the
+    /// dangling `wrap` pointer.
+    alive_weak: std::rc::Weak<Cell<bool>>,
+    /// Set once the one-shot callback has fired (or been suppressed).
+    fired: bool,
+    /// Set by [`stator_dom_weak_ref_clear`]; suppresses future dispatch.
+    cleared: bool,
+    /// Index in the isolate's `dom_weak_slots` table; stable for the slot's
+    /// lifetime and used by [`stator_dom_weak_ref_destroy`] to remove the
+    /// slot.
+    index: usize,
+    /// The isolate that owns this slot.
+    isolate: *mut StatorIsolate,
+}
+
+/// An opaque handle to a DOM wrapper weak reference.
 ///
 /// Created by [`stator_dom_weak_ref_new`] and freed by
-/// [`stator_dom_weak_ref_destroy`].
+/// [`stator_dom_weak_ref_destroy`].  The reference does **not** keep the
+/// associated DOM wrapper (or its materialized JS value) alive; the embedder
+/// callback registered at creation time fires exactly once when the engine
+/// proves the wrapper unreachable from JS, when the wrapper is invalidated,
+/// or when the wrapper is destroyed.
+///
+/// Dispatch is driven by the GC: every call to [`stator_isolate_gc`] (or
+/// [`stator_gc_collect`]) walks the isolate's DOM weak table and fires every
+/// eligible slot exactly once.  The legacy [`stator_dom_weak_ref_invoke`]
+/// helper still works for embedders that want to drive the callback
+/// directly, but the GC-driven path is now authoritative.
+///
+/// The callback must not re-enter the script VM or touch the (now-dead)
+/// wrapper — see `docs/handles.md` §2.3.
 pub struct StatorDomWeakRef {
-    inner: DomWeakRef,
+    /// Stable pointer to the slot inside the isolate's `dom_weak_slots`
+    /// table.  Reads/writes go through this pointer rather than through
+    /// `StatorDomWeakRef` directly so the dispatch loop can mutate slot
+    /// state without invalidating the embedder's `StatorDomWeakRef`
+    /// pointer.
+    slot: *mut StatorDomWeakSlot,
 }
 
 // SAFETY: `StatorDomWeakRef` is single-threaded; see [`StatorValue`].
 unsafe impl Send for StatorDomWeakRef {}
 
+/// Walk the isolate's DOM weak-slot table and fire one-shot callbacks for
+/// slots whose wrapper has become unreachable (invalidated, destroyed, or
+/// — once materialized as a JS value — with zero external strong holders).
+///
+/// Dispatch is split into a snapshot phase (collect callbacks to fire while
+/// holding a unique borrow on the slot table) and a drain phase (invoke
+/// without any outstanding borrow), mirroring [`dispatch_weak_callbacks`].
+/// Re-entrant `stator_dom_weak_ref_*` calls from inside the callback (e.g.
+/// `clear`, `destroy`) are therefore safe.
+///
+/// # Safety
+/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// current thread.
+unsafe fn dispatch_dom_weak_callbacks(isolate: *mut StatorIsolate) {
+    // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
+    let iso_ref = unsafe { &mut *isolate };
+
+    // Snapshot phase: identify and prepare slots to fire while holding a
+    // unique borrow on `dom_weak_slots`.  Clear `callback` before releasing
+    // the borrow so a callback that re-enters dispatch cannot re-fire.
+    let mut to_fire: Vec<(StatorDomWeakCb, *mut c_void)> = Vec::new();
+    for slot_opt in iso_ref.dom_weak_slots.iter_mut() {
+        let Some(slot) = slot_opt.as_mut() else {
+            continue;
+        };
+        if slot.fired || slot.cleared {
+            continue;
+        }
+
+        // Determine whether the wrapper is unreachable.  We never
+        // dereference `wrap` unless the alive cell is upgradable AND its
+        // value is `true`, so a destroyed wrapper cannot cause UB here.
+        let mut should_fire = false;
+        match slot.alive_weak.upgrade() {
+            None => {
+                // Every clone of the alive flag has been dropped: the
+                // wrapper has been destroyed and no `DomWrapHandle` carries
+                // a clone of the flag.  The wrapper is unreachable.
+                should_fire = true;
+            }
+            Some(alive_cell) => {
+                if !alive_cell.get() {
+                    // Embedder invalidated the wrapper.
+                    should_fire = true;
+                } else if !slot.wrap.is_null() {
+                    // Wrapper is alive: inspect its `materialized` cache to
+                    // see whether the JS wrapper object still has any
+                    // external strong holders.  The cache contributes
+                    // exactly one strong reference; any count > 1 means a
+                    // JS value, persistent, traced reference, or scope
+                    // handle is still keeping the wrapper reachable.
+                    //
+                    // SAFETY: `alive_cell.get() == true` is the embedder's
+                    // contract that the wrapper pointer is still valid.
+                    let materialized =
+                        unsafe { (*slot.wrap).materialized.borrow().as_ref().cloned() };
+                    if let Some(plain) = materialized {
+                        // `plain` is our temporary clone, which itself
+                        // contributes 1 to `strong_count`.  The wrap's
+                        // `materialized` cache contributes another 1 (we
+                        // just observed it as `Some`).  Any external JS
+                        // holder (a live `DomWrapHandle` inside a
+                        // `StatorValue`, a `StatorPersistent`, a
+                        // `StatorTraced`, or an active `HandleScope`
+                        // entry) bumps the count above 2.  A count of
+                        // exactly 2 therefore means the wrapper is
+                        // unreachable from JS and the slot may fire.
+                        if Rc::strong_count(&plain) <= 2 {
+                            should_fire = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if should_fire {
+            let cb = slot.callback.take();
+            slot.fired = true;
+            if let Some(cb) = cb {
+                to_fire.push((cb, slot.data));
+            }
+        }
+    }
+
+    // Drain phase: invoke callbacks with no outstanding borrow on the
+    // isolate so callbacks may call back into the FFI DOM weak helpers
+    // (clear/destroy) without aliasing.
+    for (cb, data) in to_fire {
+        // SAFETY: `cb` was supplied by the embedder via
+        // `stator_dom_weak_ref_new`.  `docs/handles.md` §2.3 forbids
+        // re-entering the script VM, but re-entering FFI helpers is sound.
+        unsafe { cb(data) };
+    }
+}
+
 /// Create a new weak reference for the given DOM object wrapper.
 ///
-/// When the weak reference is later invoked (by the GC or explicitly), `cb`
-/// will be called with the embedder data pointer from internal field 0.
+/// The returned slot is **non-rooting**: it does not keep the wrapper or
+/// its materialized JS value alive.  The embedder callback `cb` fires
+/// exactly once during the GC's weak-callback dispatch phase (driven by
+/// [`stator_isolate_gc`] / [`stator_gc_collect`]) under any of the
+/// following conditions:
 ///
-/// Returns a null pointer if `wrap` is null.  The caller must eventually pass
-/// the returned pointer to [`stator_dom_weak_ref_destroy`].
+/// * the wrapper has been invalidated via
+///   [`stator_dom_object_wrap_invalidate`];
+/// * the wrapper has been destroyed via [`stator_dom_object_wrap_destroy`]
+///   and no `DomWrapHandle` is keeping its alive-flag clone reachable;
+/// * the wrapper has been materialized as a JS value and that value's
+///   external strong reference count has reached zero (so only the
+///   wrapper's internal materialization cache still holds the plain
+///   object).
+///
+/// The embedder data pointer forwarded to `cb` is snapshotted from the
+/// wrapper's internal field 0 at registration time.  Returns null if
+/// `wrap` is null.  The caller must eventually pass the returned pointer
+/// to [`stator_dom_weak_ref_destroy`] — disposing the slot before the
+/// callback fires permanently suppresses it.
+///
+/// The legacy [`stator_dom_weak_ref_invoke`] entry point continues to work
+/// (for compatibility with embedders that want to fire the callback
+/// without waiting for the next GC tick) but the GC-driven path is now
+/// authoritative.
 ///
 /// # Safety
 /// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
@@ -14321,15 +14518,43 @@ pub unsafe extern "C" fn stator_dom_weak_ref_new(
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `wrap` is valid.
-    let dom_wrap = unsafe { &(*wrap).inner };
-    let weak = DomWeakRef::new(dom_wrap, move |data| {
-        // SAFETY: `cb` is guaranteed valid by the caller.
-        unsafe { cb(data) };
+    let wrap_mut = wrap as *mut StatorDomObjectWrap;
+    let isolate = unsafe { (*wrap_mut).isolate };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let data = unsafe { (*wrap_mut).inner.get_internal_field(0) };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let alive_weak = unsafe { Rc::downgrade(&(*wrap_mut).alive) };
+
+    // SAFETY: `isolate` is valid; we are on the owning thread.
+    let iso_ref = unsafe { &mut *isolate };
+    let index = iso_ref
+        .dom_weak_slots
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or_else(|| {
+            iso_ref.dom_weak_slots.push(None);
+            iso_ref.dom_weak_slots.len() - 1
+        });
+    let mut slot = Box::new(StatorDomWeakSlot {
+        data,
+        callback: Some(cb),
+        wrap: wrap_mut,
+        alive_weak,
+        fired: false,
+        cleared: false,
+        index,
+        isolate,
     });
-    Box::into_raw(Box::new(StatorDomWeakRef { inner: weak }))
+    let slot_ptr = slot.as_mut() as *mut StatorDomWeakSlot;
+    iso_ref.dom_weak_slots[index] = Some(slot);
+    Box::into_raw(Box::new(StatorDomWeakRef { slot: slot_ptr }))
 }
 
-/// Return `true` if the weak reference has not yet been invalidated.
+/// Return `true` if the weak reference has not yet fired its callback or
+/// been cleared.
 ///
 /// Returns `false` when `weak` is null.
 ///
@@ -14340,53 +14565,128 @@ pub unsafe extern "C" fn stator_dom_weak_ref_is_alive(weak: *const StatorDomWeak
     if weak.is_null() {
         return false;
     }
-    // SAFETY: caller guarantees `weak` is valid.
-    unsafe { (*weak).inner.is_alive() }
+    // SAFETY: caller guarantees `weak` is valid; the slot it points at is
+    // owned by the isolate's `dom_weak_slots` table and lives until
+    // `stator_dom_weak_ref_destroy` is called.
+    let slot = unsafe { (*weak).slot };
+    if slot.is_null() {
+        return false;
+    }
+    // SAFETY: `slot` is a valid slot pointer for the lifetime of `weak`.
+    unsafe { !(*slot).fired && !(*slot).cleared }
 }
 
-/// Fire the weak callback and mark the reference as dead.
+/// Fire the weak callback explicitly and mark the reference as dead.
 ///
-/// This is idempotent: calling it after the callback has already fired is a
-/// no-op.  Does nothing when `weak` is null.
+/// This is idempotent: calling it after the callback has already fired (or
+/// after the GC-driven dispatch has fired it) is a no-op.  Does nothing
+/// when `weak` is null.
+///
+/// The GC-driven dispatch in [`stator_isolate_gc`] / [`stator_gc_collect`]
+/// is the authoritative firing path.  This entry point remains for
+/// embedders that wish to fire the callback without waiting for the next
+/// GC tick (e.g. during synchronous teardown).
 ///
 /// # Safety
 /// `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_weak_ref_invoke(weak: *const StatorDomWeakRef) {
-    if !weak.is_null() {
-        // SAFETY: caller guarantees `weak` is valid.
-        unsafe { (*weak).inner.invoke_callback() };
+    if weak.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `weak` is valid.
+    let slot = unsafe { (*weak).slot };
+    if slot.is_null() {
+        return;
+    }
+    // Snapshot callback + data while clearing the slot so a callback that
+    // re-enters via `stator_dom_weak_ref_*` cannot re-fire.
+    let cb;
+    let data;
+    // SAFETY: slot is valid.
+    unsafe {
+        if (*slot).fired || (*slot).cleared {
+            return;
+        }
+        cb = (*slot).callback.take();
+        data = (*slot).data;
+        (*slot).fired = true;
+    }
+    if let Some(cb) = cb {
+        // SAFETY: `cb` was supplied by the embedder via
+        // `stator_dom_weak_ref_new` and is invoked with the snapshot data
+        // pointer.  Re-entering FFI helpers is sound.
+        unsafe { cb(data) };
     }
 }
 
 /// Reset the weak reference without invoking the callback.
 ///
-/// Does nothing when `weak` is null.
+/// After this call [`stator_dom_weak_ref_is_alive`] returns `false` and the
+/// GC-driven dispatch will never fire this slot's callback, even if the
+/// wrapper later becomes unreachable.  Does nothing when `weak` is null.
 ///
 /// # Safety
 /// `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_weak_ref_clear(weak: *const StatorDomWeakRef) {
-    if !weak.is_null() {
-        // SAFETY: caller guarantees `weak` is valid.
-        unsafe { (*weak).inner.clear() };
+    if weak.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `weak` is valid.
+    let slot = unsafe { (*weak).slot };
+    if slot.is_null() {
+        return;
+    }
+    // SAFETY: slot is valid for the lifetime of `weak`.
+    unsafe {
+        (*slot).callback = None;
+        (*slot).cleared = true;
+        (*slot).fired = true;
     }
 }
 
 /// Destroy a weak reference previously created with [`stator_dom_weak_ref_new`].
 ///
-/// If the callback has not yet been invoked it will **not** be called; use
-/// [`stator_dom_weak_ref_invoke`] first if you need the callback to fire.
+/// If the callback has not yet been invoked it will **not** be called;
+/// destroying the slot before its callback fires permanently suppresses it.
+/// Use [`stator_dom_weak_ref_invoke`] (or wait for the next GC tick) before
+/// destroy if the callback must run.
 ///
 /// # Safety
 /// `weak` must be a non-null pointer returned by [`stator_dom_weak_ref_new`]
 /// and must not be used again after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef) {
-    if !weak.is_null() {
-        // SAFETY: pointer was created by `Box::into_raw`.
-        drop(unsafe { Box::from_raw(weak) });
+    if weak.is_null() {
+        return;
     }
+    // SAFETY: pointer was created by `Box::into_raw` in
+    // `stator_dom_weak_ref_new`.
+    let weak_box = unsafe { Box::from_raw(weak) };
+    let slot_ptr = weak_box.slot;
+    if slot_ptr.is_null() {
+        return;
+    }
+    // SAFETY: slot is valid; the isolate it belongs to is alive for the
+    // slot's lifetime.
+    let (isolate, index) = unsafe { ((*slot_ptr).isolate, (*slot_ptr).index) };
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: isolate is valid and owned by this thread.
+    let iso_ref = unsafe { &mut *isolate };
+    let Some(slot_box) = iso_ref.dom_weak_slots.get_mut(index).and_then(Option::take) else {
+        return;
+    };
+    // Defence in depth: a freshly reused slot index might have produced a
+    // different box than the one this `weak` referred to.  Put it back if
+    // we'd be freeing the wrong slot.
+    if !std::ptr::eq(Box::as_ref(&slot_box), slot_ptr) {
+        iso_ref.dom_weak_slots[index] = Some(slot_box);
+        return;
+    }
+    drop(slot_box);
 }
 
 // ── DOM hardened slice: class identity + V2 interceptors ──────────────────────
@@ -29803,6 +30103,248 @@ mod tests {
         unsafe { stator_dom_weak_ref_invoke(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_clear(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_destroy(std::ptr::null_mut()) };
+    }
+
+    // ── DOM weak refs driven by GC ──────────────────────────────────────
+
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering as DomWeakOrdering;
+
+    static GC_DOM_WEAK_FIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static GC_DOM_WEAK_LAST_DATA: AtomicUsize = AtomicUsize::new(0);
+    /// Serialises tests that share the static `GC_DOM_WEAK_*` counters so
+    /// parallel test execution does not produce false failures.
+    static GC_DOM_WEAK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe extern "C" fn gc_dom_weak_counting_cb(data: *mut c_void) {
+        GC_DOM_WEAK_FIRE_COUNT.fetch_add(1, DomWeakOrdering::SeqCst);
+        GC_DOM_WEAK_LAST_DATA.store(data as usize, DomWeakOrdering::SeqCst);
+    }
+
+    fn reset_gc_dom_weak_counters() -> std::sync::MutexGuard<'static, ()> {
+        let guard = GC_DOM_WEAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        GC_DOM_WEAK_FIRE_COUNT.store(0, DomWeakOrdering::SeqCst);
+        GC_DOM_WEAK_LAST_DATA.store(0, DomWeakOrdering::SeqCst);
+        guard
+    }
+
+    #[test]
+    fn test_dom_weak_ref_gc_fires_after_invalidate() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 1) };
+        assert!(!wrap.is_null());
+
+        // Snapshot a distinctive embedder data pointer into internal field 0
+        // to verify it is forwarded unchanged to the callback.
+        let sentinel: usize = 0xDEAD_BEEF;
+        unsafe {
+            stator_dom_object_wrap_set_internal_field(wrap, 0, sentinel as *mut c_void);
+        }
+
+        // SAFETY: `wrap` is valid.
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+        assert!(!weak.is_null());
+        assert!(unsafe { stator_dom_weak_ref_is_alive(weak) });
+
+        // No GC yet: callback must not fire.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 0);
+
+        // Invalidate the wrapper, then run GC: callback fires exactly once.
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+        assert_eq!(
+            GC_DOM_WEAK_LAST_DATA.load(DomWeakOrdering::SeqCst),
+            sentinel
+        );
+        assert!(!unsafe { stator_dom_weak_ref_is_alive(weak) });
+
+        // Exactly-once: subsequent GC cycles never re-fire.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_weak_ref_gc_fires_after_destroy() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 1) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+        assert!(!weak.is_null());
+
+        // Destroying the wrap invalidates it and drops the wrapper box; the
+        // weak slot must not dereference the dangling pointer during dispatch.
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        // Exactly-once.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        unsafe { stator_dom_weak_ref_destroy(weak) };
+    }
+
+    #[test]
+    fn test_dom_weak_ref_gc_does_not_fire_for_live_wrapper() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+
+        // Live, never materialized, never invalidated: callback must not fire
+        // across repeated GC cycles.
+        for _ in 0..5 {
+            unsafe { stator_isolate_gc(iso.as_ptr()) };
+        }
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 0);
+        assert!(unsafe { stator_dom_weak_ref_is_alive(weak) });
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_weak_ref_gc_fires_when_materialized_value_unreachable() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        // Materialize the wrapper as a JS value: this is the only external
+        // strong holder of the wrapper's plain object.
+        let val = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(!val.is_null());
+
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+
+        // While `val` is alive the wrapper is reachable from JS — no fire.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 0);
+
+        // Dropping `val` removes the only external strong holder; the next
+        // GC pass observes strong_count == 1 (just the wrap cache) and fires.
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        // Exactly-once.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_weak_ref_clear_suppresses_gc_dispatch() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+
+        // Clear before the wrapper becomes unreachable: the callback must
+        // never fire, even after invalidate + multiple GC cycles.
+        unsafe { stator_dom_weak_ref_clear(weak) };
+        assert!(!unsafe { stator_dom_weak_ref_is_alive(weak) });
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 0);
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_weak_ref_destroy_before_gc_suppresses_callback() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+
+        // Destroying the weak ref before the wrapper goes unreachable must
+        // permanently suppress the callback.
+        unsafe { stator_dom_weak_ref_destroy(weak) };
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 0);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_dom_weak_ref_manual_invoke_then_gc_only_fires_once() {
+        let _gc_dom_weak_guard = reset_gc_dom_weak_counters();
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, gc_dom_weak_counting_cb) };
+
+        // Manual invoke fires immediately.
+        unsafe { stator_dom_weak_ref_invoke(weak) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        // Subsequent GC must not re-fire even after invalidation.
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(GC_DOM_WEAK_FIRE_COUNT.load(DomWeakOrdering::SeqCst), 1);
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
+    fn test_dom_weak_ref_callback_can_safely_clear_self() {
+        // Verify the callback may re-enter the FFI helpers (clear/destroy)
+        // without aliasing the dispatch borrow on the isolate.  We do not
+        // re-enter the script VM; that contract is documented elsewhere.
+        static REENTRY_WEAK: AtomicUsize = AtomicUsize::new(0);
+        static REENTRY_HITS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn reentrant_cb(_data: *mut c_void) {
+            REENTRY_HITS.fetch_add(1, DomWeakOrdering::SeqCst);
+            let weak = REENTRY_WEAK.load(DomWeakOrdering::SeqCst) as *const StatorDomWeakRef;
+            // Clearing inside the callback is a no-op (the slot has already
+            // fired) but must not deadlock or alias the dispatch borrow.
+            unsafe { stator_dom_weak_ref_clear(weak) };
+        }
+        REENTRY_HITS.store(0, DomWeakOrdering::SeqCst);
+
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let weak = unsafe { stator_dom_weak_ref_new(wrap, reentrant_cb) };
+        REENTRY_WEAK.store(weak as usize, DomWeakOrdering::SeqCst);
+
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(REENTRY_HITS.load(DomWeakOrdering::SeqCst), 1);
+        // Re-entrant clear inside the callback must not unbalance the
+        // dispatch loop; another GC cycle still fires exactly zero
+        // additional times.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(REENTRY_HITS.load(DomWeakOrdering::SeqCst), 1);
+
+        unsafe {
+            stator_dom_weak_ref_destroy(weak);
+            stator_dom_object_wrap_destroy(wrap);
+        }
     }
 
     // ── DOM hardened slice: class identity + V2 interceptors ───────────────
