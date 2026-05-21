@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 0
+#define STATOR_FFI_ABI_VERSION_MINOR 1
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1417,6 +1417,19 @@ typedef struct StatorEmbedderCallbacks {
    */
   StatorMonotonicTimeFn monotonic_time;
 } StatorEmbedderCallbacks;
+
+/**
+ * Opaque persistent-handle slot exposed to the embedder.
+ *
+ * The pointer returned by [`stator_persistent_new`] is the address of a
+ * stable, isolate-owned slot.  Its address does not change until the slot
+ * is freed by [`stator_persistent_dispose`].  The bytes pointed at are
+ * implementation-defined and must not be inspected or mutated by the
+ * embedder.
+ */
+typedef struct StatorPersistent {
+  uint8_t _opaque[0];
+} StatorPersistent;
 
 /**
  * Free callback for resolver-owned embedder data.
@@ -5344,6 +5357,85 @@ uint32_t stator_inspector_register_script(struct StatorInspector *inspector,
                                           struct StatorScript *_script,
                                           const char *source,
                                           size_t source_len);
+
+/**
+ * Create a new persistent (embedder-rooted) handle that keeps `value` alive
+ * independently of any open [`StatorHandleScope`].
+ *
+ * The persistent's underlying storage is owned by `ctx`'s parent isolate
+ * and survives both [`stator_handle_scope_close`] and any number of
+ * [`stator_isolate_gc`] calls.  The slot is released by
+ * [`stator_persistent_dispose`].
+ *
+ * Returns null if either argument is null, or if `value` was created on a
+ * different isolate than `ctx`'s parent.
+ *
+ * # Safety
+ * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+ * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ */
+struct StatorPersistent *stator_persistent_new(struct StatorContext *ctx,
+                                               struct StatorValue *value);
+
+/**
+ * Clear the value stored in `persistent` without freeing the slot.
+ *
+ * After `reset()`, [`stator_persistent_is_empty`] returns `true` and
+ * [`stator_persistent_get`] returns null until the slot is disposed and a
+ * new persistent is allocated.  The slot pointer itself remains valid; the
+ * slot is only freed by [`stator_persistent_dispose`].
+ *
+ * Null-tolerant: passing null is a no-op.
+ *
+ * # Safety
+ * `persistent` must be null or a slot pointer returned by
+ * [`stator_persistent_new`] that has not yet been passed to
+ * [`stator_persistent_dispose`].
+ */
+void stator_persistent_reset(struct StatorPersistent *persistent);
+
+/**
+ * Return `true` if `persistent` is null or has been cleared via
+ * [`stator_persistent_reset`].
+ *
+ * # Safety
+ * `persistent` must be null or a slot pointer returned by
+ * [`stator_persistent_new`] that has not yet been passed to
+ * [`stator_persistent_dispose`].
+ */
+bool stator_persistent_is_empty(const struct StatorPersistent *persistent);
+
+/**
+ * Materialise a fresh [`StatorValue`] from the value stored in `persistent`.
+ *
+ * The returned value is allocated on the embedder side and, if a handle
+ * scope is open on the persistent's isolate, registered with that scope so
+ * it follows the usual handle-scope lifetime.  Returns null if `persistent`
+ * is null, empty, or its owning isolate has been destroyed.
+ *
+ * # Safety
+ * `persistent` must be null or a slot pointer returned by
+ * [`stator_persistent_new`] that has not yet been passed to
+ * [`stator_persistent_dispose`].
+ */
+struct StatorValue *stator_persistent_get(const struct StatorPersistent *persistent);
+
+/**
+ * Free the slot backing `persistent`, releasing the engine-side root and
+ * the cloned value it owns.
+ *
+ * After this call the `persistent` pointer must not be used.  Calling
+ * `dispose` twice on the same slot is a documented no-op: the first call
+ * removes the slot from the isolate's table, so a subsequent call finds
+ * nothing to do.  Passing null is also a no-op.
+ *
+ * # Safety
+ * `persistent` must be null or a slot pointer returned by
+ * [`stator_persistent_new`].  After this call returns, the embedder must
+ * treat the pointer as invalid (it must not be passed to any other
+ * `stator_persistent_*` function except as a redundant `dispose`).
+ */
+void stator_persistent_dispose(struct StatorPersistent *persistent);
 
 #ifdef __cplusplus
 }  // extern "C"

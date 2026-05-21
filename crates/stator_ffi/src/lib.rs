@@ -71,7 +71,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 0;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 1;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -181,6 +181,20 @@ pub struct StatorIsolate {
     /// Setting and observing the flag from any thread is well-defined; the
     /// rest of `StatorIsolate` remains single-threaded.
     terminating: AtomicBool,
+    /// Persistent root table.  Each entry owns a cloned [`StatorValueInner`]
+    /// (whose `Rc`-based variants keep the underlying JS object alive across
+    /// handle-scope exits and GC cycles).  `None` slots have been disposed
+    /// and may be reused.
+    ///
+    /// Slot addresses are exposed to the embedder as opaque
+    /// [`StatorPersistent`] pointers and remain stable until
+    /// [`stator_persistent_dispose`] frees the slot.
+    persistent_slots: Vec<Option<Box<StatorPersistentSlot>>>,
+    /// GC root registry mirroring `persistent_slots` so engine-side GC
+    /// abstractions (see [`stator_jse::gc::handle::PersistentRoots`]) see
+    /// every persistent as a strong root.  Each entry stores the address of
+    /// the corresponding `StatorPersistentSlot` box.
+    persistent_roots: stator_jse::gc::handle::PersistentRoots,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -207,6 +221,8 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         active_handle_scope: std::ptr::null_mut(),
         jit_disabled: false,
         terminating: AtomicBool::new(false),
+        persistent_slots: Vec::new(),
+        persistent_roots: stator_jse::gc::handle::PersistentRoots::new(),
     }))
 }
 
@@ -765,6 +781,10 @@ pub struct StatorContext {
     /// `user_data` cleanup contract and is dropped when replaced, cleared, or
     /// when the context is destroyed.
     module_resolver: Option<StatorModuleResolver>,
+    /// Optional host callback used to canonicalise module specifiers to URLs
+    /// before module lookup/fetch. When installed, failures from this hook
+    /// fail closed and the module resolver is not invoked.
+    module_url_resolver: Option<StatorModuleUrlResolver>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -797,6 +817,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
         embedder_data: Vec::new(),
         module_resolver: None,
+        module_url_resolver: None,
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -1039,6 +1060,51 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
     // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
     // duration of this FFI call. Assignment drops the previous resolver, if any.
     unsafe { (*ctx).module_resolver = resolver };
+    true
+}
+
+/// Register, replace, or clear the module URL resolver callback for `ctx`.
+///
+/// When installed, the callback is invoked before static module resolution,
+/// dynamic `import()`, and `import.meta.resolve`. It must return a canonical
+/// resolved URL or a structured [`StatorResolveStatus`] failure. Failures are
+/// propagated without falling back to the raw specifier or invoking the module
+/// resolver.
+///
+/// Returns `true` on successful registration or clear, and `false` for a null
+/// context or malformed clear request.
+///
+/// # Safety
+/// The callback and `user_data` lifetime rules match
+/// [`stator_context_set_module_resolver`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_set_module_url_resolver(
+    ctx: *mut StatorContext,
+    callback: Option<StatorModuleUrlResolverCallback>,
+    user_data: *mut c_void,
+    free_user_data: Option<StatorUserDataFreeCallback>,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+
+    let resolver = match callback {
+        Some(callback) => Some(StatorModuleUrlResolver {
+            callback,
+            user_data,
+            free_user_data,
+        }),
+        None => {
+            if !user_data.is_null() || free_user_data.is_some() {
+                return false;
+            }
+            None
+        }
+    };
+
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
+    // duration of this FFI call. Assignment drops the previous resolver, if any.
+    unsafe { (*ctx).module_url_resolver = resolver };
     true
 }
 
@@ -3071,6 +3137,28 @@ pub type StatorModuleResolverCallback = unsafe extern "C" fn(
     out_error: *mut *mut StatorString,
 ) -> StatorResolveStatus;
 
+/// Synchronous host callback used to canonicalise an import specifier to a URL.
+///
+/// Browser embedders can use this hook for import-map, base-URL, CSP,
+/// credentials, and referrer-policy logic. On success the host writes a
+/// canonical resolved module URL through `out_resolved_url` using a
+/// [`StatorString`] allocated by [`stator_string_new`]. On failure the host
+/// returns a non-`Ok` status and may write an owned diagnostic through
+/// `out_error`. Stator consumes and frees any non-null out strings after the
+/// callback returns.
+pub type StatorModuleUrlResolverCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    user_data: *mut c_void,
+    referrer: *const StatorModule,
+    origin: *const StatorModuleOrigin,
+    specifier: *const c_char,
+    specifier_len: usize,
+    attributes: *const StatorImportAttribute,
+    attributes_len: usize,
+    out_resolved_url: *mut *mut StatorString,
+    out_error: *mut *mut StatorString,
+) -> StatorResolveStatus;
+
 struct StatorModuleResolver {
     callback: StatorModuleResolverCallback,
     user_data: *mut c_void,
@@ -3078,6 +3166,24 @@ struct StatorModuleResolver {
 }
 
 impl Drop for StatorModuleResolver {
+    fn drop(&mut self) {
+        if let Some(free_user_data) = self.free_user_data
+            && !self.user_data.is_null()
+        {
+            // SAFETY: the embedder supplied this callback for exactly this
+            // resolver-owned `user_data` pointer.
+            unsafe { free_user_data(self.user_data) };
+        }
+    }
+}
+
+struct StatorModuleUrlResolver {
+    callback: StatorModuleUrlResolverCallback,
+    user_data: *mut c_void,
+    free_user_data: Option<StatorUserDataFreeCallback>,
+}
+
+impl Drop for StatorModuleUrlResolver {
     fn drop(&mut self) {
         if let Some(free_user_data) = self.free_user_data
             && !self.user_data.is_null()
@@ -6722,6 +6828,15 @@ unsafe fn take_resolver_error_string(out_error: *mut StatorString) -> Option<Str
     Some(String::from_utf8_lossy(&owned.bytes).into_owned())
 }
 
+unsafe fn take_resolver_string_bytes(out_string: *mut StatorString) -> Option<Vec<u8>> {
+    if out_string.is_null() {
+        return None;
+    }
+    // SAFETY: hosts transfer ownership of resolver out-strings to the engine on return.
+    let owned = unsafe { Box::from_raw(out_string) };
+    Some(owned.bytes)
+}
+
 fn resolver_status_error(
     status: StatorResolveStatus,
     specifier: &str,
@@ -6760,6 +6875,67 @@ fn js_error_from_stator_error(error: stator_jse::error::StatorError) -> JsError 
         StatorError::RangeError(message) => JsError::new(ErrorKind::RangeError, message),
         StatorError::URIError(message) => JsError::new(ErrorKind::URIError, message),
         other => JsError::new(ErrorKind::TypeError, other.to_string()),
+    }
+}
+
+unsafe fn resolve_module_url(
+    ctx: *mut StatorContext,
+    referrer: *const StatorModule,
+    origin: &StatorModuleOrigin,
+    specifier: &[u8],
+    attributes: *const StatorImportAttribute,
+    attributes_len: usize,
+) -> Result<Option<Vec<u8>>, stator_jse::error::StatorError> {
+    if ctx.is_null() {
+        return Ok(None);
+    }
+
+    // SAFETY: caller guarantees `ctx` is valid for this synchronous resolution.
+    let (callback, user_data) = match unsafe { (*ctx).module_url_resolver.as_ref() } {
+        Some(resolver) => (resolver.callback, resolver.user_data),
+        None => return Ok(None),
+    };
+
+    let mut out_resolved_url: *mut StatorString = std::ptr::null_mut();
+    let mut out_error: *mut StatorString = std::ptr::null_mut();
+    let specifier_display = String::from_utf8_lossy(specifier);
+    // SAFETY: resolver registration guarantees the callback remains callable
+    // while installed. Borrowed origin/specifier/attributes are valid for this
+    // synchronous call, and out pointers are valid locals.
+    let status = unsafe {
+        callback(
+            ctx,
+            user_data,
+            referrer,
+            origin,
+            specifier.as_ptr() as *const c_char,
+            specifier.len(),
+            attributes,
+            attributes_len,
+            &mut out_resolved_url,
+            &mut out_error,
+        )
+    };
+    // SAFETY: hosts may transfer ownership of out strings via resolver params.
+    let detail = unsafe { take_resolver_error_string(out_error) };
+    // SAFETY: hosts transfer non-null URL strings to us on successful return.
+    let resolved_url = unsafe { take_resolver_string_bytes(out_resolved_url) };
+
+    if status != StatorResolveStatus::StatorResolveStatusOk {
+        return Err(resolver_status_error(
+            status,
+            &specifier_display,
+            detail.as_deref(),
+        ));
+    }
+
+    match resolved_url {
+        Some(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+        _ => Err(resolver_status_error(
+            StatorResolveStatus::StatorResolveStatusNotFound,
+            &specifier_display,
+            detail.as_deref(),
+        )),
     }
 }
 
@@ -6835,7 +7011,34 @@ impl FfiHostModuleLoader {
 
 impl HostModuleLoader for FfiHostModuleLoader {
     fn dynamic_import(&self, specifier: &str, _referrer: Option<&str>) -> Result<JsValue, JsError> {
-        let module = self.resolve_module(specifier).map_err(|error| *error)?;
+        let module_specifier = if !self.ctx.is_null() && !self.referrer.is_null() {
+            // SAFETY: `referrer` is the live module currently being evaluated.
+            let origin = unsafe { module_origin_view(&*self.referrer) };
+            match unsafe {
+                resolve_module_url(
+                    self.ctx,
+                    self.referrer,
+                    &origin,
+                    specifier.as_bytes(),
+                    std::ptr::null(),
+                    0,
+                )
+            } {
+                Ok(Some(resolved_url)) => String::from_utf8(resolved_url).map_err(|_| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "module URL resolver returned non-UTF-8 URL".to_string(),
+                    )
+                })?,
+                Ok(None) => specifier.to_string(),
+                Err(error) => return Err(js_error_from_stator_error(error)),
+            }
+        } else {
+            specifier.to_string()
+        };
+        let module = self
+            .resolve_module(&module_specifier)
+            .map_err(|error| *error)?;
         let mut visiting = HashSet::new();
         // SAFETY: the resolver returned a live module pointer by contract.
         if let Err(error) = unsafe { instantiate_module_graph(self.ctx, module, &mut visiting) } {
@@ -6858,6 +7061,32 @@ impl HostModuleLoader for FfiHostModuleLoader {
     }
 
     fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {
+        if !self.ctx.is_null() && !self.referrer.is_null() {
+            // SAFETY: `referrer` is the live module currently being evaluated.
+            let origin = unsafe { module_origin_view(&*self.referrer) };
+            match unsafe {
+                resolve_module_url(
+                    self.ctx,
+                    self.referrer,
+                    &origin,
+                    specifier.as_bytes(),
+                    std::ptr::null(),
+                    0,
+                )
+            } {
+                Ok(Some(resolved_url)) => {
+                    return String::from_utf8(resolved_url).map_err(|_| {
+                        JsError::new(
+                            ErrorKind::TypeError,
+                            "module URL resolver returned non-UTF-8 URL".to_string(),
+                        )
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => return Err(js_error_from_stator_error(error)),
+            }
+        }
+
         let module = self.resolve_module(specifier).map_err(|error| *error)?;
         // SAFETY: the resolver returned a live module pointer by contract.
         let module_ref = unsafe { &*module };
@@ -6980,6 +7209,24 @@ unsafe fn instantiate_module_graph(
         } else {
             request.attributes.as_ptr()
         };
+        let resolved_specifier = match unsafe {
+            resolve_module_url(
+                ctx,
+                module,
+                &origin,
+                request.specifier.as_bytes(),
+                attributes_ptr,
+                request.attributes.len(),
+            )
+        } {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => request.specifier.as_bytes().to_vec(),
+            Err(error) => {
+                visiting.remove(&module);
+                set_module_link_error(module_ref, &error);
+                return Err(error);
+            }
+        };
         // SAFETY: resolver registration requires the callback to remain callable
         // while installed. Request slices and origin metadata are borrowed from
         // `module` for the duration of this synchronous call, and out pointers
@@ -6990,8 +7237,8 @@ unsafe fn instantiate_module_graph(
                 user_data,
                 module,
                 &origin,
-                request.specifier.as_ptr(),
-                request.specifier.as_bytes().len(),
+                resolved_specifier.as_ptr() as *const c_char,
+                resolved_specifier.len(),
                 attributes_ptr,
                 request.attributes.len(),
                 &mut out_module,
@@ -6999,7 +7246,7 @@ unsafe fn instantiate_module_graph(
             )
         };
 
-        let specifier = request.specifier.to_string_lossy();
+        let specifier = String::from_utf8_lossy(&resolved_specifier);
         // SAFETY: hosts may transfer ownership of an error string via
         // `out_error`. We always reclaim and free it here, even on success.
         let detail = unsafe { take_resolver_error_string(out_error) };
@@ -14991,6 +15238,291 @@ pub unsafe extern "C" fn stator_inspector_register_script(
     unsafe { (*inspector).inner.register_script(text) }
 }
 
+// ── Persistent handles ───────────────────────────────────────────────────────
+//
+// A `StatorPersistent` is an embedder-rooted strong handle that survives the
+// closing of any [`StatorHandleScope`] and any number of `stator_isolate_gc`
+// cycles, mirroring the semantics described in `docs/handles.md` §2.2.
+//
+// Storage: every isolate owns a `persistent_slots` table.  Each slot is a
+// heap-allocated [`StatorPersistentSlot`] box whose address is stable for the
+// slot's lifetime; the embedder receives that address reinterpreted as the
+// opaque pointer type `*mut StatorPersistent`.  The slot owns a cloned
+// [`StatorValueInner`] — for the `Rc`-backed variants (object handles, native
+// functions, DOM wrappers) the `Rc` clone keeps the underlying JS object
+// alive even after every [`StatorValue`] that wrapped it has been destroyed
+// (e.g. by closing the originating handle scope) and after any number of
+// `stator_isolate_gc` calls.  In parallel the slot's address is registered
+// in the isolate's `persistent_roots`
+// ([`stator_jse::gc::handle::PersistentRoots`]) so engine-side GC
+// abstractions see every persistent as a strong root.
+//
+// All `stator_persistent_*` functions are null-tolerant: passing a null
+// `StatorPersistent*` is a documented no-op (or returns null / true /
+// `false`, as appropriate).  Calling `stator_persistent_dispose` more than
+// once on the same slot is safe — the second call is a no-op because the
+// slot pointer has already been removed from the isolate's table.
+
+/// Opaque persistent-handle slot exposed to the embedder.
+///
+/// The pointer returned by [`stator_persistent_new`] is the address of a
+/// stable, isolate-owned slot.  Its address does not change until the slot
+/// is freed by [`stator_persistent_dispose`].  The bytes pointed at are
+/// implementation-defined and must not be inspected or mutated by the
+/// embedder.
+#[repr(C)]
+pub struct StatorPersistent {
+    _opaque: [u8; 0],
+}
+
+/// Internal storage backing a [`StatorPersistent`] slot.
+///
+/// Owned by the isolate's `persistent_slots` table; the slot's heap address
+/// is what the embedder sees as a `*mut StatorPersistent`.  The slot owns a
+/// cloned [`StatorValueInner`] which, for `Rc`-backed JS values, transitively
+/// keeps the underlying object alive.
+struct StatorPersistentSlot {
+    /// The cloned value, or `None` after [`stator_persistent_reset`].
+    inner: Option<StatorValueInner>,
+    /// The isolate that owns this slot.
+    isolate: *mut StatorIsolate,
+    /// Index into the isolate's `persistent_slots` table; stable for the
+    /// slot's lifetime (see §2.2 of `docs/handles.md`).
+    index: usize,
+    /// GC root index in the isolate's `PersistentRoots` registry, kept in
+    /// sync with `index` so that disposing the slot also unregisters it from
+    /// the engine-side root set.
+    root_index: usize,
+}
+
+impl StatorValueInner {
+    /// Clone this value's inner storage for placement into a persistent
+    /// slot.  `Rc`-backed variants are cloned by incrementing the reference
+    /// count, so the underlying JS object stays alive as long as either the
+    /// embedder or the engine still holds a clone.
+    fn clone_for_persistent(&self) -> Self {
+        match self {
+            Self::Undefined => Self::Undefined,
+            Self::Null => Self::Null,
+            Self::Boolean(b) => Self::Boolean(*b),
+            Self::Number(n) => Self::Number(*n),
+            Self::Str(s) => Self::Str(s.clone()),
+            Self::Object => Self::Object,
+            Self::ObjectHandle(rc) => Self::ObjectHandle(Rc::clone(rc)),
+            Self::DomWrapHandle { plain, wrap, alive } => Self::DomWrapHandle {
+                plain: Rc::clone(plain),
+                wrap: *wrap,
+                alive: Rc::clone(alive),
+            },
+            Self::Function => Self::Function,
+            Self::NativeFunctionValue(f) => Self::NativeFunctionValue(Rc::clone(f)),
+            Self::Array => Self::Array,
+            Self::Date => Self::Date,
+            Self::RegExp => Self::RegExp,
+            Self::Promise => Self::Promise,
+            Self::Map => Self::Map,
+            Self::Set => Self::Set,
+        }
+    }
+}
+
+/// Create a new persistent (embedder-rooted) handle that keeps `value` alive
+/// independently of any open [`StatorHandleScope`].
+///
+/// The persistent's underlying storage is owned by `ctx`'s parent isolate
+/// and survives both [`stator_handle_scope_close`] and any number of
+/// [`stator_isolate_gc`] calls.  The slot is released by
+/// [`stator_persistent_dispose`].
+///
+/// Returns null if either argument is null, or if `value` was created on a
+/// different isolate than `ctx`'s parent.
+///
+/// # Safety
+/// - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_new(
+    ctx: *mut StatorContext,
+    value: *mut StatorValue,
+) -> *mut StatorPersistent {
+    if ctx.is_null() || value.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees both pointers are valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `value` is valid; its `isolate` field is set at allocation
+    // time.  Disallow cross-isolate persistents (invariant 4 in handles.md).
+    let value_isolate = unsafe { (*value).isolate };
+    if value_isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `value` is valid for read.
+    let cloned = unsafe { (*value).inner.clone_for_persistent() };
+
+    // SAFETY: `isolate` is valid; we are on the owning thread.
+    let iso_ref = unsafe { &mut *isolate };
+
+    // Reserve a table entry (reuse a freed slot if any), then box the slot
+    // so its address is stable for the slot's lifetime.
+    let index = iso_ref
+        .persistent_slots
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or_else(|| {
+            iso_ref.persistent_slots.push(None);
+            iso_ref.persistent_slots.len() - 1
+        });
+    let mut slot = Box::new(StatorPersistentSlot {
+        inner: Some(cloned),
+        isolate,
+        index,
+        root_index: 0,
+    });
+    let slot_addr = slot.as_mut() as *mut StatorPersistentSlot as *mut u8;
+    slot.root_index = iso_ref.persistent_roots.register_root(slot_addr);
+    let raw = Box::into_raw(slot);
+    // SAFETY: `raw` was just produced by `Box::into_raw`; reclaim it into
+    // the table where the isolate owns it for the slot's lifetime.
+    iso_ref.persistent_slots[index] = Some(unsafe { Box::from_raw(raw) });
+    raw as *mut StatorPersistent
+}
+
+/// Clear the value stored in `persistent` without freeing the slot.
+///
+/// After `reset()`, [`stator_persistent_is_empty`] returns `true` and
+/// [`stator_persistent_get`] returns null until the slot is disposed and a
+/// new persistent is allocated.  The slot pointer itself remains valid; the
+/// slot is only freed by [`stator_persistent_dispose`].
+///
+/// Null-tolerant: passing null is a no-op.
+///
+/// # Safety
+/// `persistent` must be null or a slot pointer returned by
+/// [`stator_persistent_new`] that has not yet been passed to
+/// [`stator_persistent_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_reset(persistent: *mut StatorPersistent) {
+    if persistent.is_null() {
+        return;
+    }
+    let slot = persistent as *mut StatorPersistentSlot;
+    // SAFETY: caller guarantees the slot is live.
+    unsafe {
+        (*slot).inner = None;
+    }
+}
+
+/// Return `true` if `persistent` is null or has been cleared via
+/// [`stator_persistent_reset`].
+///
+/// # Safety
+/// `persistent` must be null or a slot pointer returned by
+/// [`stator_persistent_new`] that has not yet been passed to
+/// [`stator_persistent_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_is_empty(persistent: *const StatorPersistent) -> bool {
+    if persistent.is_null() {
+        return true;
+    }
+    let slot = persistent as *const StatorPersistentSlot;
+    // SAFETY: caller guarantees the slot is live.
+    unsafe { (*slot).inner.is_none() }
+}
+
+/// Materialise a fresh [`StatorValue`] from the value stored in `persistent`.
+///
+/// The returned value is allocated on the embedder side and, if a handle
+/// scope is open on the persistent's isolate, registered with that scope so
+/// it follows the usual handle-scope lifetime.  Returns null if `persistent`
+/// is null, empty, or its owning isolate has been destroyed.
+///
+/// # Safety
+/// `persistent` must be null or a slot pointer returned by
+/// [`stator_persistent_new`] that has not yet been passed to
+/// [`stator_persistent_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_get(
+    persistent: *const StatorPersistent,
+) -> *mut StatorValue {
+    if persistent.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slot = persistent as *const StatorPersistentSlot;
+    // SAFETY: caller guarantees the slot is live.
+    let (isolate, cloned) = unsafe {
+        let isolate = (*slot).isolate;
+        let cloned = match &(*slot).inner {
+            Some(inner) => inner.clone_for_persistent(),
+            None => return std::ptr::null_mut(),
+        };
+        (isolate, cloned)
+    };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `isolate` is the same isolate that minted the slot; it is
+    // alive for as long as the slot is.  `allocate_stator_value` registers
+    // the new handle with any currently-open handle scope.
+    unsafe { allocate_stator_value(isolate, cloned) }
+}
+
+/// Free the slot backing `persistent`, releasing the engine-side root and
+/// the cloned value it owns.
+///
+/// After this call the `persistent` pointer must not be used.  Calling
+/// `dispose` twice on the same slot is a documented no-op: the first call
+/// removes the slot from the isolate's table, so a subsequent call finds
+/// nothing to do.  Passing null is also a no-op.
+///
+/// # Safety
+/// `persistent` must be null or a slot pointer returned by
+/// [`stator_persistent_new`].  After this call returns, the embedder must
+/// treat the pointer as invalid (it must not be passed to any other
+/// `stator_persistent_*` function except as a redundant `dispose`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_dispose(persistent: *mut StatorPersistent) {
+    if persistent.is_null() {
+        return;
+    }
+    let slot_ptr = persistent as *mut StatorPersistentSlot;
+    // SAFETY: caller guarantees the slot was returned by `stator_persistent_new`.
+    let (isolate, index, root_index) = unsafe {
+        (
+            (*slot_ptr).isolate,
+            (*slot_ptr).index,
+            (*slot_ptr).root_index,
+        )
+    };
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: `isolate` is alive for the slot's lifetime; we are on its
+    // owning thread.
+    let iso_ref = unsafe { &mut *isolate };
+    // Take the owning Box out of the table; if the slot is already `None`
+    // this call is a safe no-op (double-dispose).
+    let Some(slot_box) = iso_ref
+        .persistent_slots
+        .get_mut(index)
+        .and_then(Option::take)
+    else {
+        return;
+    };
+    // Defence in depth: if the slot index has been re-used by a fresh
+    // `stator_persistent_new`, the box we just took may belong to that new
+    // persistent rather than the stale pointer the caller passed.  Put it
+    // back in that case to avoid corrupting a live persistent.
+    if !std::ptr::eq(Box::as_ref(&slot_box), slot_ptr) {
+        iso_ref.persistent_slots[index] = Some(slot_box);
+        return;
+    }
+    iso_ref.persistent_roots.unregister_root(root_index);
+    drop(slot_box);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16953,6 +17485,46 @@ mod tests {
     }
 
     #[test]
+    fn test_module_evaluate_dynamic_import_uses_url_resolver_without_fallback() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import('./dep.js');");
+        let dep = compile_module_src("export const value = 1;");
+        let mut data = fresh_url_resolver_data("https://example.test/app/dep.js", dep);
+        data.status = StatorResolveStatus::StatorResolveStatusTypeError;
+        data.detail = Some(b"dynamic import blocked".to_vec());
+
+        // SAFETY: callbacks and user data live for this test scope.
+        unsafe {
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_module_resolver(
+                ctx,
+                Some(test_canonical_module_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(err.contains("dynamic import blocked"), "{err}");
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 1);
+        assert_eq!(data.module_calls, 0);
+    }
+
+    #[test]
     fn test_module_evaluate_import_meta_resolve_routes_to_ffi_resolver() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -16995,6 +17567,44 @@ mod tests {
             stator_module_free(dep);
             stator_context_destroy(ctx);
         }
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_resolve_uses_url_resolver() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import.meta.resolve('./dep.js');");
+        let dep = compile_module_src("export const value = 1;");
+        let dep_url = "https://example.test/app/dep.js";
+        let mut data = fresh_url_resolver_data(dep_url, dep);
+
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            let resolved = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(resolved, dep_url);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 1);
+        assert_eq!(data.module_calls, 0);
     }
 
     #[test]
@@ -22840,6 +23450,261 @@ mod tests {
             data.captured_parser_metadata,
             StatorParserMetadata::StatorParserMetadataNotParserInserted
         );
+    }
+
+    struct TestUrlResolverData {
+        urls: HashMap<String, Vec<u8>>,
+        modules: HashMap<String, *mut StatorModule>,
+        status: StatorResolveStatus,
+        detail: Option<Vec<u8>>,
+        url_calls: usize,
+        module_calls: usize,
+        captured_base_url: Option<Vec<u8>>,
+        captured_referrer_was_null: bool,
+    }
+
+    unsafe extern "C" fn test_module_url_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        referrer: *const StatorModule,
+        origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        _attributes: *const StatorImportAttribute,
+        _attributes_len: usize,
+        out_resolved_url: *mut *mut StatorString,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestUrlResolverData) };
+        data.url_calls += 1;
+        data.captured_referrer_was_null = referrer.is_null();
+        if !origin.is_null() {
+            // SAFETY: callback contract guarantees `origin` is valid for this call.
+            let view = unsafe { &*origin };
+            data.captured_base_url = if view.base_url.is_null() {
+                None
+            } else {
+                // SAFETY: callback contract guarantees `base_url_len` valid bytes.
+                Some(unsafe {
+                    std::slice::from_raw_parts(view.base_url as *const u8, view.base_url_len)
+                        .to_vec()
+                })
+            };
+        }
+
+        if !out_error.is_null() {
+            let error = data.detail.as_ref().map_or(std::ptr::null_mut(), |detail| {
+                // SAFETY: detail points to valid bytes for this call.
+                unsafe { stator_string_new(detail.as_ptr() as *const c_char, detail.len()) }
+            });
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_error = error };
+        }
+        if data.status != StatorResolveStatus::StatorResolveStatusOk {
+            if !out_resolved_url.is_null() {
+                // SAFETY: out pointer is valid for one write in this test.
+                unsafe { *out_resolved_url = std::ptr::null_mut() };
+            }
+            return data.status;
+        }
+
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap();
+        let Some(resolved) = data.urls.get(specifier) else {
+            if !out_resolved_url.is_null() {
+                // SAFETY: out pointer is valid for one write in this test.
+                unsafe { *out_resolved_url = std::ptr::null_mut() };
+            }
+            return StatorResolveStatus::StatorResolveStatusNotFound;
+        };
+        if !out_resolved_url.is_null() {
+            // SAFETY: resolved points to valid bytes for this call.
+            let url =
+                unsafe { stator_string_new(resolved.as_ptr() as *const c_char, resolved.len()) };
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_resolved_url = url };
+        }
+        StatorResolveStatus::StatorResolveStatusOk
+    }
+
+    unsafe extern "C" fn test_canonical_module_resolver_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        _attributes: *const StatorImportAttribute,
+        _attributes_len: usize,
+        out_module: *mut *mut StatorModule,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestUrlResolverData) };
+        data.module_calls += 1;
+        if !out_error.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_error = std::ptr::null_mut() };
+        }
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap();
+        let module = data
+            .modules
+            .get(specifier)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        if !out_module.is_null() {
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_module = module };
+        }
+        if module.is_null() {
+            StatorResolveStatus::StatorResolveStatusNotFound
+        } else {
+            StatorResolveStatus::StatorResolveStatusOk
+        }
+    }
+
+    fn fresh_url_resolver_data(dep_url: &str, dep: *mut StatorModule) -> TestUrlResolverData {
+        let mut urls = HashMap::new();
+        urls.insert("./dep.js".to_string(), dep_url.as_bytes().to_vec());
+        let mut modules = HashMap::new();
+        modules.insert(dep_url.to_string(), dep);
+        TestUrlResolverData {
+            urls,
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            detail: None,
+            url_calls: 0,
+            module_calls: 0,
+            captured_base_url: None,
+            captured_referrer_was_null: true,
+        }
+    }
+
+    #[test]
+    fn test_module_url_resolver_canonicalizes_before_static_resolution() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+        let dep_url = "https://example.test/app/dep.js";
+        let mut data = fresh_url_resolver_data(dep_url, dep);
+
+        // SAFETY: callbacks and user data live for this test scope.
+        unsafe {
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_module_resolver(
+                ctx,
+                Some(test_canonical_module_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_module_instantiate(ctx, root));
+            assert_eq!(
+                stator_module_get_status(root),
+                StatorModuleStatus::StatorModuleStatusLinked
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 1);
+        assert_eq!(data.module_calls, 1);
+    }
+
+    #[test]
+    fn test_module_url_resolver_failure_propagates_without_module_fallback() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+        let mut data = fresh_url_resolver_data("https://example.test/app/dep.js", dep);
+        data.status = StatorResolveStatus::StatorResolveStatusTypeError;
+        data.detail = Some(b"blocked by import map".to_vec());
+
+        // SAFETY: callbacks and user data live for this test scope.
+        unsafe {
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_module_resolver(
+                ctx,
+                Some(test_canonical_module_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(!stator_module_instantiate(ctx, root));
+            let error = CStr::from_ptr(stator_module_get_error(root))
+                .to_string_lossy()
+                .into_owned();
+            assert!(error.contains("blocked by import map"), "{error}");
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 1);
+        assert_eq!(data.module_calls, 0);
+    }
+
+    #[test]
+    fn test_module_url_resolver_receives_referrer_base_url() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import './dep.js';");
+        let dep = compile_module_src("export const value = 1;");
+        let base_url = b"https://example.test/app/main.js";
+        let mut data = fresh_url_resolver_data("https://example.test/app/dep.js", dep);
+
+        // SAFETY: pointers are valid for these calls.
+        unsafe {
+            assert!(stator_module_set_origin_metadata(
+                root,
+                base_url.as_ptr() as *const c_char,
+                base_url.len(),
+                StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin,
+                StatorParserMetadata::StatorParserMetadataNotParserInserted,
+            ));
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_module_resolver(
+                ctx,
+                Some(test_canonical_module_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_module_instantiate(ctx, root));
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert!(!data.captured_referrer_was_null);
+        assert_eq!(data.captured_base_url.as_deref(), Some(base_url.as_ref()));
     }
 
     #[test]
@@ -30281,5 +31146,192 @@ mod tests {
             )
         };
         assert_eq!(id, 0);
+    }
+
+    // ── Persistent handles ────────────────────────────────────────────────────
+
+    /// Test helper: create a context on `iso` and tear it down in `Drop`.
+    struct ContextGuard {
+        ctx: *mut StatorContext,
+    }
+
+    impl ContextGuard {
+        fn new(iso: *mut StatorIsolate) -> Self {
+            // SAFETY: caller passes a live isolate.
+            let ctx = unsafe { stator_context_new(iso) };
+            assert!(!ctx.is_null());
+            Self { ctx }
+        }
+        fn as_ptr(&self) -> *mut StatorContext {
+            self.ctx
+        }
+    }
+
+    impl Drop for ContextGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.ctx` was created by `stator_context_new`.
+            unsafe { stator_context_destroy(self.ctx) };
+        }
+    }
+
+    #[test]
+    fn test_persistent_new_null_args_returns_null() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        // SAFETY: passing null is documented as safe; should return null.
+        let p1 = unsafe { stator_persistent_new(std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert!(p1.is_null());
+        let p2 = unsafe { stator_persistent_new(ctx.as_ptr(), std::ptr::null_mut()) };
+        assert!(p2.is_null());
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let p3 = unsafe { stator_persistent_new(std::ptr::null_mut(), val) };
+        assert!(p3.is_null());
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_persistent_survives_handle_scope_close() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        // Open a handle scope, allocate an object, persist it, then close
+        // the scope: the persistent must still let us read the object back.
+        // SAFETY: `iso` is live.
+        let scope = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        assert!(!scope.is_null());
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"answer";
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        unsafe { stator_object_set(obj, key.as_ptr(), val) };
+        let obj_value = unsafe { stator_object_as_value(obj) };
+        let persistent = unsafe { stator_persistent_new(ctx.as_ptr(), obj_value) };
+        assert!(!persistent.is_null());
+        assert!(!unsafe { stator_persistent_is_empty(persistent) });
+        // Destroy the originating object handle now; the persistent should
+        // still keep the underlying JsObject alive.
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_handle_scope_close(scope) };
+
+        // After the scope is closed, fetch a fresh value from the persistent
+        // and confirm the property survived.
+        let scope2 = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        let materialized = unsafe { stator_persistent_get(persistent) };
+        assert!(!materialized.is_null());
+        let obj2 = unsafe { stator_value_as_object(materialized) };
+        assert!(!obj2.is_null());
+        let got = unsafe { stator_object_get(obj2, key.as_ptr()) };
+        assert!(!got.is_null());
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 7.0).abs() < f64::EPSILON);
+        unsafe { stator_object_destroy(obj2) };
+        unsafe { stator_handle_scope_close(scope2) };
+        unsafe { stator_persistent_dispose(persistent) };
+    }
+
+    #[test]
+    fn test_persistent_survives_multiple_gc_cycles() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"k";
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 99.0) };
+        unsafe { stator_object_set(obj, key.as_ptr(), val) };
+        let obj_value = unsafe { stator_object_as_value(obj) };
+        let persistent = unsafe { stator_persistent_new(ctx.as_ptr(), obj_value) };
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_value_destroy(obj_value) };
+        unsafe { stator_object_destroy(obj) };
+
+        // Trigger several GC cycles; persistent must keep the object alive.
+        for _ in 0..3 {
+            unsafe { stator_isolate_gc(iso.as_ptr()) };
+        }
+        let materialized = unsafe { stator_persistent_get(persistent) };
+        assert!(!materialized.is_null());
+        let obj2 = unsafe { stator_value_as_object(materialized) };
+        let got = unsafe { stator_object_get(obj2, key.as_ptr()) };
+        assert!(!got.is_null());
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 99.0).abs() < f64::EPSILON);
+        unsafe { stator_value_destroy(got) };
+        unsafe { stator_object_destroy(obj2) };
+        unsafe { stator_value_destroy(materialized) };
+        unsafe { stator_persistent_dispose(persistent) };
+    }
+
+    #[test]
+    fn test_persistent_reset_clears_value_and_is_empty() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        let persistent = unsafe { stator_persistent_new(ctx.as_ptr(), val) };
+        unsafe { stator_value_destroy(val) };
+        assert!(!unsafe { stator_persistent_is_empty(persistent) });
+        unsafe { stator_persistent_reset(persistent) };
+        assert!(unsafe { stator_persistent_is_empty(persistent) });
+        // get() on an empty persistent returns null.
+        let got = unsafe { stator_persistent_get(persistent) };
+        assert!(got.is_null());
+        unsafe { stator_persistent_dispose(persistent) };
+    }
+
+    #[test]
+    fn test_persistent_replace_with_different_value() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        // Dispose first persistent, then allocate another holding a
+        // different value; the underlying slot may legitimately be reused.
+        let v1 = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let p1 = unsafe { stator_persistent_new(ctx.as_ptr(), v1) };
+        unsafe { stator_value_destroy(v1) };
+        unsafe { stator_persistent_dispose(p1) };
+
+        let v2 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        let p2 = unsafe { stator_persistent_new(ctx.as_ptr(), v2) };
+        unsafe { stator_value_destroy(v2) };
+        let got = unsafe { stator_persistent_get(p2) };
+        assert!(!got.is_null());
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 2.0).abs() < f64::EPSILON);
+        unsafe { stator_value_destroy(got) };
+        unsafe { stator_persistent_dispose(p2) };
+    }
+
+    #[test]
+    fn test_persistent_null_tolerant_calls_are_noops() {
+        // Every entry point must accept null without crashing.
+        unsafe { stator_persistent_reset(std::ptr::null_mut()) };
+        assert!(unsafe { stator_persistent_is_empty(std::ptr::null()) });
+        assert!(unsafe { stator_persistent_get(std::ptr::null()).is_null() });
+        unsafe { stator_persistent_dispose(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_persistent_double_dispose_is_safe() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 5.0) };
+        let p = unsafe { stator_persistent_new(ctx.as_ptr(), val) };
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_persistent_dispose(p) };
+        // Second dispose on the same pointer is a documented no-op.
+        unsafe { stator_persistent_dispose(p) };
+        // The isolate must remain usable.
+        let v2 = unsafe { stator_value_new_number(iso.as_ptr(), 6.0) };
+        let p2 = unsafe { stator_persistent_new(ctx.as_ptr(), v2) };
+        assert!(!p2.is_null());
+        unsafe { stator_value_destroy(v2) };
+        unsafe { stator_persistent_dispose(p2) };
+    }
+
+    #[test]
+    fn test_persistent_cross_isolate_value_rejected() {
+        let iso_a = IsolateGuard::new();
+        let iso_b = IsolateGuard::new();
+        let ctx_a = ContextGuard::new(iso_a.as_ptr());
+        // Value belongs to iso_b but we try to root it through ctx_a.
+        let val = unsafe { stator_value_new_number(iso_b.as_ptr(), 1.0) };
+        let p = unsafe { stator_persistent_new(ctx_a.as_ptr(), val) };
+        assert!(p.is_null());
+        unsafe { stator_value_destroy(val) };
     }
 }

@@ -184,6 +184,23 @@ impl PersistentRoots {
     }
 
     /// Register `ptr` and return its slot index.
+    ///
+    /// Exposed publicly so that embedders (e.g. the FFI layer's persistent
+    /// table) can mirror their own root tables into the engine-side root
+    /// registry.  The pointer is stored verbatim and is not dereferenced by
+    /// `PersistentRoots`; callers are responsible for the lifetime of the
+    /// memory it points to.
+    pub fn register_root(&mut self, ptr: *mut u8) -> usize {
+        self.register(ptr)
+    }
+
+    /// Clear the slot at `index`, indicating the root is no longer live.
+    /// Companion to [`register_root`](Self::register_root).
+    pub fn unregister_root(&mut self, index: usize) {
+        self.unregister(index);
+    }
+
+    /// Register `ptr` and return its slot index.
     fn register(&mut self, ptr: *mut u8) -> usize {
         // Reuse a freed slot when available.
         if let Some(idx) = self.roots.iter().position(|s| s.is_none()) {
