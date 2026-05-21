@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 13
+#define STATOR_FFI_ABI_VERSION_MINOR 14
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -94,6 +94,11 @@
  * Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
  */
 #define STATOR_OSR_EXIT_REASON_COUNT 4
+
+/**
+ * Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+ */
+#define STATOR_JIT_UNWIND_TIER_COUNT 4
 
 /**
  * Default named-property handler behaviour; no flag bits set.
@@ -1663,6 +1668,65 @@ typedef struct StatorOsrCountersStats {
 } StatorOsrCountersStats;
 
 /**
+ * Per-tier release-safe JIT unwind counters, mirroring
+ * [`stator_jse::jit_unwind::JitUnwindTierSnapshot`].
+ *
+ * `unwind_supported` is `false` for every tier in this build; see
+ * `docs/edge_diagnostics.md` for the rationale and the conditions under
+ * which a future tier will flip the flag.
+ */
+typedef struct StatorJitUnwindTierStats {
+  /**
+   * Stable tier index (matches `JitTier` discriminant).
+   */
+  uint32_t tier;
+  /**
+   * Whether this tier currently emits Win64 `RUNTIME_FUNCTION` records.
+   */
+  bool unwind_supported;
+  /**
+   * Number of registration attempts (including unsupported/failed ones).
+   */
+  uint64_t register_attempts;
+  /**
+   * Registrations that returned a live handle.
+   */
+  uint64_t register_successes;
+  /**
+   * Registrations that the OS rejected after the supported-tier check.
+   */
+  uint64_t register_failures;
+  /**
+   * Registrations rejected because the tier or platform does not yet
+   * emit Win64 unwind records.
+   */
+  uint64_t unsupported_tier_attempts;
+  /**
+   * Live handles that were dropped (and therefore deregistered).
+   */
+  uint64_t deregistrations;
+} StatorJitUnwindTierStats;
+
+/**
+ * Aggregate release-safe JIT unwind counter snapshot exposed to embedders.
+ */
+typedef struct StatorJitUnwindStats {
+  /**
+   * Whether the current build target supports Win64 unwind registration
+   * (i.e. is `x86_64-pc-windows-*`).
+   */
+  bool platform_supported;
+  /**
+   * Number of per-tier rows that follow.
+   */
+  uint32_t tier_row_count;
+  /**
+   * Per-tier counters, indexed by `JitTier` discriminant.
+   */
+  struct StatorJitUnwindTierStats tiers[STATOR_JIT_UNWIND_TIER_COUNT];
+} StatorJitUnwindStats;
+
+/**
  * Read-only view of the browser policy/origin metadata associated with a
  * referrer module, supplied to host module resolver callbacks.
  *
@@ -3138,6 +3202,30 @@ void stator_isolate_get_osr_counters_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_osr_counters_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with the current process-global JIT unwind counters.
+ *
+ * `isolate` may be null; the counters are process-global diagnostics
+ * rather than heap-owned state.  Does nothing when `stats` is null.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes of a `StatorJitUnwindStats`.
+ */
+void stator_isolate_get_jit_unwind_stats(const struct StatorIsolate *_isolate,
+                                         struct StatorJitUnwindStats *stats);
+
+/**
+ * Reset every JIT unwind counter visible through
+ * [`stator_isolate_get_jit_unwind_stats`].
+ *
+ * `isolate` may be null; the counters are process-global.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_jit_unwind_stats(struct StatorIsolate *_isolate);
 
 /**
  * Enable or disable JIT tiers for scripts run in `isolate`.

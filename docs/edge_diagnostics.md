@@ -314,6 +314,103 @@ snapshot with:
 If OSR counters are all zero while `true_osr_supported == false`, report the
 build as "no true OSR support" rather than "zero OSR churn".
 
+## Win64 JIT unwind registration counters
+
+### Scope
+
+Edge crash reporting, ETW profiling, and the Visual Studio debugger walk
+Win64 stacks through the OS structured-exception-handling table.  JIT
+code that is not covered by a registered `RUNTIME_FUNCTION` array is
+invisible to that machinery: a sampling profiler attempting to climb out
+of a JIT frame will either truncate or, worse, produce a bogus walk.
+
+The `stator_jse::jit_unwind` module exposes the registration plumbing
+(`RtlAddFunctionTable` / `RtlDeleteFunctionTable` on Windows, no-op
+stubs elsewhere) plus a release-safe per-tier counter snapshot that
+reports, fail-closed, which tiers actually emit unwind metadata today.
+
+### Current tier support
+
+| Tier      | Emits Win64 unwind records | Notes |
+| --------- | -------------------------- | ----- |
+| Baseline  | **no**                     | Handcrafted `masm_x64` prologue/epilogue. |
+| Maglev    | **no**                     | Same in-tree assembler. |
+| Turbofan  | **no**                     | Cranelift can emit `.pdata`, but the in-process pipeline does not yet thread it through. |
+| Cranelift | **no**                     | Standalone Cranelift functions share executable memory but are not yet registered. |
+
+[`jit_unwind::register_for_tier`] therefore always returns
+`UnwindError::UnsupportedTier` (or `UnsupportedPlatform` off Windows) and
+bumps the `unsupported_tier_attempts` counter rather than fabricating
+bogus unwind info.  When a tier learns to emit `.pdata`, flip
+`JitTier::emits_unwind_info` for that arm and route the registration
+through `jit_unwind::register_runtime_functions` with caller-owned
+records.  The returned `JitUnwindRegistration` is RAII: drop
+deregisters via `RtlDeleteFunctionTable` with the same pointer that was
+registered.
+
+### Counters
+
+Per tier (Baseline / Maglev / Turbofan / Cranelift):
+
+| Field | Meaning |
+| ----- | ------- |
+| `unwind_supported` | Mirrors `JitTier::emits_unwind_info` for the tier. Currently always `false`. |
+| `register_attempts` | Every call into `register_for_tier` / `register_runtime_functions`. |
+| `register_successes` | Calls that returned a live `JitUnwindRegistration`. |
+| `register_failures` | Empty region / OS-rejected outcomes after the supported-tier check passed. |
+| `unsupported_tier_attempts` | Fail-closed sentinel — the platform or tier had no real registration backend. |
+| `deregistrations` | `JitUnwindRegistration` handles dropped (table removed from the OS). |
+
+Aggregate flag `platform_supported` reports whether this build is
+`x86_64-pc-windows-*` and therefore *could* register unwind tables at
+all.
+
+### Rust API
+
+```rust
+use stator_jse::jit_unwind::{self, JitTier};
+
+let snapshot = jit_unwind::snapshot();
+assert!(!snapshot.tier(JitTier::Baseline).unwind_supported);
+let unsupported = snapshot.total_unsupported_tier_attempts();
+let live = snapshot.total_currently_registered();
+```
+
+### C FFI
+
+```c
+StatorJitUnwindStats stats = {0};
+stator_isolate_reset_jit_unwind_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_jit_unwind_stats(NULL, &stats);
+if (!stats.platform_supported) {
+    /* Non-Windows or non-x86_64 build — Win64 unwind not applicable. */
+}
+if (!stats.tiers[/*Baseline=*/0].unwind_supported) {
+    /* Edge profilers cannot unwind through Baseline JIT frames yet. */
+}
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the counters are
+process-global.  Adding the symbol surface bumps the ABI minor version
+to 14 (additive, backwards-compatible).
+
+### Edge usage notes
+
+When Edge crash reports show truncated stacks that bottom out in a JIT
+code region, query this snapshot at the time of the crash:
+
+* If `platform_supported == false`, this is a non-Windows build — Win64
+  unwind is structurally inapplicable.
+* If `unwind_supported == false` for the tier hosting the truncated
+  frame, the truncation is expected; treat it as "no unwind info
+  emitted" rather than a regression.
+* If `register_failures` is non-zero, the OS rejected a tier that
+  *does* emit unwind records — escalate as an OS/ABI bug.
+* `currently_registered` (= `register_successes - deregistrations`)
+  should stay bounded by the live JIT code-cache size; an ever-growing
+  gap indicates a teardown leak.
+
 ## Related counters
 
 - **`stator_jse::compiler::compile_counters`** — per-tier

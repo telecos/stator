@@ -65,6 +65,9 @@ pub mod ic;
 pub mod inspector;
 /// Bytecode interpreter: fetch-decode-dispatch loop and activation frame.
 pub mod interpreter;
+/// Windows x64 JIT unwind metadata registration (RtlAddFunctionTable wrapper)
+/// and fail-closed per-tier diagnostics.
+pub mod jit_unwind;
 /// JavaScript value representation and heap object types.
 pub mod objects;
 /// JavaScript parser infrastructure (lexer and AST node definitions).

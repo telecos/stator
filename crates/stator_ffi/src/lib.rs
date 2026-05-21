@@ -43,6 +43,7 @@ use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
 };
+use stator_jse::jit_unwind;
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::PropertyMap;
@@ -84,7 +85,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 13;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 14;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -1178,6 +1179,9 @@ pub const STATOR_OSR_TIER_COUNT: usize = 4;
 /// Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
 pub const STATOR_OSR_EXIT_REASON_COUNT: usize = 4;
 
+/// Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+pub const STATOR_JIT_UNWIND_TIER_COUNT: usize = 4;
+
 /// Per-source/target true-OSR entry counters.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1418,6 +1422,104 @@ pub unsafe extern "C" fn stator_isolate_get_osr_counters_stats(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_reset_osr_counters_stats(_isolate: *mut StatorIsolate) {
     osr_counters::reset();
+}
+
+// ── JIT unwind diagnostics ──────────────────────────────────────────────────
+
+/// Per-tier release-safe JIT unwind counters, mirroring
+/// [`stator_jse::jit_unwind::JitUnwindTierSnapshot`].
+///
+/// `unwind_supported` is `false` for every tier in this build; see
+/// `docs/edge_diagnostics.md` for the rationale and the conditions under
+/// which a future tier will flip the flag.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitUnwindTierStats {
+    /// Stable tier index (matches `JitTier` discriminant).
+    pub tier: u32,
+    /// Whether this tier currently emits Win64 `RUNTIME_FUNCTION` records.
+    pub unwind_supported: bool,
+    /// Number of registration attempts (including unsupported/failed ones).
+    pub register_attempts: u64,
+    /// Registrations that returned a live handle.
+    pub register_successes: u64,
+    /// Registrations that the OS rejected after the supported-tier check.
+    pub register_failures: u64,
+    /// Registrations rejected because the tier or platform does not yet
+    /// emit Win64 unwind records.
+    pub unsupported_tier_attempts: u64,
+    /// Live handles that were dropped (and therefore deregistered).
+    pub deregistrations: u64,
+}
+
+/// Aggregate release-safe JIT unwind counter snapshot exposed to embedders.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitUnwindStats {
+    /// Whether the current build target supports Win64 unwind registration
+    /// (i.e. is `x86_64-pc-windows-*`).
+    pub platform_supported: bool,
+    /// Number of per-tier rows that follow.
+    pub tier_row_count: u32,
+    /// Per-tier counters, indexed by `JitTier` discriminant.
+    pub tiers: [StatorJitUnwindTierStats; STATOR_JIT_UNWIND_TIER_COUNT],
+}
+
+impl StatorJitUnwindStats {
+    fn from_engine_snapshot(snapshot: &jit_unwind::JitUnwindSnapshot) -> Self {
+        let mut tiers = [StatorJitUnwindTierStats::default(); STATOR_JIT_UNWIND_TIER_COUNT];
+        for (idx, src) in snapshot.tiers.iter().enumerate() {
+            tiers[idx] = StatorJitUnwindTierStats {
+                tier: src.tier as u32,
+                unwind_supported: src.unwind_supported,
+                register_attempts: src.register_attempts,
+                register_successes: src.register_successes,
+                register_failures: src.register_failures,
+                unsupported_tier_attempts: src.unsupported_tier_attempts,
+                deregistrations: src.deregistrations,
+            };
+        }
+        Self {
+            platform_supported: snapshot.platform_supported,
+            tier_row_count: STATOR_JIT_UNWIND_TIER_COUNT as u32,
+            tiers,
+        }
+    }
+}
+
+/// Fill `*stats` with the current process-global JIT unwind counters.
+///
+/// `isolate` may be null; the counters are process-global diagnostics
+/// rather than heap-owned state.  Does nothing when `stats` is null.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes of a `StatorJitUnwindStats`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_jit_unwind_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorJitUnwindStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = jit_unwind::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorJitUnwindStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset every JIT unwind counter visible through
+/// [`stator_isolate_get_jit_unwind_stats`].
+///
+/// `isolate` may be null; the counters are process-global.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_jit_unwind_stats(_isolate: *mut StatorIsolate) {
+    jit_unwind::reset();
 }
 
 /// Enable or disable JIT tiers for scripts run in `isolate`.
@@ -30869,6 +30971,80 @@ mod tests {
         assert!(!after.true_osr_supported);
         assert_eq!(after.per_script_row_count, 0);
         assert_eq!(after.total(), 0);
+    }
+
+    #[test]
+    fn test_jit_unwind_stats_null_safety_and_fail_closed() {
+        use std::sync::Mutex;
+        // Serialise with the engine-side tests so we do not race on
+        // process-global counters.
+        static FFI_JIT_UNWIND_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_JIT_UNWIND_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // Null output is a no-op.
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_jit_unwind_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // Null isolate is accepted; counters are process-global.
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_unwind_stats(std::ptr::null_mut()) };
+
+        // Constant matches the engine tier count.
+        assert_eq!(STATOR_JIT_UNWIND_TIER_COUNT, jit_unwind::JitTier::COUNT);
+
+        // After a reset every counter is zero.
+        let mut stats = unsafe { std::mem::zeroed::<StatorJitUnwindStats>() };
+        // SAFETY: `stats` is valid for writes; null isolate is accepted.
+        unsafe { stator_isolate_get_jit_unwind_stats(std::ptr::null(), &mut stats) };
+        assert_eq!(stats.tier_row_count, jit_unwind::JitTier::COUNT as u32);
+        assert_eq!(
+            stats.platform_supported,
+            cfg!(all(target_arch = "x86_64", windows))
+        );
+        for (idx, tier) in jit_unwind::JitTier::all().iter().enumerate() {
+            assert_eq!(stats.tiers[idx].tier, *tier as u32);
+            assert!(!stats.tiers[idx].unwind_supported);
+            assert_eq!(stats.tiers[idx].register_attempts, 0);
+            assert_eq!(stats.tiers[idx].register_successes, 0);
+            assert_eq!(stats.tiers[idx].unsupported_tier_attempts, 0);
+            assert_eq!(stats.tiers[idx].deregistrations, 0);
+        }
+
+        // A fail-closed register attempt bumps the unsupported counter on
+        // every target without producing a registration success.
+        let buf = [0u8; 16];
+        let err =
+            jit_unwind::register_for_tier(jit_unwind::JitTier::Baseline, buf.as_ptr(), buf.len())
+                .expect_err("baseline emits no unwind info");
+        if cfg!(all(target_arch = "x86_64", windows)) {
+            assert!(matches!(
+                err,
+                jit_unwind::UnwindError::UnsupportedTier(jit_unwind::JitTier::Baseline)
+            ));
+        } else {
+            assert_eq!(err, jit_unwind::UnwindError::UnsupportedPlatform);
+        }
+
+        let mut after = unsafe { std::mem::zeroed::<StatorJitUnwindStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_jit_unwind_stats(std::ptr::null(), &mut after) };
+        let base_row = &after.tiers[jit_unwind::JitTier::Baseline as usize];
+        assert_eq!(base_row.register_attempts, 1);
+        assert_eq!(base_row.register_successes, 0);
+        assert_eq!(base_row.unsupported_tier_attempts, 1);
+
+        // Reset returns the snapshot back to zero.
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_unwind_stats(std::ptr::null_mut()) };
+        let mut zeroed = unsafe { std::mem::zeroed::<StatorJitUnwindStats>() };
+        // SAFETY: `zeroed` is valid for writes.
+        unsafe { stator_isolate_get_jit_unwind_stats(std::ptr::null(), &mut zeroed) };
+        for tier_idx in 0..jit_unwind::JitTier::COUNT {
+            assert_eq!(zeroed.tiers[tier_idx].register_attempts, 0);
+            assert_eq!(zeroed.tiers[tier_idx].unsupported_tier_attempts, 0);
+        }
     }
 
     #[test]
