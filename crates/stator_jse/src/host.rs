@@ -18,7 +18,82 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
+use crate::builtins::promise::{JsPromise, MicrotaskQueue};
 use crate::objects::value::JsValue;
+
+/// A host-visible ECMAScript import attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostImportAttribute {
+    /// Attribute key (for example, `type`).
+    pub key: String,
+    /// Attribute value.
+    pub value: String,
+}
+
+/// Host request object for dynamic `import()`.
+///
+/// The request owns the promise returned to JavaScript. Hosts may settle it
+/// synchronously inside [`HostModuleLoader::dynamic_import`] or retain a clone
+/// and settle it later on the same thread after fetch/compile/evaluate work
+/// completes.
+#[derive(Clone)]
+pub struct HostDynamicImportRequest {
+    specifier: String,
+    referrer: Option<String>,
+    attributes: Vec<HostImportAttribute>,
+    promise: JsPromise,
+    queue: MicrotaskQueue,
+}
+
+impl HostDynamicImportRequest {
+    /// Create a host dynamic-import request around a pending promise.
+    pub fn new(
+        specifier: String,
+        referrer: Option<String>,
+        attributes: Vec<HostImportAttribute>,
+        promise: JsPromise,
+        queue: MicrotaskQueue,
+    ) -> Self {
+        Self {
+            specifier,
+            referrer,
+            attributes,
+            promise,
+            queue,
+        }
+    }
+
+    /// Requested module specifier after `ToString`.
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+
+    /// URL of the referrer module, when known.
+    pub fn referrer(&self) -> Option<&str> {
+        self.referrer.as_deref()
+    }
+
+    /// Import attributes supplied by `import(specifier, { with: ... })`.
+    pub fn attributes(&self) -> &[HostImportAttribute] {
+        &self.attributes
+    }
+
+    /// Promise returned to JavaScript for this dynamic import.
+    pub fn promise(&self) -> JsPromise {
+        self.promise.clone()
+    }
+
+    /// Fulfil the dynamic-import promise.
+    pub fn resolve(&self, namespace: JsValue) {
+        self.promise.resolve(namespace, &self.queue);
+    }
+
+    /// Reject the dynamic-import promise with a structured JavaScript error.
+    pub fn reject(&self, error: JsError) {
+        self.promise
+            .reject(JsValue::Error(Rc::new(error)), &self.queue);
+    }
+}
 
 /// Host-populated fields for an `import.meta` object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,19 +118,19 @@ pub struct HostImportMeta {
 
 /// Embedder hook for resolving dynamic `import()` and `import.meta.resolve`.
 ///
-/// Implementations are intentionally synchronous: the interpreter
-/// fulfils or rejects the returned dynamic-import `Promise` immediately
-/// based on the result.  Embedders that need to defer work should keep
-/// their own scheduler and resolve their own pending state inside
-/// [`Self::dynamic_import`] only once the work is ready.
+/// Dynamic import is intentionally start/settle split: the interpreter creates
+/// the JavaScript promise and passes a [`HostDynamicImportRequest`] to the host.
+/// Hosts may settle the request immediately or retain a clone and settle it
+/// later after browser fetch/compile/evaluate lifecycle completes.
 pub trait HostModuleLoader {
-    /// Resolve and evaluate `specifier` on behalf of dynamic `import()`.
+    /// Start host processing for dynamic `import()`.
     ///
-    /// `referrer` is the URL of the module that issued the import, or
-    /// `None` if the import came from a script or a module without
-    /// origin metadata.  The returned [`JsValue`] is used to fulfil the
-    /// dynamic-import `Promise`; an `Err` rejects it.
-    fn dynamic_import(&self, specifier: &str, referrer: Option<&str>) -> Result<JsValue, JsError>;
+    /// Returning `Err` rejects the promise immediately. Returning `Ok(())`
+    /// means the host has accepted the request and is responsible for calling
+    /// [`HostDynamicImportRequest::resolve`] or
+    /// [`HostDynamicImportRequest::reject`]. If it does neither, the promise
+    /// remains pending rather than silently falling back to fake resolution.
+    fn dynamic_import(&self, request: HostDynamicImportRequest) -> Result<(), JsError>;
 
     /// Resolve `specifier` to a URL string for `import.meta.resolve`.
     ///
@@ -129,12 +204,9 @@ mod tests {
     struct StubLoader;
 
     impl HostModuleLoader for StubLoader {
-        fn dynamic_import(
-            &self,
-            specifier: &str,
-            _referrer: Option<&str>,
-        ) -> Result<JsValue, JsError> {
-            Ok(JsValue::String(specifier.to_string().into()))
+        fn dynamic_import(&self, request: HostDynamicImportRequest) -> Result<(), JsError> {
+            request.resolve(JsValue::String(request.specifier().to_string().into()));
+            Ok(())
         }
 
         fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {

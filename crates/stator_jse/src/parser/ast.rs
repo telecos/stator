@@ -1402,13 +1402,15 @@ pub struct AwaitExpr {
     pub argument: Box<Expr>,
 }
 
-/// `import(source)` — dynamic import expression.
+/// `import(source[, options])` — dynamic import expression.
 #[derive(Debug, Clone)]
 pub struct ImportExpr {
     /// Source location.
     pub loc: SourceLocation,
     /// The module specifier.
     pub source: Box<Expr>,
+    /// Optional import options object.
+    pub options: Option<Box<Expr>>,
 }
 
 /// `import.meta` or `new.target` — meta property expression.
@@ -1905,6 +1907,7 @@ mod tests {
             Expr::Import(Box::new(ImportExpr {
                 loc,
                 source: null(),
+                options: None,
             })),
             Expr::MetaProp(MetaPropExpr {
                 loc,

@@ -6801,8 +6801,8 @@ fn handle_call_runtime(
     };
 
     if runtime_id == crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT {
-        use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
-        use crate::host::{current_loader, current_module_url};
+        use crate::builtins::promise::{MicrotaskQueue, promise_pending, promise_reject};
+        use crate::host::{HostDynamicImportRequest, current_loader, current_module_url};
 
         let Operand::Register(args_start_v) = *instr.operand(1) else {
             return Err(err_bad_operand("CallRuntime", 1));
@@ -6815,22 +6815,46 @@ fn handle_call_runtime(
         let promise = if arg_count >= 1 {
             let raw = ctx.frame.read_reg(args_start_v)?.cheap_clone();
             match raw.to_js_string() {
-                Ok(specifier) => match current_loader() {
-                    Some(loader) => {
-                        let referrer = current_module_url();
-                        match loader.dynamic_import(&specifier, referrer.as_deref()) {
-                            Ok(value) => promise_resolve(value, &queue),
-                            Err(err) => promise_reject(JsValue::Error(Rc::new(err)), &queue),
+                Ok(specifier) => {
+                    let attributes = if arg_count >= 2 {
+                        let options = ctx.frame.read_reg(args_start_v + 1)?.cheap_clone();
+                        match dynamic_import_attributes_from_options(&options) {
+                            Ok(attributes) => attributes,
+                            Err(err) => {
+                                let reason = JsValue::Error(Rc::new(*err));
+                                ctx.frame.accumulator =
+                                    JsValue::Promise(promise_reject(reason, &queue));
+                                return Ok(DispatchAction::Continue);
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    match current_loader() {
+                        Some(loader) => {
+                            let referrer = current_module_url().map(|url| url.to_string());
+                            let promise = promise_pending();
+                            let request = HostDynamicImportRequest::new(
+                                specifier,
+                                referrer,
+                                attributes,
+                                promise.clone(),
+                                queue.clone(),
+                            );
+                            if let Err(err) = loader.dynamic_import(request) {
+                                promise.reject(JsValue::Error(Rc::new(err)), &queue);
+                            }
+                            promise
+                        }
+                        None => {
+                            let reason = JsValue::Error(Rc::new(JsError::new(
+                                ErrorKind::TypeError,
+                                "dynamic import is not supported by this host".to_string(),
+                            )));
+                            promise_reject(reason, &queue)
                         }
                     }
-                    None => {
-                        let reason = JsValue::Error(Rc::new(JsError::new(
-                            ErrorKind::TypeError,
-                            "dynamic import is not supported by this host".to_string(),
-                        )));
-                        promise_reject(reason, &queue)
-                    }
-                },
+                }
                 Err(err) => {
                     let reason = JsValue::Error(Rc::new(JsError::new(
                         ErrorKind::TypeError,
@@ -6850,6 +6874,47 @@ fn handle_call_runtime(
     }
     // Unrecognised runtime IDs are no-ops.
     Ok(DispatchAction::Continue)
+}
+
+fn dynamic_import_attributes_from_options(
+    options: &JsValue,
+) -> Result<Vec<crate::host::HostImportAttribute>, Box<JsError>> {
+    if matches!(options, JsValue::Undefined | JsValue::Null) {
+        return Ok(Vec::new());
+    }
+    let JsValue::PlainObject(options_map) = options else {
+        return Err(Box::new(JsError::new(
+            ErrorKind::TypeError,
+            "dynamic import options must be an object".to_string(),
+        )));
+    };
+    let with_value = options_map.borrow().get("with").cloned();
+    let Some(with_value) = with_value else {
+        return Ok(Vec::new());
+    };
+    if matches!(with_value, JsValue::Undefined | JsValue::Null) {
+        return Ok(Vec::new());
+    }
+    let JsValue::PlainObject(attributes_map) = with_value else {
+        return Err(Box::new(JsError::new(
+            ErrorKind::TypeError,
+            "dynamic import attributes must be an object".to_string(),
+        )));
+    };
+    let mut attributes = Vec::new();
+    for (key, value) in attributes_map.borrow().iter() {
+        let JsValue::String(value) = value else {
+            return Err(Box::new(JsError::new(
+                ErrorKind::TypeError,
+                "dynamic import attribute values must be strings".to_string(),
+            )));
+        };
+        attributes.push(crate::host::HostImportAttribute {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(attributes)
 }
 
 fn handle_sta_named_own_property(

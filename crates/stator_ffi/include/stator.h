@@ -156,7 +156,7 @@ typedef enum StatorResolveStatus {
    */
   StatorResolveStatusTypeError = 3,
   /**
-   * Resolution will complete asynchronously in a future API slice.
+   * Dynamic import was accepted and will settle asynchronously.
    */
   StatorResolveStatusPending = 4,
 } StatorResolveStatus;
@@ -712,6 +712,8 @@ typedef enum StatorWeakParameterKind {
   InternalFields = 1,
 } StatorWeakParameterKind;
 
+typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
+
 /**
  * An opaque handle to a CDP WebSocket server.
  *
@@ -801,6 +803,16 @@ typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
  * wrapper — see `docs/handles.md` §2.3.
  */
 typedef struct StatorDomWeakRef StatorDomWeakRef;
+
+/**
+ * Opaque host-owned dynamic `import()` request.
+ *
+ * A request is created by Stator when JavaScript evaluates `import()`.
+ * Ownership transfers to the host only when the dynamic-import callback returns
+ * `StatorResolveStatusOk` or `StatorResolveStatusPending`. The host must
+ * consume it exactly once with a resolve/reject/dispose API.
+ */
+typedef struct StatorDynamicImportRequest StatorDynamicImportRequest;
 
 /**
  * An opaque escapable handle scope.
@@ -2834,6 +2846,33 @@ bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
                                               void (*free_user_data)(void *user_data));
 
 /**
+ * Register, replace, or clear the async dynamic `import()` callback for `ctx`.
+ *
+ * When installed, module-evaluation dynamic `import()` calls invoke this
+ * callback after the URL resolver has canonicalised the specifier. The callback
+ * receives a [`StatorDynamicImportRequest`] handle and must return
+ * [`StatorResolveStatus::StatorResolveStatusOk`] or
+ * [`StatorResolveStatus::StatorResolveStatusPending`] after it has accepted
+ * ownership of the request. It must later call either
+ * [`stator_dynamic_import_request_resolve_module`] or
+ * [`stator_dynamic_import_request_reject`]. Non-success statuses reject the
+ * JavaScript promise immediately and Stator consumes the request.
+ *
+ * Returns `true` on successful registration or clear, and `false` for a null
+ * context or malformed clear request.
+ *
+ * # Safety
+ * The callback and `user_data` lifetime rules match
+ * [`stator_context_set_module_resolver`]. The callback must not settle or free
+ * the request before returning; request settlement is a later host action on
+ * the same serialized context/module thread.
+ */
+bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,
+                                                struct Option_StatorDynamicImportCallback callback,
+                                                void *user_data,
+                                                void (*free_user_data)(void *user_data));
+
+/**
  * Create a new number value.
  *
  * Returns a null pointer if `isolate` is null.
@@ -4037,6 +4076,49 @@ enum StatorModuleStatus stator_module_get_status(const struct StatorModule *modu
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 enum StatorModuleType stator_module_get_type(const struct StatorModule *module);
+
+/**
+ * Resolve and consume a dynamic-import request with a compiled module.
+ *
+ * Stator instantiates and evaluates `module` using the request's original
+ * context, then fulfils the JavaScript promise with the module namespace object
+ * placeholder used by the current module runtime. On failure the promise is
+ * rejected with the structured module error and the request is still consumed.
+ *
+ * # Safety
+ * - `request` must be a live request accepted by the host dynamic-import
+ *   callback and not previously settled.
+ * - `module` must be null or a live compiled module pointer. Null rejects with
+ *   `StatorResolveStatusNotFound`.
+ * - Must be called on the same serialized context/module thread as the
+ *   callback.
+ */
+enum StatorResolveStatus stator_dynamic_import_request_resolve_module(struct StatorDynamicImportRequest *request,
+                                                                      struct StatorModule *module);
+
+/**
+ * Reject and consume a dynamic-import request with a structured host error.
+ *
+ * `detail`, when non-null, must be a [`StatorString`] allocated by
+ * [`stator_string_new`]; ownership transfers to Stator.
+ *
+ * # Safety
+ * `request` must be a live request accepted by the host dynamic-import
+ * callback and not previously settled. Must be called on the same serialized
+ * context/module thread as the callback.
+ */
+bool stator_dynamic_import_request_reject(struct StatorDynamicImportRequest *request,
+                                          enum StatorResolveStatus status,
+                                          struct StatorString *detail);
+
+/**
+ * Reject and consume a dynamic-import request that the host abandons.
+ *
+ * # Safety
+ * `request` must be a live request accepted by the host dynamic-import
+ * callback and not previously settled.
+ */
+bool stator_dynamic_import_request_dispose(struct StatorDynamicImportRequest *request);
 
 /**
  * Link a compiled module graph by resolving all static import/re-export requests.

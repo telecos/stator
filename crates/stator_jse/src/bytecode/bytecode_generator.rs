@@ -4606,7 +4606,7 @@ impl FunctionCompiler {
         Ok(())
     }
 
-    /// Compile a dynamic `import(source)` call.
+    /// Compile a dynamic `import(source[, options])` call.
     ///
     /// Emits `CallRuntime [RUNTIME_DYNAMIC_IMPORT, args_start, arg_count]`
     /// so the interpreter can resolve the import and return a `Promise`.
@@ -4615,15 +4615,28 @@ impl FunctionCompiler {
         self.compile_expr(&imp.source)?;
         let source_reg = self.allocator.allocate_temporary();
         self.emit_star(source_reg);
+        let options_reg = if let Some(options) = &imp.options {
+            self.compile_expr(options)?;
+            let reg = self.allocator.allocate_temporary();
+            self.emit_star(reg);
+            Some(reg)
+        } else {
+            None
+        };
 
         self.emit(Instruction::new_unchecked(
             Opcode::CallRuntime,
             vec![
                 Operand::RuntimeId(RUNTIME_DYNAMIC_IMPORT),
                 to_reg_op(source_reg),
-                Operand::RegisterCount(1),
+                Operand::RegisterCount(if options_reg.is_some() { 2 } else { 1 }),
             ],
         ));
+        if let Some(reg) = options_reg {
+            self.allocator
+                .release_temporary(reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
         self.allocator
             .release_temporary(source_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -11641,6 +11654,7 @@ mod tests {
         let import_expr = Expr::Import(Box::new(ImportExpr {
             loc: span(),
             source: Box::new(str_expr("./mod.js")),
+            options: None,
         }));
         let prog = make_program(vec![Stmt::Expr(ExprStmt {
             loc: span(),
@@ -11761,6 +11775,7 @@ mod tests {
         let import_expr = Expr::Import(Box::new(ImportExpr {
             loc: span(),
             source: Box::new(str_expr("./mod.json")),
+            options: None,
         }));
         let prog = make_program(vec![Stmt::Expr(ExprStmt {
             loc: span(),

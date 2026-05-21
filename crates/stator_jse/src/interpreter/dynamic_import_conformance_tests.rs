@@ -396,25 +396,29 @@ mod tests {
 
     // ── Host-routed dynamic import and import.meta ─────────────────────────────
 
-    use crate::host::{HostImportMeta, HostModuleLoader, HostScope};
+    use crate::host::{
+        HostDynamicImportRequest, HostImportAttribute, HostImportMeta, HostModuleLoader, HostScope,
+    };
     use std::cell::RefCell;
     use std::rc::Rc as StdRc;
 
     struct RecordingLoader {
-        calls: RefCell<Vec<(String, Option<String>)>>,
+        calls: RefCell<Vec<(String, Option<String>, Vec<HostImportAttribute>)>>,
         result: JsValue,
     }
 
     impl HostModuleLoader for RecordingLoader {
         fn dynamic_import(
             &self,
-            specifier: &str,
-            referrer: Option<&str>,
-        ) -> Result<JsValue, crate::builtins::error::JsError> {
-            self.calls
-                .borrow_mut()
-                .push((specifier.to_string(), referrer.map(str::to_string)));
-            Ok(self.result.clone())
+            request: HostDynamicImportRequest,
+        ) -> Result<(), crate::builtins::error::JsError> {
+            self.calls.borrow_mut().push((
+                request.specifier().to_string(),
+                request.referrer().map(str::to_string),
+                request.attributes().to_vec(),
+            ));
+            request.resolve(self.result.clone());
+            Ok(())
         }
 
         fn resolve(
@@ -422,9 +426,11 @@ mod tests {
             specifier: &str,
             referrer: Option<&str>,
         ) -> Result<String, crate::builtins::error::JsError> {
-            self.calls
-                .borrow_mut()
-                .push((specifier.to_string(), referrer.map(str::to_string)));
+            self.calls.borrow_mut().push((
+                specifier.to_string(),
+                referrer.map(str::to_string),
+                Vec::new(),
+            ));
             Ok(format!("resolved:{specifier}"))
         }
     }
@@ -454,6 +460,63 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "./dep.js");
         assert_eq!(calls[0].1.as_deref(), Some("https://example/m.js"));
+        assert!(calls[0].2.is_empty());
+    }
+
+    #[test]
+    fn e2e_dynamic_import_can_settle_asynchronously_and_propagates_attributes() {
+        use crate::builtins::promise::PromiseState;
+
+        struct DeferredLoader {
+            requests: RefCell<Vec<HostDynamicImportRequest>>,
+        }
+
+        impl HostModuleLoader for DeferredLoader {
+            fn dynamic_import(
+                &self,
+                request: HostDynamicImportRequest,
+            ) -> Result<(), crate::builtins::error::JsError> {
+                self.requests.borrow_mut().push(request);
+                Ok(())
+            }
+
+            fn resolve(
+                &self,
+                _specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<String, crate::builtins::error::JsError> {
+                unreachable!()
+            }
+        }
+
+        let loader = StdRc::new(DeferredLoader {
+            requests: RefCell::new(Vec::new()),
+        });
+        let _scope = HostScope::install(
+            Some(loader.clone() as StdRc<dyn HostModuleLoader>),
+            Some("https://example/referrer.js"),
+        );
+
+        let result = global_eval("import('./data.json', { with: { type: 'json' } })").unwrap();
+        let JsValue::Promise(promise) = result else {
+            panic!("expected promise");
+        };
+        assert!(matches!(promise.state(), PromiseState::Pending));
+        let request = loader.requests.borrow()[0].clone();
+        assert_eq!(request.specifier(), "./data.json");
+        assert_eq!(request.referrer(), Some("https://example/referrer.js"));
+        assert_eq!(
+            request.attributes(),
+            &[HostImportAttribute {
+                key: "type".to_string(),
+                value: "json".to_string(),
+            }]
+        );
+        request.resolve(JsValue::Smi(7));
+        assert!(matches!(
+            promise.state(),
+            PromiseState::Fulfilled(JsValue::Smi(7))
+        ));
     }
 
     #[test]
@@ -463,11 +526,7 @@ mod tests {
 
         struct RejectingLoader;
         impl HostModuleLoader for RejectingLoader {
-            fn dynamic_import(
-                &self,
-                _specifier: &str,
-                _referrer: Option<&str>,
-            ) -> Result<JsValue, JsError> {
+            fn dynamic_import(&self, _request: HostDynamicImportRequest) -> Result<(), JsError> {
                 Err(JsError::new(ErrorKind::TypeError, "nope".into()))
             }
             fn resolve(
@@ -550,10 +609,10 @@ mod tests {
         impl HostModuleLoader for MetaLoader {
             fn dynamic_import(
                 &self,
-                _specifier: &str,
-                _referrer: Option<&str>,
-            ) -> Result<JsValue, crate::builtins::error::JsError> {
-                Ok(JsValue::Undefined)
+                request: HostDynamicImportRequest,
+            ) -> Result<(), crate::builtins::error::JsError> {
+                request.resolve(JsValue::Undefined);
+                Ok(())
             }
 
             fn resolve(

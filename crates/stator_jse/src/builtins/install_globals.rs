@@ -43273,8 +43273,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_import_rejects_second_argument_script() {
-        assert_dynamic_import_syntax_error("import('module', {})");
+    fn test_dynamic_import_accepts_options_argument_script() {
+        let result = global_eval("import('module', {})");
+        assert!(
+            result.is_ok(),
+            "dynamic import options argument should parse: {result:?}"
+        );
     }
 
     #[test]

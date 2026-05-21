@@ -2254,7 +2254,13 @@ impl<'src> Parser<'src> {
             }
             Expr::Spread(spread) => Self::expr_contains_yield(&spread.argument),
             Expr::Await(await_expr) => Self::expr_contains_yield(&await_expr.argument),
-            Expr::Import(import_expr) => Self::expr_contains_yield(&import_expr.source),
+            Expr::Import(import_expr) => {
+                Self::expr_contains_yield(&import_expr.source)
+                    || import_expr
+                        .options
+                        .as_deref()
+                        .is_some_and(Self::expr_contains_yield)
+            }
             Expr::Template(template) => template.expressions.iter().any(Self::expr_contains_yield),
             Expr::Null(_)
             | Expr::Bool(_)
@@ -4262,16 +4268,29 @@ impl<'src> Parser<'src> {
                         ));
                     }
                     let source = self.parse_assignment_expr()?;
-                    if self.eat(TokenKind::Comma)? {
-                        return Err(Self::error_at(
-                            self.current_span(),
-                            "import() requires exactly one argument",
-                        ));
-                    }
+                    let options = if self.eat(TokenKind::Comma)? {
+                        if self.peek_kind() == TokenKind::RightParen {
+                            return Err(Self::error_at(
+                                self.current_span(),
+                                "import() requires an options argument after ','",
+                            ));
+                        }
+                        let options = self.parse_assignment_expr()?;
+                        if self.eat(TokenKind::Comma)? {
+                            return Err(Self::error_at(
+                                self.current_span(),
+                                "import() accepts at most two arguments",
+                            ));
+                        }
+                        Some(Box::new(options))
+                    } else {
+                        None
+                    };
                     let end = self.expect(TokenKind::RightParen)?;
                     Ok(Expr::Import(Box::new(ImportExpr {
                         loc: Self::merge_spans(import_tok.span, end.span),
                         source: Box::new(source),
+                        options,
                     })))
                 } else {
                     Err(Self::error_at(
@@ -8373,13 +8392,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dynamic_import_rejects_second_argument() {
-        let err = parse("import('./mod.json', { with: { type: 'json' } })").unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("import() requires exactly one argument"),
-            "unexpected error: {msg}"
-        );
+    fn test_parse_dynamic_import_accepts_options_argument() {
+        let prog = parse("import('./mod.json', { with: { type: 'json' } })").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Import(imp) = expr.as_ref() {
+                assert!(matches!(imp.source.as_ref(), Expr::Str(_)));
+                assert!(imp.options.is_some());
+            } else {
+                panic!("expected import expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
     }
 
     #[test]
@@ -8387,7 +8411,7 @@ mod tests {
         let err = parse("import('./mod.js',)").unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("import() requires exactly one argument"),
+            msg.contains("import() requires an options argument after ','"),
             "unexpected error: {msg}"
         );
     }

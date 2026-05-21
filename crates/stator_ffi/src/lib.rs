@@ -36,7 +36,7 @@ use stator_jse::dom::{
     NamedPropertyHandlerFlags,
 };
 use stator_jse::gc::heap::Heap;
-use stator_jse::host::{HostImportMeta, HostModuleLoader};
+use stator_jse::host::{HostDynamicImportRequest, HostImportMeta, HostModuleLoader};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
 };
@@ -966,6 +966,9 @@ pub struct StatorContext {
     /// Optional host callback used to populate `import.meta` before a module
     /// body can observe it. Failures fail closed with no default fallback.
     import_meta_populator: Option<StatorImportMetaPopulator>,
+    /// Optional host callback used to start dynamic `import()` work. The host
+    /// later settles the request with a module namespace or structured error.
+    dynamic_import_resolver: Option<StatorDynamicImportResolver>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -1000,6 +1003,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         module_resolver: None,
         module_url_resolver: None,
         import_meta_populator: None,
+        dynamic_import_resolver: None,
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -1353,6 +1357,57 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
     // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
     // duration of this FFI call. Assignment drops the previous populator, if any.
     unsafe { (*ctx).import_meta_populator = populator };
+    true
+}
+
+/// Register, replace, or clear the async dynamic `import()` callback for `ctx`.
+///
+/// When installed, module-evaluation dynamic `import()` calls invoke this
+/// callback after the URL resolver has canonicalised the specifier. The callback
+/// receives a [`StatorDynamicImportRequest`] handle and must return
+/// [`StatorResolveStatus::StatorResolveStatusOk`] or
+/// [`StatorResolveStatus::StatorResolveStatusPending`] after it has accepted
+/// ownership of the request. It must later call either
+/// [`stator_dynamic_import_request_resolve_module`] or
+/// [`stator_dynamic_import_request_reject`]. Non-success statuses reject the
+/// JavaScript promise immediately and Stator consumes the request.
+///
+/// Returns `true` on successful registration or clear, and `false` for a null
+/// context or malformed clear request.
+///
+/// # Safety
+/// The callback and `user_data` lifetime rules match
+/// [`stator_context_set_module_resolver`]. The callback must not settle or free
+/// the request before returning; request settlement is a later host action on
+/// the same serialized context/module thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_set_dynamic_import_resolver(
+    ctx: *mut StatorContext,
+    callback: Option<StatorDynamicImportCallback>,
+    user_data: *mut c_void,
+    free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+
+    let resolver = match callback {
+        Some(callback) => Some(StatorDynamicImportResolver {
+            callback,
+            user_data,
+            free_user_data,
+        }),
+        None => {
+            if !user_data.is_null() || free_user_data.is_some() {
+                return false;
+            }
+            None
+        }
+    };
+
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
+    // duration of this FFI call. Assignment drops the previous resolver, if any.
+    unsafe { (*ctx).dynamic_import_resolver = resolver };
     true
 }
 
@@ -3310,7 +3365,7 @@ pub enum StatorResolveStatus {
     StatorResolveStatusNetworkError = 2,
     /// Resolution failed due to invalid specifier/attribute usage.
     StatorResolveStatusTypeError = 3,
-    /// Resolution will complete asynchronously in a future API slice.
+    /// Dynamic import was accepted and will settle asynchronously.
     StatorResolveStatusPending = 4,
 }
 
@@ -3410,6 +3465,38 @@ pub type StatorModuleUrlResolverCallback = unsafe extern "C" fn(
     attributes: *const StatorImportAttribute,
     attributes_len: usize,
     out_resolved_url: *mut *mut StatorString,
+    out_error: *mut *mut StatorString,
+) -> StatorResolveStatus;
+
+/// Opaque host-owned dynamic `import()` request.
+///
+/// A request is created by Stator when JavaScript evaluates `import()`.
+/// Ownership transfers to the host only when the dynamic-import callback returns
+/// `StatorResolveStatusOk` or `StatorResolveStatusPending`. The host must
+/// consume it exactly once with a resolve/reject/dispose API.
+pub struct StatorDynamicImportRequest {
+    inner: HostDynamicImportRequest,
+    ctx: *mut StatorContext,
+    specifier: String,
+}
+
+/// Host callback used to start async dynamic `import()` work.
+///
+/// The callback receives the canonical specifier (after URL resolution, when a
+/// URL resolver is installed), the referrer module/origin, import attributes,
+/// and a request handle to retain for later settlement. Returning a non-success
+/// status rejects the promise immediately; returning `Ok` or `Pending` transfers
+/// request ownership to the host.
+pub type StatorDynamicImportCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    user_data: *mut c_void,
+    request: *mut StatorDynamicImportRequest,
+    referrer: *const StatorModule,
+    origin: *const StatorModuleOrigin,
+    specifier: *const c_char,
+    specifier_len: usize,
+    attributes: *const StatorImportAttribute,
+    attributes_len: usize,
     out_error: *mut *mut StatorString,
 ) -> StatorResolveStatus;
 
@@ -3519,6 +3606,24 @@ impl Drop for StatorImportMetaPopulator {
         {
             // SAFETY: the embedder supplied this callback for exactly this
             // populator-owned `user_data` pointer.
+            unsafe { free_user_data(self.user_data) };
+        }
+    }
+}
+
+struct StatorDynamicImportResolver {
+    callback: StatorDynamicImportCallback,
+    user_data: *mut c_void,
+    free_user_data: Option<StatorUserDataFreeCallback>,
+}
+
+impl Drop for StatorDynamicImportResolver {
+    fn drop(&mut self) {
+        if let Some(free_user_data) = self.free_user_data
+            && !self.user_data.is_null()
+        {
+            // SAFETY: the embedder supplied this callback for exactly this
+            // resolver-owned `user_data` pointer.
             unsafe { free_user_data(self.user_data) };
         }
     }
@@ -7526,6 +7631,126 @@ unsafe fn resolve_module_url(
     }
 }
 
+/// Resolve and consume a dynamic-import request with a compiled module.
+///
+/// Stator instantiates and evaluates `module` using the request's original
+/// context, then fulfils the JavaScript promise with the module namespace object
+/// placeholder used by the current module runtime. On failure the promise is
+/// rejected with the structured module error and the request is still consumed.
+///
+/// # Safety
+/// - `request` must be a live request accepted by the host dynamic-import
+///   callback and not previously settled.
+/// - `module` must be null or a live compiled module pointer. Null rejects with
+///   `StatorResolveStatusNotFound`.
+/// - Must be called on the same serialized context/module thread as the
+///   callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dynamic_import_request_resolve_module(
+    request: *mut StatorDynamicImportRequest,
+    module: *mut StatorModule,
+) -> StatorResolveStatus {
+    if request.is_null() {
+        return StatorResolveStatus::StatorResolveStatusTypeError;
+    }
+    // SAFETY: caller transfers a live, unsettled request pointer.
+    let request = unsafe { Box::from_raw(request) };
+    if module.is_null() {
+        request
+            .inner
+            .reject(js_error_from_stator_error(resolver_status_error(
+                StatorResolveStatus::StatorResolveStatusNotFound,
+                &request.specifier,
+                None,
+            )));
+        return StatorResolveStatus::StatorResolveStatusNotFound;
+    }
+
+    let mut visiting = HashSet::new();
+    // SAFETY: caller guarantees `module` is live; request stores the active ctx.
+    if let Err(error) = unsafe { instantiate_module_graph(request.ctx, module, &mut visiting) } {
+        request.inner.reject(js_error_from_stator_error(error));
+        return StatorResolveStatus::StatorResolveStatusTypeError;
+    }
+
+    // SAFETY: caller guarantees `module` is live for this settlement.
+    let result = unsafe { stator_module_evaluate(module, request.ctx) };
+    if result.is_null() {
+        // SAFETY: `module` is live for the duration of this call.
+        let error = unsafe { module_stored_error(&*module) };
+        request.inner.reject(js_error_from_stator_error(error));
+        return StatorResolveStatus::StatorResolveStatusTypeError;
+    }
+    // SAFETY: `stator_module_evaluate` returned a value owned by us.
+    unsafe { stator_value_destroy(result) };
+    request
+        .inner
+        .resolve(JsValue::PlainObject(Rc::new(RefCell::new(
+            PropertyMap::new(),
+        ))));
+    StatorResolveStatus::StatorResolveStatusOk
+}
+
+/// Reject and consume a dynamic-import request with a structured host error.
+///
+/// `detail`, when non-null, must be a [`StatorString`] allocated by
+/// [`stator_string_new`]; ownership transfers to Stator.
+///
+/// # Safety
+/// `request` must be a live request accepted by the host dynamic-import
+/// callback and not previously settled. Must be called on the same serialized
+/// context/module thread as the callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dynamic_import_request_reject(
+    request: *mut StatorDynamicImportRequest,
+    status: StatorResolveStatus,
+    detail: *mut StatorString,
+) -> bool {
+    if request.is_null() {
+        return false;
+    }
+    // SAFETY: caller transfers ownership of any non-null detail string.
+    let detail = unsafe { take_resolver_error_string(detail) };
+    // SAFETY: caller transfers a live, unsettled request pointer.
+    let request = unsafe { Box::from_raw(request) };
+    let status = if status == StatorResolveStatus::StatorResolveStatusOk
+        || status == StatorResolveStatus::StatorResolveStatusPending
+    {
+        StatorResolveStatus::StatorResolveStatusTypeError
+    } else {
+        status
+    };
+    request
+        .inner
+        .reject(js_error_from_stator_error(resolver_status_error(
+            status,
+            &request.specifier,
+            detail.as_deref(),
+        )));
+    true
+}
+
+/// Reject and consume a dynamic-import request that the host abandons.
+///
+/// # Safety
+/// `request` must be a live request accepted by the host dynamic-import
+/// callback and not previously settled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dynamic_import_request_dispose(
+    request: *mut StatorDynamicImportRequest,
+) -> bool {
+    if request.is_null() {
+        return false;
+    }
+    // SAFETY: caller transfers a live, unsettled request pointer.
+    let request = unsafe { Box::from_raw(request) };
+    request.inner.reject(JsError::new(
+        ErrorKind::TypeError,
+        "dynamic import request was disposed before settlement".to_string(),
+    ));
+    true
+}
+
 struct FfiHostModuleLoader {
     ctx: *mut StatorContext,
     referrer: *mut StatorModule,
@@ -7618,54 +7843,115 @@ impl FfiHostModuleLoader {
 }
 
 impl HostModuleLoader for FfiHostModuleLoader {
-    fn dynamic_import(&self, specifier: &str, _referrer: Option<&str>) -> Result<JsValue, JsError> {
-        let module_specifier = if !self.ctx.is_null() && !self.referrer.is_null() {
-            // SAFETY: `referrer` is the live module currently being evaluated.
-            let origin = unsafe { module_origin_view(&*self.referrer) };
-            match unsafe {
-                resolve_module_url(
-                    self.ctx,
-                    self.referrer,
-                    &origin,
-                    specifier.as_bytes(),
-                    std::ptr::null(),
-                    0,
-                )
-            } {
-                Ok(Some(resolved_url)) => String::from_utf8(resolved_url).map_err(|_| {
-                    JsError::new(
-                        ErrorKind::TypeError,
-                        "module URL resolver returned non-UTF-8 URL".to_string(),
-                    )
-                })?,
-                Ok(None) => specifier.to_string(),
-                Err(error) => return Err(js_error_from_stator_error(error)),
-            }
-        } else {
-            specifier.to_string()
-        };
-        let module = self
-            .resolve_module(&module_specifier)
-            .map_err(|error| *error)?;
-        let mut visiting = HashSet::new();
-        // SAFETY: the resolver returned a live module pointer by contract.
-        if let Err(error) = unsafe { instantiate_module_graph(self.ctx, module, &mut visiting) } {
-            return Err(js_error_from_stator_error(error));
+    fn dynamic_import(&self, request: HostDynamicImportRequest) -> Result<(), JsError> {
+        if self.ctx.is_null() || self.referrer.is_null() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "dynamic import callback is not installed".to_string(),
+            ));
         }
 
-        // SAFETY: the resolver returned a live module pointer by contract.
-        let result = unsafe { stator_module_evaluate(module, self.ctx) };
-        if result.is_null() {
-            // SAFETY: `module` is live for the duration of this synchronous
-            // dynamic import.
-            let error = unsafe { module_stored_error(&*module) };
-            return Err(js_error_from_stator_error(error));
+        // SAFETY: `ctx` is valid for the active module evaluation and access is
+        // serialized by the FFI contract.
+        let (callback, user_data) = match unsafe { (*self.ctx).dynamic_import_resolver.as_ref() } {
+            Some(resolver) => (resolver.callback, resolver.user_data),
+            None => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "dynamic import callback is not installed".to_string(),
+                ));
+            }
+        };
+
+        let owned_attrs: Vec<(Vec<u8>, Vec<u8>)> = request
+            .attributes()
+            .iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_bytes().to_vec(),
+                    attribute.value.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let c_attrs: Vec<StatorImportAttribute> = owned_attrs
+            .iter()
+            .map(|(key, value)| StatorImportAttribute {
+                key: key.as_ptr() as *const c_char,
+                key_len: key.len(),
+                value: value.as_ptr() as *const c_char,
+                value_len: value.len(),
+            })
+            .collect();
+        let attrs_ptr = if c_attrs.is_empty() {
+            std::ptr::null()
+        } else {
+            c_attrs.as_ptr()
+        };
+
+        // SAFETY: `referrer` is the live module currently being evaluated.
+        let origin = unsafe { module_origin_view(&*self.referrer) };
+        let specifier = match unsafe {
+            resolve_module_url(
+                self.ctx,
+                self.referrer,
+                &origin,
+                request.specifier().as_bytes(),
+                attrs_ptr,
+                c_attrs.len(),
+            )
+        } {
+            Ok(Some(resolved_url)) => String::from_utf8(resolved_url).map_err(|_| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    "module URL resolver returned non-UTF-8 URL".to_string(),
+                )
+            })?,
+            Ok(None) => request.specifier().to_string(),
+            Err(error) => return Err(js_error_from_stator_error(error)),
+        };
+
+        let ffi_request = Box::into_raw(Box::new(StatorDynamicImportRequest {
+            inner: request,
+            ctx: self.ctx,
+            specifier: specifier.clone(),
+        }));
+        let mut out_error: *mut StatorString = std::ptr::null_mut();
+        // SAFETY: callback registration guarantees the callback remains
+        // callable while installed. Borrowed origin/specifier/attributes are
+        // valid for this synchronous start call. On success, request ownership
+        // transfers to the host; on failure we reclaim it below.
+        let status = unsafe {
+            callback(
+                self.ctx,
+                user_data,
+                ffi_request,
+                self.referrer,
+                &origin,
+                specifier.as_ptr() as *const c_char,
+                specifier.len(),
+                attrs_ptr,
+                c_attrs.len(),
+                &mut out_error,
+            )
+        };
+        // SAFETY: callbacks transfer any non-null detail string to us.
+        let detail = unsafe { take_resolver_error_string(out_error) };
+        match status {
+            StatorResolveStatus::StatorResolveStatusOk
+            | StatorResolveStatus::StatorResolveStatusPending => Ok(()),
+            failure => {
+                // SAFETY: callback did not accept ownership on failure.
+                let request = unsafe { Box::from_raw(ffi_request) };
+                request
+                    .inner
+                    .reject(js_error_from_stator_error(resolver_status_error(
+                        failure,
+                        &specifier,
+                        detail.as_deref(),
+                    )));
+                Ok(())
+            }
         }
-        // SAFETY: `stator_module_evaluate` returned a value owned by us.
-        unsafe { stator_value_destroy(result) };
-        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
-            PropertyMap::new(),
-        ))))
     }
 
     fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {
@@ -9164,6 +9450,7 @@ unsafe fn run_module_bytecodes(
             (*ctx).module_resolver.is_some()
                 || (*ctx).module_url_resolver.is_some()
                 || (*ctx).import_meta_populator.is_some()
+                || (*ctx).dynamic_import_resolver.is_some()
         };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
@@ -9672,6 +9959,7 @@ where
             (*ctx).module_resolver.is_some()
                 || (*ctx).module_url_resolver.is_some()
                 || (*ctx).import_meta_populator.is_some()
+                || (*ctx).dynamic_import_resolver.is_some()
         };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
@@ -20449,16 +20737,16 @@ mod tests {
         calls: Vec<String>,
     }
 
-    unsafe extern "C" fn test_detail_resolver_cb(
+    unsafe extern "C" fn test_dynamic_import_detail_cb(
         _ctx: *mut StatorContext,
         user_data: *mut c_void,
+        request: *mut StatorDynamicImportRequest,
         _referrer: *const StatorModule,
         _origin: *const StatorModuleOrigin,
         specifier: *const c_char,
         specifier_len: usize,
         _attributes: *const StatorImportAttribute,
         attributes_len: usize,
-        out_module: *mut *mut StatorModule,
         out_error: *mut *mut StatorString,
     ) -> StatorResolveStatus {
         assert_eq!(attributes_len, 0);
@@ -20469,10 +20757,6 @@ mod tests {
             unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
         data.calls
             .push(std::str::from_utf8(specifier_bytes).unwrap().to_string());
-        if !out_module.is_null() {
-            // SAFETY: out pointer is valid for one write in this test.
-            unsafe { *out_module = std::ptr::null_mut() };
-        }
         if !out_error.is_null() {
             let detail = data.detail.as_bytes();
             // SAFETY: detail bytes are valid for the duration of this call and
@@ -20481,6 +20765,7 @@ mod tests {
                 *out_error = stator_string_new(detail.as_ptr() as *const c_char, detail.len());
             }
         }
+        assert!(!request.is_null());
         data.status
     }
 
@@ -20956,7 +21241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_module_evaluate_dynamic_import_uses_ffi_resolver_error_detail() {
+    fn test_module_evaluate_dynamic_import_callback_rejects_with_error_detail() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
@@ -20968,9 +21253,9 @@ mod tests {
         };
         // SAFETY: callback and user data remain live for this test.
         assert!(unsafe {
-            stator_context_set_module_resolver(
+            stator_context_set_dynamic_import_resolver(
                 ctx,
-                Some(test_detail_resolver_cb),
+                Some(test_dynamic_import_detail_cb),
                 &mut data as *mut TestDetailResolverData as *mut c_void,
                 None,
             )
@@ -21020,6 +21305,12 @@ mod tests {
                 &mut data as *mut TestUrlResolverData as *mut c_void,
                 None,
             ));
+            assert!(stator_context_set_dynamic_import_resolver(
+                ctx,
+                Some(test_dynamic_import_canonical_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
             let result = stator_module_evaluate(root, ctx);
             assert!(result.is_null());
             let err = CStr::from_ptr(stator_module_get_error(root))
@@ -21033,6 +21324,93 @@ mod tests {
 
         assert_eq!(data.url_calls, 1);
         assert_eq!(data.module_calls, 0);
+        assert!(data.dynamic_calls.is_empty());
+    }
+
+    #[test]
+    fn test_module_evaluate_dynamic_import_async_callback_gets_url_and_attributes() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import('./dep.js', { with: { type: 'json' } });");
+        let dep = compile_module_src("export const value = 1;");
+        let dep_url = "https://example.test/app/dep.js";
+        let mut data = fresh_url_resolver_data(dep_url, dep);
+
+        // SAFETY: callbacks and user data live for this test scope.
+        unsafe {
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_dynamic_import_resolver(
+                ctx,
+                Some(test_dynamic_import_canonical_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 1);
+        assert_eq!(data.module_calls, 0);
+        assert_eq!(
+            data.dynamic_calls,
+            vec![(
+                dep_url.to_string(),
+                vec![("type".to_string(), "json".to_string())]
+            )]
+        );
+        assert!(!data.captured_referrer_was_null);
+    }
+
+    #[test]
+    fn test_module_evaluate_dynamic_import_without_callback_does_not_fallback() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import('./dep.js');");
+        let dep = compile_module_src("export const value = 1;");
+        let mut data = fresh_url_resolver_data("https://example.test/app/dep.js", dep);
+
+        // SAFETY: callbacks and user data live for this test scope.
+        unsafe {
+            assert!(stator_context_set_module_url_resolver(
+                ctx,
+                Some(test_module_url_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            assert!(stator_context_set_module_resolver(
+                ctx,
+                Some(test_canonical_module_resolver_cb),
+                &mut data as *mut TestUrlResolverData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(root, ctx);
+            assert!(result.is_null());
+            let err = CStr::from_ptr(stator_module_get_error(root))
+                .to_str()
+                .unwrap();
+            assert!(
+                err.contains("dynamic import callback is not installed"),
+                "{err}"
+            );
+            stator_module_free(root);
+            stator_module_free(dep);
+            stator_context_destroy(ctx);
+        }
+
+        assert_eq!(data.url_calls, 0);
+        assert_eq!(data.module_calls, 0);
+        assert!(data.dynamic_calls.is_empty());
     }
 
     #[test]
@@ -27091,6 +27469,7 @@ mod tests {
         detail: Option<Vec<u8>>,
         url_calls: usize,
         module_calls: usize,
+        dynamic_calls: Vec<(String, Vec<(String, String)>)>,
         captured_base_url: Option<Vec<u8>>,
         captured_referrer_was_null: bool,
     }
@@ -27201,6 +27580,43 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn test_dynamic_import_canonical_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        request: *mut StatorDynamicImportRequest,
+        _referrer: *const StatorModule,
+        _origin: *const StatorModuleOrigin,
+        specifier: *const c_char,
+        specifier_len: usize,
+        attributes: *const StatorImportAttribute,
+        attributes_len: usize,
+        _out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid resolver data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestUrlResolverData) };
+        // SAFETY: callback contract supplies a valid specifier byte slice.
+        let specifier_bytes =
+            unsafe { std::slice::from_raw_parts(specifier as *const u8, specifier_len) };
+        let specifier = std::str::from_utf8(specifier_bytes).unwrap().to_string();
+        let attrs = if attributes_len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: callback contract supplies `attributes_len` valid entries.
+            unsafe { std::slice::from_raw_parts(attributes, attributes_len) }
+                .iter()
+                .map(|attribute| unsafe { import_attribute_pair(attribute) })
+                .collect()
+        };
+        data.dynamic_calls.push((specifier.clone(), attrs));
+        let module = data
+            .modules
+            .get(&specifier)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        // SAFETY: request is the live handle supplied to this callback.
+        unsafe { stator_dynamic_import_request_resolve_module(request, module) }
+    }
+
     fn fresh_url_resolver_data(dep_url: &str, dep: *mut StatorModule) -> TestUrlResolverData {
         let mut urls = HashMap::new();
         urls.insert("./dep.js".to_string(), dep_url.as_bytes().to_vec());
@@ -27213,6 +27629,7 @@ mod tests {
             detail: None,
             url_calls: 0,
             module_calls: 0,
+            dynamic_calls: Vec::new(),
             captured_base_url: None,
             captured_referrer_was_null: true,
         }
