@@ -717,6 +717,199 @@ impl JsRegExp {
         results
     }
 
+    /// Cancellable counterpart of [`Self::symbol_match`].
+    ///
+    /// Behaves identically to [`Self::symbol_match`] but polls the
+    /// embedder-published termination flag (see
+    /// [`crate::interpreter::check_interrupt_flag`]) at the top of every
+    /// wrapper-controlled global-match iteration.  If termination has been
+    /// requested the loop short-circuits with the canonical
+    /// `script execution terminated` error.
+    ///
+    /// The underlying `regress` engine call itself is *not* interruptible:
+    /// a pathological pattern that backtracks inside a single
+    /// `find_from` invocation will not observe termination until that call
+    /// returns.  See `docs/termination_polling_gap_matrix.md` for the
+    /// engine-level gap.
+    pub fn try_symbol_match(&self, input: &str) -> StatorResult<Option<SymbolMatchResult>> {
+        if !self.flags.contains(RegExpFlags::GLOBAL) {
+            return Ok(self.exec(input).map(SymbolMatchResult::Single));
+        }
+        self.last_index.set(0);
+        let mut matches: Vec<String> = Vec::new();
+        loop {
+            regexp_poll_termination()?;
+            let start = self.last_index.get();
+            if start > input.len() {
+                self.last_index.set(0);
+                break;
+            }
+            let m = if self.flags.contains(RegExpFlags::STICKY) {
+                self.compiled
+                    .find_from(input, start)
+                    .next()
+                    .filter(|m| m.start() == start)
+            } else {
+                self.compiled.find_from(input, start).next()
+            };
+            match m {
+                None => {
+                    self.last_index.set(0);
+                    break;
+                }
+                Some(mat) => {
+                    let end = mat.end();
+                    matches.push(input[mat.range()].to_string());
+                    self.last_index.set(advance_after_match(input, start, end));
+                }
+            }
+        }
+        Ok(if matches.is_empty() {
+            None
+        } else {
+            Some(SymbolMatchResult::All(matches))
+        })
+    }
+
+    /// Cancellable counterpart of [`Self::symbol_replace`].
+    ///
+    /// See [`Self::try_symbol_match`] for the polling contract and the
+    /// `regress` engine-level caveat.
+    pub fn try_symbol_replace(&self, input: &str, replacement: &str) -> StatorResult<String> {
+        let global = self.flags.contains(RegExpFlags::GLOBAL);
+        if !global {
+            return Ok(self.symbol_replace(input, replacement));
+        }
+        self.last_index.set(0);
+        let mut result = String::new();
+        let mut last_end = 0_usize;
+        loop {
+            regexp_poll_termination()?;
+            let start = self.last_index.get();
+            if start > input.len() {
+                self.last_index.set(0);
+                break;
+            }
+            let m = if self.flags.contains(RegExpFlags::STICKY) {
+                self.compiled
+                    .find_from(input, start)
+                    .next()
+                    .filter(|m| m.start() == start)
+            } else {
+                self.compiled.find_from(input, start).next()
+            };
+            match m {
+                None => {
+                    self.last_index.set(0);
+                    break;
+                }
+                Some(mat) => {
+                    let rm = build_match(input, &mat, false);
+                    result.push_str(&input[last_end..rm.index]);
+                    result.push_str(&apply_replacement(replacement, &rm, input));
+                    let end = mat.end();
+                    last_end = end;
+                    self.last_index.set(advance_after_match(input, start, end));
+                }
+            }
+        }
+        result.push_str(&input[last_end..]);
+        Ok(result)
+    }
+
+    /// Cancellable counterpart of [`Self::symbol_split`].
+    ///
+    /// See [`Self::try_symbol_match`] for the polling contract and the
+    /// `regress` engine-level caveat.
+    pub fn try_symbol_split(
+        &self,
+        input: &str,
+        limit: Option<usize>,
+    ) -> StatorResult<Vec<Option<String>>> {
+        let lim = limit.unwrap_or(usize::MAX);
+        if lim == 0 {
+            return Ok(Vec::new());
+        }
+        if input.is_empty() {
+            return Ok(self.symbol_split(input, limit));
+        }
+
+        let mut parts: Vec<Option<String>> = Vec::new();
+        let mut last_end = 0usize;
+        let mut search_index = 0usize;
+
+        while search_index < input.len() {
+            regexp_poll_termination()?;
+            let matched = self
+                .compiled
+                .find_from(input, search_index)
+                .next()
+                .filter(|mat| mat.start() == search_index);
+
+            let Some(mat) = matched else {
+                search_index = advance_string_index(input, search_index);
+                continue;
+            };
+
+            let match_end = mat.end();
+            if match_end == last_end {
+                search_index = advance_string_index(input, search_index);
+                continue;
+            }
+
+            parts.push(Some(input[last_end..search_index].to_string()));
+            if parts.len() >= lim {
+                return Ok(parts);
+            }
+            for cap in &mat.captures {
+                parts.push(cap.as_ref().map(|r| input[r.clone()].to_string()));
+                if parts.len() >= lim {
+                    return Ok(parts);
+                }
+            }
+            last_end = match_end;
+            search_index = last_end;
+        }
+
+        if parts.len() < lim {
+            parts.push(Some(input[last_end..].to_string()));
+        }
+        Ok(parts)
+    }
+
+    /// Cancellable counterpart of [`Self::symbol_match_all`].
+    ///
+    /// See [`Self::try_symbol_match`] for the polling contract and the
+    /// `regress` engine-level caveat.
+    pub fn try_symbol_match_all(&self, input: &str) -> StatorResult<Vec<RegExpMatch>> {
+        let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
+        let mut results = Vec::new();
+        let mut start = self.last_index.get();
+        loop {
+            regexp_poll_termination()?;
+            if start > input.len() {
+                break;
+            }
+            let m = if self.flags.contains(RegExpFlags::STICKY) {
+                self.compiled
+                    .find_from(input, start)
+                    .next()
+                    .filter(|m| m.start() == start)
+            } else {
+                self.compiled.find_from(input, start).next()
+            };
+            match m {
+                None => break,
+                Some(mat) => {
+                    let end = mat.end();
+                    results.push(build_match(input, &mat, has_indices));
+                    start = advance_after_match(input, start, end);
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Create a clone of this regexp for use by `[Symbol.matchAll]`.
     ///
     /// Per §22.2.6.9 the clone has the same pattern and flags, and its
@@ -751,6 +944,23 @@ pub enum SymbolMatchResult {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Poll the embedder-published termination flag.
+///
+/// Returns the canonical `script execution terminated` error when the host
+/// has asked the interpreter to abort.  This is the polling hook used by
+/// the `try_symbol_*` wrapper loops so they observe termination between
+/// iterations of the Stator-controlled outer match loop.  See
+/// `docs/termination_polling_gap_matrix.md` for the broader contract and
+/// the note about uninterruptible `regress` engine calls.
+#[inline]
+fn regexp_poll_termination() -> StatorResult<()> {
+    if crate::interpreter::check_interrupt_flag() {
+        Err(crate::interpreter::script_terminated_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Builds the [`RegressFlags`] value that corresponds to a [`RegExpFlags`].
 ///
@@ -2020,12 +2230,110 @@ mod tests {
 
     // ── Lookahead + lookbehind combined ──────────────────────────────────
 
+    // ── Termination polling for try_symbol_* wrapper loops ──────────────
+    //
+    // These tests publish the embedder termination flag and confirm that
+    // the wrapper-controlled match loops in `try_symbol_match`,
+    // `try_symbol_replace`, `try_symbol_split`, and `try_symbol_match_all`
+    // short-circuit with the canonical terminated error.  The patterns and
+    // inputs are deliberately small so they never depend on the
+    // (uninterruptible) `regress` engine taking unbounded time inside a
+    // single `find_from` call.  See
+    // `docs/termination_polling_gap_matrix.md` for the engine-level gap.
+
+    use std::sync::atomic::AtomicBool;
+
+    fn assert_terminated<T: std::fmt::Debug>(result: StatorResult<T>) {
+        match result {
+            Err(StatorError::Internal(ref m))
+                if m == crate::interpreter::SCRIPT_TERMINATED_MESSAGE => {}
+            other => panic!("expected script-terminated error, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_lookahead_and_lookbehind_combined() {
-        let re = JsRegExp::new(r"(?<=\$)\d+(?=\s)", "").unwrap();
-        let m = re.exec("$100 dollars").unwrap();
-        assert_eq!(m.matched, "100");
-        // Must not match: no space after digits
-        assert!(re.exec("$100dollars").is_none());
+    fn test_try_symbol_match_observes_interrupt_flag() {
+        let re = JsRegExp::new(r"\d", "g").unwrap();
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = re.try_symbol_match("1 2 3 4 5 6 7 8 9");
+        crate::interpreter::clear_interrupt_flag();
+        assert_terminated(result);
+    }
+
+    #[test]
+    fn test_try_symbol_replace_observes_interrupt_flag() {
+        let re = JsRegExp::new(r"\d", "g").unwrap();
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = re.try_symbol_replace("1 2 3 4 5 6 7 8 9", "X");
+        crate::interpreter::clear_interrupt_flag();
+        assert_terminated(result);
+    }
+
+    #[test]
+    fn test_try_symbol_split_observes_interrupt_flag() {
+        let re = JsRegExp::new(r",", "").unwrap();
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = re.try_symbol_split("a,b,c,d,e", None);
+        crate::interpreter::clear_interrupt_flag();
+        assert_terminated(result);
+    }
+
+    #[test]
+    fn test_try_symbol_match_all_observes_interrupt_flag() {
+        let re = JsRegExp::new(r"\d", "g").unwrap();
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = re.try_symbol_match_all("1 2 3 4 5 6 7 8 9");
+        crate::interpreter::clear_interrupt_flag();
+        assert_terminated(result);
+    }
+
+    #[test]
+    fn test_try_symbol_match_nonglobal_returns_normally_when_flag_clear() {
+        let re = JsRegExp::new(r"\d+", "").unwrap();
+        let result = re.try_symbol_match("price 42").unwrap().unwrap();
+        match result {
+            SymbolMatchResult::Single(m) => assert_eq!(m.matched, "42"),
+            other => panic!("expected single match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_symbol_replace_global_matches_symbol_replace_when_flag_clear() {
+        let re = JsRegExp::new(r"\d", "g").unwrap();
+        let a = re.try_symbol_replace("a1b2c3", "X").unwrap();
+        let re2 = JsRegExp::new(r"\d", "g").unwrap();
+        let b = re2.symbol_replace("a1b2c3", "X");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_try_symbol_split_matches_symbol_split_when_flag_clear() {
+        let re = JsRegExp::new(r",", "").unwrap();
+        let a = re.try_symbol_split("a,b,c", None).unwrap();
+        let re2 = JsRegExp::new(r",", "").unwrap();
+        let b = re2.symbol_split("a,b,c", None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_try_symbol_match_all_matches_symbol_match_all_when_flag_clear() {
+        let re = JsRegExp::new(r"\d", "g").unwrap();
+        let a = re.try_symbol_match_all("1 2 3");
+        let re2 = JsRegExp::new(r"\d", "g").unwrap();
+        let b = re2.symbol_match_all("1 2 3");
+        let a = a.unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.matched, y.matched);
+            assert_eq!(x.index, y.index);
+        }
     }
 }

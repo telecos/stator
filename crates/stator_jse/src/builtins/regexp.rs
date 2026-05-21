@@ -331,7 +331,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_match);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = match re_match.symbol_match(&input) {
+                let result = match re_match.try_symbol_match(&input)? {
                     None => JsValue::Null,
                     Some(SymbolMatchResult::Single(m)) => match_to_js(&m),
                     Some(SymbolMatchResult::All(v)) => {
@@ -359,7 +359,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 let result = if is_callable(&replacement) {
                     regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
                 } else {
-                    re_replace.symbol_replace(&input, &replacement.to_js_string()?)
+                    re_replace.try_symbol_replace(&input, &replacement.to_js_string()?)?
                 };
                 sync_last_index_to_props(&w, &re_replace);
                 Ok(JsValue::String(result.into()))
@@ -400,7 +400,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                     Some(JsValue::Undefined) | None => None,
                     Some(v) => Some(crate::builtins::util::clamped_f64_to_usize(v.to_number()?)),
                 };
-                let parts = re_split.symbol_split(&input, limit);
+                let parts = re_split.try_symbol_split(&input, limit)?;
                 sync_last_index_to_props(&w, &re_split);
                 Ok(JsValue::new_array(
                     parts
@@ -424,7 +424,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_match_all);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let matches = re_match_all.symbol_match_all(&input);
+                let matches = re_match_all.try_symbol_match_all(&input)?;
                 sync_last_index_to_props(&w, &re_match_all);
                 let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
                 Ok(JsValue::Iterator(NativeIterator::from_items(items)))
@@ -527,7 +527,7 @@ fn regexp_replace_with_callback(
 
     if global {
         re.set_last_index(0);
-        let matches = re.symbol_match_all(input);
+        let matches = re.try_symbol_match_all(input)?;
         if matches.is_empty() {
             re.set_last_index(0);
             return Ok(input.to_string());

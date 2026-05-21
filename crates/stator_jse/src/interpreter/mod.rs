@@ -15637,7 +15637,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                let parts = re.symbol_split(&s, limit);
+                                let parts = re.try_symbol_split(&s, limit)?;
                                 let items: Vec<JsValue> = parts
                                     .into_iter()
                                     .map(|p| match p {
@@ -15806,7 +15806,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(re.symbol_replace(&s, &replacement).into()))
+                                Ok(JsValue::String(
+                                    re.try_symbol_replace(&s, &replacement)?.into(),
+                                ))
                             } else {
                                 Ok(JsValue::String(s.clone()))
                             }
@@ -15862,7 +15864,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(re.symbol_replace(&s, &replacement).into()))
+                                Ok(JsValue::String(
+                                    re.try_symbol_replace(&s, &replacement)?.into(),
+                                ))
                             } else {
                                 Ok(JsValue::String(s.clone()))
                             }
@@ -15983,7 +15987,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             };
                             drop(borrow);
                             let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            match re.symbol_match(&s) {
+                            match re.try_symbol_match(&s)? {
                                 Some(result) => {
                                     use crate::objects::regexp::SymbolMatchResult;
                                     match result {
@@ -16076,7 +16080,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             }
                             drop(borrow);
                             let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            let matches = re.symbol_match_all(&s);
+                            let matches = re.try_symbol_match_all(&s)?;
                             let results: Vec<JsValue> = matches
                                 .into_iter()
                                 .map(|m| {
