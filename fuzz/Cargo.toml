@@ -157,3 +157,9 @@ name = "fuzz_deopt"
 path = "fuzz_targets/fuzz_deopt.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "snapshot_load"
+path = "fuzz_targets/fuzz_snapshot_load.rs"
+test = false
+doc = false
