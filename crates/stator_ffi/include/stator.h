@@ -52,6 +52,15 @@
 #define STATOR_FFI_ABI_VERSION (((STATOR_FFI_ABI_VERSION_MAJOR << 16) | (STATOR_FFI_ABI_VERSION_MINOR << 8)) | STATOR_FFI_ABI_VERSION_PATCH)
 
 /**
+ * Number of histogram buckets carried by [`StatorTierLatencyTier`].
+ *
+ * This must match
+ * [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
+ * part of the C ABI contract.  Bumping this value is a breaking change.
+ */
+#define STATOR_TIER_LATENCY_BUCKET_COUNT 9
+
+/**
  * Default named-property handler behaviour; no flag bits set.
  */
 #define STATOR_DOM_NAMED_HANDLER_FLAG_NONE 0
@@ -1126,6 +1135,76 @@ typedef struct StatorTieringStats {
    */
   uint64_t stub_call_counts[24];
 } StatorTieringStats;
+
+/**
+ * Per-tier portion of [`StatorTierLatencyStats`].
+ *
+ * All durations are expressed in **nanoseconds**.  Histogram bucket
+ * boundaries follow
+ * [`stator_jse::compiler::tier_latency::HISTOGRAM_BUCKETS_US`] (in
+ * microseconds), with the final bucket counting overflows above the
+ * last named upper bound.
+ */
+typedef struct StatorTierLatencyTier {
+  /**
+   * Number of synchronous promotion requests recorded for this tier.
+   */
+  uint64_t requested;
+  /**
+   * Number of successful promotions (tier ready after the request).
+   */
+  uint64_t succeeded;
+  /**
+   * Number of failed promotion attempts (work was attempted but
+   * the target tier was not observable as ready afterwards).
+   */
+  uint64_t failed;
+  /**
+   * Sum of successful promotion durations in nanoseconds.
+   */
+  uint64_t success_total_ns;
+  /**
+   * Largest single successful promotion duration in nanoseconds.
+   */
+  uint64_t success_max_ns;
+  /**
+   * Sum of failed promotion durations in nanoseconds.
+   */
+  uint64_t failure_total_ns;
+  /**
+   * Largest single failed promotion duration in nanoseconds.
+   */
+  uint64_t failure_max_ns;
+  /**
+   * Histogram of successful promotion durations, indexed as
+   * described on [`STATOR_TIER_LATENCY_BUCKET_COUNT`].
+   */
+  uint64_t success_buckets[STATOR_TIER_LATENCY_BUCKET_COUNT];
+} StatorTierLatencyTier;
+
+/**
+ * Always-on tier-promotion latency diagnostics for Edge performance
+ * proof runs.
+ *
+ * Counters are process-global aggregates: per-script attribution is
+ * not exposed today (bytecode arrays do not carry a stable
+ * script-hash through the promotion entry points).  See
+ * `docs/edge_diagnostics.md` for the documented scope.
+ */
+typedef struct StatorTierLatencyStats {
+  /**
+   * Baseline JIT promotion counters and timings.
+   */
+  struct StatorTierLatencyTier baseline;
+  /**
+   * Maglev mid-tier optimising-compiler promotion counters.
+   */
+  struct StatorTierLatencyTier maglev;
+  /**
+   * Turbofan (Cranelift) promotion counters.
+   */
+  struct StatorTierLatencyTier turbofan;
+} StatorTierLatencyStats;
 
 /**
  * Read-only view of the browser policy/origin metadata associated with a
@@ -2388,6 +2467,31 @@ void stator_isolate_get_tiering_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_tiering_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with the current tier-promotion latency counters.
+ *
+ * Does nothing when `stats` is null.  A null isolate is accepted: the
+ * counters are process-global diagnostics rather than heap-owned
+ * state, matching `stator_isolate_get_tiering_stats`.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes.
+ */
+void stator_isolate_get_tier_latency_stats(const struct StatorIsolate *_isolate,
+                                           struct StatorTierLatencyStats *stats);
+
+/**
+ * Reset every tier-promotion latency counter to zero.
+ *
+ * A null isolate is accepted; counters are process-global diagnostics
+ * rather than heap-owned state.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_tier_latency_stats(struct StatorIsolate *_isolate);
 
 /**
  * Enable or disable JIT tiers for scripts run in `isolate`.

@@ -48,5 +48,8 @@ pub mod compile_counters;
 pub mod maglev;
 /// On-Stack Replacement: mid-execution tier-up for hot loops.
 pub mod osr;
+/// Always-on, release-safe counters and timing for JIT tier promotion
+/// requests (Baseline / Maglev / Turbofan).
+pub mod tier_latency;
 /// Turbofan: Cranelift-backed optimising JIT backend.
 pub mod turbofan;

@@ -1924,12 +1924,18 @@ fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
     ))]
     {
         use crate::compiler::baseline::compiler::{BaselineCompiler, CachedExecutableCode};
+        use crate::compiler::tier_latency::{PromotionTier, PromotionTimer};
+        let timer = PromotionTimer::start(PromotionTier::Baseline);
         if ba.has_baseline_jit_code() {
+            timer.discard();
             return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
         }
         let cc = match BaselineCompiler::compile(ba) {
             Ok(cc) => cc,
-            Err(_) => return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false),
+            Err(_) => {
+                timer.record_failure();
+                return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false);
+            }
         };
         // SAFETY: `cc.code` was produced by `BaselineCompiler::compile`.
         match unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) } {
@@ -1937,9 +1943,11 @@ fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
                 ba.store_jit_code(cached);
                 JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
                 JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(cc.code.len())));
+                timer.record_success();
                 TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
             }
             Err(_) => {
+                timer.record_failure();
                 TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false)
             }
         }
@@ -2233,12 +2241,16 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     use crate::compiler::maglev::codegen as maglev_codegen;
     use crate::compiler::maglev::graph_builder::GraphBuilder;
     use crate::compiler::maglev::optimizer::optimize;
+    use crate::compiler::tier_latency::{PromotionTier, PromotionTimer};
 
     let tier = JitTier::Maglev;
+    let timer = PromotionTimer::start(PromotionTier::Maglev);
     if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
+        timer.discard();
         return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
     }
     if ba.jit_maglev_has_deopted() {
+        timer.discard();
         return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
     }
 
@@ -2262,12 +2274,14 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
             optimize(&mut g);
             if g.is_degenerate() {
                 MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                timer.record_failure();
                 return TierRequestResult::new(tier, TierRequestStatus::DegenerateGraph, false);
             }
             g
         }
         Err(_) => {
             MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            timer.record_failure();
             return TierRequestResult::new(tier, TierRequestStatus::GraphBuildFailed, false);
         }
     };
@@ -2276,6 +2290,7 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
         Ok(cc) => cc,
         Err(_) => {
             MAGLEV_COMPILATION_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            timer.record_failure();
             return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false);
         }
     };
@@ -2297,9 +2312,13 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
             MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MAGLEV_CODE_BYTES.fetch_add(cc.code.len(), std::sync::atomic::Ordering::Relaxed);
+            timer.record_success();
             TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
         }
-        None => TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false),
+        None => {
+            timer.record_failure();
+            TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false)
+        }
     }
 }
 
@@ -2566,9 +2585,12 @@ fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
         use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
+        use crate::compiler::tier_latency::{PromotionTier, PromotionTimer};
         use crate::compiler::turbofan;
 
+        let timer = PromotionTimer::start(PromotionTier::Turbofan);
         if ba.has_turbofan_jit_code() {
+            timer.discard();
             return TierRequestResult::new(tier, TierRequestStatus::AlreadyReady, true);
         }
         let _ = ba.try_start_turbofan_compile();
@@ -2586,17 +2608,20 @@ fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
         let mut graph = match GraphBuilder::build(ba, &feedback) {
             Ok(graph) => graph,
             Err(_) => {
+                timer.record_failure();
                 return TierRequestResult::new(tier, TierRequestStatus::GraphBuildFailed, false);
             }
         };
         optimize(&mut graph);
         if graph.is_degenerate() {
+            timer.record_failure();
             return TierRequestResult::new(tier, TierRequestStatus::DegenerateGraph, false);
         }
         let tc =
             match turbofan::compile_with_feedback(&graph, ba.parameter_count(), Some(&feedback)) {
                 Ok(tc) => tc,
                 Err(_) => {
+                    timer.record_failure();
                     return TierRequestResult::new(tier, TierRequestStatus::CompileFailed, false);
                 }
             };
@@ -2607,8 +2632,10 @@ fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
                 .store(true, std::sync::atomic::Ordering::Release);
             TURBOFAN_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             TURBOFAN_CODE_BYTES.fetch_add(code_size, std::sync::atomic::Ordering::Relaxed);
+            timer.record_success();
             TierRequestResult::new(tier, TierRequestStatus::Compiled, true)
         } else {
+            timer.record_failure();
             TierRequestResult::new(tier, TierRequestStatus::ExecutableAllocationFailed, false)
         }
     }
@@ -22367,6 +22394,99 @@ mod tests {
 
         assert!(!result.ready);
         assert_eq!(result.status, TierRequestStatus::JitDisabled);
+    }
+
+    /// Deterministic force-tier interaction with the tier-latency
+    /// counters: a `JitDisabled` short-circuit must not bump any
+    /// promotion counters, and a real compile must bump `requested`
+    /// and exactly one of `succeeded` / `failed` for the targeted
+    /// tier.
+    #[test]
+    fn test_force_tier_updates_tier_latency_counters() {
+        use crate::compiler::tier_latency::{self, PromotionTier};
+        use std::sync::Mutex;
+        // tier_latency counters are process-global, so serialise with
+        // any other tests that mutate them.
+        static GUARD: Mutex<()> = Mutex::new(());
+        let _g = match GUARD.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // 1. JitDisabled path: counters untouched.
+        tier_latency::reset();
+        let disabled_ba = make_add_bytecode();
+        disabled_ba.set_jit_disabled(true);
+        let disabled_result = force_tier_sync(&disabled_ba, JitTier::Baseline);
+        assert_eq!(disabled_result.status, TierRequestStatus::JitDisabled);
+        let after_disabled = tier_latency::snapshot();
+        assert_eq!(after_disabled.total_requested(), 0);
+        assert_eq!(after_disabled.total_succeeded(), 0);
+        assert_eq!(after_disabled.total_failed(), 0);
+
+        // 2. Real compile path: deterministic force-tier promotes.
+        tier_latency::reset();
+        let add_ba = make_add_bytecode();
+        let result = force_tier_sync(&add_ba, JitTier::Baseline);
+        let snap = tier_latency::snapshot();
+        let baseline = snap.for_tier(PromotionTier::Baseline);
+
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        {
+            assert_eq!(result.status, TierRequestStatus::Compiled);
+            assert_eq!(baseline.requested, 1);
+            assert_eq!(baseline.succeeded, 1);
+            assert_eq!(baseline.failed, 0);
+            // Other tiers untouched by a baseline force.
+            assert_eq!(snap.for_tier(PromotionTier::Maglev).requested, 0);
+            assert_eq!(snap.for_tier(PromotionTier::Turbofan).requested, 0);
+        }
+        #[cfg(not(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
+        {
+            assert_eq!(result.status, TierRequestStatus::UnsupportedTier);
+            // On unsupported targets the timer is never started.
+            assert_eq!(baseline.requested, 0);
+            assert_eq!(baseline.succeeded, 0);
+            assert_eq!(baseline.failed, 0);
+        }
+
+        // 3. A second force on an already-ready BA must short-circuit
+        //    in `force_tier_sync` (via `observe_tier` → AlreadyReady)
+        //    without reaching `force_baseline_sync`, so no extra
+        //    request, success, or failure is recorded.  This keeps
+        //    the latency histogram free of zero-duration noise.
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        {
+            let _ = result;
+            let second = force_tier_sync(&add_ba, JitTier::Baseline);
+            assert_eq!(second.status, TierRequestStatus::AlreadyReady);
+            let snap2 = tier_latency::snapshot();
+            let b2 = snap2.for_tier(PromotionTier::Baseline);
+            assert_eq!(
+                b2.requested, 1,
+                "AlreadyReady short-circuits before the promotion entry point"
+            );
+            assert_eq!(b2.succeeded, 1);
+            assert_eq!(b2.failed, 0);
+        }
+
+        // 4. Reset clears everything; a subsequent snapshot is stable.
+        tier_latency::reset();
+        let snap_after_reset_a = tier_latency::snapshot();
+        let snap_after_reset_b = tier_latency::snapshot();
+        assert_eq!(snap_after_reset_a, snap_after_reset_b);
+        assert_eq!(snap_after_reset_a.total_requested(), 0);
+        assert_eq!(snap_after_reset_a.total_succeeded(), 0);
+        assert_eq!(snap_after_reset_a.total_failed(), 0);
     }
 
     #[test]

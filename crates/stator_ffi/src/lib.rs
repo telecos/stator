@@ -777,6 +777,118 @@ pub unsafe extern "C" fn stator_isolate_reset_tiering_stats(_isolate: *mut Stato
     stator_jse::interpreter::reset_tiering_stats();
 }
 
+/// Number of histogram buckets carried by [`StatorTierLatencyTier`].
+///
+/// This must match
+/// [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
+/// part of the C ABI contract.  Bumping this value is a breaking change.
+pub const STATOR_TIER_LATENCY_BUCKET_COUNT: usize = 9;
+
+/// Per-tier portion of [`StatorTierLatencyStats`].
+///
+/// All durations are expressed in **nanoseconds**.  Histogram bucket
+/// boundaries follow
+/// [`stator_jse::compiler::tier_latency::HISTOGRAM_BUCKETS_US`] (in
+/// microseconds), with the final bucket counting overflows above the
+/// last named upper bound.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct StatorTierLatencyTier {
+    /// Number of synchronous promotion requests recorded for this tier.
+    pub requested: u64,
+    /// Number of successful promotions (tier ready after the request).
+    pub succeeded: u64,
+    /// Number of failed promotion attempts (work was attempted but
+    /// the target tier was not observable as ready afterwards).
+    pub failed: u64,
+    /// Sum of successful promotion durations in nanoseconds.
+    pub success_total_ns: u64,
+    /// Largest single successful promotion duration in nanoseconds.
+    pub success_max_ns: u64,
+    /// Sum of failed promotion durations in nanoseconds.
+    pub failure_total_ns: u64,
+    /// Largest single failed promotion duration in nanoseconds.
+    pub failure_max_ns: u64,
+    /// Histogram of successful promotion durations, indexed as
+    /// described on [`STATOR_TIER_LATENCY_BUCKET_COUNT`].
+    pub success_buckets: [u64; STATOR_TIER_LATENCY_BUCKET_COUNT],
+}
+
+/// Always-on tier-promotion latency diagnostics for Edge performance
+/// proof runs.
+///
+/// Counters are process-global aggregates: per-script attribution is
+/// not exposed today (bytecode arrays do not carry a stable
+/// script-hash through the promotion entry points).  See
+/// `docs/edge_diagnostics.md` for the documented scope.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct StatorTierLatencyStats {
+    /// Baseline JIT promotion counters and timings.
+    pub baseline: StatorTierLatencyTier,
+    /// Maglev mid-tier optimising-compiler promotion counters.
+    pub maglev: StatorTierLatencyTier,
+    /// Turbofan (Cranelift) promotion counters.
+    pub turbofan: StatorTierLatencyTier,
+}
+
+fn tier_latency_to_ffi(
+    snap: &stator_jse::compiler::tier_latency::TierLatencySnapshot,
+) -> StatorTierLatencyTier {
+    StatorTierLatencyTier {
+        requested: snap.requested,
+        succeeded: snap.succeeded,
+        failed: snap.failed,
+        success_total_ns: snap.success_total_ns,
+        success_max_ns: snap.success_max_ns,
+        failure_total_ns: snap.failure_total_ns,
+        failure_max_ns: snap.failure_max_ns,
+        success_buckets: snap.success_buckets,
+    }
+}
+
+/// Fill `*stats` with the current tier-promotion latency counters.
+///
+/// Does nothing when `stats` is null.  A null isolate is accepted: the
+/// counters are process-global diagnostics rather than heap-owned
+/// state, matching `stator_isolate_get_tiering_stats`.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_tier_latency_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorTierLatencyStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    use stator_jse::compiler::tier_latency::{self, PromotionTier};
+    let snap = tier_latency::snapshot();
+    let out = StatorTierLatencyStats {
+        baseline: tier_latency_to_ffi(snap.for_tier(PromotionTier::Baseline)),
+        maglev: tier_latency_to_ffi(snap.for_tier(PromotionTier::Maglev)),
+        turbofan: tier_latency_to_ffi(snap.for_tier(PromotionTier::Turbofan)),
+    };
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = out;
+    }
+}
+
+/// Reset every tier-promotion latency counter to zero.
+///
+/// A null isolate is accepted; counters are process-global diagnostics
+/// rather than heap-owned state.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_tier_latency_stats(_isolate: *mut StatorIsolate) {
+    stator_jse::compiler::tier_latency::reset();
+}
+
 /// Enable or disable JIT tiers for scripts run in `isolate`.
 ///
 /// Does nothing when `isolate` is null.
@@ -27429,6 +27541,76 @@ mod tests {
         unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), &mut stats) };
         // SAFETY: null isolate is accepted for resetting process/thread diagnostics.
         unsafe { stator_isolate_reset_tiering_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_tier_latency_stats_null_safety() {
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_tier_latency_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted and `stats` is valid for writes.
+        let mut stats = unsafe { std::mem::zeroed::<StatorTierLatencyStats>() };
+        unsafe { stator_isolate_get_tier_latency_stats(std::ptr::null(), &mut stats) };
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_tier_latency_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_tier_latency_bucket_count_matches_engine() {
+        assert_eq!(
+            STATOR_TIER_LATENCY_BUCKET_COUNT,
+            stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS
+        );
+    }
+
+    #[test]
+    fn test_tier_latency_snapshot_roundtrip_via_ffi() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        // Serialise with other tier-latency tests to avoid stomping the
+        // process-global counters.
+        static FFI_TIER_LATENCY_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_TIER_LATENCY_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null isolate is accepted; we reset before recording.
+        unsafe { stator_isolate_reset_tier_latency_stats(std::ptr::null_mut()) };
+        use stator_jse::compiler::tier_latency::{self, PromotionTier};
+        tier_latency::record_request(PromotionTier::Maglev);
+        tier_latency::record_success(PromotionTier::Maglev, Duration::from_micros(42));
+        tier_latency::record_request(PromotionTier::Turbofan);
+        tier_latency::record_failure(PromotionTier::Turbofan, Duration::from_micros(7));
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorTierLatencyStats>() };
+        // SAFETY: `stats` is valid for writes and a null isolate is accepted.
+        unsafe { stator_isolate_get_tier_latency_stats(std::ptr::null(), &mut stats) };
+
+        assert_eq!(stats.baseline.requested, 0);
+        assert_eq!(stats.maglev.requested, 1);
+        assert_eq!(stats.maglev.succeeded, 1);
+        assert_eq!(stats.maglev.failed, 0);
+        assert_eq!(stats.maglev.success_total_ns, 42_000);
+        assert_eq!(stats.maglev.success_max_ns, 42_000);
+        assert_eq!(stats.turbofan.requested, 1);
+        assert_eq!(stats.turbofan.succeeded, 0);
+        assert_eq!(stats.turbofan.failed, 1);
+        assert_eq!(stats.turbofan.failure_total_ns, 7_000);
+
+        // SAFETY: null isolate is accepted.
+        unsafe { stator_isolate_reset_tier_latency_stats(std::ptr::null_mut()) };
+        let mut after = unsafe { std::mem::zeroed::<StatorTierLatencyStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_tier_latency_stats(std::ptr::null(), &mut after) };
+        assert_eq!(after.baseline.requested, 0);
+        assert_eq!(after.maglev.requested, 0);
+        assert_eq!(after.maglev.succeeded, 0);
+        assert_eq!(after.maglev.success_total_ns, 0);
+        assert_eq!(after.turbofan.failed, 0);
+        assert_eq!(after.turbofan.failure_total_ns, 0);
+        for b in after.maglev.success_buckets {
+            assert_eq!(b, 0);
+        }
     }
 
     #[test]
