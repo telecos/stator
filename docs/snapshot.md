@@ -311,37 +311,90 @@ into the engine can corrupt the heap.  The contract:
 
 ## 7. Compatibility / version metadata
 
+Snapshot compatibility is **fail-closed**.  A loader must reject the
+blob before allocating payload storage, creating JS objects, installing
+callbacks, or running any bytecode unless every compatibility key below
+matches the current engine and embedder environment exactly.  There is
+no best-effort or warning-only mode for production loads.
+
 The v1 binary header is extended (new magic `STWC` — *Stator Warm
 Context* — to keep the legacy `STSS` loader available unchanged):
 
 ```text
 Header (fixed):
-  magic           : [u8; 4]   = b"STWC"
-  format_version  : u32 LE    = 1
-  build_id        : [u8; 32]  (BLAKE3 fingerprint of engine build)
-  ffi_abi_version : u32 LE    (mirrors STATOR_FFI_ABI_VERSION)
-  arch            : u8        (1 = x86_64, 2 = aarch64, …)
-  pointer_width   : u8        (4 or 8)
-  endianness      : u8        (1 = little, 2 = big)
-  feature_flags   : u64 LE    (bitset of compile-time features that
-                               change observable behaviour: jit,
-                               wasm, intl, inspector, gc strategy)
-  manifest_hash   : [u8; 32]  (BLAKE3 of sorted callback id list)
-  payload_len     : u64 LE
+  magic               : [u8; 4]   = b"STWC"
+  snapshot_format_ver : u32 LE    = 1
+  bytecode_format_ver : u32 LE    (current BytecodeArray encoding)
+  engine_crate_ver    : str32     (stator_jse Cargo.toml version)
+  ffi_crate_ver       : str32     (stator_ffi Cargo.toml version)
+  commit_id           : str32     (git SHA or "unknown")
+  build_id            : [u8; 32]  (BLAKE3 fingerprint of engine build)
+  ffi_abi_version     : u32 LE    (mirrors STATOR_FFI_ABI_VERSION)
+  target_triple       : str32     (rustc target triple)
+  os                  : str16     (target OS component)
+  arch                : str16     (target arch component)
+  pointer_width       : u8        (4 or 8)
+  endianness          : u8        (1 = little, 2 = big)
+  cargo_profile       : str16     (dev, release, custom profile name)
+  build_features_hash : [u8; 32]  (BLAKE3 of sorted enabled Cargo cfg/features)
+  jit_tiering_hash    : [u8; 32]  (BLAKE3 of enabled JIT/tiering modes)
+  cpu_features_hash   : [u8; 32]  (BLAKE3 of required CPU feature set)
+  manifest_hash       : [u8; 32]  (BLAKE3 of sorted native callback id list)
+  edge_release_hash   : [u8; 32]  (BLAKE3 of Edge vendored metadata; zero if unused)
+  payload_len         : u64 LE
 Payload:
   …deterministic encoding of the context graph…
 Footer:
   digest          : [u8; 32]  (BLAKE3 of header + payload)
 ```
 
-Every field above is checked by the loader before any allocation
-beyond the header itself.  Mismatches return a typed error
-(`SnapshotError::BuildMismatch`, `SnapshotError::AbiMismatch`,
-`SnapshotError::ArchMismatch`, `SnapshotError::ManifestMismatch`,
-`SnapshotError::DigestMismatch`).
+### Field-specific rejection rules
+
+Every field above is checked by the loader before any allocation beyond
+the header itself.  Every mismatch returns a typed diagnostic that names
+the field, the snapshot value, and the runtime value.  The diagnostic is
+also surfaced through the C ABI status detail string so Edge telemetry
+can bucket failures without parsing human prose.
+
+| Field(s) | Match rule | Required diagnostic |
+|----------|------------|---------------------|
+| `magic` | Must be `STWC`; `STSS` is accepted only by the legacy globals-only loader. | `SnapshotError::MagicMismatch { found, expected }` |
+| `snapshot_format_ver` | Must equal the loader's warm-context snapshot format version. | `SnapshotError::SnapshotFormatMismatch { found, expected }` |
+| `bytecode_format_ver` | Must equal the engine bytecode encoding version used by `BytecodeArray`. | `SnapshotError::BytecodeFormatMismatch { found, expected }` |
+| `engine_crate_ver`, `ffi_crate_ver` | Must equal the linked `stator_jse` and `stator_ffi` crate versions. | `SnapshotError::CrateVersionMismatch { crate_name, found, expected }` |
+| `commit_id`, `build_id` | `build_id` must match byte-for-byte; `commit_id` is diagnostic metadata and must match unless the runtime was built with an explicit local-development override. | `SnapshotError::BuildMismatch { found_build_id, expected_build_id, found_commit, expected_commit }` |
+| `ffi_abi_version` | Must equal `STATOR_FFI_ABI_VERSION`; any ABI bump invalidates existing snapshots. | `SnapshotError::AbiMismatch { found, expected }` |
+| `target_triple`, `os`, `arch`, `pointer_width`, `endianness` | Must equal the current target environment exactly. | `SnapshotError::TargetMismatch { field, found, expected }` |
+| `cargo_profile` | Must equal the profile that built the runtime.  Release and debug snapshots are not interchangeable because assertions, layout choices, and JIT settings may differ. | `SnapshotError::CargoProfileMismatch { found, expected }` |
+| `build_features_hash` | Must equal the hash of enabled Cargo features and relevant `cfg` values (`jit`, `wasm`, `intl`, `inspector`, GC strategy, allocator, panic mode). | `SnapshotError::BuildFeaturesMismatch { found, expected }` |
+| `jit_tiering_hash` | Must equal the configured JIT/tiering feature set, including interpreter-only mode, baseline JIT, optimizing JIT, inline-cache policy, and codegen backend. | `SnapshotError::JitTieringMismatch { found, expected }` |
+| `cpu_features_hash` | Must be exactly equal for snapshots containing native/JIT-sensitive metadata.  A future portable-interpreter-only mode may define a weaker subset check, but v1 does not. | `SnapshotError::CpuFeaturesMismatch { found, expected }` |
+| `manifest_hash` | Must equal the BLAKE3 hash of the sorted native callback manifest ids used at load time, unless `allow_extra` is explicitly set; missing ids are always fatal. | `SnapshotError::ManifestMismatch { missing_ids, extra_ids, found_hash, expected_hash }` |
+| `edge_release_hash` | If non-zero, must equal the Edge vendored release metadata hash supplied by the embedder. | `SnapshotError::EdgeReleaseMismatch { found, expected }` |
+| `payload_len`, `digest` | Length must fit configured caps; digest must verify over the exact header and payload bytes. | `SnapshotError::PayloadLengthExceeded { found, max }` or `SnapshotError::DigestMismatch { found, expected }` |
 
 The legacy `STSS` v2 format (today's globals-only snapshot) is kept
 working for `st8`'s existing flow; new embedders MUST use `STWC`.
+
+### Edge vendored release metadata
+
+Edge consumes Stator as a vendored component, so the compatibility
+envelope also binds snapshots to the release metadata Edge already
+records for reproducibility.  The Edge-side package must provide a
+canonical metadata document containing at least: Stator repository URL,
+vendored commit, crate versions, generated `stator.h` version,
+`STATOR_FFI_ABI_VERSION`, Rust toolchain, target triple, Cargo profile,
+enabled Cargo features, JIT/tiering configuration, CPU baseline, and the
+native callback manifest hash.  The snapshot header stores
+`edge_release_hash = BLAKE3(canonical-json(metadata))`.
+
+During load, Edge passes the same canonical metadata to the FFI loader.
+If the snapshot header contains a non-zero `edge_release_hash`, the
+loader rejects any mismatch with `SnapshotError::EdgeReleaseMismatch`.
+If the field is zero, only non-Edge embedders may continue; Edge release
+and prepublish gates must reject zero-valued release hashes so a shipped
+snapshot is always traceable to the exact vendored Stator artefact that
+created it.
 
 ---
 
