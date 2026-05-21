@@ -138,6 +138,46 @@ pub enum StatorError {
         /// snapshot header.
         extra_ids: Vec<String>,
     },
+
+    /// A warm-context (`STWC`) snapshot header field did not match the
+    /// load-time engine/embedder environment.
+    ///
+    /// Emitted by [`crate::snapshot::load_globals_stwc`] before any
+    /// payload is decoded.  `field` names the compatibility key (e.g.
+    /// `"magic"`, `"snapshot_format_ver"`, `"bytecode_format_ver"`,
+    /// `"engine_crate_ver"`, `"ffi_abi_version"`, `"target_triple"`,
+    /// `"build_id"`, `"build_features_hash"`, `"edge_release_hash"`,
+    /// `"payload_len"`).  The found/expected strings are
+    /// human-readable renderings of the snapshot vs. load-time
+    /// values, suitable for direct surfacing through telemetry.
+    #[error(
+        "snapshot: warm-context compatibility mismatch on field `{field}` \
+         (found {found}, expected {expected})"
+    )]
+    SnapshotCompatibilityMismatch {
+        /// Name of the compatibility field that mismatched.
+        field: &'static str,
+        /// Human-readable rendering of the value stored in the snapshot
+        /// header.
+        found: String,
+        /// Human-readable rendering of the value expected by the
+        /// load-time engine/embedder environment.
+        expected: String,
+    },
+
+    /// A warm-context (`STWC`) snapshot footer digest did not verify.
+    ///
+    /// Emitted by [`crate::snapshot::load_globals_stwc`] when the
+    /// computed digest of the header + payload does not match the
+    /// digest stored in the footer.  Any digest mismatch is fatal and
+    /// no payload is decoded.
+    #[error("snapshot: warm-context digest mismatch (expected {expected}, found {found})")]
+    SnapshotDigestMismatch {
+        /// Hex-encoded digest stored in the snapshot footer.
+        expected: String,
+        /// Hex-encoded digest recomputed from the on-disk bytes.
+        found: String,
+    },
 }
 
 /// Convenient `Result` alias for fallible engine operations.

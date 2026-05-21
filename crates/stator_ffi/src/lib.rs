@@ -12378,6 +12378,8 @@ fn message_kind_for_error(
         E::DebuggerPaused { .. } => StatorMessageKind::StatorMessageKindInternal,
         E::SnapshotUnsupportedValue { .. } => StatorMessageKind::StatorMessageKindInternal,
         E::SnapshotManifestMismatch { .. } => StatorMessageKind::StatorMessageKindInternal,
+        E::SnapshotCompatibilityMismatch { .. } => StatorMessageKind::StatorMessageKindInternal,
+        E::SnapshotDigestMismatch { .. } => StatorMessageKind::StatorMessageKindInternal,
     }
 }
 

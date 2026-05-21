@@ -2,7 +2,7 @@
 
 | Field    | Value                              |
 |----------|------------------------------------|
-| Status   | Draft, with strict deterministic `STSS` support implemented |
+| Status   | Draft, with strict deterministic `STSS`, manifest-aware `STSM`, and warm-context `STWC` v1 envelope support implemented |
 | Audience | Stator engine + Edge embedder team |
 | Scope    | `crates/stator_jse/src/snapshot/`, `crates/st8`, future `stator_ffi` snapshot FFI |
 
@@ -397,6 +397,55 @@ can bucket failures without parsing human prose.
 
 The legacy `STSS` v2 format (today's globals-only snapshot) is kept
 working for `st8`'s existing flow; new embedders MUST use `STWC`.
+
+> **Implemented today (`STWC` v1 envelope):** the engine ships
+> [`snapshot::serialize_globals_stwc`] and
+> [`snapshot::load_globals_stwc`] in
+> [`crates/stator_jse/src/snapshot/stwc.rs`].  The on-disk layout uses
+> the `STWC` magic, `snapshot_format_ver = 1`,
+> `bytecode_format_ver = STWC_BYTECODE_FORMAT_VERSION`, and embeds
+> every compatibility field listed below (`engine_crate_ver`,
+> `ffi_crate_ver`, `commit_id`, `build_id`, `ffi_abi_version`,
+> `target_triple`, `os`, `arch`, `pointer_width`, `endianness`,
+> `cargo_profile`, `build_features_hash`, `jit_tiering_hash`,
+> `cpu_features_hash`, `manifest_hash`, `edge_release_hash`,
+> `payload_len`).  Each is byte-for-byte compared against the
+> load-time [`StwcBuildBinding`] before any payload is decoded; any
+> mismatch returns a structured
+> [`StatorError::SnapshotCompatibilityMismatch { field, found, expected }`]
+> naming the offending key.  The footer carries a 32-byte
+> domain-separated FNV-1a-64 fold (`stwc_hash32`) over the exact
+> header + payload bytes; a tampered or truncated blob is rejected
+> with [`StatorError::SnapshotDigestMismatch`] before any value is
+> decoded.  The payload reuses the strict deterministic
+> manifest-aware encoder used by `STSM`, so unsupported value
+> classes (`NativeFunction` without a manifest entry, raw `Object`
+> GC pointers, `Generator`, `Iterator`, `Promise`, `Context`,
+> `Proxy`, `ArrayBuffer`, `TypedArray`, `DataView`, `TheHole`)
+> continue to fail closed with
+> [`StatorError::SnapshotUnsupportedValue`].
+>
+> Implementation limitations of `STWC` v1 as shipped:
+>
+> - Scope is still globals-only.  Intrinsics, prototype topology,
+>   hidden-class registry, module cache, and saved `Context` /
+>   `Realm` are NOT captured; they remain future work.
+> - The integrity digest is a non-cryptographic four-fold FNV-1a-64
+>   fold.  Release-bundle signing (BLAKE3 + ed25519, §10) layers on
+>   top and remains the authoritative gate for shipped artefacts.
+> - The build / target / hash fields beyond
+>   `snapshot_format_ver`, `bytecode_format_ver`,
+>   `engine_crate_ver`, `target_triple`, `os`, `arch`,
+>   `pointer_width`, `endianness`, and `cargo_profile` are supplied
+>   by the embedder via [`StwcBuildBinding`].  A future slice will
+>   wire automatic derivation of `build_id`, the feature/JIT/CPU
+>   hashes, `commit_id`, and `ffi_*` fields from `build.rs` / the
+>   FFI crate.
+> - There is no FFI loader yet; Edge cannot consume `STWC` via
+>   `stator_ffi` until the slice that exposes
+>   `stator_create_snapshot` / `stator_load_snapshot` lands.
+> - No `allow_extra` mode for the callback manifest — load is fully
+>   fail-closed (matches `STSM`).
 
 ### Edge vendored release metadata
 

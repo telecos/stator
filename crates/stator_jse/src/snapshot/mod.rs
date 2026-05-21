@@ -127,8 +127,14 @@ use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 pub mod manifest;
+pub mod stwc;
 
 pub use manifest::{MANIFEST_DIGEST_LEN, ManifestDigest, SnapshotCallbackManifest};
+pub use stwc::{
+    STWC_BYTECODE_FORMAT_VERSION, STWC_DIGEST_LEN, STWC_EDGE_RELEASE_UNSET, STWC_FORMAT_VERSION,
+    STWC_HASH_LEN, STWC_MAGIC, STWC_MAX_METADATA_STR_LEN, STWC_MAX_PAYLOAD_LEN, StwcBuildBinding,
+    load_globals_stwc, serialize_globals_stwc, stwc_hash32,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants

@@ -12407,7 +12407,9 @@ impl Interpreter {
             | StatorError::DebuggerPaused { .. }
             | StatorError::SandboxViolation { .. }
             | StatorError::SnapshotUnsupportedValue { .. }
-            | StatorError::SnapshotManifestMismatch { .. } => None,
+            | StatorError::SnapshotManifestMismatch { .. }
+            | StatorError::SnapshotCompatibilityMismatch { .. }
+            | StatorError::SnapshotDigestMismatch { .. } => None,
         }
     }
 
