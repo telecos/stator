@@ -87,6 +87,13 @@
 //!   every call.  Embedders that need to restore real host callbacks should
 //!   re-install them by name after calling [`deserialize_globals`].
 //!
+//! These lossy fallbacks apply only to the legacy [`serialize_globals`]
+//! entry point.  Callers building Edge warm-context snapshots (or any
+//! pipeline that must *fail closed* on unsupported heap state) should use
+//! [`serialize_globals_strict`], which returns a structured
+//! [`StatorError::SnapshotUnsupportedValue`] error pointing at the dotted
+//! path of the offending value instead of silently downgrading it.
+//!
 //! # Example
 //!
 //! ```
@@ -360,6 +367,56 @@ pub fn serialize_globals(globals: &HashMap<String, JsValue>) -> StartupSnapshot 
     StartupSnapshot { data: buf }
 }
 
+/// Strict variant of [`serialize_globals`] that fails closed on any heap
+/// value the snapshot format cannot losslessly capture.
+///
+/// Unlike [`serialize_globals`], which silently downgrades unsupported
+/// host/native values to `Undefined` and emits placeholder stubs for
+/// `NativeFunction`, this entry point returns a structured
+/// [`StatorError::SnapshotUnsupportedValue`] the first time it encounters
+/// any value class that is unsafe to serialize for an Edge warm-context
+/// snapshot.
+///
+/// Rejected classes (when reachable from `globals`, including transitively
+/// through `Array`, `PlainObject`, or `ModuleBinding` values):
+///
+/// - `NativeFunction` — host callback closure; cannot be captured without
+///   an embedder-provided manifest.
+/// - `Object` — raw GC `HeapObject` pointer; non-portable across processes.
+/// - `Generator`, `Iterator` — live suspended execution state.
+/// - `Promise` — pending host scheduler / resolver state.
+/// - `Context` — execution-context handle.
+/// - `Proxy` — handler table includes native traps.
+/// - `ArrayBuffer`, `TypedArray`, `DataView` — backing store ownership is
+///   not represented in the v2 binary format.
+/// - `TheHole` — internal sentinel that must not leak across snapshots.
+///
+/// `ModuleBinding` is transparently followed to its current cell value.
+///
+/// # Errors
+///
+/// Returns [`StatorError::SnapshotUnsupportedValue`] describing the
+/// rejected value class and the dotted path at which it was found.
+pub fn serialize_globals_strict(
+    globals: &HashMap<String, JsValue>,
+) -> StatorResult<StartupSnapshot> {
+    let mut buf = Vec::new();
+    let mut ctx = SerContext::new();
+    write_magic_header(&mut buf);
+    write_u32(&mut buf, globals.len() as u32);
+    let mut keys: Vec<&String> = globals.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &globals[key];
+        write_str32(&mut buf, key);
+        let path = format!("globals.{key}");
+        write_jsvalue_strict(&mut buf, value, &mut ctx, &path)?;
+    }
+    let checksum = fnv1a_32(&buf);
+    write_u32(&mut buf, checksum);
+    Ok(StartupSnapshot { data: buf })
+}
+
 /// Deserialize a [`StartupSnapshot`] into a globals map.
 ///
 /// # Errors
@@ -581,6 +638,187 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
         | JsValue::TheHole => {
             write_u8(buf, TAG_UNDEFINED);
         }
+    }
+}
+
+/// Strict counterpart of [`write_jsvalue`] that returns an error on any
+/// value class unsupported by the current snapshot binary format.
+///
+/// `path` is the dotted ancestry of the value being written, used purely
+/// for diagnostics (e.g. `"globals.foo.bar[2]"`).
+fn write_jsvalue_strict(
+    buf: &mut Vec<u8>,
+    value: &JsValue,
+    ctx: &mut SerContext,
+    path: &str,
+) -> StatorResult<()> {
+    match value {
+        JsValue::ModuleBinding(cell) => write_jsvalue_strict(buf, &cell.read(), ctx, path),
+        JsValue::Undefined => {
+            write_u8(buf, TAG_UNDEFINED);
+            Ok(())
+        }
+        JsValue::Null => {
+            write_u8(buf, TAG_NULL);
+            Ok(())
+        }
+        JsValue::Boolean(b) => {
+            write_u8(buf, TAG_BOOLEAN);
+            write_u8(buf, if *b { 1 } else { 0 });
+            Ok(())
+        }
+        JsValue::Smi(n) => {
+            write_u8(buf, TAG_SMI);
+            write_i32(buf, *n);
+            Ok(())
+        }
+        JsValue::HeapNumber(n) => {
+            write_u8(buf, TAG_HEAP_NUMBER);
+            write_f64(buf, *n);
+            Ok(())
+        }
+        JsValue::String(s) => {
+            write_u8(buf, TAG_STRING);
+            write_str32(buf, s);
+            Ok(())
+        }
+        JsValue::Symbol(id) => {
+            write_u8(buf, TAG_SYMBOL);
+            write_u64(buf, *id);
+            Ok(())
+        }
+        JsValue::BigInt(n) => {
+            write_u8(buf, TAG_BIGINT);
+            write_i128(buf, **n);
+            Ok(())
+        }
+        JsValue::Function(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_FUNCTION);
+                write_bytecode_array(buf, rc);
+            }
+            Ok(())
+        }
+        JsValue::Array(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+                Ok(())
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ARRAY);
+                let borrow = rc.borrow();
+                write_u32(buf, borrow.len() as u32);
+                for (i, item) in borrow.iter().enumerate() {
+                    let child_path = format!("{path}[{i}]");
+                    write_jsvalue_strict(buf, item, ctx, &child_path)?;
+                }
+                Ok(())
+            }
+        }
+        JsValue::PlainObject(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+                Ok(())
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                let borrow = rc.borrow();
+                write_u8(buf, TAG_PLAIN_OBJECT);
+                write_u32(buf, borrow.len() as u32);
+                let mut entries: Vec<(&Rc<str>, &JsValue)> = borrow.iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+                for (k, v) in entries {
+                    write_str32(buf, k);
+                    let child_path = format!("{path}.{}", k.as_ref());
+                    write_jsvalue_strict(buf, v, ctx, &child_path)?;
+                }
+                Ok(())
+            }
+        }
+        JsValue::Error(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ERROR);
+                write_u8(buf, error_kind_to_byte(rc.kind));
+                write_str32(buf, &rc.message);
+            }
+            Ok(())
+        }
+        JsValue::NativeFunction(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "NativeFunction",
+            path: path.to_owned(),
+            reason: Some("native host callbacks cannot be captured without an embedder manifest"),
+        }),
+        JsValue::Object(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Object",
+            path: path.to_owned(),
+            reason: Some("raw GC heap pointers are not portable across processes"),
+        }),
+        JsValue::Generator(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Generator",
+            path: path.to_owned(),
+            reason: Some("live suspended generator state is not snapshot-safe"),
+        }),
+        JsValue::Iterator(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Iterator",
+            path: path.to_owned(),
+            reason: Some("native iterator cursors cannot be reconstructed deterministically"),
+        }),
+        JsValue::Promise(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Promise",
+            path: path.to_owned(),
+            reason: Some("promise scheduler and resolver state is not captured"),
+        }),
+        JsValue::Context(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Context",
+            path: path.to_owned(),
+            reason: Some("execution-context handles are tied to the live engine"),
+        }),
+        JsValue::Proxy(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "Proxy",
+            path: path.to_owned(),
+            reason: Some("proxy handler traps may invoke native code"),
+        }),
+        JsValue::ArrayBuffer(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "ArrayBuffer",
+            path: path.to_owned(),
+            reason: Some("backing-store ownership is not encoded in the v2 format"),
+        }),
+        JsValue::TypedArray(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "TypedArray",
+            path: path.to_owned(),
+            reason: Some("typed-array views over external buffers are not snapshot-safe"),
+        }),
+        JsValue::DataView(_) => Err(StatorError::SnapshotUnsupportedValue {
+            class: "DataView",
+            path: path.to_owned(),
+            reason: Some("DataView views over external buffers are not snapshot-safe"),
+        }),
+        JsValue::TheHole => Err(StatorError::SnapshotUnsupportedValue {
+            class: "TheHole",
+            path: path.to_owned(),
+            reason: Some("internal sentinel value must not leak across snapshots"),
+        }),
     }
 }
 
@@ -1780,6 +2018,132 @@ mod tests {
         assert!(
             err.to_string().contains("checksum"),
             "corruption should be caught by checksum: {err}"
+        );
+    }
+
+    // ── strict serializer: rejection paths ───────────────────────────────────
+
+    /// Match a [`StatorError::SnapshotUnsupportedValue`] and assert the
+    /// reported class and path substring.
+    fn assert_unsupported(err: StatorError, expected_class: &str, expected_path_contains: &str) {
+        match err {
+            StatorError::SnapshotUnsupportedValue {
+                class,
+                ref path,
+                reason,
+            } => {
+                assert_eq!(
+                    class, expected_class,
+                    "wrong rejected class: got {class}, expected {expected_class}"
+                );
+                assert!(
+                    path.contains(expected_path_contains),
+                    "path {path:?} should contain {expected_path_contains:?}"
+                );
+                assert!(reason.is_some(), "structured rejection must carry a reason");
+            }
+            other => panic!(
+                "expected SnapshotUnsupportedValue, got {other:?} ({})",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_strict_accepts_supported_values() {
+        let mut g = HashMap::new();
+        g.insert("u".to_string(), JsValue::Undefined);
+        g.insert("n".to_string(), JsValue::Null);
+        g.insert("b".to_string(), JsValue::Boolean(true));
+        g.insert("i".to_string(), JsValue::Smi(7));
+        g.insert("f".to_string(), JsValue::HeapNumber(2.5));
+        g.insert("s".to_string(), JsValue::String("hi".to_string().into()));
+        g.insert("sym".to_string(), JsValue::Symbol(1));
+        g.insert("big".to_string(), JsValue::BigInt(Box::new(123)));
+        g.insert(
+            "arr".to_string(),
+            JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]),
+        );
+        let mut map = PropertyMap::new();
+        map.insert("k".to_string(), JsValue::Boolean(false));
+        g.insert(
+            "obj".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(map))),
+        );
+
+        let snap = serialize_globals_strict(&g).expect("supported values must serialize");
+        let restored = deserialize_globals(snap.as_bytes()).expect("deser");
+        assert_eq!(restored.get("i"), Some(&JsValue::Smi(7)));
+        assert_eq!(
+            restored.get("s"),
+            Some(&JsValue::String("hi".to_string().into()))
+        );
+    }
+
+    #[test]
+    fn test_strict_rejects_native_function() {
+        let mut g = HashMap::new();
+        g.insert(
+            "cb".to_string(),
+            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+        );
+        let err = serialize_globals_strict(&g).unwrap_err();
+        assert_unsupported(err, "NativeFunction", "globals.cb");
+    }
+
+    #[test]
+    fn test_strict_rejects_object_pointer() {
+        let mut g = HashMap::new();
+        g.insert("dom".to_string(), JsValue::Object(std::ptr::null_mut()));
+        let err = serialize_globals_strict(&g).unwrap_err();
+        assert_unsupported(err, "Object", "globals.dom");
+    }
+
+    #[test]
+    fn test_strict_rejects_the_hole() {
+        let mut g = HashMap::new();
+        g.insert("hole".to_string(), JsValue::TheHole);
+        let err = serialize_globals_strict(&g).unwrap_err();
+        assert_unsupported(err, "TheHole", "globals.hole");
+    }
+
+    #[test]
+    fn test_strict_rejects_nested_in_plain_object() {
+        let mut inner = PropertyMap::new();
+        inner.insert(
+            "onclick".to_string(),
+            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+        );
+        let mut g = HashMap::new();
+        g.insert(
+            "window".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(inner))),
+        );
+        let err = serialize_globals_strict(&g).unwrap_err();
+        assert_unsupported(err, "NativeFunction", "globals.window.onclick");
+    }
+
+    #[test]
+    fn test_strict_rejects_nested_in_array() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Object(std::ptr::null_mut())]);
+        let mut g = HashMap::new();
+        g.insert("xs".to_string(), arr);
+        let err = serialize_globals_strict(&g).unwrap_err();
+        assert_unsupported(err, "Object", "globals.xs[1]");
+    }
+
+    #[test]
+    fn test_strict_error_display_includes_class_and_path() {
+        let mut g = HashMap::new();
+        g.insert(
+            "cb".to_string(),
+            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+        );
+        let err = serialize_globals_strict(&g).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NativeFunction") && msg.contains("globals.cb"),
+            "diagnostic should mention class and path: {msg}"
         );
     }
 }

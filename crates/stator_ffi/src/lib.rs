@@ -12018,6 +12018,7 @@ fn message_kind_for_error(
             }
         }
         E::DebuggerPaused { .. } => StatorMessageKind::StatorMessageKindInternal,
+        E::SnapshotUnsupportedValue { .. } => StatorMessageKind::StatorMessageKindInternal,
     }
 }
 

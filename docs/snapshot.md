@@ -74,6 +74,19 @@ These limitations are why a new *warm-context* contract is needed before
 Edge can ship Stator behind a snapshot boundary equivalent to V8
 `mksnapshot` / `SnapshotCreator`.
 
+> **Implemented today (legacy `STSS`):** the engine now exposes
+> `snapshot::serialize_globals_strict`, a strict-mode counterpart to the
+> legacy lossy `serialize_globals`.  It fails closed with the structured
+> [`StatorError::SnapshotUnsupportedValue { class, path, reason }`]
+> diagnostic the first time it encounters any heap value class the v2
+> binary format cannot losslessly capture (`NativeFunction`, raw
+> `Object` GC pointers, `Generator`, `Iterator`, `Promise`, `Context`,
+> `Proxy`, `ArrayBuffer`, `TypedArray`, `DataView`, `TheHole`), including
+> when reached transitively through `Array`, `PlainObject`, or
+> `ModuleBinding` values.  This matches the rejection policy specified
+> for the future `STWC` warm-context format and is the migration target
+> for embedders that must never silently downgrade unsupported state.
+
 ---
 
 ## 2. Goals and non-goals

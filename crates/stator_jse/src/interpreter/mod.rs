@@ -12320,7 +12320,8 @@ impl Interpreter {
             StatorError::OutOfMemory
             | StatorError::Internal(_)
             | StatorError::DebuggerPaused { .. }
-            | StatorError::SandboxViolation { .. } => None,
+            | StatorError::SandboxViolation { .. }
+            | StatorError::SnapshotUnsupportedValue { .. } => None,
         }
     }
 

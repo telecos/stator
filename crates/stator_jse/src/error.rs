@@ -82,6 +82,35 @@ pub enum StatorError {
         /// Size of the sandbox virtual-address range in bytes.
         sandbox_size: usize,
     },
+
+    /// A strict snapshot serializer encountered a heap value that cannot be
+    /// safely captured.
+    ///
+    /// This is returned by the strict serialization entry points (e.g.
+    /// [`crate::snapshot::serialize_globals_strict`]) instead of silently
+    /// downgrading the value to `Undefined`, so embedders fail closed when
+    /// asked to persist unsupported host/native state — native function
+    /// closures, raw `Object` GC pointers, generators, iterators, promises,
+    /// contexts, proxies, ArrayBuffers / TypedArrays / DataViews, internal
+    /// `TheHole` sentinels, or any other non-deterministic host wrapper.
+    #[error(
+        "snapshot: unsupported heap value of class `{class}` at `{path}`{}",
+        match reason {
+            Some(r) => format!(": {r}"),
+            None => String::new(),
+        }
+    )]
+    SnapshotUnsupportedValue {
+        /// Symbolic name of the rejected value class
+        /// (e.g. `"NativeFunction"`, `"Promise"`, `"Proxy"`).
+        class: &'static str,
+        /// Dotted path from the snapshot root to the rejected value
+        /// (e.g. `"globals.window.document"` or `"globals.arr[3].cb"`).
+        path: String,
+        /// Optional free-form reason describing why this class is unsafe to
+        /// serialize for warm-context snapshots.
+        reason: Option<&'static str>,
+    },
 }
 
 /// Convenient `Result` alias for fallible engine operations.
