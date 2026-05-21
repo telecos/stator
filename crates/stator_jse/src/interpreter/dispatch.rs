@@ -46,6 +46,7 @@ use crate::bytecode::bytecode_array::{
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
+use crate::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use crate::objects::js_object::JsObject;
 use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
@@ -3916,6 +3917,14 @@ fn handle_lda_named_property(
     // ── Merged IC fast paths (mono → mega → proto) ──────────────────
     // A single outer guard + single RefCell borrow covers all three IC
     // tiers, saving 1-2 borrow/drop round-trips per hot iteration.
+    let ic_eligible = slot != u32::MAX
+        && matches!(
+            obj,
+            JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Function(_)
+        );
+    if ic_eligible {
+        ic_counters::record_probe(IcTier::Interpreter, IcOp::NamedLoad);
+    }
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
     {
@@ -3928,6 +3937,7 @@ fn handle_lda_named_property(
             && let Some(val) = pm.get_by_offset(cached_offset)
         {
             ctx.frame.accumulator = val.resolve_live_binding();
+            ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
         }
 
@@ -3945,6 +3955,7 @@ fn handle_lda_named_property(
                     let v = val.resolve_live_binding();
                     drop(pm);
                     ctx.frame.accumulator = v;
+                    ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
                 }
             } else {
@@ -3960,6 +3971,7 @@ fn handle_lda_named_property(
                         drop(proto_pm);
                         drop(pm);
                         ctx.frame.accumulator = v;
+                        ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
                         return Ok(DispatchAction::Continue);
                     }
                 }
@@ -3975,6 +3987,7 @@ fn handle_lda_named_property(
             .and_then(|cache| cache.probe_epoch(slot, layout, global_epoch))
         {
             ctx.frame.accumulator = ic.value.cheap_clone();
+            ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
         }
         if let Some(ic) = ctx
@@ -3985,6 +3998,7 @@ fn handle_lda_named_property(
             && ic.proto_generation == pm.proto_generation_with_epoch(global_epoch)
         {
             ctx.frame.accumulator = ic.value.cheap_clone();
+            ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
         }
     }
@@ -4005,6 +4019,7 @@ fn handle_lda_named_property(
             for &(cached_ptr, ref cached_val) in entries {
                 if cached_ptr == ptr {
                     ctx.frame.accumulator = cached_val.cheap_clone();
+                    ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -4020,6 +4035,9 @@ fn handle_lda_named_property(
                 "undefined"
             }
         )));
+    }
+    if ic_eligible {
+        ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
     }
     let mut inherited_proto_depth = None;
     let result = if let Some(result) = try_fast_named_property_lookup(&obj, &prop_name) {
@@ -4118,6 +4136,13 @@ fn handle_lda_named_property(
                                 }
                             }
                             ctx.frame.accumulator = result;
+                            if ic_eligible {
+                                ic_counters::record(
+                                    IcTier::Interpreter,
+                                    IcOp::NamedLoad,
+                                    IcEvent::Transition,
+                                );
+                            }
                             return Ok(DispatchAction::Continue);
                         }
                     }
@@ -4162,6 +4187,9 @@ fn handle_lda_named_property(
         }
     }
     ctx.frame.accumulator = result;
+    if ic_eligible {
+        ic_counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Transition);
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -4208,6 +4236,10 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
+            let ic_eligible = slot != u32::MAX;
+            if ic_eligible {
+                ic_counters::record_probe(IcTier::Interpreter, IcOp::NamedStore);
+            }
             // ── Monomorphic IC fast path for store ─────────────────────────
             // Mirror of the load mono-IC: cached (layout, offset) per slot.
             if slot != u32::MAX
@@ -4221,6 +4253,7 @@ fn handle_sta_named_property(
                     drop(pm);
                     map.borrow_mut().set_by_offset(cached_offset, val);
                     invalidate_plain_object_caches(ctx, map);
+                    ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -4249,6 +4282,7 @@ fn handle_sta_named_property(
                                 !entries.is_empty()
                             });
                         }
+                        ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                         return Ok(DispatchAction::Continue);
                     }
                     // Non-writable: TypeError in strict mode, silently ignore in sloppy.
@@ -4259,6 +4293,9 @@ fn handle_sta_named_property(
                     }
                     return Ok(DispatchAction::Continue);
                 }
+            }
+            if ic_eligible {
+                ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
             }
             // Check for setter accessor first (own object).
             if map.borrow().has_accessors {
@@ -4369,6 +4406,13 @@ fn handle_sta_named_property(
                             !entries.is_empty()
                         });
                     }
+                    if ic_eligible {
+                        ic_counters::record(
+                            IcTier::Interpreter,
+                            IcOp::NamedStore,
+                            IcEvent::Transition,
+                        );
+                    }
                     return Ok(DispatchAction::Continue);
                 }
                 Err(val) => map.borrow_mut().insert_rc(Rc::clone(&prop_name), val),
@@ -4403,6 +4447,9 @@ fn handle_sta_named_property(
                     entries.retain(|(ptr, _)| *ptr != map_ptr);
                     !entries.is_empty()
                 });
+            }
+            if ic_eligible {
+                ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Transition);
             }
         }
         JsValue::Function(ref ba) => {
@@ -4444,6 +4491,7 @@ fn handle_lda_keyed_property(
     let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaKeyedProperty", 0));
     };
+    ic_counters::record_probe(IcTier::Interpreter, IcOp::IndexedLoad);
     // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
     // Skips to_property_key (String alloc), getter check (format! alloc),
     // and prototype chain walk.  Numeric keys on arrays never have getters.
@@ -4470,6 +4518,7 @@ fn handle_lda_keyed_property(
             } else {
                 JsValue::Undefined
             };
+            ic_counters::record(IcTier::Interpreter, IcOp::IndexedLoad, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
         } else if let JsValue::PlainObject(map) = obj {
             let borrow = map.borrow();
@@ -4482,6 +4531,7 @@ fn handle_lda_keyed_property(
                     let result = val.resolve_live_binding();
                     drop(borrow);
                     ctx.frame.accumulator = result;
+                    ic_counters::record(IcTier::Interpreter, IcOp::IndexedLoad, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -4504,6 +4554,7 @@ fn handle_lda_keyed_property(
         )));
     }
     ctx.frame.accumulator = keyed_load(&obj, &key)?;
+    ic_counters::record(IcTier::Interpreter, IcOp::IndexedLoad, IcEvent::Miss);
     Ok(DispatchAction::Continue)
 }
 
@@ -4517,6 +4568,7 @@ fn handle_sta_keyed_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("StaKeyedProperty", 1));
     };
+    ic_counters::record_probe(IcTier::Interpreter, IcOp::IndexedStore);
     // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
     // Skips setter check, prototype walk, writable check, and string alloc.
     // Numeric indices on array-like PlainObjects never have setter accessors.
@@ -4542,6 +4594,7 @@ fn handle_sta_keyed_property(
                 v.resize(i, JsValue::TheHole);
                 v.push(val);
             }
+            ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
         } else if let JsValue::PlainObject(map) = obj_ref {
             // SAFETY: single-threaded interpreter; no concurrent borrows.
@@ -4563,10 +4616,12 @@ fn handle_sta_keyed_property(
                 if i >= cur_len {
                     m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
                 }
+                ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
                 return Ok(DispatchAction::Continue);
             }
         }
     }
+    ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Miss);
     // ── General path ─────────────────────────────────────────────────
     let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     let key = ctx.frame.read_reg(key_v)?.cheap_clone();

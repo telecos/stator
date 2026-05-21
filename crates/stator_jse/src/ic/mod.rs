@@ -82,11 +82,17 @@
 //! assert_eq!(val2, JsValue::Smi(42));
 //! ```
 
+/// Release-safe per-tier inline-cache probe/hit/miss/transition counters.
+///
+/// See module docs for schema, FFI exposure and tier limitations.
+pub mod counters;
+
 use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::feedback::{FeedbackVector, InlineCacheState};
 use crate::error::StatorResult;
+use crate::ic::counters::{IcEvent, IcOp, IcTier};
 use crate::objects::js_object::JsObject;
 use crate::objects::shapes::{ShapeId, ShapeTable};
 use crate::objects::value::JsValue;
@@ -316,11 +322,13 @@ impl PropertyLoadIc {
         table: &ShapeTable,
         mut stats: Option<&mut IcStats>,
     ) -> JsValue {
+        counters::record_probe(IcTier::Interpreter, IcOp::NamedLoad);
         match feedback.get_state(slot) {
             None => {
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
                 obj.get_property(key)
             }
 
@@ -332,10 +340,12 @@ impl PropertyLoadIc {
                     if let Some(s) = stats.as_mut() {
                         s.transitions += 1;
                     }
+                    counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Transition);
                 }
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
                 val
             }
 
@@ -346,6 +356,7 @@ impl PropertyLoadIc {
                         if let Some(s) = stats.as_mut() {
                             s.mono_hits += 1;
                         }
+                        counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
                         return obj
                             .get_fast_property_at_index(entry.fast_index)
                             .unwrap_or(JsValue::Undefined);
@@ -361,10 +372,12 @@ impl PropertyLoadIc {
                     if let Some(s) = stats.as_mut() {
                         s.transitions += 1;
                     }
+                    counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Transition);
                 }
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
                 obj.get_property(key)
             }
 
@@ -374,6 +387,7 @@ impl PropertyLoadIc {
                     if let Some(s) = stats.as_mut() {
                         s.poly_hits += 1;
                     }
+                    counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Hit);
                     return obj
                         .get_fast_property_at_index(entry.fast_index)
                         .unwrap_or(JsValue::Undefined);
@@ -389,11 +403,13 @@ impl PropertyLoadIc {
                         if let Some(s) = stats.as_mut() {
                             s.transitions += 1;
                         }
+                        counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Transition);
                     }
                 }
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
                 obj.get_property(key)
             }
 
@@ -401,6 +417,7 @@ impl PropertyLoadIc {
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedLoad, IcEvent::Miss);
                 obj.get_property(key)
             }
         }
@@ -495,11 +512,13 @@ impl PropertyStoreIc {
         table: &ShapeTable,
         mut stats: Option<&mut IcStats>,
     ) -> StatorResult<()> {
+        counters::record_probe(IcTier::Interpreter, IcOp::NamedStore);
         match feedback.get_state(slot) {
             None => {
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
                 obj.set_property(key, value)
             }
 
@@ -511,10 +530,12 @@ impl PropertyStoreIc {
                     if let Some(s) = stats.as_mut() {
                         s.transitions += 1;
                     }
+                    counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Transition);
                 }
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
                 Ok(())
             }
 
@@ -527,6 +548,7 @@ impl PropertyStoreIc {
                         if let Some(s) = stats.as_mut() {
                             s.mono_hits += 1;
                         }
+                        counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                         return Ok(());
                     }
                     // Shape mismatch: runtime store.
@@ -539,6 +561,11 @@ impl PropertyStoreIc {
                         if let Some(s) = stats.as_mut() {
                             s.transitions += 1;
                         }
+                        counters::record(
+                            IcTier::Interpreter,
+                            IcOp::NamedStore,
+                            IcEvent::Transition,
+                        );
                     }
                 } else {
                     obj.set_property(key, value)?;
@@ -549,6 +576,7 @@ impl PropertyStoreIc {
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
                 Ok(())
             }
 
@@ -560,6 +588,7 @@ impl PropertyStoreIc {
                     if let Some(s) = stats.as_mut() {
                         s.poly_hits += 1;
                     }
+                    counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                     return Ok(());
                 }
                 // Miss: runtime store.
@@ -575,11 +604,17 @@ impl PropertyStoreIc {
                         if let Some(s) = stats.as_mut() {
                             s.transitions += 1;
                         }
+                        counters::record(
+                            IcTier::Interpreter,
+                            IcOp::NamedStore,
+                            IcEvent::Transition,
+                        );
                     }
                 }
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
                 Ok(())
             }
 
@@ -587,6 +622,7 @@ impl PropertyStoreIc {
                 if let Some(s) = stats.as_mut() {
                     s.misses += 1;
                 }
+                counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Miss);
                 obj.set_property(key, value)
             }
         }
@@ -638,18 +674,23 @@ impl CallIc {
         let Some(id) = callee_identity(callee) else {
             return;
         };
+        counters::record_probe(IcTier::Interpreter, IcOp::Call);
         match feedback.get_state(slot) {
             None => {}
 
             Some(InlineCacheState::Uninitialized) => {
                 self.callee_ids.push(id);
                 feedback.transition(slot, InlineCacheState::Monomorphic);
+                counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Transition);
             }
 
             Some(InlineCacheState::Monomorphic) => {
                 if !self.callee_ids.iter().any(|&p| std::ptr::eq(p, id)) {
                     self.callee_ids.push(id);
                     feedback.transition(slot, InlineCacheState::Polymorphic);
+                    counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Transition);
+                } else {
+                    counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Hit);
                 }
             }
 
@@ -658,14 +699,19 @@ impl CallIc {
                     if self.callee_ids.len() >= POLY_MAX {
                         self.callee_ids.clear();
                         feedback.transition(slot, InlineCacheState::Megamorphic);
+                        counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Transition);
                     } else {
                         self.callee_ids.push(id);
+                        counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Transition);
                     }
+                } else {
+                    counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Hit);
                 }
             }
 
             Some(InlineCacheState::Megamorphic) => {
                 // Already megamorphic; nothing more to record.
+                counters::record(IcTier::Interpreter, IcOp::Call, IcEvent::Miss);
             }
         }
     }

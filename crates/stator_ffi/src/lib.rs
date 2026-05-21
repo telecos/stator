@@ -38,6 +38,7 @@ use stator_jse::dom::{
 };
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostDynamicImportRequest, HostImportMeta, HostModuleLoader};
+use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
 };
@@ -79,7 +80,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 11;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 12;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -902,6 +903,157 @@ pub unsafe extern "C" fn stator_isolate_get_deopt_histogram_stats(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_reset_deopt_histogram_stats(_isolate: *mut StatorIsolate) {
     deopt_counters::reset();
+}
+
+/// Number of execution tiers carried by [`StatorIcCountersStats`].
+pub const STATOR_IC_TIER_COUNT: usize = 4;
+
+/// Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+pub const STATOR_IC_OP_COUNT: usize = 5;
+
+/// Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+pub const STATOR_IC_EVENT_COUNT: usize = 4;
+
+/// Per-event inline-cache counters for one (tier, op) cell.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorIcEventCounts {
+    /// IC site was probed (regardless of hit/miss outcome).
+    pub probe: u64,
+    /// IC fast path satisfied the operation without falling back.
+    pub hit: u64,
+    /// IC fast path could not satisfy the operation; slow path ran.
+    pub miss: u64,
+    /// IC state machine advanced (cache populated / shape transition).
+    pub transition: u64,
+}
+
+impl StatorIcEventCounts {
+    fn from_snapshot(snap: &ic_counters::IcOpSnapshot) -> Self {
+        Self {
+            probe: snap.count(IcEvent::Probe),
+            hit: snap.count(IcEvent::Hit),
+            miss: snap.count(IcEvent::Miss),
+            transition: snap.count(IcEvent::Transition),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.probe + self.hit + self.miss + self.transition
+    }
+}
+
+/// Per-operation inline-cache counters for one execution tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorIcOpCounters {
+    /// Named-property load IC counters (`obj.prop`).
+    pub named_load: StatorIcEventCounts,
+    /// Named-property store IC counters (`obj.prop = v`).
+    pub named_store: StatorIcEventCounts,
+    /// Keyed/indexed load IC counters (`obj[k]`).
+    pub indexed_load: StatorIcEventCounts,
+    /// Keyed/indexed store IC counters (`obj[k] = v`).
+    pub indexed_store: StatorIcEventCounts,
+    /// Call IC counters (callee specialization at call sites).
+    pub call: StatorIcEventCounts,
+}
+
+impl StatorIcOpCounters {
+    fn from_snapshot(snap: &ic_counters::IcTierSnapshot) -> Self {
+        Self {
+            named_load: StatorIcEventCounts::from_snapshot(snap.for_op(IcOp::NamedLoad)),
+            named_store: StatorIcEventCounts::from_snapshot(snap.for_op(IcOp::NamedStore)),
+            indexed_load: StatorIcEventCounts::from_snapshot(snap.for_op(IcOp::IndexedLoad)),
+            indexed_store: StatorIcEventCounts::from_snapshot(snap.for_op(IcOp::IndexedStore)),
+            call: StatorIcEventCounts::from_snapshot(snap.for_op(IcOp::Call)),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.named_load.total()
+            + self.named_store.total()
+            + self.indexed_load.total()
+            + self.indexed_store.total()
+            + self.call.total()
+    }
+}
+
+/// Stable per-tier inline-cache counter snapshot.
+///
+/// Only the `interpreter` field is currently populated; the JIT tiers
+/// (`baseline`, `maglev`, `turbofan`) are wired into the schema but read zero
+/// because their IC stubs are not yet instrumented (Baseline JIT is the only
+/// JIT tier with IC stubs and they are not wired to these counters yet, and
+/// Turbofan/Cranelift execution is disabled in this build).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorIcCountersStats {
+    /// Interpreter IC counters (the only currently-populated tier).
+    pub interpreter: StatorIcOpCounters,
+    /// Baseline JIT IC counters.  Currently zero; see type docs.
+    pub baseline: StatorIcOpCounters,
+    /// Maglev IC counters.  Currently zero; see type docs.
+    pub maglev: StatorIcOpCounters,
+    /// Turbofan/Cranelift IC counters.  Currently zero; see type docs.
+    pub turbofan: StatorIcOpCounters,
+}
+
+impl StatorIcCountersStats {
+    fn from_engine_snapshot(snapshot: &ic_counters::IcCountersSnapshot) -> Self {
+        Self {
+            interpreter: StatorIcOpCounters::from_snapshot(snapshot.for_tier(IcTier::Interpreter)),
+            baseline: StatorIcOpCounters::from_snapshot(snapshot.for_tier(IcTier::Baseline)),
+            maglev: StatorIcOpCounters::from_snapshot(snapshot.for_tier(IcTier::Maglev)),
+            turbofan: StatorIcOpCounters::from_snapshot(snapshot.for_tier(IcTier::Turbofan)),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.interpreter.total()
+            + self.baseline.total()
+            + self.maglev.total()
+            + self.turbofan.total()
+    }
+}
+
+/// Fill `*stats` with current release-safe per-tier inline-cache counters.
+///
+/// Does nothing when `stats` is null. Passing a null isolate is permitted and
+/// still returns process counters.
+///
+/// # Safety
+/// - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_ic_counters_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorIcCountersStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = ic_counters::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorIcCountersStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset inline-cache counters visible through
+/// `stator_isolate_get_ic_counters_stats`.
+///
+/// A null isolate is accepted; counters are process diagnostics rather than
+/// heap-owned state.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_ic_counters_stats(_isolate: *mut StatorIsolate) {
+    ic_counters::reset();
 }
 
 /// Number of histogram buckets carried by [`StatorTierLatencyTier`].
@@ -29308,6 +29460,72 @@ mod tests {
         let mut after = unsafe { std::mem::zeroed::<StatorDeoptHistogramStats>() };
         // SAFETY: `after` is valid for writes.
         unsafe { stator_isolate_get_deopt_histogram_stats(std::ptr::null(), &mut after) };
+        assert_eq!(after.total(), 0);
+    }
+
+    #[test]
+    fn test_ic_counters_stats_null_safety() {
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_ic_counters_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted and `stats` is valid for writes.
+        let mut stats = unsafe { std::mem::zeroed::<StatorIcCountersStats>() };
+        unsafe { stator_isolate_get_ic_counters_stats(std::ptr::null(), &mut stats) };
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_ic_counters_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_ic_counters_constants_match_engine() {
+        assert_eq!(
+            STATOR_IC_TIER_COUNT,
+            stator_jse::ic::counters::IcTier::COUNT
+        );
+        assert_eq!(STATOR_IC_OP_COUNT, stator_jse::ic::counters::IcOp::COUNT);
+        assert_eq!(
+            STATOR_IC_EVENT_COUNT,
+            stator_jse::ic::counters::IcEvent::COUNT
+        );
+    }
+
+    #[test]
+    fn test_ic_counters_snapshot_roundtrip_via_ffi() {
+        use std::sync::Mutex;
+        static FFI_IC_COUNTERS_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_IC_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null isolate is accepted; we reset before recording.
+        unsafe { stator_isolate_reset_ic_counters_stats(std::ptr::null_mut()) };
+        use stator_jse::ic::counters::{
+            self as ic_counters, IcEvent as Ev, IcOp as Op, IcTier as Tr,
+        };
+        ic_counters::record(Tr::Interpreter, Op::NamedLoad, Ev::Probe);
+        ic_counters::record(Tr::Interpreter, Op::NamedLoad, Ev::Hit);
+        ic_counters::record(Tr::Interpreter, Op::NamedStore, Ev::Miss);
+        ic_counters::record(Tr::Interpreter, Op::IndexedLoad, Ev::Hit);
+        ic_counters::record(Tr::Interpreter, Op::IndexedStore, Ev::Miss);
+        ic_counters::record(Tr::Interpreter, Op::Call, Ev::Transition);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorIcCountersStats>() };
+        // SAFETY: `stats` is valid for writes and a null isolate is accepted.
+        unsafe { stator_isolate_get_ic_counters_stats(std::ptr::null(), &mut stats) };
+        assert_eq!(stats.interpreter.named_load.probe, 1);
+        assert_eq!(stats.interpreter.named_load.hit, 1);
+        assert_eq!(stats.interpreter.named_store.miss, 1);
+        assert_eq!(stats.interpreter.indexed_load.hit, 1);
+        assert_eq!(stats.interpreter.indexed_store.miss, 1);
+        assert_eq!(stats.interpreter.call.transition, 1);
+        assert_eq!(stats.baseline.total(), 0);
+        assert_eq!(stats.maglev.total(), 0);
+        assert_eq!(stats.turbofan.total(), 0);
+
+        // SAFETY: null isolate is accepted.
+        unsafe { stator_isolate_reset_ic_counters_stats(std::ptr::null_mut()) };
+        let mut after = unsafe { std::mem::zeroed::<StatorIcCountersStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_ic_counters_stats(std::ptr::null(), &mut after) };
         assert_eq!(after.total(), 0);
     }
 

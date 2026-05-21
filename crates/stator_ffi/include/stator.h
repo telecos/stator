@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 11
+#define STATOR_FFI_ABI_VERSION_MINOR 12
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -60,6 +60,21 @@
  * Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
  */
 #define STATOR_DEOPT_REASON_COUNT 7
+
+/**
+ * Number of execution tiers carried by [`StatorIcCountersStats`].
+ */
+#define STATOR_IC_TIER_COUNT 4
+
+/**
+ * Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+ */
+#define STATOR_IC_OP_COUNT 5
+
+/**
+ * Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+ */
+#define STATOR_IC_EVENT_COUNT 4
 
 /**
  * Number of histogram buckets carried by [`StatorTierLatencyTier`].
@@ -1243,6 +1258,82 @@ typedef struct StatorDeoptHistogramStats {
    */
   struct StatorDeoptReasonCounts turbofan;
 } StatorDeoptHistogramStats;
+
+/**
+ * Per-event inline-cache counters for one (tier, op) cell.
+ */
+typedef struct StatorIcEventCounts {
+  /**
+   * IC site was probed (regardless of hit/miss outcome).
+   */
+  uint64_t probe;
+  /**
+   * IC fast path satisfied the operation without falling back.
+   */
+  uint64_t hit;
+  /**
+   * IC fast path could not satisfy the operation; slow path ran.
+   */
+  uint64_t miss;
+  /**
+   * IC state machine advanced (cache populated / shape transition).
+   */
+  uint64_t transition;
+} StatorIcEventCounts;
+
+/**
+ * Per-operation inline-cache counters for one execution tier.
+ */
+typedef struct StatorIcOpCounters {
+  /**
+   * Named-property load IC counters (`obj.prop`).
+   */
+  struct StatorIcEventCounts named_load;
+  /**
+   * Named-property store IC counters (`obj.prop = v`).
+   */
+  struct StatorIcEventCounts named_store;
+  /**
+   * Keyed/indexed load IC counters (`obj[k]`).
+   */
+  struct StatorIcEventCounts indexed_load;
+  /**
+   * Keyed/indexed store IC counters (`obj[k] = v`).
+   */
+  struct StatorIcEventCounts indexed_store;
+  /**
+   * Call IC counters (callee specialization at call sites).
+   */
+  struct StatorIcEventCounts call;
+} StatorIcOpCounters;
+
+/**
+ * Stable per-tier inline-cache counter snapshot.
+ *
+ * Only the `interpreter` field is currently populated; the JIT tiers
+ * (`baseline`, `maglev`, `turbofan`) are wired into the schema but read zero
+ * because their IC stubs are not yet instrumented (Baseline JIT is the only
+ * JIT tier with IC stubs and they are not wired to these counters yet, and
+ * Turbofan/Cranelift execution is disabled in this build).
+ */
+typedef struct StatorIcCountersStats {
+  /**
+   * Interpreter IC counters (the only currently-populated tier).
+   */
+  struct StatorIcOpCounters interpreter;
+  /**
+   * Baseline JIT IC counters.  Currently zero; see type docs.
+   */
+  struct StatorIcOpCounters baseline;
+  /**
+   * Maglev IC counters.  Currently zero; see type docs.
+   */
+  struct StatorIcOpCounters maglev;
+  /**
+   * Turbofan/Cranelift IC counters.  Currently zero; see type docs.
+   */
+  struct StatorIcOpCounters turbofan;
+} StatorIcCountersStats;
 
 /**
  * Per-tier portion of [`StatorTierLatencyStats`].
@@ -2716,6 +2807,31 @@ void stator_isolate_get_deopt_histogram_stats(const struct StatorIsolate *_isola
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_deopt_histogram_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with current release-safe per-tier inline-cache counters.
+ *
+ * Does nothing when `stats` is null. Passing a null isolate is permitted and
+ * still returns process counters.
+ *
+ * # Safety
+ * - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes.
+ */
+void stator_isolate_get_ic_counters_stats(const struct StatorIsolate *_isolate,
+                                          struct StatorIcCountersStats *stats);
+
+/**
+ * Reset inline-cache counters visible through
+ * `stator_isolate_get_ic_counters_stats`.
+ *
+ * A null isolate is accepted; counters are process diagnostics rather than
+ * heap-owned state.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_ic_counters_stats(struct StatorIsolate *_isolate);
 
 /**
  * Fill `*stats` with the current tier-promotion latency counters.

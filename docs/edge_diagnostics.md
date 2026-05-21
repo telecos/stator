@@ -147,6 +147,72 @@ printf("maglev stub fallback deopts=%llu\n",
 Both FFI calls accept a null `StatorIsolate*` because the histogram is
 process-global. `STATOR_DEOPT_TIER_COUNT` and `STATOR_DEOPT_REASON_COUNT`
 mirror the Rust tier/reason enum counts and are enforced by FFI tests.
+
+## Inline-cache counters
+
+Stator records release-safe per-tier inline-cache (IC) probe / hit / miss
+/ transition counters so that Edge proof runs can attribute slow paths to
+specific operation kinds.  The counter table is keyed by
+`(IcTier, IcOp, IcEvent)`:
+
+| Dimension | Variants |
+| --------- | -------- |
+| `IcTier`  | `Interpreter`, `Baseline`, `Maglev`, `Turbofan` |
+| `IcOp`    | `NamedLoad`, `NamedStore`, `IndexedLoad`, `IndexedStore`, `Call` |
+| `IcEvent` | `Probe`, `Hit`, `Miss`, `Transition` |
+
+The full snapshot has shape `4 × 5 × 4 = 80` cells.
+
+### Current tier limitations
+
+Only the `Interpreter` row is populated today. The interpreter is the only
+consistently active IC source in this build: the Baseline JIT is gated off
+in default workloads, Turbofan/Cranelift execution is disabled while
+correctness issues are being fixed, and Baseline's `jit_runtime_*` IC stubs
+do not yet feed these global counters.  The `Baseline`, `Maglev`, and
+`Turbofan` rows are wired into the schema so embedders can rely on a
+stable layout, but they read zero until the corresponding JIT IC stubs are
+instrumented in a follow-up.
+
+For named-property load and store, an IC site is considered "eligible" and
+counted when the bytecode carries a non-sentinel feedback slot and the
+receiver is a `PlainObject` / `Array` / `Function` (load) or `PlainObject`
+(store).  For keyed/indexed access, every Smi-key receiver is probed.
+
+### Rust API
+
+```rust
+use stator_jse::ic::counters::{self, IcEvent, IcOp, IcTier};
+
+counters::reset();
+// ... run workload ...
+let snap = counters::snapshot();
+let interp_named_load = snap
+    .for_tier(IcTier::Interpreter)
+    .for_op(IcOp::NamedLoad);
+let hit_rate = interp_named_load.count(IcEvent::Hit) as f64
+    / interp_named_load.count(IcEvent::Probe).max(1) as f64;
+println!("interpreter named-load IC hit rate = {hit_rate:.3}");
+```
+
+### C FFI
+
+```c
+StatorIcCountersStats stats = {0};
+stator_isolate_reset_ic_counters_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_ic_counters_stats(NULL, &stats);
+printf("interp named-load hits=%llu miss=%llu transitions=%llu\n",
+       (unsigned long long) stats.interpreter.named_load.hit,
+       (unsigned long long) stats.interpreter.named_load.miss,
+       (unsigned long long) stats.interpreter.named_load.transition);
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the counters are
+process-global. `STATOR_IC_TIER_COUNT`, `STATOR_IC_OP_COUNT`, and
+`STATOR_IC_EVENT_COUNT` mirror the Rust enum counts and are enforced by
+FFI tests.
+
 ## Related counters
 
 - **`stator_jse::compiler::compile_counters`** — per-tier
