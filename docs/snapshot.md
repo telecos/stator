@@ -527,21 +527,287 @@ The implementation slices must land tests in `crates/stator_jse`,
 
 ## 10. Release artefact expectations
 
-When the implementation slices ship, a tagged release MUST include:
+Edge consumes Stator as a vendored component, so every tagged Stator
+release that ships a warm-context snapshot MUST publish a fully
+self-describing artefact bundle that Edge's vendoring tooling can
+ingest without out-of-band coordination.  The bundle is the *only*
+supported source of warm-context snapshots used in shipping Edge
+builds; ad-hoc snapshots produced on developer machines MUST NOT be
+checked into Edge's vendored tree.
 
-- `stator-snapshot-spec-v1.md` (frozen copy of this document, header
-  bumped to *Status: Frozen*).
-- The regenerated `stator.h` exposing the §8 FFI surface.
-- A `snapshots/` directory in the release tarball containing a
-  reference warm-context snapshot produced from the canonical
-  bootstrap script, alongside its `BuildId`, `manifest_hash`, and
-  BLAKE3 digest in a sidecar `manifest.json`.
-- An updated `RELEASES.md` entry that records the bumped
-  `STATOR_FFI_ABI_VERSION` and lists the new `SnapshotError` variants
-  as a stability checkpoint.
-- The Edge prepublish gate (see commit `aa8f1b2f`) extended to
-  verify that the shipped snapshot loads cleanly into a freshly
-  built engine with the matching manifest.
+### 10.1 Artefact bundle layout
+
+A release tag `vX.Y.Z` produces a single bundle published as a GitHub
+release asset and mirrored to Edge's internal package store.  Per
+supported target triple the bundle is named:
+
+```text
+stator-warm-snapshot-<crate_ver>-<target_triple>-<profile>.tar.zst
+```
+
+where `<crate_ver>` is the `stator_jse` Cargo version (which must
+equal `stator_ffi`'s version at release time), `<target_triple>` is a
+rustc target triple (e.g. `x86_64-pc-windows-msvc`,
+`aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
+`aarch64-apple-darwin`), and `<profile>` is `release` or
+`release-edge` (the Edge-tuned Cargo profile defined in the workspace
+`Cargo.toml`).  Bundles for `dev`/`debug` profiles MUST NOT be
+published; they are rejected by the prepublish gate.
+
+The decompressed bundle has a fixed directory layout:
+
+```text
+stator-warm-snapshot-<crate_ver>-<target_triple>-<profile>/
+├── manifest.json                  # canonical metadata, see §10.2
+├── manifest.json.blake3           # BLAKE3 digest of manifest.json (lower-hex)
+├── manifest.json.sig              # detached signature, see §10.4
+├── stator.h                       # cbindgen-generated header for this release
+├── stator.h.blake3
+├── CHANGELOG.md                   # release notes section for this tag
+├── snapshots/
+│   ├── edge-bootstrap.stwc        # canonical warm-context snapshot
+│   ├── edge-bootstrap.stwc.blake3
+│   ├── edge-bootstrap.stwc.sig
+│   ├── edge-bootstrap.manifest.json  # callback manifest source (sorted)
+│   └── edge-bootstrap.warmup.js   # exact bootstrap script used
+├── callback-manifest/
+│   ├── manifest.toml              # human-editable manifest source
+│   └── manifest.blake3            # mirrors header `manifest_hash` value
+└── validation/
+    ├── validate.ps1               # Windows verification entry-point
+    ├── validate.sh                # POSIX verification entry-point
+    └── expected-header.json       # decoded header expected by validators
+```
+
+All filenames are stable across releases.  Tooling that needs to
+locate a specific file MUST do so by path, not by globbing, so future
+additions cannot silently shadow expected files.
+
+Bundles for additional snapshot variants (for example, an extra
+warm-context produced from a different bootstrap script) are placed
+side-by-side in `snapshots/<variant>.stwc` with matching `.blake3`,
+`.sig`, `.manifest.json`, and `.warmup.js` siblings.  Every variant
+is independently listed in `manifest.json` (see §10.2).
+
+### 10.2 `manifest.json` fields
+
+`manifest.json` is the single source of truth for the bundle.  It is
+canonicalised as JCS (RFC 8785) before hashing so the BLAKE3 digest
+and signature are reproducible.  Required top-level fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | string | Always `"stator.warm-snapshot.manifest/v1"`. |
+| `release_tag` | string | Git tag, e.g. `"v0.4.0"`. |
+| `released_at` | string | RFC 3339 UTC timestamp of the build. |
+| `repository_url` | string | Canonical Stator repo URL. |
+| `commit_id` | string | Full 40-char git SHA of the release commit. |
+| `crate_versions.stator_jse` | string | semver of `stator_jse`. |
+| `crate_versions.stator_ffi` | string | semver of `stator_ffi`. |
+| `crate_versions.st8` | string | semver of `st8` at this tag. |
+| `ffi_abi_version` | integer | Decimal value of `STATOR_FFI_ABI_VERSION`. |
+| `snapshot_format_version` | integer | `STWC` header `snapshot_format_ver`. |
+| `bytecode_format_version` | integer | `STWC` header `bytecode_format_ver`. |
+| `rust_toolchain` | string | Output of `rustc -V` used for the build. |
+| `cargo_profile` | string | `release` or `release-edge`. |
+| `target_triple` | string | rustc target triple matching the bundle name. |
+| `os` | string | Target OS component (`windows`, `linux`, `macos`). |
+| `arch` | string | Target arch component (`x86_64`, `aarch64`). |
+| `pointer_width` | integer | 4 or 8. |
+| `endianness` | string | `"little"` or `"big"`. |
+| `build_id` | string | Lower-hex BLAKE3 fingerprint of the engine build (mirrors `STWC` header `build_id`). |
+| `build_features_hash` | string | Lower-hex BLAKE3, mirrors `STWC` header. |
+| `jit_tiering_hash` | string | Lower-hex BLAKE3, mirrors `STWC` header. |
+| `cpu_features_hash` | string | Lower-hex BLAKE3, mirrors `STWC` header. |
+| `cpu_baseline` | object | Human-readable enumeration of required CPU features (e.g. `{"x86_64": ["sse4.2", "popcnt"]}`); informational, hashed into `cpu_features_hash`. |
+| `enabled_features` | array of strings | Sorted Cargo features enabled at build time. |
+| `enabled_cfgs` | array of strings | Sorted non-default `rustc --cfg` keys (e.g. `gc=marksweep`, `inspector`). |
+| `callback_manifest.hash` | string | Lower-hex BLAKE3 mirroring `STWC` header `manifest_hash`. |
+| `callback_manifest.ids` | array of strings | Sorted callback ids included in the manifest. |
+| `callback_manifest.source_path` | string | Path within the bundle to the manifest source file. |
+| `snapshots[]` | array | One entry per `.stwc` file in `snapshots/`. |
+| `snapshots[].name` | string | File basename, e.g. `"edge-bootstrap.stwc"`. |
+| `snapshots[].purpose` | string | Short slug, e.g. `"edge-bootstrap"`. |
+| `snapshots[].bytes` | integer | File size in bytes. |
+| `snapshots[].blake3` | string | Lower-hex BLAKE3 of the file. |
+| `snapshots[].header_digest` | string | Lower-hex BLAKE3 of the snapshot's footer `digest` field (mirrors the `STWC` footer). |
+| `snapshots[].warmup_script` | string | Path within the bundle to the exact `.js` source replayed to create the snapshot. |
+| `snapshots[].warmup_script_blake3` | string | BLAKE3 of the warmup script. |
+| `header_digest` | string | Lower-hex BLAKE3 of the canonicalised manifest *excluding* the `header_digest`, `signatures`, and `edge_release_hash` fields.  This is the value Edge feeds back into the loader as the embedder-supplied release metadata hash and is what `STWC` header `edge_release_hash` MUST equal. |
+| `edge_release_hash` | string | Equal to `header_digest`; published as a separate field so Edge tooling can lift it without re-hashing. |
+| `signatures[]` | array | Detached signatures over `manifest.json`'s canonical bytes, see §10.4. |
+| `revoked` | boolean | `false` at publish time.  Flipped to `true` by a follow-up patch release if the bundle is recalled (see §10.6). |
+
+`manifest.json` MUST NOT contain any field not listed above; unknown
+fields cause the prepublish gate and Edge ingestion to reject the
+bundle.
+
+### 10.3 Validation commands
+
+Every bundle is self-validating.  After extracting, an Edge build
+agent runs (Windows):
+
+```powershell
+# 1. Recompute and verify the manifest digest and signature.
+.\validation\validate.ps1 -BundleRoot .
+
+# 2. Verify every per-file digest listed in manifest.json.
+.\validation\validate.ps1 -BundleRoot . -CheckFiles
+
+# 3. Load the reference snapshot into a freshly built engine and
+#    assert the typed-no-op invariant (no JS executed during load).
+.\validation\validate.ps1 -BundleRoot . -Smoke `
+    -StatorLibDir $env:STATOR_LIB_DIR
+```
+
+POSIX agents run the equivalent `validation/validate.sh`.  Both
+scripts:
+
+1. Recompute BLAKE3 of `manifest.json` and compare with
+   `manifest.json.blake3`.
+2. Verify `manifest.json.sig` against the published Stator release
+   public key set (see §10.4).
+3. Iterate `snapshots[]`, recompute BLAKE3 for each file and compare
+   with both `manifest.json` and the `<file>.blake3` sibling.
+4. Decode each `.stwc` header, compare every field with the
+   corresponding `manifest.json` value, and emit a typed diagnostic
+   identifying the first mismatch (mirroring §7 error variants).
+5. (`-Smoke` only) invoke `st8 --warm-snapshot=<path> --no-eval` to
+   exercise `stator_snapshot_from_bytes` +
+   `stator_isolate_create_with_snapshot` against the just-built FFI,
+   asserting that loading succeeds and that no user JS callback was
+   invoked during load.
+6. Exit with status `0` only when every check passes; any failure
+   exits non-zero with the matching `SnapshotError::*` variant name
+   on the last stderr line so CI can bucket failures.
+
+The scripts MUST be hermetic — no network calls, no environment
+inference beyond `STATOR_LIB_DIR` for the smoke step — so any
+embedder can reproduce the same verification offline.
+
+### 10.4 Digests, signing, and key management
+
+- Every artefact (`manifest.json`, `stator.h`, every `.stwc`, every
+  `.warmup.js`, every callback `manifest.toml`) ships with a
+  `<name>.blake3` sibling containing the lower-hex BLAKE3 digest of
+  the file.  Digests are computed over the raw file bytes.
+- `manifest.json` and every `.stwc` are additionally signed with
+  detached Ed25519 signatures stored alongside as `<name>.sig`.  The
+  same signatures are duplicated inside `manifest.json`'s
+  `signatures[]` array (so the manifest carries its own provenance
+  even when distributed without sidecar files) using objects of the
+  form `{ "key_id": "<hex>", "algorithm": "ed25519", "target":
+  "<relative-path>", "signature": "<base64>" }`.
+- Signing keys are owned by the Stator release team and rotated
+  yearly.  The public key set is checked into the Stator repo at
+  `docs/release-keys/` and mirrored to Edge's vendored tree so
+  offline validation never depends on network access.
+- The prepublish gate refuses to upload a bundle whose manifest
+  references a `key_id` not present in `docs/release-keys/`.
+
+### 10.5 Revendor flow
+
+Edge revendors Stator using the following deterministic procedure;
+it is the only supported way to consume a new warm-context snapshot:
+
+1. Download the bundle for every supported target triple from the
+   Stator release page (or the mirror).
+2. Verify each bundle with `validation/validate.sh -Smoke`.  Any
+   failure aborts the revendor with a non-zero exit code; partial
+   updates are not allowed.
+3. Replace the entire `third_party/stator/` directory in Edge's
+   source tree with the new bundle contents; never merge files
+   from two different releases.
+4. Update Edge's component metadata (`third_party/stator/README.chromium`
+   plus the Edge-internal `stator_release.gni`) with the manifest's
+   `release_tag`, `commit_id`, `crate_versions`, `ffi_abi_version`,
+   `snapshot_format_version`, `build_id`, `manifest_hash`, every
+   per-target `header_digest`, and the bundle's BLAKE3.
+5. Pin Edge's build system to the new `STATOR_FFI_ABI_VERSION`
+   (also emitted as a compile-time `static_assert` in
+   `examples/mini_browser/` and in Edge's wrapper) so a stale
+   header cannot link against a refreshed library.
+6. Run Edge's snapshot-load CI step, which calls
+   `validate.ps1 -Smoke` against the freshly built Edge binary —
+   not just the Stator release library — to confirm the snapshot
+   loads under the exact Edge link configuration.
+7. Land the revendor as a single commit whose message records the
+   `release_tag`, `commit_id`, `STATOR_FFI_ABI_VERSION`, and
+   `edge_release_hash` of the new bundle, so bisection can map an
+   Edge regression to an exact Stator artefact without consulting
+   external systems.
+
+A revendor MUST NOT cherry-pick a subset of bundles (e.g. update
+only the Windows artefact); doing so would diverge `build_id` and
+`edge_release_hash` across targets, breaking the loader's
+fail-closed envelope on the unupdated platforms.
+
+### 10.6 Cache invalidation and rollback
+
+Edge persists loaded warm-context snapshots under a content-addressed
+cache keyed by the bundle's `edge_release_hash`.  The following
+events invalidate cache entries and force a re-fetch:
+
+- A revendor that changes any of `crate_versions`, `ffi_abi_version`,
+  `snapshot_format_version`, `bytecode_format_version`, `build_id`,
+  `build_features_hash`, `jit_tiering_hash`, `cpu_features_hash`,
+  `manifest_hash`, or `edge_release_hash`.  Because all of these
+  participate in `header_digest`, *any* substantive change flips
+  `edge_release_hash` and therefore the cache key.
+- A bundle being marked `"revoked": true` in a follow-up patch
+  release (see below).  Edge's update channel publishes the revoked
+  hash list; on next launch the cache evicts matching entries
+  before any load attempt.
+- A loader rejection at runtime (any `SnapshotError::*` variant from
+  §7).  The offending cache entry is quarantined and the loader
+  falls back to cold start; the rejection diagnostic is reported
+  through Edge telemetry bucketed by the `SnapshotError` variant
+  name surfaced via the FFI status detail string.
+
+Rollback procedure when a shipped bundle is found defective:
+
+1. The Stator release team publishes a patch release `vX.Y.Z+1` that
+   re-uses the prior known-good bundle contents but bumps
+   `release_tag` and `released_at` and lists the defective bundle's
+   `edge_release_hash` in a new `revoked_hashes[]` array of the
+   release notes.  A separate `revocations.json` (signed with the
+   same key set) is published alongside for tooling consumption.
+2. Edge's update channel propagates `revocations.json`.  On next
+   launch every Edge instance evicts cache entries matching the
+   listed hashes and refuses to load any snapshot whose
+   `edge_release_hash` appears in the revocation list — even if the
+   bundle is still physically present in the vendored tree.
+3. The Edge revendor for `vX.Y.Z+1` follows §10.5 verbatim.
+4. The defective Stator release is left in place (not deleted) so
+   bisection and post-mortem can still inspect it, but the
+   prepublish gate marks it `revoked: true` so any accidental
+   re-ingestion is rejected.
+
+### 10.7 Prepublish gate
+
+Before a Stator tag is allowed to publish artefacts the prepublish
+gate (extending the workflow introduced in commit `aa8f1b2f`) MUST:
+
+1. Build every supported `(target_triple, profile)` pair.
+2. Regenerate `stator.h` and assert it matches the committed copy
+   byte-for-byte.
+3. Produce the bundle exactly as described in §10.1 from build
+   outputs only — no manual file copies.
+4. Run `validation/validate.sh -Smoke` (or `.ps1` on Windows) on
+   every bundle in a freshly provisioned runner that matches the
+   bundle's target.
+5. Verify `STATOR_FFI_ABI_VERSION` was bumped iff the FFI surface or
+   `STWC` header changed since the previous tag; refuse to publish
+   on mismatch.
+6. Cross-check every `snapshots[].header_digest` value in
+   `manifest.json` against the actual footer digest of each `.stwc`.
+7. Refuse to publish if any bundle's `cargo_profile` is `dev` or
+   `debug`, if `revoked` is `true`, or if `edge_release_hash` is
+   absent or all-zero.
+
+The same gate runs in dry-run mode on every PR that touches the
+snapshot subsystem, so regressions in artefact packaging are caught
+before the tag is cut.
 
 ---
 
