@@ -396,7 +396,7 @@ mod tests {
 
     // ── Host-routed dynamic import and import.meta ─────────────────────────────
 
-    use crate::host::{HostModuleLoader, HostScope};
+    use crate::host::{HostImportMeta, HostModuleLoader, HostScope};
     use std::cell::RefCell;
     use std::rc::Rc as StdRc;
 
@@ -542,6 +542,81 @@ mod tests {
         };
         let url = map.borrow().get("url").cloned();
         assert_eq!(url, Some(Val::String("https://host/page.js".into())));
+    }
+
+    #[test]
+    fn e2e_import_meta_host_population_can_override_url_and_metadata() {
+        struct MetaLoader;
+        impl HostModuleLoader for MetaLoader {
+            fn dynamic_import(
+                &self,
+                _specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<JsValue, crate::builtins::error::JsError> {
+                Ok(JsValue::Undefined)
+            }
+
+            fn resolve(
+                &self,
+                _specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<String, crate::builtins::error::JsError> {
+                Ok("unused".to_string())
+            }
+
+            fn populate_import_meta(
+                &self,
+                mut defaults: HostImportMeta,
+            ) -> Result<HostImportMeta, crate::builtins::error::JsError> {
+                defaults.url = "https://host/overridden.js".to_string();
+                defaults.origin = Some("https://host/".to_string());
+                defaults.referrer_policy = Some("strict-origin".to_string());
+                Ok(defaults)
+            }
+        }
+
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecodes::{Instruction, Opcode, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::objects::value::JsValue as Val;
+
+        let _scope = HostScope::install(
+            Some(StdRc::new(MetaLoader) as StdRc<dyn HostModuleLoader>),
+            Some("https://host/page.js"),
+        );
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        let Val::PlainObject(map) = result else {
+            panic!("expected PlainObject")
+        };
+        let map = map.borrow();
+        assert_eq!(
+            map.get("url"),
+            Some(&Val::String("https://host/overridden.js".into()))
+        );
+        assert_eq!(
+            map.get("origin"),
+            Some(&Val::String("https://host/".into()))
+        );
+        assert_eq!(
+            map.get("referrerPolicy"),
+            Some(&Val::String("strict-origin".into()))
+        );
     }
 
     #[test]

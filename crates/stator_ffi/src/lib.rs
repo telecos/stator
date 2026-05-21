@@ -34,7 +34,7 @@ use stator_jse::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
 use stator_jse::gc::heap::Heap;
-use stator_jse::host::HostModuleLoader;
+use stator_jse::host::{HostImportMeta, HostModuleLoader};
 use stator_jse::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
@@ -830,6 +830,9 @@ pub struct StatorContext {
     /// before module lookup/fetch. When installed, failures from this hook
     /// fail closed and the module resolver is not invoked.
     module_url_resolver: Option<StatorModuleUrlResolver>,
+    /// Optional host callback used to populate `import.meta` before a module
+    /// body can observe it. Failures fail closed with no default fallback.
+    import_meta_populator: Option<StatorImportMetaPopulator>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -863,6 +866,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         embedder_data: Vec::new(),
         module_resolver: None,
         module_url_resolver: None,
+        import_meta_populator: None,
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -1163,6 +1167,59 @@ pub unsafe extern "C" fn stator_context_set_module_url_resolver(
     // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
     // duration of this FFI call. Assignment drops the previous resolver, if any.
     unsafe { (*ctx).module_url_resolver = resolver };
+    true
+}
+
+/// Register, replace, or clear the `import.meta` population callback for `ctx`.
+///
+/// When installed, the callback runs before module evaluation exposes
+/// `import.meta`. Returning a non-`Ok` status fails evaluation closed and
+/// prevents default metadata fallback. Lifetime and cleanup rules match
+/// [`stator_context_set_module_resolver`].
+///
+/// Returns `true` on successful registration or clear, and `false` for a null
+/// context or malformed clear request.
+///
+/// # Safety
+/// The callback and `user_data` lifetime rules match
+/// [`stator_context_set_module_resolver`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_set_import_meta_populator(
+    ctx: *mut StatorContext,
+    callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            referrer: *const StatorModule,
+            origin: *const StatorModuleOrigin,
+            out_meta: *mut StatorImportMetaProperties,
+            out_error: *mut *mut StatorString,
+        ) -> StatorResolveStatus,
+    >,
+    user_data: *mut c_void,
+    free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+
+    let populator = match callback {
+        Some(callback) => Some(StatorImportMetaPopulator {
+            callback,
+            user_data,
+            free_user_data,
+        }),
+        None => {
+            if !user_data.is_null() || free_user_data.is_some() {
+                return false;
+            }
+            None
+        }
+    };
+
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable for the
+    // duration of this FFI call. Assignment drops the previous populator, if any.
+    unsafe { (*ctx).import_meta_populator = populator };
     true
 }
 
@@ -3221,6 +3278,63 @@ pub type StatorModuleUrlResolverCallback = unsafe extern "C" fn(
     out_error: *mut *mut StatorString,
 ) -> StatorResolveStatus;
 
+/// Optional host-owned `import.meta` string overrides.
+///
+/// Hosts initialize the struct to zero/null, populate any fields they want to
+/// override via [`stator_string_new`], and return `StatorResolveStatusOk`.
+/// Stator consumes and frees every non-null field after the callback returns.
+/// Null fields preserve Stator's default URL/source/policy metadata.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorImportMetaProperties {
+    /// Optional replacement for `import.meta.url`.
+    pub url: *mut StatorString,
+    /// Optional `import.meta.origin` value.
+    pub origin: *mut StatorString,
+    /// Optional `import.meta.sourceType` value.
+    pub source_type: *mut StatorString,
+    /// Optional `import.meta.baseURL` value.
+    pub base_url: *mut StatorString,
+    /// Optional `import.meta.integrity` value.
+    pub integrity_metadata: *mut StatorString,
+    /// Optional `import.meta.credentialsMode` value.
+    pub credentials_mode: *mut StatorString,
+    /// Optional `import.meta.referrerPolicy` value.
+    pub referrer_policy: *mut StatorString,
+    /// Optional `import.meta.parserMetadata` value.
+    pub parser_metadata: *mut StatorString,
+}
+
+impl Default for StatorImportMetaProperties {
+    fn default() -> Self {
+        Self {
+            url: std::ptr::null_mut(),
+            origin: std::ptr::null_mut(),
+            source_type: std::ptr::null_mut(),
+            base_url: std::ptr::null_mut(),
+            integrity_metadata: std::ptr::null_mut(),
+            credentials_mode: std::ptr::null_mut(),
+            referrer_policy: std::ptr::null_mut(),
+            parser_metadata: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Synchronous host callback used to populate `import.meta`.
+///
+/// The callback is invoked before a module body observes `import.meta`. It
+/// receives the evaluating module and its origin/policy metadata. Returning a
+/// non-`Ok` status fails evaluation closed; Stator does not fall back to default
+/// fields when the host reports an error.
+pub type StatorImportMetaPopulateCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    user_data: *mut c_void,
+    referrer: *const StatorModule,
+    origin: *const StatorModuleOrigin,
+    out_meta: *mut StatorImportMetaProperties,
+    out_error: *mut *mut StatorString,
+) -> StatorResolveStatus;
+
 struct StatorModuleResolver {
     callback: StatorModuleResolverCallback,
     user_data: *mut c_void,
@@ -3252,6 +3366,24 @@ impl Drop for StatorModuleUrlResolver {
         {
             // SAFETY: the embedder supplied this callback for exactly this
             // resolver-owned `user_data` pointer.
+            unsafe { free_user_data(self.user_data) };
+        }
+    }
+}
+
+struct StatorImportMetaPopulator {
+    callback: StatorImportMetaPopulateCallback,
+    user_data: *mut c_void,
+    free_user_data: Option<StatorUserDataFreeCallback>,
+}
+
+impl Drop for StatorImportMetaPopulator {
+    fn drop(&mut self) {
+        if let Some(free_user_data) = self.free_user_data
+            && !self.user_data.is_null()
+        {
+            // SAFETY: the embedder supplied this callback for exactly this
+            // populator-owned `user_data` pointer.
             unsafe { free_user_data(self.user_data) };
         }
     }
@@ -3558,6 +3690,42 @@ fn module_type_name(source_type: StatorModuleType) -> &'static str {
         StatorModuleType::StatorModuleTypeJson => "JSON",
         StatorModuleType::StatorModuleTypeWebAssembly => "WebAssembly",
         StatorModuleType::StatorModuleTypeCss => "CSS",
+    }
+}
+
+fn credentials_mode_name(mode: StatorCredentialsMode) -> &'static str {
+    match mode {
+        StatorCredentialsMode::StatorCredentialsModeDefault => "default",
+        StatorCredentialsMode::StatorCredentialsModeOmit => "omit",
+        StatorCredentialsMode::StatorCredentialsModeSameOrigin => "same-origin",
+        StatorCredentialsMode::StatorCredentialsModeInclude => "include",
+    }
+}
+
+fn referrer_policy_name(policy: StatorReferrerPolicy) -> &'static str {
+    match policy {
+        StatorReferrerPolicy::StatorReferrerPolicyDefault => "default",
+        StatorReferrerPolicy::StatorReferrerPolicyNoReferrer => "no-referrer",
+        StatorReferrerPolicy::StatorReferrerPolicyNoReferrerWhenDowngrade => {
+            "no-referrer-when-downgrade"
+        }
+        StatorReferrerPolicy::StatorReferrerPolicySameOrigin => "same-origin",
+        StatorReferrerPolicy::StatorReferrerPolicyOrigin => "origin",
+        StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin => "strict-origin",
+        StatorReferrerPolicy::StatorReferrerPolicyOriginWhenCrossOrigin => {
+            "origin-when-cross-origin"
+        }
+        StatorReferrerPolicy::StatorReferrerPolicyStrictOriginWhenCrossOrigin => {
+            "strict-origin-when-cross-origin"
+        }
+        StatorReferrerPolicy::StatorReferrerPolicyUnsafeUrl => "unsafe-url",
+    }
+}
+
+fn parser_metadata_name(metadata: StatorParserMetadata) -> &'static str {
+    match metadata {
+        StatorParserMetadata::StatorParserMetadataNotParserInserted => "not-parser-inserted",
+        StatorParserMetadata::StatorParserMetadataParserInserted => "parser-inserted",
     }
 }
 
@@ -6899,6 +7067,17 @@ unsafe fn take_resolver_string_bytes(out_string: *mut StatorString) -> Option<Ve
     Some(owned.bytes)
 }
 
+unsafe fn take_resolver_string_utf8(
+    out_string: *mut StatorString,
+) -> Result<Option<String>, String> {
+    match unsafe { take_resolver_string_bytes(out_string) } {
+        Some(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| "import.meta callback returned non-UTF-8".to_string()),
+        None => Ok(None),
+    }
+}
+
 fn resolver_status_error(
     status: StatorResolveStatus,
     specifier: &str,
@@ -7004,6 +7183,27 @@ unsafe fn resolve_module_url(
 struct FfiHostModuleLoader {
     ctx: *mut StatorContext,
     referrer: *mut StatorModule,
+}
+
+fn import_meta_defaults_for_module(module: &StatorModule, module_url: String) -> HostImportMeta {
+    let base_url = module
+        .base_url
+        .as_ref()
+        .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+    let integrity_metadata = module
+        .integrity_metadata
+        .as_ref()
+        .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+    HostImportMeta {
+        url: module_url,
+        origin: base_url.clone(),
+        source_type: Some(module_type_name(module.source_type).to_string()),
+        base_url,
+        integrity_metadata,
+        credentials_mode: Some(credentials_mode_name(module.credentials_mode).to_string()),
+        referrer_policy: Some(referrer_policy_name(module.referrer_policy).to_string()),
+        parser_metadata: Some(parser_metadata_name(module.parser_metadata).to_string()),
+    }
 }
 
 impl FfiHostModuleLoader {
@@ -7157,6 +7357,81 @@ impl HostModuleLoader for FfiHostModuleLoader {
             .as_ref()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| specifier.to_string()))
+    }
+
+    fn populate_import_meta(&self, defaults: HostImportMeta) -> Result<HostImportMeta, JsError> {
+        if self.ctx.is_null() || self.referrer.is_null() {
+            return Ok(defaults);
+        }
+        // SAFETY: `referrer` is the live module currently being evaluated.
+        let mut meta = unsafe { import_meta_defaults_for_module(&*self.referrer, defaults.url) };
+        // SAFETY: `ctx` and `referrer` are live for active module evaluation.
+        let (callback, user_data) = match unsafe { (*self.ctx).import_meta_populator.as_ref() } {
+            Some(populator) => (populator.callback, populator.user_data),
+            None => return Ok(meta),
+        };
+
+        // SAFETY: `referrer` is the live module currently being evaluated.
+        let origin = unsafe { module_origin_view(&*self.referrer) };
+        let mut out_meta = StatorImportMetaProperties::default();
+        let mut out_error: *mut StatorString = std::ptr::null_mut();
+        // SAFETY: populator registration guarantees the callback remains
+        // callable while installed. Borrowed module/origin and out pointers are
+        // valid for this synchronous call.
+        let status = unsafe {
+            callback(
+                self.ctx,
+                user_data,
+                self.referrer,
+                &origin,
+                &mut out_meta,
+                &mut out_error,
+            )
+        };
+        // SAFETY: callbacks transfer any non-null detail string to us.
+        let detail = unsafe { take_resolver_error_string(out_error) };
+        if status != StatorResolveStatus::StatorResolveStatusOk {
+            return Err(js_error_from_stator_error(resolver_status_error(
+                status,
+                "import.meta",
+                detail.as_deref(),
+            )));
+        }
+
+        macro_rules! take_meta_string {
+            ($value:expr) => {
+                // SAFETY: import-meta callbacks transfer any non-null strings to us.
+                match unsafe { take_resolver_string_utf8($value) } {
+                    Ok(value) => value,
+                    Err(message) => return Err(JsError::new(ErrorKind::TypeError, message)),
+                }
+            };
+        }
+        if let Some(value) = take_meta_string!(out_meta.url) {
+            meta.url = value;
+        }
+        if let Some(value) = take_meta_string!(out_meta.origin) {
+            meta.origin = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.source_type) {
+            meta.source_type = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.base_url) {
+            meta.base_url = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.integrity_metadata) {
+            meta.integrity_metadata = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.credentials_mode) {
+            meta.credentials_mode = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.referrer_policy) {
+            meta.referrer_policy = Some(value);
+        }
+        if let Some(value) = take_meta_string!(out_meta.parser_metadata) {
+            meta.parser_metadata = Some(value);
+        }
+        Ok(meta)
     }
 }
 
@@ -8539,8 +8814,11 @@ unsafe fn run_module_bytecodes(
         None
     } else {
         // SAFETY: caller guarantees `ctx` is valid when non-null.
-        let has_resolver =
-            unsafe { (*ctx).module_resolver.is_some() || (*ctx).module_url_resolver.is_some() };
+        let has_resolver = unsafe {
+            (*ctx).module_resolver.is_some()
+                || (*ctx).module_url_resolver.is_some()
+                || (*ctx).import_meta_populator.is_some()
+        };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
                 ctx,
@@ -9044,8 +9322,11 @@ where
         None
     } else {
         // SAFETY: caller guarantees `ctx` is valid when non-null.
-        let has_resolver =
-            unsafe { (*ctx).module_resolver.is_some() || (*ctx).module_url_resolver.is_some() };
+        let has_resolver = unsafe {
+            (*ctx).module_resolver.is_some()
+                || (*ctx).module_url_resolver.is_some()
+                || (*ctx).import_meta_populator.is_some()
+        };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
                 ctx,
@@ -18949,6 +19230,127 @@ mod tests {
     }
 
     #[test]
+    fn test_module_evaluate_import_meta_populator_overrides_url() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let module = compile_module_src("import.meta.url;");
+        let url = c"https://app.example.test/root.mjs";
+        let mut data = TestImportMetaData {
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            detail: None,
+            url: Some(b"https://edge.example.test/overridden.mjs".to_vec()),
+            calls: 0,
+            captured_referrer_was_null: true,
+            captured_base_url: None,
+        };
+
+        // SAFETY: pointers and callbacks are valid for this test.
+        unsafe {
+            stator_module_set_origin(module, url.as_ptr(), 0, 0);
+            assert!(stator_context_set_import_meta_populator(
+                ctx,
+                Some(test_import_meta_populator_cb),
+                &mut data as *mut TestImportMetaData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(module, ctx);
+            assert!(!result.is_null());
+            let meta_url = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(meta_url, "https://edge.example.test/overridden.mjs");
+            stator_value_destroy(result);
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
+        assert_eq!(data.calls, 1);
+        assert!(!data.captured_referrer_was_null);
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_exposes_origin_policy_metadata() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let module = compile_module_src("import.meta.referrerPolicy;");
+        let base_url = b"https://app.example.test/base/";
+        let mut data = TestImportMetaData {
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            detail: None,
+            url: None,
+            calls: 0,
+            captured_referrer_was_null: true,
+            captured_base_url: None,
+        };
+
+        // SAFETY: pointers and callbacks are valid for this test.
+        unsafe {
+            assert!(stator_module_set_origin_metadata(
+                module,
+                base_url.as_ptr() as *const c_char,
+                base_url.len(),
+                StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+                std::ptr::null(),
+                0,
+                StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin,
+                StatorParserMetadata::StatorParserMetadataParserInserted,
+            ));
+            assert!(stator_context_set_import_meta_populator(
+                ctx,
+                Some(test_import_meta_populator_cb),
+                &mut data as *mut TestImportMetaData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(module, ctx);
+            assert!(!result.is_null());
+            let referrer_policy = CStr::from_ptr(stator_value_as_string(result))
+                .to_str()
+                .unwrap();
+            assert_eq!(referrer_policy, "strict-origin");
+            stator_value_destroy(result);
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
+        assert_eq!(data.captured_base_url.as_deref(), Some(base_url.as_ref()));
+    }
+
+    #[test]
+    fn test_module_evaluate_import_meta_populator_error_fails_closed() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let module = compile_module_src("import.meta.url;");
+        let mut data = TestImportMetaData {
+            status: StatorResolveStatus::StatorResolveStatusTypeError,
+            detail: Some(b"policy blocked import.meta".to_vec()),
+            url: Some(b"https://should-not-fallback.test/".to_vec()),
+            calls: 0,
+            captured_referrer_was_null: true,
+            captured_base_url: None,
+        };
+
+        // SAFETY: pointers and callbacks are valid for this test.
+        unsafe {
+            assert!(stator_context_set_import_meta_populator(
+                ctx,
+                Some(test_import_meta_populator_cb),
+                &mut data as *mut TestImportMetaData as *mut c_void,
+                None,
+            ));
+            let result = stator_module_evaluate(module, ctx);
+            assert!(result.is_null());
+            let error = CStr::from_ptr(stator_module_get_error(module))
+                .to_str()
+                .unwrap();
+            assert!(error.contains("policy blocked import.meta"), "{error}");
+            stator_module_free(module);
+            stator_context_destroy(ctx);
+        }
+        assert_eq!(data.calls, 1);
+    }
+
+    #[test]
     fn test_module_evaluate_ffi_resolver_replacement_uses_current_resolver() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -24881,6 +25283,63 @@ mod tests {
             captured_base_url: None,
             captured_referrer_was_null: true,
         }
+    }
+
+    struct TestImportMetaData {
+        status: StatorResolveStatus,
+        detail: Option<Vec<u8>>,
+        url: Option<Vec<u8>>,
+        calls: usize,
+        captured_referrer_was_null: bool,
+        captured_base_url: Option<Vec<u8>>,
+    }
+
+    unsafe extern "C" fn test_import_meta_populator_cb(
+        _ctx: *mut StatorContext,
+        user_data: *mut c_void,
+        referrer: *const StatorModule,
+        origin: *const StatorModuleOrigin,
+        out_meta: *mut StatorImportMetaProperties,
+        out_error: *mut *mut StatorString,
+    ) -> StatorResolveStatus {
+        // SAFETY: tests pass a valid import-meta data pointer.
+        let data = unsafe { &mut *(user_data as *mut TestImportMetaData) };
+        data.calls += 1;
+        data.captured_referrer_was_null = referrer.is_null();
+        if !origin.is_null() {
+            // SAFETY: callback contract guarantees `origin` is valid for this call.
+            let view = unsafe { &*origin };
+            data.captured_base_url = if view.base_url.is_null() {
+                None
+            } else {
+                // SAFETY: callback contract guarantees `base_url_len` valid bytes.
+                Some(unsafe {
+                    std::slice::from_raw_parts(view.base_url as *const u8, view.base_url_len)
+                        .to_vec()
+                })
+            };
+        }
+        if !out_error.is_null() {
+            let error = data.detail.as_ref().map_or(std::ptr::null_mut(), |detail| {
+                // SAFETY: detail points to valid bytes for this call.
+                unsafe { stator_string_new(detail.as_ptr() as *const c_char, detail.len()) }
+            });
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_error = error };
+        }
+        if data.status != StatorResolveStatus::StatorResolveStatusOk {
+            return data.status;
+        }
+        if !out_meta.is_null() {
+            let mut meta = StatorImportMetaProperties::default();
+            if let Some(url) = data.url.as_ref() {
+                // SAFETY: url points to valid bytes for this call.
+                meta.url = unsafe { stator_string_new(url.as_ptr() as *const c_char, url.len()) };
+            }
+            // SAFETY: out pointer is valid for one write in this test.
+            unsafe { *out_meta = meta };
+        }
+        StatorResolveStatus::StatorResolveStatusOk
     }
 
     #[test]

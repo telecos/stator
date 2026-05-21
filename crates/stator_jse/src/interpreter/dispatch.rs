@@ -8480,13 +8480,57 @@ fn handle_lda_import_meta(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    use crate::host::{current_loader, current_module_url};
+    use crate::host::{HostImportMeta, current_loader, current_module_url};
 
     let url = current_module_url()
         .map(|u| u.as_ref().to_string())
         .unwrap_or_default();
+    let defaults = HostImportMeta {
+        url,
+        origin: None,
+        source_type: None,
+        base_url: None,
+        integrity_metadata: None,
+        credentials_mode: None,
+        referrer_policy: None,
+        parser_metadata: None,
+    };
+    let meta_fields = match current_loader() {
+        Some(loader) => loader
+            .populate_import_meta(defaults)
+            .map_err(|err| match err.kind {
+                ErrorKind::TypeError => StatorError::TypeError(err.message),
+                ErrorKind::ReferenceError => StatorError::ReferenceError(err.message),
+                ErrorKind::RangeError => StatorError::RangeError(err.message),
+                ErrorKind::SyntaxError => StatorError::SyntaxError(err.message),
+                ErrorKind::URIError => StatorError::URIError(err.message),
+                _ => StatorError::TypeError(err.message),
+            })?,
+        None => defaults,
+    };
     let mut meta = PropertyMap::new();
-    meta.insert("url".into(), JsValue::String(url.into()));
+    meta.insert("url".into(), JsValue::String(meta_fields.url.into()));
+    if let Some(value) = meta_fields.origin {
+        meta.insert("origin".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.source_type {
+        meta.insert("sourceType".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.base_url {
+        meta.insert("baseURL".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.integrity_metadata {
+        meta.insert("integrity".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.credentials_mode {
+        meta.insert("credentialsMode".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.referrer_policy {
+        meta.insert("referrerPolicy".into(), JsValue::String(value.into()));
+    }
+    if let Some(value) = meta_fields.parser_metadata {
+        meta.insert("parserMetadata".into(), JsValue::String(value.into()));
+    }
     meta.insert(
         "resolve".into(),
         JsValue::NativeFunction(Rc::new(|args| {

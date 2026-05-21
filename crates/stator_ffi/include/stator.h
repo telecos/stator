@@ -994,6 +994,49 @@ typedef struct StatorImportAttribute {
 } StatorImportAttribute;
 
 /**
+ * Optional host-owned `import.meta` string overrides.
+ *
+ * Hosts initialize the struct to zero/null, populate any fields they want to
+ * override via [`stator_string_new`], and return `StatorResolveStatusOk`.
+ * Stator consumes and frees every non-null field after the callback returns.
+ * Null fields preserve Stator's default URL/source/policy metadata.
+ */
+typedef struct StatorImportMetaProperties {
+  /**
+   * Optional replacement for `import.meta.url`.
+   */
+  struct StatorString *url;
+  /**
+   * Optional `import.meta.origin` value.
+   */
+  struct StatorString *origin;
+  /**
+   * Optional `import.meta.sourceType` value.
+   */
+  struct StatorString *source_type;
+  /**
+   * Optional `import.meta.baseURL` value.
+   */
+  struct StatorString *base_url;
+  /**
+   * Optional `import.meta.integrity` value.
+   */
+  struct StatorString *integrity_metadata;
+  /**
+   * Optional `import.meta.credentialsMode` value.
+   */
+  struct StatorString *credentials_mode;
+  /**
+   * Optional `import.meta.referrerPolicy` value.
+   */
+  struct StatorString *referrer_policy;
+  /**
+   * Optional `import.meta.parserMetadata` value.
+   */
+  struct StatorString *parser_metadata;
+} StatorImportMetaProperties;
+
+/**
  * Browser-facing source identity and policy options for module compilation.
  *
  * All pointer/length pairs are optional when their length is zero. Non-empty
@@ -1655,6 +1698,21 @@ typedef enum StatorResolveStatus (*StatorModuleUrlResolverCallback)(struct Stato
                                                                     struct StatorString **out_error);
 
 /**
+ * Synchronous host callback used to populate `import.meta`.
+ *
+ * The callback is invoked before a module body observes `import.meta`. It
+ * receives the evaluating module and its origin/policy metadata. Returning a
+ * non-`Ok` status fails evaluation closed; Stator does not fall back to default
+ * fields when the host reports an error.
+ */
+typedef enum StatorResolveStatus (*StatorImportMetaPopulateCallback)(struct StatorContext *ctx,
+                                                                     void *user_data,
+                                                                     const struct StatorModule *referrer,
+                                                                     const struct StatorModuleOrigin *origin,
+                                                                     struct StatorImportMetaProperties *out_meta,
+                                                                     struct StatorString **out_error);
+
+/**
  * Synchronous host-function callback used to fulfil a Wasm import.
  *
  * Invoked synchronously on the thread running the Wasm caller.  Returns
@@ -2312,6 +2370,31 @@ bool stator_context_set_module_url_resolver(struct StatorContext *ctx,
                                                                                  struct StatorString **out_error),
                                             void *user_data,
                                             void (*free_user_data)(void *user_data));
+
+/**
+ * Register, replace, or clear the `import.meta` population callback for `ctx`.
+ *
+ * When installed, the callback runs before module evaluation exposes
+ * `import.meta`. Returning a non-`Ok` status fails evaluation closed and
+ * prevents default metadata fallback. Lifetime and cleanup rules match
+ * [`stator_context_set_module_resolver`].
+ *
+ * Returns `true` on successful registration or clear, and `false` for a null
+ * context or malformed clear request.
+ *
+ * # Safety
+ * The callback and `user_data` lifetime rules match
+ * [`stator_context_set_module_resolver`].
+ */
+bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
+                                              enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
+                                                                                   void *user_data,
+                                                                                   const struct StatorModule *referrer,
+                                                                                   const struct StatorModuleOrigin *origin,
+                                                                                   struct StatorImportMetaProperties *out_meta,
+                                                                                   struct StatorString **out_error),
+                                              void *user_data,
+                                              void (*free_user_data)(void *user_data));
 
 /**
  * Create a new number value.

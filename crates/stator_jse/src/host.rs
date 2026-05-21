@@ -20,6 +20,27 @@ use std::rc::Rc;
 use crate::builtins::error::JsError;
 use crate::objects::value::JsValue;
 
+/// Host-populated fields for an `import.meta` object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostImportMeta {
+    /// Public `import.meta.url` value.
+    pub url: String,
+    /// Optional host origin/base identity.
+    pub origin: Option<String>,
+    /// Optional module source kind metadata.
+    pub source_type: Option<String>,
+    /// Optional browser base URL metadata.
+    pub base_url: Option<String>,
+    /// Optional Subresource Integrity metadata.
+    pub integrity_metadata: Option<String>,
+    /// Optional browser credentials-mode metadata.
+    pub credentials_mode: Option<String>,
+    /// Optional browser referrer-policy metadata.
+    pub referrer_policy: Option<String>,
+    /// Optional HTML parser-metadata classification.
+    pub parser_metadata: Option<String>,
+}
+
 /// Embedder hook for resolving dynamic `import()` and `import.meta.resolve`.
 ///
 /// Implementations are intentionally synchronous: the interpreter
@@ -42,6 +63,15 @@ pub trait HostModuleLoader {
     /// no module URL is currently published.  Returning `Err` causes
     /// the call to throw.
     fn resolve(&self, specifier: &str, referrer: Option<&str>) -> Result<String, JsError>;
+
+    /// Populate host fields for the current module's `import.meta` object.
+    ///
+    /// The default implementation preserves Stator's built-in metadata. Hosts
+    /// may override URL/policy fields or return `Err` to fail module evaluation
+    /// closed before any partially-populated `import.meta` object is exposed.
+    fn populate_import_meta(&self, defaults: HostImportMeta) -> Result<HostImportMeta, JsError> {
+        Ok(defaults)
+    }
 }
 
 thread_local! {
