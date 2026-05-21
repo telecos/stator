@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 10
+#define STATOR_FFI_ABI_VERSION_MINOR 11
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -50,6 +50,16 @@
  * ```
  */
 #define STATOR_FFI_ABI_VERSION (((STATOR_FFI_ABI_VERSION_MAJOR << 16) | (STATOR_FFI_ABI_VERSION_MINOR << 8)) | STATOR_FFI_ABI_VERSION_PATCH)
+
+/**
+ * Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+ */
+#define STATOR_DEOPT_TIER_COUNT 3
+
+/**
+ * Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+ */
+#define STATOR_DEOPT_REASON_COUNT 7
 
 /**
  * Number of histogram buckets carried by [`StatorTierLatencyTier`].
@@ -1179,6 +1189,60 @@ typedef struct StatorTieringStats {
    */
   uint64_t stub_call_counts[24];
 } StatorTieringStats;
+
+/**
+ * Per-reason deopt counters for one JIT tier.
+ */
+typedef struct StatorDeoptReasonCounts {
+  /**
+   * Unsupported opcode/codegen/runtime fallback to a lower tier.
+   */
+  uint64_t unsupported_opcode_or_runtime_fallback;
+  /**
+   * Checked small-integer arithmetic overflow.
+   */
+  uint64_t arithmetic_overflow;
+  /**
+   * Runtime stub could not satisfy a specialised fast path.
+   */
+  uint64_t runtime_stub_fallback;
+  /**
+   * Promoted global load/store fast path failed.
+   */
+  uint64_t global_load_fallback;
+  /**
+   * Embedder termination or interrupt polling requested unwind.
+   */
+  uint64_t termination_interrupt;
+  /**
+   * Integer division by zero would need non-fast-path semantics.
+   */
+  uint64_t division_by_zero;
+  /**
+   * Unknown, internal, or out-of-range deopt sentinel.
+   */
+  uint64_t internal_error;
+} StatorDeoptReasonCounts;
+
+/**
+ * Stable deopt/bailout/fallback histogram snapshot by JIT tier.
+ */
+typedef struct StatorDeoptHistogramStats {
+  /**
+   * Baseline JIT deopt-like bailout counters.  Currently zero because
+   * baseline execution is disabled in this build.
+   */
+  struct StatorDeoptReasonCounts baseline;
+  /**
+   * Maglev deopt counters recorded from real JIT deopt sentinels.
+   */
+  struct StatorDeoptReasonCounts maglev;
+  /**
+   * Turbofan/Cranelift deopt counters.  Currently zero because execution is
+   * disabled while codegen correctness issues are being fixed.
+   */
+  struct StatorDeoptReasonCounts turbofan;
+} StatorDeoptHistogramStats;
 
 /**
  * Per-tier portion of [`StatorTierLatencyStats`].
@@ -2627,6 +2691,31 @@ void stator_isolate_get_tiering_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_tiering_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with current release-safe deopt histograms.
+ *
+ * Does nothing when `stats` is null. Passing a null isolate is permitted and
+ * still returns process counters.
+ *
+ * # Safety
+ * - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes.
+ */
+void stator_isolate_get_deopt_histogram_stats(const struct StatorIsolate *_isolate,
+                                              struct StatorDeoptHistogramStats *stats);
+
+/**
+ * Reset deopt histogram diagnostics visible through
+ * `stator_isolate_get_deopt_histogram_stats`.
+ *
+ * A null isolate is accepted; counters are process diagnostics rather than
+ * heap-owned state.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_deopt_histogram_stats(struct StatorIsolate *_isolate);
 
 /**
  * Fill `*stats` with the current tier-promotion latency counters.

@@ -30,6 +30,7 @@ use stator_jse::compiler::baseline::compiler::{
     first_deopt_counts, reset_first_deopt_counts, reset_stub_deopt_counts, stub_call_counts,
     stub_deopt_counts,
 };
+use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
 use stator_jse::dom::{
     AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
     IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
@@ -78,7 +79,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 10;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 11;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -780,6 +781,127 @@ pub unsafe extern "C" fn stator_isolate_get_tiering_stats(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_reset_tiering_stats(_isolate: *mut StatorIsolate) {
     stator_jse::interpreter::reset_tiering_stats();
+}
+
+/// Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+pub const STATOR_DEOPT_TIER_COUNT: usize = 3;
+
+/// Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+pub const STATOR_DEOPT_REASON_COUNT: usize = 7;
+
+/// Per-reason deopt counters for one JIT tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorDeoptReasonCounts {
+    /// Unsupported opcode/codegen/runtime fallback to a lower tier.
+    pub unsupported_opcode_or_runtime_fallback: u64,
+    /// Checked small-integer arithmetic overflow.
+    pub arithmetic_overflow: u64,
+    /// Runtime stub could not satisfy a specialised fast path.
+    pub runtime_stub_fallback: u64,
+    /// Promoted global load/store fast path failed.
+    pub global_load_fallback: u64,
+    /// Embedder termination or interrupt polling requested unwind.
+    pub termination_interrupt: u64,
+    /// Integer division by zero would need non-fast-path semantics.
+    pub division_by_zero: u64,
+    /// Unknown, internal, or out-of-range deopt sentinel.
+    pub internal_error: u64,
+}
+
+impl StatorDeoptReasonCounts {
+    fn from_snapshot(tier: &deopt_counters::DeoptTierSnapshot) -> Self {
+        Self {
+            unsupported_opcode_or_runtime_fallback: tier
+                .count(DeoptReason::UnsupportedOpcodeOrRuntimeFallback),
+            arithmetic_overflow: tier.count(DeoptReason::ArithmeticOverflow),
+            runtime_stub_fallback: tier.count(DeoptReason::RuntimeStubFallback),
+            global_load_fallback: tier.count(DeoptReason::GlobalLoadFallback),
+            termination_interrupt: tier.count(DeoptReason::TerminationInterrupt),
+            division_by_zero: tier.count(DeoptReason::DivisionByZero),
+            internal_error: tier.count(DeoptReason::InternalError),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.unsupported_opcode_or_runtime_fallback
+            + self.arithmetic_overflow
+            + self.runtime_stub_fallback
+            + self.global_load_fallback
+            + self.termination_interrupt
+            + self.division_by_zero
+            + self.internal_error
+    }
+}
+
+/// Stable deopt/bailout/fallback histogram snapshot by JIT tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorDeoptHistogramStats {
+    /// Baseline JIT deopt-like bailout counters.  Currently zero because
+    /// baseline execution is disabled in this build.
+    pub baseline: StatorDeoptReasonCounts,
+    /// Maglev deopt counters recorded from real JIT deopt sentinels.
+    pub maglev: StatorDeoptReasonCounts,
+    /// Turbofan/Cranelift deopt counters.  Currently zero because execution is
+    /// disabled while codegen correctness issues are being fixed.
+    pub turbofan: StatorDeoptReasonCounts,
+}
+
+impl StatorDeoptHistogramStats {
+    fn from_engine_snapshot(snapshot: &deopt_counters::DeoptHistogramSnapshot) -> Self {
+        Self {
+            baseline: StatorDeoptReasonCounts::from_snapshot(
+                snapshot.for_tier(DeoptTier::Baseline),
+            ),
+            maglev: StatorDeoptReasonCounts::from_snapshot(snapshot.for_tier(DeoptTier::Maglev)),
+            turbofan: StatorDeoptReasonCounts::from_snapshot(
+                snapshot.for_tier(DeoptTier::Turbofan),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.baseline.total() + self.maglev.total() + self.turbofan.total()
+    }
+}
+
+/// Fill `*stats` with current release-safe deopt histograms.
+///
+/// Does nothing when `stats` is null. Passing a null isolate is permitted and
+/// still returns process counters.
+///
+/// # Safety
+/// - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_deopt_histogram_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorDeoptHistogramStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = deopt_counters::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorDeoptHistogramStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset deopt histogram diagnostics visible through
+/// `stator_isolate_get_deopt_histogram_stats`.
+///
+/// A null isolate is accepted; counters are process diagnostics rather than
+/// heap-owned state.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_deopt_histogram_stats(_isolate: *mut StatorIsolate) {
+    deopt_counters::reset();
 }
 
 /// Number of histogram buckets carried by [`StatorTierLatencyTier`].
@@ -29131,6 +29253,62 @@ mod tests {
         unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), &mut stats) };
         // SAFETY: null isolate is accepted for resetting process/thread diagnostics.
         unsafe { stator_isolate_reset_tiering_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_deopt_histogram_stats_null_safety() {
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_deopt_histogram_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted and `stats` is valid for writes.
+        let mut stats = unsafe { std::mem::zeroed::<StatorDeoptHistogramStats>() };
+        unsafe { stator_isolate_get_deopt_histogram_stats(std::ptr::null(), &mut stats) };
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_deopt_histogram_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_deopt_histogram_constants_match_engine() {
+        assert_eq!(
+            STATOR_DEOPT_TIER_COUNT,
+            stator_jse::compiler::deopt_counters::DeoptTier::COUNT
+        );
+        assert_eq!(
+            STATOR_DEOPT_REASON_COUNT,
+            stator_jse::compiler::deopt_counters::DeoptReason::COUNT
+        );
+    }
+
+    #[test]
+    fn test_deopt_histogram_snapshot_roundtrip_via_ffi() {
+        use std::sync::Mutex;
+        static FFI_DEOPT_HISTOGRAM_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_DEOPT_HISTOGRAM_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null isolate is accepted; we reset before recording.
+        unsafe { stator_isolate_reset_deopt_histogram_stats(std::ptr::null_mut()) };
+        use stator_jse::compiler::baseline::compiler::{JIT_DEOPT_STUB, JIT_DEOPT_TERMINATED};
+        use stator_jse::compiler::deopt_counters::{self, DeoptTier};
+        deopt_counters::record_jit_deopt_value(DeoptTier::Maglev, JIT_DEOPT_STUB);
+        deopt_counters::record_jit_deopt_value(DeoptTier::Maglev, JIT_DEOPT_TERMINATED);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorDeoptHistogramStats>() };
+        // SAFETY: `stats` is valid for writes and a null isolate is accepted.
+        unsafe { stator_isolate_get_deopt_histogram_stats(std::ptr::null(), &mut stats) };
+        assert_eq!(stats.baseline.total(), 0);
+        assert_eq!(stats.maglev.runtime_stub_fallback, 1);
+        assert_eq!(stats.maglev.termination_interrupt, 1);
+        assert_eq!(stats.maglev.total(), 2);
+        assert_eq!(stats.turbofan.total(), 0);
+
+        // SAFETY: null isolate is accepted.
+        unsafe { stator_isolate_reset_deopt_histogram_stats(std::ptr::null_mut()) };
+        let mut after = unsafe { std::mem::zeroed::<StatorDeoptHistogramStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_deopt_histogram_stats(std::ptr::null(), &mut after) };
+        assert_eq!(after.total(), 0);
     }
 
     #[test]

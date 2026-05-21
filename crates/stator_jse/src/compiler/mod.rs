@@ -44,6 +44,8 @@ pub mod baseline;
 /// Always-on diagnostic counters for compile attempts, successes, and
 /// failures broken down by compilation tier.
 pub mod compile_counters;
+/// Release-safe deopt and bailout histograms broken down by tier and reason.
+pub mod deopt_counters;
 /// Maglev optimising compiler tier.
 pub mod maglev;
 /// On-Stack Replacement: mid-execution tier-up for hot loops.

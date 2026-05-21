@@ -1608,6 +1608,7 @@ pub fn reset_tiering_stats() {
     crate::compiler::baseline::compiler::reset_stub_deopt_counts();
     crate::compiler::baseline::compiler::reset_first_deopt_counts();
     crate::compiler::baseline::compiler::reset_stub_call_counts();
+    crate::compiler::deopt_counters::reset();
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2422,7 +2423,11 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
-            // Update per-category deopt counters.
+            crate::compiler::deopt_counters::record_jit_deopt_value(
+                crate::compiler::deopt_counters::DeoptTier::Maglev,
+                result,
+            );
+            // Update legacy per-category deopt counters.
             MAGLEV_DIAG_DEOPT_CATS.with(|c| {
                 let mut cats = c.get();
                 let idx = deopt_offset as usize;

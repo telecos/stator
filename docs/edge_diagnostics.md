@@ -92,6 +92,61 @@ points are reflected directly in the tier-latency counters. This makes
 the counters useful for deterministic Edge proof runs that force a
 specific tier rather than relying on the heuristic tier-up path.
 
+## Deopt reason histogram counters
+
+The `stator_jse::compiler::deopt_counters` module records release-safe
+histograms of real deopt, bailout, and runtime-fallback events by tier:
+`baseline`, `maglev`, and `turbofan` (the Cranelift-backed top tier).
+The reason schema is intentionally small and stable:
+
+| Field | Meaning today |
+| --- | --- |
+| `unsupported_opcode_or_runtime_fallback` | The tier hit unsupported bytecode/codegen and returned the generic `JIT_DEOPT` fallback sentinel. |
+| `arithmetic_overflow` | A checked small-integer arithmetic fast path overflowed. |
+| `runtime_stub_fallback` | A runtime stub could not satisfy the specialised path and returned a stub deopt sentinel. |
+| `global_load_fallback` | A promoted global access fast path failed. |
+| `termination_interrupt` | Embedder termination or interrupt polling requested unwind. This is not treated as code-quality instability. |
+| `division_by_zero` | Integer division by zero required lower-tier/runtime semantics. |
+| `internal_error` | Unknown, internal, or out-of-range deopt sentinel. |
+
+### Current tier limitations
+
+Only Maglev execution is active in the current runtime, so Maglev deopt
+sentinels are the only real increment source. Baseline JIT and
+Turbofan/Cranelift execution paths are currently disabled due known codegen
+correctness/safety issues; their histogram rows are still exposed and reset but
+remain zero. Do not interpret zero baseline/Turbofan counts as proof that those
+tiers are stable until execution is re-enabled.
+
+### Rust API
+
+```rust
+use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
+
+deopt_counters::reset();
+// ... run workload ...
+let snap = deopt_counters::snapshot();
+let maglev = snap.for_tier(DeoptTier::Maglev);
+println!(
+    "maglev stub fallback deopts = {}",
+    maglev.count(DeoptReason::RuntimeStubFallback),
+);
+```
+
+### C FFI
+
+```c
+StatorDeoptHistogramStats stats;
+stator_isolate_reset_deopt_histogram_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_deopt_histogram_stats(NULL, &stats);
+printf("maglev stub fallback deopts=%llu\n",
+       (unsigned long long) stats.maglev.runtime_stub_fallback);
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the histogram is
+process-global. `STATOR_DEOPT_TIER_COUNT` and `STATOR_DEOPT_REASON_COUNT`
+mirror the Rust tier/reason enum counts and are enforced by FFI tests.
 ## Related counters
 
 - **`stator_jse::compiler::compile_counters`** — per-tier
