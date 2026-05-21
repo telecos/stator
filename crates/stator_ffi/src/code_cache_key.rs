@@ -1249,4 +1249,281 @@ mod tests {
             build_code_cache_key(&b).unwrap().hash
         );
     }
+
+    fn assert_field_mutation_changes_hash<F>(label: &str, mutate: F)
+    where
+        F: FnOnce(&mut CodeCacheKeyInput),
+    {
+        let base = sample_input();
+        let base_hash = build_code_cache_key(&base).unwrap().hash;
+        let mut mutated = base;
+        mutate(&mut mutated);
+        let mutated_hash = build_code_cache_key(&mutated).unwrap().hash;
+        assert_ne!(base_hash, mutated_hash, "{label} did not change key hash");
+    }
+
+    fn assert_null_distinct_from_empty<F, S>(label: &str, mut set_to_empty: F, mut set_to_null: S)
+    where
+        F: FnMut(&mut CodeCacheKeyInput),
+        S: FnMut(&mut CodeCacheKeyInput),
+    {
+        let mut empty_input = sample_input();
+        set_to_empty(&mut empty_input);
+        let mut null_input = sample_input();
+        set_to_null(&mut null_input);
+        assert_ne!(
+            build_code_cache_key(&empty_input).unwrap().hash,
+            build_code_cache_key(&null_input).unwrap().hash,
+            "{label} null must differ from empty"
+        );
+    }
+
+    #[test]
+    fn test_resource_url_changes_key() {
+        assert_field_mutation_changes_hash("resource_url", |input| {
+            input.source.resource_url = Some("https://example.test/other.js".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "resource_url",
+            |input| input.source.resource_url = Some(String::new()),
+            |input| input.source.resource_url = None,
+        );
+    }
+
+    #[test]
+    fn test_source_url_directive_changes_key_distinct_from_resource_url() {
+        let mut input = sample_input();
+        input.source.resource_url = Some("https://example.test/app.js".to_owned());
+        input.source.source_url = None;
+        let base = build_code_cache_key(&input).unwrap().hash;
+        let mut with_directive = input.clone();
+        with_directive.source.source_url = Some("https://example.test/app.js".to_owned());
+        assert_ne!(
+            base,
+            build_code_cache_key(&with_directive).unwrap().hash,
+            "//# sourceURL= directive must affect key even when equal to resource_url"
+        );
+        let mut other_directive = input;
+        other_directive.source.source_url = Some("webpack:///app.js".to_owned());
+        assert_ne!(
+            build_code_cache_key(&with_directive).unwrap().hash,
+            build_code_cache_key(&other_directive).unwrap().hash
+        );
+    }
+
+    #[test]
+    fn test_source_origin_changes_key_independent_of_resource_url() {
+        assert_field_mutation_changes_hash("source_origin", |input| {
+            input.source.source_origin = Some("https://other.test".to_owned());
+        });
+        assert_field_mutation_changes_hash("opaque source_origin", |input| {
+            input.source.source_origin = Some("opaque://abc-123".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "source_origin",
+            |input| input.source.source_origin = Some(String::new()),
+            |input| input.source.source_origin = None,
+        );
+    }
+
+    #[test]
+    fn test_base_url_changes_key() {
+        assert_field_mutation_changes_hash("base_url", |input| {
+            input.source.base_url = Some("https://example.test/sub/".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "base_url",
+            |input| input.source.base_url = Some(String::new()),
+            |input| input.source.base_url = None,
+        );
+    }
+
+    #[test]
+    fn test_referrer_url_changes_key() {
+        assert_field_mutation_changes_hash("referrer_url", |input| {
+            input.source.referrer_url = Some("https://other-referrer.test/".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "referrer_url",
+            |input| input.source.referrer_url = Some(String::new()),
+            |input| input.source.referrer_url = None,
+        );
+    }
+
+    #[test]
+    fn test_integrity_metadata_changes_key() {
+        assert_field_mutation_changes_hash("integrity_metadata", |input| {
+            input.source.integrity_metadata = Some("sha384-xyz".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "integrity_metadata",
+            |input| input.source.integrity_metadata = Some(String::new()),
+            |input| input.source.integrity_metadata = None,
+        );
+    }
+
+    #[test]
+    fn test_credentials_mode_changes_key() {
+        for mode in [
+            CredentialsMode::Omit,
+            CredentialsMode::SameOrigin,
+            CredentialsMode::Include,
+        ] {
+            let mut a = sample_input();
+            a.source.credentials_mode = Some(mode);
+            let mut b = sample_input();
+            b.source.credentials_mode = None;
+            assert_ne!(
+                build_code_cache_key(&a).unwrap().hash,
+                build_code_cache_key(&b).unwrap().hash,
+                "credentials_mode {} must differ from null",
+                mode.token()
+            );
+        }
+        let mut omit = sample_input();
+        omit.source.credentials_mode = Some(CredentialsMode::Omit);
+        let mut include = sample_input();
+        include.source.credentials_mode = Some(CredentialsMode::Include);
+        assert_ne!(
+            build_code_cache_key(&omit).unwrap().hash,
+            build_code_cache_key(&include).unwrap().hash
+        );
+    }
+
+    #[test]
+    fn test_referrer_policy_changes_key() {
+        assert_field_mutation_changes_hash("referrer_policy", |input| {
+            input.source.referrer_policy = Some("no-referrer".to_owned());
+        });
+        assert_null_distinct_from_empty(
+            "referrer_policy",
+            |input| input.source.referrer_policy = Some(String::new()),
+            |input| input.source.referrer_policy = None,
+        );
+    }
+
+    #[test]
+    fn test_line_and_column_offsets_change_key_including_negative() {
+        assert_field_mutation_changes_hash("line_offset positive", |input| {
+            input.source.line_offset = 5;
+        });
+        assert_field_mutation_changes_hash("line_offset negative", |input| {
+            input.source.line_offset = -3;
+        });
+        assert_field_mutation_changes_hash("column_offset positive", |input| {
+            input.source.column_offset = 12;
+        });
+        assert_field_mutation_changes_hash("column_offset negative", |input| {
+            input.source.column_offset = -1;
+        });
+        let mut neg = sample_input();
+        neg.source.line_offset = -1;
+        let mut pos = sample_input();
+        pos.source.line_offset = 1;
+        assert_ne!(
+            build_code_cache_key(&neg).unwrap().hash,
+            build_code_cache_key(&pos).unwrap().hash,
+            "signed line_offset must distinguish sign"
+        );
+    }
+
+    #[test]
+    fn test_source_map_url_changes_key_even_when_source_unchanged() {
+        let base_input = sample_input();
+        let base_hash = build_code_cache_key(&base_input).unwrap().hash;
+        let mut changed = base_input.clone();
+        changed.source.source_map_url = Some("https://example.test/other.map".to_owned());
+        assert_ne!(base_hash, build_code_cache_key(&changed).unwrap().hash);
+        assert_null_distinct_from_empty(
+            "source_map_url",
+            |input| input.source.source_map_url = Some(String::new()),
+            |input| input.source.source_map_url = None,
+        );
+    }
+
+    #[test]
+    fn test_host_defined_and_compile_options_change_key() {
+        assert_field_mutation_changes_hash("host_defined_options_hash", |input| {
+            input.source.host_defined_options_hash = Some(sha256_bytes(b"other-host").to_vec());
+        });
+        assert_field_mutation_changes_hash("compile_options_hash", |input| {
+            input.source.compile_options_hash = Some(sha256_bytes(b"other-compile").to_vec());
+        });
+        // Null must differ from a present zero-length digest.
+        let mut empty_digest = sample_input();
+        empty_digest.source.compile_options_hash = Some(Vec::new());
+        let mut null_digest = sample_input();
+        null_digest.source.compile_options_hash = None;
+        assert_ne!(
+            build_code_cache_key(&empty_digest).unwrap().hash,
+            build_code_cache_key(&null_digest).unwrap().hash,
+            "compile_options_hash zero-length digest must differ from null"
+        );
+        let mut empty_host = sample_input();
+        empty_host.source.host_defined_options_hash = Some(Vec::new());
+        let mut null_host = sample_input();
+        null_host.source.host_defined_options_hash = None;
+        assert_ne!(
+            build_code_cache_key(&empty_host).unwrap().hash,
+            build_code_cache_key(&null_host).unwrap().hash
+        );
+    }
+
+    #[test]
+    fn test_import_policy_and_map_epoch_change_key() {
+        assert_field_mutation_changes_hash("import_policy_hash", |input| {
+            input.module.import_policy_hash = Some(sha256_bytes(b"other-policy").to_vec());
+        });
+        assert_field_mutation_changes_hash("import_map_epoch", |input| {
+            input.module.import_map_epoch = Some("epoch-8".to_owned());
+        });
+        assert_field_mutation_changes_hash("resolution_base_url", |input| {
+            input.module.resolution_base_url = Some("https://example.test/v2/".to_owned());
+        });
+    }
+
+    #[test]
+    fn test_import_attributes_value_change_affects_key() {
+        let base = sample_input();
+        let base_hash = build_code_cache_key(&base).unwrap().hash;
+        let mut changed_value = base.clone();
+        changed_value
+            .module
+            .import_attributes
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a.key == "type")
+            .unwrap()
+            .value = "css".to_owned();
+        assert_ne!(
+            base_hash,
+            build_code_cache_key(&changed_value).unwrap().hash,
+            "import attribute value change must alter key"
+        );
+        let mut added = base;
+        added
+            .module
+            .import_attributes
+            .as_mut()
+            .unwrap()
+            .push(ImportAttributeInput {
+                key: "extra".to_owned(),
+                value: "v".to_owned(),
+            });
+        assert_ne!(base_hash, build_code_cache_key(&added).unwrap().hash);
+    }
+
+    #[test]
+    fn test_import_attributes_present_empty_distinct_from_null() {
+        let mut empty = sample_input();
+        empty.module.import_attributes = Some(Vec::new());
+        let mut null = sample_input();
+        null.module.import_attributes = None;
+        assert_ne!(
+            build_code_cache_key(&empty).unwrap().hash,
+            build_code_cache_key(&null).unwrap().hash,
+            "present empty import attributes list must differ from null"
+        );
+    }
 }
