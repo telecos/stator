@@ -328,6 +328,143 @@ impl<T> Drop for Persistent<T> {
     }
 }
 
+/// Registry of Oilpan-style **traced** GC roots owned by an `Isolate`.
+///
+/// Unlike [`PersistentRoots`], entries here are *re-validated* on every GC
+/// cycle.  A `TracedReference` slot only counts as a live root for the
+/// duration of the cycle in which the embedder reports it through the
+/// registered traced-root visitor.  The protocol is:
+///
+/// 1. The GC bumps [`TracedRoots::begin_epoch`] at the start of a cycle.
+/// 2. The embedder visitor calls [`TracedRoots::mark_visited`] for every
+///    `TracedReference` it still considers live.  Marking stamps the slot
+///    with the new epoch.
+/// 3. The GC iterates live roots via [`TracedRoots::iter_live_roots`],
+///    which only yields slots whose epoch matches `current_epoch`.
+/// 4. Slots that were not visited this cycle are *not* roots and may be
+///    cleared by the embedder layer (see `stator_ffi::dispatch_traced_sweep`).
+///
+/// Backing storage mirrors [`PersistentRoots`]: each slot is `Some(ptr)`
+/// while a `TracedReference` slot is live and `None` after disposal.  The
+/// per-slot `epoch` is parallel-indexed so slot reuse always starts in the
+/// "stale" state and cannot accidentally count toward the current cycle.
+pub struct TracedRoots {
+    roots: Vec<Option<*mut u8>>,
+    /// Per-slot epoch stamp; valid iff the corresponding `roots` entry is
+    /// `Some`.  Slots created in the middle of a cycle start out with epoch
+    /// `0` and are treated as stale until the embedder visits them.
+    epochs: Vec<u32>,
+    /// Monotonically increasing cycle counter.  Wraps around in the unlikely
+    /// event of `u32` overflow; embedders that hit the overflow bug are
+    /// documented in `docs/handles.md` §"blocker-traced-references".
+    current_epoch: u32,
+}
+
+// SAFETY: Raw pointers are GC roots; access is guarded by Rust ownership.
+unsafe impl Send for TracedRoots {}
+
+impl TracedRoots {
+    /// Create an empty traced-root set.
+    pub fn new() -> Self {
+        Self {
+            roots: Vec::new(),
+            epochs: Vec::new(),
+            current_epoch: 0,
+        }
+    }
+
+    /// Register a fresh traced slot and return its stable index.
+    ///
+    /// Newly registered slots start in the **stale** state (epoch `0`,
+    /// never equal to `current_epoch` once any cycle has run) so a slot
+    /// created mid-cycle by an embedder is not treated as a live root
+    /// until it is explicitly visited by the embedder root visitor.
+    pub fn register_root(&mut self, ptr: *mut u8) -> usize {
+        if let Some(idx) = self.roots.iter().position(Option::is_none) {
+            self.roots[idx] = Some(ptr);
+            // Reset epoch to a value guaranteed != `current_epoch` so the
+            // slot is not silently counted as visited just because the
+            // previous occupant of the same index was.
+            self.epochs[idx] = self.current_epoch.wrapping_sub(1);
+            return idx;
+        }
+        let idx = self.roots.len();
+        self.roots.push(Some(ptr));
+        self.epochs.push(self.current_epoch.wrapping_sub(1));
+        idx
+    }
+
+    /// Clear the slot at `index`, indicating the traced root is gone.
+    pub fn unregister_root(&mut self, index: usize) {
+        if let Some(slot) = self.roots.get_mut(index) {
+            *slot = None;
+        }
+    }
+
+    /// Begin a new GC cycle by bumping `current_epoch`.  Returns the new
+    /// epoch so the FFI traced-visitor token can stamp it into slots.
+    pub fn begin_epoch(&mut self) -> u32 {
+        self.current_epoch = self.current_epoch.wrapping_add(1);
+        self.current_epoch
+    }
+
+    /// Return the epoch active for the current GC cycle.
+    pub fn current_epoch(&self) -> u32 {
+        self.current_epoch
+    }
+
+    /// Mark the slot at `index` as visited in the current cycle.  Returns
+    /// `false` if `index` is out of range or refers to a freed slot; the
+    /// embedder visitor uses that to fail closed on a stale handle.
+    pub fn mark_visited(&mut self, index: usize) -> bool {
+        match (self.roots.get(index), self.epochs.get_mut(index)) {
+            (Some(Some(_)), Some(epoch)) => {
+                *epoch = self.current_epoch;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the slot at `index` was reported by the embedder
+    /// visitor during the current cycle.
+    pub fn is_visited(&self, index: usize) -> bool {
+        matches!(
+            (self.roots.get(index), self.epochs.get(index)),
+            (Some(Some(_)), Some(epoch)) if *epoch == self.current_epoch
+        )
+    }
+
+    /// Iterate live (visited-this-cycle) traced root pointers.
+    pub fn iter_live_roots(&self) -> impl Iterator<Item = *mut u8> + '_ {
+        self.roots.iter().enumerate().filter_map(|(idx, slot)| {
+            slot.filter(|_| {
+                self.epochs
+                    .get(idx)
+                    .copied()
+                    .is_some_and(|e| e == self.current_epoch)
+            })
+        })
+    }
+
+    /// Iterate every registered traced slot index, regardless of epoch.
+    ///
+    /// Used by the embedder sweep that runs after the visitor to clear
+    /// unreported (stale) slots' strong references.
+    pub fn iter_all_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.roots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.map(|_| idx))
+    }
+}
+
+impl Default for TracedRoots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +601,97 @@ mod tests {
 
         // The freed slot should be reused.
         assert_eq!(idx1, idx2);
+    }
+
+    // ── TracedRoots ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_traced_roots_new_slot_is_stale_until_visited() {
+        let mut roots = TracedRoots::new();
+        let mut v: u8 = 1;
+        let p = &mut v as *mut u8;
+        let idx = roots.register_root(p);
+        // Without an explicit `begin_epoch`, the slot is in the initial
+        // (stale) state and must not be reported as live.
+        assert_eq!(roots.iter_live_roots().count(), 0);
+        // Even after a fresh epoch, the slot remains stale until visited.
+        roots.begin_epoch();
+        assert!(!roots.is_visited(idx));
+        assert_eq!(roots.iter_live_roots().count(), 0);
+    }
+
+    #[test]
+    fn test_traced_roots_visited_slot_appears_in_iter() {
+        let mut roots = TracedRoots::new();
+        let mut v: u8 = 7;
+        let p = &mut v as *mut u8;
+        let idx = roots.register_root(p);
+        roots.begin_epoch();
+        assert!(roots.mark_visited(idx));
+        assert!(roots.is_visited(idx));
+        let live: Vec<_> = roots.iter_live_roots().collect();
+        assert_eq!(live, vec![p]);
+    }
+
+    #[test]
+    fn test_traced_roots_unvisited_slot_dropped_after_new_epoch() {
+        let mut roots = TracedRoots::new();
+        let mut v: u8 = 9;
+        let p = &mut v as *mut u8;
+        let idx = roots.register_root(p);
+        roots.begin_epoch();
+        assert!(roots.mark_visited(idx));
+        assert_eq!(roots.iter_live_roots().count(), 1);
+        // Next cycle: no mark_visited call -> slot is no longer a root.
+        roots.begin_epoch();
+        assert!(!roots.is_visited(idx));
+        assert_eq!(roots.iter_live_roots().count(), 0);
+    }
+
+    #[test]
+    fn test_traced_roots_freed_slot_index_reuse_starts_stale() {
+        let mut roots = TracedRoots::new();
+        let mut v1: u8 = 1;
+        let mut v2: u8 = 2;
+        let p1 = &mut v1 as *mut u8;
+        let p2 = &mut v2 as *mut u8;
+        let idx = roots.register_root(p1);
+        roots.begin_epoch();
+        assert!(roots.mark_visited(idx));
+        // Free and reuse the same index.
+        roots.unregister_root(idx);
+        let idx2 = roots.register_root(p2);
+        assert_eq!(idx, idx2);
+        // The fresh occupant must not inherit the previous occupant's
+        // "visited this epoch" stamp.
+        assert!(!roots.is_visited(idx2));
+        assert_eq!(roots.iter_live_roots().count(), 0);
+    }
+
+    #[test]
+    fn test_traced_roots_mark_visited_invalid_index_fails_closed() {
+        let mut roots = TracedRoots::new();
+        roots.begin_epoch();
+        assert!(!roots.mark_visited(0));
+        assert!(!roots.mark_visited(usize::MAX));
+        // After registering then unregistering, the slot must also fail.
+        let mut v: u8 = 1;
+        let idx = roots.register_root(&mut v as *mut u8);
+        roots.unregister_root(idx);
+        assert!(!roots.mark_visited(idx));
+    }
+
+    #[test]
+    fn test_traced_roots_iter_all_indices_skips_freed() {
+        let mut roots = TracedRoots::new();
+        let mut v1: u8 = 1;
+        let mut v2: u8 = 2;
+        let mut v3: u8 = 3;
+        let i1 = roots.register_root(&mut v1 as *mut u8);
+        let i2 = roots.register_root(&mut v2 as *mut u8);
+        let i3 = roots.register_root(&mut v3 as *mut u8);
+        roots.unregister_root(i2);
+        let indices: Vec<_> = roots.iter_all_indices().collect();
+        assert_eq!(indices, vec![i1, i3]);
     }
 }
