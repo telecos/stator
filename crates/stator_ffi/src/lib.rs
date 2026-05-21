@@ -71,7 +71,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 1;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 2;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -1080,9 +1080,22 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_module_url_resolver(
     ctx: *mut StatorContext,
-    callback: Option<StatorModuleUrlResolverCallback>,
+    callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            referrer: *const StatorModule,
+            origin: *const StatorModuleOrigin,
+            specifier: *const c_char,
+            specifier_len: usize,
+            attributes: *const StatorImportAttribute,
+            attributes_len: usize,
+            out_resolved_url: *mut *mut StatorString,
+            out_error: *mut *mut StatorString,
+        ) -> StatorResolveStatus,
+    >,
     user_data: *mut c_void,
-    free_user_data: Option<StatorUserDataFreeCallback>,
+    free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> bool {
     if ctx.is_null() {
         return false;
@@ -8477,7 +8490,8 @@ unsafe fn run_module_bytecodes(
         None
     } else {
         // SAFETY: caller guarantees `ctx` is valid when non-null.
-        let has_resolver = unsafe { (*ctx).module_resolver.is_some() };
+        let has_resolver =
+            unsafe { (*ctx).module_resolver.is_some() || (*ctx).module_url_resolver.is_some() };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
                 ctx,
@@ -8981,7 +8995,8 @@ where
         None
     } else {
         // SAFETY: caller guarantees `ctx` is valid when non-null.
-        let has_resolver = unsafe { (*ctx).module_resolver.is_some() };
+        let has_resolver =
+            unsafe { (*ctx).module_resolver.is_some() || (*ctx).module_url_resolver.is_some() };
         has_resolver.then(|| {
             Rc::new(FfiHostModuleLoader {
                 ctx,

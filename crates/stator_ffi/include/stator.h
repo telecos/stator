@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 1
+#define STATOR_FFI_ABI_VERSION_MINOR 2
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -490,10 +490,6 @@ typedef enum StatorPromiseRejectionEventKind {
    */
   StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
 } StatorPromiseRejectionEventKind;
-
-typedef struct Option_StatorModuleUrlResolverCallback Option_StatorModuleUrlResolverCallback;
-
-typedef struct Option_StatorUserDataFreeCallback Option_StatorUserDataFreeCallback;
 
 /**
  * An opaque handle to a CDP WebSocket server.
@@ -2182,9 +2178,18 @@ bool stator_context_set_module_resolver(struct StatorContext *ctx,
  * [`stator_context_set_module_resolver`].
  */
 bool stator_context_set_module_url_resolver(struct StatorContext *ctx,
-                                            struct Option_StatorModuleUrlResolverCallback callback,
+                                            enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
+                                                                                 void *user_data,
+                                                                                 const struct StatorModule *referrer,
+                                                                                 const struct StatorModuleOrigin *origin,
+                                                                                 const char *specifier,
+                                                                                 size_t specifier_len,
+                                                                                 const struct StatorImportAttribute *attributes,
+                                                                                 size_t attributes_len,
+                                                                                 struct StatorString **out_resolved_url,
+                                                                                 struct StatorString **out_error),
                                             void *user_data,
-                                            struct Option_StatorUserDataFreeCallback free_user_data);
+                                            void (*free_user_data)(void *user_data));
 
 /**
  * Create a new number value.
