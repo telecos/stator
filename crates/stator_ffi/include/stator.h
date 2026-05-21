@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 2
+#define STATOR_FFI_ABI_VERSION_MINOR 3
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -490,6 +490,28 @@ typedef enum StatorPromiseRejectionEventKind {
    */
   StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
 } StatorPromiseRejectionEventKind;
+
+/**
+ * Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+ * the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
+ * `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
+ * can recover embedder fields without re-dereferencing the dead object.
+ */
+typedef enum StatorWeakParameterKind {
+  /**
+   * The callback only needs the opaque `parameter` pointer captured at
+   * [`stator_weak_new`] time.  `internal_fields` are zeroed.
+   */
+  Opaque = 0,
+  /**
+   * The callback expects the first two internal fields of the referent
+   * to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+   * slot-creation time.  This is the kind Blink uses to break C++ side
+   * pointers from inside the weak callback without touching the (dead)
+   * JS wrapper.
+   */
+  InternalFields = 1,
+} StatorWeakParameterKind;
 
 /**
  * An opaque handle to a CDP WebSocket server.
@@ -1430,6 +1452,57 @@ typedef struct StatorEmbedderCallbacks {
 typedef struct StatorPersistent {
   uint8_t _opaque[0];
 } StatorPersistent;
+
+/**
+ * Opaque weak-handle slot exposed to the embedder.
+ *
+ * The pointer returned by [`stator_weak_new`] / [`stator_persistent_make_weak`]
+ * is the address of a stable, isolate-owned slot.  Its address does not
+ * change until the slot is freed by [`stator_weak_dispose`].  The bytes
+ * pointed at are implementation-defined and must not be inspected or
+ * mutated by the embedder.
+ */
+typedef struct StatorWeak {
+  uint8_t _opaque[0];
+} StatorWeak;
+
+/**
+ * Payload passed to a [`StatorWeakCallback`] when the weak slot's referent
+ * has been collected.  All fields are stable for the duration of the
+ * callback invocation.  The embedder must not dereference the dead
+ * referent — by the time the callback runs the JS object is already
+ * considered unreachable.
+ */
+typedef struct StatorWeakCallbackInfo {
+  /**
+   * The opaque pointer registered with [`stator_weak_new`].
+   */
+  void *parameter;
+  /**
+   * First two internal-field pointers snapshotted at slot creation when
+   * the weak slot was registered with
+   * [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
+   * [`StatorWeakParameterKind::Opaque`] slots.
+   */
+  void *internal_fields[2];
+  /**
+   * The isolate that owns the slot — typically used to schedule
+   * follow-up embedder work.  The callback must **not** call back into
+   * the script VM through this isolate (§2.3 of `docs/handles.md`).
+   */
+  struct StatorIsolate *isolate;
+} StatorWeakCallbackInfo;
+
+/**
+ * Embedder-supplied one-shot finalization callback for a weak handle.
+ *
+ * Invoked exactly once, in the GC's weak-callback dispatch phase, after the
+ * engine has proved the referent unreachable.  The callback runs on the
+ * isolate's owning thread.  It **must not** call back into the script VM,
+ * allocate JS heap objects, upgrade itself to a strong handle, or access
+ * the (now-dead) wrapper's contents.
+ */
+typedef void (*StatorWeakCallback)(const struct StatorWeakCallbackInfo *info);
 
 /**
  * Free callback for resolver-owned embedder data.
@@ -5488,6 +5561,134 @@ struct StatorValue *stator_persistent_get(const struct StatorPersistent *persist
  * `stator_persistent_*` function except as a redundant `dispose`).
  */
 void stator_persistent_dispose(struct StatorPersistent *persistent);
+
+/**
+ * Register a weak handle on `value` and arm a one-shot finalization
+ * callback that fires when `value`'s referent becomes unreachable.
+ *
+ * The slot does **not** keep `value` alive.  When every other strong
+ * holder of the underlying object has been dropped (and a subsequent
+ * [`stator_isolate_gc`] / [`stator_gc_collect`] runs), the engine
+ * invokes `cb` exactly once and clears the slot.  The slot pointer
+ * itself remains valid until the embedder calls [`stator_weak_dispose`].
+ *
+ * Returns null if:
+ * - any required pointer argument is null;
+ * - `value` was created on a different isolate than `ctx`'s parent;
+ * - `value`'s payload is not a reference-counted (object/wrapper/native
+ *   function) variant — primitives, plain tag-only objects, and unhandled
+ *   tag-only variants cannot meaningfully be weakly referenced.
+ *
+ * A null `cb` is accepted: the slot will still observe collection (via
+ * [`stator_weak_is_empty`]) but no embedder callback is invoked.
+ *
+ * # Safety
+ * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+ * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ * - `parameter` and `internal_fields` are passed verbatim to `cb`; their
+ *   lifetime is entirely the embedder's responsibility.
+ */
+struct StatorWeak *stator_weak_new(struct StatorContext *ctx,
+                                   struct StatorValue *value,
+                                   void *parameter,
+                                   void *internal_field0,
+                                   void *internal_field1,
+                                   StatorWeakCallback cb,
+                                   enum StatorWeakParameterKind parameter_kind);
+
+/**
+ * Clear the weak reference stored in `weak` and suppress its callback,
+ * without freeing the slot.
+ *
+ * After `reset()`, [`stator_weak_is_empty`] returns `true`, the slot is
+ * skipped by future weak-callback dispatch phases (so the one-shot
+ * callback is **never** invoked, even if the referent is already dead),
+ * and [`stator_weak_upgrade`] returns null.  The slot itself is only
+ * freed by [`stator_weak_dispose`].
+ *
+ * Null-tolerant: passing null is a no-op.
+ *
+ * # Safety
+ * `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+ * (or [`stator_persistent_make_weak`]) that has not yet been passed to
+ * [`stator_weak_dispose`].
+ */
+void stator_weak_reset(struct StatorWeak *weak);
+
+/**
+ * Return `true` if `weak` is null, has been reset, has had its callback
+ * fired, or whose referent has been collected since the last GC.
+ *
+ * This is the cheap polling path: it inspects the slot's local state and
+ * the underlying `Rc`'s strong count without involving the GC.  A `true`
+ * result means [`stator_weak_upgrade`] would also return null.
+ *
+ * # Safety
+ * `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+ * (or [`stator_persistent_make_weak`]) that has not yet been passed to
+ * [`stator_weak_dispose`].
+ */
+bool stator_weak_is_empty(const struct StatorWeak *weak);
+
+/**
+ * Try to upgrade `weak` into a fresh [`StatorPersistent`] strong handle.
+ *
+ * Returns null when the referent has already been collected (the weak's
+ * strong-count is zero), when the slot has been reset or fired, or when
+ * `weak` is null.  On success the returned persistent has its own
+ * independent lifetime and must be disposed via [`stator_persistent_dispose`].
+ *
+ * Per `docs/handles.md` §2.3 this is the only documented path back to a
+ * strong handle from a weak; the weak slot itself is unchanged and must
+ * still be disposed by the embedder when no longer needed.
+ *
+ * # Safety
+ * `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+ * (or [`stator_persistent_make_weak`]) that has not yet been passed to
+ * [`stator_weak_dispose`].
+ */
+struct StatorPersistent *stator_weak_upgrade(struct StatorWeak *weak);
+
+/**
+ * Free the slot backing `weak`.
+ *
+ * After this call the `weak` pointer must not be used (except as a
+ * redundant `dispose`, which is a documented no-op).  Disposing a weak
+ * slot **before** its callback fires permanently suppresses the callback —
+ * the slot is removed from the isolate's table before any future dispatch
+ * phase can observe it.  Passing null is also a no-op.
+ *
+ * # Safety
+ * `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+ * (or [`stator_persistent_make_weak`]).  After this call returns the
+ * embedder must treat the pointer as invalid.
+ */
+void stator_weak_dispose(struct StatorWeak *weak);
+
+/**
+ * Downgrade `persistent` to a weak handle in place.
+ *
+ * Disposes the persistent slot (releasing the engine-side root and the
+ * cloned strong value it held) and immediately allocates a fresh weak
+ * slot with the same referent and the supplied callback metadata.
+ * Returns a pointer to the new weak slot; the caller must not use the
+ * original `persistent` pointer afterwards.
+ *
+ * Returns null if `persistent` is null or empty, or if the persistent's
+ * payload is not a reference-counted variant (in which case the original
+ * persistent is left untouched so the caller can still dispose it).
+ *
+ * # Safety
+ * `persistent` must be null or a slot pointer returned by
+ * [`stator_persistent_new`] that has not yet been passed to
+ * [`stator_persistent_dispose`].
+ */
+struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persistent,
+                                               void *parameter,
+                                               void *internal_field0,
+                                               void *internal_field1,
+                                               StatorWeakCallback cb,
+                                               enum StatorWeakParameterKind parameter_kind);
 
 #ifdef __cplusplus
 }  // extern "C"

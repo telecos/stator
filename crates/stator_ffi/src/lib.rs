@@ -71,7 +71,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 2;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 3;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -195,6 +195,18 @@ pub struct StatorIsolate {
     /// every persistent as a strong root.  Each entry stores the address of
     /// the corresponding `StatorPersistentSlot` box.
     persistent_roots: stator_jse::gc::handle::PersistentRoots,
+    /// Weak root table.  Each entry owns a [`StatorWeakSlot`] whose `referent`
+    /// holds only `std::rc::Weak` clones of the underlying value (or `None`
+    /// after reset / callback dispatch), so weak handles never keep the
+    /// referent alive.  See `docs/handles.md` §2.3.
+    ///
+    /// Slot addresses are exposed to the embedder as opaque
+    /// [`StatorWeak`] pointers and remain stable until
+    /// [`stator_weak_dispose`] frees the slot.  Unlike `persistent_slots`,
+    /// weak entries are **not** mirrored into `persistent_roots`; they are
+    /// scanned only during the weak-callback dispatch phase driven by
+    /// [`stator_isolate_gc`].
+    weak_slots: Vec<Option<Box<StatorWeakSlot>>>,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -223,6 +235,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         terminating: AtomicBool::new(false),
         persistent_slots: Vec::new(),
         persistent_roots: stator_jse::gc::handle::PersistentRoots::new(),
+        weak_slots: Vec::new(),
     }))
 }
 
@@ -529,6 +542,9 @@ pub unsafe extern "C" fn stator_isolate_gc(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
         // SAFETY: caller guarantees `isolate` is valid.
         unsafe { (*isolate).heap.collect() };
+        // SAFETY: caller guarantees `isolate` is valid; dispatch_weak_callbacks
+        // re-borrows the isolate internally and is sound on the owning thread.
+        unsafe { dispatch_weak_callbacks(isolate) };
     }
 }
 
@@ -2431,6 +2447,8 @@ pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
         // SAFETY: caller guarantees `isolate` is valid.
         unsafe { (*isolate).heap.collect() };
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe { dispatch_weak_callbacks(isolate) };
     }
 }
 
@@ -15538,6 +15556,583 @@ pub unsafe extern "C" fn stator_persistent_dispose(persistent: *mut StatorPersis
     }
     iso_ref.persistent_roots.unregister_root(root_index);
     drop(slot_box);
+}
+
+// ── Weak handles ─────────────────────────────────────────────────────────────
+//
+// A `StatorWeak` is a one-shot, GC-notified, **non-rooting** handle that lets
+// the embedder release embedder-side bookkeeping when a JS wrapper becomes
+// unreachable.  Semantics follow `docs/handles.md` §2.3:
+//
+// - The slot does **not** keep its referent alive.  Internally it stores only
+//   `std::rc::Weak` clones of the value's `Rc`-backed payload, so the strong
+//   count of the underlying `Rc` is unchanged.
+// - Weak slots are **not** mirrored into the engine's `PersistentRoots` set;
+//   they are scanned only during the dedicated weak-callback dispatch phase
+//   driven by [`stator_isolate_gc`] / [`stator_gc_collect`].
+// - The registered callback fires **exactly once**, after a collection cycle
+//   proves the referent unreachable.  Subsequent GC cycles never re-fire it.
+// - Explicit [`stator_weak_dispose`] (or [`stator_weak_reset`]) suppresses the
+//   callback: a slot whose `referent` has been cleared by the embedder is
+//   skipped during dispatch and `dispose` removes the slot from the table
+//   altogether before any future dispatch phase can observe it.
+// - `dispose` is idempotent; double-dispose and null arguments are safe.
+//
+// Storage parallels [`StatorPersistentSlot`]: every slot is a heap-allocated
+// [`StatorWeakSlot`] box whose address is stable for the slot's lifetime and
+// is what the embedder sees as a `*mut StatorWeak`.  The slot lives in the
+// isolate's `weak_slots` table.
+
+/// Opaque weak-handle slot exposed to the embedder.
+///
+/// The pointer returned by [`stator_weak_new`] / [`stator_persistent_make_weak`]
+/// is the address of a stable, isolate-owned slot.  Its address does not
+/// change until the slot is freed by [`stator_weak_dispose`].  The bytes
+/// pointed at are implementation-defined and must not be inspected or
+/// mutated by the embedder.
+#[repr(C)]
+pub struct StatorWeak {
+    _opaque: [u8; 0],
+}
+
+/// Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+/// the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
+/// `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
+/// can recover embedder fields without re-dereferencing the dead object.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StatorWeakParameterKind {
+    /// The callback only needs the opaque `parameter` pointer captured at
+    /// [`stator_weak_new`] time.  `internal_fields` are zeroed.
+    Opaque = 0,
+    /// The callback expects the first two internal fields of the referent
+    /// to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+    /// slot-creation time.  This is the kind Blink uses to break C++ side
+    /// pointers from inside the weak callback without touching the (dead)
+    /// JS wrapper.
+    InternalFields = 1,
+}
+
+/// Payload passed to a [`StatorWeakCallback`] when the weak slot's referent
+/// has been collected.  All fields are stable for the duration of the
+/// callback invocation.  The embedder must not dereference the dead
+/// referent — by the time the callback runs the JS object is already
+/// considered unreachable.
+#[repr(C)]
+pub struct StatorWeakCallbackInfo {
+    /// The opaque pointer registered with [`stator_weak_new`].
+    pub parameter: *mut c_void,
+    /// First two internal-field pointers snapshotted at slot creation when
+    /// the weak slot was registered with
+    /// [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
+    /// [`StatorWeakParameterKind::Opaque`] slots.
+    pub internal_fields: [*mut c_void; 2],
+    /// The isolate that owns the slot — typically used to schedule
+    /// follow-up embedder work.  The callback must **not** call back into
+    /// the script VM through this isolate (§2.3 of `docs/handles.md`).
+    pub isolate: *mut StatorIsolate,
+}
+
+/// Embedder-supplied one-shot finalization callback for a weak handle.
+///
+/// Invoked exactly once, in the GC's weak-callback dispatch phase, after the
+/// engine has proved the referent unreachable.  The callback runs on the
+/// isolate's owning thread.  It **must not** call back into the script VM,
+/// allocate JS heap objects, upgrade itself to a strong handle, or access
+/// the (now-dead) wrapper's contents.
+pub type StatorWeakCallback = Option<unsafe extern "C" fn(info: *const StatorWeakCallbackInfo)>;
+
+/// Internal storage backing a [`StatorWeak`] slot.
+///
+/// Owned by the isolate's `weak_slots` table; the slot's heap address is
+/// what the embedder sees as a `*mut StatorWeak`.  The slot owns at most a
+/// [`WeakRef`] — a bundle of `std::rc::Weak` references that detect when the
+/// underlying `Rc`-backed payload has been dropped without contributing to
+/// its strong reference count.
+struct StatorWeakSlot {
+    /// The weak reference, or `None` after [`stator_weak_reset`] or after
+    /// the one-shot callback has fired.  Always `None` once `fired` is set.
+    referent: Option<WeakRef>,
+    /// The isolate that owns this slot.
+    isolate: *mut StatorIsolate,
+    /// Index into the isolate's `weak_slots` table; stable for the slot's
+    /// lifetime and used by [`stator_weak_dispose`] to free the slot.
+    index: usize,
+    /// One-shot callback; cleared once fired so a subsequent GC cycle that
+    /// somehow re-observes the (now empty) slot can never re-enter it.
+    callback: StatorWeakCallback,
+    /// Opaque pointer passed verbatim to the callback.
+    parameter: *mut c_void,
+    /// First two embedder internal fields snapshotted at slot creation;
+    /// surfaced to the callback for [`StatorWeakParameterKind::InternalFields`].
+    internal_fields: [*mut c_void; 2],
+    /// Whether the callback wants the opaque `parameter` only or the
+    /// internal-fields snapshot as well.
+    parameter_kind: StatorWeakParameterKind,
+    /// Set to `true` once the one-shot callback has been invoked, so future
+    /// GC dispatch phases skip this slot.
+    fired: bool,
+}
+
+/// A weak reference to one of the [`StatorValueInner`] variants whose
+/// payload is reference-counted.  Cloning a `WeakRef` does not contribute
+/// to the referent's strong count, so a slot holding only a `WeakRef`
+/// cannot keep the referent alive.
+enum WeakRef {
+    /// Weak handle to an [`StatorValueInner::ObjectHandle`].
+    Object(std::rc::Weak<RefCell<JsObject>>),
+    /// Weak handle to an [`StatorValueInner::DomWrapHandle`].  The `wrap`
+    /// pointer is **not** owned by the weak slot; it is only used by
+    /// [`stator_weak_upgrade`] to reconstitute the original handle if the
+    /// referent is still alive.
+    DomWrap {
+        plain: std::rc::Weak<RefCell<PropertyMap>>,
+        wrap: *mut StatorDomObjectWrap,
+        alive: std::rc::Weak<Cell<bool>>,
+    },
+    /// Weak handle to an [`StatorValueInner::NativeFunctionValue`].
+    Native(std::rc::Weak<dyn Fn(Vec<JsValue>) -> stator_jse::error::StatorResult<JsValue>>),
+}
+
+impl WeakRef {
+    /// Build a `WeakRef` from a value's inner payload, if the payload is
+    /// `Rc`-backed.  Returns `None` for variants whose payload is a plain
+    /// `Copy`/owned value (primitives, tag-only object placeholders, etc.) —
+    /// those carry no GC identity, so a weak handle would be meaningless.
+    fn from_inner(inner: &StatorValueInner) -> Option<Self> {
+        match inner {
+            StatorValueInner::ObjectHandle(rc) => Some(Self::Object(Rc::downgrade(rc))),
+            StatorValueInner::DomWrapHandle { plain, wrap, alive } => Some(Self::DomWrap {
+                plain: Rc::downgrade(plain),
+                wrap: *wrap,
+                alive: Rc::downgrade(alive),
+            }),
+            StatorValueInner::NativeFunctionValue(rc) => Some(Self::Native(Rc::downgrade(rc))),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the referent still has at least one strong holder.
+    /// A `false` result means the GC has proved the referent unreachable
+    /// from any non-weak source and the slot is eligible for one-shot
+    /// callback dispatch.
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Object(w) => w.strong_count() > 0,
+            Self::DomWrap { plain, .. } => plain.strong_count() > 0,
+            Self::Native(w) => w.strong_count() > 0,
+        }
+    }
+
+    /// Try to upgrade the weak reference back into a full
+    /// [`StatorValueInner`].  Returns `None` if the referent has already
+    /// been collected (its strong count reached zero).
+    fn upgrade(&self) -> Option<StatorValueInner> {
+        match self {
+            Self::Object(w) => w.upgrade().map(StatorValueInner::ObjectHandle),
+            Self::DomWrap { plain, wrap, alive } => {
+                let plain = plain.upgrade()?;
+                let alive = alive.upgrade()?;
+                Some(StatorValueInner::DomWrapHandle {
+                    plain,
+                    wrap: *wrap,
+                    alive,
+                })
+            }
+            Self::Native(w) => w.upgrade().map(StatorValueInner::NativeFunctionValue),
+        }
+    }
+}
+
+/// Internal helper: register a fresh [`StatorWeakSlot`] in the isolate's
+/// `weak_slots` table and return the stable slot pointer the embedder
+/// receives as a `*mut StatorWeak`.
+///
+/// # Safety
+/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// current thread.
+unsafe fn install_weak_slot(
+    isolate: *mut StatorIsolate,
+    referent: WeakRef,
+    parameter: *mut c_void,
+    internal_fields: [*mut c_void; 2],
+    callback: StatorWeakCallback,
+    parameter_kind: StatorWeakParameterKind,
+) -> *mut StatorWeak {
+    // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
+    let iso_ref = unsafe { &mut *isolate };
+    let index = iso_ref
+        .weak_slots
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or_else(|| {
+            iso_ref.weak_slots.push(None);
+            iso_ref.weak_slots.len() - 1
+        });
+    let mut slot = Box::new(StatorWeakSlot {
+        referent: Some(referent),
+        isolate,
+        index,
+        callback,
+        parameter,
+        internal_fields,
+        parameter_kind,
+        fired: false,
+    });
+    let raw = slot.as_mut() as *mut StatorWeakSlot;
+    iso_ref.weak_slots[index] = Some(slot);
+    raw as *mut StatorWeak
+}
+
+/// Walk the isolate's weak-slot table and fire one-shot callbacks for slots
+/// whose referent has been proved unreachable since the last dispatch.
+///
+/// Dispatch is split into a snapshot phase and a drain phase: we first
+/// collect every slot that needs to fire (clearing the slot's referent and
+/// callback before releasing the borrow on the isolate), then invoke each
+/// callback with no outstanding borrow into the isolate so re-entrant
+/// `stator_weak_*` calls from inside the callback (e.g. `dispose`) are
+/// safe.  Slots that have already fired, been reset, or been disposed are
+/// skipped — guaranteeing the one-shot contract from `docs/handles.md` §2.3.
+///
+/// # Safety
+/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// current thread.
+unsafe fn dispatch_weak_callbacks(isolate: *mut StatorIsolate) {
+    // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
+    let iso_ref = unsafe { &mut *isolate };
+
+    // Snapshot phase: collect everything we need to fire, while holding a
+    // unique borrow on `weak_slots`.  We deliberately clear `referent` and
+    // `callback` here so the slot cannot fire twice even if a callback
+    // re-enters the GC (which is forbidden by docs but we still defend in
+    // depth).
+    let mut to_fire: Vec<(
+        StatorWeakCallbackInfo,
+        unsafe extern "C" fn(*const StatorWeakCallbackInfo),
+    )> = Vec::new();
+    for slot_opt in iso_ref.weak_slots.iter_mut() {
+        let Some(slot) = slot_opt.as_mut() else {
+            continue;
+        };
+        if slot.fired {
+            continue;
+        }
+        let dead = match &slot.referent {
+            Some(r) => !r.is_alive(),
+            None => false,
+        };
+        if !dead {
+            continue;
+        }
+        // Snapshot the callback metadata and clear the slot before
+        // releasing the borrow, so re-entrant calls observe a fired slot.
+        let cb = slot.callback.take();
+        slot.referent = None;
+        slot.fired = true;
+        let Some(cb) = cb else {
+            continue;
+        };
+        let info = StatorWeakCallbackInfo {
+            parameter: slot.parameter,
+            internal_fields: match slot.parameter_kind {
+                StatorWeakParameterKind::InternalFields => slot.internal_fields,
+                StatorWeakParameterKind::Opaque => [std::ptr::null_mut(), std::ptr::null_mut()],
+            },
+            isolate: slot.isolate,
+        };
+        to_fire.push((info, cb));
+    }
+
+    // Drain phase: invoke callbacks with no outstanding borrow on the
+    // isolate so callbacks may call `stator_weak_dispose` (or any other
+    // FFI helper that re-borrows the isolate) without aliasing.
+    for (info, cb) in to_fire {
+        // SAFETY: `cb` was supplied by the embedder via `stator_weak_new`
+        // and is invoked with a valid `*const StatorWeakCallbackInfo` whose
+        // referenced storage outlives the call.  The contract on
+        // [`StatorWeakCallback`] forbids re-entering the VM, but
+        // re-entering the FFI weak/persistent helpers is safe.
+        unsafe { cb(&info as *const StatorWeakCallbackInfo) };
+    }
+}
+
+/// Register a weak handle on `value` and arm a one-shot finalization
+/// callback that fires when `value`'s referent becomes unreachable.
+///
+/// The slot does **not** keep `value` alive.  When every other strong
+/// holder of the underlying object has been dropped (and a subsequent
+/// [`stator_isolate_gc`] / [`stator_gc_collect`] runs), the engine
+/// invokes `cb` exactly once and clears the slot.  The slot pointer
+/// itself remains valid until the embedder calls [`stator_weak_dispose`].
+///
+/// Returns null if:
+/// - any required pointer argument is null;
+/// - `value` was created on a different isolate than `ctx`'s parent;
+/// - `value`'s payload is not a reference-counted (object/wrapper/native
+///   function) variant — primitives, plain tag-only objects, and unhandled
+///   tag-only variants cannot meaningfully be weakly referenced.
+///
+/// A null `cb` is accepted: the slot will still observe collection (via
+/// [`stator_weak_is_empty`]) but no embedder callback is invoked.
+///
+/// # Safety
+/// - `ctx` must be null or a valid, live [`StatorContext`] pointer.
+/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+/// - `parameter` and `internal_fields` are passed verbatim to `cb`; their
+///   lifetime is entirely the embedder's responsibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_weak_new(
+    ctx: *mut StatorContext,
+    value: *mut StatorValue,
+    parameter: *mut c_void,
+    internal_field0: *mut c_void,
+    internal_field1: *mut c_void,
+    cb: StatorWeakCallback,
+    parameter_kind: StatorWeakParameterKind,
+) -> *mut StatorWeak {
+    if ctx.is_null() || value.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `value` is valid; cross-isolate weaks are
+    // rejected (same invariant as `stator_persistent_new`).
+    let value_isolate = unsafe { (*value).isolate };
+    if value_isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `value` is valid for read.
+    let Some(referent) = (unsafe { WeakRef::from_inner(&(*value).inner) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `isolate` is valid; we are on the owning thread.
+    unsafe {
+        install_weak_slot(
+            isolate,
+            referent,
+            parameter,
+            [internal_field0, internal_field1],
+            cb,
+            parameter_kind,
+        )
+    }
+}
+
+/// Clear the weak reference stored in `weak` and suppress its callback,
+/// without freeing the slot.
+///
+/// After `reset()`, [`stator_weak_is_empty`] returns `true`, the slot is
+/// skipped by future weak-callback dispatch phases (so the one-shot
+/// callback is **never** invoked, even if the referent is already dead),
+/// and [`stator_weak_upgrade`] returns null.  The slot itself is only
+/// freed by [`stator_weak_dispose`].
+///
+/// Null-tolerant: passing null is a no-op.
+///
+/// # Safety
+/// `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+/// (or [`stator_persistent_make_weak`]) that has not yet been passed to
+/// [`stator_weak_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_weak_reset(weak: *mut StatorWeak) {
+    if weak.is_null() {
+        return;
+    }
+    let slot = weak as *mut StatorWeakSlot;
+    // SAFETY: caller guarantees the slot is live.
+    unsafe {
+        (*slot).referent = None;
+        (*slot).callback = None;
+        // Mark as fired so dispatch never revisits this slot, even if the
+        // embedder reuses the index after dispose (defence in depth).
+        (*slot).fired = true;
+    }
+}
+
+/// Return `true` if `weak` is null, has been reset, has had its callback
+/// fired, or whose referent has been collected since the last GC.
+///
+/// This is the cheap polling path: it inspects the slot's local state and
+/// the underlying `Rc`'s strong count without involving the GC.  A `true`
+/// result means [`stator_weak_upgrade`] would also return null.
+///
+/// # Safety
+/// `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+/// (or [`stator_persistent_make_weak`]) that has not yet been passed to
+/// [`stator_weak_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_weak_is_empty(weak: *const StatorWeak) -> bool {
+    if weak.is_null() {
+        return true;
+    }
+    let slot = weak as *const StatorWeakSlot;
+    // SAFETY: caller guarantees the slot is live.
+    unsafe {
+        match &(*slot).referent {
+            None => true,
+            Some(r) => !r.is_alive(),
+        }
+    }
+}
+
+/// Try to upgrade `weak` into a fresh [`StatorPersistent`] strong handle.
+///
+/// Returns null when the referent has already been collected (the weak's
+/// strong-count is zero), when the slot has been reset or fired, or when
+/// `weak` is null.  On success the returned persistent has its own
+/// independent lifetime and must be disposed via [`stator_persistent_dispose`].
+///
+/// Per `docs/handles.md` §2.3 this is the only documented path back to a
+/// strong handle from a weak; the weak slot itself is unchanged and must
+/// still be disposed by the embedder when no longer needed.
+///
+/// # Safety
+/// `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+/// (or [`stator_persistent_make_weak`]) that has not yet been passed to
+/// [`stator_weak_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_weak_upgrade(weak: *mut StatorWeak) -> *mut StatorPersistent {
+    if weak.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slot_ptr = weak as *mut StatorWeakSlot;
+    // SAFETY: caller guarantees the slot is live.
+    let (isolate, inner) = unsafe {
+        let isolate = (*slot_ptr).isolate;
+        let Some(referent) = (*slot_ptr).referent.as_ref() else {
+            return std::ptr::null_mut();
+        };
+        let Some(inner) = referent.upgrade() else {
+            return std::ptr::null_mut();
+        };
+        (isolate, inner)
+    };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `isolate` is valid; we are on the owning thread.
+    let iso_ref = unsafe { &mut *isolate };
+    let index = iso_ref
+        .persistent_slots
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or_else(|| {
+            iso_ref.persistent_slots.push(None);
+            iso_ref.persistent_slots.len() - 1
+        });
+    let mut p_slot = Box::new(StatorPersistentSlot {
+        inner: Some(inner),
+        isolate,
+        index,
+        root_index: 0,
+    });
+    let slot_addr = p_slot.as_mut() as *mut StatorPersistentSlot as *mut u8;
+    p_slot.root_index = iso_ref.persistent_roots.register_root(slot_addr);
+    let raw = Box::into_raw(p_slot);
+    // SAFETY: reclaim the box into the table so the isolate owns it.
+    iso_ref.persistent_slots[index] = Some(unsafe { Box::from_raw(raw) });
+    raw as *mut StatorPersistent
+}
+
+/// Free the slot backing `weak`.
+///
+/// After this call the `weak` pointer must not be used (except as a
+/// redundant `dispose`, which is a documented no-op).  Disposing a weak
+/// slot **before** its callback fires permanently suppresses the callback —
+/// the slot is removed from the isolate's table before any future dispatch
+/// phase can observe it.  Passing null is also a no-op.
+///
+/// # Safety
+/// `weak` must be null or a slot pointer returned by [`stator_weak_new`]
+/// (or [`stator_persistent_make_weak`]).  After this call returns the
+/// embedder must treat the pointer as invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_weak_dispose(weak: *mut StatorWeak) {
+    if weak.is_null() {
+        return;
+    }
+    let slot_ptr = weak as *mut StatorWeakSlot;
+    // SAFETY: caller guarantees the slot was returned by `stator_weak_new`.
+    let (isolate, index) = unsafe { ((*slot_ptr).isolate, (*slot_ptr).index) };
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: `isolate` is alive for the slot's lifetime; we are on its
+    // owning thread.
+    let iso_ref = unsafe { &mut *isolate };
+    let Some(slot_box) = iso_ref.weak_slots.get_mut(index).and_then(Option::take) else {
+        return;
+    };
+    // Defence in depth: if the slot index has been re-used by a fresh
+    // `stator_weak_new`, the box we just took may belong to that new weak
+    // rather than the stale pointer the caller passed.  Put it back to
+    // avoid corrupting a live weak slot.
+    if !std::ptr::eq(Box::as_ref(&slot_box), slot_ptr) {
+        iso_ref.weak_slots[index] = Some(slot_box);
+        return;
+    }
+    drop(slot_box);
+}
+
+/// Downgrade `persistent` to a weak handle in place.
+///
+/// Disposes the persistent slot (releasing the engine-side root and the
+/// cloned strong value it held) and immediately allocates a fresh weak
+/// slot with the same referent and the supplied callback metadata.
+/// Returns a pointer to the new weak slot; the caller must not use the
+/// original `persistent` pointer afterwards.
+///
+/// Returns null if `persistent` is null or empty, or if the persistent's
+/// payload is not a reference-counted variant (in which case the original
+/// persistent is left untouched so the caller can still dispose it).
+///
+/// # Safety
+/// `persistent` must be null or a slot pointer returned by
+/// [`stator_persistent_new`] that has not yet been passed to
+/// [`stator_persistent_dispose`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_persistent_make_weak(
+    persistent: *mut StatorPersistent,
+    parameter: *mut c_void,
+    internal_field0: *mut c_void,
+    internal_field1: *mut c_void,
+    cb: StatorWeakCallback,
+    parameter_kind: StatorWeakParameterKind,
+) -> *mut StatorWeak {
+    if persistent.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slot_ptr = persistent as *mut StatorPersistentSlot;
+    // SAFETY: caller guarantees the slot is live.
+    let (isolate, inner_opt) = unsafe {
+        let isolate = (*slot_ptr).isolate;
+        let inner = (*slot_ptr).inner.as_ref().and_then(WeakRef::from_inner);
+        (isolate, inner)
+    };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(referent) = inner_opt else {
+        return std::ptr::null_mut();
+    };
+    // Dispose the persistent slot now that we have captured a weak handle.
+    // SAFETY: the pointer is the live slot we just inspected.
+    unsafe { stator_persistent_dispose(persistent) };
+    // SAFETY: `isolate` is valid; we are on the owning thread.
+    unsafe {
+        install_weak_slot(
+            isolate,
+            referent,
+            parameter,
+            [internal_field0, internal_field1],
+            cb,
+            parameter_kind,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -31350,5 +31945,382 @@ mod tests {
         let p = unsafe { stator_persistent_new(ctx_a.as_ptr(), val) };
         assert!(p.is_null());
         unsafe { stator_value_destroy(val) };
+    }
+
+    // ── Weak handles ──────────────────────────────────────────────────────────
+
+    /// Each weak-callback test allocates its own per-test counter so the
+    /// tests can run in parallel without sharing global state.
+    use std::sync::atomic::AtomicUsize;
+
+    /// Generic callback: the embedder-supplied `parameter` is treated as a
+    /// pointer to an `AtomicUsize` that the callback increments each time it
+    /// fires.  The one-shot contract on weak handles guarantees this should
+    /// be observed at most once per slot.
+    unsafe extern "C" fn counting_weak_cb(info: *const StatorWeakCallbackInfo) {
+        // SAFETY: `info` is non-null and supplied by the engine; the
+        // embedder-side test leaks a `Box<AtomicUsize>` and passes its
+        // address as `parameter`, so it remains valid for the duration of
+        // the test.
+        unsafe {
+            let counter = (*info).parameter as *const AtomicUsize;
+            if !counter.is_null() {
+                (*counter).fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Allocate a fresh counter on the heap and leak it so the pointer is
+    /// stable for the duration of the test.  Returns the raw pointer the
+    /// embedder hands to `stator_weak_new` as `parameter`.
+    fn leak_counter() -> *mut AtomicUsize {
+        Box::into_raw(Box::new(AtomicUsize::new(0)))
+    }
+
+    /// Read and free a leaked counter from `leak_counter`.
+    fn take_counter(p: *mut AtomicUsize) -> usize {
+        // SAFETY: `p` was produced by `leak_counter` and not freed yet.
+        let boxed = unsafe { Box::from_raw(p) };
+        boxed.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_weak_new_null_args_returns_null() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let counter = leak_counter();
+        let cb: StatorWeakCallback = Some(counting_weak_cb);
+        // SAFETY: null ctx + null value -> null.
+        let w0 = unsafe {
+            stator_weak_new(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                cb,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(w0.is_null());
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // Value is a primitive (Number) — not Rc-backed, must be rejected.
+        let w1 = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                cb,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(w1.is_null(), "weak on primitive must be rejected");
+        unsafe { stator_value_destroy(val) };
+        // Null value with non-null ctx -> null.
+        let w2 = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                std::ptr::null_mut(),
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                cb,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(w2.is_null());
+        // Callback never fired: counter unchanged.
+        assert_eq!(take_counter(counter), 0);
+    }
+
+    #[test]
+    fn test_weak_does_not_keep_object_alive_and_callback_fires_once() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let counter = leak_counter();
+
+        // Create an object and a value handle that shares its Rc.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        assert!(!val.is_null());
+
+        // Register a weak handle on the value.  This must not bump the
+        // referent's strong count.
+        let weak = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(counting_weak_cb),
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(!weak.is_null());
+        assert!(!unsafe { stator_weak_is_empty(weak) });
+
+        // GC while the referent is still alive must not fire the callback
+        // and the slot must report non-empty.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(counter_load(counter), 0);
+        assert!(!unsafe { stator_weak_is_empty(weak) });
+
+        // Drop every strong holder of the underlying object.
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+
+        // Now the referent has no strong holders; a GC must fire the
+        // callback exactly once.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(counter_load(counter), 1);
+        assert!(unsafe { stator_weak_is_empty(weak) });
+
+        // Subsequent GC cycles must not re-fire the one-shot callback.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(counter_load(counter), 1);
+
+        unsafe { stator_weak_dispose(weak) };
+        assert_eq!(take_counter(counter), 1);
+    }
+
+    /// Read a leaked counter without freeing it (used between GC cycles).
+    fn counter_load(p: *mut AtomicUsize) -> usize {
+        // SAFETY: `p` was produced by `leak_counter` and is still alive.
+        unsafe { (*p).load(Ordering::SeqCst) }
+    }
+
+    #[test]
+    fn test_weak_dispose_suppresses_callback() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let counter = leak_counter();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let weak = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(counting_weak_cb),
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        // Dispose the weak *before* the referent is collected; the
+        // callback must never fire.
+        unsafe { stator_weak_dispose(weak) };
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(take_counter(counter), 0);
+    }
+
+    #[test]
+    fn test_weak_reset_clears_and_suppresses_callback() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let counter = leak_counter();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let weak = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(counting_weak_cb),
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(!unsafe { stator_weak_is_empty(weak) });
+        unsafe { stator_weak_reset(weak) };
+        assert!(unsafe { stator_weak_is_empty(weak) });
+        // Drop the referent and GC; reset must permanently suppress the cb.
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(take_counter(counter), 0);
+        unsafe { stator_weak_dispose(weak) };
+    }
+
+    #[test]
+    fn test_weak_upgrade_succeeds_while_alive_and_fails_after_collection() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let weak = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        // Upgrade while the referent is still alive: returns a fresh
+        // persistent that itself keeps the referent alive.
+        let p = unsafe { stator_weak_upgrade(weak) };
+        assert!(!p.is_null());
+        assert!(!unsafe { stator_persistent_is_empty(p) });
+        // Drop the original strong holders.  The persistent we just
+        // obtained must continue to keep the object alive across a GC.
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert!(!unsafe { stator_weak_is_empty(weak) });
+        let materialized = unsafe { stator_persistent_get(p) };
+        assert!(!materialized.is_null());
+        unsafe { stator_value_destroy(materialized) };
+        // Drop the persistent.  Now the referent should be collectable;
+        // upgrade must return null after GC.
+        unsafe { stator_persistent_dispose(p) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert!(unsafe { stator_weak_is_empty(weak) });
+        let p2 = unsafe { stator_weak_upgrade(weak) };
+        assert!(p2.is_null());
+        unsafe { stator_weak_dispose(weak) };
+    }
+
+    #[test]
+    fn test_weak_null_tolerant_calls_are_noops() {
+        // Every entry point must accept null without crashing.
+        unsafe { stator_weak_reset(std::ptr::null_mut()) };
+        assert!(unsafe { stator_weak_is_empty(std::ptr::null()) });
+        assert!(unsafe { stator_weak_upgrade(std::ptr::null_mut()).is_null() });
+        unsafe { stator_weak_dispose(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_weak_double_dispose_is_safe() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let weak = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_weak_dispose(weak) };
+        // Second dispose is a documented no-op.
+        unsafe { stator_weak_dispose(weak) };
+        // Allocate another weak slot; the isolate must remain usable.
+        let obj2 = unsafe { stator_object_new(iso.as_ptr()) };
+        let val2 = unsafe { stator_object_as_value(obj2) };
+        let weak2 = unsafe {
+            stator_weak_new(
+                ctx.as_ptr(),
+                val2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(!weak2.is_null());
+        unsafe { stator_value_destroy(val2) };
+        unsafe { stator_object_destroy(obj2) };
+        unsafe { stator_weak_dispose(weak2) };
+    }
+
+    #[test]
+    fn test_weak_cross_isolate_value_rejected() {
+        let iso_a = IsolateGuard::new();
+        let iso_b = IsolateGuard::new();
+        let ctx_a = ContextGuard::new(iso_a.as_ptr());
+        let obj_b = unsafe { stator_object_new(iso_b.as_ptr()) };
+        let val_b = unsafe { stator_object_as_value(obj_b) };
+        // Value belongs to iso_b but we try to register a weak through
+        // ctx_a — must fail closed.
+        let w = unsafe {
+            stator_weak_new(
+                ctx_a.as_ptr(),
+                val_b,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(w.is_null());
+        unsafe { stator_value_destroy(val_b) };
+        unsafe { stator_object_destroy(obj_b) };
+    }
+
+    #[test]
+    fn test_persistent_make_weak_downgrades_in_place() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let counter = leak_counter();
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_object_as_value(obj) };
+        let p = unsafe { stator_persistent_new(ctx.as_ptr(), val) };
+        assert!(!p.is_null());
+        // Downgrade the persistent into a weak with a finalization callback.
+        // After this call the persistent pointer is invalid and must not be
+        // touched again.
+        let weak = unsafe {
+            stator_persistent_make_weak(
+                p,
+                counter as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(counting_weak_cb),
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(!weak.is_null());
+        // Drop every other strong holder; the only remaining strong was the
+        // persistent we just downgraded, so the referent should now be dead.
+        unsafe { stator_value_destroy(val) };
+        unsafe { stator_object_destroy(obj) };
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        assert_eq!(counter_load(counter), 1);
+        assert!(unsafe { stator_weak_is_empty(weak) });
+        unsafe { stator_weak_dispose(weak) };
+        assert_eq!(take_counter(counter), 1);
+    }
+
+    #[test]
+    fn test_persistent_make_weak_on_primitive_returns_null() {
+        let iso = IsolateGuard::new();
+        let ctx = ContextGuard::new(iso.as_ptr());
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        let p = unsafe { stator_persistent_new(ctx.as_ptr(), val) };
+        unsafe { stator_value_destroy(val) };
+        assert!(!p.is_null());
+        let w = unsafe {
+            stator_persistent_make_weak(
+                p,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                StatorWeakParameterKind::Opaque,
+            )
+        };
+        assert!(w.is_null());
+        // The persistent is left untouched and must still be disposable.
+        unsafe { stator_persistent_dispose(p) };
     }
 }

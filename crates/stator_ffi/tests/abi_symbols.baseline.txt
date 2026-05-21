@@ -175,6 +175,7 @@ stator_object_template_set_internal_field_count
 stator_persistent_dispose
 stator_persistent_get
 stator_persistent_is_empty
+stator_persistent_make_weak
 stator_persistent_new
 stator_persistent_reset
 stator_platform_current_clock_time_millis
@@ -271,3 +272,8 @@ stator_wasm_instance_destroy
 stator_wasm_instance_exports
 stator_wasm_instantiate
 stator_wasm_module_destroy
+stator_weak_dispose
+stator_weak_is_empty
+stator_weak_new
+stator_weak_reset
+stator_weak_upgrade
