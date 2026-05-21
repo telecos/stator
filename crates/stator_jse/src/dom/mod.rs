@@ -57,6 +57,121 @@ pub type NamedDeleterCallback = Box<dyn Fn(&str, *mut c_void) -> bool>;
 /// Callback that enumerates intercepted named properties.
 pub type NamedEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<String>>;
 
+// ── Symbol-keyed named handler callbacks ────────────────────────────────────
+
+/// Identity of a JavaScript `Symbol` value as routed through a DOM
+/// named-property handler.
+///
+/// `id` is the engine-assigned `u64` identity that backs
+/// [`JsValue::Symbol`][crate::objects::value::JsValue::Symbol].  Two
+/// `SymbolKey`s with the same `id` denote the same Symbol within the
+/// owning isolate; `description` is informational only and **never** used
+/// to determine identity.  In particular, the description is *not* a
+/// string property name — it is preserved purely so embedder interceptors
+/// can produce meaningful diagnostics without ever silently coercing the
+/// symbol to a string.
+///
+/// # Example
+/// ```
+/// use stator_jse::dom::SymbolKey;
+///
+/// let key = SymbolKey::new(7, Some("Symbol.iterator".to_string()));
+/// assert_eq!(key.id(), 7);
+/// assert_eq!(key.description(), Some("Symbol.iterator"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolKey {
+    id: u64,
+    description: Option<String>,
+}
+
+impl SymbolKey {
+    /// Construct a [`SymbolKey`] from an engine-assigned symbol `id` and
+    /// an optional `description`.
+    pub fn new(id: u64, description: Option<String>) -> Self {
+        Self { id, description }
+    }
+
+    /// Return the engine-assigned symbol identity.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Return the optional human-readable description.
+    ///
+    /// This value is **never** used as a string property key; it exists
+    /// purely for diagnostics inside embedder interceptors.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// A named-property handler key — either a UTF-8 string or a symbol
+/// identity.
+///
+/// Borrowed view used by symbol-aware interceptor callbacks so the
+/// embedder can distinguish JS `Symbol`-keyed access from JS
+/// string-keyed access without ever coercing one form to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedKey<'a> {
+    /// A UTF-8 string property name.
+    String(&'a str),
+    /// A symbol property identity.
+    Symbol(&'a SymbolKey),
+}
+
+impl<'a> NamedKey<'a> {
+    /// Return `true` if this key is a symbol identity.
+    pub fn is_symbol(&self) -> bool {
+        matches!(self, NamedKey::Symbol(_))
+    }
+
+    /// Return the string key, if this is a string key.
+    pub fn as_str(&self) -> Option<&'a str> {
+        match self {
+            NamedKey::String(s) => Some(s),
+            NamedKey::Symbol(_) => None,
+        }
+    }
+
+    /// Return the symbol key, if this is a symbol key.
+    pub fn as_symbol(&self) -> Option<&'a SymbolKey> {
+        match self {
+            NamedKey::Symbol(sym) => Some(*sym),
+            NamedKey::String(_) => None,
+        }
+    }
+}
+
+/// Callback for intercepting symbol-keyed named-property **get**.
+pub type NamedSymbolGetterCallback = Box<dyn Fn(&SymbolKey, *mut c_void) -> NamedGetterResult>;
+
+/// Callback for intercepting symbol-keyed named-property **set**.
+pub type NamedSymbolSetterCallback =
+    Box<dyn Fn(&SymbolKey, &JsValue, *mut c_void) -> NamedSetterResult>;
+
+/// Callback for intercepting symbol-keyed named-property **query**.
+pub type NamedSymbolQueryCallback = Box<dyn Fn(&SymbolKey, *mut c_void) -> Option<u32>>;
+
+/// Callback for intercepting symbol-keyed named-property **delete**.
+pub type NamedSymbolDeleterCallback = Box<dyn Fn(&SymbolKey, *mut c_void) -> bool>;
+
+/// Callback that enumerates intercepted symbol-keyed properties.
+pub type NamedSymbolEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<SymbolKey>>;
+
+/// Borrowed symbol-keyed getter reference.
+type NamedSymbolGetterRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> NamedGetterResult>;
+
+/// Borrowed symbol-keyed setter reference.
+type NamedSymbolSetterRef<'a> =
+    Option<&'a dyn Fn(&SymbolKey, &JsValue, *mut c_void) -> NamedSetterResult>;
+
+/// Borrowed symbol-keyed query reference.
+type NamedSymbolQueryRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> Option<u32>>;
+
+/// Borrowed symbol-keyed deleter reference.
+type NamedSymbolDeleterRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> bool>;
+
 /// Result returned by an indexed-property getter interceptor.
 pub type IndexedGetterResult = Option<JsValue>;
 
@@ -296,6 +411,11 @@ pub struct NamedPropertyHandlerConfig {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    symbol_getter: Option<NamedSymbolGetterCallback>,
+    symbol_setter: Option<NamedSymbolSetterCallback>,
+    symbol_query: Option<NamedSymbolQueryCallback>,
+    symbol_deleter: Option<NamedSymbolDeleterCallback>,
+    symbol_enumerator: Option<NamedSymbolEnumeratorCallback>,
     flags: NamedPropertyHandlerFlags,
 }
 
@@ -334,6 +454,80 @@ impl NamedPropertyHandlerConfig {
     pub fn flags(&self) -> NamedPropertyHandlerFlags {
         self.flags
     }
+
+    // ── Symbol-keyed accessors ───────────────────────────────────────
+
+    /// Return a reference to the symbol-keyed getter callback, if installed.
+    pub fn symbol_getter(&self) -> NamedSymbolGetterRef<'_> {
+        self.symbol_getter.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed setter callback, if installed.
+    pub fn symbol_setter(&self) -> NamedSymbolSetterRef<'_> {
+        self.symbol_setter.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed query callback, if installed.
+    pub fn symbol_query(&self) -> NamedSymbolQueryRef<'_> {
+        self.symbol_query.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed deleter callback, if installed.
+    pub fn symbol_deleter(&self) -> NamedSymbolDeleterRef<'_> {
+        self.symbol_deleter.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed enumerator, if installed.
+    pub fn symbol_enumerator(&self) -> Option<&dyn Fn(*mut c_void) -> Vec<SymbolKey>> {
+        self.symbol_enumerator.as_deref()
+    }
+
+    /// Return `true` if symbol keys should be routed through this handler.
+    ///
+    /// This implements the fail-closed flag policy that mirrors V8's
+    /// `PropertyHandlerFlags`:
+    ///
+    /// * If [`NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS`] is set,
+    ///   symbols are **never** routed through the interceptor — even if
+    ///   [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`] is also set.
+    /// * Otherwise, symbols are routed only when
+    ///   [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`] is set.
+    ///
+    /// The default (no flags) therefore forwards no symbol-keyed access,
+    /// matching V8's legacy named-handler behaviour and preventing any
+    /// accidental coercion of a symbol to its description string.
+    pub fn symbols_enabled(&self) -> bool {
+        if self
+            .flags
+            .contains(NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS)
+        {
+            return false;
+        }
+        self.flags
+            .contains(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+    }
+
+    /// Consume this config and return a builder pre-populated with every
+    /// installed callback and the current flag bitset.
+    ///
+    /// Used by additive symbol-handler installation paths that want to
+    /// preserve previously installed string-keyed callbacks while
+    /// layering on symbol-keyed callbacks.
+    pub fn into_builder(self) -> NamedPropertyHandlerConfigBuilder {
+        NamedPropertyHandlerConfigBuilder {
+            getter: self.getter,
+            setter: self.setter,
+            query: self.query,
+            deleter: self.deleter,
+            enumerator: self.enumerator,
+            symbol_getter: self.symbol_getter,
+            symbol_setter: self.symbol_setter,
+            symbol_query: self.symbol_query,
+            symbol_deleter: self.symbol_deleter,
+            symbol_enumerator: self.symbol_enumerator,
+            flags: self.flags,
+        }
+    }
 }
 
 impl std::fmt::Debug for NamedPropertyHandlerConfig {
@@ -344,6 +538,11 @@ impl std::fmt::Debug for NamedPropertyHandlerConfig {
             .field("has_query", &self.query.is_some())
             .field("has_deleter", &self.deleter.is_some())
             .field("has_enumerator", &self.enumerator.is_some())
+            .field("has_symbol_getter", &self.symbol_getter.is_some())
+            .field("has_symbol_setter", &self.symbol_setter.is_some())
+            .field("has_symbol_query", &self.symbol_query.is_some())
+            .field("has_symbol_deleter", &self.symbol_deleter.is_some())
+            .field("has_symbol_enumerator", &self.symbol_enumerator.is_some())
             .field("flags", &self.flags)
             .finish()
     }
@@ -357,6 +556,11 @@ pub struct NamedPropertyHandlerConfigBuilder {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    symbol_getter: Option<NamedSymbolGetterCallback>,
+    symbol_setter: Option<NamedSymbolSetterCallback>,
+    symbol_query: Option<NamedSymbolQueryCallback>,
+    symbol_deleter: Option<NamedSymbolDeleterCallback>,
+    symbol_enumerator: Option<NamedSymbolEnumeratorCallback>,
     flags: NamedPropertyHandlerFlags,
 }
 
@@ -410,8 +614,67 @@ impl NamedPropertyHandlerConfigBuilder {
             query: self.query,
             deleter: self.deleter,
             enumerator: self.enumerator,
+            symbol_getter: self.symbol_getter,
+            symbol_setter: self.symbol_setter,
+            symbol_query: self.symbol_query,
+            symbol_deleter: self.symbol_deleter,
+            symbol_enumerator: self.symbol_enumerator,
             flags: self.flags,
         }
+    }
+
+    // ── Symbol-keyed callbacks ───────────────────────────────────────
+
+    /// Install a symbol-keyed named-property getter interceptor.
+    ///
+    /// The callback is invoked **only** when the handler's flag bitset
+    /// has [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`] set *and*
+    /// [`NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS`] is not set
+    /// (see [`NamedPropertyHandlerConfig::symbols_enabled`]).  Without
+    /// the flag, symbol-keyed access fails closed — the engine does not
+    /// fall back to the string getter and never stringifies the symbol.
+    pub fn symbol_getter(
+        mut self,
+        cb: impl Fn(&SymbolKey, *mut c_void) -> NamedGetterResult + 'static,
+    ) -> Self {
+        self.symbol_getter = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a symbol-keyed named-property setter interceptor.
+    pub fn symbol_setter(
+        mut self,
+        cb: impl Fn(&SymbolKey, &JsValue, *mut c_void) -> NamedSetterResult + 'static,
+    ) -> Self {
+        self.symbol_setter = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a symbol-keyed named-property query interceptor.
+    pub fn symbol_query(
+        mut self,
+        cb: impl Fn(&SymbolKey, *mut c_void) -> Option<u32> + 'static,
+    ) -> Self {
+        self.symbol_query = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a symbol-keyed named-property deleter interceptor.
+    pub fn symbol_deleter(
+        mut self,
+        cb: impl Fn(&SymbolKey, *mut c_void) -> bool + 'static,
+    ) -> Self {
+        self.symbol_deleter = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a symbol-keyed enumerator callback.
+    pub fn symbol_enumerator(
+        mut self,
+        cb: impl Fn(*mut c_void) -> Vec<SymbolKey> + 'static,
+    ) -> Self {
+        self.symbol_enumerator = Some(Box::new(cb));
+        self
     }
 }
 
@@ -593,6 +856,12 @@ pub enum AccessCheckKey<'a> {
     Named(&'a str),
     /// An indexed property key.
     Indexed(u32),
+    /// A symbol property key.
+    ///
+    /// Carries the engine-assigned [`SymbolKey`] identity verbatim;
+    /// access-check callbacks receive it without any stringification so
+    /// embedder policy decisions can faithfully observe symbol identity.
+    Symbol(&'a SymbolKey),
 }
 
 /// Embedder callback that decides whether a DOM wrapper property
@@ -1085,6 +1354,131 @@ impl DomObjectWrap {
         names
     }
 
+    // ── symbol-keyed named property access ───────────────────────────────
+
+    /// Read a symbol-keyed named property.
+    ///
+    /// Symbols are routed through the named handler **only** when
+    /// [`NamedPropertyHandlerConfig::symbols_enabled`] is `true` (i.e.
+    /// the handler set [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`]
+    /// without [`NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS`]).
+    /// Otherwise the access fails closed and returns
+    /// [`JsValue::Undefined`] — the engine never stringifies the symbol
+    /// to fall back to the string getter.
+    ///
+    /// When routing is enabled the resolution order mirrors
+    /// [`Self::get_property`]:
+    /// 1. Access-check callback (with [`AccessCheckKey::Symbol`]).  A
+    ///    denial returns `Undefined` unless the handler sets
+    ///    [`NamedPropertyHandlerFlags::ALL_CAN_READ`].
+    /// 2. Symbol-keyed interceptor getter.
+    pub fn get_symbol_property(&self, key: &SymbolKey) -> JsValue {
+        let allowed =
+            self.check_access(AccessCheckOperation::NamedGet, AccessCheckKey::Symbol(key));
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && (allowed || all_can_read)
+            && let Some(getter) = cfg.symbol_getter()
+            && let Some(val) = getter(key, self.data_ptr())
+        {
+            return val;
+        }
+        JsValue::Undefined
+    }
+
+    /// Write a symbol-keyed named property through the interceptor.
+    ///
+    /// Returns `true` when the interceptor handled the write *or* when
+    /// the access check denied it (the write is silently discarded —
+    /// fail-closed).  Returns `false` when symbol routing is disabled
+    /// (the symbol must not be coerced to a string and stored on the
+    /// own-property map) or when no symbol setter is installed.
+    pub fn set_symbol_property(&self, key: &SymbolKey, value: JsValue) -> bool {
+        if !self.check_access(AccessCheckOperation::NamedSet, AccessCheckKey::Symbol(key)) {
+            return true;
+        }
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && let Some(setter) = cfg.symbol_setter()
+        {
+            return setter(key, &value, self.data_ptr());
+        }
+        false
+    }
+
+    /// Query whether a symbol-keyed property exists via the interceptor.
+    ///
+    /// Returns `false` when symbol routing is disabled, when no symbol
+    /// query callback is installed, or when access is denied (subject
+    /// to the same [`NamedPropertyHandlerFlags::ALL_CAN_READ`] override
+    /// as the string path).
+    pub fn has_symbol_property(&self, key: &SymbolKey) -> bool {
+        let allowed = self.check_access(
+            AccessCheckOperation::NamedQuery,
+            AccessCheckKey::Symbol(key),
+        );
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && (allowed || all_can_read)
+            && let Some(query) = cfg.symbol_query()
+        {
+            return query(key, self.data_ptr()).is_some();
+        }
+        false
+    }
+
+    /// Delete a symbol-keyed property via the interceptor.
+    ///
+    /// Returns `false` when symbol routing is disabled, when no symbol
+    /// deleter is installed, or when access is denied.
+    pub fn delete_symbol_property(&self, key: &SymbolKey) -> bool {
+        if !self.check_access(
+            AccessCheckOperation::NamedDelete,
+            AccessCheckKey::Symbol(key),
+        ) {
+            return false;
+        }
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && let Some(deleter) = cfg.symbol_deleter()
+        {
+            return deleter(key, self.data_ptr());
+        }
+        false
+    }
+
+    /// Enumerate the symbol-keyed properties reported by the
+    /// interceptor.
+    ///
+    /// Returns an empty list when symbol routing is disabled, when no
+    /// symbol enumerator is installed, or when the access check denies
+    /// the enumeration.
+    pub fn symbol_property_keys(&self) -> Vec<SymbolKey> {
+        if !self.check_access(AccessCheckOperation::NamedEnumerate, AccessCheckKey::None) {
+            return Vec::new();
+        }
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && let Some(enumerator) = cfg.symbol_enumerator()
+        {
+            return enumerator(self.data_ptr());
+        }
+        Vec::new()
+    }
+
     // ── indexed property access ──────────────────────────────────────────
 
     /// Read an indexed property via the interceptor.
@@ -1173,6 +1567,17 @@ impl DomObjectWrap {
     /// Install a named-property handler configuration.
     pub fn set_named_handler(&mut self, config: NamedPropertyHandlerConfig) {
         self.named_handler = Some(config);
+    }
+
+    /// Take the currently-installed named-property handler configuration,
+    /// leaving the wrapper without a named handler.  Returns `None` when
+    /// no named handler is installed.
+    ///
+    /// Used by additive installation paths (e.g. layering symbol callbacks
+    /// on top of pre-existing string callbacks) to rebuild a handler from
+    /// the existing trait objects rather than cloning them.
+    pub fn take_named_handler(&mut self) -> Option<NamedPropertyHandlerConfig> {
+        self.named_handler.take()
     }
 
     /// Return `true` if a named-property handler is installed.
@@ -1730,6 +2135,7 @@ mod tests {
             let key_str = match key {
                 AccessCheckKey::Named(name) => name.to_string(),
                 AccessCheckKey::Indexed(i) => format!("[{i}]"),
+                AccessCheckKey::Symbol(sym) => format!("@@{}", sym.id()),
                 AccessCheckKey::None => String::new(),
             };
             log.borrow_mut().push((op, key_str, data as usize));
@@ -2289,5 +2695,264 @@ mod tests {
             cfg.flags()
                 .contains(NamedPropertyHandlerFlags::HAS_NO_SIDE_EFFECT)
         );
+    }
+
+    // ── Symbol-keyed named handler ───────────────────────────────────────
+
+    fn iter_sym() -> SymbolKey {
+        SymbolKey::new(7, Some("Symbol.iterator".to_string()))
+    }
+    fn async_iter_sym() -> SymbolKey {
+        SymbolKey::new(11, Some("Symbol.asyncIterator".to_string()))
+    }
+
+    #[test]
+    fn test_symbol_key_identity_independent_of_description() {
+        let a = SymbolKey::new(42, Some("foo".to_string()));
+        let b = SymbolKey::new(42, Some("bar".to_string()));
+        // Hash/Eq derive uses both fields, but identity is the `id` field;
+        // callers must look at .id() for identity comparisons.
+        assert_eq!(a.id(), b.id());
+        assert_ne!(a, b);
+        assert_eq!(a.description(), Some("foo"));
+    }
+
+    #[test]
+    fn test_named_key_helpers() {
+        let s = "id";
+        let sym = iter_sym();
+        let ks = NamedKey::String(s);
+        let kx = NamedKey::Symbol(&sym);
+        assert!(!ks.is_symbol());
+        assert!(kx.is_symbol());
+        assert_eq!(ks.as_str(), Some("id"));
+        assert!(ks.as_symbol().is_none());
+        assert_eq!(kx.as_symbol().map(|s| s.id()), Some(7));
+        assert!(kx.as_str().is_none());
+    }
+
+    #[test]
+    fn test_symbol_get_disabled_by_default_returns_undefined() {
+        // INTERCEPT_SYMBOLS not set: even a symbol getter is not consulted.
+        let mut wrap = DomObjectWrap::new(1);
+        let invoked = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&invoked);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(move |_sym, _data| {
+                    flag.set(true);
+                    Some(JsValue::Smi(1))
+                })
+                .build(),
+        );
+        let sym = iter_sym();
+        assert_eq!(wrap.get_symbol_property(&sym), JsValue::Undefined);
+        assert!(
+            !invoked.get(),
+            "symbol getter must not run without INTERCEPT_SYMBOLS flag"
+        );
+    }
+
+    #[test]
+    fn test_symbol_get_routed_when_intercept_symbols_set() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(|sym, _data| {
+                    if sym.id() == 7 {
+                        Some(JsValue::String(
+                            sym.description().unwrap_or("").to_string().into(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        let sym = iter_sym();
+        assert_eq!(
+            wrap.get_symbol_property(&sym),
+            JsValue::String("Symbol.iterator".into())
+        );
+        let unknown = SymbolKey::new(999, None);
+        assert_eq!(wrap.get_symbol_property(&unknown), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_symbol_get_blocked_by_only_intercept_strings() {
+        // ONLY_INTERCEPT_STRINGS overrides INTERCEPT_SYMBOLS, even when both set.
+        let mut wrap = DomObjectWrap::new(1);
+        let invoked = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&invoked);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(move |_, _| {
+                    flag.set(true);
+                    Some(JsValue::Smi(1))
+                })
+                .flags(
+                    NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS
+                        | NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS,
+                )
+                .build(),
+        );
+        let sym = iter_sym();
+        assert_eq!(wrap.get_symbol_property(&sym), JsValue::Undefined);
+        assert!(!invoked.get());
+    }
+
+    #[test]
+    fn test_symbol_set_query_delete_routed() {
+        let stored = Rc::new(RefCell::new(Vec::<(u64, JsValue)>::new()));
+        let stored_set = Rc::clone(&stored);
+        let stored_query = Rc::clone(&stored);
+        let stored_del = Rc::clone(&stored);
+
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_setter(move |sym, val, _| {
+                    stored_set.borrow_mut().push((sym.id(), val.clone()));
+                    true
+                })
+                .symbol_query(move |sym, _| {
+                    if stored_query.borrow().iter().any(|(id, _)| *id == sym.id()) {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                })
+                .symbol_deleter(move |sym, _| {
+                    let before = stored_del.borrow().len();
+                    stored_del.borrow_mut().retain(|(id, _)| *id != sym.id());
+                    stored_del.borrow().len() != before
+                })
+                .symbol_enumerator(|_| vec![iter_sym(), async_iter_sym()])
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        let sym = iter_sym();
+        assert!(wrap.set_symbol_property(&sym, JsValue::Smi(99)));
+        assert_eq!(stored.borrow().len(), 1);
+        assert!(wrap.has_symbol_property(&sym));
+        assert!(!wrap.has_symbol_property(&SymbolKey::new(123, None)));
+        assert!(wrap.delete_symbol_property(&sym));
+        assert!(!wrap.has_symbol_property(&sym));
+
+        let syms = wrap.symbol_property_keys();
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].id(), 7);
+        assert_eq!(syms[1].id(), 11);
+    }
+
+    #[test]
+    fn test_symbol_set_without_setter_returns_false() {
+        // Critical: must not silently stringify the symbol and fall through.
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .setter(|name, _val, _data| {
+                    panic!("string setter must not be called with symbol key: {name}")
+                })
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        let sym = iter_sym();
+        assert!(!wrap.set_symbol_property(&sym, JsValue::Smi(1)));
+        // No own-property entry created (symbol must not become "Symbol.iterator").
+        assert!(!wrap.has_property("Symbol.iterator"));
+        assert!(!wrap.has_property("Symbol(7)"));
+    }
+
+    #[test]
+    fn test_symbol_access_check_denied() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(|_sym, _data| Some(JsValue::String("secret".into())))
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, key, _| {
+            // Deny any symbol-keyed get.
+            !(matches!(op, AccessCheckOperation::NamedGet)
+                && matches!(key, AccessCheckKey::Symbol(_)))
+        }));
+        let sym = iter_sym();
+        assert_eq!(wrap.get_symbol_property(&sym), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_symbol_access_check_all_can_read_overrides_deny() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(|_sym, _data| Some(JsValue::Smi(123)))
+                .flags(
+                    NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS
+                        | NamedPropertyHandlerFlags::ALL_CAN_READ,
+                )
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _| false));
+        let sym = iter_sym();
+        assert_eq!(wrap.get_symbol_property(&sym), JsValue::Smi(123));
+    }
+
+    #[test]
+    fn test_symbol_access_check_receives_symbol_key() {
+        let observed: Rc<RefCell<Vec<(u64, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&observed);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_getter(|_, _| None)
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(move |_op, key, _| {
+            if let AccessCheckKey::Symbol(sym) = key {
+                log.borrow_mut()
+                    .push((sym.id(), sym.description().map(|s| s.to_string())));
+            }
+            true
+        }));
+        let sym = iter_sym();
+        let _ = wrap.get_symbol_property(&sym);
+        let entries = observed.borrow();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 7);
+        assert_eq!(entries[0].1.as_deref(), Some("Symbol.iterator"));
+    }
+
+    #[test]
+    fn test_string_path_unchanged_when_symbol_callbacks_installed() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|name, _| {
+                    if name == "id" {
+                        Some(JsValue::String("ok".into()))
+                    } else {
+                        None
+                    }
+                })
+                .symbol_getter(|_, _| panic!("symbol getter must not run for string key"))
+                .flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS)
+                .build(),
+        );
+        assert_eq!(wrap.get_property("id"), JsValue::String("ok".into()));
+    }
+
+    #[test]
+    fn test_symbol_enumerator_disabled_without_flag() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_enumerator(|_| vec![iter_sym()])
+                .build(),
+        );
+        assert!(wrap.symbol_property_keys().is_empty());
     }
 }

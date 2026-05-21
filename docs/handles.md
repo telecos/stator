@@ -557,8 +557,8 @@ Named-handler flags (`STATOR_DOM_NAMED_HANDLER_FLAG_*`):
 | `NONE` | Default behaviour; interceptor is consulted before own properties on every operation. |
 | `ALL_CAN_READ` | Read-side ops (`Get`, `Query`) still consult the interceptor even when the access-check callback denies the access. Writes/deletes/enumeration remain access-checked. |
 | `NON_MASKING` | Interceptor only fires when the wrapper's own-property map does not already define the key. Existing own properties "mask" interceptor entries on both reads and writes. |
-| `ONLY_INTERCEPT_STRINGS` | Stored-only metadata. Stator does not yet route symbol-keyed access through DOM wrappers, so this flag matches the implicit steady-state behaviour. |
-| `INTERCEPT_SYMBOLS` | Stored-only metadata. Reserved for future symbol-key routing; today it has no runtime effect. |
+| `ONLY_INTERCEPT_STRINGS` | Suppresses symbol-keyed routing. When set, the symbol-aware getter/setter/query/deleter/enumerator callbacks are never consulted (even if `INTERCEPT_SYMBOLS` is also set). String-keyed access is unaffected. |
+| `INTERCEPT_SYMBOLS` | Enables routing of symbol-keyed property access through the wrapper's symbol-aware callbacks (see §7.5). Default is **off**; symbol routing is fail-closed and must be opted in. Has no effect when `ONLY_INTERCEPT_STRINGS` is also set. |
 | `HAS_NO_SIDE_EFFECT` | Stored-only metadata. Intended for profilers/debuggers that need to invoke the interceptor without observable side effects; no runtime effect today. |
 
 Indexed-handler flags (`STATOR_DOM_INDEXED_HANDLER_FLAG_*`):
@@ -585,10 +585,11 @@ FFI surface:
 
 Current limitations:
 
-- Stator does not yet honour `ONLY_INTERCEPT_STRINGS`, `INTERCEPT_SYMBOLS`,
-  or `HAS_NO_SIDE_EFFECT` at runtime — they are stored-only capability
-  metadata that future Stator versions can wire into symbol-key routing
-  and side-effect-free diagnostics paths.
+- Stator does not yet honour `HAS_NO_SIDE_EFFECT` at runtime — it is
+  stored-only capability metadata that future Stator versions can wire
+  into side-effect-free diagnostics paths. `ONLY_INTERCEPT_STRINGS` and
+  `INTERCEPT_SYMBOLS` are observed at runtime as documented above and
+  in §7.5.
 - Flags are stored per handler instance, not on an underlying template;
   reinstalling a named handler via
   `stator_dom_object_wrap_install_named_handler` replaces both the
@@ -640,6 +641,113 @@ Current limitations:
   `stator_value_is_dom_object_wrap_class` for stale script values; those
   fail closed using the wrapper liveness token without dereferencing the
   destroyed pointer.
+
+### 7.5 DOM wrapper symbol-keyed named property handlers
+
+JavaScript Symbol values carry an engine-assigned numeric identity and an
+optional descriptive label. Edge/Blink bindings need to intercept symbol-
+keyed access (e.g. `Symbol.iterator`, `Symbol.toPrimitive`) without
+coercing the symbol to a string. Stator exposes an additive, symbol-aware
+slot on every `DomObjectWrap` named-handler that, when opted in, routes
+symbol-keyed operations through a parallel callback set:
+
+| Operation | Symbol-aware callback |
+|-----------|----------------------|
+| `Get` | `StatorDomNamedSymbolGetterCb` |
+| `Set` | `StatorDomNamedSymbolSetterCb` |
+| `Has` / `Query` | `StatorDomNamedSymbolQueryCb` |
+| `Delete` | `StatorDomNamedSymbolDeleterCb` |
+| `Enumerate` | `StatorDomNamedSymbolEnumeratorCb` |
+
+Each callback receives a borrowed `StatorDomSymbolKey`:
+
+```c
+typedef struct StatorDomSymbolKey {
+    uint64_t symbol_id;             // identity (never zero for valid symbols)
+    const char *description_utf8;   // optional, NUL not required
+    size_t description_len;
+} StatorDomSymbolKey;
+```
+
+**Identity rule.** A symbol's identity is its `symbol_id`. The
+`description_utf8` field is purely informational (diagnostics, hashing
+hints, devtools labels) and **must not** be used as a string key.
+Different symbols with identical descriptions are distinct.
+
+#### Fail-closed routing policy
+
+Symbol routing is **off** by default. The engine consults the symbol-
+aware callbacks only when **both** of the following hold:
+
+1. `INTERCEPT_SYMBOLS` is set on the named-handler flags, **and**
+2. `ONLY_INTERCEPT_STRINGS` is **not** set.
+
+Any other combination (no flag at all, or both flags set) silently
+suppresses symbol routing. The engine never coerces a symbol to a string
+on the named-handler path, and an embedder that has not installed
+symbol-aware callbacks observes the historical string-only behaviour
+verbatim.
+
+#### FFI surface
+
+```c
+// Install symbol-aware callbacks additively (preserves any previously
+// installed string callbacks).  At least one callback field must be
+// non-NULL.  Flags are unchanged; the embedder must call
+// stator_dom_object_wrap_set_named_handler_flags afterwards to enable
+// routing.
+StatorStatus stator_dom_object_wrap_install_named_symbol_handler(
+    StatorDomObjectWrap *wrap,
+    const StatorDomNamedSymbolHandler *handler);
+
+// Synchronous invocation helpers used by Edge/Blink test shims and by
+// the engine's own dispatch.  Each helper validates arguments, builds a
+// SymbolKey, and routes through the wrapper's handler honouring the
+// flag policy above.  When routing is suppressed, the *_getter helper
+// writes NULL into *out and returns Ok; *_setter / *_deleter / *_query
+// write `false` into their handled/has/deleted out-params; the
+// enumerator helper leaves the supplied buffer unchanged.
+StatorStatus stator_dom_object_wrap_invoke_symbol_getter(...);
+StatorStatus stator_dom_object_wrap_invoke_symbol_setter(...);
+StatorStatus stator_dom_object_wrap_invoke_symbol_query(...);
+StatorStatus stator_dom_object_wrap_invoke_symbol_deleter(...);
+StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(
+    StatorDomObjectWrap *wrap, StatorDomSymbolBuffer *out_buf);
+
+// Embedder-owned buffer used by the enumerator path.  Caller owns the
+// buffer and must pair every `_new` with `_destroy`.  Borrowed
+// description_utf8 returned by `_get` is valid until the next `_push`
+// or `_destroy`.
+StatorDomSymbolBuffer *stator_dom_symbol_buffer_new(void);
+void                   stator_dom_symbol_buffer_destroy(StatorDomSymbolBuffer*);
+size_t                 stator_dom_symbol_buffer_len(const StatorDomSymbolBuffer*);
+StatorStatus           stator_dom_symbol_buffer_get(
+    const StatorDomSymbolBuffer*, size_t index, StatorDomSymbolKey *out_key);
+StatorStatus           stator_dom_symbol_buffer_push(
+    StatorDomSymbolBuffer*, uint64_t symbol_id,
+    const char *description_utf8, size_t description_len);
+```
+
+#### Access checks and symbols
+
+The v1 access-check signature
+(`stator_dom_object_wrap_set_access_check`) cannot represent symbol
+identity. Stator therefore **fails closed** on every symbol-keyed access
+whenever a v1 access check is installed: the user callback is never
+invoked for symbol keys, and the operation is denied as if the check
+returned `false`. Embedders that need symbol-aware access policy must
+wait for the planned symbol-aware access-check counterpart.
+
+#### Validation
+
+- Empty handlers (all five callbacks NULL) are rejected with
+  `StatorStatusInvalidArg`.
+- `build_symbol_key` validates the description as UTF-8 and fails closed
+  on `NULL` pointer with non-zero length.
+- The symbol-aware install path preserves any previously installed
+  string-keyed callbacks (and their flag bitmask) by extracting the
+  current handler into a builder and layering symbol slots on top.
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.

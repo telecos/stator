@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 8
+#define STATOR_FFI_ABI_VERSION_MINOR 9
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -772,6 +772,14 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
  * Both default to zero / null and are never dereferenced by the engine.
  */
 typedef struct StatorDomObjectWrap StatorDomObjectWrap;
+
+/**
+ * Opaque buffer passed to a [`StatorDomNamedSymbolEnumeratorCb`] callback.
+ * The callback pushes symbol identities by repeatedly invoking
+ * [`stator_dom_symbol_buffer_push`].  The buffer is owned by the FFI
+ * bridge and must not outlive the callback invocation.
+ */
+typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
 
 /**
  * An opaque handle to a DOM wrapper weak reference.
@@ -1780,6 +1788,80 @@ typedef struct StatorDomIndexedHandler {
    */
   void *data;
 } StatorDomIndexedHandler;
+
+/**
+ * POD descriptor for a symbol property key passed across the FFI
+ * boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
+ * without ever coercing the symbol to a string: `symbol_id` carries the
+ * engine-assigned identity verbatim, and `description_utf8`/`description_len`
+ * carry the optional description for diagnostics only.
+ *
+ * `description_utf8` may be `NULL` (with `description_len == 0`) when the
+ * symbol has no description.  The pointer is borrowed for the duration of
+ * the callback and must not be retained by the embedder past that point.
+ */
+typedef struct StatorDomSymbolKey {
+  /**
+   * Engine-assigned symbol identity.  Two symbols are equal iff they
+   * share this value within the owning isolate.
+   */
+  uint64_t symbol_id;
+  /**
+   * Borrowed UTF-8 description bytes, or `NULL`.
+   */
+  const char *description_utf8;
+  /**
+   * Length in bytes of the description, or `0`.
+   */
+  size_t description_len;
+} StatorDomSymbolKey;
+
+/**
+ * POD bundle of symbol-keyed named-property interceptors, installed in
+ * one call by [`stator_dom_object_wrap_install_named_symbol_handler`].
+ *
+ * Each callback is optional.  At least one callback must be non-null
+ * for the install call to succeed.  The bundle is **additive** with
+ * respect to any string-keyed [`StatorDomNamedHandler`] already
+ * installed: callers who want both must install the string handler
+ * first and then the symbol handler.
+ *
+ * Symbol callbacks are only ever invoked when the wrapper's named
+ * handler flags allow symbol routing (see the
+ * `STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS` flag).  Without
+ * that flag, symbol-keyed access fails closed and never falls back to
+ * the string-keyed callbacks — the symbol is *never* stringified.
+ */
+typedef struct StatorDomNamedSymbolHandler {
+  /**
+   * Symbol-keyed getter, or null.
+   */
+  enum StatorStatus (*getter)(const struct StatorDomSymbolKey *key,
+                              void *data,
+                              struct StatorValue **out);
+  /**
+   * Symbol-keyed setter, or null.
+   */
+  enum StatorStatus (*setter)(const struct StatorDomSymbolKey *key,
+                              const struct StatorValue *value,
+                              void *data);
+  /**
+   * Symbol-keyed query callback, or null.
+   */
+  enum StatorStatus (*query)(const struct StatorDomSymbolKey *key, void *data, uint32_t *out_attrs);
+  /**
+   * Symbol-keyed deleter, or null.
+   */
+  enum StatorStatus (*deleter)(const struct StatorDomSymbolKey *key, void *data, bool *out_deleted);
+  /**
+   * Symbol-keyed enumerator, or null.
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomSymbolBuffer *buf, void *data);
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomNamedSymbolHandler;
 
 /**
  * C-callable Promise rejection event callback signature.
@@ -5965,6 +6047,193 @@ enum StatorStatus stator_dom_object_wrap_install_named_handler(struct StatorDomO
  */
 enum StatorStatus stator_dom_object_wrap_install_indexed_handler(struct StatorDomObjectWrap *wrap,
                                                                  const struct StatorDomIndexedHandler *handler);
+
+/**
+ * Append a symbol identity to a [`StatorDomSymbolBuffer`].
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+ *   `description_utf8` is null while `description_len` is non-zero, or
+ *   when the description byte range is not valid UTF-8.
+ *
+ * # Safety
+ * - `buf` must be a valid pointer to a [`StatorDomSymbolBuffer`] currently
+ *   borrowed by an enumerator callback.
+ * - `description_utf8` must point to at least `description_len` valid
+ *   bytes when `description_len > 0`.
+ */
+enum StatorStatus stator_dom_symbol_buffer_push(struct StatorDomSymbolBuffer *buf,
+                                                uint64_t symbol_id,
+                                                const char *description_utf8,
+                                                size_t description_len);
+
+/**
+ * Install an aggregated set of symbol-keyed named-property interceptors
+ * on `wrap`.
+ *
+ * This installs symbol callbacks on the named handler **without**
+ * disturbing any previously-installed string-keyed callbacks.  If no
+ * named handler is installed yet, an empty one is created so the
+ * symbol callbacks have a home.  The installation **does not** set the
+ * `INTERCEPT_SYMBOLS` flag automatically — the embedder must call
+ * [`stator_dom_object_wrap_set_named_handler_flags`] to opt in.
+ * Without that flag the symbol callbacks remain dormant (fail-closed),
+ * matching V8/Blink semantics and preventing accidental stringification.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `handler` is
+ *   null, or when every callback field in `handler` is null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `handler` must be a non-null, readable pointer to a
+ *   [`StatorDomNamedSymbolHandler`].  The function pointers it carries
+ *   must remain valid for the lifetime of the wrapper.
+ */
+enum StatorStatus stator_dom_object_wrap_install_named_symbol_handler(struct StatorDomObjectWrap *wrap,
+                                                                      const struct StatorDomNamedSymbolHandler *handler);
+
+/**
+ * Invoke the wrapper's symbol-keyed named-property **getter** path.
+ *
+ * The function applies the same access-check / flag / interceptor rules
+ * as a symbol-keyed JS property read would: a denial or a wrapper
+ * without `INTERCEPT_SYMBOLS` reports "not handled" (`StatorStatusOk`
+ * with `*out` left null), while a successful interceptor write returns
+ * `StatorStatusOk` with `*out` set to a fresh [`StatorValue`] owned by
+ * the caller (free with [`stator_value_destroy`]).
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] in every "no exception" case;
+ *   `*out` is null when the property is undefined or unhandled, and
+ *   non-null when the interceptor produced a value.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out` is
+ *   null, or when `description_utf8` is null while `description_len > 0`,
+ *   or when the description byte range is not valid UTF-8.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `out` must be writable.
+ * - `description_utf8` must point to at least `description_len` valid
+ *   bytes when `description_len > 0`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_getter(struct StatorDomObjectWrap *wrap,
+                                                              uint64_t symbol_id,
+                                                              const char *description_utf8,
+                                                              size_t description_len,
+                                                              struct StatorValue **out);
+
+/**
+ * Invoke the wrapper's symbol-keyed **setter** path.
+ *
+ * Returns [`StatorStatus::StatorStatusOk`] with `*out_handled` set to
+ * `true` when the interceptor handled the write (or the access check
+ * silently dropped it).  Returns `StatorStatusOk` with `*out_handled =
+ * false` when symbol routing is disabled or no setter is installed (so
+ * the embedder can fall through to a normal property store).
+ *
+ * # Safety
+ * See [`stator_dom_object_wrap_invoke_symbol_getter`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_setter(struct StatorDomObjectWrap *wrap,
+                                                              uint64_t symbol_id,
+                                                              const char *description_utf8,
+                                                              size_t description_len,
+                                                              const struct StatorValue *value,
+                                                              bool *out_handled);
+
+/**
+ * Invoke the wrapper's symbol-keyed **query** (`in`/`has`) path.
+ *
+ * On success writes `true`/`false` into `*out_has`.
+ *
+ * # Safety
+ * See [`stator_dom_object_wrap_invoke_symbol_getter`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_query(struct StatorDomObjectWrap *wrap,
+                                                             uint64_t symbol_id,
+                                                             const char *description_utf8,
+                                                             size_t description_len,
+                                                             bool *out_has);
+
+/**
+ * Invoke the wrapper's symbol-keyed **deleter** path.
+ *
+ * On success writes `true`/`false` into `*out_deleted`.
+ *
+ * # Safety
+ * See [`stator_dom_object_wrap_invoke_symbol_getter`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_deleter(struct StatorDomObjectWrap *wrap,
+                                                               uint64_t symbol_id,
+                                                               const char *description_utf8,
+                                                               size_t description_len,
+                                                               bool *out_deleted);
+
+/**
+ * Collect the symbol-keyed property names reported by the wrapper's
+ * symbol enumerator into `buf`.  The buffer is owned by the caller and
+ * reused across invocations; the enumerator pushes onto it via
+ * [`stator_dom_symbol_buffer_push`].
+ *
+ * Use [`stator_dom_object_wrap_invoke_symbol_enumerate_into`] to drive
+ * the enumerator with a caller-supplied buffer that has already been
+ * created via [`stator_dom_symbol_buffer_new`].
+ *
+ * # Safety
+ * See [`stator_dom_object_wrap_invoke_symbol_getter`].  `buf` must be a
+ * valid buffer pointer from [`stator_dom_symbol_buffer_new`] until
+ * [`stator_dom_symbol_buffer_destroy`] is called.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct StatorDomObjectWrap *wrap,
+                                                                      struct StatorDomSymbolBuffer *buf);
+
+/**
+ * Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with
+ * [`stator_dom_symbol_buffer_destroy`].
+ *
+ * # Safety
+ * The returned pointer must be released exactly once via
+ * [`stator_dom_symbol_buffer_destroy`].
+ */
+struct StatorDomSymbolBuffer *stator_dom_symbol_buffer_new(void);
+
+/**
+ * Free a [`StatorDomSymbolBuffer`].  Does nothing when `buf` is null.
+ *
+ * # Safety
+ * `buf` must be either null or a pointer returned by
+ * [`stator_dom_symbol_buffer_new`], not previously destroyed.
+ */
+void stator_dom_symbol_buffer_destroy(struct StatorDomSymbolBuffer *buf);
+
+/**
+ * Return the number of symbol identities currently in `buf`.
+ * Returns `0` when `buf` is null.
+ *
+ * # Safety
+ * `buf` must be either null or a valid buffer pointer.
+ */
+size_t stator_dom_symbol_buffer_len(const struct StatorDomSymbolBuffer *buf);
+
+/**
+ * Read the entry at `index` from `buf` into `*out_key`.
+ *
+ * The borrowed `description_utf8` pointer remains valid until `buf` is
+ * mutated (pushed to, cleared, or destroyed).
+ *
+ * Returns [`StatorStatus::StatorStatusInvalidArg`] when `buf` or
+ * `out_key` is null or `index` is out of range; otherwise
+ * [`StatorStatus::StatorStatusOk`].
+ *
+ * # Safety
+ * `buf` and `out_key` must be valid pointers; see lifetime note above.
+ */
+enum StatorStatus stator_dom_symbol_buffer_get(const struct StatorDomSymbolBuffer *buf,
+                                               size_t index,
+                                               struct StatorDomSymbolKey *out_key);
 
 /**
  * Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.

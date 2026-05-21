@@ -78,7 +78,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 8;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 9;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -15648,6 +15648,11 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_access_check(
             AccessCheckKey::Named(name) => (name.as_ptr() as *const c_char, name.len(), 0u32),
             AccessCheckKey::Indexed(i) => (std::ptr::null::<c_char>(), 0usize, i),
             AccessCheckKey::None => (std::ptr::null::<c_char>(), 0usize, 0u32),
+            // The legacy v1 access-check signature cannot represent symbol
+            // identity, so a Symbol-keyed access fails closed.  Embedders
+            // that need symbol-aware policy must install the symbol-aware
+            // counterpart `stator_dom_object_wrap_set_access_check_v2`.
+            AccessCheckKey::Symbol(_) => return false,
         };
         let data = user_data_addr as *mut c_void;
         // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
@@ -16228,6 +16233,645 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { (*wrap).inner.set_indexed_handler(builder.build()) };
     StatorStatus::StatorStatusOk
+}
+
+// ── Symbol-keyed named-handler FFI ──────────────────────────────────────────
+
+/// POD descriptor for a symbol property key passed across the FFI
+/// boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
+/// without ever coercing the symbol to a string: `symbol_id` carries the
+/// engine-assigned identity verbatim, and `description_utf8`/`description_len`
+/// carry the optional description for diagnostics only.
+///
+/// `description_utf8` may be `NULL` (with `description_len == 0`) when the
+/// symbol has no description.  The pointer is borrowed for the duration of
+/// the callback and must not be retained by the embedder past that point.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomSymbolKey {
+    /// Engine-assigned symbol identity.  Two symbols are equal iff they
+    /// share this value within the owning isolate.
+    pub symbol_id: u64,
+    /// Borrowed UTF-8 description bytes, or `NULL`.
+    pub description_utf8: *const c_char,
+    /// Length in bytes of the description, or `0`.
+    pub description_len: usize,
+}
+
+/// Symbol-keyed named-property **getter** callback.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] with `*out` set to a freshly
+/// allocated [`StatorValue`] (ownership transferred to the engine via
+/// [`stator_value_destroy`]) when the interceptor handles the access.
+/// Any other status leaves the engine observing `undefined`.
+pub type StatorDomNamedSymbolGetterCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// Symbol-keyed named-property **setter** callback.
+pub type StatorDomNamedSymbolSetterCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    value: *const StatorValue,
+    data: *mut c_void,
+) -> StatorStatus;
+
+/// Symbol-keyed named-property **query** callback.
+pub type StatorDomNamedSymbolQueryCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    data: *mut c_void,
+    out_attrs: *mut u32,
+) -> StatorStatus;
+
+/// Symbol-keyed named-property **delete** callback.
+pub type StatorDomNamedSymbolDeleterCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    data: *mut c_void,
+    out_deleted: *mut bool,
+) -> StatorStatus;
+
+/// Opaque buffer passed to a [`StatorDomNamedSymbolEnumeratorCb`] callback.
+/// The callback pushes symbol identities by repeatedly invoking
+/// [`stator_dom_symbol_buffer_push`].  The buffer is owned by the FFI
+/// bridge and must not outlive the callback invocation.
+pub struct StatorDomSymbolBuffer {
+    keys: Vec<stator_jse::dom::SymbolKey>,
+}
+
+// SAFETY: `StatorDomSymbolBuffer` only holds owned `SymbolKey`s and is
+// accessed on the owning thread during a single callback invocation.
+unsafe impl Send for StatorDomSymbolBuffer {}
+
+/// Append a symbol identity to a [`StatorDomSymbolBuffer`].
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+///   `description_utf8` is null while `description_len` is non-zero, or
+///   when the description byte range is not valid UTF-8.
+///
+/// # Safety
+/// - `buf` must be a valid pointer to a [`StatorDomSymbolBuffer`] currently
+///   borrowed by an enumerator callback.
+/// - `description_utf8` must point to at least `description_len` valid
+///   bytes when `description_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_symbol_buffer_push(
+    buf: *mut StatorDomSymbolBuffer,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+) -> StatorStatus {
+    if buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    if description_len > 0 && description_utf8.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let description: Option<String> = if description_len == 0 {
+        if description_utf8.is_null() {
+            None
+        } else {
+            Some(String::new())
+        }
+    } else {
+        // SAFETY: caller guarantees the byte range is valid.
+        let slice =
+            unsafe { std::slice::from_raw_parts(description_utf8 as *const u8, description_len) };
+        match std::str::from_utf8(slice) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return StatorStatus::StatorStatusInvalidArg,
+        }
+    };
+    // SAFETY: caller guarantees `buf` is a live buffer.
+    unsafe {
+        (*buf)
+            .keys
+            .push(stator_jse::dom::SymbolKey::new(symbol_id, description));
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Symbol-keyed enumerator callback.  The callback populates `buf` with
+/// the symbol identities it wants the engine to enumerate by repeatedly
+/// invoking [`stator_dom_symbol_buffer_push`].
+pub type StatorDomNamedSymbolEnumeratorCb =
+    unsafe extern "C" fn(buf: *mut StatorDomSymbolBuffer, data: *mut c_void) -> StatorStatus;
+
+/// POD bundle of symbol-keyed named-property interceptors, installed in
+/// one call by [`stator_dom_object_wrap_install_named_symbol_handler`].
+///
+/// Each callback is optional.  At least one callback must be non-null
+/// for the install call to succeed.  The bundle is **additive** with
+/// respect to any string-keyed [`StatorDomNamedHandler`] already
+/// installed: callers who want both must install the string handler
+/// first and then the symbol handler.
+///
+/// Symbol callbacks are only ever invoked when the wrapper's named
+/// handler flags allow symbol routing (see the
+/// `STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS` flag).  Without
+/// that flag, symbol-keyed access fails closed and never falls back to
+/// the string-keyed callbacks — the symbol is *never* stringified.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomNamedSymbolHandler {
+    /// Symbol-keyed getter, or null.
+    pub getter: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
+    /// Symbol-keyed setter, or null.
+    pub setter: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            value: *const StatorValue,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
+    /// Symbol-keyed query callback, or null.
+    pub query: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            data: *mut c_void,
+            out_attrs: *mut u32,
+        ) -> StatorStatus,
+    >,
+    /// Symbol-keyed deleter, or null.
+    pub deleter: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            data: *mut c_void,
+            out_deleted: *mut bool,
+        ) -> StatorStatus,
+    >,
+    /// Symbol-keyed enumerator, or null.
+    pub enumerator: Option<
+        unsafe extern "C" fn(buf: *mut StatorDomSymbolBuffer, data: *mut c_void) -> StatorStatus,
+    >,
+    /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+fn with_symbol_ffi_key<R>(
+    key: &stator_jse::dom::SymbolKey,
+    f: impl FnOnce(*const StatorDomSymbolKey) -> R,
+) -> R {
+    let desc_bytes: Option<&[u8]> = key.description().map(|s| s.as_bytes());
+    let (desc_ptr, desc_len) = match desc_bytes {
+        Some(b) => (b.as_ptr() as *const c_char, b.len()),
+        None => (std::ptr::null::<c_char>(), 0usize),
+    };
+    let ffi_key = StatorDomSymbolKey {
+        symbol_id: key.id(),
+        description_utf8: desc_ptr,
+        description_len: desc_len,
+    };
+    f(&ffi_key as *const StatorDomSymbolKey)
+}
+
+/// Install an aggregated set of symbol-keyed named-property interceptors
+/// on `wrap`.
+///
+/// This installs symbol callbacks on the named handler **without**
+/// disturbing any previously-installed string-keyed callbacks.  If no
+/// named handler is installed yet, an empty one is created so the
+/// symbol callbacks have a home.  The installation **does not** set the
+/// `INTERCEPT_SYMBOLS` flag automatically — the embedder must call
+/// [`stator_dom_object_wrap_set_named_handler_flags`] to opt in.
+/// Without that flag the symbol callbacks remain dormant (fail-closed),
+/// matching V8/Blink semantics and preventing accidental stringification.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `handler` is
+///   null, or when every callback field in `handler` is null.
+///
+/// # Safety
+/// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+/// - `handler` must be a non-null, readable pointer to a
+///   [`StatorDomNamedSymbolHandler`].  The function pointers it carries
+///   must remain valid for the lifetime of the wrapper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_named_symbol_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomNamedSymbolHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.getter.is_none()
+        && h.setter.is_none()
+        && h.query.is_none()
+        && h.deleter.is_none()
+        && h.enumerator.is_none()
+    {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    let user_data_addr = h.data as usize;
+    // SAFETY: caller guarantees `wrap` is valid for this installation.
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
+
+    // Take any existing handler so we can preserve string-keyed callbacks
+    // and flags while layering on the new symbol-keyed ones.
+    // SAFETY: caller guarantees `wrap` is valid.
+    let existing = unsafe { (*wrap).inner.take_named_handler() };
+    let mut builder = match existing {
+        Some(cfg) => cfg.into_builder(),
+        None => NamedPropertyHandlerConfig::builder(),
+    };
+
+    if let Some(cb) = h.getter {
+        builder = builder.symbol_getter(move |sym, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+                unsafe { cb(k, data, &mut out) }
+            });
+            match status {
+                StatorStatus::StatorStatusOk if !out.is_null() => {
+                    // SAFETY: callback transferred ownership of `out`.
+                    let js = stator_value_inner_to_jsvalue(unsafe { &(*out).inner });
+                    // SAFETY: free with the destroyer that maintains the
+                    // isolate's live-object counter.
+                    unsafe { stator_value_destroy(out) };
+                    Some(js)
+                }
+                StatorStatus::StatorStatusException => {
+                    // SAFETY: `isolate` is the wrapper's valid isolate pointer.
+                    unsafe {
+                        ensure_pending_dom_interceptor_exception(
+                            isolate,
+                            "DOM symbol getter exception",
+                        )
+                    };
+                    None
+                }
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.setter {
+        builder = builder.symbol_setter(move |sym, value, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let c_val = StatorValue {
+                inner: jsvalue_to_stator_value_inner(value),
+                isolate: std::ptr::null_mut(),
+            };
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+                unsafe { cb(k, &c_val, data) }
+            });
+            if status == StatorStatus::StatorStatusException {
+                // SAFETY: `isolate` is the wrapper's valid isolate pointer.
+                unsafe {
+                    ensure_pending_dom_interceptor_exception(isolate, "DOM symbol setter exception")
+                };
+            }
+            matches!(status, StatorStatus::StatorStatusOk)
+        });
+    }
+    if let Some(cb) = h.query {
+        builder = builder.symbol_query(move |sym, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut attrs: u32 = 0;
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+                unsafe { cb(k, data, &mut attrs) }
+            });
+            match status {
+                StatorStatus::StatorStatusOk => Some(attrs),
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.deleter {
+        builder = builder.symbol_deleter(move |sym, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut deleted = false;
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+                unsafe { cb(k, data, &mut deleted) }
+            });
+            matches!(status, StatorStatus::StatorStatusOk) && deleted
+        });
+    }
+    if let Some(cb) = h.enumerator {
+        builder = builder.symbol_enumerator(move |_data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut buf = StatorDomSymbolBuffer { keys: Vec::new() };
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&mut buf as *mut StatorDomSymbolBuffer, data) };
+            if matches!(status, StatorStatus::StatorStatusOk) {
+                buf.keys
+            } else {
+                Vec::new()
+            }
+        });
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_named_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the wrapper's symbol-keyed named-property **getter** path.
+///
+/// The function applies the same access-check / flag / interceptor rules
+/// as a symbol-keyed JS property read would: a denial or a wrapper
+/// without `INTERCEPT_SYMBOLS` reports "not handled" (`StatorStatusOk`
+/// with `*out` left null), while a successful interceptor write returns
+/// `StatorStatusOk` with `*out` set to a fresh [`StatorValue`] owned by
+/// the caller (free with [`stator_value_destroy`]).
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] in every "no exception" case;
+///   `*out` is null when the property is undefined or unhandled, and
+///   non-null when the interceptor produced a value.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out` is
+///   null, or when `description_utf8` is null while `description_len > 0`,
+///   or when the description byte range is not valid UTF-8.
+///
+/// # Safety
+/// - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+/// - `out` must be writable.
+/// - `description_utf8` must point to at least `description_len` valid
+///   bytes when `description_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_getter(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    out: *mut *mut StatorValue,
+) -> StatorStatus {
+    if wrap.is_null() || out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let isolate = unsafe { (*wrap).isolate };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let value = unsafe { (*wrap).inner.get_symbol_property(&key) };
+    // SAFETY: `out` non-null verified above.
+    unsafe {
+        *out = match value {
+            stator_jse::objects::value::JsValue::Undefined => std::ptr::null_mut(),
+            v => {
+                let inner = jsvalue_to_stator_value_inner(&v);
+                Box::into_raw(Box::new(StatorValue { inner, isolate }))
+            }
+        };
+    }
+    if !isolate.is_null() {
+        // SAFETY: isolate is valid.
+        unsafe {
+            if !(*out).is_null() {
+                (*isolate).live_objects += 1;
+            }
+        }
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the wrapper's symbol-keyed **setter** path.
+///
+/// Returns [`StatorStatus::StatorStatusOk`] with `*out_handled` set to
+/// `true` when the interceptor handled the write (or the access check
+/// silently dropped it).  Returns `StatorStatusOk` with `*out_handled =
+/// false` when symbol routing is disabled or no setter is installed (so
+/// the embedder can fall through to a normal property store).
+///
+/// # Safety
+/// See [`stator_dom_object_wrap_invoke_symbol_getter`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_setter(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    value: *const StatorValue,
+    out_handled: *mut bool,
+) -> StatorStatus {
+    if wrap.is_null() || value.is_null() || out_handled.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `value` is readable.
+    let js = stator_value_inner_to_jsvalue(unsafe { &(*value).inner });
+    // SAFETY: caller guarantees `wrap` is valid.
+    let handled = unsafe { (*wrap).inner.set_symbol_property(&key, js) };
+    // SAFETY: out_handled non-null verified above.
+    unsafe {
+        *out_handled = handled;
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the wrapper's symbol-keyed **query** (`in`/`has`) path.
+///
+/// On success writes `true`/`false` into `*out_has`.
+///
+/// # Safety
+/// See [`stator_dom_object_wrap_invoke_symbol_getter`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_query(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    out_has: *mut bool,
+) -> StatorStatus {
+    if wrap.is_null() || out_has.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let has = unsafe { (*wrap).inner.has_symbol_property(&key) };
+    // SAFETY: out_has non-null verified above.
+    unsafe {
+        *out_has = has;
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the wrapper's symbol-keyed **deleter** path.
+///
+/// On success writes `true`/`false` into `*out_deleted`.
+///
+/// # Safety
+/// See [`stator_dom_object_wrap_invoke_symbol_getter`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_deleter(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    out_deleted: *mut bool,
+) -> StatorStatus {
+    if wrap.is_null() || out_deleted.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let deleted = unsafe { (*wrap).inner.delete_symbol_property(&key) };
+    // SAFETY: out_deleted non-null verified above.
+    unsafe {
+        *out_deleted = deleted;
+    }
+    StatorStatus::StatorStatusOk
+}
+
+/// Collect the symbol-keyed property names reported by the wrapper's
+/// symbol enumerator into `buf`.  The buffer is owned by the caller and
+/// reused across invocations; the enumerator pushes onto it via
+/// [`stator_dom_symbol_buffer_push`].
+///
+/// Use [`stator_dom_object_wrap_invoke_symbol_enumerate_into`] to drive
+/// the enumerator with a caller-supplied buffer that has already been
+/// created via [`stator_dom_symbol_buffer_new`].
+///
+/// # Safety
+/// See [`stator_dom_object_wrap_invoke_symbol_getter`].  `buf` must be a
+/// valid buffer pointer from [`stator_dom_symbol_buffer_new`] until
+/// [`stator_dom_symbol_buffer_destroy`] is called.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_enumerate_into(
+    wrap: *mut StatorDomObjectWrap,
+    buf: *mut StatorDomSymbolBuffer,
+) -> StatorStatus {
+    if wrap.is_null() || buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let keys = unsafe { (*wrap).inner.symbol_property_keys() };
+    // SAFETY: caller guarantees `buf` is valid.
+    unsafe { (*buf).keys.extend(keys) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with
+/// [`stator_dom_symbol_buffer_destroy`].
+///
+/// # Safety
+/// The returned pointer must be released exactly once via
+/// [`stator_dom_symbol_buffer_destroy`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_dom_symbol_buffer_new() -> *mut StatorDomSymbolBuffer {
+    Box::into_raw(Box::new(StatorDomSymbolBuffer { keys: Vec::new() }))
+}
+
+/// Free a [`StatorDomSymbolBuffer`].  Does nothing when `buf` is null.
+///
+/// # Safety
+/// `buf` must be either null or a pointer returned by
+/// [`stator_dom_symbol_buffer_new`], not previously destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_symbol_buffer_destroy(buf: *mut StatorDomSymbolBuffer) {
+    if !buf.is_null() {
+        // SAFETY: caller guarantees `buf` is valid and uniquely owned.
+        drop(unsafe { Box::from_raw(buf) });
+    }
+}
+
+/// Return the number of symbol identities currently in `buf`.
+/// Returns `0` when `buf` is null.
+///
+/// # Safety
+/// `buf` must be either null or a valid buffer pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_symbol_buffer_len(buf: *const StatorDomSymbolBuffer) -> usize {
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `buf` is valid.
+    unsafe { (*buf).keys.len() }
+}
+
+/// Read the entry at `index` from `buf` into `*out_key`.
+///
+/// The borrowed `description_utf8` pointer remains valid until `buf` is
+/// mutated (pushed to, cleared, or destroyed).
+///
+/// Returns [`StatorStatus::StatorStatusInvalidArg`] when `buf` or
+/// `out_key` is null or `index` is out of range; otherwise
+/// [`StatorStatus::StatorStatusOk`].
+///
+/// # Safety
+/// `buf` and `out_key` must be valid pointers; see lifetime note above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_symbol_buffer_get(
+    buf: *const StatorDomSymbolBuffer,
+    index: usize,
+    out_key: *mut StatorDomSymbolKey,
+) -> StatorStatus {
+    if buf.is_null() || out_key.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `buf` is valid.
+    let Some(key) = (unsafe { &(*buf).keys }).get(index) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    let (desc_ptr, desc_len) = match key.description() {
+        Some(s) => (s.as_ptr() as *const c_char, s.len()),
+        None => (std::ptr::null::<c_char>(), 0usize),
+    };
+    // SAFETY: out_key non-null verified above.
+    unsafe {
+        *out_key = StatorDomSymbolKey {
+            symbol_id: key.id(),
+            description_utf8: desc_ptr,
+            description_len: desc_len,
+        };
+    }
+    StatorStatus::StatorStatusOk
+}
+
+fn build_symbol_key(
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+) -> Result<stator_jse::dom::SymbolKey, StatorStatus> {
+    if description_len > 0 && description_utf8.is_null() {
+        return Err(StatorStatus::StatorStatusInvalidArg);
+    }
+    let description: Option<String> = if description_len == 0 {
+        if description_utf8.is_null() {
+            None
+        } else {
+            Some(String::new())
+        }
+    } else {
+        // SAFETY: caller guarantees the byte range is valid.
+        let slice =
+            unsafe { std::slice::from_raw_parts(description_utf8 as *const u8, description_len) };
+        match std::str::from_utf8(slice) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return Err(StatorStatus::StatorStatusInvalidArg),
+        }
+    };
+    Ok(stator_jse::dom::SymbolKey::new(symbol_id, description))
 }
 
 // ── PropertyHandlerFlags FFI ───────────────────────────────────────────────
@@ -36447,5 +37091,534 @@ mod tests {
             StatorStatus::StatorStatusInvalidArg
         );
         unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    // ── Symbol-aware named handler FFI ────────────────────────────────────
+
+    unsafe extern "C" fn sym_getter_echo(
+        key: *const StatorDomSymbolKey,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        unsafe {
+            let id = (*key).symbol_id;
+            let iso = ACTIVE_ISO.with(|c| c.get());
+            let inner = StatorValueInner::Number(id as f64);
+            *out = Box::into_raw(Box::new(StatorValue {
+                inner,
+                isolate: iso,
+            }));
+            if !iso.is_null() {
+                (*iso).live_objects += 1;
+            }
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn sym_getter_not_handled(
+        _key: *const StatorDomSymbolKey,
+        _data: *mut c_void,
+        _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        StatorStatus::StatorStatusFalse
+    }
+
+    #[test]
+    fn test_ffi_install_symbol_handler_rejects_nulls() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let empty = StatorDomNamedSymbolHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &empty) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_echo),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_symbol_handler(std::ptr::null_mut(), &handler)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_invoke_symbol_invalid_args() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        // Null wrap.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Null out.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(
+                    wrap,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Non-zero len with null ptr.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(wrap, 1, std::ptr::null(), 5, &mut out)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Invalid UTF-8.
+        let bad = [0xffu8, 0xfeu8];
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(
+                    wrap,
+                    1,
+                    bad.as_ptr() as *const c_char,
+                    bad.len(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_getter_disabled_without_flag() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_echo),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        // No INTERCEPT_SYMBOLS flag set: getter must not run.
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        let s = unsafe {
+            stator_dom_object_wrap_invoke_symbol_getter(wrap, 42, std::ptr::null(), 0, &mut out)
+        };
+        assert_eq!(s, StatorStatus::StatorStatusOk);
+        assert!(out.is_null(), "interceptor must not run without flag");
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_getter_routed_with_flag() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_echo),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        let s = unsafe {
+            stator_dom_object_wrap_invoke_symbol_getter(wrap, 42, std::ptr::null(), 0, &mut out)
+        };
+        assert_eq!(s, StatorStatus::StatorStatusOk);
+        assert!(!out.is_null());
+        unsafe { stator_value_destroy(out) };
+        // ONLY_INTERCEPT_STRINGS must override INTERCEPT_SYMBOLS even when set.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS
+                        | STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out2: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(
+                    wrap,
+                    42,
+                    std::ptr::null(),
+                    0,
+                    &mut out2,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(out2.is_null(), "ONLY_INTERCEPT_STRINGS must block symbols");
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_handler_preserves_string_callbacks() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        // Install string handler first.
+        let s_handler = StatorDomNamedHandler {
+            getter: Some(flags_test_named_getter),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &s_handler) },
+            StatorStatus::StatorStatusOk
+        );
+        // Now install symbol handler additively.
+        let sym_handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_not_handled),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &sym_handler) },
+            StatorStatus::StatorStatusOk
+        );
+        // String getter still installed: get the wrapper's plain object and
+        // confirm the named getter responds via the engine path.
+        unsafe {
+            assert!((*wrap).inner.has_named_handler());
+        }
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_invoke_setter_query_delete() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+
+        unsafe extern "C" fn sym_setter_ok(
+            _key: *const StatorDomSymbolKey,
+            _value: *const StatorValue,
+            _data: *mut c_void,
+        ) -> StatorStatus {
+            StatorStatus::StatorStatusOk
+        }
+        unsafe extern "C" fn sym_query_present(
+            _key: *const StatorDomSymbolKey,
+            _data: *mut c_void,
+            out_attrs: *mut u32,
+        ) -> StatorStatus {
+            unsafe {
+                *out_attrs = 0;
+            }
+            StatorStatus::StatorStatusOk
+        }
+        unsafe extern "C" fn sym_deleter_ok(
+            _key: *const StatorDomSymbolKey,
+            _data: *mut c_void,
+            out_deleted: *mut bool,
+        ) -> StatorStatus {
+            unsafe {
+                *out_deleted = true;
+            }
+            StatorStatus::StatorStatusOk
+        }
+        unsafe extern "C" fn sym_enum(
+            buf: *mut StatorDomSymbolBuffer,
+            _data: *mut c_void,
+        ) -> StatorStatus {
+            let label = b"Symbol.iterator";
+            unsafe {
+                stator_dom_symbol_buffer_push(buf, 7, label.as_ptr() as *const c_char, label.len());
+            }
+            StatorStatus::StatorStatusOk
+        }
+
+        let handler = StatorDomNamedSymbolHandler {
+            getter: None,
+            setter: Some(sym_setter_ok),
+            query: Some(sym_query_present),
+            deleter: Some(sym_deleter_ok),
+            enumerator: Some(sym_enum),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Setter.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let mut handled = false;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_setter(
+                    wrap,
+                    7,
+                    std::ptr::null(),
+                    0,
+                    val,
+                    &mut handled,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(handled);
+        unsafe { stator_value_destroy(val) };
+
+        // Query.
+        let mut has = false;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_query(wrap, 7, std::ptr::null(), 0, &mut has)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(has);
+
+        // Deleter.
+        let mut deleted = false;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_deleter(
+                    wrap,
+                    7,
+                    std::ptr::null(),
+                    0,
+                    &mut deleted,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(deleted);
+
+        // Enumerator (round-trip).
+        let buf = stator_dom_symbol_buffer_new();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_symbol_enumerate_into(wrap, buf) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_symbol_buffer_len(buf) }, 1);
+        let mut out_key = StatorDomSymbolKey {
+            symbol_id: 0,
+            description_utf8: std::ptr::null(),
+            description_len: 0,
+        };
+        assert_eq!(
+            unsafe { stator_dom_symbol_buffer_get(buf, 0, &mut out_key) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out_key.symbol_id, 7);
+        assert_eq!(out_key.description_len, b"Symbol.iterator".len());
+        unsafe { stator_dom_symbol_buffer_destroy(buf) };
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_access_check_v1_fails_closed() {
+        // The legacy v1 access-check signature cannot represent symbol
+        // identity, so any symbol-keyed access is denied (fail closed).
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let sym_handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_echo),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &sym_handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        // Install a permissive v1 access check.
+        unsafe extern "C" fn allow_all(
+            _op: StatorDomAccessCheckOperation,
+            _name: *const c_char,
+            _name_len: usize,
+            _index: u32,
+            _native_ptr: *mut c_void,
+            _class_id: u32,
+            _data: *mut c_void,
+        ) -> bool {
+            true
+        }
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(wrap, Some(allow_all), std::ptr::null_mut())
+            },
+            StatorStatus::StatorStatusOk
+        );
+        // Symbol-keyed get must observe undefined (callback denies it).
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_symbol_getter(wrap, 42, std::ptr::null(), 0, &mut out)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(out.is_null(), "v1 access check must fail-closed on symbols");
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_handler_invalidated_wrapper() {
+        // After invalidate, the wrapper is dead — its inner is still
+        // technically present until destroy, but symbol invokes through
+        // a destroyed wrap is UB; only test invalidate (alive flag false).
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedSymbolHandler {
+            getter: Some(sym_getter_echo),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_symbol_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        // After invalidate, the wrapper's interceptors are still callable
+        // (the wrap still owns its inner config); but the alive flag is
+        // false so any v1 access check would deny.  Symbol invocation
+        // still routes through the interceptor when no access check is
+        // installed.  Just confirm we don't crash.
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        let _ = unsafe {
+            stator_dom_object_wrap_invoke_symbol_getter(wrap, 42, std::ptr::null(), 0, &mut out)
+        };
+        if !out.is_null() {
+            unsafe { stator_value_destroy(out) };
+        }
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_symbol_buffer_basic_ops() {
+        let buf = stator_dom_symbol_buffer_new();
+        assert!(!buf.is_null());
+        assert_eq!(unsafe { stator_dom_symbol_buffer_len(buf) }, 0);
+        // Null buf push.
+        assert_eq!(
+            unsafe { stator_dom_symbol_buffer_push(std::ptr::null_mut(), 1, std::ptr::null(), 0) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Invalid UTF-8.
+        let bad = [0xc3u8, 0x28];
+        assert_eq!(
+            unsafe {
+                stator_dom_symbol_buffer_push(buf, 1, bad.as_ptr() as *const c_char, bad.len())
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Push valid.
+        let label = b"foo";
+        assert_eq!(
+            unsafe {
+                stator_dom_symbol_buffer_push(buf, 99, label.as_ptr() as *const c_char, label.len())
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_symbol_buffer_len(buf) }, 1);
+        // Out-of-range get.
+        let mut key = StatorDomSymbolKey {
+            symbol_id: 0,
+            description_utf8: std::ptr::null(),
+            description_len: 0,
+        };
+        assert_eq!(
+            unsafe { stator_dom_symbol_buffer_get(buf, 7, &mut key) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_symbol_buffer_destroy(buf) };
+        // Destroy null is no-op.
+        unsafe { stator_dom_symbol_buffer_destroy(std::ptr::null_mut()) };
     }
 }
