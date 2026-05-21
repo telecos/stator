@@ -478,6 +478,16 @@ a mismatch code.
 | `snapshot_build_id` | `rejected_snapshot` |
 | `snapshot_feature_set` | `rejected_snapshot` |
 | `snapshot_context_kind` | `rejected_snapshot` |
+| `manifest_id` | `rejected_release_artifact` |
+| `min_compatible_manifest_id` | `rejected_release_artifact` |
+| `revoked_manifest_ids` | `rejected_release_artifact` |
+| `eviction_policy` | `rejected_release_artifact` |
+| `edge_channel_window` | `rejected_release_artifact` |
+| `previous_manifest_id` | `rejected_release_artifact` |
+| `rollback_supported` | `rejected_release_artifact` |
+| `artifact_path` | `rejected_release_artifact` |
+| `root_relative_to_manifest` | `rejected_release_artifact` |
+| `artifact_subdir` | `rejected_release_artifact` |
 
 ## Edge release and vendoring expectations
 
@@ -530,6 +540,85 @@ authoritative validator and its mutation test matrix live in
   aggregation stay in sync with the engine's emitted codes.
 - `telemetry.field_allowlist[]`: required array describing the privacy-
   approved low-cardinality fields permitted in telemetry payloads.
+- `manifest_id` (string): non-empty stable identifier for this exact
+  manifest revision. Edge keys persisted cache partitions and revocation
+  decisions by `manifest_id`; collisions across drops are not allowed.
+- `compatibility.min_compatible_manifest_id` (string): non-empty oldest
+  `manifest_id` whose persisted cache entries are still accepted under
+  this drop. Edge MUST evict entries whose original `manifest_id` sorts
+  before this value when `eviction_policy` is `partition-by-manifest-id`.
+- `compatibility.revoked_manifest_ids[]` (array of strings): every
+  previously-shipped `manifest_id` whose artifacts must be evicted
+  immediately. Entries must be unique and must not include this
+  manifest's own `manifest_id` (self-revocation is rejected).
+- `compatibility.eviction_policy` (enum: `clear-all`,
+  `partition-by-manifest-id`): how Edge MUST treat the persisted cache
+  store when this manifest is adopted. `clear-all` requires wiping all
+  prior partitions; `partition-by-manifest-id` allows keeping entries
+  whose `manifest_id` is still compatible and not revoked.
+- `compatibility.edge_channel_window[]` (array of non-empty strings):
+  Edge release channels (`canary`, `dev`, `beta`, `stable`, internal
+  channel names) for which this manifest is approved. Empty arrays are
+  rejected because an Edge channel mismatch must fail closed.
+- `rollback.rollback_supported` (boolean): whether Edge is permitted to
+  re-adopt the manifest identified by `previous_manifest_id`. When
+  `false`, downgrades MUST evict the entire cache.
+- `rollback.previous_manifest_id` (string or null): the `manifest_id` of
+  the immediately prior shipped drop, or `null` for the first drop.
+  Missing field is rejected so rollback intent is always explicit.
+- `package_layout.root_relative_to_manifest` (string): non-empty path
+  describing the packaging root relative to the manifest file (typically
+  `.`).
+- `package_layout.artifact_subdir` (string): non-empty
+  forward-slash-separated relative subdirectory under the packaging
+  root that contains every artifact payload. Traversal segments,
+  backslashes, drive-letter prefixes, and absolute paths are rejected.
+- `artifacts[].artifact_path` (string): forward-slash-separated relative
+  POSIX path under `package_layout.artifact_subdir` that locates the
+  artifact's on-disk payload. Backslashes, leading `/`, drive-letter
+  prefixes, empty segments, `.`, and `..` are rejected before any I/O.
+
+### Edge code-cache packaging layout
+
+An Edge code-cache vendoring drop is laid out next to the vendored
+`stator.h` and Stator libraries as follows:
+
+```
+<vendor-root>/
+  edge-code-cache-manifest.json   # the manifest validated above
+  cache/                          # package_layout.artifact_subdir
+    script-bytecode/...           # per-artifact paths from artifacts[].artifact_path
+    module-bytecode/...
+    baseline-code/...
+    jit-code/...
+    snapshot-reference/...
+```
+
+Edge revendor automation MUST:
+
+1. Refuse to publish a drop whose manifest fails the schema validator.
+2. Refuse to publish a drop whose `manifest_id` collides with any
+   previously shipped drop.
+3. Refuse to publish a drop in which any artifact's on-disk payload is
+   missing, has a size different from `size_bytes`, or whose recomputed
+   `digest_algorithm`/`digest_hex` does not match the manifest. The
+   reference fail-closed packaging hook is
+   `validate_packaging_layout` in
+   `crates/stator_ffi/tests/release_manifest.rs`; it emits
+   `rejected_release_artifact` diagnostics on missing, short, or
+   tampered payloads and refuses to touch traversal/absolute paths.
+4. Apply `compatibility.eviction_policy` on adoption: `clear-all` wipes
+   the persisted cache store; `partition-by-manifest-id` keeps
+   partitions whose `manifest_id` is `>= min_compatible_manifest_id`
+   and not present in `revoked_manifest_ids`.
+5. Honor `rollback.rollback_supported`: when `false`, downgrades MUST
+   wipe the persisted cache store regardless of policy.
+
+Runtime script-cache APIs that load these payloads remain proposal-only
+(see "Proposed C ABI" above); the packaging validator therefore
+verifies metadata, layout, and on-disk payload integrity only. It does
+not synthesize fake cache-hit success — restore acceptance is the
+responsibility of the runtime once the script-cache ABI is implemented.
 
 The validator collects every error rather than failing on the first
 mismatch so release automation can surface a single, actionable report.

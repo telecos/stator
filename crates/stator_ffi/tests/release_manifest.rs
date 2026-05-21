@@ -164,6 +164,16 @@ const FIELD_TO_DIAGNOSTIC_CODE: &[(&str, &str)] = &[
     ("panic_strategy", "rejected_build_features"),
     ("edge_channel", "rejected_release_artifact"),
     ("edge_build_id", "rejected_release_artifact"),
+    ("manifest_id", "rejected_release_artifact"),
+    ("min_compatible_manifest_id", "rejected_release_artifact"),
+    ("revoked_manifest_ids", "rejected_release_artifact"),
+    ("eviction_policy", "rejected_release_artifact"),
+    ("edge_channel_window", "rejected_release_artifact"),
+    ("previous_manifest_id", "rejected_release_artifact"),
+    ("rollback_supported", "rejected_release_artifact"),
+    ("artifact_path", "rejected_release_artifact"),
+    ("root_relative_to_manifest", "rejected_release_artifact"),
+    ("artifact_subdir", "rejected_release_artifact"),
     ("snapshot_digest", "rejected_snapshot"),
     ("snapshot_build_id", "rejected_snapshot"),
     ("snapshot_feature_set", "rejected_snapshot"),
@@ -178,6 +188,11 @@ const VALID_KEY_HASH_ALGORITHMS: &[&str] = &["sha256"];
 
 /// Digest algorithms accepted for per-artifact integrity fields.
 const VALID_DIGEST_ALGORITHMS: &[&str] = &["sha256", "sha384", "sha512"];
+
+/// Cache eviction policies a manifest is allowed to declare. Anything
+/// outside this set must fail closed because Edge would not know how to
+/// honor a previously-cached partition under an unknown policy.
+const VALID_EVICTION_POLICIES: &[&str] = &["clear-all", "partition-by-manifest-id"];
 
 /// Validate a parsed manifest value and return every detected error.
 /// The validator collects all errors rather than failing on the first
@@ -239,8 +254,106 @@ fn validate(manifest: &Value) -> Vec<String> {
 
     validate_artifacts(root, &mut errs);
     validate_telemetry(root, &mut errs);
+    validate_packaging_metadata(root, &mut errs);
 
     errs
+}
+
+/// Validate the packaging/invalidation/rollback metadata block. These
+/// fields are what lets Edge invalidate, partition, or revoke a
+/// previously vendored drop without re-deriving identity from the
+/// per-artifact records. Anything missing or malformed must fail closed
+/// at the vendoring boundary, because the cost of acting on a stale
+/// `manifest_id` or unknown eviction policy is loading bytecode under
+/// the wrong engine identity.
+fn validate_packaging_metadata(root: &Map<String, Value>, errs: &mut Vec<String>) {
+    require_nonempty_string(root, "manifest_id", errs);
+
+    if let Some(compat) = require_object(root, "compatibility", errs) {
+        require_nonempty_string(compat, "min_compatible_manifest_id", errs);
+        if let Some(policy) = require_nonempty_string(compat, "eviction_policy", errs)
+            && !VALID_EVICTION_POLICIES.contains(&policy.as_str())
+        {
+            errs.push(format!(
+                "compatibility.eviction_policy '{policy}' is not an accepted policy \
+                 (expected one of {VALID_EVICTION_POLICIES:?})"
+            ));
+        }
+        match compat.get("revoked_manifest_ids") {
+            Some(Value::Array(items)) => {
+                let mut seen: Vec<&str> = Vec::new();
+                for (idx, item) in items.iter().enumerate() {
+                    match item.as_str() {
+                        Some(s) if !s.is_empty() => {
+                            if seen.contains(&s) {
+                                errs.push(format!(
+                                    "compatibility.revoked_manifest_ids[{idx}] duplicates '{s}'"
+                                ));
+                            }
+                            seen.push(s);
+                        }
+                        _ => errs.push(format!(
+                            "compatibility.revoked_manifest_ids[{idx}] must be a non-empty string"
+                        )),
+                    }
+                }
+                if let Some(mid) = root.get("manifest_id").and_then(Value::as_str)
+                    && seen.contains(&mid)
+                {
+                    errs.push(format!(
+                        "compatibility.revoked_manifest_ids must not contain this manifest's own \
+                         manifest_id '{mid}'"
+                    ));
+                }
+            }
+            Some(_) => {
+                errs.push("compatibility.revoked_manifest_ids must be a JSON array".to_string())
+            }
+            None => errs.push("'revoked_manifest_ids' is required".to_string()),
+        }
+        match compat.get("edge_channel_window") {
+            Some(Value::Array(items)) if !items.is_empty() => {
+                for (idx, item) in items.iter().enumerate() {
+                    if item.as_str().is_none_or(str::is_empty) {
+                        errs.push(format!(
+                            "compatibility.edge_channel_window[{idx}] must be a non-empty string"
+                        ));
+                    }
+                }
+            }
+            Some(Value::Array(_)) => errs.push(
+                "compatibility.edge_channel_window must contain at least one entry".to_string(),
+            ),
+            Some(_) => {
+                errs.push("compatibility.edge_channel_window must be a JSON array".to_string())
+            }
+            None => errs.push("'edge_channel_window' is required".to_string()),
+        }
+    }
+
+    if let Some(rb) = require_object(root, "rollback", errs) {
+        match rb.get("rollback_supported") {
+            Some(Value::Bool(_)) => {}
+            Some(_) => errs.push("rollback.rollback_supported must be a boolean".to_string()),
+            None => errs.push("'rollback_supported' is required".to_string()),
+        }
+        match rb.get("previous_manifest_id") {
+            Some(Value::Null) => {}
+            Some(Value::String(s)) if !s.is_empty() => {}
+            Some(Value::String(_)) => errs.push(
+                "rollback.previous_manifest_id must be a non-empty string or null".to_string(),
+            ),
+            Some(_) => {
+                errs.push("rollback.previous_manifest_id must be a string or null".to_string())
+            }
+            None => errs.push("'previous_manifest_id' is required".to_string()),
+        }
+    }
+
+    if let Some(layout) = require_object(root, "package_layout", errs) {
+        require_nonempty_string(layout, "root_relative_to_manifest", errs);
+        require_nonempty_string(layout, "artifact_subdir", errs);
+    }
 }
 
 fn validate_crates(stator: &Map<String, Value>, errs: &mut Vec<String>) {
@@ -298,6 +411,13 @@ fn validate_artifacts(root: &Map<String, Value>, errs: &mut Vec<String>) {
         require_nonempty_string(a, "target_arch", errs);
         require_nonempty_string(a, "cargo_profile", errs);
         require_uint(a, "size_bytes", errs);
+        if let Some(path) = require_nonempty_string(a, "artifact_path", errs)
+            && let Some(reason) = invalid_artifact_path_reason(&path)
+        {
+            errs.push(format!(
+                "artifacts[{idx}].artifact_path is invalid: {reason}"
+            ));
+        }
         if let Some(algo) = require_nonempty_string(a, "digest_algorithm", errs)
             && !VALID_DIGEST_ALGORITHMS.contains(&algo.as_str())
         {
@@ -439,6 +559,141 @@ fn is_lower_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Reject artifact paths that would let a vendored manifest escape its
+/// packaging root, alias an absolute system path, or rely on
+/// platform-specific separators. The packaging validator joins these
+/// paths against the on-disk manifest root, so any traversal segment
+/// (`..`), absolute prefix (`/`, drive letter), backslash separator, or
+/// embedded NUL must fail closed before any I/O happens. Returns `None`
+/// when the path is acceptable, or `Some(reason)` with a short
+/// human-readable diagnostic otherwise.
+fn invalid_artifact_path_reason(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("must not be empty");
+    }
+    if path.contains('\\') {
+        return Some("must use forward slashes (POSIX-style relative path)");
+    }
+    if path.contains('\0') {
+        return Some("must not contain a NUL byte");
+    }
+    if path.starts_with('/') {
+        return Some("must not start with '/'");
+    }
+    // Reject Windows-style drive prefixes like `C:` so the manifest
+    // cannot be interpreted as an absolute path on Windows hosts.
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        return Some("must not contain a drive letter prefix");
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            return Some("must not contain empty path segments");
+        }
+        if segment == "." || segment == ".." {
+            return Some("must not contain '.' or '..' segments");
+        }
+    }
+    None
+}
+
+/// Validate that the on-disk Edge code-cache package layout under
+/// `artifact_root` matches the manifest. This is the fail-closed
+/// packaging hook: every artifact declared in the manifest must exist
+/// as a regular file at `artifact_root.join(package_layout.artifact_subdir).join(artifact_path)`,
+/// its size must match `size_bytes`, and (when `digest_algorithm` is
+/// `sha256`) its on-disk content must hash to `digest_hex`. Missing
+/// payloads, length mismatches, or digest mismatches are reported with
+/// the `rejected_release_artifact` diagnostic vocabulary so vendoring
+/// automation cannot publish a drop whose runtime artifact payloads are
+/// absent or tampered with. Manifests whose schema is itself invalid
+/// (as reported by `validate`) must be rejected before calling this
+/// helper.
+fn validate_packaging_layout(manifest: &Value, artifact_root: &std::path::Path) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut errs = Vec::new();
+    let Some(root) = manifest.as_object() else {
+        errs.push("manifest root must be a JSON object".to_string());
+        return errs;
+    };
+    let subdir = root
+        .get("package_layout")
+        .and_then(Value::as_object)
+        .and_then(|l| l.get("artifact_subdir"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if subdir.is_empty() || invalid_artifact_path_reason(subdir).is_some() {
+        errs.push(
+            "rejected_release_artifact: package_layout.artifact_subdir is missing or invalid"
+                .to_string(),
+        );
+        return errs;
+    }
+    let Some(artifacts) = root.get("artifacts").and_then(Value::as_array) else {
+        errs.push("rejected_release_artifact: artifacts is missing".to_string());
+        return errs;
+    };
+    for (idx, artifact) in artifacts.iter().enumerate() {
+        let Some(a) = artifact.as_object() else {
+            errs.push(format!(
+                "rejected_release_artifact: artifacts[{idx}] must be an object"
+            ));
+            continue;
+        };
+        let Some(rel) = a.get("artifact_path").and_then(Value::as_str) else {
+            errs.push(format!(
+                "rejected_release_artifact: artifacts[{idx}].artifact_path is missing"
+            ));
+            continue;
+        };
+        if let Some(reason) = invalid_artifact_path_reason(rel) {
+            errs.push(format!(
+                "rejected_release_artifact: artifacts[{idx}].artifact_path is invalid: {reason}"
+            ));
+            continue;
+        }
+        let on_disk = artifact_root.join(subdir).join(rel);
+        let bytes = match std::fs::read(&on_disk) {
+            Ok(b) => b,
+            Err(e) => {
+                errs.push(format!(
+                    "rejected_release_artifact: artifacts[{idx}] payload at {} is unreadable: {e}",
+                    on_disk.display()
+                ));
+                continue;
+            }
+        };
+        if let Some(expected_size) = a.get("size_bytes").and_then(Value::as_u64)
+            && bytes.len() as u64 != expected_size
+        {
+            errs.push(format!(
+                "rejected_release_artifact: artifacts[{idx}] size mismatch (manifest {}, on disk {})",
+                expected_size,
+                bytes.len()
+            ));
+        }
+        let algo = a
+            .get("digest_algorithm")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let expected_hex = a.get("digest_hex").and_then(Value::as_str).unwrap_or("");
+        if algo == "sha256" && !expected_hex.is_empty() {
+            let digest = Sha256::digest(&bytes);
+            let actual_hex: String = digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if actual_hex != expected_hex {
+                errs.push(format!(
+                    "rejected_release_artifact: artifacts[{idx}] sha256 digest mismatch \
+                     (manifest {expected_hex}, on disk {actual_hex})"
+                ));
+            }
+        }
+    }
+    errs
+}
+
 fn baseline_manifest() -> Value {
     json!({
         "schema_id": SCHEMA_ID,
@@ -480,6 +735,7 @@ fn baseline_manifest() -> Value {
                 "target_arch": "x86_64",
                 "cargo_profile": "release",
                 "size_bytes": 1024,
+                "artifact_path": "script-bytecode/example.scbc",
                 "digest_algorithm": "sha256",
                 "digest_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
                 "signature": {
@@ -488,6 +744,21 @@ fn baseline_manifest() -> Value {
                 }
             }
         ],
+        "manifest_id": "stator-edge-cache-2026-05-21-0000",
+        "compatibility": {
+            "min_compatible_manifest_id": "stator-edge-cache-2026-05-21-0000",
+            "revoked_manifest_ids": [],
+            "eviction_policy": "partition-by-manifest-id",
+            "edge_channel_window": ["canary", "dev", "beta", "stable"]
+        },
+        "rollback": {
+            "rollback_supported": true,
+            "previous_manifest_id": null
+        },
+        "package_layout": {
+            "root_relative_to_manifest": ".",
+            "artifact_subdir": "cache"
+        },
         "telemetry": {
             "diagnostic_codes": [
                 "accepted",
@@ -851,4 +1122,316 @@ fn test_validate_rejects_missing_size_bytes() {
         .unwrap()
         .remove("size_bytes");
     assert_err_contains(&m, "'size_bytes' is required");
+}
+
+// ---------------------------------------------------------------------------
+// Packaging/invalidation/rollback contract: every manifest must declare a
+// stable manifest identity, an Edge channel compatibility window, an
+// explicit cache eviction policy, an unambiguous revocation list, the
+// rollback contract, and a packaging layout that points at on-disk
+// artifact payloads. Anything missing, malformed, or escaping the
+// packaging root must fail closed so vendoring cannot publish a drop
+// whose runtime cache artifacts are absent or tampered with.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_validate_rejects_missing_manifest_id() {
+    let mut m = baseline_manifest();
+    m.as_object_mut().unwrap().remove("manifest_id");
+    assert_err_contains(&m, "'manifest_id' is required");
+}
+
+#[test]
+fn test_validate_rejects_empty_manifest_id() {
+    let mut m = baseline_manifest();
+    m["manifest_id"] = json!("");
+    assert_err_contains(&m, "'manifest_id' must be a non-empty string");
+}
+
+#[test]
+fn test_validate_rejects_missing_compatibility_block() {
+    let mut m = baseline_manifest();
+    m.as_object_mut().unwrap().remove("compatibility");
+    assert_err_contains(&m, "'compatibility' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_min_compatible_manifest_id() {
+    let mut m = baseline_manifest();
+    m["compatibility"]
+        .as_object_mut()
+        .unwrap()
+        .remove("min_compatible_manifest_id");
+    assert_err_contains(&m, "'min_compatible_manifest_id' is required");
+}
+
+#[test]
+fn test_validate_rejects_unknown_eviction_policy() {
+    let mut m = baseline_manifest();
+    m["compatibility"]["eviction_policy"] = json!("never");
+    assert_err_contains(&m, "not an accepted policy");
+}
+
+#[test]
+fn test_validate_rejects_missing_revoked_list() {
+    let mut m = baseline_manifest();
+    m["compatibility"]
+        .as_object_mut()
+        .unwrap()
+        .remove("revoked_manifest_ids");
+    assert_err_contains(&m, "'revoked_manifest_ids' is required");
+}
+
+#[test]
+fn test_validate_rejects_duplicate_revoked_manifest_id() {
+    let mut m = baseline_manifest();
+    m["compatibility"]["revoked_manifest_ids"] = json!(["old-1", "old-1"]);
+    assert_err_contains(&m, "duplicates 'old-1'");
+}
+
+#[test]
+fn test_validate_rejects_self_revocation() {
+    let mut m = baseline_manifest();
+    let id = m["manifest_id"].as_str().unwrap().to_string();
+    m["compatibility"]["revoked_manifest_ids"] = json!([id]);
+    assert_err_contains(&m, "must not contain this manifest's own manifest_id");
+}
+
+#[test]
+fn test_validate_rejects_non_string_revoked_entry() {
+    let mut m = baseline_manifest();
+    m["compatibility"]["revoked_manifest_ids"] = json!([42]);
+    assert_err_contains(&m, "must be a non-empty string");
+}
+
+#[test]
+fn test_validate_rejects_empty_channel_window() {
+    let mut m = baseline_manifest();
+    m["compatibility"]["edge_channel_window"] = json!([]);
+    assert_err_contains(&m, "must contain at least one entry");
+}
+
+#[test]
+fn test_validate_rejects_missing_rollback_block() {
+    let mut m = baseline_manifest();
+    m.as_object_mut().unwrap().remove("rollback");
+    assert_err_contains(&m, "'rollback' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_rollback_supported() {
+    let mut m = baseline_manifest();
+    m["rollback"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rollback_supported");
+    assert_err_contains(&m, "'rollback_supported' is required");
+}
+
+#[test]
+fn test_validate_rejects_non_bool_rollback_supported() {
+    let mut m = baseline_manifest();
+    m["rollback"]["rollback_supported"] = json!("yes");
+    assert_err_contains(&m, "must be a boolean");
+}
+
+#[test]
+fn test_validate_rejects_missing_previous_manifest_id_field() {
+    let mut m = baseline_manifest();
+    m["rollback"]
+        .as_object_mut()
+        .unwrap()
+        .remove("previous_manifest_id");
+    assert_err_contains(&m, "'previous_manifest_id' is required");
+}
+
+#[test]
+fn test_validate_accepts_null_previous_manifest_id() {
+    let mut m = baseline_manifest();
+    m["rollback"]["previous_manifest_id"] = json!(null);
+    assert_ok(&m);
+}
+
+#[test]
+fn test_validate_rejects_missing_package_layout() {
+    let mut m = baseline_manifest();
+    m.as_object_mut().unwrap().remove("package_layout");
+    assert_err_contains(&m, "'package_layout' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_artifact_subdir() {
+    let mut m = baseline_manifest();
+    m["package_layout"]
+        .as_object_mut()
+        .unwrap()
+        .remove("artifact_subdir");
+    assert_err_contains(&m, "'artifact_subdir' is required");
+}
+
+#[test]
+fn test_validate_rejects_missing_artifact_path() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("artifact_path");
+    assert_err_contains(&m, "'artifact_path' is required");
+}
+
+#[test]
+fn test_validate_rejects_traversal_artifact_path() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["artifact_path"] = json!("../escape.bin");
+    assert_err_contains(&m, "must not contain '.' or '..' segments");
+}
+
+#[test]
+fn test_validate_rejects_absolute_artifact_path() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["artifact_path"] = json!("/etc/passwd");
+    assert_err_contains(&m, "must not start with '/'");
+}
+
+#[test]
+fn test_validate_rejects_backslash_artifact_path() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["artifact_path"] = json!("cache\\foo.bin");
+    assert_err_contains(&m, "must use forward slashes");
+}
+
+#[test]
+fn test_validate_rejects_drive_letter_artifact_path() {
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["artifact_path"] = json!("C:/cache/foo.bin");
+    assert_err_contains(&m, "must not contain a drive letter prefix");
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed on-disk packaging validator: missing/short/tampered payloads
+// must reject under the `rejected_release_artifact` vocabulary instead of
+// silently accepting an Edge drop whose runtime cache files are absent or
+// corrupted. Manifests in this section synthesize their digests from the
+// payload bytes written to disk so the test is hermetic.
+// ---------------------------------------------------------------------------
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn packaging_tmpdir(label: &str) -> std::path::PathBuf {
+    // Cargo sets CARGO_TARGET_TMPDIR for integration tests; fall back to
+    // OUT_DIR if for some reason it is not set. This keeps test artifacts
+    // inside the workspace target directory and never touches /tmp.
+    let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("OUT_DIR").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = base.join(format!("release_manifest_pkg_{label}_{pid}_{nanos}"));
+    std::fs::create_dir_all(&dir).expect("create packaging tmpdir");
+    dir
+}
+
+fn write_payload(root: &std::path::Path, subdir: &str, rel: &str, bytes: &[u8]) {
+    let path = root.join(subdir).join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir packaging subdir");
+    std::fs::write(&path, bytes).expect("write packaging payload");
+}
+
+#[test]
+fn test_packaging_layout_accepts_matching_payload() {
+    let root = packaging_tmpdir("accept");
+    let payload = b"hello-bytecode-payload";
+    let rel = "script-bytecode/example.scbc";
+    write_payload(&root, "cache", rel, payload);
+
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["size_bytes"] = json!(payload.len() as u64);
+    m["artifacts"][0]["digest_hex"] = json!(sha256_hex(payload));
+    m["artifacts"][0]["artifact_path"] = json!(rel);
+
+    let errs = validate_packaging_layout(&m, &root);
+    assert!(
+        errs.is_empty(),
+        "expected no packaging errors, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_packaging_layout_rejects_missing_payload() {
+    let root = packaging_tmpdir("missing");
+    let m = baseline_manifest();
+    let errs = validate_packaging_layout(&m, &root);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("rejected_release_artifact") && e.contains("unreadable")),
+        "expected missing-payload rejection, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_packaging_layout_rejects_size_mismatch() {
+    let root = packaging_tmpdir("size");
+    let payload = b"short";
+    let rel = "script-bytecode/example.scbc";
+    write_payload(&root, "cache", rel, payload);
+
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["size_bytes"] = json!(9999u64);
+    m["artifacts"][0]["digest_hex"] = json!(sha256_hex(payload));
+    m["artifacts"][0]["artifact_path"] = json!(rel);
+
+    let errs = validate_packaging_layout(&m, &root);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("rejected_release_artifact") && e.contains("size mismatch")),
+        "expected size-mismatch rejection, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_packaging_layout_rejects_digest_mismatch() {
+    let root = packaging_tmpdir("digest");
+    let payload = b"hello-payload";
+    let rel = "script-bytecode/example.scbc";
+    write_payload(&root, "cache", rel, payload);
+
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["size_bytes"] = json!(payload.len() as u64);
+    m["artifacts"][0]["digest_hex"] =
+        json!("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    m["artifacts"][0]["artifact_path"] = json!(rel);
+
+    let errs = validate_packaging_layout(&m, &root);
+    assert!(
+        errs.iter().any(
+            |e| e.contains("rejected_release_artifact") && e.contains("sha256 digest mismatch")
+        ),
+        "expected digest-mismatch rejection, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_packaging_layout_rejects_traversal_path_without_io() {
+    // Even when the on-disk file would exist, the validator must refuse to
+    // touch a traversal path so a malicious manifest can never read outside
+    // its packaging root.
+    let root = packaging_tmpdir("traversal");
+    let mut m = baseline_manifest();
+    m["artifacts"][0]["artifact_path"] = json!("../escape.bin");
+    let errs = validate_packaging_layout(&m, &root);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("rejected_release_artifact") && e.contains("invalid")),
+        "expected traversal rejection, got {errs:?}"
+    );
 }

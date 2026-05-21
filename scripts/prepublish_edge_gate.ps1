@@ -2,6 +2,7 @@ param(
     [string]$EdgeRepo = "Q:\Edge\src",
     [string]$EdgeBuildDir = "out\stator_release_candidate",
     [string]$OutputDir = "target\release-gate",
+    [string]$CacheArtifactRoot = "",
     [switch]$AllowDirty,
     [switch]$SkipMandatoryChecks,
     [switch]$SkipEdgeValidation
@@ -160,6 +161,38 @@ $report = [ordered]@{
         required_commands = $edgeCommands
     }
 }
+
+# Edge code-cache packaging contract. Until the runtime script-cache ABI is
+# implemented (see docs\code_cache.md "Proposed C ABI: classic-script bytecode
+# cache"), this script does NOT fabricate cache-hit success. If a caller
+# points -CacheArtifactRoot at a real packaging drop, we fail closed when
+# the manifest is missing; otherwise we record that runtime artifact payloads
+# are unavailable so downstream Edge automation can require them explicitly.
+$cachePackaging = [ordered]@{
+    schema_validator = "crates\stator_ffi\tests\release_manifest.rs"
+    validator_test_command = "cargo test -p stator_jse_ffi --test release_manifest"
+    contract_doc = "docs\code_cache.md"
+    artifact_root = $CacheArtifactRoot
+    manifest_relative_path = "edge-code-cache-manifest.json"
+    runtime_payloads_available = $false
+    status = "runtime-payloads-not-available"
+    notes = "Runtime script-cache APIs are proposal-only; packaging hook validates manifest/layout only."
+}
+
+if ($CacheArtifactRoot -ne "") {
+    if (-not (Test-Path $CacheArtifactRoot)) {
+        throw "Edge cache artifact root not found: $CacheArtifactRoot"
+    }
+    $manifestPath = Join-Path $CacheArtifactRoot "edge-code-cache-manifest.json"
+    if (-not (Test-Path $manifestPath)) {
+        throw "rejected_release_artifact: Edge code-cache manifest missing at $manifestPath"
+    }
+    $cachePackaging.manifest_path = $manifestPath
+    $cachePackaging.runtime_payloads_available = $true
+    $cachePackaging.status = "manifest-present"
+    $cachePackaging.notes = "Manifest present; payload-level digest validation is performed by the Rust packaging validator in tests."
+}
+$report.cache_packaging = $cachePackaging
 
 $reportPath = Join-Path $outputPath "edge-prepublish-gate-metadata.json"
 [System.IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
