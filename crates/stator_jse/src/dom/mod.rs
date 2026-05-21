@@ -90,6 +90,180 @@ type NamedDeleterRef<'a> = Option<&'a dyn Fn(&str, *mut c_void) -> bool>;
 type IndexedSetterRef<'a> = Option<&'a dyn Fn(u32, &JsValue, *mut c_void) -> IndexedSetterResult>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PropertyHandlerFlags
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bitmask flags that modify the behaviour of a
+/// [`NamedPropertyHandlerConfig`], mirroring V8/Blink's
+/// `v8::PropertyHandlerFlags` for named interceptors.
+///
+/// Flags are an additive, backwards-compatible refinement of interceptor
+/// semantics: the default value [`NamedPropertyHandlerFlags::NONE`]
+/// preserves the historical behaviour, and any combination of the
+/// documented bits below is valid.  Setting unknown bits is an error
+/// reported by [`NamedPropertyHandlerFlags::validate`].
+///
+/// # Supported semantics
+///
+/// | Flag | Effect |
+/// |------|--------|
+/// | [`NamedPropertyHandlerFlags::NONE`] | Default; the interceptor is consulted before own properties on every operation. |
+/// | [`NamedPropertyHandlerFlags::ALL_CAN_READ`] | Read-side operations (`get`, `query`) still consult the interceptor even when the installed access-check callback would otherwise deny the access.  Writes/deletes/enumeration remain access-checked. |
+/// | [`NamedPropertyHandlerFlags::NON_MASKING`] | The interceptor is consulted **only** when the wrapper's own-property map does not already define the key.  Own properties therefore "mask" interceptor entries. |
+/// | [`NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS`] | Stored-only metadata.  Stator does not yet route symbol-keyed access through DOM wrappers, so this flag is already implicitly the steady-state behaviour.  Documented for future symbol support. |
+/// | [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`] | Stored-only metadata.  Documents that the embedder *wants* symbol keys forwarded to the interceptor once Stator routes them; today it has no runtime effect. |
+/// | [`NamedPropertyHandlerFlags::HAS_NO_SIDE_EFFECT`] | Stored-only metadata, intended for profilers/debuggers that need to call interceptors without observable side effects.  No runtime effect today. |
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct NamedPropertyHandlerFlags(u32);
+
+impl NamedPropertyHandlerFlags {
+    /// No flags set; default V8-compatible interceptor behaviour.
+    pub const NONE: Self = Self(0);
+    /// Read-side operations bypass an access-check denial.
+    pub const ALL_CAN_READ: Self = Self(1 << 0);
+    /// Interceptor only fires when own properties don't already define the key.
+    pub const NON_MASKING: Self = Self(1 << 1);
+    /// Stored-only metadata; the interceptor is intended to fire only for string keys.
+    pub const ONLY_INTERCEPT_STRINGS: Self = Self(1 << 2);
+    /// Stored-only metadata; the interceptor is intended to fire for symbol keys as well.
+    pub const INTERCEPT_SYMBOLS: Self = Self(1 << 3);
+    /// Stored-only metadata; the interceptor is side-effect-free for diagnostics use.
+    pub const HAS_NO_SIDE_EFFECT: Self = Self(1 << 4);
+
+    /// Bitmask of every flag bit recognised by this Stator build.  Setting
+    /// any other bit will cause [`NamedPropertyHandlerFlags::validate`] to
+    /// reject the value.
+    pub const ALL: Self = Self(
+        Self::ALL_CAN_READ.0
+            | Self::NON_MASKING.0
+            | Self::ONLY_INTERCEPT_STRINGS.0
+            | Self::INTERCEPT_SYMBOLS.0
+            | Self::HAS_NO_SIDE_EFFECT.0,
+    );
+
+    /// Construct a flag set from a raw bitmask **without** validation.
+    /// Prefer [`NamedPropertyHandlerFlags::from_bits`] for embedder-supplied
+    /// values.
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// Construct a flag set from a raw bitmask, rejecting any unrecognised
+    /// bits (fail-closed) so embedders cannot silently activate semantics
+    /// the current Stator build does not understand.
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Return the underlying bitmask.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Return `true` if every bit in `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Bitwise union of two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Return `Ok(())` when only documented bits are set, else
+    /// `Err(unknown_bits)`.
+    pub const fn validate(self) -> Result<(), u32> {
+        let bad = self.0 & !Self::ALL.0;
+        if bad != 0 { Err(bad) } else { Ok(()) }
+    }
+}
+
+impl std::ops::BitOr for NamedPropertyHandlerFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Bitmask flags that modify the behaviour of an
+/// [`IndexedPropertyHandlerConfig`], mirroring V8/Blink's
+/// `v8::PropertyHandlerFlags` for indexed interceptors.
+///
+/// Indexed interceptors never see string keys, so the
+/// `OnlyInterceptStrings`/`InterceptSymbols` flags do not apply.  All
+/// remaining flags carry the same semantics as their named counterparts
+/// (see [`NamedPropertyHandlerFlags`]), restricted to indexed operations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct IndexedPropertyHandlerFlags(u32);
+
+impl IndexedPropertyHandlerFlags {
+    /// No flags set; default V8-compatible interceptor behaviour.
+    pub const NONE: Self = Self(0);
+    /// Read-side operations bypass an access-check denial.
+    pub const ALL_CAN_READ: Self = Self(1 << 0);
+    /// Interceptor only fires when own properties don't already define the key.
+    /// Indexed wrappers do not maintain a per-index own-property map today,
+    /// so this flag is stored-only and reserved for future symmetry with
+    /// named interceptors.
+    pub const NON_MASKING: Self = Self(1 << 1);
+    /// Stored-only metadata; the interceptor is side-effect-free for
+    /// diagnostics use.  No runtime effect today.
+    pub const HAS_NO_SIDE_EFFECT: Self = Self(1 << 4);
+
+    /// Bitmask of every flag bit recognised by this Stator build.
+    pub const ALL: Self =
+        Self(Self::ALL_CAN_READ.0 | Self::NON_MASKING.0 | Self::HAS_NO_SIDE_EFFECT.0);
+
+    /// Construct a flag set from a raw bitmask **without** validation.
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// Construct a flag set from a raw bitmask, rejecting any unrecognised
+    /// bits (fail-closed).
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Return the underlying bitmask.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Return `true` if every bit in `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Bitwise union of two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Return `Ok(())` when only documented bits are set, else
+    /// `Err(unknown_bits)`.
+    pub const fn validate(self) -> Result<(), u32> {
+        let bad = self.0 & !Self::ALL.0;
+        if bad != 0 { Err(bad) } else { Ok(()) }
+    }
+}
+
+impl std::ops::BitOr for IndexedPropertyHandlerFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // NamedPropertyHandlerConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -121,6 +295,7 @@ pub struct NamedPropertyHandlerConfig {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    flags: NamedPropertyHandlerFlags,
 }
 
 impl NamedPropertyHandlerConfig {
@@ -153,6 +328,11 @@ impl NamedPropertyHandlerConfig {
     pub fn enumerator(&self) -> Option<&dyn Fn(*mut c_void) -> Vec<String>> {
         self.enumerator.as_deref()
     }
+
+    /// Return the flag bitset configured on this handler.
+    pub fn flags(&self) -> NamedPropertyHandlerFlags {
+        self.flags
+    }
 }
 
 impl std::fmt::Debug for NamedPropertyHandlerConfig {
@@ -163,6 +343,7 @@ impl std::fmt::Debug for NamedPropertyHandlerConfig {
             .field("has_query", &self.query.is_some())
             .field("has_deleter", &self.deleter.is_some())
             .field("has_enumerator", &self.enumerator.is_some())
+            .field("flags", &self.flags)
             .finish()
     }
 }
@@ -175,6 +356,7 @@ pub struct NamedPropertyHandlerConfigBuilder {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    flags: NamedPropertyHandlerFlags,
 }
 
 impl NamedPropertyHandlerConfigBuilder {
@@ -211,6 +393,14 @@ impl NamedPropertyHandlerConfigBuilder {
         self
     }
 
+    /// Set the [`NamedPropertyHandlerFlags`] bitmask that modifies the
+    /// behaviour of the configured interceptors.  Replaces any previously
+    /// set flags.
+    pub fn flags(mut self, flags: NamedPropertyHandlerFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
     /// Consume the builder and return the finished configuration.
     pub fn build(self) -> NamedPropertyHandlerConfig {
         NamedPropertyHandlerConfig {
@@ -219,6 +409,7 @@ impl NamedPropertyHandlerConfigBuilder {
             query: self.query,
             deleter: self.deleter,
             enumerator: self.enumerator,
+            flags: self.flags,
         }
     }
 }
@@ -253,6 +444,7 @@ pub struct IndexedPropertyHandlerConfig {
     setter: Option<IndexedSetterCallback>,
     query: Option<IndexedQueryCallback>,
     length: Option<IndexedLengthCallback>,
+    flags: IndexedPropertyHandlerFlags,
 }
 
 impl IndexedPropertyHandlerConfig {
@@ -280,6 +472,11 @@ impl IndexedPropertyHandlerConfig {
     pub fn length(&self) -> Option<&dyn Fn(*mut c_void) -> u32> {
         self.length.as_deref()
     }
+
+    /// Return the flag bitset configured on this handler.
+    pub fn flags(&self) -> IndexedPropertyHandlerFlags {
+        self.flags
+    }
 }
 
 impl std::fmt::Debug for IndexedPropertyHandlerConfig {
@@ -289,6 +486,7 @@ impl std::fmt::Debug for IndexedPropertyHandlerConfig {
             .field("has_setter", &self.setter.is_some())
             .field("has_query", &self.query.is_some())
             .field("has_length", &self.length.is_some())
+            .field("flags", &self.flags)
             .finish()
     }
 }
@@ -300,6 +498,7 @@ pub struct IndexedPropertyHandlerConfigBuilder {
     setter: Option<IndexedSetterCallback>,
     query: Option<IndexedQueryCallback>,
     length: Option<IndexedLengthCallback>,
+    flags: IndexedPropertyHandlerFlags,
 }
 
 impl IndexedPropertyHandlerConfigBuilder {
@@ -333,6 +532,14 @@ impl IndexedPropertyHandlerConfigBuilder {
         self
     }
 
+    /// Set the [`IndexedPropertyHandlerFlags`] bitmask that modifies the
+    /// behaviour of the configured interceptors.  Replaces any previously
+    /// set flags.
+    pub fn flags(mut self, flags: IndexedPropertyHandlerFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
     /// Consume the builder and return the finished configuration.
     pub fn build(self) -> IndexedPropertyHandlerConfig {
         IndexedPropertyHandlerConfig {
@@ -340,6 +547,7 @@ impl IndexedPropertyHandlerConfigBuilder {
             setter: self.setter,
             query: self.query,
             length: self.length,
+            flags: self.flags,
         }
     }
 }
@@ -535,23 +743,42 @@ impl DomObjectWrap {
     /// Read a named property, consulting the access-check callback first,
     /// then the interceptor, then own properties.
     ///
-    /// Resolution order:
+    /// Resolution order (modified by [`NamedPropertyHandlerFlags`] on the
+    /// installed handler, if any):
     /// 1. Access-check callback (if installed).  A denial returns
     ///    `JsValue::Undefined` without consulting either the interceptor
-    ///    or own properties.
-    /// 2. Named-property interceptor getter (if installed).
+    ///    or own properties — unless the handler sets
+    ///    [`NamedPropertyHandlerFlags::ALL_CAN_READ`], in which case the
+    ///    interceptor is still consulted (own properties remain hidden).
+    /// 2. Named-property interceptor getter (if installed).  When the
+    ///    handler sets [`NamedPropertyHandlerFlags::NON_MASKING`] the
+    ///    interceptor is skipped if an own property with the same key
+    ///    already exists.
     /// 3. Own properties on this wrapper.
     /// 4. `JsValue::Undefined`.
     pub fn get_property(&self, key: &str) -> JsValue {
-        if !self.check_access(AccessCheckOperation::NamedGet, AccessCheckKey::Named(key)) {
-            return JsValue::Undefined;
-        }
-        // 1. Interceptor
+        let allowed = self.check_access(AccessCheckOperation::NamedGet, AccessCheckKey::Named(key));
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        let non_masking = flags.contains(NamedPropertyHandlerFlags::NON_MASKING);
+
+        // 1. Interceptor (subject to access check and non-masking).
         if let Some(cfg) = &self.named_handler
             && let Some(getter) = cfg.getter()
+            && (allowed || all_can_read)
+            && (!non_masking || !self.properties.borrow().contains_key(key))
             && let Some(val) = getter(key, self.data_ptr())
         {
             return val;
+        }
+        if !allowed {
+            // Access denied and interceptor either absent or did not
+            // handle the key; own properties remain hidden.
+            return JsValue::Undefined;
         }
         // 2. Own properties
         self.properties
@@ -567,12 +794,22 @@ impl DomObjectWrap {
     /// If the access check denies the write, the value is *silently
     /// discarded* (fail-closed); the wrapper's own-property map is not
     /// mutated.  Otherwise, if the interceptor handles the write it short-
-    /// circuits the own-property store as before.
+    /// circuits the own-property store as before.  When the handler sets
+    /// [`NamedPropertyHandlerFlags::NON_MASKING`] the interceptor is
+    /// skipped when an own property already exists for `key`, so the
+    /// existing own property is updated directly.
     pub fn set_property(&mut self, key: &str, value: JsValue) {
         if !self.check_access(AccessCheckOperation::NamedSet, AccessCheckKey::Named(key)) {
             return;
         }
-        if let Some(cfg) = &self.named_handler
+        let non_masking = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags().contains(NamedPropertyHandlerFlags::NON_MASKING))
+            .unwrap_or(false);
+        let already_own = non_masking && self.properties.borrow().contains_key(key);
+        if !already_own
+            && let Some(cfg) = &self.named_handler
             && let Some(setter) = cfg.setter()
             && setter(key, &value, self.data_ptr())
         {
@@ -587,7 +824,10 @@ impl DomObjectWrap {
     /// the access check denied the write (the write is silently dropped
     /// and the engine treats the operation as handled so it does not fall
     /// through to a generic store).  Returns `false` when no setter is
-    /// installed and access was allowed.
+    /// installed and access was allowed.  When the handler sets
+    /// [`NamedPropertyHandlerFlags::NON_MASKING`] and the wrapper already
+    /// owns `key`, the interceptor is skipped and `false` is returned so
+    /// the caller updates the own-property store.
     pub fn set_intercepted_property(&self, key: &str, value: JsValue) -> bool {
         if !self.check_access(AccessCheckOperation::NamedSet, AccessCheckKey::Named(key)) {
             // Access denied: treat as handled so the caller does not fall
@@ -597,22 +837,43 @@ impl DomObjectWrap {
         if let Some(cfg) = &self.named_handler
             && let Some(setter) = cfg.setter()
         {
+            if cfg.flags().contains(NamedPropertyHandlerFlags::NON_MASKING)
+                && self.properties.borrow().contains_key(key)
+            {
+                return false;
+            }
             return setter(key, &value, self.data_ptr());
         }
         false
     }
 
     /// Query whether a named property exists, consulting the access-check
-    /// callback first.  A denial reports the property as absent.
+    /// callback first.  A denial reports the property as absent unless the
+    /// handler sets [`NamedPropertyHandlerFlags::ALL_CAN_READ`], in which
+    /// case the interceptor query is still consulted (own properties stay
+    /// hidden).  When the handler sets
+    /// [`NamedPropertyHandlerFlags::NON_MASKING`] the interceptor query is
+    /// skipped if an own property already covers `key`.
     pub fn has_property(&self, key: &str) -> bool {
-        if !self.check_access(AccessCheckOperation::NamedQuery, AccessCheckKey::Named(key)) {
-            return false;
-        }
+        let allowed =
+            self.check_access(AccessCheckOperation::NamedQuery, AccessCheckKey::Named(key));
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        let non_masking = flags.contains(NamedPropertyHandlerFlags::NON_MASKING);
         if let Some(cfg) = &self.named_handler
             && let Some(query) = cfg.query()
+            && (allowed || all_can_read)
+            && (!non_masking || !self.properties.borrow().contains_key(key))
             && query(key, self.data_ptr()).is_some()
         {
             return true;
+        }
+        if !allowed {
+            return false;
         }
         self.properties.borrow().contains_key(key)
     }
@@ -666,13 +927,25 @@ impl DomObjectWrap {
     /// Read an indexed property via the interceptor.
     ///
     /// Returns `JsValue::Undefined` if the access-check callback denies
-    /// the read, if no indexed-property interceptor is installed, or if
-    /// the interceptor does not handle this index.
+    /// the read (unless the handler sets
+    /// [`IndexedPropertyHandlerFlags::ALL_CAN_READ`], in which case the
+    /// interceptor is still consulted), if no indexed-property
+    /// interceptor is installed, or if the interceptor does not handle
+    /// this index.
     pub fn get_indexed(&self, index: u32) -> JsValue {
-        if !self.check_access(
+        let allowed = self.check_access(
             AccessCheckOperation::IndexedGet,
             AccessCheckKey::Indexed(index),
-        ) {
+        );
+        let all_can_read = self
+            .indexed_handler
+            .as_ref()
+            .map(|c| {
+                c.flags()
+                    .contains(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+            })
+            .unwrap_or(false);
+        if !allowed && !all_can_read {
             return JsValue::Undefined;
         }
         if let Some(cfg) = &self.indexed_handler
@@ -707,10 +980,21 @@ impl DomObjectWrap {
 
     /// Query the length of the indexed collection via the interceptor.
     ///
-    /// Returns `0` when the access-check callback denies the query or
-    /// when no length callback is installed.
+    /// Returns `0` when the access-check callback denies the query (unless
+    /// the handler sets [`IndexedPropertyHandlerFlags::ALL_CAN_READ`], in
+    /// which case the length callback is still consulted) or when no
+    /// length callback is installed.
     pub fn indexed_length(&self) -> u32 {
-        if !self.check_access(AccessCheckOperation::IndexedLength, AccessCheckKey::None) {
+        let allowed = self.check_access(AccessCheckOperation::IndexedLength, AccessCheckKey::None);
+        let all_can_read = self
+            .indexed_handler
+            .as_ref()
+            .map(|c| {
+                c.flags()
+                    .contains(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+            })
+            .unwrap_or(false);
+        if !allowed && !all_can_read {
             return 0;
         }
         if let Some(cfg) = &self.indexed_handler
@@ -741,6 +1025,52 @@ impl DomObjectWrap {
     /// Return `true` if an indexed-property handler is installed.
     pub fn has_indexed_handler(&self) -> bool {
         self.indexed_handler.is_some()
+    }
+
+    /// Return the [`NamedPropertyHandlerFlags`] currently configured on
+    /// the installed named handler, or [`NamedPropertyHandlerFlags::NONE`]
+    /// when no handler is installed.
+    pub fn named_handler_flags(&self) -> NamedPropertyHandlerFlags {
+        self.named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE)
+    }
+
+    /// Replace the [`NamedPropertyHandlerFlags`] on the installed named
+    /// handler.  Returns `true` when a handler was present (and its flags
+    /// were updated), `false` when no handler is installed.
+    pub fn set_named_handler_flags(&mut self, flags: NamedPropertyHandlerFlags) -> bool {
+        match &mut self.named_handler {
+            Some(cfg) => {
+                cfg.flags = flags;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Return the [`IndexedPropertyHandlerFlags`] currently configured on
+    /// the installed indexed handler, or
+    /// [`IndexedPropertyHandlerFlags::NONE`] when no handler is installed.
+    pub fn indexed_handler_flags(&self) -> IndexedPropertyHandlerFlags {
+        self.indexed_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(IndexedPropertyHandlerFlags::NONE)
+    }
+
+    /// Replace the [`IndexedPropertyHandlerFlags`] on the installed
+    /// indexed handler.  Returns `true` when a handler was present (and
+    /// its flags were updated), `false` when no handler is installed.
+    pub fn set_indexed_handler_flags(&mut self, flags: IndexedPropertyHandlerFlags) -> bool {
+        match &mut self.indexed_handler {
+            Some(cfg) => {
+                cfg.flags = flags;
+                true
+            }
+            None => false,
+        }
     }
 
     // ── access-check installation ────────────────────────────────────────
@@ -1419,5 +1749,320 @@ mod tests {
         let s = format!("{cfg:?}");
         assert!(s.contains("has_getter: true"));
         assert!(s.contains("has_length: true"));
+    }
+
+    // ── PropertyHandlerFlags — bit/validation helpers ────────────────────
+
+    #[test]
+    fn test_named_flags_default_is_none() {
+        let f: NamedPropertyHandlerFlags = NamedPropertyHandlerFlags::default();
+        assert_eq!(f, NamedPropertyHandlerFlags::NONE);
+        assert_eq!(f.bits(), 0);
+        assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn test_named_flags_from_bits_round_trip() {
+        let raw = NamedPropertyHandlerFlags::ALL_CAN_READ.bits()
+            | NamedPropertyHandlerFlags::NON_MASKING.bits();
+        let parsed = NamedPropertyHandlerFlags::from_bits(raw).expect("valid bits");
+        assert_eq!(parsed.bits(), raw);
+        assert!(parsed.contains(NamedPropertyHandlerFlags::ALL_CAN_READ));
+        assert!(parsed.contains(NamedPropertyHandlerFlags::NON_MASKING));
+        assert!(!parsed.contains(NamedPropertyHandlerFlags::HAS_NO_SIDE_EFFECT));
+    }
+
+    #[test]
+    fn test_named_flags_reject_unknown_bits() {
+        let bad = 1u32 << 31;
+        assert!(NamedPropertyHandlerFlags::from_bits(bad).is_none());
+        let truncated = NamedPropertyHandlerFlags::from_bits_truncate(bad);
+        assert_eq!(truncated.bits(), 0);
+    }
+
+    #[test]
+    fn test_indexed_flags_reject_unknown_bits() {
+        // Indexed flags do not include ONLY_INTERCEPT_STRINGS/INTERCEPT_SYMBOLS.
+        let bad = 1u32 << 2;
+        assert!(IndexedPropertyHandlerFlags::from_bits(bad).is_none());
+    }
+
+    #[test]
+    fn test_named_flags_bitor_union() {
+        let f = NamedPropertyHandlerFlags::ALL_CAN_READ | NamedPropertyHandlerFlags::NON_MASKING;
+        assert!(f.contains(NamedPropertyHandlerFlags::ALL_CAN_READ));
+        assert!(f.contains(NamedPropertyHandlerFlags::NON_MASKING));
+    }
+
+    // ── Default flags / builder integration ──────────────────────────────
+
+    #[test]
+    fn test_named_config_default_flags_none() {
+        let cfg = NamedPropertyHandlerConfig::builder()
+            .getter(|_, _| None)
+            .build();
+        assert_eq!(cfg.flags(), NamedPropertyHandlerFlags::NONE);
+    }
+
+    #[test]
+    fn test_named_config_builder_sets_flags() {
+        let cfg = NamedPropertyHandlerConfig::builder()
+            .getter(|_, _| None)
+            .flags(NamedPropertyHandlerFlags::ALL_CAN_READ)
+            .build();
+        assert!(
+            cfg.flags()
+                .contains(NamedPropertyHandlerFlags::ALL_CAN_READ)
+        );
+    }
+
+    #[test]
+    fn test_indexed_config_default_flags_none() {
+        let cfg = IndexedPropertyHandlerConfig::builder().build();
+        assert_eq!(cfg.flags(), IndexedPropertyHandlerFlags::NONE);
+    }
+
+    #[test]
+    fn test_wrap_named_flags_accessors_when_no_handler() {
+        let mut wrap = DomObjectWrap::new(0);
+        assert_eq!(wrap.named_handler_flags(), NamedPropertyHandlerFlags::NONE);
+        // No-op when no handler is installed.
+        assert!(!wrap.set_named_handler_flags(NamedPropertyHandlerFlags::ALL_CAN_READ));
+        assert_eq!(wrap.named_handler_flags(), NamedPropertyHandlerFlags::NONE);
+    }
+
+    #[test]
+    fn test_wrap_indexed_flags_accessors_when_no_handler() {
+        let mut wrap = DomObjectWrap::new(0);
+        assert_eq!(
+            wrap.indexed_handler_flags(),
+            IndexedPropertyHandlerFlags::NONE
+        );
+        assert!(!wrap.set_indexed_handler_flags(IndexedPropertyHandlerFlags::ALL_CAN_READ));
+    }
+
+    #[test]
+    fn test_wrap_named_flags_update_after_install() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|_, _| None)
+                .build(),
+        );
+        assert_eq!(wrap.named_handler_flags(), NamedPropertyHandlerFlags::NONE);
+        assert!(wrap.set_named_handler_flags(
+            NamedPropertyHandlerFlags::ALL_CAN_READ | NamedPropertyHandlerFlags::NON_MASKING
+        ));
+        assert!(
+            wrap.named_handler_flags()
+                .contains(NamedPropertyHandlerFlags::ALL_CAN_READ)
+        );
+        assert!(
+            wrap.named_handler_flags()
+                .contains(NamedPropertyHandlerFlags::NON_MASKING)
+        );
+    }
+
+    // ── ALL_CAN_READ semantics — named ───────────────────────────────────
+
+    #[test]
+    fn test_named_all_can_read_bypasses_access_check_for_get() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|name, _data| {
+                    if name == "id" {
+                        Some(JsValue::String("ok".into()))
+                    } else {
+                        None
+                    }
+                })
+                .flags(NamedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        // Deny everything.
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        // ALL_CAN_READ still routes reads through the interceptor.
+        assert_eq!(wrap.get_property("id"), JsValue::String("ok".into()));
+        // Keys not handled by the interceptor still return Undefined.
+        assert_eq!(wrap.get_property("class"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_named_all_can_read_does_not_expose_own_props() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(42));
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(|_name, _data| None)
+                .flags(NamedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        // Own property "x" stays hidden because access was denied.
+        assert_eq!(wrap.get_property("x"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_named_all_can_read_bypass_for_query() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .query(|name, _data| if name == "id" { Some(0) } else { None })
+                .flags(NamedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        assert!(wrap.has_property("id"));
+        assert!(!wrap.has_property("missing"));
+    }
+
+    #[test]
+    fn test_named_all_can_read_does_not_bypass_writes_or_deletes() {
+        let intercepted = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&intercepted);
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .setter(move |_n, _v, _d| {
+                    flag.set(true);
+                    true
+                })
+                .flags(NamedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        wrap.set_property("x", JsValue::Smi(1));
+        // Write must still be denied: setter never ran.
+        assert!(!intercepted.get());
+    }
+
+    // ── NON_MASKING semantics — named ────────────────────────────────────
+
+    #[test]
+    fn test_named_non_masking_skips_interceptor_for_existing_own_prop() {
+        let intercept_calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&intercept_calls);
+        let mut wrap = DomObjectWrap::new(0);
+        // Own property "x" already set before the interceptor is installed.
+        wrap.set_property("x", JsValue::Smi(42));
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .getter(move |_name, _data| {
+                    counter.set(counter.get() + 1);
+                    Some(JsValue::String("intercepted".into()))
+                })
+                .flags(NamedPropertyHandlerFlags::NON_MASKING)
+                .build(),
+        );
+
+        // Existing own property — interceptor must NOT run, own value wins.
+        assert_eq!(wrap.get_property("x"), JsValue::Smi(42));
+        assert_eq!(intercept_calls.get(), 0);
+
+        // Missing own property — interceptor runs.
+        assert_eq!(
+            wrap.get_property("y"),
+            JsValue::String("intercepted".into())
+        );
+        assert_eq!(intercept_calls.get(), 1);
+    }
+
+    #[test]
+    fn test_named_non_masking_setter_falls_back_to_own_for_existing_key() {
+        let intercept_calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&intercept_calls);
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(1));
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .setter(move |_n, _v, _d| {
+                    counter.set(counter.get() + 1);
+                    true
+                })
+                .flags(NamedPropertyHandlerFlags::NON_MASKING)
+                .build(),
+        );
+        wrap.set_property("x", JsValue::Smi(99));
+        // Interceptor skipped; own property updated in place.
+        assert_eq!(intercept_calls.get(), 0);
+        assert_eq!(wrap.get_property("x"), JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_named_non_masking_set_intercepted_returns_false_for_existing_own() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_property("x", JsValue::Smi(1));
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .setter(|_n, _v, _d| true)
+                .flags(NamedPropertyHandlerFlags::NON_MASKING)
+                .build(),
+        );
+        // For an existing own prop, the interceptor write is bypassed.
+        assert!(!wrap.set_intercepted_property("x", JsValue::Smi(2)));
+        // For a fresh key, the interceptor handles the write.
+        assert!(wrap.set_intercepted_property("y", JsValue::Smi(3)));
+    }
+
+    // ── ALL_CAN_READ semantics — indexed ─────────────────────────────────
+
+    #[test]
+    fn test_indexed_all_can_read_bypasses_access_check_for_get_and_length() {
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .getter(|idx, _d| Some(JsValue::Smi(idx as i32)))
+                .length(|_d| 3)
+                .flags(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        assert_eq!(wrap.get_indexed(0), JsValue::Smi(0));
+        assert_eq!(wrap.get_indexed(2), JsValue::Smi(2));
+        assert_eq!(wrap.indexed_length(), 3);
+    }
+
+    #[test]
+    fn test_indexed_all_can_read_does_not_bypass_set() {
+        let intercepted = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&intercepted);
+        let mut wrap = DomObjectWrap::new(0);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .setter(move |_idx, _v, _d| {
+                    flag.set(true);
+                    true
+                })
+                .flags(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|_op, _key, _data| false));
+        let handled = wrap.set_indexed(0, &JsValue::Smi(7));
+        // Access check denial still treats the write as handled and
+        // silently drops it; the setter must NOT have run.
+        assert!(handled);
+        assert!(!intercepted.get());
+    }
+
+    // ── Stored-only flags ────────────────────────────────────────────────
+
+    #[test]
+    fn test_stored_only_flags_preserved_in_config() {
+        let cfg = NamedPropertyHandlerConfig::builder()
+            .getter(|_, _| None)
+            .flags(
+                NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS
+                    | NamedPropertyHandlerFlags::HAS_NO_SIDE_EFFECT,
+            )
+            .build();
+        assert!(
+            cfg.flags()
+                .contains(NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS)
+        );
+        assert!(
+            cfg.flags()
+                .contains(NamedPropertyHandlerFlags::HAS_NO_SIDE_EFFECT)
+        );
     }
 }

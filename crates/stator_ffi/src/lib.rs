@@ -32,7 +32,7 @@ use stator_jse::compiler::baseline::compiler::{
 };
 use stator_jse::dom::{
     AccessCheckKey, AccessCheckOperation, DomObjectWrap, IndexedPropertyHandlerConfig,
-    NamedPropertyHandlerConfig,
+    IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig, NamedPropertyHandlerFlags,
 };
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{HostImportMeta, HostModuleLoader};
@@ -77,7 +77,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 6;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 7;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -15889,6 +15889,182 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
 
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { (*wrap).inner.set_indexed_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
+}
+
+// ── PropertyHandlerFlags FFI ───────────────────────────────────────────────
+
+/// Default named-property handler behaviour; no flag bits set.
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_NONE: u32 = 0;
+/// Read-side named-property operations bypass an access-check denial and
+/// still consult the interceptor.  Writes/deletes/enumeration remain
+/// access-checked.
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ: u32 = 1 << 0;
+/// Named-property interceptor only fires when the wrapper's own-property
+/// map does not already contain the key (own properties "mask"
+/// interceptor entries).
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING: u32 = 1 << 1;
+/// Stored-only metadata: the interceptor is intended to fire only for
+/// string keys.  Stator does not route symbol keys through DOM wrappers
+/// today, so this flag is already the implicit behaviour.
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS: u32 = 1 << 2;
+/// Stored-only metadata: the interceptor wants to receive symbol keys as
+/// well.  Reserved for future symbol-key routing.
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS: u32 = 1 << 3;
+/// Stored-only metadata: the interceptor is side-effect-free; safe for
+/// profilers/debuggers to invoke.  No runtime effect today.
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT: u32 = 1 << 4;
+/// Bitmask of every named-handler flag recognised by this Stator build.
+/// Any bit outside this mask is rejected by
+/// [`stator_dom_object_wrap_set_named_handler_flags`].
+pub const STATOR_DOM_NAMED_HANDLER_FLAG_ALL: u32 = STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ
+    | STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING
+    | STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS
+    | STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS
+    | STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT;
+
+/// Default indexed-property handler behaviour; no flag bits set.
+pub const STATOR_DOM_INDEXED_HANDLER_FLAG_NONE: u32 = 0;
+/// Read-side indexed-property operations (`get`, `query`, `length`) bypass
+/// an access-check denial and still consult the interceptor.  Writes
+/// remain access-checked.
+pub const STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ: u32 = 1 << 0;
+/// Stored-only metadata: reserved for future symmetry with named
+/// non-masking semantics.  Indexed wrappers do not maintain a per-index
+/// own-property map today, so this flag has no runtime effect.
+pub const STATOR_DOM_INDEXED_HANDLER_FLAG_NON_MASKING: u32 = 1 << 1;
+/// Stored-only metadata: the interceptor is side-effect-free for
+/// diagnostics use.  No runtime effect today.
+pub const STATOR_DOM_INDEXED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT: u32 = 1 << 4;
+/// Bitmask of every indexed-handler flag recognised by this Stator build.
+pub const STATOR_DOM_INDEXED_HANDLER_FLAG_ALL: u32 = STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ
+    | STATOR_DOM_INDEXED_HANDLER_FLAG_NON_MASKING
+    | STATOR_DOM_INDEXED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT;
+
+/// Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+///
+/// The flag set is validated against
+/// [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`] and rejected if any unknown bit
+/// is set — this is the fail-closed behaviour that prevents an embedder
+/// from silently activating semantics this Stator build does not
+/// understand.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the flags were stored.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+///   no named handler is currently installed (install one with
+///   [`stator_dom_object_wrap_install_named_handler`] first), or when
+///   `flags` contains a bit outside [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`].
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_set_named_handler_flags(
+    wrap: *mut StatorDomObjectWrap,
+    flags: u32,
+) -> StatorStatus {
+    if wrap.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let Some(parsed) = NamedPropertyHandlerFlags::from_bits(flags) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let installed = unsafe { (*wrap).inner.set_named_handler_flags(parsed) };
+    if installed {
+        StatorStatus::StatorStatusOk
+    } else {
+        StatorStatus::StatorStatusInvalidArg
+    }
+}
+
+/// Read the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+///   currently-installed flag bitmask (always `0` when no named handler
+///   is installed).
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+///   is null.
+///
+/// # Safety
+/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `out_flags` must be a writable `*mut u32` slot on
+///   [`StatorStatus::StatorStatusOk`] return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_get_named_handler_flags(
+    wrap: *const StatorDomObjectWrap,
+    out_flags: *mut u32,
+) -> StatorStatus {
+    if wrap.is_null() || out_flags.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let flags = unsafe { (*wrap).inner.named_handler_flags() };
+    // SAFETY: caller guarantees `out_flags` is writable.
+    unsafe { *out_flags = flags.bits() };
+    StatorStatus::StatorStatusOk
+}
+
+/// Replace the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+///
+/// The flag set is validated against
+/// [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`] and rejected if any unknown
+/// bit is set.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] when the flags were stored.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+///   no indexed handler is currently installed, or when `flags` contains
+///   a bit outside [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`].
+///
+/// # Safety
+/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_set_indexed_handler_flags(
+    wrap: *mut StatorDomObjectWrap,
+    flags: u32,
+) -> StatorStatus {
+    if wrap.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let Some(parsed) = IndexedPropertyHandlerFlags::from_bits(flags) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    let installed = unsafe { (*wrap).inner.set_indexed_handler_flags(parsed) };
+    if installed {
+        StatorStatus::StatorStatusOk
+    } else {
+        StatorStatus::StatorStatusInvalidArg
+    }
+}
+
+/// Read the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+///   currently-installed flag bitmask (always `0` when no indexed
+///   handler is installed).
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+///   is null.
+///
+/// # Safety
+/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `out_flags` must be a writable `*mut u32` slot on
+///   [`StatorStatus::StatorStatusOk`] return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_get_indexed_handler_flags(
+    wrap: *const StatorDomObjectWrap,
+    out_flags: *mut u32,
+) -> StatorStatus {
+    if wrap.is_null() || out_flags.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let flags = unsafe { (*wrap).inner.indexed_handler_flags() };
+    // SAFETY: caller guarantees `out_flags` is writable.
+    unsafe { *out_flags = flags.bits() };
     StatorStatus::StatorStatusOk
 }
 
@@ -35428,5 +35604,259 @@ mod tests {
         };
         unsafe { stator_isolate_set_traced_root_visitor(iso.as_ptr(), None, std::ptr::null_mut()) };
         unsafe { stator_isolate_gc(iso.as_ptr()) };
+    }
+
+    // ── PropertyHandlerFlags FFI ─────────────────────────────────────────
+
+    unsafe extern "C" fn flags_test_named_getter(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "id" {
+            let iso = ACTIVE_ISO.with(|c| c.get());
+            let bytes = b"intercepted";
+            let v = unsafe {
+                stator_value_new_string(iso, bytes.as_ptr() as *const c_char, bytes.len())
+            };
+            unsafe { *out = v };
+            StatorStatus::StatorStatusOk
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn flags_test_indexed_getter(
+        _index: u32,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let v = unsafe { stator_value_new_number(iso, 42.0) };
+        unsafe { *out = v };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn flags_test_deny_all(
+        _op: StatorDomAccessCheckOperation,
+        _name_utf8: *const c_char,
+        _name_len: usize,
+        _index: u32,
+        _native_ptr: *mut c_void,
+        _class_id: u32,
+        _data: *mut c_void,
+    ) -> bool {
+        false
+    }
+
+    #[test]
+    fn test_ffi_named_flags_default_is_zero_with_no_handler() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let mut flags: u32 = 0xFFFF_FFFF;
+        let s = unsafe { stator_dom_object_wrap_get_named_handler_flags(wrap, &mut flags) };
+        assert_eq!(s, StatorStatus::StatorStatusOk);
+        assert_eq!(flags, STATOR_DOM_NAMED_HANDLER_FLAG_NONE);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_named_flags_set_requires_installed_handler() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let s = unsafe {
+            stator_dom_object_wrap_set_named_handler_flags(
+                wrap,
+                STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ,
+            )
+        };
+        assert_eq!(s, StatorStatus::StatorStatusInvalidArg);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_named_flags_round_trip_after_install() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(flags_test_named_getter),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        let bits = STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ
+            | STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING
+            | STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_set_named_handler_flags(wrap, bits) },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out: u32 = 0;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_named_handler_flags(wrap, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out, bits);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_named_flags_reject_unknown_bits() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(flags_test_named_getter),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        let bad = 1u32 << 31;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_set_named_handler_flags(wrap, bad) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let mut out: u32 = 0xFF;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_named_handler_flags(wrap, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        // Previous set was rejected — flags must still be zero.
+        assert_eq!(out, STATOR_DOM_NAMED_HANDLER_FLAG_NONE);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_named_flags_all_can_read_bypasses_access_check() {
+        use stator_jse::objects::value::JsValue;
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(flags_test_named_getter),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(flags_test_deny_all),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Without ALL_CAN_READ: read is denied.
+        assert!(matches!(
+            unsafe { (*wrap).inner.get_property("id") },
+            JsValue::Undefined
+        ));
+
+        // Install ALL_CAN_READ: interceptor runs even though access check denies.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    wrap,
+                    STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        match unsafe { (*wrap).inner.get_property("id") } {
+            JsValue::String(s) => assert_eq!(&*s, "intercepted"),
+            other => panic!("expected interceptor string, got {other:?}"),
+        }
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_indexed_flags_round_trip_and_reject() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: Some(flags_test_indexed_getter),
+            setter: None,
+            query: None,
+            length: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        // Valid: ALL_CAN_READ.
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_indexed_handler_flags(
+                    wrap,
+                    STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out: u32 = 0;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_indexed_handler_flags(wrap, &mut out) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(out, STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ);
+        // Reject: ONLY_INTERCEPT_STRINGS does not apply to indexed handlers.
+        let bad = STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_set_indexed_handler_flags(wrap, bad) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_flags_null_wrap_and_null_out_are_rejected() {
+        let mut out: u32 = 0;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_named_handler_flags(
+                    std::ptr::null_mut(),
+                    STATOR_DOM_NAMED_HANDLER_FLAG_NONE,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_named_handler_flags(std::ptr::null(), &mut out) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_get_named_handler_flags(wrap, std::ptr::null_mut()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
     }
 }

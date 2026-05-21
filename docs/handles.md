@@ -541,6 +541,60 @@ Current limitations (Stator does **not** match V8 exactly here):
 - The callback runs synchronously on the script thread; it must not
   re-enter Stator or call back into JS.
 
+### 7.3 DOM wrapper property-handler flags
+
+Each `DomObjectWrap` named / indexed property handler carries a flag
+bitmask that mirrors V8/Blink's `v8::PropertyHandlerFlags`. The flags
+are additive: the default (`NONE`) reproduces the historical Stator
+interceptor semantics, and any unknown bit is rejected fail-closed so
+embedders cannot silently activate semantics the current Stator build
+does not understand.
+
+Named-handler flags (`STATOR_DOM_NAMED_HANDLER_FLAG_*`):
+
+| Flag | Effect today |
+|------|--------------|
+| `NONE` | Default behaviour; interceptor is consulted before own properties on every operation. |
+| `ALL_CAN_READ` | Read-side ops (`Get`, `Query`) still consult the interceptor even when the access-check callback denies the access. Writes/deletes/enumeration remain access-checked. |
+| `NON_MASKING` | Interceptor only fires when the wrapper's own-property map does not already define the key. Existing own properties "mask" interceptor entries on both reads and writes. |
+| `ONLY_INTERCEPT_STRINGS` | Stored-only metadata. Stator does not yet route symbol-keyed access through DOM wrappers, so this flag matches the implicit steady-state behaviour. |
+| `INTERCEPT_SYMBOLS` | Stored-only metadata. Reserved for future symbol-key routing; today it has no runtime effect. |
+| `HAS_NO_SIDE_EFFECT` | Stored-only metadata. Intended for profilers/debuggers that need to invoke the interceptor without observable side effects; no runtime effect today. |
+
+Indexed-handler flags (`STATOR_DOM_INDEXED_HANDLER_FLAG_*`):
+
+| Flag | Effect today |
+|------|--------------|
+| `NONE` | Default behaviour. |
+| `ALL_CAN_READ` | Read-side ops (`Get`, `Query`, `Length`) still consult the interceptor even when the access-check callback denies the access. Writes remain access-checked. |
+| `NON_MASKING` | Stored-only metadata. Indexed wrappers do not maintain a per-index own-property map today, so this flag is reserved for future symmetry with named handlers. |
+| `HAS_NO_SIDE_EFFECT` | Stored-only metadata; no runtime effect today. |
+
+FFI surface:
+
+- `stator_dom_object_wrap_set_named_handler_flags(wrap, flags)` —
+  validates `flags` against `STATOR_DOM_NAMED_HANDLER_FLAG_ALL` (fail-
+  closed on unknown bits) and stores them on the installed named
+  handler. Requires a named handler to be installed first.
+- `stator_dom_object_wrap_get_named_handler_flags(wrap, &out_flags)` —
+  reads the current named-handler flags (or `0` when no handler is
+  installed).
+- `stator_dom_object_wrap_set_indexed_handler_flags(wrap, flags)` /
+  `stator_dom_object_wrap_get_indexed_handler_flags` — the indexed
+  counterparts; validated against `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`.
+
+Current limitations:
+
+- Stator does not yet honour `ONLY_INTERCEPT_STRINGS`, `INTERCEPT_SYMBOLS`,
+  or `HAS_NO_SIDE_EFFECT` at runtime — they are stored-only capability
+  metadata that future Stator versions can wire into symbol-key routing
+  and side-effect-free diagnostics paths.
+- Flags are stored per handler instance, not on an underlying template;
+  reinstalling a named handler via
+  `stator_dom_object_wrap_install_named_handler` replaces both the
+  callbacks and the flag bitmask (the freshly-built handler defaults to
+  `NONE`).
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.
