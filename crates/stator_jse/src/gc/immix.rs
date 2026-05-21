@@ -705,6 +705,9 @@ impl ImmixCollector {
     /// See [`mark`][Self::mark] and [`evacuate`][Self::evacuate] for the
     /// full safety contracts.
     pub unsafe fn collect(&mut self, roots: &mut [*mut *mut HeapObject], space: &mut ImmixSpace) {
+        let _pause_timer = crate::gc::pause_metrics::PauseTimer::start(
+            crate::gc::pause_metrics::GcCollectionKind::Immix,
+        );
         let mut blocks = space.drain_full_blocks();
 
         // Phase 1: Mark.

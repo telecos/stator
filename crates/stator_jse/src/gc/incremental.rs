@@ -437,6 +437,9 @@ impl IncrementalGc {
     /// # Safety
     /// All root pointers must be valid, aligned, live `HeapObject`s.
     pub unsafe fn major_gc(&mut self, heap: &mut Heap, roots: &[*mut *mut HeapObject]) {
+        let _pause_timer = crate::gc::pause_metrics::PauseTimer::start(
+            crate::gc::pause_metrics::GcCollectionKind::Major,
+        );
         let start = Instant::now();
 
         // Mark phase (run to completion synchronously).

@@ -423,6 +423,9 @@ impl Heap {
     /// available; for a proper live-object copy use
     /// [`scavenge_with_roots`][Self::scavenge_with_roots].
     pub fn collect(&mut self) {
+        let _pause_timer = crate::gc::pause_metrics::PauseTimer::start(
+            crate::gc::pause_metrics::GcCollectionKind::Minor,
+        );
         self.young_space.collect();
     }
 
@@ -480,6 +483,9 @@ impl Heap {
         roots: &mut [*mut *mut HeapObject],
         remembered_set: &mut crate::gc::scavenger::RememberedSet,
     ) {
+        let _pause_timer = crate::gc::pause_metrics::PauseTimer::start(
+            crate::gc::pause_metrics::GcCollectionKind::Major,
+        );
         // Phase 1: evacuate the nursery.
         // SAFETY: caller upholds scavenge_with_roots preconditions.
         unsafe { self.scavenge_with_roots(roots, remembered_set) };
@@ -641,5 +647,29 @@ mod tests {
         // Allocation succeeds again after collection.
         let ptr = heap.allocate(layout);
         assert!(!ptr.is_null(), "allocation after collection must succeed");
+    }
+
+    #[test]
+    fn heap_collect_increments_minor_pause_metric() {
+        use crate::gc::pause_metrics;
+        // Pause counters are process-global and other tests may run
+        // collections concurrently, so we assert monotonic increase rather
+        // than an exact delta.
+        let before = pause_metrics::snapshot()
+            .for_kind(pause_metrics::GcCollectionKind::Minor)
+            .count;
+
+        let mut heap = Heap::new();
+        let layout = Layout::new::<HeapObject>();
+        heap.allocate(layout);
+        heap.collect();
+
+        let after = pause_metrics::snapshot()
+            .for_kind(pause_metrics::GcCollectionKind::Minor)
+            .count;
+        assert!(
+            after >= before + 1,
+            "Heap::collect must record at least one minor pause (before={before}, after={after})"
+        );
     }
 }

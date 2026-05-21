@@ -240,6 +240,9 @@ impl<'heap> MarkSweepCompactor<'heap> {
     /// See [`mark`][Self::mark] and [`compact`][Self::compact] for the full
     /// safety contracts.
     pub unsafe fn collect(&mut self, roots: &mut [*mut *mut HeapObject]) {
+        let _pause_timer = crate::gc::pause_metrics::PauseTimer::start(
+            crate::gc::pause_metrics::GcCollectionKind::MarkSweepCompact,
+        );
         // Mark phase: identify live objects.
         // SAFETY: caller upholds mark's preconditions.
         unsafe { self.mark(roots) };

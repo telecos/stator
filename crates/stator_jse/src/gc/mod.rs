@@ -12,6 +12,8 @@ pub mod immix;
 pub mod incremental;
 /// Mark-Sweep-Compact collector for the old (tenured) generation.
 pub mod mark_sweep_compact;
+/// Always-on GC pause-time counters and fixed-bucket histogram.
+pub mod pause_metrics;
 /// Thread-local heap runtime: allocation, collection, and root management.
 pub mod runtime;
 /// Cheney semi-space scavenger (minor GC) and write-barrier remembered set.
