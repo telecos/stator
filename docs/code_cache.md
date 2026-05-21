@@ -14,6 +14,186 @@ Every artifact key begins with an `artifact_type` discriminator:
 | `jit-code` | Optimizing-tier native code (`maglev`, `turbofan`, or future tiers) plus guards, feedback dependencies, deopt metadata, and code-range layout constraints. | May be restored only when feedback schema, compiler flags, and CPU feature set match exactly. |
 | `snapshot-reference` | A reference from code cache entries to a startup or context snapshot blob. The key stores the referenced snapshot identity, not a copy of the snapshot. | May be used only if the referenced snapshot blob is present and its own format/build key matches. |
 
+## Proposed C ABI: classic-script bytecode cache
+
+The existing C ABI exposes module cache entry points only:
+`stator_module_create_code_cache` and `stator_module_compile_cached`. Classic
+scripts currently compile with `stator_script_compile`, then callers can attach
+origin metadata afterward with `stator_script_set_origin`; that is too late for
+a bytecode cache key because the origin, source-map URL, and host options must
+be validated before accepting cached bytecode. The script cache ABI should
+therefore use a compile-options struct that is passed to both production and
+restore paths.
+
+### Types
+
+```c
+typedef enum StatorScriptCacheStatus {
+  /* Operation succeeded: a blob was produced or bytecode was restored. */
+  StatorScriptCacheStatusOk = 0,
+  /*
+   * Cache was well-formed enough to inspect but did not match the requested
+   * source, origin, options, engine, or format identity. compile_cached falls
+   * back to a normal source compile and returns that script handle.
+   */
+  StatorScriptCacheStatusRejected = 1,
+  /*
+   * A required pointer/length pair, options struct, output argument, or cache
+   * envelope was invalid. compile_cached falls back to source compile when the
+   * source/options inputs are still usable; otherwise it returns an errored
+   * script handle.
+   */
+  StatorScriptCacheStatusInvalid = 2,
+  /*
+   * This engine build or option combination cannot serialize/restore script
+   * bytecode. compile_cached falls back to source compile.
+   */
+  StatorScriptCacheStatusUnsupported = 3,
+  /*
+   * Producing bytecode, restoring bytecode, or compiling the fallback source
+   * raised a parser/compiler exception. The returned script is an errored
+   * StatorScript and no cache bytes are accepted.
+   */
+  StatorScriptCacheStatusException = 4,
+} StatorScriptCacheStatus;
+
+typedef enum StatorScriptCacheDiagnostic {
+  StatorScriptCacheDiagnosticNone = 0,
+  StatorScriptCacheDiagnosticSchemaVersion = 1,
+  StatorScriptCacheDiagnosticArtifactType = 2,
+  StatorScriptCacheDiagnosticEngineVersion = 3,
+  StatorScriptCacheDiagnosticFormatVersion = 4,
+  StatorScriptCacheDiagnosticSourceIdentity = 5,
+  StatorScriptCacheDiagnosticOrigin = 6,
+  StatorScriptCacheDiagnosticSourceMap = 7,
+  StatorScriptCacheDiagnosticHostOptions = 8,
+  StatorScriptCacheDiagnosticParserFlags = 9,
+  StatorScriptCacheDiagnosticCompilerFlags = 10,
+  StatorScriptCacheDiagnosticPlatform = 11,
+  StatorScriptCacheDiagnosticBuildFeatures = 12,
+  StatorScriptCacheDiagnosticSnapshot = 13,
+  StatorScriptCacheDiagnosticCorruptPayload = 14,
+  StatorScriptCacheDiagnosticUnsupportedFeature = 15,
+  StatorScriptCacheDiagnosticCompileException = 16,
+} StatorScriptCacheDiagnostic;
+
+typedef struct StatorScriptCompileOptions {
+  /* Stable script URL/resource name; copied by Stator during the call. */
+  const char *resource_name;
+  size_t resource_name_len;
+  /* Serialized origin or opaque-origin token supplied by the embedder. */
+  const char *source_origin;
+  size_t source_origin_len;
+  /* Optional //# sourceURL= override when it differs from resource_name. */
+  const char *source_url;
+  size_t source_url_len;
+  int32_t line_offset;
+  int32_t column_offset;
+  const char *source_map_url;
+  size_t source_map_url_len;
+  /*
+   * Embedder-defined compile-affecting options. Stator treats the byte sequence
+   * as opaque key material and stores only its digest in diagnostics.
+   */
+  const uint8_t *host_defined_options;
+  size_t host_defined_options_len;
+  uint64_t parser_feature_bits;
+  uint64_t bytecode_feature_bits;
+  uint32_t strict_mode_policy;
+} StatorScriptCompileOptions;
+
+typedef struct StatorScriptCacheTelemetry {
+  StatorScriptCacheStatus status;
+  StatorScriptCacheDiagnostic diagnostic;
+  uint32_t cache_schema_version;
+  uint32_t script_cache_format_version;
+  uint64_t source_length_bytes;
+  uint64_t cache_length_bytes;
+  uint64_t restored_bytecode_length_bytes;
+  bool fallback_compile_attempted;
+  bool fallback_compile_succeeded;
+} StatorScriptCacheTelemetry;
+```
+
+Telemetry fields are low-cardinality by design. They must not contain full URLs,
+source text, raw hashes, source-map URLs, or host-defined option bytes. If Edge
+needs URL/source attribution, it should join these counters to a privacy-reviewed
+browser-side cache key bucket rather than logging Stator inputs directly.
+
+### Entry points
+
+```c
+StatorString *stator_script_create_code_cache(
+    const StatorScript *script,
+    const char *source,
+    size_t source_len,
+    const StatorScriptCompileOptions *options,
+    StatorScriptCacheStatus *out_status,
+    StatorScriptCacheTelemetry *out_telemetry);
+
+StatorScript *stator_script_compile_cached(
+    StatorContext *ctx,
+    const char *source,
+    size_t source_len,
+    const char *cache_data,
+    size_t cache_len,
+    const StatorScriptCompileOptions *options,
+    StatorScriptCacheStatus *out_status,
+    StatorScriptCacheTelemetry *out_telemetry);
+```
+
+`stator_script_create_code_cache` accepts only a successfully compiled
+`StatorScript` plus the exact source and compile options used to create it. It
+returns an engine-owned `StatorString` containing a versioned `script-bytecode`
+blob when `out_status` is `StatorScriptCacheStatusOk`; callers read bytes with
+`stator_string_data` / `stator_string_len`, copy them into their persistent
+store if desired, and release the handle with `stator_string_free`. Null script
+handles, errored scripts, invalid source/options, or unsupported bytecode shapes
+return null and set `out_status` to `Invalid`, `Exception`, or `Unsupported`.
+
+`stator_script_compile_cached` validates the blob magic, schema, script cache
+format, engine/ABI identity, source hash/length/encoding, origin fields,
+source-map URL, host-defined options, parser flags, bytecode flags, platform,
+build features, and snapshot references before any bytecode is restored. On
+`Ok`, the returned `StatorScript` owns restored bytecode and has the supplied
+origin/options installed before callers can execute it. On `Rejected`,
+`Invalid`, or `Unsupported`, the API falls back to compiling `source` with the
+same options so embedders can use a single call on cache miss; telemetry records
+whether fallback was attempted and succeeded. On `Exception`, the returned
+script is an errored `StatorScript` whose existing error accessors expose the
+parser/compiler failure.
+
+All pointer/length inputs are borrowed for the duration of the call and copied
+or hashed before return. `out_status` and `out_telemetry` are optional; when
+present each must be valid for one write. Cache bytes are untrusted input and
+must fail closed: accepted blobs may skip parsing and bytecode generation, but
+must never weaken source, origin, option, or version validation.
+
+### Parity and differences versus module cache
+
+Script and module caches share the same key schema, manifest invalidation rules,
+cache blob ownership model, privacy constraints, coarse status contract, and
+diagnostic vocabulary. Both production APIs return `StatorString` blobs owned by
+Stator, both restore APIs validate source/options before use, and both must
+reject corrupt payloads without executing cached code.
+
+Script cache behavior intentionally differs where classic scripts differ from
+modules:
+
+- `artifact_type` is `script-bytecode`, `artifact_scope` is `classic-script`,
+  and `parse_goal` is Script; there is no module request graph, import/export
+  shape, import attributes hash, top-level-await state, or `import.meta.url`.
+- Script origin/options are inputs to cache production and restore. The current
+  post-compile `stator_script_set_origin` remains useful for non-cached scripts
+  but is not sufficient for cacheable scripts because origin affects the key.
+- `stator_script_compile_cached` falls back to normal source compilation on
+  rejected, invalid, or unsupported cache input. Module cache restore currently
+  returns an errored module on rejection because module graph/linking state has
+  stricter fail-closed behavior.
+- Classic-script blobs restore interpreter bytecode only. Native baseline/JIT
+  artifacts, if added later, must use separate `baseline-code` or `jit-code`
+  artifact types and stricter platform/sandbox validation.
+
 ## Canonical serialization
 
 Keys are serialized as deterministic UTF-8 records before hashing or embedding in cache payloads. Producers and consumers must use the same order below.
