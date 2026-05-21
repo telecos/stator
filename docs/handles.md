@@ -457,6 +457,31 @@ Edge (the embedder) is responsible for:
   Edge-side wrapper that owned the handle is destroyed, so the slot is
   reclaimed.
 
+### 7.1 DOM wrapper `invalidate` vs `destroy`
+
+Blink/Oilpan separates "the native DOM object is no longer usable" from
+"the JS wrapper handle may be reclaimed." Stator must preserve that split
+so host wrappers fail closed without inventing extra lifetime:
+
+| Event | Owner | Stator handle action | JS-visible behavior |
+|-------|-------|----------------------|---------------------|
+| Invalidate native object | Edge/Oilpan | Keep the existing handle slot, clear or poison the embedder payload, and mark the wrapper as invalid. Do not invoke weak callbacks and do not dispose the slot. | Property access, calls, brand checks, and callbacks that require the native payload throw the host-provided invalid-wrapper error. Enumeration of cached JS-only properties may continue only if it does not dereference the native object. |
+| Destroy wrapper record | Edge/Oilpan or weak callback | Dispose the owning `Persistent`/`Weak`/`TracedReference` slot exactly once and clear Edge back-pointers. | The wrapper must never be re-entered through this handle. Any stale host pointer is an embedder bug and should be diagnosed, not silently ignored. |
+| Isolate teardown | Stator | Run the teardown GC pipeline (§4.4), dispatch remaining weak callbacks, then assert/dispose remaining persistent and traced slots. | No script execution, callbacks, or wrapper resurrection is allowed. |
+
+Rules:
+- `invalidate` is **not** a GC event. It must not make a live JS object
+  disappear, fire finalizers, or trigger weak callbacks.
+- `destroy` is **not** an invalidation substitute. If Edge destroys the
+  native payload while JS can still reach the wrapper, it must first
+  invalidate the wrapper so every subsequent entry point fails closed.
+- Revalidation requires a new host payload and an explicit Edge-side
+  state transition. Stator must not automatically reattach stale payloads
+  or fall back to a global/default object.
+- Weak callbacks run only after Stator proves the JS wrapper is
+  unreachable. They may destroy Edge bookkeeping but must not inspect the
+  invalidated payload or call back into script (§4.6).
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.
