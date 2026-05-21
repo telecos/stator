@@ -154,6 +154,9 @@ const SNAPSHOT_VERSION: u32 = 2;
 /// Format version of the manifest-aware (`STSM`) snapshot layout.
 const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
 
+/// Canonical quiet NaN payload used by strict deterministic snapshot encoding.
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
 // JsValue tag bytes
 const TAG_UNDEFINED: u8 = 0x00;
 const TAG_NULL: u8 = 0x01;
@@ -720,6 +723,15 @@ fn write_f64(buf: &mut Vec<u8>, v: f64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+fn write_f64_canonical(buf: &mut Vec<u8>, v: f64) {
+    let bits = if v.is_nan() {
+        CANONICAL_NAN_BITS
+    } else {
+        v.to_bits()
+    };
+    buf.extend_from_slice(&bits.to_le_bytes());
+}
+
 /// Write a `u32`-length-prefixed UTF-8 string.
 fn write_str32(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
@@ -874,7 +886,7 @@ fn write_jsvalue_strict(
         }
         JsValue::HeapNumber(n) => {
             write_u8(buf, TAG_HEAP_NUMBER);
-            write_f64(buf, *n);
+            write_f64_canonical(buf, *n);
             Ok(())
         }
         JsValue::String(s) => {
@@ -902,7 +914,7 @@ fn write_jsvalue_strict(
                 write_u8(buf, TAG_DEFINE_REF);
                 write_u32(buf, id);
                 write_u8(buf, TAG_FUNCTION);
-                write_bytecode_array(buf, rc);
+                write_bytecode_array_strict(buf, rc);
             }
             Ok(())
         }
@@ -1105,6 +1117,18 @@ fn write_jsvalue_with_manifest(
 }
 
 fn write_bytecode_array(buf: &mut Vec<u8>, ba: &BytecodeArray) {
+    write_bytecode_array_with_number_mode(buf, ba, false);
+}
+
+fn write_bytecode_array_strict(buf: &mut Vec<u8>, ba: &BytecodeArray) {
+    write_bytecode_array_with_number_mode(buf, ba, true);
+}
+
+fn write_bytecode_array_with_number_mode(
+    buf: &mut Vec<u8>,
+    ba: &BytecodeArray,
+    canonical_numbers: bool,
+) {
     // bytecodes
     let bc = ba.bytecodes();
     write_u32(buf, bc.len() as u32);
@@ -1114,7 +1138,7 @@ fn write_bytecode_array(buf: &mut Vec<u8>, ba: &BytecodeArray) {
     let pool = ba.constant_pool();
     write_u32(buf, pool.len() as u32);
     for entry in pool {
-        write_constant_pool_entry(buf, entry);
+        write_constant_pool_entry_with_number_mode(buf, entry, canonical_numbers);
     }
 
     // frame_size, parameter_count
@@ -1151,11 +1175,19 @@ fn write_bytecode_array(buf: &mut Vec<u8>, ba: &BytecodeArray) {
     write_u8(buf, if ba.is_generator() { 1 } else { 0 });
 }
 
-fn write_constant_pool_entry(buf: &mut Vec<u8>, entry: &ConstantPoolEntry) {
+fn write_constant_pool_entry_with_number_mode(
+    buf: &mut Vec<u8>,
+    entry: &ConstantPoolEntry,
+    canonical_numbers: bool,
+) {
     match entry {
         ConstantPoolEntry::Number(n) => {
             write_u8(buf, CPE_NUMBER);
-            write_f64(buf, *n);
+            if canonical_numbers {
+                write_f64_canonical(buf, *n);
+            } else {
+                write_f64(buf, *n);
+            }
         }
         ConstantPoolEntry::String(s) => {
             write_u8(buf, CPE_STRING);
@@ -1173,7 +1205,7 @@ fn write_constant_pool_entry(buf: &mut Vec<u8>, entry: &ConstantPoolEntry) {
         }
         ConstantPoolEntry::Function(ba) => {
             write_u8(buf, CPE_FUNCTION);
-            write_bytecode_array(buf, ba);
+            write_bytecode_array_with_number_mode(buf, ba, canonical_numbers);
         }
         ConstantPoolEntry::TemplateObject { cooked, raw } => {
             write_u8(buf, CPE_TEMPLATE_OBJECT);
@@ -1795,13 +1827,169 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
     use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
-    use crate::objects::value::{JsValue, NativeFn};
+    use crate::interpreter::GlobalEnv;
+    use crate::objects::value::{JsValue, ModuleBindingCell, NativeFn};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
     fn round_trip(globals: HashMap<String, JsValue>) -> HashMap<String, JsValue> {
         let snap = serialize_globals(&globals);
         deserialize_globals(snap.as_bytes()).expect("deserialization should succeed")
+    }
+
+    fn strict_snapshot_bytes(globals: &HashMap<String, JsValue>) -> Vec<u8> {
+        serialize_globals_strict(globals)
+            .expect("strict snapshot serialization should succeed")
+            .into_bytes()
+    }
+
+    fn plain_object(entries: Vec<(&str, JsValue)>) -> JsValue {
+        let mut map = PropertyMap::new();
+        for (key, value) in entries {
+            map.insert(key.to_string(), value);
+        }
+        JsValue::PlainObject(Rc::new(RefCell::new(map)))
+    }
+
+    fn module_binding_value(value: JsValue, reversed_insert_order: bool) -> JsValue {
+        let mut env = GlobalEnv::new();
+        if reversed_insert_order {
+            env.insert("noise".to_string(), JsValue::Smi(-1));
+            env.insert("target".to_string(), value);
+        } else {
+            env.insert("target".to_string(), value);
+            env.insert("noise".to_string(), JsValue::Smi(-1));
+        }
+        JsValue::ModuleBinding(Rc::new(ModuleBindingCell {
+            global_env: Rc::new(RefCell::new(env)),
+            key: Rc::<str>::from("target"),
+        }))
+    }
+
+    fn function_with_nan_constant(number_bits: u64, nested_number_bits: u64) -> JsValue {
+        let nested = BytecodeArray::new(
+            vec![0x02],
+            vec![ConstantPoolEntry::Number(f64::from_bits(
+                nested_number_bits,
+            ))],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let outer = BytecodeArray::new(
+            vec![0x01],
+            vec![
+                ConstantPoolEntry::Number(f64::from_bits(number_bits)),
+                ConstantPoolEntry::Function(Rc::new(nested)),
+            ],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        JsValue::Function(Rc::new(outer))
+    }
+
+    #[test]
+    fn test_strict_serialization_repeated_snapshots_byte_equal() {
+        let mut globals = HashMap::new();
+        globals.insert("z".to_string(), JsValue::Smi(26));
+        globals.insert(
+            "nested".to_string(),
+            plain_object(vec![
+                (
+                    "array",
+                    JsValue::new_array(vec![
+                        plain_object(vec![("b", JsValue::Smi(2)), ("a", JsValue::Smi(1))]),
+                        module_binding_value(JsValue::String("live".into()), false),
+                    ]),
+                ),
+                ("number", JsValue::HeapNumber(1.25)),
+            ]),
+        );
+        globals.insert("a".to_string(), JsValue::Boolean(true));
+
+        let first = strict_snapshot_bytes(&globals);
+        let second = strict_snapshot_bytes(&globals);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_strict_serialization_ignores_root_and_property_insertion_order() {
+        let mut left = HashMap::new();
+        left.insert("z".to_string(), JsValue::Smi(3));
+        left.insert(
+            "obj".to_string(),
+            plain_object(vec![("beta", JsValue::Smi(2)), ("alpha", JsValue::Smi(1))]),
+        );
+        left.insert("a".to_string(), JsValue::String("first".into()));
+
+        let mut right = HashMap::new();
+        right.insert("a".to_string(), JsValue::String("first".into()));
+        right.insert(
+            "obj".to_string(),
+            plain_object(vec![("alpha", JsValue::Smi(1)), ("beta", JsValue::Smi(2))]),
+        );
+        right.insert("z".to_string(), JsValue::Smi(3));
+
+        assert_eq!(strict_snapshot_bytes(&left), strict_snapshot_bytes(&right));
+    }
+
+    #[test]
+    fn test_strict_serialization_ignores_module_binding_backing_order() {
+        let mut left = HashMap::new();
+        left.insert(
+            "binding".to_string(),
+            module_binding_value(JsValue::HeapNumber(9.0), false),
+        );
+        let mut right = HashMap::new();
+        right.insert(
+            "binding".to_string(),
+            module_binding_value(JsValue::HeapNumber(9.0), true),
+        );
+
+        assert_eq!(strict_snapshot_bytes(&left), strict_snapshot_bytes(&right));
+    }
+
+    #[test]
+    fn test_strict_serialization_canonicalizes_heap_number_nan_payloads() {
+        let mut left = HashMap::new();
+        left.insert(
+            "nan".to_string(),
+            JsValue::HeapNumber(f64::from_bits(0x7ff8_0000_0000_0001)),
+        );
+        let mut right = HashMap::new();
+        right.insert(
+            "nan".to_string(),
+            JsValue::HeapNumber(f64::from_bits(0x7fff_ffff_ffff_ffff)),
+        );
+
+        let bytes = strict_snapshot_bytes(&left);
+        assert_eq!(bytes, strict_snapshot_bytes(&right));
+        let restored = deserialize_globals(&bytes).expect("canonical NaN snapshot should load");
+        match restored.get("nan") {
+            Some(JsValue::HeapNumber(value)) => assert_eq!(value.to_bits(), CANONICAL_NAN_BITS),
+            other => panic!("expected HeapNumber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strict_function_constant_pool_canonicalizes_nan_payloads() {
+        let mut left = HashMap::new();
+        left.insert(
+            "fn".to_string(),
+            function_with_nan_constant(0x7ff8_0000_0000_1111, 0x7ff8_0000_0000_2222),
+        );
+        let mut right = HashMap::new();
+        right.insert(
+            "fn".to_string(),
+            function_with_nan_constant(0x7fff_0000_0000_3333, 0x7fff_0000_0000_4444),
+        );
+
+        assert_eq!(strict_snapshot_bytes(&left), strict_snapshot_bytes(&right));
     }
 
     // ── primitive values ──────────────────────────────────────────────────────

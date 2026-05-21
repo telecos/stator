@@ -2,15 +2,15 @@
 
 | Field    | Value                              |
 |----------|------------------------------------|
-| Status   | Draft (design only — no code yet)  |
+| Status   | Draft, with strict deterministic `STSS` support implemented |
 | Audience | Stator engine + Edge embedder team |
 | Scope    | `crates/stator_jse/src/snapshot/`, `crates/st8`, future `stator_ffi` snapshot FFI |
 
 This document specifies the **warm-context startup snapshot** that Stator must
 provide to support Edge's mksnapshot-equivalent embedding flow.  It describes
 what exists today, what must change, and the rules a future implementation must
-respect.  Nothing in this document is yet implemented; concrete code work is
-tracked by separate slices/todos referenced at the end.
+respect.  Several strict `STSS` building blocks are now implemented; remaining
+warm-context work is tracked by separate slices/todos referenced at the end.
 
 ---
 
@@ -65,10 +65,10 @@ The CLI driver (`crates/st8/src/main.rs`) exposes the flow as
 5. **No FFI surface.** `stator_ffi` does not expose any
    snapshot-create / snapshot-load entry points; Edge cannot consume the
    current capability without linking Rust directly.
-6. **No determinism guarantees.** Serialization iterates a
-   `HashMap`, so byte output is not stable across runs.  This blocks
-   reproducible-build verification, deterministic golden tests, and
-   content-addressed packaging.
+6. **Legacy determinism is limited.** The legacy `serialize_globals` path keeps
+   its lossy compatibility behavior and is not the Edge release-artifact
+   contract.  The strict path described below is the deterministic entry point
+   for reproducible cache keys.
 
 These limitations are why a new *warm-context* contract is needed before
 Edge can ship Stator behind a snapshot boundary equivalent to V8
@@ -85,7 +85,16 @@ Edge can ship Stator behind a snapshot boundary equivalent to V8
 > when reached transitively through `Array`, `PlainObject`, or
 > `ModuleBinding` values.  This matches the rejection policy specified
 > for the future `STWC` warm-context format and is the migration target
-> for embedders that must never silently downgrade unsupported state.
+> for embedders that must never silently downgrade unsupported state.  Strict
+> serialization also emits deterministic bytes for supported global graphs on a
+> fixed engine build: global names and plain-object properties are sorted
+> lexicographically before traversal; arrays preserve index order; module live
+> bindings are serialized as their current resolved values; reference ids are
+> assigned from that canonical traversal; strings use raw UTF-8 `str32`; integer,
+> BigInt, and finite `f64` values use little-endian encodings; and all `NaN`
+> payloads in strict heap numbers and function constant-pool numbers are
+> canonicalized to one quiet NaN bit pattern.  Unsupported or host-owned state
+> still fails closed rather than receiving a deterministic placeholder.
 
 ---
 
