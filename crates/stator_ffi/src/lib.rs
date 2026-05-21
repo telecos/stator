@@ -78,7 +78,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 9;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 10;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -15801,6 +15801,10 @@ pub enum StatorDomAccessCheckOperation {
     StatorDomAccessCheckOperationIndexedQuery = 7,
     /// Indexed-collection length query.
     StatorDomAccessCheckOperationIndexedLength = 8,
+    /// Indexed-property `delete` (e.g. `delete nodeList[0]`).
+    StatorDomAccessCheckOperationIndexedDelete = 9,
+    /// Indexed-property enumeration (e.g. `for (let i in nodeList)`).
+    StatorDomAccessCheckOperationIndexedEnumerate = 10,
 }
 
 /// C-callable access-check (security) callback for a DOM wrapper.
@@ -15863,6 +15867,12 @@ fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
         }
         AccessCheckOperation::IndexedLength => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedLength
+        }
+        AccessCheckOperation::IndexedDelete => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDelete
+        }
+        AccessCheckOperation::IndexedEnumerate => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedEnumerate
         }
     }
 }
@@ -16139,6 +16149,48 @@ pub type StatorDomIndexedQueryCb =
 pub type StatorDomIndexedLengthCb =
     unsafe extern "C" fn(data: *mut c_void, out_len: *mut u32) -> StatorStatus;
 
+/// V2 indexed-property **deleter** callback.
+///
+/// Encodes the three-way [`stator_jse::dom::IndexedDeleterResult`]
+/// outcome through the [`StatorStatus`] / `*out_deleted` channel:
+///
+/// | Return                                  | Engine effect                                         |
+/// |-----------------------------------------|-------------------------------------------------------|
+/// | [`StatorStatusOk`] with `*out = true`   | Index was deleted; `delete` reports success.          |
+/// | [`StatorStatusOk`] with `*out = false`  | Interceptor handled the delete but refused.           |
+/// | [`StatorStatusFalse`]                   | No-intercept; engine treats the index as not-deleted. |
+/// | Any other status (incl. `Exception`)    | Treated fail-closed as no-intercept (not deleted).    |
+///
+/// `*out_deleted` is read only when the callback returns
+/// [`StatorStatusOk`].
+///
+/// [`StatorStatusOk`]: StatorStatus::StatorStatusOk
+/// [`StatorStatusFalse`]: StatorStatus::StatorStatusFalse
+///
+/// # Safety
+/// `out_deleted` must be a writable `*mut bool` slot when the callback
+/// returns [`StatorStatus::StatorStatusOk`].
+pub type StatorDomIndexedDeleterCb =
+    unsafe extern "C" fn(index: u32, data: *mut c_void, out_deleted: *mut bool) -> StatorStatus;
+
+/// V2 indexed-property **enumerator** callback.
+///
+/// The callback pushes indices onto `buf` via
+/// [`stator_dom_index_buffer_push`] and returns
+/// [`StatorStatus::StatorStatusOk`] on success.  Any other status is
+/// treated as "no indices produced" and the engine observes an empty
+/// list — the indices already pushed are discarded.
+///
+/// Stator passes the buffer contents through verbatim, so the embedder
+/// controls the observable order (and is responsible for any
+/// de-duplication it wishes callers to see).
+///
+/// # Safety
+/// `buf` must be the non-null pointer the FFI bridge passed in and must
+/// not outlive the callback invocation.
+pub type StatorDomIndexedEnumeratorCb =
+    unsafe extern "C" fn(buf: *mut StatorDomIndexBuffer, data: *mut c_void) -> StatorStatus;
+
 /// POD bundle of named-property interceptors, installed in one call by
 /// [`stator_dom_object_wrap_install_named_handler`].
 ///
@@ -16226,8 +16278,133 @@ pub struct StatorDomIndexedHandler {
     >,
     /// Indexed-collection length callback, or null.
     pub length: Option<unsafe extern "C" fn(data: *mut c_void, out_len: *mut u32) -> StatorStatus>,
+    /// Indexed-property `delete` callback, or null.  See
+    /// [`StatorDomIndexedDeleterCb`] for the three-way result encoding
+    /// (deleted / explicitly-refused / no-intercept).
+    pub deleter: Option<
+        unsafe extern "C" fn(index: u32, data: *mut c_void, out_deleted: *mut bool) -> StatorStatus,
+    >,
+    /// Indexed-property enumerator callback, or null.  Pushes onto a
+    /// caller-borrowed [`StatorDomIndexBuffer`] via
+    /// [`stator_dom_index_buffer_push`].
+    pub enumerator: Option<
+        unsafe extern "C" fn(buf: *mut StatorDomIndexBuffer, data: *mut c_void) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
+}
+
+/// Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
+/// callback.  The callback fills it by repeatedly calling
+/// [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
+/// bridge for the duration of the callback and must not outlive it.
+///
+/// Embedders that want to drive the indexed enumerator directly from C
+/// (rather than through an installed handler) can allocate a buffer with
+/// [`stator_dom_index_buffer_new`], pass it to
+/// [`stator_dom_object_wrap_invoke_indexed_enumerate_into`], inspect the
+/// contents via [`stator_dom_index_buffer_len`] /
+/// [`stator_dom_index_buffer_get`], and release it with
+/// [`stator_dom_index_buffer_destroy`].
+pub struct StatorDomIndexBuffer {
+    indices: Vec<u32>,
+}
+
+// SAFETY: `StatorDomIndexBuffer` only holds owned `u32`s and is accessed
+// on the owning thread during a single callback invocation.
+unsafe impl Send for StatorDomIndexBuffer {}
+
+/// Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
+/// [`stator_dom_index_buffer_destroy`].
+///
+/// # Safety
+/// The returned pointer must be released exactly once via
+/// [`stator_dom_index_buffer_destroy`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_dom_index_buffer_new() -> *mut StatorDomIndexBuffer {
+    Box::into_raw(Box::new(StatorDomIndexBuffer {
+        indices: Vec::new(),
+    }))
+}
+
+/// Free a [`StatorDomIndexBuffer`].  Does nothing when `buf` is null.
+///
+/// # Safety
+/// `buf` must be either null or a pointer returned by
+/// [`stator_dom_index_buffer_new`], not previously destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_index_buffer_destroy(buf: *mut StatorDomIndexBuffer) {
+    if !buf.is_null() {
+        // SAFETY: caller guarantees `buf` is valid and uniquely owned.
+        drop(unsafe { Box::from_raw(buf) });
+    }
+}
+
+/// Return the number of indices currently in `buf`.  Returns `0` when
+/// `buf` is null.
+///
+/// # Safety
+/// `buf` must be either null or a valid buffer pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_index_buffer_len(buf: *const StatorDomIndexBuffer) -> usize {
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `buf` is valid.
+    unsafe { (*buf).indices.len() }
+}
+
+/// Read the entry at `index` from `buf` into `*out_index`.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` or `out_index`
+///   is null, or when `index` is out of range.
+///
+/// # Safety
+/// - `buf` must be either null or a valid buffer pointer.
+/// - `out_index` must be either null or a writable `*mut u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_index_buffer_get(
+    buf: *const StatorDomIndexBuffer,
+    index: usize,
+    out_index: *mut u32,
+) -> StatorStatus {
+    if buf.is_null() || out_index.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `buf` is valid.
+    let slice = unsafe { (*buf).indices.as_slice() };
+    let Some(v) = slice.get(index) else {
+        return StatorStatus::StatorStatusInvalidArg;
+    };
+    // SAFETY: caller guarantees `out_index` is writable.
+    unsafe { *out_index = *v };
+    StatorStatus::StatorStatusOk
+}
+
+/// Append an index to a [`StatorDomIndexBuffer`].
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success.
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null.
+///
+/// # Safety
+/// `buf` must be either null or a valid pointer to a
+/// [`StatorDomIndexBuffer`] currently borrowed by an enumerator callback
+/// (or owned by the caller between
+/// [`stator_dom_index_buffer_new`]/[`stator_dom_index_buffer_destroy`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_index_buffer_push(
+    buf: *mut StatorDomIndexBuffer,
+    index: u32,
+) -> StatorStatus {
+    if buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `buf` is valid.
+    unsafe { (*buf).indices.push(index) };
+    StatorStatus::StatorStatusOk
 }
 
 /// Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
@@ -16456,7 +16633,13 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
     }
     // SAFETY: caller guarantees `handler` is readable.
     let h = unsafe { *handler };
-    if h.getter.is_none() && h.setter.is_none() && h.query.is_none() && h.length.is_none() {
+    if h.getter.is_none()
+        && h.setter.is_none()
+        && h.query.is_none()
+        && h.length.is_none()
+        && h.deleter.is_none()
+        && h.enumerator.is_none()
+    {
         return StatorStatus::StatorStatusInvalidArg;
     }
 
@@ -16514,6 +16697,37 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
                 out_len
             } else {
                 0
+            }
+        });
+    }
+    if let Some(cb) = h.deleter {
+        builder = builder.deleter(move |index, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut deleted = false;
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(index, data, &mut deleted) };
+            match status {
+                StatorStatus::StatorStatusOk => Some(deleted),
+                StatorStatus::StatorStatusFalse => None,
+                // Any other status (Exception, InvalidArg, Unsupported)
+                // is treated fail-closed as no-intercept so the engine
+                // observes "not deleted".
+                _ => None,
+            }
+        });
+    }
+    if let Some(cb) = h.enumerator {
+        builder = builder.enumerator(move |_data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let mut buf = StatorDomIndexBuffer {
+                indices: Vec::new(),
+            };
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&mut buf as *mut StatorDomIndexBuffer, data) };
+            if matches!(status, StatorStatus::StatorStatusOk) {
+                buf.indices
+            } else {
+                Vec::new()
             }
         });
     }
@@ -17056,6 +17270,95 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_enumerate_into(
     let keys = unsafe { (*wrap).inner.symbol_property_keys() };
     // SAFETY: caller guarantees `buf` is valid.
     unsafe { (*buf).keys.extend(keys) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the wrapper's indexed-property **deleter** path.
+///
+/// Mirrors `delete nodeList[index]`.  The result is encoded through
+/// [`StatorStatus`] / `*out_deleted` to expose the three-way
+/// [`stator_jse::dom::IndexedDeleterResult`] outcome to embedders:
+///
+/// | Wrapper outcome                                         | Status                | `*out_deleted` |
+/// |---------------------------------------------------------|-----------------------|----------------|
+/// | Interceptor returned `Some(true)`                       | `StatorStatusOk`      | `true`         |
+/// | Interceptor returned `Some(false)`                      | `StatorStatusOk`      | `false`        |
+/// | No interceptor handled this index (no-intercept)        | `StatorStatusOk`      | `false`        |
+/// | No deleter installed                                    | `StatorStatusOk`      | `false`        |
+/// | Access-check denied / wrapper invalidated (fail-closed) | `StatorStatusOk`      | `false`        |
+///
+/// `*out_deleted` is always written when this function returns
+/// [`StatorStatus::StatorStatusOk`].  This function only reports a
+/// non-`Ok` status when its FFI arguments are themselves invalid (null
+/// `wrap`/`out_deleted`, or a stale wrapper pointer), in which case
+/// `*out_deleted` is left untouched.
+///
+/// # Safety
+/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+/// - `out_deleted` must be either null or a writable `*mut bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
+    wrap: *mut StatorDomObjectWrap,
+    index: u32,
+    out_deleted: *mut bool,
+) -> StatorStatus {
+    if wrap.is_null() || out_deleted.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let alive = unsafe { (*wrap).alive.get() };
+    if !alive {
+        // Fail-closed for invalidated/destroyed wrappers: report the
+        // operation as not-deleted without dispatching any callback.
+        // SAFETY: out_deleted non-null verified above.
+        unsafe { *out_deleted = false };
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and live.
+    let deleted = unsafe { (*wrap).inner.delete_indexed(index) };
+    // SAFETY: out_deleted non-null verified above.
+    unsafe { *out_deleted = deleted };
+    StatorStatus::StatorStatusOk
+}
+
+/// Collect the indices reported by the wrapper's indexed-property
+/// enumerator into `buf`.  The buffer is owned by the caller, created
+/// with [`stator_dom_index_buffer_new`] and released with
+/// [`stator_dom_index_buffer_destroy`].
+///
+/// The enumerator is invoked with the wrapper's `IndexedEnumerate`
+/// access-check gate; on denial (or when the wrapper has been
+/// invalidated) the buffer is left untouched.  Indices appended to
+/// `buf` preserve the order reported by the embedder callback —
+/// Stator does not reorder or de-duplicate them.
+///
+/// Returns:
+/// * [`StatorStatus::StatorStatusOk`] on success (including the empty
+///   no-handler / denied / invalidated cases).
+/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `buf` is
+///   null.
+///
+/// # Safety
+/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+/// - `buf` must be either null or a valid buffer pointer returned by
+///   [`stator_dom_index_buffer_new`] that has not been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_enumerate_into(
+    wrap: *mut StatorDomObjectWrap,
+    buf: *mut StatorDomIndexBuffer,
+) -> StatorStatus {
+    if wrap.is_null() || buf.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let alive = unsafe { (*wrap).alive.get() };
+    if !alive {
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and live.
+    let indices = unsafe { (*wrap).inner.indexed_property_keys() };
+    // SAFETY: caller guarantees `buf` is a valid buffer pointer.
+    unsafe { (*buf).indices.extend(indices) };
     StatorStatus::StatorStatusOk
 }
 
@@ -32804,6 +33107,8 @@ mod tests {
             setter: None,
             query: None,
             length: None,
+            deleter: None,
+            enumerator: None,
             data: std::ptr::null_mut(),
         };
         let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &empty) };
@@ -33827,6 +34132,8 @@ mod tests {
             setter: None,
             query: None,
             length: Some(indexed_length_three),
+            deleter: None,
+            enumerator: None,
             data: std::ptr::null_mut(),
         };
         let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) };
@@ -33842,6 +34149,398 @@ mod tests {
             JsValue::Undefined
         ));
         assert_eq!(unsafe { (*wrap).inner.indexed_length() }, 3);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    // ── Indexed deleter / enumerator FFI ─────────────────────────────────
+
+    unsafe extern "C" fn indexed_delete_zero_ok(
+        index: u32,
+        _data: *mut c_void,
+        out_deleted: *mut bool,
+    ) -> StatorStatus {
+        if index == 0 {
+            unsafe { *out_deleted = true };
+            StatorStatus::StatorStatusOk
+        } else if index == 1 {
+            unsafe { *out_deleted = false };
+            StatorStatus::StatorStatusOk
+        } else {
+            // "no-intercept" — engine treats as not-deleted.
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn indexed_enumerator_three_seven(
+        buf: *mut StatorDomIndexBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        unsafe {
+            assert_eq!(
+                stator_dom_index_buffer_push(buf, 7),
+                StatorStatus::StatorStatusOk
+            );
+            assert_eq!(
+                stator_dom_index_buffer_push(buf, 3),
+                StatorStatus::StatorStatusOk
+            );
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn indexed_enumerator_error(
+        buf: *mut StatorDomIndexBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        // Push a stray index, then report failure: engine must discard it.
+        unsafe {
+            let _ = stator_dom_index_buffer_push(buf, 999);
+        }
+        StatorStatus::StatorStatusException
+    }
+
+    #[test]
+    fn test_ffi_indexed_deleter_three_way_outcome() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: Some(indexed_delete_zero_ok),
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let mut deleted = true;
+        // Success.
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(deleted);
+        // Explicit refusal.
+        deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 1, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!deleted);
+        // No-intercept fall-through.
+        deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 42, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!deleted);
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_ffi_indexed_deleter_no_handler_returns_false() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let mut deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!deleted);
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_ffi_indexed_deleter_rejects_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let mut deleted = false;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_indexed_deleter(std::ptr::null_mut(), 0, &mut deleted)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, std::ptr::null_mut()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_indexed_enumerate_preserves_order_and_discards_on_error() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: None,
+            enumerator: Some(indexed_enumerator_three_seven),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let buf = stator_dom_index_buffer_new();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_enumerate_into(wrap, buf) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_index_buffer_len(buf) }, 2);
+        let mut out = 0u32;
+        unsafe {
+            assert_eq!(
+                stator_dom_index_buffer_get(buf, 0, &mut out),
+                StatorStatus::StatorStatusOk
+            );
+        }
+        assert_eq!(out, 7);
+        unsafe {
+            assert_eq!(
+                stator_dom_index_buffer_get(buf, 1, &mut out),
+                StatorStatus::StatorStatusOk
+            );
+        }
+        assert_eq!(out, 3);
+        // Out-of-range.
+        assert_eq!(
+            unsafe { stator_dom_index_buffer_get(buf, 2, &mut out) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_index_buffer_destroy(buf) };
+
+        // Error-status enumerator yields an empty list.
+        let err_handler = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: None,
+            enumerator: Some(indexed_enumerator_error),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &err_handler) },
+            StatorStatus::StatorStatusOk
+        );
+        let buf = stator_dom_index_buffer_new();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_enumerate_into(wrap, buf) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_index_buffer_len(buf) }, 0);
+        unsafe { stator_dom_index_buffer_destroy(buf) };
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_ffi_indexed_enumerate_rejects_null_inputs() {
+        let iso = IsolateGuard::new();
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let buf = stator_dom_index_buffer_new();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_indexed_enumerate_into(std::ptr::null_mut(), buf)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_indexed_enumerate_into(wrap, std::ptr::null_mut())
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        // Null buf push is rejected; null buf len returns 0.
+        assert_eq!(
+            unsafe { stator_dom_index_buffer_push(std::ptr::null_mut(), 0) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(unsafe { stator_dom_index_buffer_len(std::ptr::null()) }, 0);
+        unsafe { stator_dom_index_buffer_destroy(buf) };
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+    }
+
+    #[test]
+    fn test_ffi_indexed_deleter_fail_closed_after_invalidate() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: Some(indexed_delete_zero_ok),
+            enumerator: Some(indexed_enumerator_three_seven),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+
+        let mut deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        // Despite the deleter saying "yes" for index 0, the wrapper is
+        // invalidated and we report fail-closed not-deleted without
+        // dispatching the callback.
+        assert!(!deleted);
+
+        let buf = stator_dom_index_buffer_new();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_enumerate_into(wrap, buf) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_index_buffer_len(buf) }, 0);
+        unsafe { stator_dom_index_buffer_destroy(buf) };
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_ffi_indexed_deleter_access_check_denied() {
+        unsafe extern "C" fn deny_indexed_delete(
+            op: StatorDomAccessCheckOperation,
+            _name: *const c_char,
+            _name_len: usize,
+            _index: u32,
+            _native_ptr: *mut c_void,
+            _class_id: u32,
+            _data: *mut c_void,
+        ) -> bool {
+            !matches!(
+                op,
+                StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDelete
+                    | StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedEnumerate
+            )
+        }
+
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: Some(indexed_delete_zero_ok),
+            enumerator: Some(indexed_enumerator_three_seven),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_set_access_check(
+                    wrap,
+                    Some(deny_indexed_delete),
+                    std::ptr::null_mut(),
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        let mut deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!deleted);
+
+        let buf = stator_dom_index_buffer_new();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_enumerate_into(wrap, buf) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_dom_index_buffer_len(buf) }, 0);
+        unsafe { stator_dom_index_buffer_destroy(buf) };
+
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_ffi_indexed_install_with_only_deleter_or_only_enumerator_succeeds() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let only_del = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: Some(indexed_delete_zero_ok),
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &only_del) },
+            StatorStatus::StatorStatusOk
+        );
+        let only_enum = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: None,
+            enumerator: Some(indexed_enumerator_three_seven),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &only_enum) },
+            StatorStatus::StatorStatusOk
+        );
+
+        // Legacy getter/setter/length still observed when re-installed.
+        let legacy = StatorDomIndexedHandler {
+            getter: Some(indexed_get_zero),
+            setter: None,
+            query: None,
+            length: Some(indexed_length_three),
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &legacy) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { (*wrap).inner.indexed_length() }, 3);
+        // The previously-installed deleter is gone after re-install.
+        let mut deleted = true;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_deleter(wrap, 0, &mut deleted) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(!deleted);
 
         unsafe { stator_dom_object_wrap_destroy(wrap) };
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
@@ -34069,6 +34768,8 @@ mod tests {
             setter: None,
             query: None,
             length: Some(indexed_length_three),
+            deleter: None,
+            enumerator: None,
             data: std::ptr::null_mut(),
         };
         assert_eq!(
@@ -37454,6 +38155,8 @@ mod tests {
             setter: None,
             query: None,
             length: None,
+            deleter: None,
+            enumerator: None,
             data: std::ptr::null_mut(),
         };
         assert_eq!(

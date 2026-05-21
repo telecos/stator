@@ -520,8 +520,8 @@ code path):
 | `NamedGet`, `IndexedGet` | Property read returns `undefined`. |
 | `NamedSet`, `IndexedSet` | Write is silently dropped; the engine treats it as handled so it does not fall through to the own-property store. |
 | `NamedQuery`, `IndexedQuery` | `has` reports `false`. |
-| `NamedDelete` | `delete` reports `false`. |
-| `NamedEnumerate` | Enumeration returns no names (neither interceptor names nor own-property names). |
+| `NamedDelete`, `IndexedDelete` | `delete` reports `false`. |
+| `NamedEnumerate`, `IndexedEnumerate` | Enumeration returns no names/indices (neither interceptor entries nor own-property entries). |
 | `IndexedLength` | Length reports `0`. |
 
 Lifetime / invalidate interaction: the installed callback closure
@@ -566,9 +566,38 @@ Indexed-handler flags (`STATOR_DOM_INDEXED_HANDLER_FLAG_*`):
 | Flag | Effect today |
 |------|--------------|
 | `NONE` | Default behaviour. |
-| `ALL_CAN_READ` | Read-side ops (`Get`, `Query`, `Length`) still consult the interceptor even when the access-check callback denies the access. Writes remain access-checked. |
+| `ALL_CAN_READ` | Read-side ops (`Get`, `Query`, `Length`) still consult the interceptor even when the access-check callback denies the access. Writes, deletes and enumeration remain access-checked. |
 | `NON_MASKING` | Stored-only metadata. Indexed wrappers do not maintain a per-index own-property map today, so this flag is reserved for future symmetry with named handlers. |
 | `HAS_NO_SIDE_EFFECT` | Stored-only metadata; no runtime effect today. |
+
+Indexed-handler callbacks (parallel to the named surface):
+
+- **Getter / setter / query / length** — historical Stator behaviour.
+- **Deleter** — invoked for `delete obj[index]`. The Rust-side return
+  type is `IndexedDeleterResult = Option<bool>` with three outcomes
+  forwarded over FFI as `(StatorStatus, *out_deleted)` from
+  `stator_dom_object_wrap_invoke_indexed_deleter`:
+  * `Some(true)` → the embedder handled the index and removed it.
+  * `Some(false)` → the embedder handled the index but refused
+    deletion (e.g. non-configurable index entry).
+  * `None` (FFI: `StatorStatusFalse`) → no interceptor handled the
+    index. Stator treats this as "not deleted" because indexed
+    wrappers have no per-index own-property store to fall through to.
+- **Enumerator** — invoked for `Object.keys` / `for…in` / proxy
+  ownKeys. Embedders push indices through
+  `stator_dom_index_buffer_push` in the order they want them reported;
+  Stator preserves that order and does not de-duplicate. A non-OK
+  enumerator status discards any indices already pushed and reports an
+  empty enumeration.
+
+Access-check interaction (`IndexedDelete` / `IndexedEnumerate`) is
+fail-closed exactly like the named counterparts (see §7.2). The
+`ALL_CAN_READ` indexed flag only relaxes the read-side operations
+(`Get`, `Query`, `Length`) — denying `IndexedEnumerate` always
+suppresses enumeration, matching V8/Blink. Invalidated wrappers
+(`stator_dom_object_wrap_invalidate`) report the deleter as
+fail-closed-not-deleted and the enumerator as empty without
+dispatching the embedder callback.
 
 FFI surface:
 

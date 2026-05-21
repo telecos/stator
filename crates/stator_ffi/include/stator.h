@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 9
+#define STATOR_FFI_ABI_VERSION_MINOR 10
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -674,6 +674,14 @@ typedef enum StatorDomAccessCheckOperation {
    * Indexed-collection length query.
    */
   StatorDomAccessCheckOperationIndexedLength = 8,
+  /**
+   * Indexed-property `delete` (e.g. `delete nodeList[0]`).
+   */
+  StatorDomAccessCheckOperationIndexedDelete = 9,
+  /**
+   * Indexed-property enumeration (e.g. `for (let i in nodeList)`).
+   */
+  StatorDomAccessCheckOperationIndexedEnumerate = 10,
 } StatorDomAccessCheckOperation;
 
 /**
@@ -749,6 +757,22 @@ typedef struct StatorContext StatorContext;
  * [`stator_debug_session_destroy`].
  */
 typedef struct StatorDebugSession StatorDebugSession;
+
+/**
+ * Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
+ * callback.  The callback fills it by repeatedly calling
+ * [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
+ * bridge for the duration of the callback and must not outlive it.
+ *
+ * Embedders that want to drive the indexed enumerator directly from C
+ * (rather than through an installed handler) can allocate a buffer with
+ * [`stator_dom_index_buffer_new`], pass it to
+ * [`stator_dom_object_wrap_invoke_indexed_enumerate_into`], inspect the
+ * contents via [`stator_dom_index_buffer_len`] /
+ * [`stator_dom_index_buffer_get`], and release it with
+ * [`stator_dom_index_buffer_destroy`].
+ */
+typedef struct StatorDomIndexBuffer StatorDomIndexBuffer;
 
 /**
  * Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
@@ -1795,6 +1819,18 @@ typedef struct StatorDomIndexedHandler {
    * Indexed-collection length callback, or null.
    */
   enum StatorStatus (*length)(void *data, uint32_t *out_len);
+  /**
+   * Indexed-property `delete` callback, or null.  See
+   * [`StatorDomIndexedDeleterCb`] for the three-way result encoding
+   * (deleted / explicitly-refused / no-intercept).
+   */
+  enum StatorStatus (*deleter)(uint32_t index, void *data, bool *out_deleted);
+  /**
+   * Indexed-property enumerator callback, or null.  Pushes onto a
+   * caller-borrowed [`StatorDomIndexBuffer`] via
+   * [`stator_dom_index_buffer_push`].
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomIndexBuffer *buf, void *data);
   /**
    * Opaque embedder data passed to every callback.
    */
@@ -6064,6 +6100,65 @@ bool stator_dom_object_wrap_clear_access_check(struct StatorDomObjectWrap *wrap)
 bool stator_dom_object_wrap_has_access_check(const struct StatorDomObjectWrap *wrap);
 
 /**
+ * Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
+ * [`stator_dom_index_buffer_destroy`].
+ *
+ * # Safety
+ * The returned pointer must be released exactly once via
+ * [`stator_dom_index_buffer_destroy`].
+ */
+struct StatorDomIndexBuffer *stator_dom_index_buffer_new(void);
+
+/**
+ * Free a [`StatorDomIndexBuffer`].  Does nothing when `buf` is null.
+ *
+ * # Safety
+ * `buf` must be either null or a pointer returned by
+ * [`stator_dom_index_buffer_new`], not previously destroyed.
+ */
+void stator_dom_index_buffer_destroy(struct StatorDomIndexBuffer *buf);
+
+/**
+ * Return the number of indices currently in `buf`.  Returns `0` when
+ * `buf` is null.
+ *
+ * # Safety
+ * `buf` must be either null or a valid buffer pointer.
+ */
+size_t stator_dom_index_buffer_len(const struct StatorDomIndexBuffer *buf);
+
+/**
+ * Read the entry at `index` from `buf` into `*out_index`.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` or `out_index`
+ *   is null, or when `index` is out of range.
+ *
+ * # Safety
+ * - `buf` must be either null or a valid buffer pointer.
+ * - `out_index` must be either null or a writable `*mut u32`.
+ */
+enum StatorStatus stator_dom_index_buffer_get(const struct StatorDomIndexBuffer *buf,
+                                              size_t index,
+                                              uint32_t *out_index);
+
+/**
+ * Append an index to a [`StatorDomIndexBuffer`].
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success.
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null.
+ *
+ * # Safety
+ * `buf` must be either null or a valid pointer to a
+ * [`StatorDomIndexBuffer`] currently borrowed by an enumerator callback
+ * (or owned by the caller between
+ * [`stator_dom_index_buffer_new`]/[`stator_dom_index_buffer_destroy`]).
+ */
+enum StatorStatus stator_dom_index_buffer_push(struct StatorDomIndexBuffer *buf, uint32_t index);
+
+/**
  * Append a UTF-8 name to a [`StatorDomNameBuffer`].
  *
  * Returns:
@@ -6271,6 +6366,61 @@ enum StatorStatus stator_dom_object_wrap_invoke_symbol_deleter(struct StatorDomO
  */
 enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct StatorDomObjectWrap *wrap,
                                                                       struct StatorDomSymbolBuffer *buf);
+
+/**
+ * Invoke the wrapper's indexed-property **deleter** path.
+ *
+ * Mirrors `delete nodeList[index]`.  The result is encoded through
+ * [`StatorStatus`] / `*out_deleted` to expose the three-way
+ * [`stator_jse::dom::IndexedDeleterResult`] outcome to embedders:
+ *
+ * | Wrapper outcome                                         | Status                | `*out_deleted` |
+ * |---------------------------------------------------------|-----------------------|----------------|
+ * | Interceptor returned `Some(true)`                       | `StatorStatusOk`      | `true`         |
+ * | Interceptor returned `Some(false)`                      | `StatorStatusOk`      | `false`        |
+ * | No interceptor handled this index (no-intercept)        | `StatorStatusOk`      | `false`        |
+ * | No deleter installed                                    | `StatorStatusOk`      | `false`        |
+ * | Access-check denied / wrapper invalidated (fail-closed) | `StatorStatusOk`      | `false`        |
+ *
+ * `*out_deleted` is always written when this function returns
+ * [`StatorStatus::StatorStatusOk`].  This function only reports a
+ * non-`Ok` status when its FFI arguments are themselves invalid (null
+ * `wrap`/`out_deleted`, or a stale wrapper pointer), in which case
+ * `*out_deleted` is left untouched.
+ *
+ * # Safety
+ * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+ * - `out_deleted` must be either null or a writable `*mut bool`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDomObjectWrap *wrap,
+                                                                uint32_t index,
+                                                                bool *out_deleted);
+
+/**
+ * Collect the indices reported by the wrapper's indexed-property
+ * enumerator into `buf`.  The buffer is owned by the caller, created
+ * with [`stator_dom_index_buffer_new`] and released with
+ * [`stator_dom_index_buffer_destroy`].
+ *
+ * The enumerator is invoked with the wrapper's `IndexedEnumerate`
+ * access-check gate; on denial (or when the wrapper has been
+ * invalidated) the buffer is left untouched.  Indices appended to
+ * `buf` preserve the order reported by the embedder callback —
+ * Stator does not reorder or de-duplicate them.
+ *
+ * Returns:
+ * * [`StatorStatus::StatorStatusOk`] on success (including the empty
+ *   no-handler / denied / invalidated cases).
+ * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `buf` is
+ *   null.
+ *
+ * # Safety
+ * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+ * - `buf` must be either null or a valid buffer pointer returned by
+ *   [`stator_dom_index_buffer_new`] that has not been destroyed.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_indexed_enumerate_into(struct StatorDomObjectWrap *wrap,
+                                                                       struct StatorDomIndexBuffer *buf);
 
 /**
  * Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with

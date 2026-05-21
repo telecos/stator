@@ -190,6 +190,30 @@ pub type IndexedQueryCallback = Box<dyn Fn(u32, *mut c_void) -> Option<u32>>;
 /// Callback for intercepting indexed-property **length** query.
 pub type IndexedLengthCallback = Box<dyn Fn(*mut c_void) -> u32>;
 
+/// Result returned by an indexed-property deleter interceptor.
+///
+/// * `Some(true)`  — the interceptor handled the delete and the index is
+///   now considered absent (the operation succeeds).
+/// * `Some(false)` — the interceptor handled the delete but explicitly
+///   refused (e.g. the index is non-configurable); the operation fails
+///   but is treated as handled and does not fall through.
+/// * `None`        — the interceptor declined to handle this index
+///   ("no-intercept").  The engine treats this as the default
+///   "not-deleted" outcome because indexed wrappers do not keep a
+///   per-index own-property store today.
+pub type IndexedDeleterResult = Option<bool>;
+
+/// Callback for intercepting indexed-property **delete** (e.g.
+/// `delete nodeList[0]`).  See [`IndexedDeleterResult`] for the
+/// distinction between handled/refused and no-intercept.
+pub type IndexedDeleterCallback = Box<dyn Fn(u32, *mut c_void) -> IndexedDeleterResult>;
+
+/// Callback that enumerates the indices reported by the indexed
+/// interceptor.  The returned list is passed verbatim to the engine; the
+/// embedder is responsible for any ordering or de-duplication it wishes
+/// callers to observe (Stator does not reorder the result).
+pub type IndexedEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<u32>>;
+
 /// Borrowed named-property getter reference.
 type NamedGetterRef<'a> = Option<&'a dyn Fn(&str, *mut c_void) -> NamedGetterResult>;
 
@@ -707,6 +731,8 @@ pub struct IndexedPropertyHandlerConfig {
     getter: Option<IndexedGetterCallback>,
     setter: Option<IndexedSetterCallback>,
     query: Option<IndexedQueryCallback>,
+    deleter: Option<IndexedDeleterCallback>,
+    enumerator: Option<IndexedEnumeratorCallback>,
     length: Option<IndexedLengthCallback>,
     flags: IndexedPropertyHandlerFlags,
 }
@@ -732,6 +758,16 @@ impl IndexedPropertyHandlerConfig {
         self.query.as_deref()
     }
 
+    /// Return a reference to the deleter callback, if installed.
+    pub fn deleter(&self) -> Option<&dyn Fn(u32, *mut c_void) -> IndexedDeleterResult> {
+        self.deleter.as_deref()
+    }
+
+    /// Return a reference to the enumerator callback, if installed.
+    pub fn enumerator(&self) -> Option<&dyn Fn(*mut c_void) -> Vec<u32>> {
+        self.enumerator.as_deref()
+    }
+
     /// Return a reference to the length callback, if installed.
     pub fn length(&self) -> Option<&dyn Fn(*mut c_void) -> u32> {
         self.length.as_deref()
@@ -749,6 +785,8 @@ impl std::fmt::Debug for IndexedPropertyHandlerConfig {
             .field("has_getter", &self.getter.is_some())
             .field("has_setter", &self.setter.is_some())
             .field("has_query", &self.query.is_some())
+            .field("has_deleter", &self.deleter.is_some())
+            .field("has_enumerator", &self.enumerator.is_some())
             .field("has_length", &self.length.is_some())
             .field("flags", &self.flags)
             .finish()
@@ -761,6 +799,8 @@ pub struct IndexedPropertyHandlerConfigBuilder {
     getter: Option<IndexedGetterCallback>,
     setter: Option<IndexedSetterCallback>,
     query: Option<IndexedQueryCallback>,
+    deleter: Option<IndexedDeleterCallback>,
+    enumerator: Option<IndexedEnumeratorCallback>,
     length: Option<IndexedLengthCallback>,
     flags: IndexedPropertyHandlerFlags,
 }
@@ -790,6 +830,25 @@ impl IndexedPropertyHandlerConfigBuilder {
         self
     }
 
+    /// Install an indexed-property deleter interceptor.  See
+    /// [`IndexedDeleterResult`] for the meaning of the returned value.
+    pub fn deleter(
+        mut self,
+        cb: impl Fn(u32, *mut c_void) -> IndexedDeleterResult + 'static,
+    ) -> Self {
+        self.deleter = Some(Box::new(cb));
+        self
+    }
+
+    /// Install an indexed-property enumerator callback.  The callback
+    /// returns the indices the interceptor wants exposed; Stator passes
+    /// them through verbatim, so ordering/de-duplication is the
+    /// embedder's responsibility.
+    pub fn enumerator(mut self, cb: impl Fn(*mut c_void) -> Vec<u32> + 'static) -> Self {
+        self.enumerator = Some(Box::new(cb));
+        self
+    }
+
     /// Install an indexed-property length callback.
     pub fn length(mut self, cb: impl Fn(*mut c_void) -> u32 + 'static) -> Self {
         self.length = Some(Box::new(cb));
@@ -810,6 +869,8 @@ impl IndexedPropertyHandlerConfigBuilder {
             getter: self.getter,
             setter: self.setter,
             query: self.query,
+            deleter: self.deleter,
+            enumerator: self.enumerator,
             length: self.length,
             flags: self.flags,
         }
@@ -842,6 +903,10 @@ pub enum AccessCheckOperation {
     IndexedSet,
     /// Indexed-property query.
     IndexedQuery,
+    /// Indexed-property `delete` (e.g. `delete nodeList[0]`).
+    IndexedDelete,
+    /// Indexed-property enumeration (e.g. `for (let i in nodeList)`).
+    IndexedEnumerate,
     /// Indexed-collection length query.
     IndexedLength,
 }
@@ -849,8 +914,9 @@ pub enum AccessCheckOperation {
 /// Key associated with an [`AccessCheckOperation`].
 #[derive(Debug, Clone, Copy)]
 pub enum AccessCheckKey<'a> {
-    /// No specific key — used for [`AccessCheckOperation::NamedEnumerate`]
-    /// and [`AccessCheckOperation::IndexedLength`].
+    /// No specific key — used for [`AccessCheckOperation::NamedEnumerate`],
+    /// [`AccessCheckOperation::IndexedEnumerate`], and
+    /// [`AccessCheckOperation::IndexedLength`].
     None,
     /// A named property key.
     Named(&'a str),
@@ -1560,6 +1626,63 @@ impl DomObjectWrap {
             return length_cb(self.data_ptr());
         }
         0
+    }
+
+    /// Delete an indexed property via the interceptor.
+    ///
+    /// Resolution order:
+    /// 1. Access-check callback.  A denial short-circuits to `false`
+    ///    (the property is treated as not deleted) and the interceptor
+    ///    is never invoked.  This matches the named-deleter and
+    ///    symbol-deleter fail-closed contracts.
+    /// 2. Installed indexed deleter, if any:
+    ///    * [`Some(true)`][IndexedDeleterResult] — the interceptor
+    ///      handled the delete; this method returns `true`.
+    ///    * [`Some(false)`][IndexedDeleterResult] — the interceptor
+    ///      explicitly refused; this method returns `false`.
+    ///    * [`None`][IndexedDeleterResult] — the interceptor declined
+    ///      ("no-intercept").  Because indexed wrappers do not maintain
+    ///      a per-index own-property store, this method returns
+    ///      `false` (nothing was deleted).
+    /// 3. No deleter installed → `false`.
+    pub fn delete_indexed(&mut self, index: u32) -> bool {
+        if !self.check_access(
+            AccessCheckOperation::IndexedDelete,
+            AccessCheckKey::Indexed(index),
+        ) {
+            return false;
+        }
+        if let Some(cfg) = &self.indexed_handler
+            && let Some(deleter) = cfg.deleter()
+        {
+            return match deleter(index, self.data_ptr()) {
+                Some(true) => true,
+                Some(false) | None => false,
+            };
+        }
+        false
+    }
+
+    /// Enumerate the indices reported by the indexed-property enumerator.
+    ///
+    /// Returns an empty list when:
+    /// * the access-check callback denies the enumeration, or
+    /// * no enumerator is installed.
+    ///
+    /// The list is returned verbatim from the embedder callback; Stator
+    /// does not reorder or de-duplicate it, so the embedder controls the
+    /// observable order.  This mirrors [`symbol_property_keys`][Self::symbol_property_keys]
+    /// for symbol enumeration.
+    pub fn indexed_property_keys(&self) -> Vec<u32> {
+        if !self.check_access(AccessCheckOperation::IndexedEnumerate, AccessCheckKey::None) {
+            return Vec::new();
+        }
+        if let Some(cfg) = &self.indexed_handler
+            && let Some(enumerator) = cfg.enumerator()
+        {
+            return enumerator(self.data_ptr());
+        }
+        Vec::new()
     }
 
     // ── interceptor installation ─────────────────────────────────────────
@@ -2954,5 +3077,164 @@ mod tests {
                 .build(),
         );
         assert!(wrap.symbol_property_keys().is_empty());
+    }
+
+    // ── Indexed deleter / enumerator ─────────────────────────────────────
+
+    #[test]
+    fn test_indexed_deleter_no_handler_returns_false() {
+        let mut wrap = DomObjectWrap::new(1);
+        assert!(!wrap.delete_indexed(0));
+    }
+
+    #[test]
+    fn test_indexed_deleter_success_and_explicit_refusal() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .deleter(|index, _| match index {
+                    0 => Some(true),
+                    1 => Some(false),
+                    _ => None,
+                })
+                .build(),
+        );
+        assert!(wrap.delete_indexed(0));
+        assert!(!wrap.delete_indexed(1));
+        assert!(!wrap.delete_indexed(2));
+    }
+
+    #[test]
+    fn test_indexed_deleter_access_check_denial_skips_callback() {
+        let calls: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+        let counter = Rc::clone(&calls);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .deleter(move |_idx, _| {
+                    *counter.borrow_mut() += 1;
+                    Some(true)
+                })
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, _, _| {
+            !matches!(op, AccessCheckOperation::IndexedDelete)
+        }));
+        assert!(!wrap.delete_indexed(0));
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn test_indexed_enumerator_deterministic_order_preserved() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .enumerator(|_| vec![5, 1, 3])
+                .build(),
+        );
+        let keys = wrap.indexed_property_keys();
+        assert_eq!(keys, vec![5, 1, 3]);
+        // Re-running yields the same order — determinism contract.
+        assert_eq!(wrap.indexed_property_keys(), vec![5, 1, 3]);
+    }
+
+    #[test]
+    fn test_indexed_enumerator_no_handler_returns_empty() {
+        let wrap = DomObjectWrap::new(1);
+        assert!(wrap.indexed_property_keys().is_empty());
+    }
+
+    #[test]
+    fn test_indexed_enumerator_access_check_denial_returns_empty() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .enumerator(|_| vec![0, 1, 2])
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, _, _| {
+            !matches!(op, AccessCheckOperation::IndexedEnumerate)
+        }));
+        assert!(wrap.indexed_property_keys().is_empty());
+    }
+
+    #[test]
+    fn test_indexed_enumerator_all_can_read_does_not_bypass_enumerate_denial() {
+        // ALL_CAN_READ only relaxes Get/Query/Length, not Enumerate.
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .enumerator(|_| vec![0])
+                .flags(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+                .build(),
+        );
+        wrap.set_access_check(Box::new(|op, _, _| {
+            !matches!(op, AccessCheckOperation::IndexedEnumerate)
+        }));
+        assert!(wrap.indexed_property_keys().is_empty());
+    }
+
+    #[test]
+    fn test_indexed_deleter_independent_from_legacy_getter_setter() {
+        // Installing the deleter/enumerator does not perturb the
+        // existing getter/setter/query/length paths.
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .getter(|i, _| (i == 7).then_some(JsValue::Smi(77)))
+                .setter(|_, _, _| true)
+                .query(|i, _| (i == 7).then_some(0))
+                .length(|_| 8)
+                .deleter(|_, _| Some(true))
+                .enumerator(|_| vec![7])
+                .build(),
+        );
+        assert_eq!(wrap.get_indexed(7), JsValue::Smi(77));
+        assert_eq!(wrap.get_indexed(0), JsValue::Undefined);
+        assert!(wrap.set_indexed(0, &JsValue::Smi(1)));
+        assert_eq!(wrap.indexed_length(), 8);
+        assert!(wrap.delete_indexed(0));
+        assert_eq!(wrap.indexed_property_keys(), vec![7]);
+    }
+
+    #[test]
+    fn test_indexed_access_check_keys_for_delete_and_enumerate() {
+        // The access-check callback receives the right Operation/Key
+        // pair for the new variants.
+        let log: Rc<RefCell<Vec<(AccessCheckOperation, Option<u32>)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&log);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .deleter(|_, _| Some(true))
+                .enumerator(|_| vec![1, 2])
+                .build(),
+        );
+        wrap.set_access_check(Box::new(move |op, key, _| {
+            let idx = match key {
+                AccessCheckKey::Indexed(i) => Some(i),
+                _ => None,
+            };
+            sink.borrow_mut().push((op, idx));
+            true
+        }));
+        let _ = wrap.delete_indexed(42);
+        let _ = wrap.indexed_property_keys();
+        let entries = log.borrow();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (AccessCheckOperation::IndexedDelete, Some(42)));
+        assert_eq!(entries[1], (AccessCheckOperation::IndexedEnumerate, None));
+    }
+
+    #[test]
+    fn test_indexed_handler_config_debug_reports_new_callbacks() {
+        let cfg = IndexedPropertyHandlerConfig::builder()
+            .deleter(|_, _| Some(true))
+            .enumerator(|_| Vec::new())
+            .build();
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("has_deleter: true"));
+        assert!(dbg.contains("has_enumerator: true"));
     }
 }
