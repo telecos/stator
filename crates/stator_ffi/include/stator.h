@@ -1808,12 +1808,13 @@ void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot
  * responsibility.
  *
  * Limitations:
- * * Baseline / Maglev / Turbofan JIT-emitted machine code does not poll
- *   the flag in this slice.  Termination is observed at the next
- *   interpreter boundary (JIT return / deopt / runtime stub).  Hostile
- *   code that stays inside JIT code indefinitely is not terminable until
- *   it re-enters the interpreter; embedders running untrusted code should
- *   currently call [`stator_isolate_set_jit_disabled`].
+ * * Maglev JIT-emitted loop headers poll the flag and deopt through the
+ *   interpreter's termination path.  Baseline and Turbofan JIT-emitted
+ *   machine code do not poll the flag in this slice.  Termination is observed
+ *   at the next interpreter boundary (JIT return / deopt / runtime stub).
+ *   Hostile code that stays inside baseline or Turbofan code indefinitely is
+ *   not terminable until it re-enters the interpreter; embedders running
+ *   untrusted code should currently call [`stator_isolate_set_jit_disabled`].
  * * Wasm execution polls the flag at JS↔Wasm entry and through Wasmtime epoch
  *   interruption while compiled Wasm is running.  The epoch broadcast is
  *   process-wide, but each store only traps when the thread running that store

@@ -346,12 +346,13 @@ pub unsafe extern "C" fn stator_isolate_get_data(
 /// responsibility.
 ///
 /// Limitations:
-/// * Baseline / Maglev / Turbofan JIT-emitted machine code does not poll
-///   the flag in this slice.  Termination is observed at the next
-///   interpreter boundary (JIT return / deopt / runtime stub).  Hostile
-///   code that stays inside JIT code indefinitely is not terminable until
-///   it re-enters the interpreter; embedders running untrusted code should
-///   currently call [`stator_isolate_set_jit_disabled`].
+/// * Maglev JIT-emitted loop headers poll the flag and deopt through the
+///   interpreter's termination path.  Baseline and Turbofan JIT-emitted
+///   machine code do not poll the flag in this slice.  Termination is observed
+///   at the next interpreter boundary (JIT return / deopt / runtime stub).
+///   Hostile code that stays inside baseline or Turbofan code indefinitely is
+///   not terminable until it re-enters the interpreter; embedders running
+///   untrusted code should currently call [`stator_isolate_set_jit_disabled`].
 /// * Wasm execution polls the flag at JS↔Wasm entry and through Wasmtime epoch
 ///   interruption while compiled Wasm is running.  The epoch broadcast is
 ///   process-wide, but each store only traps when the thread running that store
@@ -28824,6 +28825,55 @@ mod tests {
             assert_eq!(stator_value_as_number(r), 3.0);
             stator_value_destroy(r);
             stator_script_free(script2);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    /// The no-result FFI runner must also unblock when an embedder terminates
+    /// a hostile script from another thread.
+    #[test]
+    fn test_isolate_terminate_aborts_infinite_loop_no_result_cross_thread() {
+        #[derive(Copy, Clone)]
+        struct IsoPtr(usize);
+        // SAFETY: the other thread only performs an atomic store on the
+        // isolate termination flag.
+        unsafe impl Send for IsoPtr {}
+
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        unsafe {
+            stator_isolate_set_jit_disabled(iso.as_ptr(), true);
+        }
+
+        let src = b"while (true) { }";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        let iso_ptr = IsoPtr(iso.as_ptr() as usize);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            unsafe {
+                stator_isolate_terminate_execution(iso_ptr.0 as *mut StatorIsolate);
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let ok = unsafe { stator_script_run_no_result(script, ctx) };
+        let elapsed = start.elapsed();
+        killer.join().unwrap();
+
+        assert!(!ok, "script_run_no_result should fail after termination");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "no-result termination took too long: {elapsed:?}"
+        );
+
+        unsafe {
+            assert!(stator_isolate_is_execution_terminating(iso.as_ptr()));
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
             stator_script_free(script);
             stator_context_destroy(ctx);
         }

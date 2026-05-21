@@ -3104,6 +3104,14 @@ fn structured_clone_unsupported(type_name: &str) -> StatorError {
     structured_clone_data_clone_error(format!("{type_name} value is not cloneable"))
 }
 
+fn structured_clone_poll_termination() -> StatorResult<()> {
+    if crate::interpreter::check_interrupt_flag() {
+        Err(crate::interpreter::script_terminated_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_structured_clone_options(args: &[JsValue]) -> StatorResult<()> {
     let Some(options) = args.get(1) else {
         return Ok(());
@@ -3226,6 +3234,7 @@ fn structured_clone_plain_object(
     map: &Rc<RefCell<PropertyMap>>,
     state: &mut StructuredCloneState,
 ) -> StatorResult<JsValue> {
+    structured_clone_poll_termination()?;
     if is_callable_value(&JsValue::PlainObject(Rc::clone(map))) {
         return Err(structured_clone_unsupported("Function"));
     }
@@ -3268,6 +3277,7 @@ fn structured_clone_plain_object(
     let cloned_value = JsValue::PlainObject(Rc::clone(&cloned_rc));
     state.values.insert(key, cloned_value.clone());
     for (property, value) in entries {
+        structured_clone_poll_termination()?;
         let cloned_property = structured_clone_value(&value, state)?;
         cloned_rc.borrow_mut().insert(property, cloned_property);
     }
@@ -3278,6 +3288,7 @@ fn structured_clone_array(
     arr: &Rc<RefCell<Vec<JsValue>>>,
     state: &mut StructuredCloneState,
 ) -> StatorResult<JsValue> {
+    structured_clone_poll_termination()?;
     let key = Rc::as_ptr(arr) as usize;
     if let Some(cloned) = state.values.get(&key) {
         return Ok(cloned.clone());
@@ -3288,6 +3299,7 @@ fn structured_clone_array(
     let cloned_value = JsValue::Array(Rc::clone(&cloned_rc));
     state.values.insert(key, cloned_value.clone());
     for (index, value) in source.iter().enumerate() {
+        structured_clone_poll_termination()?;
         if matches!(value, JsValue::TheHole) {
             continue;
         }
@@ -3300,6 +3312,7 @@ fn structured_clone_value(
     val: &JsValue,
     state: &mut StructuredCloneState,
 ) -> StatorResult<JsValue> {
+    structured_clone_poll_termination()?;
     match val {
         JsValue::Undefined
         | JsValue::Null
@@ -3360,6 +3373,7 @@ fn structured_clone_value(
 }
 
 fn structured_clone(args: &[JsValue]) -> StatorResult<JsValue> {
+    structured_clone_poll_termination()?;
     validate_structured_clone_options(args)?;
     let val = args.first().unwrap_or(&JsValue::Undefined);
     structured_clone_value(val, &mut StructuredCloneState::default())
@@ -56026,6 +56040,18 @@ mod tests {
     #[test]
     fn e2e_structured_clone_exists() {
         assert_eval_true("typeof structuredClone === 'function'");
+    }
+
+    #[test]
+    fn test_structured_clone_observes_interrupt_flag() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = structured_clone(&[JsValue::Smi(1)]);
+        crate::interpreter::clear_interrupt_flag();
+        assert!(
+            matches!(result, Err(StatorError::Internal(message)) if message == crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
     }
 
     #[test]

@@ -271,9 +271,9 @@ pub fn json_parse(text: &str, reviver: Option<ReviverFn<'_>>) -> StatorResult<Js
         pos: 0,
         depth: 0,
     };
-    parser.skip_ws();
+    parser.skip_ws()?;
     let value = parser.parse_value()?;
-    parser.skip_ws();
+    parser.skip_ws()?;
     if parser.pos != parser.src.len() {
         return Err(StatorError::SyntaxError(format!(
             "Unexpected token at position {}",
@@ -380,6 +380,21 @@ pub fn json_stringify_js_value(
 
 /// Maximum nesting depth for JSON values (arrays/objects).
 const JSON_MAX_DEPTH: usize = 512;
+const TERMINATION_POLL_INTERVAL: usize = 1024;
+
+#[inline]
+fn poll_termination() -> StatorResult<()> {
+    if crate::interpreter::check_interrupt_flag() {
+        Err(crate::interpreter::script_terminated_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+fn should_poll(index: usize) -> bool {
+    index & (TERMINATION_POLL_INTERVAL - 1) == 0
+}
 
 struct Parser<'a> {
     src: &'a [char],
@@ -389,10 +404,14 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     /// Advance past any JSON whitespace (space, tab, CR, LF).
-    fn skip_ws(&mut self) {
+    fn skip_ws(&mut self) -> StatorResult<()> {
         while self.pos < self.src.len() && matches!(self.src[self.pos], ' ' | '\t' | '\r' | '\n') {
             self.pos += 1;
+            if should_poll(self.pos) {
+                poll_termination()?;
+            }
         }
+        Ok(())
     }
 
     /// Return the current character without advancing.
@@ -446,7 +465,8 @@ impl<'a> Parser<'a> {
 
     /// Parse any JSON value.
     fn parse_value(&mut self) -> StatorResult<JsonValue> {
-        self.skip_ws();
+        poll_termination()?;
+        self.skip_ws()?;
         match self.peek() {
             Some('"') => self.parse_string().map(JsonValue::Str),
             Some('{') | Some('[') => {
@@ -506,6 +526,9 @@ impl<'a> Parser<'a> {
                     )));
                 }
                 Some(c) => s.push(c),
+            }
+            if should_poll(self.pos) {
+                poll_termination()?;
             }
         }
         Ok(s)
@@ -611,6 +634,9 @@ impl<'a> Parser<'a> {
             Some(c) if c.is_ascii_digit() => {
                 while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     self.advance();
+                    if should_poll(self.pos) {
+                        poll_termination()?;
+                    }
                 }
             }
             _ => {
@@ -629,6 +655,9 @@ impl<'a> Parser<'a> {
             }
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                 self.advance();
+                if should_poll(self.pos) {
+                    poll_termination()?;
+                }
             }
         }
         // Optional exponent.
@@ -644,6 +673,9 @@ impl<'a> Parser<'a> {
             }
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                 self.advance();
+                if should_poll(self.pos) {
+                    poll_termination()?;
+                }
             }
         }
         let slice: String = self.src[start..self.pos].iter().collect();
@@ -657,16 +689,17 @@ impl<'a> Parser<'a> {
     fn parse_array(&mut self) -> StatorResult<JsonValue> {
         self.expect('[')?;
         let arr = Rc::new(RefCell::new(Vec::new()));
-        self.skip_ws();
+        self.skip_ws()?;
         if self.peek() == Some(']') {
             self.advance();
             return Ok(JsonValue::Array(arr));
         }
         loop {
-            self.skip_ws();
+            poll_termination()?;
+            self.skip_ws()?;
             let v = self.parse_value()?;
             arr.borrow_mut().push(v);
-            self.skip_ws();
+            self.skip_ws()?;
             match self.peek() {
                 Some(',') => {
                     self.advance();
@@ -693,13 +726,14 @@ impl<'a> Parser<'a> {
     fn parse_object(&mut self) -> StatorResult<JsonValue> {
         self.expect('{')?;
         let obj = Rc::new(RefCell::new(Vec::new()));
-        self.skip_ws();
+        self.skip_ws()?;
         if self.peek() == Some('}') {
             self.advance();
             return Ok(JsonValue::Object(obj));
         }
         loop {
-            self.skip_ws();
+            poll_termination()?;
+            self.skip_ws()?;
             if self.peek() != Some('"') {
                 return Err(StatorError::SyntaxError(format!(
                     "Expected string key at position {}",
@@ -707,9 +741,9 @@ impl<'a> Parser<'a> {
                 )));
             }
             let key = self.parse_string()?;
-            self.skip_ws();
+            self.skip_ws()?;
             self.expect(':')?;
-            self.skip_ws();
+            self.skip_ws()?;
             let val = self.parse_value()?;
             // §25.5.1: duplicate keys — last value wins.
             let mut entries = obj.borrow_mut();
@@ -719,7 +753,7 @@ impl<'a> Parser<'a> {
                 entries.push((key, val));
             }
             drop(entries);
-            self.skip_ws();
+            self.skip_ws()?;
             match self.peek() {
                 Some(',') => {
                     self.advance();
@@ -757,6 +791,7 @@ fn apply_reviver(
     key: &str,
     reviver: &dyn Fn(&str, JsonValue) -> StatorResult<Option<JsonValue>>,
 ) -> StatorResult<Option<JsonValue>> {
+    poll_termination()?;
     let transformed = match value {
         JsonValue::Array(ref arr) => {
             let items: Vec<JsonValue> = {
@@ -765,6 +800,7 @@ fn apply_reviver(
             };
             let mut new_items = Vec::with_capacity(items.len());
             for (i, item) in items.into_iter().enumerate() {
+                poll_termination()?;
                 let idx_str = i.to_string();
                 let revived = apply_reviver(item, &idx_str, reviver)?;
                 // §25.5.1.1: undefined → null for array elements.
@@ -780,6 +816,7 @@ fn apply_reviver(
             };
             let mut new_pairs = Vec::with_capacity(pairs.len());
             for (k, v) in pairs {
+                poll_termination()?;
                 let revived = apply_reviver(v, &k, reviver)?;
                 // §25.5.1.1: undefined → delete the property.
                 if let Some(rv) = revived {
@@ -830,6 +867,7 @@ fn stringify_value(
     in_progress: &mut HashSet<usize>,
     to_json: Option<ToJsonFn<'_>>,
 ) -> StatorResult<Option<String>> {
+    poll_termination()?;
     // Apply the toJSON hook (if provided).
     let to_json_owned;
     let value = if let Some(hook) = to_json {
@@ -875,7 +913,7 @@ fn stringify_value(
                 }
             }
         }
-        JsonValue::Str(s) => Ok(Some(stringify_string(s))),
+        JsonValue::Str(s) => Ok(Some(stringify_string(s)?)),
         JsonValue::Array(arr) => {
             let ptr = Rc::as_ptr(arr) as usize;
             if in_progress.contains(&ptr) {
@@ -904,10 +942,13 @@ fn stringify_value(
 }
 
 /// Produce the JSON representation of a string, escaping per RFC 8259 §7.
-fn stringify_string(s: &str) -> String {
+fn stringify_string(s: &str) -> StatorResult<String> {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
+    for (i, c) in s.chars().enumerate() {
+        if should_poll(i) {
+            poll_termination()?;
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -923,7 +964,7 @@ fn stringify_string(s: &str) -> String {
         }
     }
     out.push('"');
-    out
+    Ok(out)
 }
 
 /// Stringify a JSON array.
@@ -945,6 +986,7 @@ fn stringify_array(
 
     let mut parts = Vec::with_capacity(borrow.len());
     for (i, item) in borrow.iter().enumerate() {
+        poll_termination()?;
         let idx_str = i.to_string();
         let serialised = stringify_value(
             item,
@@ -992,7 +1034,7 @@ fn stringify_object(
         let serialised = stringify_value(v, k, replacer, indent, depth + 1, in_progress, to_json)?;
         // If the replacer or toJSON returns None (omit), skip this property.
         if let Some(s) = serialised {
-            let key_str = stringify_string(k);
+            let key_str = stringify_string(k)?;
             if use_indent {
                 parts.push(format!("{key_str}: {s}"));
             } else {
@@ -1035,6 +1077,7 @@ fn js_value_to_json_inner(
     value: &JsValue,
     seen: &mut HashSet<usize>,
 ) -> StatorResult<Option<JsonValue>> {
+    poll_termination()?;
     match value {
         JsValue::ModuleBinding(cell) => js_value_to_json_inner(&cell.read(), seen),
         JsValue::Undefined
@@ -1067,6 +1110,7 @@ fn js_value_to_json_inner(
             seen.insert(ptr);
             let mut arr: Vec<JsonValue> = Vec::with_capacity(items.borrow().len());
             for item in items.borrow().iter() {
+                poll_termination()?;
                 let json_item = js_value_to_json_inner(item, seen)?;
                 arr.push(json_item.unwrap_or(JsonValue::Null));
             }
@@ -1103,6 +1147,7 @@ fn js_value_to_json_inner(
             let mut entries: Vec<(String, JsonValue)> = Vec::new();
             // §25.5.2 step 6: only enumerable own properties are serialised.
             for (k, v) in map.borrow().enumerable_iter() {
+                poll_termination()?;
                 if let Some(jv) = js_value_to_json_inner(v, seen)? {
                     entries.push((k.to_string(), jv));
                 }
@@ -1122,6 +1167,7 @@ fn js_value_to_json_inner(
             let keys = proxy_own_keys(&proxy.borrow())?;
             let mut entries: Vec<(String, JsonValue)> = Vec::new();
             for key in keys {
+                poll_termination()?;
                 let key_str = match &key {
                     JsValue::String(s) => s.to_string(),
                     _ => continue,
@@ -1152,6 +1198,7 @@ fn js_value_to_json_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     // ── json_parse — primitives ───────────────────────────────────────────────
 
@@ -1481,6 +1528,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(s, r#""hello""#);
+    }
+
+    #[test]
+    fn test_json_parse_observes_interrupt_flag() {
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = json_parse("[1,2,3]", None);
+        crate::interpreter::clear_interrupt_flag();
+        assert!(
+            matches!(result, Err(StatorError::Internal(message)) if message == crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_json_stringify_observes_interrupt_flag() {
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the publish/clear pair in this test.
+        unsafe { crate::interpreter::set_interrupt_flag(&flag as *const _) };
+        let result = json_stringify(&JsonValue::Str("hello".to_string()), None, None, None);
+        crate::interpreter::clear_interrupt_flag();
+        assert!(
+            matches!(result, Err(StatorError::Internal(message)) if message == crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
     }
 
     #[test]

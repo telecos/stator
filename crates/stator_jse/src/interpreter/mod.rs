@@ -1202,14 +1202,16 @@ pub fn get_execution_deadline() -> Option<Instant> {
 //   * Between microtasks in [`crate::builtins::promise::MicrotaskQueue::drain`].
 //
 // Scope and limitations:
-//   * Baseline / Maglev / Turbofan JIT-generated code does **not** poll the
-//     flag in this slice.  Termination still unwinds at the next interpreter
-//     boundary (e.g. when JIT code returns, deopts, or calls back into the
-//     interpreter for a slow runtime stub).  An infinite loop that lives
-//     entirely inside JIT-emitted machine code will not be terminated until
-//     it falls back to the interpreter.  Embedders that require synchronous
-//     mid-JIT termination should currently disable JIT
-//     (`stator_isolate_disable_jit`) on isolates that may run hostile code.
+//   * Maglev JIT-generated loop headers poll the flag and deopt through the
+//     interpreter's termination path.  Baseline and Turbofan generated code
+//     do **not** poll the flag in this slice.  Termination still unwinds at
+//     the next interpreter boundary (e.g. when those tiers return, deopt, or
+//     call back into the interpreter for a slow runtime stub).  An infinite
+//     loop that lives entirely inside baseline or Turbofan machine code will
+//     not be terminated until it falls back to the interpreter.  Embedders
+//     that require synchronous termination for all hostile code should
+//     currently disable JIT (`stator_isolate_disable_jit`) until the remaining
+//     tiers grow loop-header polls.
 //   * Wasm execution:
 //     - Every JS→Wasm boundary (`WasmInstance::call`) checks the interrupt
 //       flag at entry and short-circuits with a terminated error before
