@@ -86,6 +86,16 @@
 #define STATOR_TIER_LATENCY_BUCKET_COUNT 9
 
 /**
+ * Number of execution tiers carried by [`StatorOsrCountersStats`].
+ */
+#define STATOR_OSR_TIER_COUNT 4
+
+/**
+ * Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+ */
+#define STATOR_OSR_EXIT_REASON_COUNT 4
+
+/**
  * Default named-property handler behaviour; no flag bits set.
  */
 #define STATOR_DOM_NAMED_HANDLER_FLAG_NONE 0
@@ -1519,6 +1529,138 @@ typedef struct StatorTierLatencyStats {
    */
   struct StatorTierLatencyTier turbofan;
 } StatorTierLatencyStats;
+
+/**
+ * Per-source/target true-OSR entry counters.
+ */
+typedef struct StatorOsrEntryCounters {
+  /**
+   * Real mid-frame OSR entry attempts.
+   */
+  uint64_t attempts;
+  /**
+   * Attempts that transferred control to the target tier.
+   */
+  uint64_t successes;
+  /**
+   * Attempts that failed before control transferred.
+   */
+  uint64_t failures;
+} StatorOsrEntryCounters;
+
+/**
+ * OSR entry counters from one source tier to every target tier.
+ */
+typedef struct StatorOsrTierEntryCounters {
+  /**
+   * Entries targeting the interpreter tier.
+   */
+  struct StatorOsrEntryCounters interpreter;
+  /**
+   * Entries targeting the baseline tier.
+   */
+  struct StatorOsrEntryCounters baseline;
+  /**
+   * Entries targeting the Maglev tier.
+   */
+  struct StatorOsrEntryCounters maglev;
+  /**
+   * Entries targeting the Turbofan tier.
+   */
+  struct StatorOsrEntryCounters turbofan;
+} StatorOsrTierEntryCounters;
+
+/**
+ * True-OSR entry counters by source and target tier.
+ */
+typedef struct StatorOsrEntryStats {
+  /**
+   * Entry counters from interpreter execution.
+   */
+  struct StatorOsrTierEntryCounters from_interpreter;
+  /**
+   * Entry counters from baseline execution.
+   */
+  struct StatorOsrTierEntryCounters from_baseline;
+  /**
+   * Entry counters from Maglev execution.
+   */
+  struct StatorOsrTierEntryCounters from_maglev;
+  /**
+   * Entry counters from Turbofan execution.
+   */
+  struct StatorOsrTierEntryCounters from_turbofan;
+} StatorOsrEntryStats;
+
+/**
+ * Per-reason true-OSR exit counters for one tier.
+ */
+typedef struct StatorOsrExitReasonCounts {
+  /**
+   * OSR-entered code returned normally.
+   */
+  uint64_t normal_return;
+  /**
+   * OSR-entered code exited through a deopt/bailout path.
+   */
+  uint64_t deopt;
+  /**
+   * OSR-entered code exited by throwing an exception.
+   */
+  uint64_t exception;
+  /**
+   * OSR-entered code exited due to embedder termination/interrupt polling.
+   */
+  uint64_t termination_interrupt;
+} StatorOsrExitReasonCounts;
+
+/**
+ * True-OSR exit counters by tier.
+ */
+typedef struct StatorOsrExitStats {
+  /**
+   * Interpreter exits after OSR entry.  Currently zero.
+   */
+  struct StatorOsrExitReasonCounts interpreter;
+  /**
+   * Baseline exits after OSR entry.  Currently zero.
+   */
+  struct StatorOsrExitReasonCounts baseline;
+  /**
+   * Maglev exits after OSR entry.  Currently zero.
+   */
+  struct StatorOsrExitReasonCounts maglev;
+  /**
+   * Turbofan exits after OSR entry.  Currently zero.
+   */
+  struct StatorOsrExitReasonCounts turbofan;
+} StatorOsrExitStats;
+
+/**
+ * Stable true-OSR diagnostic snapshot.
+ *
+ * Stator currently lacks a safe true mid-frame OSR entry/exit path.  The schema
+ * is exposed so Edge can consume stable diagnostics, but `true_osr_supported`
+ * is false and all counters remain zero until real OSR machinery is wired in.
+ */
+typedef struct StatorOsrCountersStats {
+  /**
+   * Whether this build has real mid-frame OSR instrumentation wired in.
+   */
+  bool true_osr_supported;
+  /**
+   * Number of per-script OSR rows exposed by this snapshot.  Currently zero.
+   */
+  uint32_t per_script_row_count;
+  /**
+   * Entry counters by source and target tier.
+   */
+  struct StatorOsrEntryStats entries;
+  /**
+   * Exit counters by tier and reason.
+   */
+  struct StatorOsrExitStats exits;
+} StatorOsrCountersStats;
 
 /**
  * Read-only view of the browser policy/origin metadata associated with a
@@ -2972,6 +3114,30 @@ void stator_isolate_get_tier_latency_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_tier_latency_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with current release-safe true-OSR counters.
+ *
+ * Does nothing when `stats` is null. Passing a null isolate is permitted and
+ * still returns process counters.
+ *
+ * # Safety
+ * - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes.
+ */
+void stator_isolate_get_osr_counters_stats(const struct StatorIsolate *_isolate,
+                                           struct StatorOsrCountersStats *stats);
+
+/**
+ * Reset OSR counters visible through `stator_isolate_get_osr_counters_stats`.
+ *
+ * A null isolate is accepted; counters are process diagnostics rather than
+ * heap-owned state.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_osr_counters_stats(struct StatorIsolate *_isolate);
 
 /**
  * Enable or disable JIT tiers for scripts run in `isolate`.

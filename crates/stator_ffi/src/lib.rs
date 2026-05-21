@@ -31,6 +31,7 @@ use stator_jse::compiler::baseline::compiler::{
     stub_deopt_counts,
 };
 use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
+use stator_jse::compiler::osr_counters::{self, OsrExitReason, OsrTier};
 use stator_jse::dom::{
     AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
     IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
@@ -1169,6 +1170,254 @@ pub unsafe extern "C" fn stator_isolate_get_tier_latency_stats(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_reset_tier_latency_stats(_isolate: *mut StatorIsolate) {
     stator_jse::compiler::tier_latency::reset();
+}
+
+/// Number of execution tiers carried by [`StatorOsrCountersStats`].
+pub const STATOR_OSR_TIER_COUNT: usize = 4;
+
+/// Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+pub const STATOR_OSR_EXIT_REASON_COUNT: usize = 4;
+
+/// Per-source/target true-OSR entry counters.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrEntryCounters {
+    /// Real mid-frame OSR entry attempts.
+    pub attempts: u64,
+    /// Attempts that transferred control to the target tier.
+    pub successes: u64,
+    /// Attempts that failed before control transferred.
+    pub failures: u64,
+}
+
+impl StatorOsrEntryCounters {
+    fn from_snapshot(snap: &osr_counters::OsrEntryTransitionSnapshot) -> Self {
+        Self {
+            attempts: snap.attempts,
+            successes: snap.successes,
+            failures: snap.failures,
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.attempts + self.successes + self.failures
+    }
+}
+
+/// OSR entry counters from one source tier to every target tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrTierEntryCounters {
+    /// Entries targeting the interpreter tier.
+    pub interpreter: StatorOsrEntryCounters,
+    /// Entries targeting the baseline tier.
+    pub baseline: StatorOsrEntryCounters,
+    /// Entries targeting the Maglev tier.
+    pub maglev: StatorOsrEntryCounters,
+    /// Entries targeting the Turbofan tier.
+    pub turbofan: StatorOsrEntryCounters,
+}
+
+impl StatorOsrTierEntryCounters {
+    fn from_snapshot(snapshot: &osr_counters::OsrCountersSnapshot, source: OsrTier) -> Self {
+        Self {
+            interpreter: StatorOsrEntryCounters::from_snapshot(
+                snapshot.entry(source, OsrTier::Interpreter),
+            ),
+            baseline: StatorOsrEntryCounters::from_snapshot(
+                snapshot.entry(source, OsrTier::Baseline),
+            ),
+            maglev: StatorOsrEntryCounters::from_snapshot(snapshot.entry(source, OsrTier::Maglev)),
+            turbofan: StatorOsrEntryCounters::from_snapshot(
+                snapshot.entry(source, OsrTier::Turbofan),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.interpreter.total()
+            + self.baseline.total()
+            + self.maglev.total()
+            + self.turbofan.total()
+    }
+}
+
+/// True-OSR entry counters by source and target tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrEntryStats {
+    /// Entry counters from interpreter execution.
+    pub from_interpreter: StatorOsrTierEntryCounters,
+    /// Entry counters from baseline execution.
+    pub from_baseline: StatorOsrTierEntryCounters,
+    /// Entry counters from Maglev execution.
+    pub from_maglev: StatorOsrTierEntryCounters,
+    /// Entry counters from Turbofan execution.
+    pub from_turbofan: StatorOsrTierEntryCounters,
+}
+
+impl StatorOsrEntryStats {
+    fn from_snapshot(snapshot: &osr_counters::OsrCountersSnapshot) -> Self {
+        Self {
+            from_interpreter: StatorOsrTierEntryCounters::from_snapshot(
+                snapshot,
+                OsrTier::Interpreter,
+            ),
+            from_baseline: StatorOsrTierEntryCounters::from_snapshot(snapshot, OsrTier::Baseline),
+            from_maglev: StatorOsrTierEntryCounters::from_snapshot(snapshot, OsrTier::Maglev),
+            from_turbofan: StatorOsrTierEntryCounters::from_snapshot(snapshot, OsrTier::Turbofan),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.from_interpreter.total()
+            + self.from_baseline.total()
+            + self.from_maglev.total()
+            + self.from_turbofan.total()
+    }
+}
+
+/// Per-reason true-OSR exit counters for one tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrExitReasonCounts {
+    /// OSR-entered code returned normally.
+    pub normal_return: u64,
+    /// OSR-entered code exited through a deopt/bailout path.
+    pub deopt: u64,
+    /// OSR-entered code exited by throwing an exception.
+    pub exception: u64,
+    /// OSR-entered code exited due to embedder termination/interrupt polling.
+    pub termination_interrupt: u64,
+}
+
+impl StatorOsrExitReasonCounts {
+    fn from_snapshot(snap: &osr_counters::OsrExitTierSnapshot) -> Self {
+        Self {
+            normal_return: snap.count(OsrExitReason::NormalReturn),
+            deopt: snap.count(OsrExitReason::Deopt),
+            exception: snap.count(OsrExitReason::Exception),
+            termination_interrupt: snap.count(OsrExitReason::TerminationInterrupt),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.normal_return + self.deopt + self.exception + self.termination_interrupt
+    }
+}
+
+/// True-OSR exit counters by tier.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrExitStats {
+    /// Interpreter exits after OSR entry.  Currently zero.
+    pub interpreter: StatorOsrExitReasonCounts,
+    /// Baseline exits after OSR entry.  Currently zero.
+    pub baseline: StatorOsrExitReasonCounts,
+    /// Maglev exits after OSR entry.  Currently zero.
+    pub maglev: StatorOsrExitReasonCounts,
+    /// Turbofan exits after OSR entry.  Currently zero.
+    pub turbofan: StatorOsrExitReasonCounts,
+}
+
+impl StatorOsrExitStats {
+    fn from_snapshot(snapshot: &osr_counters::OsrCountersSnapshot) -> Self {
+        Self {
+            interpreter: StatorOsrExitReasonCounts::from_snapshot(
+                snapshot.exits_for_tier(OsrTier::Interpreter),
+            ),
+            baseline: StatorOsrExitReasonCounts::from_snapshot(
+                snapshot.exits_for_tier(OsrTier::Baseline),
+            ),
+            maglev: StatorOsrExitReasonCounts::from_snapshot(
+                snapshot.exits_for_tier(OsrTier::Maglev),
+            ),
+            turbofan: StatorOsrExitReasonCounts::from_snapshot(
+                snapshot.exits_for_tier(OsrTier::Turbofan),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.interpreter.total()
+            + self.baseline.total()
+            + self.maglev.total()
+            + self.turbofan.total()
+    }
+}
+
+/// Stable true-OSR diagnostic snapshot.
+///
+/// Stator currently lacks a safe true mid-frame OSR entry/exit path.  The schema
+/// is exposed so Edge can consume stable diagnostics, but `true_osr_supported`
+/// is false and all counters remain zero until real OSR machinery is wired in.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorOsrCountersStats {
+    /// Whether this build has real mid-frame OSR instrumentation wired in.
+    pub true_osr_supported: bool,
+    /// Number of per-script OSR rows exposed by this snapshot.  Currently zero.
+    pub per_script_row_count: u32,
+    /// Entry counters by source and target tier.
+    pub entries: StatorOsrEntryStats,
+    /// Exit counters by tier and reason.
+    pub exits: StatorOsrExitStats,
+}
+
+impl StatorOsrCountersStats {
+    fn from_engine_snapshot(snapshot: &osr_counters::OsrCountersSnapshot) -> Self {
+        Self {
+            true_osr_supported: snapshot.true_osr_supported,
+            per_script_row_count: snapshot.per_script_row_count,
+            entries: StatorOsrEntryStats::from_snapshot(snapshot),
+            exits: StatorOsrExitStats::from_snapshot(snapshot),
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.entries.total() + self.exits.total()
+    }
+}
+
+/// Fill `*stats` with current release-safe true-OSR counters.
+///
+/// Does nothing when `stats` is null. Passing a null isolate is permitted and
+/// still returns process counters.
+///
+/// # Safety
+/// - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_osr_counters_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorOsrCountersStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = osr_counters::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorOsrCountersStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset OSR counters visible through `stator_isolate_get_osr_counters_stats`.
+///
+/// A null isolate is accepted; counters are process diagnostics rather than
+/// heap-owned state.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_osr_counters_stats(_isolate: *mut StatorIsolate) {
+    osr_counters::reset();
 }
 
 /// Enable or disable JIT tiers for scripts run in `isolate`.
@@ -30558,6 +30807,68 @@ mod tests {
         for b in after.maglev.success_buckets {
             assert_eq!(b, 0);
         }
+    }
+
+    #[test]
+    fn test_osr_counters_stats_null_safety() {
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted and `stats` is valid for writes.
+        let mut stats = unsafe { std::mem::zeroed::<StatorOsrCountersStats>() };
+        unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), &mut stats) };
+        assert!(!stats.true_osr_supported);
+        assert_eq!(stats.per_script_row_count, 0);
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_osr_counters_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_osr_counters_constants_match_engine() {
+        assert_eq!(
+            STATOR_OSR_TIER_COUNT,
+            stator_jse::compiler::osr_counters::OsrTier::COUNT
+        );
+        assert_eq!(
+            STATOR_OSR_EXIT_REASON_COUNT,
+            stator_jse::compiler::osr_counters::OsrExitReason::COUNT
+        );
+    }
+
+    #[test]
+    fn test_osr_counters_snapshot_roundtrip_via_ffi() {
+        use std::sync::Mutex;
+        static FFI_OSR_COUNTERS_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_OSR_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null isolate is accepted; we reset before recording.
+        unsafe { stator_isolate_reset_osr_counters_stats(std::ptr::null_mut()) };
+        use stator_jse::compiler::osr_counters::{self, OsrExitReason as Reason, OsrTier as Tier};
+        osr_counters::record_entry_attempt(Tier::Interpreter, Tier::Baseline);
+        osr_counters::record_entry_success(Tier::Interpreter, Tier::Baseline);
+        osr_counters::record_entry_failure(Tier::Baseline, Tier::Maglev);
+        osr_counters::record_exit(Tier::Baseline, Reason::Deopt);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorOsrCountersStats>() };
+        // SAFETY: `stats` is valid for writes and a null isolate is accepted.
+        unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), &mut stats) };
+        assert!(!stats.true_osr_supported);
+        assert_eq!(stats.per_script_row_count, 0);
+        assert_eq!(stats.entries.from_interpreter.baseline.attempts, 1);
+        assert_eq!(stats.entries.from_interpreter.baseline.successes, 1);
+        assert_eq!(stats.entries.from_baseline.maglev.failures, 1);
+        assert_eq!(stats.exits.baseline.deopt, 1);
+
+        // SAFETY: null isolate is accepted.
+        unsafe { stator_isolate_reset_osr_counters_stats(std::ptr::null_mut()) };
+        let mut after = unsafe { std::mem::zeroed::<StatorOsrCountersStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), &mut after) };
+        assert!(!after.true_osr_supported);
+        assert_eq!(after.per_script_row_count, 0);
+        assert_eq!(after.total(), 0);
     }
 
     #[test]

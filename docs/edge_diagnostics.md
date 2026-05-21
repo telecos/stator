@@ -213,6 +213,107 @@ process-global. `STATOR_IC_TIER_COUNT`, `STATOR_IC_OP_COUNT`, and
 `STATOR_IC_EVENT_COUNT` mirror the Rust enum counts and are enforced by
 FFI tests.
 
+
+## OSR entry/exit counters
+
+Stator exposes a stable release-safe OSR diagnostics schema through
+`stator_jse::compiler::osr_counters` and the C FFI calls
+`stator_isolate_get_osr_counters_stats` /
+`stator_isolate_reset_osr_counters_stats`.
+
+### Current tier limitations
+
+The current runtime **does not support true mid-frame OSR**. Hot-loop
+back-edges may request Baseline, Maglev, or Turbofan compilation, but the
+active interpreter dispatch paths deliberately avoid jumping into JIT code
+mid-loop: compiled code would re-run the function from entry rather than
+restore the live interpreter frame. Those compile requests are tiering
+activity, not OSR events, and they are covered by the compile and
+promotion-latency counters above.
+
+Because there is no true OSR entry/exit machinery wired in today,
+`true_osr_supported` is `false`, `per_script_row_count` is `0`, and every
+entry/exit counter remains zero. Edge consumers should treat this as
+"OSR unsupported in this build", not as proof that loop OSR was stable.
+Future real OSR support must increment only genuine mid-execution handoff
+attempts/successes/failures and exits; it must not count force-tier APIs,
+background compilation, or next-call tier-up as OSR.
+
+### Schema
+
+Entry counters are split by source tier and target tier:
+
+```text
+entries.from_<source>.<target>.attempts
+entries.from_<source>.<target>.successes
+entries.from_<source>.<target>.failures
+```
+
+The tier dimensions are `interpreter`, `baseline`, `maglev`, and
+`turbofan`. Exit counters are split by the tier entered through OSR and a
+stable reason set:
+
+| Field | Meaning |
+| --- | --- |
+| `normal_return` | OSR-entered code returned normally. |
+| `deopt` | OSR-entered code exited through a deopt/bailout path. |
+| `exception` | OSR-entered code exited by throwing an exception. |
+| `termination_interrupt` | OSR-entered code exited due to embedder termination or interrupt polling. |
+
+### Per-script attribution
+
+Per-script OSR attribution is not available today. The exported schema is
+aggregate-only and reports `per_script_row_count == 0`; no script hash rows
+are emitted until bytecode/script metadata is carried through a real OSR
+entry path.
+
+### Rust API
+
+```rust
+use stator_jse::compiler::osr_counters::{self, OsrTier};
+
+osr_counters::reset();
+// ... run workload ...
+let snap = osr_counters::snapshot();
+assert!(!snap.true_osr_supported);
+let interp_to_baseline = snap.entry(OsrTier::Interpreter, OsrTier::Baseline);
+println!("OSR attempts = {}", interp_to_baseline.attempts);
+```
+
+### C FFI
+
+```c
+StatorOsrCountersStats stats = {0};
+stator_isolate_reset_osr_counters_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_osr_counters_stats(NULL, &stats);
+if (!stats.true_osr_supported) {
+    /* Current Stator build has no true mid-frame OSR. */
+}
+printf("interp->baseline OSR attempts=%llu\n",
+       (unsigned long long) stats.entries.from_interpreter.baseline.attempts);
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the counters are
+process-global. `STATOR_OSR_TIER_COUNT` and
+`STATOR_OSR_EXIT_REASON_COUNT` mirror the Rust enum counts and are enforced
+by FFI tests.
+
+### Edge usage notes
+
+For loop-tiering instability in current Edge proof runs, combine this OSR
+snapshot with:
+
+- tier-latency counters to see deterministic force-tier and promotion
+  request outcomes;
+- compile counters to confirm whether Baseline/Maglev/Turbofan compilation
+  actually ran;
+- deopt histograms to explain optimized-tier exits once execution reaches a
+  JIT tier.
+
+If OSR counters are all zero while `true_osr_supported == false`, report the
+build as "no true OSR support" rather than "zero OSR churn".
+
 ## Related counters
 
 - **`stator_jse::compiler::compile_counters`** — per-tier

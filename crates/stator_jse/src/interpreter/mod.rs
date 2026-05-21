@@ -22495,6 +22495,28 @@ mod tests {
     }
 
     #[test]
+    fn test_force_tier_does_not_fabricate_osr_counters() {
+        use crate::compiler::osr_counters;
+        use std::sync::Mutex;
+        static GUARD: Mutex<()> = Mutex::new(());
+        let _g = match GUARD.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        osr_counters::reset();
+        let add_ba = make_add_bytecode();
+        let _ = force_tier_sync(&add_ba, JitTier::Baseline);
+        let snap = osr_counters::snapshot();
+        assert!(!snap.true_osr_supported);
+        assert_eq!(snap.per_script_row_count, 0);
+        assert_eq!(snap.total(), 0, "force-tier is not true mid-frame OSR");
+
+        osr_counters::reset();
+        assert_eq!(osr_counters::snapshot().total(), 0);
+    }
+
+    #[test]
     fn test_wait_for_tier_reports_observed_status_without_fake_success() {
         let add_ba = make_add_bytecode();
 

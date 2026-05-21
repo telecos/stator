@@ -50,6 +50,8 @@ pub mod deopt_counters;
 pub mod maglev;
 /// On-Stack Replacement: mid-execution tier-up for hot loops.
 pub mod osr;
+/// Release-safe OSR entry/exit diagnostics.
+pub mod osr_counters;
 /// Always-on, release-safe counters and timing for JIT tier promotion
 /// requests (Baseline / Maglev / Turbofan).
 pub mod tier_latency;
