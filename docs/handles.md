@@ -777,6 +777,45 @@ wait for the planned symbol-aware access-check counterpart.
   string-keyed callbacks (and their flag bitmask) by extracting the
   current handler into a builder and layering symbol slots on top.
 
+### 7.6 DOM wrapper definer and descriptor callbacks
+
+Stator exposes V8/Blink-style callbacks for intercepted
+`Object.defineProperty` and `Object.getOwnPropertyDescriptor` operations
+on named string keys, opted-in symbol keys, and indexed keys:
+
+| Operation | Named string | Named symbol | Indexed |
+|-----------|--------------|--------------|---------|
+| Define | `StatorDomNamedDefinerCb` | `StatorDomNamedSymbolDefinerCb` | `StatorDomIndexedDefinerCb` |
+| Descriptor | `StatorDomNamedDescriptorCb` | `StatorDomNamedSymbolDescriptorCb` | `StatorDomIndexedDescriptorCb` |
+
+Callbacks use `StatorDomPropertyDescriptor`, which carries
+`WRITABLE`/`ENUMERABLE`/`CONFIGURABLE` bits plus either a data `value` or
+accessor `getter`/`setter` values. Accessor values are preserved through
+the storage/invocation API where representable, but generic DOM-wrapper
+accessor invocation is not yet wired into Stator's ordinary
+`Object.defineProperty` / `Object.getOwnPropertyDescriptor` runtime path.
+Until that integration lands, Edge should use the strict invocation
+helpers (`stator_dom_object_wrap_invoke_*_definer` and
+`stator_dom_object_wrap_invoke_*_descriptor`) rather than assuming
+ordinary JS built-ins will dispatch to DOM wrapper interceptors.
+
+Result semantics are fail-closed:
+
+- Definer `StatorStatusOk` means handled, `StatorStatusFalse` means
+  no-intercept/fall through, `StatorStatusUnsupported` means rejected,
+  and `StatorStatusException` records/propagates an error.
+- Descriptor `StatorStatusOk` with `present=true` returns a descriptor;
+  `StatorStatusFalse` or helper output with `present=false` means
+  no-intercept/missing; `Unsupported` is rejected and `Exception` is an
+  error.
+- Invalid wrapper state or access-check denial rejects definitions and
+  withholds descriptors without invoking embedder callbacks.
+- `ALL_CAN_READ` permits descriptor callbacks to run through access
+  denial, matching get/query. It does not bypass define denial.
+- `NON_MASKING` skips named string definer/descriptor callbacks when an
+  own string property already exists. Indexed wrappers do not have a
+  per-index own-property store, so indexed non-masking remains metadata.
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.

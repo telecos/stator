@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
+use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
@@ -143,6 +144,91 @@ impl<'a> NamedKey<'a> {
     }
 }
 
+/// Descriptor payload used by DOM property definer and descriptor callbacks.
+///
+/// Data descriptors set [`value`]. Accessor descriptors set [`get`] and/or
+/// [`set`]. Stator stores the accessor values for embedders and FFI callers,
+/// but generic runtime accessor invocation for DOM wrappers is not wired yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomPropertyDescriptor {
+    value: Option<JsValue>,
+    get: Option<JsValue>,
+    set: Option<JsValue>,
+    attributes: PropertyAttributes,
+}
+
+impl DomPropertyDescriptor {
+    /// Create a data descriptor with a value and attributes.
+    pub fn data(value: JsValue, attributes: PropertyAttributes) -> Self {
+        Self {
+            value: Some(value),
+            get: None,
+            set: None,
+            attributes,
+        }
+    }
+
+    /// Create an accessor descriptor with getter/setter values and attributes.
+    pub fn accessor(
+        get: Option<JsValue>,
+        set: Option<JsValue>,
+        attributes: PropertyAttributes,
+    ) -> Self {
+        Self {
+            value: None,
+            get,
+            set,
+            attributes,
+        }
+    }
+
+    /// Return the data value, if this descriptor has one.
+    pub fn value(&self) -> Option<&JsValue> {
+        self.value.as_ref()
+    }
+
+    /// Return the accessor getter value, if present.
+    pub fn get(&self) -> Option<&JsValue> {
+        self.get.as_ref()
+    }
+
+    /// Return the accessor setter value, if present.
+    pub fn set(&self) -> Option<&JsValue> {
+        self.set.as_ref()
+    }
+
+    /// Return the descriptor attribute flags.
+    pub fn attributes(&self) -> PropertyAttributes {
+        self.attributes
+    }
+}
+
+/// Result returned by DOM property definer callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomPropertyDefineResult {
+    /// The interceptor handled the definition successfully.
+    Handled,
+    /// The interceptor declined; caller may fall through to ordinary storage.
+    NotIntercepted,
+    /// The interceptor handled and rejected the definition.
+    Rejected,
+    /// The interceptor failed with an embedder/JS error.
+    Exception,
+}
+
+/// Result returned by DOM property descriptor callbacks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DomPropertyDescriptorResult {
+    /// The interceptor supplied a descriptor.
+    Descriptor(DomPropertyDescriptor),
+    /// The interceptor declined; caller may fall through to ordinary storage.
+    NotIntercepted,
+    /// The interceptor handled and rejected/withheld the descriptor.
+    Rejected,
+    /// The interceptor failed with an embedder/JS error.
+    Exception,
+}
+
 /// Callback for intercepting symbol-keyed named-property **get**.
 pub type NamedSymbolGetterCallback = Box<dyn Fn(&SymbolKey, *mut c_void) -> NamedGetterResult>;
 
@@ -159,6 +245,21 @@ pub type NamedSymbolDeleterCallback = Box<dyn Fn(&SymbolKey, *mut c_void) -> boo
 /// Callback that enumerates intercepted symbol-keyed properties.
 pub type NamedSymbolEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<SymbolKey>>;
 
+/// Callback for intercepting named-property `Object.defineProperty`.
+pub type NamedDefinerCallback =
+    Box<dyn Fn(&str, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Callback for intercepting named-property `Object.getOwnPropertyDescriptor`.
+pub type NamedDescriptorCallback = Box<dyn Fn(&str, *mut c_void) -> DomPropertyDescriptorResult>;
+
+/// Callback for intercepting symbol-keyed named-property `Object.defineProperty`.
+pub type NamedSymbolDefinerCallback =
+    Box<dyn Fn(&SymbolKey, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Callback for intercepting symbol-keyed named-property descriptors.
+pub type NamedSymbolDescriptorCallback =
+    Box<dyn Fn(&SymbolKey, *mut c_void) -> DomPropertyDescriptorResult>;
+
 /// Borrowed symbol-keyed getter reference.
 type NamedSymbolGetterRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> NamedGetterResult>;
 
@@ -171,6 +272,21 @@ type NamedSymbolQueryRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> Opt
 
 /// Borrowed symbol-keyed deleter reference.
 type NamedSymbolDeleterRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> bool>;
+
+/// Borrowed named-property definer reference.
+type NamedDefinerRef<'a> =
+    Option<&'a dyn Fn(&str, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Borrowed named-property descriptor reference.
+type NamedDescriptorRef<'a> = Option<&'a dyn Fn(&str, *mut c_void) -> DomPropertyDescriptorResult>;
+
+/// Borrowed symbol-keyed named-property definer reference.
+type NamedSymbolDefinerRef<'a> =
+    Option<&'a dyn Fn(&SymbolKey, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Borrowed symbol-keyed named-property descriptor reference.
+type NamedSymbolDescriptorRef<'a> =
+    Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> DomPropertyDescriptorResult>;
 
 /// Result returned by an indexed-property getter interceptor.
 pub type IndexedGetterResult = Option<JsValue>;
@@ -214,6 +330,13 @@ pub type IndexedDeleterCallback = Box<dyn Fn(u32, *mut c_void) -> IndexedDeleter
 /// callers to observe (Stator does not reorder the result).
 pub type IndexedEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<u32>>;
 
+/// Callback for intercepting indexed-property `Object.defineProperty`.
+pub type IndexedDefinerCallback =
+    Box<dyn Fn(u32, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Callback for intercepting indexed-property descriptors.
+pub type IndexedDescriptorCallback = Box<dyn Fn(u32, *mut c_void) -> DomPropertyDescriptorResult>;
+
 /// Borrowed named-property getter reference.
 type NamedGetterRef<'a> = Option<&'a dyn Fn(&str, *mut c_void) -> NamedGetterResult>;
 
@@ -228,6 +351,13 @@ type NamedDeleterRef<'a> = Option<&'a dyn Fn(&str, *mut c_void) -> bool>;
 
 /// Borrowed indexed-property setter reference.
 type IndexedSetterRef<'a> = Option<&'a dyn Fn(u32, &JsValue, *mut c_void) -> IndexedSetterResult>;
+
+/// Borrowed indexed-property definer reference.
+type IndexedDefinerRef<'a> =
+    Option<&'a dyn Fn(u32, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult>;
+
+/// Borrowed indexed-property descriptor reference.
+type IndexedDescriptorRef<'a> = Option<&'a dyn Fn(u32, *mut c_void) -> DomPropertyDescriptorResult>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PropertyHandlerFlags
@@ -248,7 +378,7 @@ type IndexedSetterRef<'a> = Option<&'a dyn Fn(u32, &JsValue, *mut c_void) -> Ind
 /// | Flag | Effect |
 /// |------|--------|
 /// | [`NamedPropertyHandlerFlags::NONE`] | Default; the interceptor is consulted before own properties on every operation. |
-/// | [`NamedPropertyHandlerFlags::ALL_CAN_READ`] | Read-side operations (`get`, `query`) still consult the interceptor even when the installed access-check callback would otherwise deny the access.  Writes/deletes/enumeration remain access-checked. |
+/// | [`NamedPropertyHandlerFlags::ALL_CAN_READ`] | Read-side operations (`get`, `query`, `descriptor`) still consult the interceptor even when the installed access-check callback would otherwise deny the access.  Writes/defines/deletes/enumeration remain access-checked. |
 /// | [`NamedPropertyHandlerFlags::NON_MASKING`] | The interceptor is consulted **only** when the wrapper's own-property map does not already define the key.  Own properties therefore "mask" interceptor entries. |
 /// | [`NamedPropertyHandlerFlags::ONLY_INTERCEPT_STRINGS`] | Stored-only metadata.  Stator does not yet route symbol-keyed access through DOM wrappers, so this flag is already implicitly the steady-state behaviour.  Documented for future symbol support. |
 /// | [`NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS`] | Stored-only metadata.  Documents that the embedder *wants* symbol keys forwarded to the interceptor once Stator routes them; today it has no runtime effect. |
@@ -435,11 +565,15 @@ pub struct NamedPropertyHandlerConfig {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    definer: Option<NamedDefinerCallback>,
+    descriptor: Option<NamedDescriptorCallback>,
     symbol_getter: Option<NamedSymbolGetterCallback>,
     symbol_setter: Option<NamedSymbolSetterCallback>,
     symbol_query: Option<NamedSymbolQueryCallback>,
     symbol_deleter: Option<NamedSymbolDeleterCallback>,
     symbol_enumerator: Option<NamedSymbolEnumeratorCallback>,
+    symbol_definer: Option<NamedSymbolDefinerCallback>,
+    symbol_descriptor: Option<NamedSymbolDescriptorCallback>,
     flags: NamedPropertyHandlerFlags,
 }
 
@@ -474,6 +608,16 @@ impl NamedPropertyHandlerConfig {
         self.enumerator.as_deref()
     }
 
+    /// Return a reference to the definer callback, if installed.
+    pub fn definer(&self) -> NamedDefinerRef<'_> {
+        self.definer.as_deref()
+    }
+
+    /// Return a reference to the descriptor callback, if installed.
+    pub fn descriptor(&self) -> NamedDescriptorRef<'_> {
+        self.descriptor.as_deref()
+    }
+
     /// Return the flag bitset configured on this handler.
     pub fn flags(&self) -> NamedPropertyHandlerFlags {
         self.flags
@@ -504,6 +648,16 @@ impl NamedPropertyHandlerConfig {
     /// Return a reference to the symbol-keyed enumerator, if installed.
     pub fn symbol_enumerator(&self) -> Option<&dyn Fn(*mut c_void) -> Vec<SymbolKey>> {
         self.symbol_enumerator.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed definer, if installed.
+    pub fn symbol_definer(&self) -> NamedSymbolDefinerRef<'_> {
+        self.symbol_definer.as_deref()
+    }
+
+    /// Return a reference to the symbol-keyed descriptor callback, if installed.
+    pub fn symbol_descriptor(&self) -> NamedSymbolDescriptorRef<'_> {
+        self.symbol_descriptor.as_deref()
     }
 
     /// Return `true` if symbol keys should be routed through this handler.
@@ -544,11 +698,15 @@ impl NamedPropertyHandlerConfig {
             query: self.query,
             deleter: self.deleter,
             enumerator: self.enumerator,
+            definer: self.definer,
+            descriptor: self.descriptor,
             symbol_getter: self.symbol_getter,
             symbol_setter: self.symbol_setter,
             symbol_query: self.symbol_query,
             symbol_deleter: self.symbol_deleter,
             symbol_enumerator: self.symbol_enumerator,
+            symbol_definer: self.symbol_definer,
+            symbol_descriptor: self.symbol_descriptor,
             flags: self.flags,
         }
     }
@@ -562,11 +720,15 @@ impl std::fmt::Debug for NamedPropertyHandlerConfig {
             .field("has_query", &self.query.is_some())
             .field("has_deleter", &self.deleter.is_some())
             .field("has_enumerator", &self.enumerator.is_some())
+            .field("has_definer", &self.definer.is_some())
+            .field("has_descriptor", &self.descriptor.is_some())
             .field("has_symbol_getter", &self.symbol_getter.is_some())
             .field("has_symbol_setter", &self.symbol_setter.is_some())
             .field("has_symbol_query", &self.symbol_query.is_some())
             .field("has_symbol_deleter", &self.symbol_deleter.is_some())
             .field("has_symbol_enumerator", &self.symbol_enumerator.is_some())
+            .field("has_symbol_definer", &self.symbol_definer.is_some())
+            .field("has_symbol_descriptor", &self.symbol_descriptor.is_some())
             .field("flags", &self.flags)
             .finish()
     }
@@ -580,11 +742,15 @@ pub struct NamedPropertyHandlerConfigBuilder {
     query: Option<NamedQueryCallback>,
     deleter: Option<NamedDeleterCallback>,
     enumerator: Option<NamedEnumeratorCallback>,
+    definer: Option<NamedDefinerCallback>,
+    descriptor: Option<NamedDescriptorCallback>,
     symbol_getter: Option<NamedSymbolGetterCallback>,
     symbol_setter: Option<NamedSymbolSetterCallback>,
     symbol_query: Option<NamedSymbolQueryCallback>,
     symbol_deleter: Option<NamedSymbolDeleterCallback>,
     symbol_enumerator: Option<NamedSymbolEnumeratorCallback>,
+    symbol_definer: Option<NamedSymbolDefinerCallback>,
+    symbol_descriptor: Option<NamedSymbolDescriptorCallback>,
     flags: NamedPropertyHandlerFlags,
 }
 
@@ -622,6 +788,24 @@ impl NamedPropertyHandlerConfigBuilder {
         self
     }
 
+    /// Install a named-property definer callback.
+    pub fn definer(
+        mut self,
+        cb: impl Fn(&str, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult + 'static,
+    ) -> Self {
+        self.definer = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a named-property descriptor callback.
+    pub fn descriptor(
+        mut self,
+        cb: impl Fn(&str, *mut c_void) -> DomPropertyDescriptorResult + 'static,
+    ) -> Self {
+        self.descriptor = Some(Box::new(cb));
+        self
+    }
+
     /// Set the [`NamedPropertyHandlerFlags`] bitmask that modifies the
     /// behaviour of the configured interceptors.  Replaces any previously
     /// set flags.
@@ -638,11 +822,15 @@ impl NamedPropertyHandlerConfigBuilder {
             query: self.query,
             deleter: self.deleter,
             enumerator: self.enumerator,
+            definer: self.definer,
+            descriptor: self.descriptor,
             symbol_getter: self.symbol_getter,
             symbol_setter: self.symbol_setter,
             symbol_query: self.symbol_query,
             symbol_deleter: self.symbol_deleter,
             symbol_enumerator: self.symbol_enumerator,
+            symbol_definer: self.symbol_definer,
+            symbol_descriptor: self.symbol_descriptor,
             flags: self.flags,
         }
     }
@@ -700,6 +888,25 @@ impl NamedPropertyHandlerConfigBuilder {
         self.symbol_enumerator = Some(Box::new(cb));
         self
     }
+
+    /// Install a symbol-keyed definer callback.
+    pub fn symbol_definer(
+        mut self,
+        cb: impl Fn(&SymbolKey, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult
+        + 'static,
+    ) -> Self {
+        self.symbol_definer = Some(Box::new(cb));
+        self
+    }
+
+    /// Install a symbol-keyed descriptor callback.
+    pub fn symbol_descriptor(
+        mut self,
+        cb: impl Fn(&SymbolKey, *mut c_void) -> DomPropertyDescriptorResult + 'static,
+    ) -> Self {
+        self.symbol_descriptor = Some(Box::new(cb));
+        self
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,6 +940,8 @@ pub struct IndexedPropertyHandlerConfig {
     query: Option<IndexedQueryCallback>,
     deleter: Option<IndexedDeleterCallback>,
     enumerator: Option<IndexedEnumeratorCallback>,
+    definer: Option<IndexedDefinerCallback>,
+    descriptor: Option<IndexedDescriptorCallback>,
     length: Option<IndexedLengthCallback>,
     flags: IndexedPropertyHandlerFlags,
 }
@@ -768,6 +977,16 @@ impl IndexedPropertyHandlerConfig {
         self.enumerator.as_deref()
     }
 
+    /// Return a reference to the indexed definer callback, if installed.
+    pub fn definer(&self) -> IndexedDefinerRef<'_> {
+        self.definer.as_deref()
+    }
+
+    /// Return a reference to the indexed descriptor callback, if installed.
+    pub fn descriptor(&self) -> IndexedDescriptorRef<'_> {
+        self.descriptor.as_deref()
+    }
+
     /// Return a reference to the length callback, if installed.
     pub fn length(&self) -> Option<&dyn Fn(*mut c_void) -> u32> {
         self.length.as_deref()
@@ -776,6 +995,22 @@ impl IndexedPropertyHandlerConfig {
     /// Return the flag bitset configured on this handler.
     pub fn flags(&self) -> IndexedPropertyHandlerFlags {
         self.flags
+    }
+
+    /// Consume this config and return a builder pre-populated with every
+    /// installed indexed callback and the current flag bitset.
+    pub fn into_builder(self) -> IndexedPropertyHandlerConfigBuilder {
+        IndexedPropertyHandlerConfigBuilder {
+            getter: self.getter,
+            setter: self.setter,
+            query: self.query,
+            deleter: self.deleter,
+            enumerator: self.enumerator,
+            definer: self.definer,
+            descriptor: self.descriptor,
+            length: self.length,
+            flags: self.flags,
+        }
     }
 }
 
@@ -787,6 +1022,8 @@ impl std::fmt::Debug for IndexedPropertyHandlerConfig {
             .field("has_query", &self.query.is_some())
             .field("has_deleter", &self.deleter.is_some())
             .field("has_enumerator", &self.enumerator.is_some())
+            .field("has_definer", &self.definer.is_some())
+            .field("has_descriptor", &self.descriptor.is_some())
             .field("has_length", &self.length.is_some())
             .field("flags", &self.flags)
             .finish()
@@ -801,6 +1038,8 @@ pub struct IndexedPropertyHandlerConfigBuilder {
     query: Option<IndexedQueryCallback>,
     deleter: Option<IndexedDeleterCallback>,
     enumerator: Option<IndexedEnumeratorCallback>,
+    definer: Option<IndexedDefinerCallback>,
+    descriptor: Option<IndexedDescriptorCallback>,
     length: Option<IndexedLengthCallback>,
     flags: IndexedPropertyHandlerFlags,
 }
@@ -849,6 +1088,24 @@ impl IndexedPropertyHandlerConfigBuilder {
         self
     }
 
+    /// Install an indexed-property definer callback.
+    pub fn definer(
+        mut self,
+        cb: impl Fn(u32, &DomPropertyDescriptor, *mut c_void) -> DomPropertyDefineResult + 'static,
+    ) -> Self {
+        self.definer = Some(Box::new(cb));
+        self
+    }
+
+    /// Install an indexed-property descriptor callback.
+    pub fn descriptor(
+        mut self,
+        cb: impl Fn(u32, *mut c_void) -> DomPropertyDescriptorResult + 'static,
+    ) -> Self {
+        self.descriptor = Some(Box::new(cb));
+        self
+    }
+
     /// Install an indexed-property length callback.
     pub fn length(mut self, cb: impl Fn(*mut c_void) -> u32 + 'static) -> Self {
         self.length = Some(Box::new(cb));
@@ -871,6 +1128,8 @@ impl IndexedPropertyHandlerConfigBuilder {
             query: self.query,
             deleter: self.deleter,
             enumerator: self.enumerator,
+            definer: self.definer,
+            descriptor: self.descriptor,
             length: self.length,
             flags: self.flags,
         }
@@ -897,6 +1156,10 @@ pub enum AccessCheckOperation {
     NamedDelete,
     /// Named-property enumeration (e.g. `for-in`, `Object.keys`).
     NamedEnumerate,
+    /// Named-property definition (`Object.defineProperty`).
+    NamedDefine,
+    /// Named-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+    NamedDescriptor,
     /// Indexed-property read (e.g. `nodeList[0]`).
     IndexedGet,
     /// Indexed-property write (e.g. `nodeList[0] = x`).
@@ -909,6 +1172,10 @@ pub enum AccessCheckOperation {
     IndexedEnumerate,
     /// Indexed-collection length query.
     IndexedLength,
+    /// Indexed-property definition (`Object.defineProperty` for an array index).
+    IndexedDefine,
+    /// Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+    IndexedDescriptor,
 }
 
 /// Key associated with an [`AccessCheckOperation`].
@@ -1376,6 +1643,74 @@ impl DomObjectWrap {
         self.properties.borrow().contains_key(key)
     }
 
+    /// Define a named property through the definer interceptor.
+    ///
+    /// Access-check denial fails closed as [`DomPropertyDefineResult::Rejected`].
+    /// If no definer is installed, or `NON_MASKING` skips an existing own
+    /// property, this returns [`DomPropertyDefineResult::NotIntercepted`].
+    pub fn define_property(
+        &self,
+        key: &str,
+        descriptor: &DomPropertyDescriptor,
+    ) -> DomPropertyDefineResult {
+        if !self.check_access(
+            AccessCheckOperation::NamedDefine,
+            AccessCheckKey::Named(key),
+        ) {
+            return DomPropertyDefineResult::Rejected;
+        }
+        if let Some(cfg) = &self.named_handler {
+            if cfg.flags().contains(NamedPropertyHandlerFlags::NON_MASKING)
+                && self.properties.borrow().contains_key(key)
+            {
+                return DomPropertyDefineResult::NotIntercepted;
+            }
+            if let Some(definer) = cfg.definer() {
+                return definer(key, descriptor, self.data_ptr());
+            }
+        }
+        DomPropertyDefineResult::NotIntercepted
+    }
+
+    /// Look up a named own-property descriptor through the descriptor
+    /// interceptor, then through the wrapper's own-property map.
+    pub fn get_property_descriptor(&self, key: &str) -> DomPropertyDescriptorResult {
+        let allowed = self.check_access(
+            AccessCheckOperation::NamedDescriptor,
+            AccessCheckKey::Named(key),
+        );
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        let non_masking = flags.contains(NamedPropertyHandlerFlags::NON_MASKING);
+        if let Some(cfg) = &self.named_handler
+            && (allowed || all_can_read)
+            && (!non_masking || !self.properties.borrow().contains_key(key))
+            && let Some(descriptor) = cfg.descriptor()
+        {
+            return descriptor(key, self.data_ptr());
+        }
+        if !allowed {
+            return DomPropertyDescriptorResult::Rejected;
+        }
+        self.properties
+            .borrow()
+            .get(key)
+            .cloned()
+            .map(|value| {
+                DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
+                    value,
+                    PropertyAttributes::WRITABLE
+                        | PropertyAttributes::ENUMERABLE
+                        | PropertyAttributes::CONFIGURABLE,
+                ))
+            })
+            .unwrap_or(DomPropertyDescriptorResult::NotIntercepted)
+    }
+
     /// Delete a named property, consulting the access-check callback
     /// first.  A denial returns `false` and leaves the property in place.
     pub fn delete_property(&mut self, key: &str) -> bool {
@@ -1524,6 +1859,53 @@ impl DomObjectWrap {
             return deleter(key, self.data_ptr());
         }
         false
+    }
+
+    /// Define a symbol-keyed named property through the interceptor.
+    pub fn define_symbol_property(
+        &self,
+        key: &SymbolKey,
+        descriptor: &DomPropertyDescriptor,
+    ) -> DomPropertyDefineResult {
+        if !self.check_access(
+            AccessCheckOperation::NamedDefine,
+            AccessCheckKey::Symbol(key),
+        ) {
+            return DomPropertyDefineResult::Rejected;
+        }
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && let Some(definer) = cfg.symbol_definer()
+        {
+            return definer(key, descriptor, self.data_ptr());
+        }
+        DomPropertyDefineResult::NotIntercepted
+    }
+
+    /// Look up a symbol-keyed property descriptor through the interceptor.
+    pub fn get_symbol_property_descriptor(&self, key: &SymbolKey) -> DomPropertyDescriptorResult {
+        let allowed = self.check_access(
+            AccessCheckOperation::NamedDescriptor,
+            AccessCheckKey::Symbol(key),
+        );
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        if let Some(cfg) = &self.named_handler
+            && cfg.symbols_enabled()
+            && (allowed || all_can_read)
+            && let Some(descriptor) = cfg.symbol_descriptor()
+        {
+            return descriptor(key, self.data_ptr());
+        }
+        if allowed {
+            DomPropertyDescriptorResult::NotIntercepted
+        } else {
+            DomPropertyDescriptorResult::Rejected
+        }
     }
 
     /// Enumerate the symbol-keyed properties reported by the
@@ -1685,6 +2067,53 @@ impl DomObjectWrap {
         Vec::new()
     }
 
+    /// Define an indexed property through the definer interceptor.
+    pub fn define_indexed(
+        &self,
+        index: u32,
+        descriptor: &DomPropertyDescriptor,
+    ) -> DomPropertyDefineResult {
+        if !self.check_access(
+            AccessCheckOperation::IndexedDefine,
+            AccessCheckKey::Indexed(index),
+        ) {
+            return DomPropertyDefineResult::Rejected;
+        }
+        if let Some(cfg) = &self.indexed_handler
+            && let Some(definer) = cfg.definer()
+        {
+            return definer(index, descriptor, self.data_ptr());
+        }
+        DomPropertyDefineResult::NotIntercepted
+    }
+
+    /// Look up an indexed property descriptor through the descriptor interceptor.
+    pub fn get_indexed_descriptor(&self, index: u32) -> DomPropertyDescriptorResult {
+        let allowed = self.check_access(
+            AccessCheckOperation::IndexedDescriptor,
+            AccessCheckKey::Indexed(index),
+        );
+        let all_can_read = self
+            .indexed_handler
+            .as_ref()
+            .map(|c| {
+                c.flags()
+                    .contains(IndexedPropertyHandlerFlags::ALL_CAN_READ)
+            })
+            .unwrap_or(false);
+        if let Some(cfg) = &self.indexed_handler
+            && (allowed || all_can_read)
+            && let Some(descriptor) = cfg.descriptor()
+        {
+            return descriptor(index, self.data_ptr());
+        }
+        if allowed {
+            DomPropertyDescriptorResult::NotIntercepted
+        } else {
+            DomPropertyDescriptorResult::Rejected
+        }
+    }
+
     // ── interceptor installation ─────────────────────────────────────────
 
     /// Install a named-property handler configuration.
@@ -1711,6 +2140,11 @@ impl DomObjectWrap {
     /// Install an indexed-property handler configuration.
     pub fn set_indexed_handler(&mut self, config: IndexedPropertyHandlerConfig) {
         self.indexed_handler = Some(config);
+    }
+
+    /// Take the currently-installed indexed-property handler configuration.
+    pub fn take_indexed_handler(&mut self) -> Option<IndexedPropertyHandlerConfig> {
+        self.indexed_handler.take()
     }
 
     /// Return `true` if an indexed-property handler is installed.
@@ -3236,5 +3670,144 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("has_deleter: true"));
         assert!(dbg.contains("has_enumerator: true"));
+    }
+
+    #[test]
+    fn test_named_descriptor_and_definer_callbacks() {
+        let defined = Rc::new(RefCell::new(Vec::<(String, DomPropertyDescriptor)>::new()));
+        let defined_log = Rc::clone(&defined);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .descriptor(|name, _| {
+                    if name == "id" {
+                        DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
+                            JsValue::String("node".into()),
+                            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+                        ))
+                    } else {
+                        DomPropertyDescriptorResult::NotIntercepted
+                    }
+                })
+                .definer(move |name, desc, _| {
+                    defined_log
+                        .borrow_mut()
+                        .push((name.to_string(), desc.clone()));
+                    DomPropertyDefineResult::Handled
+                })
+                .build(),
+        );
+
+        let desc = wrap.get_property_descriptor("id");
+        match desc {
+            DomPropertyDescriptorResult::Descriptor(d) => {
+                assert_eq!(d.value(), Some(&JsValue::String("node".into())));
+                assert!(d.attributes().contains(PropertyAttributes::ENUMERABLE));
+                assert!(!d.attributes().contains(PropertyAttributes::WRITABLE));
+            }
+            other => panic!("unexpected descriptor result: {other:?}"),
+        }
+        let input = DomPropertyDescriptor::data(
+            JsValue::Smi(7),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        assert_eq!(
+            wrap.define_property("id", &input),
+            DomPropertyDefineResult::Handled
+        );
+        assert_eq!(defined.borrow().len(), 1);
+        assert_eq!(defined.borrow()[0].0, "id");
+    }
+
+    #[test]
+    fn test_named_symbol_descriptor_requires_flag() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .symbol_descriptor(|_, _| {
+                    DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
+                        JsValue::Smi(1),
+                        PropertyAttributes::ENUMERABLE,
+                    ))
+                })
+                .symbol_definer(|_, _, _| DomPropertyDefineResult::Handled)
+                .build(),
+        );
+        let sym = iter_sym();
+        assert_eq!(
+            wrap.get_symbol_property_descriptor(&sym),
+            DomPropertyDescriptorResult::NotIntercepted
+        );
+        assert_eq!(
+            wrap.define_symbol_property(
+                &sym,
+                &DomPropertyDescriptor::data(JsValue::Smi(1), PropertyAttributes::empty())
+            ),
+            DomPropertyDefineResult::NotIntercepted
+        );
+        assert!(wrap.set_named_handler_flags(NamedPropertyHandlerFlags::INTERCEPT_SYMBOLS));
+        assert!(matches!(
+            wrap.get_symbol_property_descriptor(&sym),
+            DomPropertyDescriptorResult::Descriptor(_)
+        ));
+    }
+
+    #[test]
+    fn test_indexed_descriptor_define_access_check_and_no_intercept() {
+        let calls = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let calls_def = Rc::clone(&calls);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_indexed_handler(
+            IndexedPropertyHandlerConfig::builder()
+                .descriptor(|index, _| {
+                    if index == 2 {
+                        DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
+                            JsValue::Smi(20),
+                            PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
+                        ))
+                    } else {
+                        DomPropertyDescriptorResult::NotIntercepted
+                    }
+                })
+                .definer(move |index, _, _| {
+                    calls_def.borrow_mut().push(index);
+                    DomPropertyDefineResult::Rejected
+                })
+                .build(),
+        );
+        assert!(matches!(
+            wrap.get_indexed_descriptor(2),
+            DomPropertyDescriptorResult::Descriptor(_)
+        ));
+        assert_eq!(
+            wrap.get_indexed_descriptor(3),
+            DomPropertyDescriptorResult::NotIntercepted
+        );
+        assert_eq!(
+            wrap.define_indexed(
+                2,
+                &DomPropertyDescriptor::data(JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            ),
+            DomPropertyDefineResult::Rejected
+        );
+        assert_eq!(calls.borrow().as_slice(), &[2]);
+
+        wrap.set_access_check(Box::new(|op, _, _| {
+            !matches!(
+                op,
+                AccessCheckOperation::IndexedDefine | AccessCheckOperation::IndexedDescriptor
+            )
+        }));
+        assert_eq!(
+            wrap.get_indexed_descriptor(2),
+            DomPropertyDescriptorResult::Rejected
+        );
+        assert_eq!(
+            wrap.define_indexed(
+                4,
+                &DomPropertyDescriptor::data(JsValue::Smi(1), PropertyAttributes::empty())
+            ),
+            DomPropertyDefineResult::Rejected
+        );
     }
 }

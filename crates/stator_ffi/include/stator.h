@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 17
+#define STATOR_FFI_ABI_VERSION_MINOR 18
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -104,6 +104,26 @@
  * Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
  */
 #define STATOR_JIT_MEMORY_TIER_COUNT 4
+
+/**
+ * DOM property descriptor flag for writable data properties.
+ */
+#define STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE (1 << 0)
+
+/**
+ * DOM property descriptor flag for enumerable properties.
+ */
+#define STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE (1 << 1)
+
+/**
+ * DOM property descriptor flag for configurable properties.
+ */
+#define STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE (1 << 2)
+
+/**
+ * Mask of descriptor attribute bits recognised by this build.
+ */
+#define STATOR_DOM_PROPERTY_ATTRIBUTE_ALL ((STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE | STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE) | STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE)
 
 /**
  * Default named-property handler behaviour; no flag bits set.
@@ -840,7 +860,45 @@ typedef enum StatorDomAccessCheckOperation {
    * Indexed-property enumeration (e.g. `for (let i in nodeList)`).
    */
   StatorDomAccessCheckOperationIndexedEnumerate = 10,
+  /**
+   * Named-property definition (`Object.defineProperty`).
+   */
+  StatorDomAccessCheckOperationNamedDefine = 11,
+  /**
+   * Named-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+   */
+  StatorDomAccessCheckOperationNamedDescriptor = 12,
+  /**
+   * Indexed-property definition (`Object.defineProperty` on an index).
+   */
+  StatorDomAccessCheckOperationIndexedDefine = 13,
+  /**
+   * Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+   */
+  StatorDomAccessCheckOperationIndexedDescriptor = 14,
 } StatorDomAccessCheckOperation;
+
+/**
+ * C-visible result for direct definer invocation helpers.
+ */
+typedef enum StatorDomPropertyDefineCallbackResult {
+  /**
+   * Interceptor handled the definition.
+   */
+  StatorDomPropertyDefineCallbackHandled = 0,
+  /**
+   * Interceptor declined; caller may fall through.
+   */
+  StatorDomPropertyDefineCallbackNoIntercept = 1,
+  /**
+   * Interceptor handled and rejected the definition.
+   */
+  StatorDomPropertyDefineCallbackRejected = 2,
+  /**
+   * Interceptor failed with an exception/error.
+   */
+  StatorDomPropertyDefineCallbackException = 3,
+} StatorDomPropertyDefineCallbackResult;
 
 /**
  * Host-visible Promise rejection event kind.
@@ -949,6 +1007,18 @@ typedef enum StatorNativeCodeCacheTier {
    */
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
+
+typedef struct Option_StatorDomIndexedDefinerCb Option_StatorDomIndexedDefinerCb;
+
+typedef struct Option_StatorDomIndexedDescriptorCb Option_StatorDomIndexedDescriptorCb;
+
+typedef struct Option_StatorDomNamedDefinerCb Option_StatorDomNamedDefinerCb;
+
+typedef struct Option_StatorDomNamedDescriptorCb Option_StatorDomNamedDescriptorCb;
+
+typedef struct Option_StatorDomNamedSymbolDefinerCb Option_StatorDomNamedSymbolDefinerCb;
+
+typedef struct Option_StatorDomNamedSymbolDescriptorCb Option_StatorDomNamedSymbolDescriptorCb;
 
 typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
 
@@ -2539,6 +2609,50 @@ typedef struct StatorTraced {
 } StatorTraced;
 
 /**
+ * FFI representation of a DOM property descriptor.
+ *
+ * `present == false` represents a missing/no-intercept descriptor in helper
+ * results.  Installed descriptor callbacks return `StatorStatusOk` with this
+ * struct populated; data descriptors set `has_value`, while accessor
+ * descriptors set `has_getter` and/or `has_setter`.  Stator stores accessor
+ * values but generic DOM-wrapper accessor invocation is not wired yet.
+ */
+typedef struct StatorDomPropertyDescriptor {
+  /**
+   * Whether a descriptor is present in helper output.
+   */
+  bool present;
+  /**
+   * Bitwise OR of `STATOR_DOM_PROPERTY_ATTRIBUTE_*` values.
+   */
+  uint32_t attributes;
+  /**
+   * Whether `value` is populated for a data descriptor.
+   */
+  bool has_value;
+  /**
+   * Data value.  Borrowed for definer input; owned by caller in helper output.
+   */
+  struct StatorValue *value;
+  /**
+   * Whether `getter` is populated for an accessor descriptor.
+   */
+  bool has_getter;
+  /**
+   * Accessor getter value, if representable.
+   */
+  struct StatorValue *getter;
+  /**
+   * Whether `setter` is populated for an accessor descriptor.
+   */
+  bool has_setter;
+  /**
+   * Accessor setter value, if representable.
+   */
+  struct StatorValue *setter;
+} StatorDomPropertyDescriptor;
+
+/**
  * POD bundle of named-property interceptors, installed in one call by
  * [`stator_dom_object_wrap_install_named_handler`].
  *
@@ -2698,6 +2812,50 @@ typedef struct StatorDomNamedSymbolHandler {
    */
   void *data;
 } StatorDomNamedSymbolHandler;
+
+/**
+ * Additive named/symbol definer + descriptor callback bundle.
+ */
+typedef struct StatorDomNamedDefinerDescriptorHandler {
+  /**
+   * String-keyed definer, or null.
+   */
+  struct Option_StatorDomNamedDefinerCb definer;
+  /**
+   * String-keyed descriptor callback, or null.
+   */
+  struct Option_StatorDomNamedDescriptorCb descriptor;
+  /**
+   * Symbol-keyed definer, or null.
+   */
+  struct Option_StatorDomNamedSymbolDefinerCb symbol_definer;
+  /**
+   * Symbol-keyed descriptor callback, or null.
+   */
+  struct Option_StatorDomNamedSymbolDescriptorCb symbol_descriptor;
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomNamedDefinerDescriptorHandler;
+
+/**
+ * Additive indexed definer + descriptor callback bundle.
+ */
+typedef struct StatorDomIndexedDefinerDescriptorHandler {
+  /**
+   * Indexed definer, or null.
+   */
+  struct Option_StatorDomIndexedDefinerCb definer;
+  /**
+   * Indexed descriptor callback, or null.
+   */
+  struct Option_StatorDomIndexedDescriptorCb descriptor;
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomIndexedDefinerDescriptorHandler;
 
 /**
  * C-callable Promise rejection event callback signature.
@@ -7360,6 +7518,16 @@ bool stator_dom_object_wrap_clear_access_check(struct StatorDomObjectWrap *wrap)
 bool stator_dom_object_wrap_has_access_check(const struct StatorDomObjectWrap *wrap);
 
 /**
+ * Destroy any `StatorValue` handles owned by a descriptor returned from a
+ * descriptor invocation helper, and reset the descriptor to empty.
+ *
+ * # Safety
+ * `descriptor` must be null or a writable descriptor previously populated by
+ * a Stator helper. Borrowed input descriptors must not be cleared with this.
+ */
+void stator_dom_property_descriptor_clear(struct StatorDomPropertyDescriptor *descriptor);
+
+/**
  * Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
  * [`stator_dom_index_buffer_destroy`].
  *
@@ -7726,6 +7894,107 @@ size_t stator_dom_symbol_buffer_len(const struct StatorDomSymbolBuffer *buf);
 enum StatorStatus stator_dom_symbol_buffer_get(const struct StatorDomSymbolBuffer *buf,
                                                size_t index,
                                                struct StatorDomSymbolKey *out_key);
+
+/**
+ * Install additive named/symbol definer and descriptor callbacks on `wrap`.
+ *
+ * Existing getter/setter/query/delete/enumerator callbacks and handler flags
+ * are preserved. Symbol callbacks remain gated by `INTERCEPT_SYMBOLS`.
+ *
+ * # Safety
+ * `wrap` must be a valid live DOM wrapper and `handler` must be a readable
+ * pointer whose callback function pointers remain valid for the wrapper's
+ * lifetime.
+ */
+enum StatorStatus stator_dom_object_wrap_install_named_definer_descriptor_handler(struct StatorDomObjectWrap *wrap,
+                                                                                  const struct StatorDomNamedDefinerDescriptorHandler *handler);
+
+/**
+ * Install additive indexed definer and descriptor callbacks on `wrap`.
+ *
+ * # Safety
+ * `wrap` must be a valid live DOM wrapper and `handler` must be a readable
+ * pointer whose callback function pointers remain valid for the wrapper's
+ * lifetime.
+ */
+enum StatorStatus stator_dom_object_wrap_install_indexed_definer_descriptor_handler(struct StatorDomObjectWrap *wrap,
+                                                                                    const struct StatorDomIndexedDefinerDescriptorHandler *handler);
+
+/**
+ * Invoke the named definer path for a string key.
+ *
+ * # Safety
+ * `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+ * the call. `name_utf8` must point to `name_len` bytes when `name_len > 0`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_named_definer(struct StatorDomObjectWrap *wrap,
+                                                              const char *name_utf8,
+                                                              size_t name_len,
+                                                              const struct StatorDomPropertyDescriptor *descriptor,
+                                                              enum StatorDomPropertyDefineCallbackResult *out_result);
+
+/**
+ * Invoke the named descriptor path for a string key.
+ *
+ * # Safety
+ * `wrap` and `out_descriptor` must be valid for the duration of the call.
+ * `name_utf8` must point to `name_len` bytes when `name_len > 0`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_named_descriptor(struct StatorDomObjectWrap *wrap,
+                                                                 const char *name_utf8,
+                                                                 size_t name_len,
+                                                                 struct StatorDomPropertyDescriptor *out_descriptor);
+
+/**
+ * Invoke the symbol-keyed definer path.
+ *
+ * # Safety
+ * `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+ * the call. `description_utf8` must point to `description_len` bytes when
+ * `description_len > 0`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_definer(struct StatorDomObjectWrap *wrap,
+                                                               uint64_t symbol_id,
+                                                               const char *description_utf8,
+                                                               size_t description_len,
+                                                               const struct StatorDomPropertyDescriptor *descriptor,
+                                                               enum StatorDomPropertyDefineCallbackResult *out_result);
+
+/**
+ * Invoke the symbol-keyed descriptor path.
+ *
+ * # Safety
+ * `wrap` and `out_descriptor` must be valid for the duration of the call.
+ * `description_utf8` must point to `description_len` bytes when
+ * `description_len > 0`.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_symbol_descriptor(struct StatorDomObjectWrap *wrap,
+                                                                  uint64_t symbol_id,
+                                                                  const char *description_utf8,
+                                                                  size_t description_len,
+                                                                  struct StatorDomPropertyDescriptor *out_descriptor);
+
+/**
+ * Invoke the indexed definer path.
+ *
+ * # Safety
+ * `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+ * the call.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_indexed_definer(struct StatorDomObjectWrap *wrap,
+                                                                uint32_t index,
+                                                                const struct StatorDomPropertyDescriptor *descriptor,
+                                                                enum StatorDomPropertyDefineCallbackResult *out_result);
+
+/**
+ * Invoke the indexed descriptor path.
+ *
+ * # Safety
+ * `wrap` and `out_descriptor` must be valid for the duration of the call.
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_indexed_descriptor(struct StatorDomObjectWrap *wrap,
+                                                                   uint32_t index,
+                                                                   struct StatorDomPropertyDescriptor *out_descriptor);
 
 /**
  * Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.

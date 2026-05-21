@@ -37,6 +37,7 @@ use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
 use stator_jse::compiler::osr_counters::{self, OsrExitReason, OsrTier};
 use stator_jse::dom::{
     AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
+    DomPropertyDefineResult, DomPropertyDescriptor, DomPropertyDescriptorResult,
     IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
     NamedPropertyHandlerFlags,
 };
@@ -90,7 +91,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 17;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 18;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -18096,6 +18097,14 @@ pub enum StatorDomAccessCheckOperation {
     StatorDomAccessCheckOperationIndexedDelete = 9,
     /// Indexed-property enumeration (e.g. `for (let i in nodeList)`).
     StatorDomAccessCheckOperationIndexedEnumerate = 10,
+    /// Named-property definition (`Object.defineProperty`).
+    StatorDomAccessCheckOperationNamedDefine = 11,
+    /// Named-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+    StatorDomAccessCheckOperationNamedDescriptor = 12,
+    /// Indexed-property definition (`Object.defineProperty` on an index).
+    StatorDomAccessCheckOperationIndexedDefine = 13,
+    /// Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
+    StatorDomAccessCheckOperationIndexedDescriptor = 14,
 }
 
 /// C-callable access-check (security) callback for a DOM wrapper.
@@ -18147,6 +18156,12 @@ fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
         AccessCheckOperation::NamedEnumerate => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedEnumerate
         }
+        AccessCheckOperation::NamedDefine => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedDefine
+        }
+        AccessCheckOperation::NamedDescriptor => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationNamedDescriptor
+        }
         AccessCheckOperation::IndexedGet => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedGet
         }
@@ -18164,6 +18179,12 @@ fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
         }
         AccessCheckOperation::IndexedEnumerate => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedEnumerate
+        }
+        AccessCheckOperation::IndexedDefine => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDefine
+        }
+        AccessCheckOperation::IndexedDescriptor => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDescriptor
         }
     }
 }
@@ -18585,6 +18606,341 @@ pub struct StatorDomIndexedHandler {
     pub data: *mut c_void,
 }
 
+/// DOM property descriptor flag for writable data properties.
+pub const STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE: u32 = 1 << 0;
+/// DOM property descriptor flag for enumerable properties.
+pub const STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE: u32 = 1 << 1;
+/// DOM property descriptor flag for configurable properties.
+pub const STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE: u32 = 1 << 2;
+/// Mask of descriptor attribute bits recognised by this build.
+pub const STATOR_DOM_PROPERTY_ATTRIBUTE_ALL: u32 = STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE
+    | STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE
+    | STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE;
+
+/// FFI representation of a DOM property descriptor.
+///
+/// `present == false` represents a missing/no-intercept descriptor in helper
+/// results.  Installed descriptor callbacks return `StatorStatusOk` with this
+/// struct populated; data descriptors set `has_value`, while accessor
+/// descriptors set `has_getter` and/or `has_setter`.  Stator stores accessor
+/// values but generic DOM-wrapper accessor invocation is not wired yet.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomPropertyDescriptor {
+    /// Whether a descriptor is present in helper output.
+    pub present: bool,
+    /// Bitwise OR of `STATOR_DOM_PROPERTY_ATTRIBUTE_*` values.
+    pub attributes: u32,
+    /// Whether `value` is populated for a data descriptor.
+    pub has_value: bool,
+    /// Data value.  Borrowed for definer input; owned by caller in helper output.
+    pub value: *mut StatorValue,
+    /// Whether `getter` is populated for an accessor descriptor.
+    pub has_getter: bool,
+    /// Accessor getter value, if representable.
+    pub getter: *mut StatorValue,
+    /// Whether `setter` is populated for an accessor descriptor.
+    pub has_setter: bool,
+    /// Accessor setter value, if representable.
+    pub setter: *mut StatorValue,
+}
+
+impl Default for StatorDomPropertyDescriptor {
+    fn default() -> Self {
+        Self {
+            present: false,
+            attributes: 0,
+            has_value: false,
+            value: std::ptr::null_mut(),
+            has_getter: false,
+            getter: std::ptr::null_mut(),
+            has_setter: false,
+            setter: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// C-visible result for direct definer invocation helpers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorDomPropertyDefineCallbackResult {
+    /// Interceptor handled the definition.
+    StatorDomPropertyDefineCallbackHandled = 0,
+    /// Interceptor declined; caller may fall through.
+    StatorDomPropertyDefineCallbackNoIntercept = 1,
+    /// Interceptor handled and rejected the definition.
+    StatorDomPropertyDefineCallbackRejected = 2,
+    /// Interceptor failed with an exception/error.
+    StatorDomPropertyDefineCallbackException = 3,
+}
+
+/// Named-property definer callback.
+pub type StatorDomNamedDefinerCb = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    descriptor: *const StatorDomPropertyDescriptor,
+    data: *mut c_void,
+) -> StatorStatus;
+
+/// Named-property descriptor callback.
+pub type StatorDomNamedDescriptorCb = unsafe extern "C" fn(
+    name_utf8: *const c_char,
+    name_len: usize,
+    data: *mut c_void,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus;
+
+/// Symbol-keyed named-property definer callback.
+pub type StatorDomNamedSymbolDefinerCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    descriptor: *const StatorDomPropertyDescriptor,
+    data: *mut c_void,
+) -> StatorStatus;
+
+/// Symbol-keyed named-property descriptor callback.
+pub type StatorDomNamedSymbolDescriptorCb = unsafe extern "C" fn(
+    key: *const StatorDomSymbolKey,
+    data: *mut c_void,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus;
+
+/// Indexed-property definer callback.
+pub type StatorDomIndexedDefinerCb = unsafe extern "C" fn(
+    index: u32,
+    descriptor: *const StatorDomPropertyDescriptor,
+    data: *mut c_void,
+) -> StatorStatus;
+
+/// Indexed-property descriptor callback.
+pub type StatorDomIndexedDescriptorCb = unsafe extern "C" fn(
+    index: u32,
+    data: *mut c_void,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus;
+
+/// Additive named/symbol definer + descriptor callback bundle.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomNamedDefinerDescriptorHandler {
+    /// String-keyed definer, or null.
+    pub definer: Option<StatorDomNamedDefinerCb>,
+    /// String-keyed descriptor callback, or null.
+    pub descriptor: Option<StatorDomNamedDescriptorCb>,
+    /// Symbol-keyed definer, or null.
+    pub symbol_definer: Option<StatorDomNamedSymbolDefinerCb>,
+    /// Symbol-keyed descriptor callback, or null.
+    pub symbol_descriptor: Option<StatorDomNamedSymbolDescriptorCb>,
+    /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+/// Additive indexed definer + descriptor callback bundle.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomIndexedDefinerDescriptorHandler {
+    /// Indexed definer, or null.
+    pub definer: Option<StatorDomIndexedDefinerCb>,
+    /// Indexed descriptor callback, or null.
+    pub descriptor: Option<StatorDomIndexedDescriptorCb>,
+    /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+fn property_attrs_from_bits(bits: u32) -> Result<PropertyAttributes, StatorStatus> {
+    if bits & !STATOR_DOM_PROPERTY_ATTRIBUTE_ALL != 0 {
+        return Err(StatorStatus::StatorStatusInvalidArg);
+    }
+    let mut attrs = PropertyAttributes::empty();
+    if bits & STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE != 0 {
+        attrs |= PropertyAttributes::WRITABLE;
+    }
+    if bits & STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE != 0 {
+        attrs |= PropertyAttributes::ENUMERABLE;
+    }
+    if bits & STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE != 0 {
+        attrs |= PropertyAttributes::CONFIGURABLE;
+    }
+    Ok(attrs)
+}
+
+fn property_attrs_to_bits(attrs: PropertyAttributes) -> u32 {
+    let mut bits = 0;
+    if attrs.contains(PropertyAttributes::WRITABLE) {
+        bits |= STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE;
+    }
+    if attrs.contains(PropertyAttributes::ENUMERABLE) {
+        bits |= STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE;
+    }
+    if attrs.contains(PropertyAttributes::CONFIGURABLE) {
+        bits |= STATOR_DOM_PROPERTY_ATTRIBUTE_CONFIGURABLE;
+    }
+    bits
+}
+
+unsafe fn ffi_descriptor_to_dom(
+    descriptor: *const StatorDomPropertyDescriptor,
+) -> Result<DomPropertyDescriptor, StatorStatus> {
+    if descriptor.is_null() {
+        return Err(StatorStatus::StatorStatusInvalidArg);
+    }
+    // SAFETY: caller guaranteed descriptor is readable.
+    let d = unsafe { &*descriptor };
+    let attrs = property_attrs_from_bits(d.attributes)?;
+    if d.has_value {
+        if d.value.is_null() {
+            return Err(StatorStatus::StatorStatusInvalidArg);
+        }
+        // SAFETY: `value` is a borrowed valid StatorValue pointer.
+        let value = stator_value_inner_to_jsvalue(unsafe { &(*d.value).inner });
+        Ok(DomPropertyDescriptor::data(value, attrs))
+    } else {
+        let get = if d.has_getter {
+            if d.getter.is_null() {
+                return Err(StatorStatus::StatorStatusInvalidArg);
+            }
+            // SAFETY: `getter` is a borrowed valid StatorValue pointer.
+            Some(stator_value_inner_to_jsvalue(unsafe { &(*d.getter).inner }))
+        } else {
+            None
+        };
+        let set = if d.has_setter {
+            if d.setter.is_null() {
+                return Err(StatorStatus::StatorStatusInvalidArg);
+            }
+            // SAFETY: `setter` is a borrowed valid StatorValue pointer.
+            Some(stator_value_inner_to_jsvalue(unsafe { &(*d.setter).inner }))
+        } else {
+            None
+        };
+        if get.is_some() || set.is_some() {
+            Ok(DomPropertyDescriptor::accessor(get, set, attrs))
+        } else {
+            Ok(DomPropertyDescriptor::data(JsValue::Undefined, attrs))
+        }
+    }
+}
+
+unsafe fn dom_descriptor_to_ffi(
+    descriptor: &DomPropertyDescriptor,
+    isolate: *mut StatorIsolate,
+    out: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus {
+    if out.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let mut ffi = StatorDomPropertyDescriptor {
+        present: true,
+        attributes: property_attrs_to_bits(descriptor.attributes()),
+        ..StatorDomPropertyDescriptor::default()
+    };
+    if let Some(value) = descriptor.value() {
+        ffi.has_value = true;
+        let inner = jsvalue_to_stator_value_inner(value);
+        ffi.value = Box::into_raw(Box::new(StatorValue { inner, isolate }));
+        if !isolate.is_null() {
+            // SAFETY: isolate is the wrapper's valid isolate pointer.
+            unsafe { (*isolate).live_objects += 1 };
+        }
+    }
+    if let Some(getter) = descriptor.get() {
+        ffi.has_getter = true;
+        let inner = jsvalue_to_stator_value_inner(getter);
+        ffi.getter = Box::into_raw(Box::new(StatorValue { inner, isolate }));
+        if !isolate.is_null() {
+            // SAFETY: isolate is the wrapper's valid isolate pointer.
+            unsafe { (*isolate).live_objects += 1 };
+        }
+    }
+    if let Some(setter) = descriptor.set() {
+        ffi.has_setter = true;
+        let inner = jsvalue_to_stator_value_inner(setter);
+        ffi.setter = Box::into_raw(Box::new(StatorValue { inner, isolate }));
+        if !isolate.is_null() {
+            // SAFETY: isolate is the wrapper's valid isolate pointer.
+            unsafe { (*isolate).live_objects += 1 };
+        }
+    }
+    // SAFETY: caller guarantees `out` is writable.
+    unsafe { *out = ffi };
+    StatorStatus::StatorStatusOk
+}
+
+fn define_result_to_ffi(result: DomPropertyDefineResult) -> StatorDomPropertyDefineCallbackResult {
+    match result {
+        DomPropertyDefineResult::Handled => {
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackHandled
+        }
+        DomPropertyDefineResult::NotIntercepted => {
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackNoIntercept
+        }
+        DomPropertyDefineResult::Rejected => {
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected
+        }
+        DomPropertyDefineResult::Exception => {
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackException
+        }
+    }
+}
+
+fn status_to_define_result(status: StatorStatus) -> DomPropertyDefineResult {
+    match status {
+        StatorStatus::StatorStatusOk => DomPropertyDefineResult::Handled,
+        StatorStatus::StatorStatusFalse => DomPropertyDefineResult::NotIntercepted,
+        StatorStatus::StatorStatusUnsupported => DomPropertyDefineResult::Rejected,
+        StatorStatus::StatorStatusException => DomPropertyDefineResult::Exception,
+        StatorStatus::StatorStatusInvalidArg => DomPropertyDefineResult::Rejected,
+    }
+}
+
+unsafe fn ffi_descriptor_output_to_dom(
+    out: *mut StatorDomPropertyDescriptor,
+) -> DomPropertyDescriptorResult {
+    // SAFETY: caller created a local descriptor output slot.
+    let desc = unsafe { &*out };
+    match unsafe { ffi_descriptor_to_dom(out as *const StatorDomPropertyDescriptor) } {
+        Ok(d) => {
+            if desc.has_value || desc.has_getter || desc.has_setter {
+                DomPropertyDescriptorResult::Descriptor(d)
+            } else {
+                DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
+                    JsValue::Undefined,
+                    d.attributes(),
+                ))
+            }
+        }
+        Err(_) => DomPropertyDescriptorResult::Rejected,
+    }
+}
+
+/// Destroy any `StatorValue` handles owned by a descriptor returned from a
+/// descriptor invocation helper, and reset the descriptor to empty.
+///
+/// # Safety
+/// `descriptor` must be null or a writable descriptor previously populated by
+/// a Stator helper. Borrowed input descriptors must not be cleared with this.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_property_descriptor_clear(
+    descriptor: *mut StatorDomPropertyDescriptor,
+) {
+    if descriptor.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees descriptor is writable.
+    let d = unsafe { &mut *descriptor };
+    if d.has_value && !d.value.is_null() {
+        // SAFETY: helper output transfers ownership to the caller.
+        unsafe { stator_value_destroy(d.value) };
+    }
+    if d.has_getter && !d.getter.is_null() {
+        // SAFETY: helper output transfers ownership to the caller.
+        unsafe { stator_value_destroy(d.getter) };
+    }
+    if d.has_setter && !d.setter.is_null() {
+        // SAFETY: helper output transfers ownership to the caller.
+        unsafe { stator_value_destroy(d.setter) };
+    }
+    *d = StatorDomPropertyDescriptor::default();
+}
 /// Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
 /// callback.  The callback fills it by repeatedly calling
 /// [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
@@ -19756,6 +20112,490 @@ fn build_symbol_key(
     Ok(stator_jse::dom::SymbolKey::new(symbol_id, description))
 }
 
+/// Install additive named/symbol definer and descriptor callbacks on `wrap`.
+///
+/// Existing getter/setter/query/delete/enumerator callbacks and handler flags
+/// are preserved. Symbol callbacks remain gated by `INTERCEPT_SYMBOLS`.
+///
+/// # Safety
+/// `wrap` must be a valid live DOM wrapper and `handler` must be a readable
+/// pointer whose callback function pointers remain valid for the wrapper's
+/// lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_named_definer_descriptor_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomNamedDefinerDescriptorHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.definer.is_none()
+        && h.descriptor.is_none()
+        && h.symbol_definer.is_none()
+        && h.symbol_descriptor.is_none()
+    {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let user_data_addr = h.data as usize;
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
+    let existing = unsafe { (*wrap).inner.take_named_handler() };
+    let mut builder = match existing {
+        Some(cfg) => cfg.into_builder(),
+        None => NamedPropertyHandlerConfig::builder(),
+    };
+    if let Some(cb) = h.definer {
+        builder = builder.definer(move |name, descriptor, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut ffi_desc = StatorDomPropertyDescriptor::default();
+            // SAFETY: local descriptor output is writable.
+            let status =
+                unsafe { dom_descriptor_to_ffi(descriptor, isolate, &mut ffi_desc as *mut _) };
+            if status != StatorStatus::StatorStatusOk {
+                return DomPropertyDefineResult::Rejected;
+            }
+            // SAFETY: `cb` is guaranteed valid by the embedder.
+            let status = unsafe {
+                cb(
+                    name.as_ptr() as *const c_char,
+                    name.len(),
+                    &ffi_desc as *const StatorDomPropertyDescriptor,
+                    data,
+                )
+            };
+            // SAFETY: clear temporary values allocated by dom_descriptor_to_ffi.
+            unsafe { stator_dom_property_descriptor_clear(&mut ffi_desc as *mut _) };
+            if status == StatorStatus::StatorStatusException {
+                // SAFETY: wrapper isolate captured at installation time.
+                unsafe {
+                    ensure_pending_dom_interceptor_exception(isolate, "DOM named definer exception")
+                };
+            }
+            status_to_define_result(status)
+        });
+    }
+    if let Some(cb) = h.descriptor {
+        builder = builder.descriptor(move |name, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut out = StatorDomPropertyDescriptor::default();
+            // SAFETY: `cb` is guaranteed valid by the embedder.
+            let status = unsafe {
+                cb(
+                    name.as_ptr() as *const c_char,
+                    name.len(),
+                    data,
+                    &mut out as *mut StatorDomPropertyDescriptor,
+                )
+            };
+            let result = match status {
+                StatorStatus::StatorStatusOk => unsafe { ffi_descriptor_output_to_dom(&mut out) },
+                StatorStatus::StatorStatusFalse => DomPropertyDescriptorResult::NotIntercepted,
+                StatorStatus::StatorStatusUnsupported => DomPropertyDescriptorResult::Rejected,
+                StatorStatus::StatorStatusException => {
+                    // SAFETY: wrapper isolate captured at installation time.
+                    unsafe {
+                        ensure_pending_dom_interceptor_exception(
+                            isolate,
+                            "DOM named descriptor exception",
+                        )
+                    };
+                    DomPropertyDescriptorResult::Exception
+                }
+                StatorStatus::StatorStatusInvalidArg => DomPropertyDescriptorResult::Rejected,
+            };
+            // SAFETY: callback output values, if any, were transferred to Stator.
+            unsafe { stator_dom_property_descriptor_clear(&mut out as *mut _) };
+            result
+        });
+    }
+    if let Some(cb) = h.symbol_definer {
+        builder = builder.symbol_definer(move |sym, descriptor, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut ffi_desc = StatorDomPropertyDescriptor::default();
+            let status = unsafe { dom_descriptor_to_ffi(descriptor, isolate, &mut ffi_desc) };
+            if status != StatorStatus::StatorStatusOk {
+                return DomPropertyDefineResult::Rejected;
+            }
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is guaranteed valid by the embedder.
+                unsafe { cb(k, &ffi_desc as *const StatorDomPropertyDescriptor, data) }
+            });
+            // SAFETY: clear temporary values allocated by dom_descriptor_to_ffi.
+            unsafe { stator_dom_property_descriptor_clear(&mut ffi_desc as *mut _) };
+            if status == StatorStatus::StatorStatusException {
+                // SAFETY: wrapper isolate captured at installation time.
+                unsafe {
+                    ensure_pending_dom_interceptor_exception(
+                        isolate,
+                        "DOM symbol definer exception",
+                    )
+                };
+            }
+            status_to_define_result(status)
+        });
+    }
+    if let Some(cb) = h.symbol_descriptor {
+        builder = builder.symbol_descriptor(move |sym, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut out = StatorDomPropertyDescriptor::default();
+            let status = with_symbol_ffi_key(sym, |k| {
+                // SAFETY: `cb` is guaranteed valid by the embedder.
+                unsafe { cb(k, data, &mut out as *mut StatorDomPropertyDescriptor) }
+            });
+            let result = match status {
+                StatorStatus::StatorStatusOk => unsafe { ffi_descriptor_output_to_dom(&mut out) },
+                StatorStatus::StatorStatusFalse => DomPropertyDescriptorResult::NotIntercepted,
+                StatorStatus::StatorStatusUnsupported => DomPropertyDescriptorResult::Rejected,
+                StatorStatus::StatorStatusException => {
+                    // SAFETY: wrapper isolate captured at installation time.
+                    unsafe {
+                        ensure_pending_dom_interceptor_exception(
+                            isolate,
+                            "DOM symbol descriptor exception",
+                        )
+                    };
+                    DomPropertyDescriptorResult::Exception
+                }
+                StatorStatus::StatorStatusInvalidArg => DomPropertyDescriptorResult::Rejected,
+            };
+            // SAFETY: callback output values, if any, were transferred to Stator.
+            unsafe { stator_dom_property_descriptor_clear(&mut out as *mut _) };
+            result
+        });
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_named_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Install additive indexed definer and descriptor callbacks on `wrap`.
+///
+/// # Safety
+/// `wrap` must be a valid live DOM wrapper and `handler` must be a readable
+/// pointer whose callback function pointers remain valid for the wrapper's
+/// lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_definer_descriptor_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomIndexedDefinerDescriptorHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.definer.is_none() && h.descriptor.is_none() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let user_data_addr = h.data as usize;
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
+    let existing = unsafe { (*wrap).inner.take_indexed_handler() };
+    let mut builder = match existing {
+        Some(cfg) => cfg.into_builder(),
+        None => IndexedPropertyHandlerConfig::builder(),
+    };
+    if let Some(cb) = h.definer {
+        builder = builder.definer(move |index, descriptor, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut ffi_desc = StatorDomPropertyDescriptor::default();
+            let status = unsafe { dom_descriptor_to_ffi(descriptor, isolate, &mut ffi_desc) };
+            if status != StatorStatus::StatorStatusOk {
+                return DomPropertyDefineResult::Rejected;
+            }
+            // SAFETY: `cb` is guaranteed valid by the embedder.
+            let status =
+                unsafe { cb(index, &ffi_desc as *const StatorDomPropertyDescriptor, data) };
+            // SAFETY: clear temporary values allocated by dom_descriptor_to_ffi.
+            unsafe { stator_dom_property_descriptor_clear(&mut ffi_desc as *mut _) };
+            if status == StatorStatus::StatorStatusException {
+                // SAFETY: wrapper isolate captured at installation time.
+                unsafe {
+                    ensure_pending_dom_interceptor_exception(
+                        isolate,
+                        "DOM indexed definer exception",
+                    )
+                };
+            }
+            status_to_define_result(status)
+        });
+    }
+    if let Some(cb) = h.descriptor {
+        builder = builder.descriptor(move |index, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let mut out = StatorDomPropertyDescriptor::default();
+            // SAFETY: `cb` is guaranteed valid by the embedder.
+            let status = unsafe { cb(index, data, &mut out as *mut StatorDomPropertyDescriptor) };
+            let result = match status {
+                StatorStatus::StatorStatusOk => unsafe { ffi_descriptor_output_to_dom(&mut out) },
+                StatorStatus::StatorStatusFalse => DomPropertyDescriptorResult::NotIntercepted,
+                StatorStatus::StatorStatusUnsupported => DomPropertyDescriptorResult::Rejected,
+                StatorStatus::StatorStatusException => {
+                    // SAFETY: wrapper isolate captured at installation time.
+                    unsafe {
+                        ensure_pending_dom_interceptor_exception(
+                            isolate,
+                            "DOM indexed descriptor exception",
+                        )
+                    };
+                    DomPropertyDescriptorResult::Exception
+                }
+                StatorStatus::StatorStatusInvalidArg => DomPropertyDescriptorResult::Rejected,
+            };
+            // SAFETY: callback output values, if any, were transferred to Stator.
+            unsafe { stator_dom_property_descriptor_clear(&mut out as *mut _) };
+            result
+        });
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    unsafe { (*wrap).inner.set_indexed_handler(builder.build()) };
+    StatorStatus::StatorStatusOk
+}
+
+unsafe fn parse_name_bytes<'a>(
+    name_utf8: *const c_char,
+    name_len: usize,
+) -> Result<&'a str, StatorStatus> {
+    if name_len > 0 && name_utf8.is_null() {
+        return Err(StatorStatus::StatorStatusInvalidArg);
+    }
+    let bytes = if name_len == 0 {
+        &[]
+    } else {
+        // SAFETY: caller provides a byte range valid for name_len bytes.
+        unsafe { std::slice::from_raw_parts(name_utf8 as *const u8, name_len) }
+    };
+    std::str::from_utf8(bytes).map_err(|_| StatorStatus::StatorStatusInvalidArg)
+}
+
+/// Invoke the named definer path for a string key.
+///
+/// # Safety
+/// `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+/// the call. `name_utf8` must point to `name_len` bytes when `name_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_named_definer(
+    wrap: *mut StatorDomObjectWrap,
+    name_utf8: *const c_char,
+    name_len: usize,
+    descriptor: *const StatorDomPropertyDescriptor,
+    out_result: *mut StatorDomPropertyDefineCallbackResult,
+) -> StatorStatus {
+    if wrap.is_null() || out_result.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let name = match unsafe { parse_name_bytes(name_utf8, name_len) } {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+    let descriptor = match unsafe { ffi_descriptor_to_dom(descriptor) } {
+        Ok(d) => d,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    if !unsafe { (*wrap).alive.get() } {
+        // SAFETY: out_result is writable.
+        unsafe {
+            *out_result =
+                StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected;
+        }
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `wrap` is valid and live.
+    let result = unsafe { (*wrap).inner.define_property(name, &descriptor) };
+    // SAFETY: out_result is writable.
+    unsafe { *out_result = define_result_to_ffi(result) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the named descriptor path for a string key.
+///
+/// # Safety
+/// `wrap` and `out_descriptor` must be valid for the duration of the call.
+/// `name_utf8` must point to `name_len` bytes when `name_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_named_descriptor(
+    wrap: *mut StatorDomObjectWrap,
+    name_utf8: *const c_char,
+    name_len: usize,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus {
+    if wrap.is_null() || out_descriptor.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let name = match unsafe { parse_name_bytes(name_utf8, name_len) } {
+        Ok(s) => s,
+        Err(s) => return s,
+    };
+    // SAFETY: caller guarantees `wrap` is valid.
+    if !unsafe { (*wrap).alive.get() } {
+        // SAFETY: out_descriptor is writable.
+        unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let isolate = unsafe { (*wrap).isolate };
+    let result = unsafe { (*wrap).inner.get_property_descriptor(name) };
+    match result {
+        DomPropertyDescriptorResult::Descriptor(d) => unsafe {
+            dom_descriptor_to_ffi(&d, isolate, out_descriptor)
+        },
+        DomPropertyDescriptorResult::NotIntercepted => {
+            // SAFETY: out_descriptor is writable.
+            unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+            StatorStatus::StatorStatusOk
+        }
+        DomPropertyDescriptorResult::Rejected => StatorStatus::StatorStatusUnsupported,
+        DomPropertyDescriptorResult::Exception => StatorStatus::StatorStatusException,
+    }
+}
+
+/// Invoke the symbol-keyed definer path.
+///
+/// # Safety
+/// `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+/// the call. `description_utf8` must point to `description_len` bytes when
+/// `description_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_definer(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    descriptor: *const StatorDomPropertyDescriptor,
+    out_result: *mut StatorDomPropertyDefineCallbackResult,
+) -> StatorStatus {
+    if wrap.is_null() || out_result.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    let descriptor = match unsafe { ffi_descriptor_to_dom(descriptor) } {
+        Ok(d) => d,
+        Err(s) => return s,
+    };
+    if !unsafe { (*wrap).alive.get() } {
+        unsafe {
+            *out_result =
+                StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected
+        };
+        return StatorStatus::StatorStatusOk;
+    }
+    let result = unsafe { (*wrap).inner.define_symbol_property(&key, &descriptor) };
+    unsafe { *out_result = define_result_to_ffi(result) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the symbol-keyed descriptor path.
+///
+/// # Safety
+/// `wrap` and `out_descriptor` must be valid for the duration of the call.
+/// `description_utf8` must point to `description_len` bytes when
+/// `description_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_descriptor(
+    wrap: *mut StatorDomObjectWrap,
+    symbol_id: u64,
+    description_utf8: *const c_char,
+    description_len: usize,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus {
+    if wrap.is_null() || out_descriptor.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let key = match build_symbol_key(symbol_id, description_utf8, description_len) {
+        Ok(k) => k,
+        Err(s) => return s,
+    };
+    if !unsafe { (*wrap).alive.get() } {
+        unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+        return StatorStatus::StatorStatusOk;
+    }
+    let isolate = unsafe { (*wrap).isolate };
+    let result = unsafe { (*wrap).inner.get_symbol_property_descriptor(&key) };
+    match result {
+        DomPropertyDescriptorResult::Descriptor(d) => unsafe {
+            dom_descriptor_to_ffi(&d, isolate, out_descriptor)
+        },
+        DomPropertyDescriptorResult::NotIntercepted => {
+            unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+            StatorStatus::StatorStatusOk
+        }
+        DomPropertyDescriptorResult::Rejected => StatorStatus::StatorStatusUnsupported,
+        DomPropertyDescriptorResult::Exception => StatorStatus::StatorStatusException,
+    }
+}
+
+/// Invoke the indexed definer path.
+///
+/// # Safety
+/// `wrap`, `descriptor`, and `out_result` must be valid for the duration of
+/// the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_definer(
+    wrap: *mut StatorDomObjectWrap,
+    index: u32,
+    descriptor: *const StatorDomPropertyDescriptor,
+    out_result: *mut StatorDomPropertyDefineCallbackResult,
+) -> StatorStatus {
+    if wrap.is_null() || out_result.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let descriptor = match unsafe { ffi_descriptor_to_dom(descriptor) } {
+        Ok(d) => d,
+        Err(s) => return s,
+    };
+    if !unsafe { (*wrap).alive.get() } {
+        unsafe {
+            *out_result =
+                StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected
+        };
+        return StatorStatus::StatorStatusOk;
+    }
+    let result = unsafe { (*wrap).inner.define_indexed(index, &descriptor) };
+    unsafe { *out_result = define_result_to_ffi(result) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke the indexed descriptor path.
+///
+/// # Safety
+/// `wrap` and `out_descriptor` must be valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_descriptor(
+    wrap: *mut StatorDomObjectWrap,
+    index: u32,
+    out_descriptor: *mut StatorDomPropertyDescriptor,
+) -> StatorStatus {
+    if wrap.is_null() || out_descriptor.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    if !unsafe { (*wrap).alive.get() } {
+        unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+        return StatorStatus::StatorStatusOk;
+    }
+    let isolate = unsafe { (*wrap).isolate };
+    let result = unsafe { (*wrap).inner.get_indexed_descriptor(index) };
+    match result {
+        DomPropertyDescriptorResult::Descriptor(d) => unsafe {
+            dom_descriptor_to_ffi(&d, isolate, out_descriptor)
+        },
+        DomPropertyDescriptorResult::NotIntercepted => {
+            unsafe { *out_descriptor = StatorDomPropertyDescriptor::default() };
+            StatorStatus::StatorStatusOk
+        }
+        DomPropertyDescriptorResult::Rejected => StatorStatus::StatorStatusUnsupported,
+        DomPropertyDescriptorResult::Exception => StatorStatus::StatorStatusException,
+    }
+}
 // ── PropertyHandlerFlags FFI ───────────────────────────────────────────────
 
 /// Default named-property handler behaviour; no flag bits set.
@@ -41923,6 +42763,164 @@ mod tests {
         // Destroy null is no-op.
         unsafe { stator_dom_symbol_buffer_destroy(std::ptr::null_mut()) };
     }
+
+    unsafe extern "C" fn ffi_named_descriptor_cb(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out: *mut StatorDomPropertyDescriptor,
+    ) -> StatorStatus {
+        let bytes = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        if bytes != b"id" {
+            return StatorStatus::StatorStatusFalse;
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let value = unsafe { stator_value_new_string(iso, c"id".as_ptr(), 2) };
+        unsafe {
+            *out = StatorDomPropertyDescriptor {
+                present: true,
+                attributes: STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE,
+                has_value: true,
+                value,
+                has_getter: false,
+                getter: std::ptr::null_mut(),
+                has_setter: false,
+                setter: std::ptr::null_mut(),
+            };
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn ffi_named_definer_cb(
+        _name: *const c_char,
+        _name_len: usize,
+        descriptor: *const StatorDomPropertyDescriptor,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        if descriptor.is_null() || unsafe { !(*descriptor).has_value } {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn ffi_indexed_descriptor_cb(
+        index: u32,
+        _data: *mut c_void,
+        out: *mut StatorDomPropertyDescriptor,
+    ) -> StatorStatus {
+        if index != 3 {
+            return StatorStatus::StatorStatusFalse;
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        let value = unsafe { stator_value_new_number(iso, 30.0) };
+        unsafe {
+            *out = StatorDomPropertyDescriptor {
+                present: true,
+                attributes: STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE
+                    | STATOR_DOM_PROPERTY_ATTRIBUTE_ENUMERABLE,
+                has_value: true,
+                value,
+                has_getter: false,
+                getter: std::ptr::null_mut(),
+                has_setter: false,
+                setter: std::ptr::null_mut(),
+            };
+        }
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn ffi_indexed_definer_reject_cb(
+        _index: u32,
+        _descriptor: *const StatorDomPropertyDescriptor,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        StatorStatus::StatorStatusUnsupported
+    }
+
+    #[test]
+    fn test_ffi_named_descriptor_define_and_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedDefinerDescriptorHandler {
+            definer: Some(ffi_named_definer_cb),
+            descriptor: Some(ffi_named_descriptor_cb),
+            symbol_definer: None,
+            symbol_descriptor: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_definer_descriptor_handler(wrap, &handler)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut desc = StatorDomPropertyDescriptor::default();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_named_descriptor(wrap, c"id".as_ptr(), 2, &mut desc)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(desc.present);
+        assert!(desc.has_value);
+        unsafe { stator_dom_property_descriptor_clear(&mut desc) };
+
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let input = StatorDomPropertyDescriptor {
+            present: true,
+            attributes: STATOR_DOM_PROPERTY_ATTRIBUTE_WRITABLE,
+            has_value: true,
+            value,
+            has_getter: false,
+            getter: std::ptr::null_mut(),
+            has_setter: false,
+            setter: std::ptr::null_mut(),
+        };
+        let mut result =
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackException;
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_named_definer(
+                    wrap,
+                    c"id".as_ptr(),
+                    2,
+                    &input,
+                    &mut result,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            result,
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackHandled
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_definer_descriptor_handler(
+                    wrap,
+                    std::ptr::null(),
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_named_definer(
+                    std::ptr::null_mut(),
+                    c"id".as_ptr(),
+                    2,
+                    &input,
+                    &mut result,
+                )
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe {
+            stator_value_destroy(value);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
     unsafe extern "C" fn snapshot_test_callback(
         info: *const StatorFunctionCallbackInfo,
     ) -> *mut StatorValue {
@@ -42143,6 +43141,66 @@ mod tests {
             stator_context_destroy(ctx_from_blob);
             stator_snapshot_manifest_destroy(ffi_manifest);
             stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_ffi_indexed_descriptor_define_and_invalidated_fail_closed() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomIndexedDefinerDescriptorHandler {
+            definer: Some(ffi_indexed_definer_reject_cb),
+            descriptor: Some(ffi_indexed_descriptor_cb),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_indexed_definer_descriptor_handler(wrap, &handler)
+            },
+            StatorStatus::StatorStatusOk
+        );
+        let mut desc = StatorDomPropertyDescriptor::default();
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_descriptor(wrap, 3, &mut desc) },
+            StatorStatus::StatorStatusOk
+        );
+        assert!(desc.present);
+        unsafe { stator_dom_property_descriptor_clear(&mut desc) };
+
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let input = StatorDomPropertyDescriptor {
+            present: true,
+            attributes: 0,
+            has_value: true,
+            value,
+            has_getter: false,
+            getter: std::ptr::null_mut(),
+            has_setter: false,
+            setter: std::ptr::null_mut(),
+        };
+        let mut result =
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackHandled;
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_definer(wrap, 3, &input, &mut result) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            result,
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_invoke_indexed_definer(wrap, 3, &input, &mut result) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            result,
+            StatorDomPropertyDefineCallbackResult::StatorDomPropertyDefineCallbackRejected
+        );
+        unsafe {
+            stator_value_destroy(value);
+            stator_dom_object_wrap_destroy(wrap);
         }
     }
 
