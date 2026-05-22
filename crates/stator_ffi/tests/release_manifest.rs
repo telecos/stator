@@ -55,6 +55,12 @@ const VALID_ARTIFACT_TYPES: &[&str] = &[
     "snapshot-reference",
 ];
 
+/// Native-tier subtype values accepted for packaged native artifacts.
+const VALID_NATIVE_TIERS: &[&str] = &["baseline", "maglev", "turbofan"];
+
+/// Current native artifacts are recognized for packaging validation only.
+const VALID_NATIVE_LOAD_POLICIES: &[&str] = &["validate-only"];
+
 /// Telemetry diagnostic codes that the manifest must enumerate so that
 /// downstream consumers can verify every code path documented in
 /// `docs/code_cache.md` ("Cache restore telemetry") is mapped. Missing
@@ -172,6 +178,15 @@ const FIELD_TO_DIAGNOSTIC_CODE: &[(&str, &str)] = &[
     ("previous_manifest_id", "rejected_release_artifact"),
     ("rollback_supported", "rejected_release_artifact"),
     ("artifact_path", "rejected_release_artifact"),
+    ("native_header_format_version", "rejected_format_version"),
+    ("target_ffi_abi_version", "rejected_engine_version"),
+    ("compiler_version", "rejected_build_features"),
+    ("target_cpu_features_digest_hex", "rejected_platform"),
+    ("jit_flags_digest_hex", "rejected_compiler_flags"),
+    ("source_key_digest_hex", "rejected_source_identity"),
+    ("payload_digest_hex", "corrupt_payload"),
+    ("payload_length_bytes", "corrupt_payload"),
+    ("native_load_policy", "unsupported_native_code"),
     ("root_relative_to_manifest", "rejected_release_artifact"),
     ("artifact_subdir", "rejected_release_artifact"),
     ("snapshot_digest", "rejected_snapshot"),
@@ -449,6 +464,47 @@ fn validate_artifacts(root: &Map<String, Value>, errs: &mut Vec<String>) {
         } else {
             errs.push(format!("artifacts[{idx}].signature is required"));
         }
+        if matches!(
+            a.get("artifact_type").and_then(Value::as_str),
+            Some("baseline-code" | "jit-code")
+        ) {
+            validate_native_artifact(idx, a, errs);
+        }
+    }
+}
+
+fn validate_native_artifact(idx: usize, artifact: &Map<String, Value>, errs: &mut Vec<String>) {
+    if let Some(tier) = require_nonempty_string(artifact, "artifact_subtype", errs)
+        && !VALID_NATIVE_TIERS.contains(&tier.as_str())
+    {
+        errs.push(format!(
+            "artifacts[{idx}].artifact_subtype '{tier}' is not a recognized native tier"
+        ));
+    }
+    require_uint(artifact, "native_header_format_version", errs);
+    require_uint(artifact, "target_ffi_abi_version", errs);
+    require_nonempty_string(artifact, "compiler_version", errs);
+    for field in [
+        "target_cpu_features_digest_hex",
+        "jit_flags_digest_hex",
+        "source_key_digest_hex",
+        "payload_digest_hex",
+    ] {
+        if let Some(hex) = require_nonempty_string(artifact, field, errs)
+            && !is_lower_hex(&hex)
+        {
+            errs.push(format!(
+                "artifacts[{idx}].{field} must be lower-case hexadecimal"
+            ));
+        }
+    }
+    require_uint(artifact, "payload_length_bytes", errs);
+    if let Some(policy) = require_nonempty_string(artifact, "native_load_policy", errs)
+        && !VALID_NATIVE_LOAD_POLICIES.contains(&policy.as_str())
+    {
+        errs.push(format!(
+            "artifacts[{idx}].native_load_policy '{policy}' is not accepted; expected validate-only"
+        ));
     }
 }
 
@@ -938,6 +994,84 @@ fn test_validate_rejects_unknown_artifact_type() {
     let mut m = baseline_manifest();
     m["artifacts"][0]["artifact_type"] = json!("turbofan-blob");
     assert_err_contains(&m, "is not a recognized type");
+}
+
+fn native_artifact() -> Value {
+    json!({
+        "artifact_type": "baseline-code",
+        "artifact_subtype": "baseline",
+        "target_triple": "x86_64-pc-windows-msvc",
+        "target_os": "windows",
+        "target_arch": "x86_64",
+        "cargo_profile": "release",
+        "size_bytes": 256,
+        "artifact_path": "native/baseline/example.stnc",
+        "digest_algorithm": "sha256",
+        "digest_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "signature": {
+            "algorithm": "ed25519",
+            "value_hex": "deadbeef"
+        },
+        "native_header_format_version": 1,
+        "target_ffi_abi_version": 658432,
+        "compiler_version": "rustc 1.90.0 / llvm 20",
+        "target_cpu_features_digest_hex": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
+        "jit_flags_digest_hex": "22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111",
+        "source_key_digest_hex": "3333444455556666777788889999aaaabbbbccccddddeeeeffff000011112222",
+        "payload_digest_hex": "444455556666777788889999aaaabbbbccccddddeeeeffff0000111122223333",
+        "payload_length_bytes": 0,
+        "native_load_policy": "validate-only"
+    })
+}
+
+#[test]
+fn test_validate_accepts_native_artifact_metadata() {
+    let mut m = baseline_manifest();
+    m["artifacts"] = json!([native_artifact()]);
+    assert_ok(&m);
+}
+
+#[test]
+fn test_validate_rejects_native_artifact_missing_required_fields() {
+    for field in [
+        "artifact_subtype",
+        "native_header_format_version",
+        "target_ffi_abi_version",
+        "compiler_version",
+        "target_cpu_features_digest_hex",
+        "jit_flags_digest_hex",
+        "source_key_digest_hex",
+        "payload_digest_hex",
+        "payload_length_bytes",
+        "native_load_policy",
+    ] {
+        let mut m = baseline_manifest();
+        let mut artifact = native_artifact();
+        artifact.as_object_mut().unwrap().remove(field);
+        m["artifacts"] = json!([artifact]);
+        assert_err_contains(&m, &format!("'{field}' is required"));
+    }
+}
+
+#[test]
+fn test_validate_rejects_native_artifact_bad_tier_policy_and_hex() {
+    let mut m = baseline_manifest();
+    let mut artifact = native_artifact();
+    artifact["artifact_subtype"] = json!("sparkplug");
+    m["artifacts"] = json!([artifact]);
+    assert_err_contains(&m, "not a recognized native tier");
+
+    let mut m = baseline_manifest();
+    let mut artifact = native_artifact();
+    artifact["native_load_policy"] = json!("load-and-execute");
+    m["artifacts"] = json!([artifact]);
+    assert_err_contains(&m, "expected validate-only");
+
+    let mut m = baseline_manifest();
+    let mut artifact = native_artifact();
+    artifact["payload_digest_hex"] = json!("ABC");
+    m["artifacts"] = json!([artifact]);
+    assert_err_contains(&m, "payload_digest_hex must be lower-case hexadecimal");
 }
 
 #[test]

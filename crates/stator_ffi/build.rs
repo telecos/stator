@@ -14,6 +14,7 @@ fn main() {
     // Mirror the Maglev JIT support cfg from `stator_jse`'s build.rs so the
     // FFI crate can gate on the same predicate without recomputing it at
     // every call site.
+    println!("cargo::rustc-check-cfg=cfg(stator_baseline_jit_x86_64)");
     println!("cargo::rustc-check-cfg=cfg(stator_maglev_jit_x86_64)");
     println!("cargo::rustc-check-cfg=cfg(stator_baseline_jit_x86_64)");
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();

@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 15
+#define STATOR_FFI_ABI_VERSION_MINOR 16
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -179,6 +179,21 @@
  * Bitmask of every indexed-handler flag recognised by this Stator build.
  */
 #define STATOR_DOM_INDEXED_HANDLER_FLAG_ALL ((STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ | STATOR_DOM_INDEXED_HANDLER_FLAG_NON_MASKING) | STATOR_DOM_INDEXED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT)
+
+/**
+ * Current native-tier artifact header format version.
+ */
+#define STATOR_NATIVE_CODE_CACHE_HEADER_VERSION 1
+
+/**
+ * SHA-256 digest length used by all fixed header digest fields.
+ */
+#define STATOR_NATIVE_CODE_CACHE_DIGEST_LEN 32
+
+/**
+ * Fixed byte length of a native-tier artifact header.
+ */
+#define STATOR_NATIVE_CODE_CACHE_HEADER_SIZE 256
 
 /**
  * Result returned by a host module resolver callback.
@@ -862,6 +877,78 @@ typedef enum StatorWeakParameterKind {
    */
   InternalFields = 1,
 } StatorWeakParameterKind;
+
+/**
+ * Stable native artifact compatibility diagnostic.
+ */
+typedef enum StatorNativeCodeCacheDiagnostic {
+  /**
+   * Header classification accepted the fixed header shape.
+   */
+  StatorNativeCodeCacheDiagnosticAccepted = 0,
+  /**
+   * A required pointer/length pair or output pointer was invalid.
+   */
+  StatorNativeCodeCacheDiagnosticInvalidArgument = 1,
+  /**
+   * Header structure, payload length, or payload digest was invalid.
+   */
+  StatorNativeCodeCacheDiagnosticCorruptPayload = 2,
+  /**
+   * The target tier or artifact type was not accepted by this consumer.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedArtifactType = 3,
+  /**
+   * Engine crate or FFI ABI identity did not match.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedEngineVersion = 4,
+  /**
+   * Native artifact/header format version did not match.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedFormatVersion = 5,
+  /**
+   * Source key digest did not match the requested source artifact key.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedSourceIdentity = 6,
+  /**
+   * Target triple or CPU feature policy did not match.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedPlatform = 7,
+  /**
+   * Compiler version/build identity did not match.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedBuildFeatures = 8,
+  /**
+   * JIT flags, sandbox mode, or tiering policy did not match.
+   */
+  StatorNativeCodeCacheDiagnosticRejectedCompilerFlags = 9,
+  /**
+   * Header is compatible, but this build must not load native bytes.
+   */
+  StatorNativeCodeCacheDiagnosticUnsupportedNativeCode = 10,
+} StatorNativeCodeCacheDiagnostic;
+
+/**
+ * Native code-cache tier encoded in a native artifact header.
+ */
+typedef enum StatorNativeCodeCacheTier {
+  /**
+   * Unknown or unrecognized tier value.
+   */
+  StatorNativeCodeCacheTierUnknown = 0,
+  /**
+   * Baseline native-code tier.
+   */
+  StatorNativeCodeCacheTierBaseline = 1,
+  /**
+   * Maglev optimizing tier.
+   */
+  StatorNativeCodeCacheTierMaglev = 2,
+  /**
+   * Turbofan optimizing tier.
+   */
+  StatorNativeCodeCacheTierTurbofan = 3,
+} StatorNativeCodeCacheTier;
 
 typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
 
@@ -2756,6 +2843,102 @@ typedef void (*StatorTracedRootVisitor)(void *userdata, struct StatorTracedVisit
  * owner).
  */
 typedef void (*StatorTracedEdgeCallback)(void *userdata, struct StatorTraced *edge);
+
+/**
+ * Decoded native-tier artifact header information.
+ */
+typedef struct StatorNativeCodeCacheHeaderInfo {
+  /**
+   * Header format version.
+   */
+  uint32_t header_version;
+  /**
+   * Target tier encoded by the artifact.
+   */
+  enum StatorNativeCodeCacheTier tier;
+  /**
+   * Baseline/JIT native artifact format version.
+   */
+  uint32_t native_format_version;
+  /**
+   * Packed `STATOR_FFI_ABI_VERSION` value encoded by the producer.
+   */
+  uint32_t ffi_abi_version;
+  /**
+   * SHA-256 digest of the canonical Stator engine version string.
+   */
+  uint8_t engine_version_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical compiler/backend version string.
+   */
+  uint8_t compiler_version_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical target triple string.
+   */
+  uint8_t target_triple_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the sorted canonical CPU feature set string.
+   */
+  uint8_t cpu_feature_set_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of canonical tiering/JIT/sandbox flags.
+   */
+  uint8_t jit_flags_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical source code-cache key record.
+   */
+  uint8_t source_key_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the native payload bytes following this header.
+   */
+  uint8_t payload_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * Exact byte length of the native payload following this header.
+   */
+  uint64_t payload_length_bytes;
+} StatorNativeCodeCacheHeaderInfo;
+
+/**
+ * Expected native-tier artifact compatibility fields supplied by the embedder.
+ */
+typedef struct StatorNativeCodeCacheCompatibility {
+  /**
+   * Required target tier.
+   */
+  enum StatorNativeCodeCacheTier tier;
+  /**
+   * Required baseline/JIT native artifact format version.
+   */
+  uint32_t native_format_version;
+  /**
+   * Required packed `STATOR_FFI_ABI_VERSION` value.
+   */
+  uint32_t ffi_abi_version;
+  /**
+   * SHA-256 digest of the canonical Stator engine version string.
+   */
+  uint8_t engine_version_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical compiler/backend version string.
+   */
+  uint8_t compiler_version_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical target triple string.
+   */
+  uint8_t target_triple_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the sorted canonical CPU feature set string.
+   */
+  uint8_t cpu_feature_set_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of canonical tiering/JIT/sandbox flags.
+   */
+  uint8_t jit_flags_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+  /**
+   * SHA-256 digest of the canonical source code-cache key record.
+   */
+  uint8_t source_key_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
+} StatorNativeCodeCacheCompatibility;
 
 /**
  * Free callback for resolver-owned embedder data.
@@ -8235,6 +8418,50 @@ void stator_traced_visit_outgoing(struct StatorIsolate *isolate,
                                   struct StatorValue *host,
                                   StatorTracedEdgeCallback callback,
                                   void *userdata);
+
+/**
+ * Return the fixed byte length of native-tier artifact headers.
+ */
+size_t stator_native_code_cache_header_size(void);
+
+/**
+ * Return a stable low-cardinality telemetry code string for a diagnostic.
+ */
+const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);
+
+/**
+ * Decode a native-tier artifact header without checking runtime compatibility.
+ *
+ * This helper accepts only the fixed header shape. It never validates or loads
+ * payload bytes and never reports that native code can be executed.
+ *
+ * # Safety
+ *
+ * `bytes` must point to `len` readable bytes for the duration of the call.
+ * When `out_info` is non-null, it must be valid for one write.
+ */
+enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(const uint8_t *bytes,
+                                                                              size_t len,
+                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);
+
+/**
+ * Validate a full native-tier artifact against expected compatibility fields.
+ *
+ * On a fully compatible header and payload this still returns
+ * `UnsupportedNativeCode`: current Stator builds do not deserialize or execute
+ * native bytes from code-cache storage. Consumers must treat every non-mismatch
+ * result as a cache miss/recompile path, not as a native cache hit.
+ *
+ * # Safety
+ *
+ * `bytes` must point to `len` readable bytes for the duration of the call,
+ * `expected` must point to a valid compatibility struct, and `out_info` must be
+ * valid for one write when it is non-null.
+ */
+enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_validate_header(const uint8_t *bytes,
+                                                                              size_t len,
+                                                                              const struct StatorNativeCodeCacheCompatibility *expected,
+                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);
 
 #ifdef __cplusplus
 }  // extern "C"

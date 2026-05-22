@@ -201,8 +201,33 @@ modules:
   returns an errored module on rejection because module graph/linking state has
   stricter fail-closed behavior.
 - Classic-script blobs restore interpreter bytecode only. Native baseline/JIT
-  artifacts, if added later, must use separate `baseline-code` or `jit-code`
-  artifact types and stricter platform/sandbox validation.
+  artifacts use separate `baseline-code` or `jit-code` artifact types and the
+  fail-closed native header contract below; they must not be reported as runtime
+  cache hits unless a future safe native loader is implemented.
+
+## Native-tier artifact header contract
+
+Baseline, Maglev, and Turbofan artifacts use a separate fixed native-tier header before any native bytes. Current Stator builds **do not deserialize or execute** those native bytes. Edge may package them only with `native_load_policy: validate-only`; runtime validation must fail closed with `unsupported_native_code` after all compatibility fields match, forcing normal compilation instead of reporting a fake cache hit.
+
+The header format is exactly 256 bytes:
+
+| Offset | Field | Type | Compatibility diagnostic |
+|---:|---|---|---|
+| 0 | `magic` | 8 ASCII bytes `STNCACH1` | `corrupt_payload` |
+| 8 | `native_header_format_version` | u32 little-endian, currently `1` | `rejected_format_version` |
+| 12 | `target_tier` | u32 (`1` baseline, `2` maglev, `3` turbofan) | `rejected_artifact_type` |
+| 16 | `native_format_version` | u32 baseline/JIT artifact format | `rejected_format_version` |
+| 20 | `target_ffi_abi_version` | packed u32 `STATOR_FFI_ABI_VERSION` | `rejected_engine_version` |
+| 24 | `engine_version_digest` | SHA-256 of canonical Stator engine version string | `rejected_engine_version` |
+| 56 | `compiler_version_digest` | SHA-256 of canonical Rust/LLVM/backend version string | `rejected_build_features` |
+| 88 | `target_triple_digest` | SHA-256 of canonical target triple | `rejected_platform` |
+| 120 | `target_cpu_features_digest` | SHA-256 of sorted canonical CPU feature set | `rejected_platform` |
+| 152 | `jit_flags_digest` | SHA-256 of tiering, sandbox, write-protect, and JIT flag policy | `rejected_compiler_flags` |
+| 184 | `source_key_digest` | SHA-256 of the canonical source code-cache key record | `rejected_source_identity` |
+| 216 | `payload_digest` | SHA-256 of the native payload bytes after the header | `corrupt_payload` |
+| 248 | `payload_length_bytes` | u64 little-endian exact payload length | `corrupt_payload` |
+
+The public FFI helpers `stator_native_code_cache_classify_header`, `stator_native_code_cache_validate_header`, `stator_native_code_cache_header_size`, and `stator_native_code_cache_diagnostic_name` expose this contract to embedders. Classification only decodes the fixed header. Validation compares target tier, engine/ABI/compiler identity, target triple and CPU features, JIT flags, source key digest, payload digest, and payload length. A fully compatible artifact returns `unsupported_native_code` until Stator has a safe native compiled-artifact serialization and loader.
 
 ### Module source metadata v2 plumbing
 
@@ -510,6 +535,15 @@ a mismatch code.
 | `previous_manifest_id` | `rejected_release_artifact` |
 | `rollback_supported` | `rejected_release_artifact` |
 | `artifact_path` | `rejected_release_artifact` |
+| `native_header_format_version` | `rejected_format_version` |
+| `target_ffi_abi_version` | `rejected_engine_version` |
+| `compiler_version` | `rejected_build_features` |
+| `target_cpu_features_digest_hex` | `rejected_platform` |
+| `jit_flags_digest_hex` | `rejected_compiler_flags` |
+| `source_key_digest_hex` | `rejected_source_identity` |
+| `payload_digest_hex` | `corrupt_payload` |
+| `payload_length_bytes` | `corrupt_payload` |
+| `native_load_policy` | `unsupported_native_code` |
 | `root_relative_to_manifest` | `rejected_release_artifact` |
 | `artifact_subdir` | `rejected_release_artifact` |
 
@@ -522,7 +556,7 @@ Each Edge vendored Stator drop must ship a manifest next to `stator.h` and the S
 - Supported cache schema, bytecode, module-cache, script-cache, native-code, and snapshot format versions.
 - Supported target triples, CPU feature policies, build features, sandbox modes, and tiering modes.
 - Edge channel/build compatibility window and explicit cache eviction policy for roll-forward and rollback.
-- Optional prebuilt snapshot/code-cache artifact names, sizes, digests, and signatures.
+- Optional prebuilt snapshot/code-cache artifact names, sizes, digests, signatures, and native-tier `validate-only` metadata.
 - Privacy-approved telemetry code list and field allowlist.
 
 Edge must clear or partition persisted cache storage when the manifest changes in any key field. Release automation should reject vendoring if the manifest and generated header disagree on ABI or cache format versions.
@@ -558,7 +592,12 @@ authoritative validator and its mutation test matrix live in
   `target_arch`, `cargo_profile`, `size_bytes`, `digest_algorithm`
   (`sha256`/`sha384`/`sha512`), `digest_hex` (even-length lower-case hex),
   and a `signature` object with non-empty `algorithm` and lower-case hex
-  `value_hex`.
+  `value_hex`. For `baseline-code` and `jit-code` entries the manifest also requires
+  `artifact_subtype` (`baseline`, `maglev`, or `turbofan`),
+  `native_header_format_version`, `target_ffi_abi_version`, `compiler_version`,
+  lower-case hex `target_cpu_features_digest_hex`, `jit_flags_digest_hex`,
+  `source_key_digest_hex`, `payload_digest_hex`, `payload_length_bytes`, and
+  `native_load_policy: validate-only`.
 - `telemetry.diagnostic_codes[]`: must include every code listed in
   "Cache restore telemetry" above so Edge privacy review and counter
   aggregation stay in sync with the engine's emitted codes.

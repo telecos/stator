@@ -12,6 +12,8 @@
 
 /// Canonical code-cache key construction for Edge-managed artifacts.
 pub mod code_cache_key;
+/// Native-tier code-cache artifact validation helpers.
+pub mod native_code_cache;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -88,7 +90,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 15;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 16;
 
 /// Patch version of the Stator FFI C ABI.
 ///
