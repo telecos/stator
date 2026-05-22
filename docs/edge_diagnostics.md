@@ -112,6 +112,48 @@ emitted.
 | `Runtime.getProperties`      | Required `objectId`. Unknown/stale ID → error.    |
 | `Runtime.releaseObject`      | Required `objectId`. Unknown/stale ID → error.    |
 | `Runtime.releaseObjectGroup` | Required `objectGroup`. Unknown group → no-op OK. |
+| `Debugger.enable`/`disable`  | Toggles per-session domain state.                 |
+| `Debugger.setPauseOnExceptions` | `"none"`/`"uncaught"`/`"all"`; other values → typed error. Forwarded to the attached interpreter debugger (and cached so a debugger attached later inherits the chosen state). |
+| `Debugger.setBreakpointByUrl`| Returns a per-session breakpoint id with a single location. |
+| `Debugger.resume`            | Applies `Continue` to the attached debugger when there is an active pause; emits `Debugger.resumed`. Otherwise a silent no-op success so DevTools teardown does not error. |
+| `Debugger.stepInto`/`stepOver`/`stepOut` | Applies the matching step on the attached debugger and emits `Debugger.resumed`; typed error when no debugger is attached or no pause is active. |
+| `Debugger.pause`             | Fail-closed: synchronous interpreter cannot be interrupted. Use `debugger;` or `setBreakpointByUrl` instead. |
+| `Debugger.evaluateOnCallFrame` | Fail-closed: call-frame snapshots are not exposed through CDP yet. |
+| `Debugger.getScriptSource`/`getPossibleBreakpoints` | Fail-closed: not bridged through the dispatcher yet. |
+
+## Bridging interpreter Debugger pauses into CDP
+
+The in-process inspector owns a single `inspector::debugger::Debugger`
+instance — exposed to the embedder via `InProcessInspector::debugger()` and
+shared with every session's dispatcher. Embedders attach it to the
+interpreter with `interpreter::attach_debugger(inspector.debugger())` before
+calling `Interpreter::run`. When `Interpreter::run` returns
+`StatorError::DebuggerPaused`, the embedder calls
+`InProcessInspector::notify_paused()`, which emits one `Debugger.paused`
+event into every session that has sent `Debugger.enable`. Sessions without
+`Debugger.enable` receive nothing.
+
+The emitted `Debugger.paused` payload is intentionally conservative:
+
+- `reason` maps interpreter pause reasons onto CDP strings:
+  `DebuggerStatement` → `"debuggerStatement"`,
+  `Breakpoint` → `"other"` plus a populated `hitBreakpoints` array,
+  `Step` → `"other"`,
+  `Exception` → `"exception"`.
+- `callFrames` contains exactly one synthetic frame named
+  `(stator: paused-frame)` carrying the paused source line and bytecode
+  offset under `data.bytecodeOffset`/`data.pausedFrame`. The interpreter
+  does not retain a portable per-frame snapshot at pause time yet, so we
+  deliberately avoid fabricating multi-frame stacks or scope chains.
+- `Debugger.evaluateOnCallFrame` is fail-closed for the same reason; use
+  `Runtime.evaluate` while paused instead.
+
+`Debugger.resume`/`stepInto`/`stepOver`/`stepOut` drive the same shared
+debugger through `Debugger::apply_action`, and emit a matching
+`Debugger.resumed` event into the calling session. Embedders can also push
+`Debugger.resumed` explicitly through
+`InProcessInspector::notify_resumed()` after the embedder resumes
+execution out-of-band.
 
 No new FFI symbols are required — CDP requests/responses flow through the
 existing `stator_inspector_dispatch` and `stator_inspector_next_message`

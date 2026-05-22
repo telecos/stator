@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::inspector::cdp::{
     CdpDispatcher, DispatchOutcome, ExecutionContextDescription, default_execution_context,
 };
+use crate::inspector::debugger::Debugger;
 use crate::interpreter::GlobalEnv;
 
 /// One CDP session within an [`InProcessInspector`].
@@ -53,10 +54,13 @@ impl InProcessInspectorSession {
         id: u32,
         globals: Rc<RefCell<GlobalEnv>>,
         contexts: Vec<ExecutionContextDescription>,
+        debugger: Rc<RefCell<Debugger>>,
     ) -> Self {
+        let mut dispatcher = CdpDispatcher::with_globals_and_contexts(globals, contexts);
+        dispatcher.attach_debugger(debugger);
         Self {
             id,
-            dispatcher: CdpDispatcher::with_globals_and_contexts(globals, contexts),
+            dispatcher,
             cached: None,
         }
     }
@@ -105,6 +109,22 @@ impl InProcessInspectorSession {
     /// Returns `true` if this session's dispatcher has seen `Debugger.enable`.
     pub fn debugger_enabled(&self) -> bool {
         self.dispatcher.debugger_enabled()
+    }
+
+    /// Bridge an interpreter pause into this session by emitting a
+    /// `Debugger.paused` event derived from the attached interpreter
+    /// debugger's most recent pause. See
+    /// [`CdpDispatcher::notify_paused`].
+    pub fn notify_paused(&mut self) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_paused()
+    }
+
+    /// Emit a `Debugger.resumed` event into this session's outbox.
+    /// See [`CdpDispatcher::notify_resumed`].
+    pub fn notify_resumed(&mut self) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_resumed()
     }
 
     /// Mutable access to the dispatcher.  Used by the parent inspector to
@@ -167,6 +187,11 @@ pub struct InProcessInspector {
     scripts: Vec<RegisteredScript>,
     /// Next script ID to assign; always non-zero.
     next_script_id: u32,
+    /// Single interpreter [`Debugger`] shared across every session this
+    /// inspector owns.  The interpreter only supports a single attached
+    /// debugger per thread, so sessions never own their own debugger; they
+    /// all observe pauses through this handle.
+    debugger: Rc<RefCell<Debugger>>,
 }
 
 impl InProcessInspector {
@@ -189,7 +214,46 @@ impl InProcessInspector {
             next_context_id: 2,
             scripts: Vec::new(),
             next_script_id: 1,
+            debugger: Rc::new(RefCell::new(Debugger::new())),
         }
+    }
+
+    /// Shared interpreter [`Debugger`] handle.  Embedders pass a clone of
+    /// this to [`crate::interpreter::attach_debugger`] before driving the
+    /// interpreter so that pause events surface through every connected
+    /// CDP session.
+    pub fn debugger(&self) -> Rc<RefCell<Debugger>> {
+        Rc::clone(&self.debugger)
+    }
+
+    /// Emit a `Debugger.paused` event into every connected session whose
+    /// `Debugger` domain is enabled. Returns the number of sessions that
+    /// received an event.
+    ///
+    /// Embedders typically call this immediately after
+    /// [`crate::interpreter::Interpreter::run`] returns
+    /// [`crate::error::StatorError::DebuggerPaused`].
+    pub fn notify_paused(&mut self) -> usize {
+        let mut emitted = 0;
+        for session in &mut self.sessions {
+            if session.notify_paused() {
+                emitted += 1;
+            }
+        }
+        emitted
+    }
+
+    /// Emit a `Debugger.resumed` event into every connected session whose
+    /// `Debugger` domain is enabled.  Returns the number of sessions that
+    /// received an event.
+    pub fn notify_resumed(&mut self) -> usize {
+        let mut emitted = 0;
+        for session in &mut self.sessions {
+            if session.notify_resumed() {
+                emitted += 1;
+            }
+        }
+        emitted
     }
 
     /// Open a new session keyed by `session_id`.  The returned pointer is
@@ -201,6 +265,7 @@ impl InProcessInspector {
             session_id,
             Rc::clone(&self.globals),
             self.contexts.clone(),
+            Rc::clone(&self.debugger),
         ));
         self.sessions.push(session);
         // SAFETY: just pushed; the box is alive and uniquely owned.
@@ -758,5 +823,68 @@ mod tests {
             !inspector.disconnect(s1_ptr),
             "double-disconnect is a no-op"
         );
+    }
+
+    #[test]
+    fn debugger_handle_is_shared_across_sessions() {
+        let mut inspector = new_inspector();
+        let dbg = inspector.debugger();
+        // The handle returned to the embedder must be the same Rc the
+        // sessions observe.
+        let _s = inspector.connect(30);
+        assert!(Rc::ptr_eq(&dbg, &inspector.debugger()));
+    }
+
+    #[test]
+    fn notify_paused_fans_out_to_debugger_enabled_sessions_only() {
+        let mut inspector = new_inspector();
+        let _ = inspector.connect(1);
+        let _ = inspector.connect(2);
+
+        // Enable Debugger only on session 1.
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        assert_eq!(
+            s1.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+            DispatchOutcome::Ok
+        );
+        // Drain the enable ack.
+        while s1.take_next_bytes().is_some() {}
+
+        // Drive a synthetic interpreter pause through the shared debugger.
+        let dbg = inspector.debugger();
+        let _ = dbg.borrow_mut().on_debugger_statement(99);
+
+        let emitted = inspector.notify_paused();
+        assert_eq!(emitted, 1, "only one session has Debugger.enable");
+
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        let msgs = drain_to_strings(s1);
+        assert_eq!(msgs.len(), 1);
+        let event: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Debugger.paused");
+        assert_eq!(event["params"]["reason"], "debuggerStatement");
+
+        let s2 = inspector.session_by_id_mut(2).unwrap();
+        let msgs2 = drain_to_strings(s2);
+        assert!(msgs2.is_empty(), "session 2 should receive nothing");
+    }
+
+    #[test]
+    fn notify_resumed_only_targets_debugger_enabled_sessions() {
+        let mut inspector = new_inspector();
+        let _ = inspector.connect(1);
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        assert_eq!(
+            s1.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+            DispatchOutcome::Ok
+        );
+        while s1.take_next_bytes().is_some() {}
+
+        assert_eq!(inspector.notify_resumed(), 1);
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        let msgs = drain_to_strings(s1);
+        assert_eq!(msgs.len(), 1);
+        let event: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Debugger.resumed");
     }
 }
