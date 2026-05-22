@@ -901,6 +901,14 @@ typedef enum StatorDomAccessCheckOperation {
    * Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
    */
   StatorDomAccessCheckOperationIndexedDescriptor = 14,
+  /**
+   * DOM wrapper call-as-function invocation.
+   */
+  StatorDomAccessCheckOperationCallAsFunction = 15,
+  /**
+   * DOM wrapper constructor invocation.
+   */
+  StatorDomAccessCheckOperationConstruct = 16,
 } StatorDomAccessCheckOperation;
 
 /**
@@ -1032,6 +1040,10 @@ typedef enum StatorNativeCodeCacheTier {
    */
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
+
+typedef struct Option_StatorDomCallAsFunctionCb Option_StatorDomCallAsFunctionCb;
+
+typedef struct Option_StatorDomConstructCb Option_StatorDomConstructCb;
 
 typedef struct Option_StatorDomIndexedDefinerCb Option_StatorDomIndexedDefinerCb;
 
@@ -2864,6 +2876,24 @@ typedef struct StatorDomIndexedHandler {
 } StatorDomIndexedHandler;
 
 /**
+ * Additive callable/constructible handler bundle for a DOM wrapper.
+ */
+typedef struct StatorDomCallableHandler {
+  /**
+   * Call-as-function callback, or null to leave ordinary calls unsupported.
+   */
+  struct Option_StatorDomCallAsFunctionCb call;
+  /**
+   * Construct callback, or null to leave `new wrapper(...)` unsupported.
+   */
+  struct Option_StatorDomConstructCb construct;
+  /**
+   * Opaque embedder data passed to both callbacks.
+   */
+  void *data;
+} StatorDomCallableHandler;
+
+/**
  * POD descriptor for a symbol property key passed across the FFI
  * boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
  * without ever coercing the symbol to a string: `symbol_id` carries the
@@ -3363,6 +3393,35 @@ typedef bool (*StatorWasmHostFuncCallback)(struct StatorContext *ctx,
                                            size_t args_len,
                                            struct StatorWasmValue *results,
                                            size_t results_len);
+
+/**
+ * DOM wrapper call-as-function callback.
+ *
+ * `receiver` is the JS receiver for ordinary calls (or null when invoked
+ * directly through FFI without one). `args` is a borrowed array of
+ * `arg_count` borrowed [`StatorValue`] pointers and may be null when
+ * `arg_count == 0`. Returning [`StatorStatus::StatorStatusOk`] transfers
+ * ownership of `*out` to Stator when it is non-null; a null `*out` means the
+ * JavaScript result is `undefined`.
+ */
+typedef enum StatorStatus (*StatorDomCallAsFunctionCb)(const struct StatorValue *receiver,
+                                                       const struct StatorValue *const *args,
+                                                       size_t arg_count,
+                                                       void *data,
+                                                       struct StatorValue **out);
+
+/**
+ * DOM wrapper constructor callback.
+ *
+ * `new_target` is the constructor value for script `new wrapper(...)` calls
+ * (or null for direct FFI invocations that do not supply one). Argument and
+ * result ownership semantics match [`StatorDomCallAsFunctionCb`].
+ */
+typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_target,
+                                                  const struct StatorValue *const *args,
+                                                  size_t arg_count,
+                                                  void *data,
+                                                  struct StatorValue **out);
 
 /**
  * V2 named-property **getter** callback.
@@ -7861,6 +7920,53 @@ enum StatorStatus stator_dom_object_wrap_install_named_handler(struct StatorDomO
  */
 enum StatorStatus stator_dom_object_wrap_install_indexed_handler(struct StatorDomObjectWrap *wrap,
                                                                  const struct StatorDomIndexedHandler *handler);
+
+/**
+ * Install call-as-function and/or construct callbacks on a DOM wrapper.
+ *
+ * This is additive with property handlers: installing callable handlers does
+ * not disturb named, symbol, indexed, definer, descriptor, class-id, access
+ * check, weak, or traced-edge state. Passing both callback fields as null is
+ * invalid; wrappers are non-callable and non-constructible by default.
+ *
+ * # Safety
+ * - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `handler` must point to a readable [`StatorDomCallableHandler`].
+ * - Callback function pointers must remain valid for the wrapper lifetime.
+ */
+enum StatorStatus stator_dom_object_wrap_install_callable_handler(struct StatorDomObjectWrap *wrap,
+                                                                  const struct StatorDomCallableHandler *handler);
+
+/**
+ * Invoke a DOM wrapper's call-as-function handler directly through FFI.
+ *
+ * Returns [`StatorStatus::StatorStatusUnsupported`] when no call handler is
+ * installed, [`StatorStatus::StatorStatusFalse`] when the wrapper was
+ * invalidated or an access check denies the call, and `Ok` with an owned
+ * `*out` result on success. A successful `undefined` result is represented by
+ * an owned undefined [`StatorValue`].
+ *
+ * # Safety
+ * `wrap`, `receiver`, `args`, and `out` must follow the callback contract
+ * documented on [`StatorDomCallAsFunctionCb`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_call_as_function(struct StatorDomObjectWrap *wrap,
+                                                                 const struct StatorValue *receiver,
+                                                                 const struct StatorValue *const *args,
+                                                                 size_t arg_count,
+                                                                 struct StatorValue **out);
+
+/**
+ * Invoke a DOM wrapper's construct handler directly through FFI.
+ *
+ * # Safety
+ * Arguments follow [`StatorDomConstructCb`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_construct(struct StatorDomObjectWrap *wrap,
+                                                          const struct StatorValue *new_target,
+                                                          const struct StatorValue *const *args,
+                                                          size_t arg_count,
+                                                          struct StatorValue **out);
 
 /**
  * Append a symbol identity to a [`StatorDomSymbolBuffer`].

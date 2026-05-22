@@ -36,11 +36,12 @@ use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
 use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
 use stator_jse::compiler::osr_counters::{self, OsrExitReason, OsrTier};
 use stator_jse::dom::{
-    AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
-    DomPropertyDefineResult, DomPropertyDescriptor, DomPropertyDescriptorResult,
+    AccessCheckKey, AccessCheckOperation, DomCallArgs, DomClassIdRegistry, DomClassInfo,
+    DomObjectWrap, DomPropertyDefineResult, DomPropertyDescriptor, DomPropertyDescriptorResult,
     IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
     NamedPropertyHandlerFlags,
 };
+use stator_jse::error::{StatorError, StatorResult};
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{
     HostDynamicImportRequest, HostImportMeta, HostModuleLoader, HostModuleSourceMetadata,
@@ -13764,6 +13765,59 @@ pub unsafe extern "C" fn stator_context_global_set(
     }
 }
 
+fn js_args_to_borrowed_stator_values(
+    args: &[JsValue],
+    isolate: *mut StatorIsolate,
+) -> (Vec<StatorValue>, Vec<*const StatorValue>) {
+    let borrowed: Vec<StatorValue> = args
+        .iter()
+        .map(|arg| StatorValue {
+            inner: jsvalue_to_stator_value_inner(arg),
+            isolate,
+        })
+        .collect();
+    let ptrs = borrowed
+        .iter()
+        .map(|arg| arg as *const StatorValue)
+        .collect();
+    (borrowed, ptrs)
+}
+
+unsafe fn take_callback_output(out: *mut StatorValue) -> JsValue {
+    if out.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: callback transferred ownership of `out` on success.
+        let js = stator_value_inner_to_jsvalue(unsafe { &(*out).inner });
+        // SAFETY: output is a Stator-owned value handle.
+        unsafe { stator_value_destroy(out) };
+        js
+    }
+}
+
+fn status_to_dom_call_result(
+    status: StatorStatus,
+    out: *mut StatorValue,
+    isolate: *mut StatorIsolate,
+    message: &'static str,
+) -> StatorResult<JsValue> {
+    match status {
+        // SAFETY: `out` follows the DOM callback ownership contract.
+        StatorStatus::StatorStatusOk => Ok(unsafe { take_callback_output(out) }),
+        StatorStatus::StatorStatusException => {
+            // SAFETY: `isolate` is the wrapper's isolate pointer.
+            unsafe { ensure_pending_dom_interceptor_exception(isolate, message) };
+            Err(StatorError::TypeError(message.to_string()))
+        }
+        StatorStatus::StatorStatusFalse => Err(StatorError::TypeError(
+            "DOM callable callback rejected invocation".to_string(),
+        )),
+        StatorStatus::StatorStatusInvalidArg | StatorStatus::StatorStatusUnsupported => Err(
+            StatorError::TypeError("DOM callable callback failed".to_string()),
+        ),
+    }
+}
+
 fn dom_object_wrap_plain_object(
     wrap: *mut StatorDomObjectWrap,
 ) -> Option<Rc<RefCell<PropertyMap>>> {
@@ -13785,6 +13839,54 @@ fn dom_object_wrap_plain_object(
     let names = unsafe { (*wrap).inner.property_names() };
     let mut object = PropertyMap::new();
     let mut installed_names: Vec<String> = Vec::new();
+
+    if unsafe { (*wrap).inner.is_callable() } {
+        let call_wrap_addr = wrap_addr;
+        let call_alive = Rc::clone(&alive);
+        object.insert_builtin(
+            "__call__".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                if !call_alive.get() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer callable".to_string(),
+                    ));
+                }
+                let wrap = call_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer callable".to_string(),
+                    ));
+                }
+                let receiver = dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined);
+                // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
+                unsafe { (*wrap).inner.call_as_function(receiver, args) }
+            })),
+        );
+    }
+
+    if unsafe { (*wrap).inner.is_constructible() } {
+        let construct_wrap_addr = wrap_addr;
+        let construct_alive = Rc::clone(&alive);
+        object.insert_builtin(
+            "__construct__".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                if !construct_alive.get() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer constructible".to_string(),
+                    ));
+                }
+                let wrap = construct_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer constructible".to_string(),
+                    ));
+                }
+                let new_target = dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined);
+                // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
+                unsafe { (*wrap).inner.construct(new_target, args) }
+            })),
+        );
+    }
 
     for name in names {
         if name.starts_with("__get_")
@@ -13951,6 +14053,18 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invalidate(wrap: *mut StatorDomO
                 registry.borrow_mut().remove(&(Rc::as_ptr(&plain) as usize));
             });
         }
+    }
+}
+
+unsafe fn stator_dom_object_wrap_drop_materialized_cache(wrap: *mut StatorDomObjectWrap) {
+    if wrap.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(plain) = unsafe { (*wrap).materialized.borrow_mut().take() } {
+        DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+            registry.borrow_mut().remove(&(Rc::as_ptr(&plain) as usize));
+        });
     }
 }
 
@@ -18528,6 +18642,10 @@ pub enum StatorDomAccessCheckOperation {
     StatorDomAccessCheckOperationIndexedDefine = 13,
     /// Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
     StatorDomAccessCheckOperationIndexedDescriptor = 14,
+    /// DOM wrapper call-as-function invocation.
+    StatorDomAccessCheckOperationCallAsFunction = 15,
+    /// DOM wrapper constructor invocation.
+    StatorDomAccessCheckOperationConstruct = 16,
 }
 
 /// C-callable access-check (security) callback for a DOM wrapper.
@@ -18608,6 +18726,12 @@ fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
         }
         AccessCheckOperation::IndexedDescriptor => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDescriptor
+        }
+        AccessCheckOperation::CallAsFunction => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationCallAsFunction
+        }
+        AccessCheckOperation::Construct => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationConstruct
         }
     }
 }
@@ -19026,6 +19150,47 @@ pub struct StatorDomIndexedHandler {
         unsafe extern "C" fn(buf: *mut StatorDomIndexBuffer, data: *mut c_void) -> StatorStatus,
     >,
     /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+/// DOM wrapper call-as-function callback.
+///
+/// `receiver` is the JS receiver for ordinary calls (or null when invoked
+/// directly through FFI without one). `args` is a borrowed array of
+/// `arg_count` borrowed [`StatorValue`] pointers and may be null when
+/// `arg_count == 0`. Returning [`StatorStatus::StatorStatusOk`] transfers
+/// ownership of `*out` to Stator when it is non-null; a null `*out` means the
+/// JavaScript result is `undefined`.
+pub type StatorDomCallAsFunctionCb = unsafe extern "C" fn(
+    receiver: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// DOM wrapper constructor callback.
+///
+/// `new_target` is the constructor value for script `new wrapper(...)` calls
+/// (or null for direct FFI invocations that do not supply one). Argument and
+/// result ownership semantics match [`StatorDomCallAsFunctionCb`].
+pub type StatorDomConstructCb = unsafe extern "C" fn(
+    new_target: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// Additive callable/constructible handler bundle for a DOM wrapper.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomCallableHandler {
+    /// Call-as-function callback, or null to leave ordinary calls unsupported.
+    pub call: Option<StatorDomCallAsFunctionCb>,
+    /// Construct callback, or null to leave `new wrapper(...)` unsupported.
+    pub construct: Option<StatorDomConstructCb>,
+    /// Opaque embedder data passed to both callbacks.
     pub data: *mut c_void,
 }
 
@@ -19805,6 +19970,220 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { (*wrap).inner.set_indexed_handler(builder.build()) };
     StatorStatus::StatorStatusOk
+}
+
+/// Install call-as-function and/or construct callbacks on a DOM wrapper.
+///
+/// This is additive with property handlers: installing callable handlers does
+/// not disturb named, symbol, indexed, definer, descriptor, class-id, access
+/// check, weak, or traced-edge state. Passing both callback fields as null is
+/// invalid; wrappers are non-callable and non-constructible by default.
+///
+/// # Safety
+/// - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `handler` must point to a readable [`StatorDomCallableHandler`].
+/// - Callback function pointers must remain valid for the wrapper lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_callable_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomCallableHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.call.is_none() && h.construct.is_none() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    let user_data_addr = h.data as usize;
+    // SAFETY: caller guarantees `wrap` is valid.
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
+
+    // SAFETY: caller guarantees `wrap` is valid and uniquely mutable here.
+    let inner = unsafe { &mut (*wrap).inner };
+    if let Some(cb) = h.call {
+        inner.set_call_as_function_handler(move |payload: &DomCallArgs, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let receiver_value = StatorValue {
+                inner: jsvalue_to_stator_value_inner(payload.receiver()),
+                isolate,
+            };
+            let (_borrowed_args, arg_ptrs) =
+                js_args_to_borrowed_stator_values(payload.args(), isolate);
+            let args_ptr = if arg_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                arg_ptrs.as_ptr()
+            };
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&receiver_value, args_ptr, arg_ptrs.len(), data, &mut out) };
+            status_to_dom_call_result(status, out, isolate, "DOM call-as-function exception")
+        });
+    } else {
+        inner.clear_call_as_function_handler();
+    }
+
+    if let Some(cb) = h.construct {
+        inner.set_construct_handler(move |payload: &DomCallArgs, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let new_target_value = StatorValue {
+                inner: jsvalue_to_stator_value_inner(payload.new_target()),
+                isolate,
+            };
+            let (_borrowed_args, arg_ptrs) =
+                js_args_to_borrowed_stator_values(payload.args(), isolate);
+            let args_ptr = if arg_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                arg_ptrs.as_ptr()
+            };
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&new_target_value, args_ptr, arg_ptrs.len(), data, &mut out) };
+            status_to_dom_call_result(status, out, isolate, "DOM construct exception")
+        });
+    } else {
+        inner.clear_construct_handler();
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid; drop stale materialization so
+    // future conversions include the new callable builtins.
+    unsafe { stator_dom_object_wrap_drop_materialized_cache(wrap) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke a DOM wrapper's call-as-function handler directly through FFI.
+///
+/// Returns [`StatorStatus::StatorStatusUnsupported`] when no call handler is
+/// installed, [`StatorStatus::StatorStatusFalse`] when the wrapper was
+/// invalidated or an access check denies the call, and `Ok` with an owned
+/// `*out` result on success. A successful `undefined` result is represented by
+/// an owned undefined [`StatorValue`].
+///
+/// # Safety
+/// `wrap`, `receiver`, `args`, and `out` must follow the callback contract
+/// documented on [`StatorDomCallAsFunctionCb`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_call_as_function(
+    wrap: *mut StatorDomObjectWrap,
+    receiver: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    out: *mut *mut StatorValue,
+) -> StatorStatus {
+    if wrap.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let wrap_ref = unsafe { &*wrap };
+    if !wrap_ref.alive.get() {
+        return StatorStatus::StatorStatusFalse;
+    }
+    if !wrap_ref.inner.is_callable() {
+        return StatorStatus::StatorStatusUnsupported;
+    }
+    let receiver_js = if receiver.is_null() {
+        dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined)
+    } else {
+        // SAFETY: caller guarantees `receiver` is valid.
+        stator_value_inner_to_jsvalue(unsafe { &(*receiver).inner })
+    };
+    let mut js_args = Vec::with_capacity(arg_count);
+    for idx in 0..arg_count {
+        // SAFETY: caller guarantees `args` points to `arg_count` entries.
+        let arg = unsafe { *args.add(idx) };
+        if arg.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        // SAFETY: caller guarantees each argument pointer is valid.
+        js_args.push(stator_value_inner_to_jsvalue(unsafe { &(*arg).inner }));
+    }
+    match wrap_ref.inner.call_as_function(receiver_js, js_args) {
+        Ok(value) => {
+            let inner = jsvalue_to_stator_value_inner(&value);
+            // SAFETY: `out` is writable and `wrap_ref.isolate` owns the result.
+            unsafe { *out = allocate_stator_value(wrap_ref.isolate, inner) };
+            StatorStatus::StatorStatusOk
+        }
+        Err(_) => {
+            // SAFETY: `out` is writable.
+            unsafe { *out = std::ptr::null_mut() };
+            if !wrap_ref.isolate.is_null()
+                // SAFETY: isolate belongs to the live wrapper.
+                && unsafe { (*wrap_ref.isolate).pending_exception.is_some() }
+            {
+                StatorStatus::StatorStatusException
+            } else {
+                StatorStatus::StatorStatusFalse
+            }
+        }
+    }
+}
+
+/// Invoke a DOM wrapper's construct handler directly through FFI.
+///
+/// # Safety
+/// Arguments follow [`StatorDomConstructCb`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_construct(
+    wrap: *mut StatorDomObjectWrap,
+    new_target: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    out: *mut *mut StatorValue,
+) -> StatorStatus {
+    if wrap.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let wrap_ref = unsafe { &*wrap };
+    if !wrap_ref.alive.get() {
+        return StatorStatus::StatorStatusFalse;
+    }
+    if !wrap_ref.inner.is_constructible() {
+        return StatorStatus::StatorStatusUnsupported;
+    }
+    let new_target_js = if new_target.is_null() {
+        dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined)
+    } else {
+        // SAFETY: caller guarantees `new_target` is valid.
+        stator_value_inner_to_jsvalue(unsafe { &(*new_target).inner })
+    };
+    let mut js_args = Vec::with_capacity(arg_count);
+    for idx in 0..arg_count {
+        // SAFETY: caller guarantees `args` points to `arg_count` entries.
+        let arg = unsafe { *args.add(idx) };
+        if arg.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        // SAFETY: caller guarantees each argument pointer is valid.
+        js_args.push(stator_value_inner_to_jsvalue(unsafe { &(*arg).inner }));
+    }
+    match wrap_ref.inner.construct(new_target_js, js_args) {
+        Ok(value) => {
+            let inner = jsvalue_to_stator_value_inner(&value);
+            // SAFETY: `out` is writable and `wrap_ref.isolate` owns the result.
+            unsafe { *out = allocate_stator_value(wrap_ref.isolate, inner) };
+            StatorStatus::StatorStatusOk
+        }
+        Err(_) => {
+            // SAFETY: `out` is writable.
+            unsafe { *out = std::ptr::null_mut() };
+            if !wrap_ref.isolate.is_null()
+                // SAFETY: isolate belongs to the live wrapper.
+                && unsafe { (*wrap_ref.isolate).pending_exception.is_some() }
+            {
+                StatorStatus::StatorStatusException
+            } else {
+                StatorStatus::StatorStatusFalse
+            }
+        }
+    }
 }
 
 // ── Symbol-keyed named-handler FFI ──────────────────────────────────────────
@@ -37884,6 +38263,68 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn dom_call_sum(
+        receiver: *const StatorValue,
+        args: *const *const StatorValue,
+        arg_count: usize,
+        data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        if receiver.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let mut total = data as usize as f64;
+        for idx in 0..arg_count {
+            // SAFETY: callback contract supplies `arg_count` readable entries.
+            let arg = unsafe { *args.add(idx) };
+            if arg.is_null() {
+                return StatorStatus::StatorStatusInvalidArg;
+            }
+            // SAFETY: pointer was validated above.
+            total += unsafe { stator_value_as_number(arg) };
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        // SAFETY: `out` is writable and result ownership transfers to Stator.
+        unsafe { *out = stator_value_new_number(iso, total) };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn dom_construct_product(
+        _new_target: *const StatorValue,
+        args: *const *const StatorValue,
+        arg_count: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        if out.is_null() || (arg_count > 0 && args.is_null()) {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let mut product = 1.0;
+        for idx in 0..arg_count {
+            // SAFETY: callback contract supplies `arg_count` readable entries.
+            let arg = unsafe { *args.add(idx) };
+            if arg.is_null() {
+                return StatorStatus::StatorStatusInvalidArg;
+            }
+            // SAFETY: pointer was validated above.
+            product *= unsafe { stator_value_as_number(arg) };
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        // SAFETY: `out` is writable and result ownership transfers to Stator.
+        unsafe { *out = stator_value_new_number(iso, product) };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn dom_callable_exception(
+        _receiver: *const StatorValue,
+        _args: *const *const StatorValue,
+        _arg_count: usize,
+        _data: *mut c_void,
+        _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        StatorStatus::StatorStatusException
+    }
+
     thread_local! {
         static ACTIVE_ISO: std::cell::Cell<*mut StatorIsolate> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
@@ -38279,6 +38720,185 @@ mod tests {
         }
         ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
         ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_dom_callable_handler_direct_call_and_construct_success() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_call_sum),
+            construct: Some(dom_construct_product),
+            data: 10usize as *mut c_void,
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let arg1 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        let arg2 = unsafe { stator_value_new_number(iso.as_ptr(), 3.0) };
+        let args = [arg1 as *const StatorValue, arg2 as *const StatorValue];
+        let receiver = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    receiver,
+                    args.as_ptr(),
+                    args.len(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_value_as_number(out) }, 15.0);
+        unsafe { stator_value_destroy(out) };
+
+        out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_construct(
+                    wrap,
+                    receiver,
+                    args.as_ptr(),
+                    args.len(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_value_as_number(out) }, 6.0);
+
+        unsafe {
+            stator_value_destroy(out);
+            stator_value_destroy(receiver);
+            stator_value_destroy(arg1);
+            stator_value_destroy(arg2);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_script_call_and_construct() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_call_sum),
+            construct: Some(dom_construct_product),
+            data: 1usize as *mut c_void,
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"host".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                b"host(4, 5) + ':' + typeof new host(2, 3)".as_ptr() as *const c_char,
+                b"host(4, 5) + ':' + typeof new host(2, 3)".len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let actual = unsafe { CStr::from_ptr(stator_value_as_string(result)) }.to_string_lossy();
+        assert_eq!(actual, "10:object");
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_rejects_null_invalid_and_non_callable() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let empty = StatorDomCallableHandler {
+            call: None,
+            construct: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &empty) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusUnsupported
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_callback_error_and_invalidated_fail_closed() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_callable_exception),
+            construct: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusException
+        );
+        unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusFalse
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
     }
 
     #[test]
