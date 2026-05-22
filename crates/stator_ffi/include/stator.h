@@ -806,6 +806,28 @@ typedef enum StatorSnapshotErrorKind {
 } StatorSnapshotErrorKind;
 
 /**
+ * Settlement state for a host-controlled WebAssembly streaming operation.
+ */
+typedef enum StatorWasmStreamingOperationStatus {
+  /**
+   * The host has started the operation but has not completed or cancelled it.
+   */
+  StatorWasmStreamingOperationStatusPending = 0,
+  /**
+   * The host or isolate termination cancelled the operation before settlement.
+   */
+  StatorWasmStreamingOperationStatusCancelled = 1,
+  /**
+   * The operation completed successfully and owns a result module.
+   */
+  StatorWasmStreamingOperationStatusCompleted = 2,
+  /**
+   * The operation failed closed; query the diagnostic string for details.
+   */
+  StatorWasmStreamingOperationStatusErrored = 3,
+} StatorWasmStreamingOperationStatus;
+
+/**
  * C-ABI Wasm value kind used by host-import marshalling.
  *
  * Discriminants are stable and embedders may rely on them.
@@ -1415,6 +1437,11 @@ typedef struct StatorWasmInstance StatorWasmInstance;
  * [`stator_wasm_module_destroy`].
  */
 typedef struct StatorWasmModule StatorWasmModule;
+
+/**
+ * Opaque host-controlled compileStreaming/instantiateStreaming operation.
+ */
+typedef struct StatorWasmStreamingOperation StatorWasmStreamingOperation;
 
 /**
  * Compilation tier statistics for an isolate.
@@ -7123,6 +7150,110 @@ double stator_platform_monotonically_increasing_time(const struct StatorPlatform
  * `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
  */
 double stator_platform_current_clock_time_millis(const struct StatorPlatform *platform);
+
+/**
+ * Begin a host-controlled `WebAssembly.compileStreaming`-style operation.
+ *
+ * The returned operation starts pending. Stator does not fetch or buffer a
+ * response body; the host must call [`stator_wasm_streaming_complete`] exactly
+ * when it has final Wasm bytes, or [`stator_wasm_streaming_cancel`] when the
+ * browser fetch/response pipeline aborts.
+ *
+ * `options`, when non-null, must have `source_type == WebAssembly`; pointer
+ * fields are copied immediately. `source_metadata`, when non-null, is also
+ * copied immediately and must be tagged as WebAssembly.
+ *
+ * # Safety
+ * - `ctx` may be null, or a valid live context used for termination checks.
+ * - `options` and `source_metadata`, when non-null, must be readable.
+ */
+struct StatorWasmStreamingOperation *stator_wasm_streaming_compile_begin(struct StatorContext *ctx,
+                                                                         const struct StatorModuleCompileOptions *options,
+                                                                         const struct StatorModuleSourceMetadataV2 *source_metadata);
+
+/**
+ * Begin a host-controlled `WebAssembly.instantiateStreaming`-style operation.
+ *
+ * Completion compiles the final bytes as a WebAssembly module, links via the
+ * existing module resolver when imports are present, and evaluates the module
+ * so exported functions are materialised. It does not invent network,
+ * `Response`, or fake Promise behaviour.
+ *
+ * # Safety
+ * Same pointer requirements as [`stator_wasm_streaming_compile_begin`].
+ */
+struct StatorWasmStreamingOperation *stator_wasm_streaming_instantiate_begin(struct StatorContext *ctx,
+                                                                             const struct StatorModuleCompileOptions *options,
+                                                                             const struct StatorModuleSourceMetadataV2 *source_metadata);
+
+/**
+ * Complete a pending host-controlled Wasm streaming operation with final bytes.
+ *
+ * This is a settlement hook, not a network-streaming implementation: Stator
+ * compiles only the complete byte slice supplied by the host. If isolate
+ * termination is already requested, the operation is cancelled before any
+ * compile/evaluate work starts.
+ *
+ * # Safety
+ * - `operation` must be a live pointer returned by a `_begin` function.
+ * - `source` must be valid for reads of `source_len` bytes.
+ */
+bool stator_wasm_streaming_complete(struct StatorWasmStreamingOperation *operation,
+                                    const char *source,
+                                    size_t source_len);
+
+/**
+ * Cancel a pending host-controlled Wasm streaming operation.
+ *
+ * Cancellation is fail-closed and terminal. It records a diagnostic but does
+ * not compile or instantiate any bytes.
+ *
+ * # Safety
+ * - `operation` must be a live pointer returned by a `_begin` function.
+ * - `reason`, when non-null, must be valid for reads of `reason_len` bytes.
+ */
+bool stator_wasm_streaming_cancel(struct StatorWasmStreamingOperation *operation,
+                                  const char *reason,
+                                  size_t reason_len);
+
+/**
+ * Return the current status of a Wasm streaming operation.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+enum StatorWasmStreamingOperationStatus stator_wasm_streaming_get_status(const struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Return the terminal diagnostic for a failed/cancelled operation, or null.
+ *
+ * The returned pointer is borrowed from `operation` and remains valid until
+ * the operation is destroyed.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+const char *stator_wasm_streaming_get_error(const struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Transfer the compiled/evaluated module result out of a completed operation.
+ *
+ * Returns null unless the operation completed successfully and still owns its
+ * module. The caller becomes responsible for eventually calling
+ * [`stator_module_free`] on the returned module.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+struct StatorModule *stator_wasm_streaming_take_module(struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Destroy a Wasm streaming operation and any unclaimed module it owns.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+void stator_wasm_streaming_destroy(struct StatorWasmStreamingOperation *operation);
 
 /**
  * Compile a WebAssembly binary into a [`StatorWasmModule`].

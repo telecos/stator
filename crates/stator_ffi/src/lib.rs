@@ -16691,6 +16691,554 @@ pub struct StatorWasmInstance {
 // for synchronisation if passed across threads.
 unsafe impl Send for StatorWasmInstance {}
 
+/// Host-controlled WebAssembly streaming operation kind.
+///
+/// Stator does not fetch network responses or pretend to incrementally compile
+/// partial bytes. The embedder owns response/body streaming and completes one
+/// of these operations only after it has an authoritative final byte buffer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorWasmStreamingOperationKind {
+    /// `WebAssembly.compileStreaming`-style compile settlement.
+    StatorWasmStreamingOperationKindCompile = 0,
+    /// `WebAssembly.instantiateStreaming`-style compile plus instantiate/evaluate settlement.
+    StatorWasmStreamingOperationKindInstantiate = 1,
+}
+
+/// Settlement state for a host-controlled WebAssembly streaming operation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorWasmStreamingOperationStatus {
+    /// The host has started the operation but has not completed or cancelled it.
+    StatorWasmStreamingOperationStatusPending = 0,
+    /// The host or isolate termination cancelled the operation before settlement.
+    StatorWasmStreamingOperationStatusCancelled = 1,
+    /// The operation completed successfully and owns a result module.
+    StatorWasmStreamingOperationStatusCompleted = 2,
+    /// The operation failed closed; query the diagnostic string for details.
+    StatorWasmStreamingOperationStatusErrored = 3,
+}
+
+#[derive(Clone)]
+struct OwnedModuleCompileOptions {
+    resource_name: Vec<u8>,
+    line_offset: i32,
+    column_offset: i32,
+    base_url: Vec<u8>,
+    credentials_mode: StatorCredentialsMode,
+    integrity_metadata: Vec<u8>,
+    referrer_policy: StatorReferrerPolicy,
+    parser_metadata: StatorParserMetadata,
+}
+
+impl Default for OwnedModuleCompileOptions {
+    fn default() -> Self {
+        Self {
+            resource_name: Vec::new(),
+            line_offset: 0,
+            column_offset: 0,
+            base_url: Vec::new(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: Vec::new(),
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        }
+    }
+}
+
+impl OwnedModuleCompileOptions {
+    fn as_ffi(&self) -> StatorModuleCompileOptions {
+        StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: bytes_or_null(&self.resource_name),
+            resource_name_len: self.resource_name.len(),
+            line_offset: self.line_offset,
+            column_offset: self.column_offset,
+            base_url: bytes_or_null(&self.base_url),
+            base_url_len: self.base_url.len(),
+            credentials_mode: self.credentials_mode,
+            integrity_metadata: bytes_or_null(&self.integrity_metadata),
+            integrity_metadata_len: self.integrity_metadata.len(),
+            referrer_policy: self.referrer_policy,
+            parser_metadata: self.parser_metadata,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct OwnedSourceMetadataV2 {
+    source_url: Option<Vec<u8>>,
+    origin_url: Option<Vec<u8>>,
+    referrer_url: Option<Vec<u8>>,
+    source_map_url: Option<Vec<u8>>,
+    source_map_digest: Option<Vec<u8>>,
+    cache_policy: Option<Vec<u8>>,
+    edge_cache_metadata: Option<Vec<u8>>,
+}
+
+impl OwnedSourceMetadataV2 {
+    fn as_ffi(&self) -> StatorModuleSourceMetadataV2 {
+        let (source_url, source_url_len) = optional_bytes_ptr(self.source_url.as_ref());
+        let (origin_url, origin_url_len) = optional_bytes_ptr(self.origin_url.as_ref());
+        let (referrer_url, referrer_url_len) = optional_bytes_ptr(self.referrer_url.as_ref());
+        let (source_map_url, source_map_url_len) = optional_bytes_ptr(self.source_map_url.as_ref());
+        let (source_map_digest, source_map_digest_len) =
+            optional_bytes_ptr(self.source_map_digest.as_ref());
+        let (cache_policy, cache_policy_len) = optional_bytes_ptr(self.cache_policy.as_ref());
+        let (edge_cache_metadata, edge_cache_metadata_len) =
+            optional_bytes_ptr(self.edge_cache_metadata.as_ref());
+        StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            source_url,
+            source_url_len,
+            origin_url,
+            origin_url_len,
+            referrer_url,
+            referrer_url_len,
+            source_map_url,
+            source_map_url_len,
+            source_map_digest,
+            source_map_digest_len,
+            cache_policy,
+            cache_policy_len,
+            edge_cache_metadata,
+            edge_cache_metadata_len,
+        }
+    }
+}
+
+/// Opaque host-controlled compileStreaming/instantiateStreaming operation.
+pub struct StatorWasmStreamingOperation {
+    ctx: *mut StatorContext,
+    kind: StatorWasmStreamingOperationKind,
+    status: StatorWasmStreamingOperationStatus,
+    module: *mut StatorModule,
+    error: Option<CString>,
+    options: OwnedModuleCompileOptions,
+    source_metadata: Option<OwnedSourceMetadataV2>,
+}
+
+fn bytes_or_null(bytes: &[u8]) -> *const c_char {
+    if bytes.is_empty() {
+        std::ptr::null()
+    } else {
+        bytes.as_ptr() as *const c_char
+    }
+}
+
+fn streaming_error(message: impl AsRef<str>) -> CString {
+    CString::new(message.as_ref())
+        .unwrap_or_else(|_| c"WebAssembly streaming operation error".into())
+}
+
+unsafe fn copy_streaming_options(
+    options: *const StatorModuleCompileOptions,
+) -> Option<OwnedModuleCompileOptions> {
+    if options.is_null() {
+        return Some(OwnedModuleCompileOptions::default());
+    }
+    // SAFETY: caller guarantees `options` points to a readable options struct.
+    let options_ref = unsafe { &*options };
+    if options_ref.source_type != StatorModuleType::StatorModuleTypeWebAssembly {
+        return None;
+    }
+    Some(OwnedModuleCompileOptions {
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        resource_name: unsafe {
+            owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
+        },
+        line_offset: options_ref.line_offset,
+        column_offset: options_ref.column_offset,
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        base_url: unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len)? },
+        credentials_mode: options_ref.credentials_mode,
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        integrity_metadata: unsafe {
+            owned_ffi_bytes(
+                options_ref.integrity_metadata,
+                options_ref.integrity_metadata_len,
+            )?
+        },
+        referrer_policy: options_ref.referrer_policy,
+        parser_metadata: options_ref.parser_metadata,
+    })
+}
+
+unsafe fn copy_streaming_source_metadata(
+    metadata: *const StatorModuleSourceMetadataV2,
+) -> Option<Option<OwnedSourceMetadataV2>> {
+    if metadata.is_null() {
+        return Some(None);
+    }
+    // SAFETY: caller guarantees `metadata` points to a readable metadata struct.
+    let metadata_ref = unsafe { &*metadata };
+    if metadata_ref.source_type != StatorModuleType::StatorModuleTypeWebAssembly {
+        return None;
+    }
+    Some(Some(OwnedSourceMetadataV2 {
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_url: unsafe {
+            metadata_field(metadata_ref.source_url, metadata_ref.source_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        origin_url: unsafe {
+            metadata_field(metadata_ref.origin_url, metadata_ref.origin_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        referrer_url: unsafe {
+            metadata_field(metadata_ref.referrer_url, metadata_ref.referrer_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_map_url: unsafe {
+            metadata_field(metadata_ref.source_map_url, metadata_ref.source_map_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_map_digest: unsafe {
+            metadata_field(
+                metadata_ref.source_map_digest,
+                metadata_ref.source_map_digest_len,
+            )?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        cache_policy: unsafe {
+            metadata_field(metadata_ref.cache_policy, metadata_ref.cache_policy_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        edge_cache_metadata: unsafe {
+            metadata_field(
+                metadata_ref.edge_cache_metadata,
+                metadata_ref.edge_cache_metadata_len,
+            )?
+        },
+    }))
+}
+
+unsafe fn stator_wasm_streaming_begin(
+    ctx: *mut StatorContext,
+    kind: StatorWasmStreamingOperationKind,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    let options = match unsafe { copy_streaming_options(options) } {
+        Some(options) => options,
+        None => return std::ptr::null_mut(),
+    };
+    let source_metadata = match unsafe { copy_streaming_source_metadata(source_metadata) } {
+        Some(metadata) => metadata,
+        None => return std::ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(StatorWasmStreamingOperation {
+        ctx,
+        kind,
+        status: StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending,
+        module: std::ptr::null_mut(),
+        error: None,
+        options,
+        source_metadata,
+    }))
+}
+
+/// Begin a host-controlled `WebAssembly.compileStreaming`-style operation.
+///
+/// The returned operation starts pending. Stator does not fetch or buffer a
+/// response body; the host must call [`stator_wasm_streaming_complete`] exactly
+/// when it has final Wasm bytes, or [`stator_wasm_streaming_cancel`] when the
+/// browser fetch/response pipeline aborts.
+///
+/// `options`, when non-null, must have `source_type == WebAssembly`; pointer
+/// fields are copied immediately. `source_metadata`, when non-null, is also
+/// copied immediately and must be tagged as WebAssembly.
+///
+/// # Safety
+/// - `ctx` may be null, or a valid live context used for termination checks.
+/// - `options` and `source_metadata`, when non-null, must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_compile_begin(
+    ctx: *mut StatorContext,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    // SAFETY: forwards caller-provided readable option pointers to the shared begin helper.
+    unsafe {
+        stator_wasm_streaming_begin(
+            ctx,
+            StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindCompile,
+            options,
+            source_metadata,
+        )
+    }
+}
+
+/// Begin a host-controlled `WebAssembly.instantiateStreaming`-style operation.
+///
+/// Completion compiles the final bytes as a WebAssembly module, links via the
+/// existing module resolver when imports are present, and evaluates the module
+/// so exported functions are materialised. It does not invent network,
+/// `Response`, or fake Promise behaviour.
+///
+/// # Safety
+/// Same pointer requirements as [`stator_wasm_streaming_compile_begin`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_instantiate_begin(
+    ctx: *mut StatorContext,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    // SAFETY: forwards caller-provided readable option pointers to the shared begin helper.
+    unsafe {
+        stator_wasm_streaming_begin(
+            ctx,
+            StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindInstantiate,
+            options,
+            source_metadata,
+        )
+    }
+}
+
+fn module_error_message(module: *const StatorModule) -> Option<String> {
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: caller passes a live module pointer.
+    unsafe {
+        (*module)
+            .error
+            .as_ref()
+            .map(|error| error.to_string_lossy().into_owned())
+    }
+}
+
+fn fail_streaming_operation(op: &mut StatorWasmStreamingOperation, message: impl AsRef<str>) {
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored;
+    op.error = Some(streaming_error(message));
+}
+
+/// Complete a pending host-controlled Wasm streaming operation with final bytes.
+///
+/// This is a settlement hook, not a network-streaming implementation: Stator
+/// compiles only the complete byte slice supplied by the host. If isolate
+/// termination is already requested, the operation is cancelled before any
+/// compile/evaluate work starts.
+///
+/// # Safety
+/// - `operation` must be a live pointer returned by a `_begin` function.
+/// - `source` must be valid for reads of `source_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_complete(
+    operation: *mut StatorWasmStreamingOperation,
+    source: *const c_char,
+    source_len: usize,
+) -> bool {
+    if operation.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending {
+        return false;
+    }
+    if unsafe { context_is_execution_terminating(op.ctx) } {
+        op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled;
+        op.error = Some(streaming_error(
+            "WebAssembly streaming operation cancelled because execution is terminating",
+        ));
+        return false;
+    }
+    if source.is_null() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation completed with null source",
+        );
+        return false;
+    }
+    // SAFETY: caller guarantees `source` is valid for `source_len` bytes.
+    let source_bytes = unsafe { std::slice::from_raw_parts(source as *const u8, source_len) };
+    let options = op.options.as_ffi();
+    // SAFETY: the local options struct points into `op.options`, which remains
+    // live throughout the call.
+    let module = unsafe {
+        stator_module_compile_with_options(op.ctx, source as *const c_char, source_len, &options)
+    };
+    if module.is_null() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation could not allocate module",
+        );
+        return false;
+    }
+    op.module = module;
+
+    if let Some(metadata) = &op.source_metadata {
+        let metadata = metadata.as_ffi();
+        // SAFETY: `module` is live and the local metadata borrows from `op`.
+        if !unsafe { stator_module_set_source_metadata_v2(module, &metadata) } {
+            fail_streaming_operation(op, "WebAssembly streaming source metadata was rejected");
+            return false;
+        }
+    }
+
+    if let Some(message) = module_error_message(module) {
+        fail_streaming_operation(op, message);
+        return false;
+    }
+    if source_bytes.is_empty() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation completed with empty source",
+        );
+        return false;
+    }
+
+    if op.kind == StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindInstantiate {
+        // SAFETY: `module` is the live module produced above.
+        if !unsafe { stator_module_instantiate(op.ctx, module) } {
+            fail_streaming_operation(
+                op,
+                module_error_message(module)
+                    .unwrap_or_else(|| "WebAssembly streaming instantiate failed".to_string()),
+            );
+            return false;
+        }
+        // SAFETY: `module` is linked; the returned namespace value is only used
+        // to drive settlement and is immediately released.
+        let value = unsafe { stator_module_evaluate(module, op.ctx) };
+        if value.is_null() {
+            fail_streaming_operation(
+                op,
+                module_error_message(module)
+                    .unwrap_or_else(|| "WebAssembly streaming evaluate failed".to_string()),
+            );
+            return false;
+        }
+        // SAFETY: `value` was returned by `stator_module_evaluate` above.
+        unsafe { stator_value_destroy(value) };
+        if let Some(message) = module_error_message(module) {
+            fail_streaming_operation(op, message);
+            return false;
+        }
+    }
+
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted;
+    true
+}
+
+/// Cancel a pending host-controlled Wasm streaming operation.
+///
+/// Cancellation is fail-closed and terminal. It records a diagnostic but does
+/// not compile or instantiate any bytes.
+///
+/// # Safety
+/// - `operation` must be a live pointer returned by a `_begin` function.
+/// - `reason`, when non-null, must be valid for reads of `reason_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_cancel(
+    operation: *mut StatorWasmStreamingOperation,
+    reason: *const c_char,
+    reason_len: usize,
+) -> bool {
+    if operation.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending {
+        return false;
+    }
+    let reason = if reason.is_null() {
+        "WebAssembly streaming operation cancelled by host".to_string()
+    } else {
+        // SAFETY: caller guarantees `reason` is valid for `reason_len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(reason as *const u8, reason_len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled;
+    op.error = Some(streaming_error(reason));
+    true
+}
+
+/// Return the current status of a Wasm streaming operation.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_get_status(
+    operation: *const StatorWasmStreamingOperation,
+) -> StatorWasmStreamingOperationStatus {
+    if operation.is_null() {
+        return StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    unsafe { (*operation).status }
+}
+
+/// Return the terminal diagnostic for a failed/cancelled operation, or null.
+///
+/// The returned pointer is borrowed from `operation` and remains valid until
+/// the operation is destroyed.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_get_error(
+    operation: *const StatorWasmStreamingOperation,
+) -> *const c_char {
+    if operation.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    unsafe {
+        (*operation)
+            .error
+            .as_ref()
+            .map_or(std::ptr::null(), |error| error.as_ptr())
+    }
+}
+
+/// Transfer the compiled/evaluated module result out of a completed operation.
+///
+/// Returns null unless the operation completed successfully and still owns its
+/// module. The caller becomes responsible for eventually calling
+/// [`stator_module_free`] on the returned module.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_take_module(
+    operation: *mut StatorWasmStreamingOperation,
+) -> *mut StatorModule {
+    if operation.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted
+    {
+        return std::ptr::null_mut();
+    }
+    let module = op.module;
+    op.module = std::ptr::null_mut();
+    module
+}
+
+/// Destroy a Wasm streaming operation and any unclaimed module it owns.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_destroy(
+    operation: *mut StatorWasmStreamingOperation,
+) {
+    if operation.is_null() {
+        return;
+    }
+    // SAFETY: caller transfers ownership of the operation back to Stator.
+    let op = unsafe { Box::from_raw(operation) };
+    if !op.module.is_null() {
+        // SAFETY: unclaimed module is still owned by the operation.
+        unsafe { stator_module_free(op.module) };
+    }
+}
+
 /// Compile a WebAssembly binary into a [`StatorWasmModule`].
 ///
 /// Returns a null pointer if `isolate` or `bytes` is null, `len` is zero, or
@@ -36977,6 +37525,224 @@ mod tests {
             stator_wasm_instance_destroy(inst);
             stator_wasm_module_destroy(m);
         }
+    }
+
+    #[test]
+    fn test_wasm_streaming_compile_settles_with_metadata() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let resource = b"https://example.test/mod.wasm";
+        let base = b"https://example.test/";
+        let source_url = b"https://example.test/mod.wasm#source";
+        let origin_url = b"https://example.test";
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: resource.as_ptr() as *const c_char,
+            resource_name_len: resource.len(),
+            line_offset: 7,
+            column_offset: 3,
+            base_url: base.as_ptr() as *const c_char,
+            base_url_len: base.len(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataParserInserted,
+        };
+        let metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            source_url: source_url.as_ptr() as *const c_char,
+            source_url_len: source_url.len(),
+            origin_url: origin_url.as_ptr() as *const c_char,
+            origin_url_len: origin_url.len(),
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        let op = unsafe { stator_wasm_streaming_compile_begin(ctx, &options, &metadata) };
+        assert!(!op.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending
+        );
+        assert!(unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted
+        );
+        let module = unsafe { stator_wasm_streaming_take_module(op) };
+        assert!(!module.is_null());
+        let resource_name = unsafe { CStr::from_ptr(stator_module_get_resource_name(module)) };
+        assert_eq!(resource_name.to_bytes(), resource);
+        assert_eq!(unsafe { stator_module_get_line_offset(module) }, 7);
+        let mut queried = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        assert!(unsafe { stator_module_get_source_metadata_v2(module, &mut queried) });
+        assert_eq!(
+            queried.source_type,
+            StatorModuleType::StatorModuleTypeWebAssembly
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.source_url, queried.source_url_len) },
+            source_url
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.origin_url, queried.origin_url_len) },
+            origin_url
+        );
+        unsafe {
+            stator_module_free(module);
+            stator_wasm_streaming_destroy(op);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_instantiate_settles_evaluated_module() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let op =
+            unsafe { stator_wasm_streaming_instantiate_begin(ctx, &options, std::ptr::null()) };
+        assert!(!op.is_null());
+        assert!(unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        let module = unsafe { stator_wasm_streaming_take_module(op) };
+        assert!(!module.is_null());
+        assert_eq!(
+            unsafe { stator_module_get_status(module) },
+            StatorModuleStatus::StatorModuleStatusEvaluated
+        );
+        unsafe {
+            stator_module_free(module);
+            stator_wasm_streaming_destroy(op);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_cancel_and_termination_fail_closed() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let op =
+            unsafe { stator_wasm_streaming_compile_begin(ctx, std::ptr::null(), std::ptr::null()) };
+        assert!(!op.is_null());
+        let reason = b"fetch aborted";
+        assert!(unsafe {
+            stator_wasm_streaming_cancel(op, reason.as_ptr() as *const c_char, reason.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled
+        );
+        let error = unsafe { CStr::from_ptr(stator_wasm_streaming_get_error(op)) };
+        assert!(error.to_string_lossy().contains("fetch aborted"));
+        unsafe { stator_wasm_streaming_destroy(op) };
+
+        let op =
+            unsafe { stator_wasm_streaming_compile_begin(ctx, std::ptr::null(), std::ptr::null()) };
+        assert!(!op.is_null());
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        unsafe { stator_isolate_terminate_execution(iso.as_ptr()) };
+        assert!(!unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled
+        );
+        assert!(unsafe { stator_wasm_streaming_take_module(op) }.is_null());
+        unsafe {
+            stator_wasm_streaming_destroy(op);
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_rejects_non_wasm_metadata_and_invalid_bytes() {
+        let bad_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let op = unsafe {
+            stator_wasm_streaming_compile_begin(
+                std::ptr::null_mut(),
+                &bad_options,
+                std::ptr::null(),
+            )
+        };
+        assert!(op.is_null());
+
+        let op = unsafe {
+            stator_wasm_streaming_compile_begin(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!op.is_null());
+        let bad = b"not wasm";
+        assert!(!unsafe {
+            stator_wasm_streaming_complete(op, bad.as_ptr() as *const c_char, bad.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored
+        );
+        let error = unsafe { CStr::from_ptr(stator_wasm_streaming_get_error(op)) };
+        assert!(error.to_string_lossy().contains("binary Wasm"));
+        unsafe { stator_wasm_streaming_destroy(op) };
     }
 
     #[test]
