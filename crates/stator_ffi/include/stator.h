@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 20
+#define STATOR_FFI_ABI_VERSION_MINOR 21
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -6302,6 +6302,44 @@ struct StatorFunctionTemplate *stator_function_template_new(struct StatorIsolate
 void stator_function_template_destroy(struct StatorFunctionTemplate *tmpl);
 
 /**
+ * Return the instance template associated with a function template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Properties set on it are installed
+ * as own properties when the function template is applied to a DOM wrapper.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_function_template_instance_template(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Return the prototype template associated with a function template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Properties set on it are installed
+ * on the DOM wrapper prototype object.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_function_template_prototype_template(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Copy parent template inheritance metadata into `tmpl`.
+ *
+ * Parent instance-template properties that do not already exist are copied as
+ * defaults. The child's prototype template receives a prototype-template link
+ * to a deep snapshot of the parent's prototype template, producing a predictable
+ * prototype chain for DOM wrapper instances.
+ *
+ * # Safety
+ * `tmpl` and `parent` must be valid, live [`StatorFunctionTemplate`] pointers.
+ */
+enum StatorStatus stator_function_template_inherit(struct StatorFunctionTemplate *tmpl,
+                                                   const struct StatorFunctionTemplate *parent);
+
+/**
  * Produce a [`StatorValue`] representing the function described by `tmpl`.
  *
  * The returned value has type `"function"` and can be installed into a
@@ -6412,6 +6450,23 @@ void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
 enum StatorStatus stator_context_global_set_dom_object_wrap(struct StatorContext *ctx,
                                                             const char *name,
                                                             struct StatorDomObjectWrap *wrap);
+
+/**
+ * Apply a function template's instance/prototype templates to a DOM wrapper.
+ *
+ * Instance-template properties are installed as own properties on the wrapper.
+ * Prototype-template properties are installed on an inherited prototype object.
+ * The template contents are snapshotted at call time so later template changes
+ * do not mutate already-applied wrappers.
+ *
+ * Returns [`StatorStatus::StatorStatusInvalidArg`] for null pointers,
+ * cross-isolate templates, or invalidated wrappers.
+ *
+ * # Safety
+ * `wrap` and `tmpl` must be valid, live pointers owned by the same isolate.
+ */
+enum StatorStatus stator_dom_object_wrap_apply_function_template(struct StatorDomObjectWrap *wrap,
+                                                                 const struct StatorFunctionTemplate *tmpl);
 
 /**
  * Create an empty snapshot callback manifest.
@@ -6763,6 +6818,17 @@ void stator_object_template_set_internal_field_count(struct StatorObjectTemplate
  * `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
  */
 int32_t stator_object_template_internal_field_count(const struct StatorObjectTemplate *tmpl);
+
+/**
+ * Return this object template's mutable prototype template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Returns null when `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_object_template_prototype_template(struct StatorObjectTemplate *tmpl);
 
 /**
  * Create a new [`StatorObject`] instance from an object template.

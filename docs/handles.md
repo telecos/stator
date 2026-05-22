@@ -830,6 +830,29 @@ Result semantics are fail-closed:
   own string property already exists. Indexed wrappers do not have a
   per-index own-property store, so indexed non-masking remains metadata.
 
+### 7.7 DOM wrapper instance/prototype templates
+
+Function templates carry separate borrowed object templates for DOM wrapper
+embedding:
+
+- `stator_function_template_instance_template(tmpl)` returns the template
+  whose properties are installed as own properties on a wrapper.
+- `stator_function_template_prototype_template(tmpl)` returns the template
+  installed on the wrapper's inherited prototype object.
+- `stator_function_template_inherit(child, parent)` snapshots parent
+  instance defaults and links the child's prototype template to a deep copy
+  of the parent's prototype template.
+- `stator_dom_object_wrap_apply_function_template(wrap, tmpl)` snapshots
+  the function template onto a live wrapper. The wrapper and template must
+  belong to the same isolate; null, cross-isolate, or invalidated inputs
+  fail closed with `StatorStatusInvalidArg`.
+
+Object templates also expose
+`stator_object_template_prototype_template(tmpl)` for ordinary instances
+created via `stator_object_template_new_instance`. Returned template
+pointers are borrowed and destroyed with their owning template; embedders
+must not destroy them separately.
+
 Stator (this engine) is responsible for:
 - Stable slot addresses; in-place rewrites on move.
 - One-shot, deterministic weak callbacks in the documented phase.

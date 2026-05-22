@@ -54,7 +54,7 @@ use stator_jse::jit_mitigations::{self, JitMitigationsTier};
 use stator_jse::jit_unwind;
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
-use stator_jse::objects::property_map::PropertyMap;
+use stator_jse::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use stator_jse::objects::value::{JsValue, ModuleBindingCell, NativeFn};
 use stator_jse::parser;
 use stator_jse::parser::ast::{
@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 20;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 21;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -2371,6 +2371,33 @@ type MaterializedDomWrapRegistry = HashMap<usize, (*mut StatorDomObjectWrap, Rc<
 thread_local! {
     static DOM_WRAP_MATERIALIZED_REGISTRY: RefCell<MaterializedDomWrapRegistry> =
         RefCell::new(HashMap::new());
+}
+
+fn clone_stator_value_inner(inner: &StatorValueInner) -> StatorValueInner {
+    match inner {
+        StatorValueInner::Undefined => StatorValueInner::Undefined,
+        StatorValueInner::Null => StatorValueInner::Null,
+        StatorValueInner::Boolean(b) => StatorValueInner::Boolean(*b),
+        StatorValueInner::Number(n) => StatorValueInner::Number(*n),
+        StatorValueInner::Str(s) => StatorValueInner::Str(s.clone()),
+        StatorValueInner::Object => StatorValueInner::Object,
+        StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
+        StatorValueInner::DomWrapHandle { plain, wrap, alive } => StatorValueInner::DomWrapHandle {
+            plain: Rc::clone(plain),
+            wrap: *wrap,
+            alive: Rc::clone(alive),
+        },
+        StatorValueInner::Function => StatorValueInner::Function,
+        StatorValueInner::NativeFunctionValue(f) => {
+            StatorValueInner::NativeFunctionValue(Rc::clone(f))
+        }
+        StatorValueInner::Array => StatorValueInner::Array,
+        StatorValueInner::Date => StatorValueInner::Date,
+        StatorValueInner::RegExp => StatorValueInner::RegExp,
+        StatorValueInner::Promise => StatorValueInner::Promise,
+        StatorValueInner::Map => StatorValueInner::Map,
+        StatorValueInner::Set => StatorValueInner::Set,
+    }
 }
 
 fn dom_wrap_inner_for_plain_object(plain: &Rc<RefCell<PropertyMap>>) -> Option<StatorValueInner> {
@@ -13545,6 +13572,8 @@ pub unsafe extern "C" fn stator_function_callback_info_get_isolate(
 pub struct StatorFunctionTemplate {
     isolate: *mut StatorIsolate,
     callback: StatorFunctionTemplateCallback,
+    instance_template: Box<StatorObjectTemplate>,
+    prototype_template: Box<StatorObjectTemplate>,
 }
 
 // SAFETY: `StatorFunctionTemplate` contains raw pointer fields that are only
@@ -13568,7 +13597,12 @@ pub unsafe extern "C" fn stator_function_template_new(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(StatorFunctionTemplate { isolate, callback }))
+    Box::into_raw(Box::new(StatorFunctionTemplate {
+        isolate,
+        callback,
+        instance_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
+        prototype_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
+    }))
 }
 
 /// Destroy a function template previously created with
@@ -13585,6 +13619,75 @@ pub unsafe extern "C" fn stator_function_template_destroy(tmpl: *mut StatorFunct
         // SAFETY: pointer was created by `Box::into_raw`.
         drop(unsafe { Box::from_raw(tmpl) });
     }
+}
+
+/// Return the instance template associated with a function template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Properties set on it are installed
+/// as own properties when the function template is applied to a DOM wrapper.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_instance_template(
+    tmpl: *mut StatorFunctionTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).instance_template.as_mut() as *mut StatorObjectTemplate }
+}
+
+/// Return the prototype template associated with a function template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Properties set on it are installed
+/// on the DOM wrapper prototype object.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_prototype_template(
+    tmpl: *mut StatorFunctionTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).prototype_template.as_mut() as *mut StatorObjectTemplate }
+}
+
+/// Copy parent template inheritance metadata into `tmpl`.
+///
+/// Parent instance-template properties that do not already exist are copied as
+/// defaults. The child's prototype template receives a prototype-template link
+/// to a deep snapshot of the parent's prototype template, producing a predictable
+/// prototype chain for DOM wrapper instances.
+///
+/// # Safety
+/// `tmpl` and `parent` must be valid, live [`StatorFunctionTemplate`] pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_inherit(
+    tmpl: *mut StatorFunctionTemplate,
+    parent: *const StatorFunctionTemplate,
+) -> StatorStatus {
+    if tmpl.is_null() || parent.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let child = unsafe { &mut *tmpl };
+    let parent = unsafe { &*parent };
+    if child.isolate != parent.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    child
+        .instance_template
+        .merge_missing_properties_from(&parent.instance_template);
+    child.prototype_template.prototype_template =
+        Some(Box::new(parent.prototype_template.clone_deep()));
+    StatorStatus::StatorStatusOk
 }
 
 /// Produce a [`StatorValue`] representing the function described by `tmpl`.
@@ -13952,6 +14055,17 @@ fn dom_object_wrap_plain_object(
         object.insert_with_attrs(name, JsValue::Undefined, PropertyAttributes::ENUMERABLE);
     }
 
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(instance_template) = unsafe { (*wrap).instance_template.as_ref() } {
+        install_object_template_on_property_map(&mut object, instance_template);
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(prototype_template) = unsafe { (*wrap).prototype_template.as_ref() } {
+        let mut prototype_link = StatorObjectTemplate::new_empty(unsafe { (*wrap).isolate });
+        prototype_link.prototype_template = Some(Box::new(prototype_template.clone_deep()));
+        install_object_template_on_property_map(&mut object, &prototype_link);
+    }
+
     object.extensible = false;
     let plain = Rc::new(RefCell::new(object));
     DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
@@ -14123,6 +14237,51 @@ pub unsafe extern "C" fn stator_context_global_set_dom_object_wrap(
     // SAFETY: caller guarantees `ctx` is valid.
     let globals = unsafe { Rc::clone(&(*ctx).globals) };
     globals.borrow_mut().insert(name_str, js_value);
+    StatorStatus::StatorStatusOk
+}
+
+/// Apply a function template's instance/prototype templates to a DOM wrapper.
+///
+/// Instance-template properties are installed as own properties on the wrapper.
+/// Prototype-template properties are installed on an inherited prototype object.
+/// The template contents are snapshotted at call time so later template changes
+/// do not mutate already-applied wrappers.
+///
+/// Returns [`StatorStatus::StatorStatusInvalidArg`] for null pointers,
+/// cross-isolate templates, or invalidated wrappers.
+///
+/// # Safety
+/// `wrap` and `tmpl` must be valid, live pointers owned by the same isolate.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_apply_function_template(
+    wrap: *mut StatorDomObjectWrap,
+    tmpl: *const StatorFunctionTemplate,
+) -> StatorStatus {
+    if wrap.is_null() || tmpl.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let wrap_ref = unsafe { &mut *wrap };
+    let tmpl_ref = unsafe { &*tmpl };
+    if !wrap_ref.alive.get() || wrap_ref.isolate.is_null() || wrap_ref.isolate != tmpl_ref.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    wrap_ref.instance_template = Some(tmpl_ref.instance_template.clone_deep());
+    wrap_ref.prototype_template = Some(tmpl_ref.prototype_template.clone_deep());
+
+    if let Some(plain) = wrap_ref.materialized.borrow().as_ref().cloned() {
+        let mut map = plain.borrow_mut();
+        if let Some(instance_template) = wrap_ref.instance_template.as_ref() {
+            install_object_template_on_property_map(&mut map, instance_template);
+        }
+        if let Some(prototype_template) = wrap_ref.prototype_template.as_ref() {
+            let mut prototype_link = StatorObjectTemplate::new_empty(wrap_ref.isolate);
+            prototype_link.prototype_template = Some(Box::new(prototype_template.clone_deep()));
+            install_object_template_on_property_map(&mut map, &prototype_link);
+        }
+    }
+
     StatorStatus::StatorStatusOk
 }
 
@@ -15527,8 +15686,45 @@ pub struct StatorObjectTemplate {
     /// Named properties to install on each new instance.  Each entry maps a
     /// property name to a value that is cloned into every instance.
     properties: HashMap<String, StatorValueInner>,
+    /// Prototype template used for objects created from this template.
+    prototype_template: Option<Box<StatorObjectTemplate>>,
     /// The number of internal fields reserved for embedder data.
     internal_field_count: i32,
+}
+
+impl StatorObjectTemplate {
+    fn new_empty(isolate: *mut StatorIsolate) -> Self {
+        Self {
+            isolate,
+            properties: HashMap::new(),
+            prototype_template: None,
+            internal_field_count: 0,
+        }
+    }
+
+    fn clone_deep(&self) -> Self {
+        Self {
+            isolate: self.isolate,
+            properties: self
+                .properties
+                .iter()
+                .map(|(key, value)| (key.clone(), clone_stator_value_inner(value)))
+                .collect(),
+            prototype_template: self
+                .prototype_template
+                .as_ref()
+                .map(|prototype| Box::new(prototype.clone_deep())),
+            internal_field_count: self.internal_field_count,
+        }
+    }
+
+    fn merge_missing_properties_from(&mut self, parent: &StatorObjectTemplate) {
+        for (key, value) in &parent.properties {
+            self.properties
+                .entry(key.clone())
+                .or_insert_with(|| clone_stator_value_inner(value));
+        }
+    }
 }
 
 // SAFETY: `StatorObjectTemplate` is single-threaded; same rationale as
@@ -15549,11 +15745,7 @@ pub unsafe extern "C" fn stator_object_template_new(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(StatorObjectTemplate {
-        isolate,
-        properties: HashMap::new(),
-        internal_field_count: 0,
-    }))
+    Box::into_raw(Box::new(StatorObjectTemplate::new_empty(isolate)))
 }
 
 /// Destroy an object template previously created with
@@ -15595,30 +15787,7 @@ pub unsafe extern "C" fn stator_object_template_set(
     let key_str = unsafe { CStr::from_ptr(key) }
         .to_string_lossy()
         .into_owned();
-    let inner = match unsafe { &(*val).inner } {
-        StatorValueInner::Number(n) => StatorValueInner::Number(*n),
-        StatorValueInner::Boolean(b) => StatorValueInner::Boolean(*b),
-        StatorValueInner::Undefined => StatorValueInner::Undefined,
-        StatorValueInner::Null => StatorValueInner::Null,
-        StatorValueInner::Str(cs) => StatorValueInner::Str(cs.clone()),
-        StatorValueInner::Object => StatorValueInner::Object,
-        StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
-        StatorValueInner::DomWrapHandle { plain, wrap, alive } => StatorValueInner::DomWrapHandle {
-            plain: Rc::clone(plain),
-            wrap: *wrap,
-            alive: Rc::clone(alive),
-        },
-        StatorValueInner::Function => StatorValueInner::Function,
-        StatorValueInner::NativeFunctionValue(f) => {
-            StatorValueInner::NativeFunctionValue(Rc::clone(f))
-        }
-        StatorValueInner::Array => StatorValueInner::Array,
-        StatorValueInner::Date => StatorValueInner::Date,
-        StatorValueInner::RegExp => StatorValueInner::RegExp,
-        StatorValueInner::Promise => StatorValueInner::Promise,
-        StatorValueInner::Map => StatorValueInner::Map,
-        StatorValueInner::Set => StatorValueInner::Set,
-    };
+    let inner = clone_stator_value_inner(unsafe { &(*val).inner });
     unsafe { (*tmpl).properties.insert(key_str, inner) };
 }
 
@@ -15657,6 +15826,76 @@ pub unsafe extern "C" fn stator_object_template_internal_field_count(
     unsafe { (*tmpl).internal_field_count }
 }
 
+/// Return this object template's mutable prototype template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Returns null when `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_prototype_template(
+    tmpl: *mut StatorObjectTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let tmpl_ref = unsafe { &mut *tmpl };
+    let isolate = tmpl_ref.isolate;
+    tmpl_ref
+        .prototype_template
+        .get_or_insert_with(|| Box::new(StatorObjectTemplate::new_empty(isolate)))
+        .as_mut() as *mut StatorObjectTemplate
+}
+
+fn object_template_to_js_object(tmpl: &StatorObjectTemplate) -> JsObject {
+    let prototype = tmpl
+        .prototype_template
+        .as_ref()
+        .map(|prototype| Rc::new(RefCell::new(object_template_to_js_object(prototype))));
+    let mut obj = match prototype {
+        Some(prototype) => JsObject::with_prototype(prototype),
+        None => JsObject::new(),
+    };
+    for (key, val_inner) in &tmpl.properties {
+        let _ = obj.set_property(key, stator_value_inner_to_jsvalue(val_inner));
+    }
+    obj
+}
+
+fn install_object_template_on_property_map(map: &mut PropertyMap, tmpl: &StatorObjectTemplate) {
+    let default_attrs = PropertyAttributes::from_bits_truncate(
+        PropertyAttributes::WRITABLE.bits()
+            | PropertyAttributes::ENUMERABLE.bits()
+            | PropertyAttributes::CONFIGURABLE.bits(),
+    );
+    let prototype_attrs = PropertyAttributes::from_bits_truncate(
+        PropertyAttributes::WRITABLE.bits() | PropertyAttributes::CONFIGURABLE.bits(),
+    );
+    for (key, val_inner) in &tmpl.properties {
+        map.insert_with_attrs(
+            key.clone(),
+            stator_value_inner_to_jsvalue(val_inner),
+            default_attrs,
+        );
+    }
+    if let Some(prototype) = &tmpl.prototype_template {
+        let prototype = object_template_to_property_map(prototype);
+        map.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.to_string(),
+            JsValue::PlainObject(prototype),
+            prototype_attrs,
+        );
+    }
+}
+
+fn object_template_to_property_map(tmpl: &StatorObjectTemplate) -> Rc<RefCell<PropertyMap>> {
+    let mut map = PropertyMap::new();
+    install_object_template_on_property_map(&mut map, tmpl);
+    Rc::new(RefCell::new(map))
+}
+
 /// Create a new [`StatorObject`] instance from an object template.
 ///
 /// The returned object has all properties defined on the template pre-installed.
@@ -15677,13 +15916,8 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    let mut obj = JsObject::new();
-    // Install template properties onto the new object.
     // SAFETY: `tmpl` is valid.
-    for (key, val_inner) in unsafe { &(*tmpl).properties } {
-        let js_val = stator_value_inner_to_jsvalue(val_inner);
-        let _ = obj.set_property(key, js_val);
-    }
+    let obj = object_template_to_js_object(unsafe { &*tmpl });
     // SAFETY: isolate is valid.
     unsafe { (*isolate).live_objects += 1 };
     Box::into_raw(Box::new(StatorObject {
@@ -17492,6 +17726,10 @@ pub struct StatorDomObjectWrap {
     /// stale JS aliases observe `undefined` instead of dereferencing a wrapper
     /// after the embedder invalidates or destroys it.
     alive: Rc<Cell<bool>>,
+    /// FunctionTemplate instance template snapshotted onto this wrapper.
+    instance_template: Option<StatorObjectTemplate>,
+    /// FunctionTemplate prototype template snapshotted onto this wrapper.
+    prototype_template: Option<StatorObjectTemplate>,
 }
 
 // SAFETY: `StatorDomObjectWrap` is single-threaded; see [`StatorValue`].
@@ -17524,6 +17762,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
         outgoing_traced_edges: Vec::new(),
         materialized: RefCell::new(None),
         alive: Rc::new(Cell::new(true)),
+        instance_template: None,
+        prototype_template: None,
     }))
 }
 
@@ -35961,6 +36201,149 @@ mod tests {
     }
 
     #[test]
+    fn test_function_template_instance_and_prototype_templates_apply_to_dom_wrapper() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let instance = unsafe { stator_function_template_instance_template(tmpl) };
+        let prototype = unsafe { stator_function_template_prototype_template(tmpl) };
+        assert!(!instance.is_null());
+        assert!(!prototype.is_null());
+
+        let own = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let proto = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        unsafe {
+            stator_object_template_set(instance, c"own".as_ptr(), own);
+            stator_object_template_set(prototype, c"proto".as_ptr(), proto);
+        }
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let preexisting_value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(!preexisting_value.is_null());
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"node.own + node.proto";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 3.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(preexisting_value);
+            stator_value_destroy(own);
+            stator_value_destroy(proto);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_inherit_links_dom_prototype_chain() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let parent = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let child = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+
+        let parent_proto = unsafe { stator_function_template_prototype_template(parent) };
+        let base_value = unsafe { stator_value_new_number(iso.as_ptr(), 5.0) };
+        unsafe { stator_object_template_set(parent_proto, c"base".as_ptr(), base_value) };
+
+        let child_instance = unsafe { stator_function_template_instance_template(child) };
+        let own_value = unsafe { stator_value_new_number(iso.as_ptr(), 11.0) };
+        unsafe { stator_object_template_set(child_instance, c"own".as_ptr(), own_value) };
+
+        assert_eq!(
+            unsafe { stator_function_template_inherit(child, parent) },
+            StatorStatus::StatorStatusOk
+        );
+        let child_proto = unsafe { stator_function_template_prototype_template(child) };
+        let child_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        unsafe { stator_object_template_set(child_proto, c"child".as_ptr(), child_value) };
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, child) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"node.own + node.child + node.base";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 23.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(base_value);
+            stator_value_destroy(own_value);
+            stator_value_destroy(child_value);
+            stator_function_template_destroy(child);
+            stator_function_template_destroy(parent);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_dom_function_template_apply_fails_closed_for_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other_tmpl = unsafe { stator_function_template_new(other.as_ptr(), noop) };
+
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(std::ptr::null_mut(), tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, other_tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        unsafe {
+            stator_function_template_destroy(other_tmpl);
+            stator_function_template_destroy(tmpl);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+    }
+
+    #[test]
     fn test_function_callback_info_length_and_get() {
         let iso = IsolateGuard::new();
         // This callback reads its arguments and stores the count in a global.
@@ -37121,6 +37504,38 @@ mod tests {
             stator_value_destroy(got);
             stator_object_destroy(obj);
             stator_value_destroy(val);
+            stator_object_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_object_template_prototype_template_installs_inherited_properties() {
+        let iso = IsolateGuard::new();
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        let proto_tmpl = unsafe { stator_object_template_prototype_template(tmpl) };
+        assert!(!proto_tmpl.is_null());
+        let own = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let proto = unsafe { stator_value_new_number(iso.as_ptr(), 6.0) };
+        unsafe {
+            stator_object_template_set(tmpl, c"own".as_ptr(), own);
+            stator_object_template_set(proto_tmpl, c"proto".as_ptr(), proto);
+        }
+
+        let obj = unsafe { stator_object_template_new_instance(tmpl) };
+        assert!(!obj.is_null());
+        let got_own = unsafe { stator_object_get(obj, c"own".as_ptr()) };
+        let got_proto = unsafe { stator_object_get(obj, c"proto".as_ptr()) };
+        assert!(!got_own.is_null());
+        assert!(!got_proto.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got_own) }, 4.0);
+        assert_eq!(unsafe { stator_value_as_number(got_proto) }, 6.0);
+
+        unsafe {
+            stator_value_destroy(got_proto);
+            stator_value_destroy(got_own);
+            stator_object_destroy(obj);
+            stator_value_destroy(proto);
+            stator_value_destroy(own);
             stator_object_template_destroy(tmpl);
         }
     }
