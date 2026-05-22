@@ -49,6 +49,7 @@ use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
 };
+use stator_jse::jit_mitigations::{self, JitMitigationsTier};
 use stator_jse::jit_unwind;
 use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
@@ -91,7 +92,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 18;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 19;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -1191,6 +1192,18 @@ pub const STATOR_JIT_UNWIND_TIER_COUNT: usize = 4;
 /// Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
 pub const STATOR_JIT_MEMORY_TIER_COUNT: usize = 4;
 
+/// Number of JIT tier rows carried by [`StatorJitMitigationsStats`].
+pub const STATOR_JIT_MITIGATIONS_TIER_COUNT: usize = 4;
+
+/// `MitigationStatus::UnsupportedPlatform` u32 encoding for the FFI snapshot.
+pub const STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM: u32 = 0;
+/// `MitigationStatus::Disabled` u32 encoding for the FFI snapshot.
+pub const STATOR_MITIGATION_STATUS_DISABLED: u32 = 1;
+/// `MitigationStatus::Enabled` u32 encoding for the FFI snapshot.
+pub const STATOR_MITIGATION_STATUS_ENABLED: u32 = 2;
+/// `MitigationStatus::Unknown` u32 encoding for the FFI snapshot.
+pub const STATOR_MITIGATION_STATUS_UNKNOWN: u32 = 3;
+
 /// Per-tier release-safe JIT code memory counters.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1645,6 +1658,133 @@ pub unsafe extern "C" fn stator_isolate_get_jit_unwind_stats(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_reset_jit_unwind_stats(_isolate: *mut StatorIsolate) {
     jit_unwind::reset();
+}
+
+// ── JIT CFG / CET mitigation diagnostics ───────────────────────────────────
+
+/// Per-tier release-safe CFG/CET counters, mirroring
+/// [`stator_jse::jit_mitigations::JitMitigationsTierSnapshot`].
+///
+/// `cfg_supported` / `cet_compatible` are `false` for every tier in this
+/// build; see `docs/edge_diagnostics.md` for the support matrix and the
+/// conditions under which a future tier flips the flag.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMitigationsTierStats {
+    /// Stable tier index (matches `JitMitigationsTier` discriminant).
+    pub tier: u32,
+    /// Whether this tier produces verified CFG call-target metadata.
+    pub cfg_supported: bool,
+    /// Whether this tier emits CET shadow-stack/IBT-compatible code.
+    pub cet_compatible: bool,
+    /// Number of CFG registration attempts (including unsupported/failed).
+    pub cfg_register_attempts: u64,
+    /// Number of CFG registrations that successfully delivered targets.
+    pub cfg_register_successes: u64,
+    /// Number of CFG registrations rejected by the OS after the
+    /// supported-tier check passed.
+    pub cfg_register_failures: u64,
+    /// Number of CFG registrations rejected because the tier or platform
+    /// does not yet produce safe call-target metadata.  Fail-closed
+    /// sentinel.
+    pub cfg_unsupported_tier_attempts: u64,
+    /// Total individual CFG call targets registered via successful
+    /// registrations.
+    pub cfg_targets_registered: u64,
+    /// JIT pages observed to be CET-compatible.  Stays at zero while
+    /// every tier reports `cet_compatible == false`.
+    pub cet_pages_marked_compatible: u64,
+    /// JIT pages observed to be CET-incompatible (fail-closed bucket).
+    pub cet_pages_marked_incompatible: u64,
+}
+
+/// Aggregate release-safe CFG/CET counter snapshot exposed to embedders.
+///
+/// `process_cfg_status` and the two `process_cet_*_status` fields are
+/// encoded using `STATOR_MITIGATION_STATUS_*` constants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMitigationsStats {
+    /// Whether the build target is a Windows target.
+    pub platform_supported: bool,
+    /// Process-level CFG status reported by Windows (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cfg_status: u32,
+    /// Process-level CET user shadow-stack status (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cet_shadow_stack_status: u32,
+    /// Process-level CET user shadow-stack *strict* mode status
+    /// (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cet_user_shadow_stack_strict_status: u32,
+    /// Number of per-tier rows that follow.
+    pub tier_row_count: u32,
+    /// Per-tier counters, indexed by `JitMitigationsTier` discriminant.
+    pub tiers: [StatorJitMitigationsTierStats; STATOR_JIT_MITIGATIONS_TIER_COUNT],
+}
+
+impl StatorJitMitigationsStats {
+    fn from_engine_snapshot(snapshot: &jit_mitigations::JitMitigationsSnapshot) -> Self {
+        let mut tiers =
+            [StatorJitMitigationsTierStats::default(); STATOR_JIT_MITIGATIONS_TIER_COUNT];
+        for tier in JitMitigationsTier::all() {
+            let src = snapshot.tier(tier);
+            tiers[tier as usize] = StatorJitMitigationsTierStats {
+                tier: tier as u32,
+                cfg_supported: src.cfg_supported,
+                cet_compatible: src.cet_compatible,
+                cfg_register_attempts: src.cfg_register_attempts,
+                cfg_register_successes: src.cfg_register_successes,
+                cfg_register_failures: src.cfg_register_failures,
+                cfg_unsupported_tier_attempts: src.cfg_unsupported_tier_attempts,
+                cfg_targets_registered: src.cfg_targets_registered,
+                cet_pages_marked_compatible: src.cet_pages_marked_compatible,
+                cet_pages_marked_incompatible: src.cet_pages_marked_incompatible,
+            };
+        }
+        Self {
+            platform_supported: snapshot.platform_supported,
+            process_cfg_status: snapshot.process_cfg_status.as_u32(),
+            process_cet_shadow_stack_status: snapshot.process_cet_shadow_stack_status.as_u32(),
+            process_cet_user_shadow_stack_strict_status: snapshot
+                .process_cet_user_shadow_stack_strict_status
+                .as_u32(),
+            tier_row_count: STATOR_JIT_MITIGATIONS_TIER_COUNT as u32,
+            tiers,
+        }
+    }
+}
+
+/// Fill `*stats` with the current process-global JIT CFG/CET counters.
+///
+/// `isolate` may be null; the counters are process-global diagnostics
+/// rather than heap-owned state.  Does nothing when `stats` is null.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes of a `StatorJitMitigationsStats`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_jit_mitigations_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorJitMitigationsStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = jit_mitigations::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorJitMitigationsStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset every JIT CFG/CET counter visible through
+/// [`stator_isolate_get_jit_mitigations_stats`].
+///
+/// `isolate` may be null; the counters are process-global.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_jit_mitigations_stats(_isolate: *mut StatorIsolate) {
+    jit_mitigations::reset();
 }
 
 /// Enable or disable JIT tiers for scripts run in `isolate`.
@@ -33006,6 +33146,127 @@ mod tests {
         for tier_idx in 0..jit_unwind::JitTier::COUNT {
             assert_eq!(zeroed.tiers[tier_idx].register_attempts, 0);
             assert_eq!(zeroed.tiers[tier_idx].unsupported_tier_attempts, 0);
+        }
+    }
+
+    #[test]
+    fn test_jit_mitigations_stats_null_safety_and_fail_closed() {
+        use std::sync::Mutex;
+        static FFI_JIT_MITIGATIONS_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_JIT_MITIGATIONS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_mitigations_stats(std::ptr::null_mut()) };
+
+        assert_eq!(
+            STATOR_JIT_MITIGATIONS_TIER_COUNT,
+            jit_mitigations::JitMitigationsTier::COUNT
+        );
+        assert_eq!(STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM, 0);
+        assert_eq!(STATOR_MITIGATION_STATUS_DISABLED, 1);
+        assert_eq!(STATOR_MITIGATION_STATUS_ENABLED, 2);
+        assert_eq!(STATOR_MITIGATION_STATUS_UNKNOWN, 3);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `stats` is valid for writes; null isolate is accepted.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut stats) };
+        assert_eq!(
+            stats.tier_row_count,
+            jit_mitigations::JitMitigationsTier::COUNT as u32
+        );
+        assert_eq!(stats.platform_supported, cfg!(windows));
+        // Off Windows every status must be `UnsupportedPlatform`.
+        if !cfg!(windows) {
+            assert_eq!(
+                stats.process_cfg_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+            assert_eq!(
+                stats.process_cet_shadow_stack_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+            assert_eq!(
+                stats.process_cet_user_shadow_stack_strict_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+        } else {
+            for status in [
+                stats.process_cfg_status,
+                stats.process_cet_shadow_stack_status,
+                stats.process_cet_user_shadow_stack_strict_status,
+            ] {
+                assert!(
+                    status == STATOR_MITIGATION_STATUS_ENABLED
+                        || status == STATOR_MITIGATION_STATUS_DISABLED
+                        || status == STATOR_MITIGATION_STATUS_UNKNOWN,
+                    "unexpected status {status}"
+                );
+            }
+        }
+
+        for (idx, tier) in jit_mitigations::JitMitigationsTier::all()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(stats.tiers[idx].tier, *tier as u32);
+            assert!(!stats.tiers[idx].cfg_supported);
+            assert!(!stats.tiers[idx].cet_compatible);
+            assert_eq!(stats.tiers[idx].cfg_register_attempts, 0);
+            assert_eq!(stats.tiers[idx].cfg_register_successes, 0);
+            assert_eq!(stats.tiers[idx].cfg_targets_registered, 0);
+            assert_eq!(stats.tiers[idx].cet_pages_marked_compatible, 0);
+            assert_eq!(stats.tiers[idx].cet_pages_marked_incompatible, 0);
+        }
+
+        // A fail-closed registration attempt bumps the unsupported counter
+        // without producing a success.
+        let buf = [0u8; 16];
+        let err = jit_mitigations::record_cfg_registration(
+            jit_mitigations::JitMitigationsTier::Maglev,
+            buf.as_ptr(),
+            buf.len(),
+            2,
+        )
+        .expect_err("no tier is cfg_supported yet");
+        if cfg!(windows) {
+            assert_eq!(
+                err,
+                jit_mitigations::MitigationError::UnsupportedTier(
+                    jit_mitigations::JitMitigationsTier::Maglev
+                )
+            );
+        } else {
+            assert_eq!(err, jit_mitigations::MitigationError::UnsupportedPlatform);
+        }
+        // A claimed-compatible CET page still lands in the incompatible bucket.
+        jit_mitigations::record_cet_page(jit_mitigations::JitMitigationsTier::Maglev, true);
+
+        let mut after = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut after) };
+        let mag = &after.tiers[jit_mitigations::JitMitigationsTier::Maglev as usize];
+        assert_eq!(mag.cfg_register_attempts, 1);
+        assert_eq!(mag.cfg_register_successes, 0);
+        assert_eq!(mag.cfg_unsupported_tier_attempts, 1);
+        assert_eq!(mag.cfg_targets_registered, 0);
+        assert_eq!(mag.cet_pages_marked_compatible, 0);
+        assert_eq!(mag.cet_pages_marked_incompatible, 1);
+
+        // Reset zeroes everything again.
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_mitigations_stats(std::ptr::null_mut()) };
+        let mut zeroed = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `zeroed` is valid for writes.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut zeroed) };
+        for tier_idx in 0..jit_mitigations::JitMitigationsTier::COUNT {
+            assert_eq!(zeroed.tiers[tier_idx].cfg_register_attempts, 0);
+            assert_eq!(zeroed.tiers[tier_idx].cfg_unsupported_tier_attempts, 0);
+            assert_eq!(zeroed.tiers[tier_idx].cet_pages_marked_incompatible, 0);
         }
     }
 

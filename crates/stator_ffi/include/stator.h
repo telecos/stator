@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 18
+#define STATOR_FFI_ABI_VERSION_MINOR 19
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -104,6 +104,31 @@
  * Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
  */
 #define STATOR_JIT_MEMORY_TIER_COUNT 4
+
+/**
+ * Number of JIT tier rows carried by [`StatorJitMitigationsStats`].
+ */
+#define STATOR_JIT_MITIGATIONS_TIER_COUNT 4
+
+/**
+ * `MitigationStatus::UnsupportedPlatform` u32 encoding for the FFI snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM 0
+
+/**
+ * `MitigationStatus::Disabled` u32 encoding for the FFI snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_DISABLED 1
+
+/**
+ * `MitigationStatus::Enabled` u32 encoding for the FFI snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_ENABLED 2
+
+/**
+ * `MitigationStatus::Unknown` u32 encoding for the FFI snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_UNKNOWN 3
 
 /**
  * DOM property descriptor flag for writable data properties.
@@ -1952,6 +1977,96 @@ typedef struct StatorJitUnwindStats {
    */
   struct StatorJitUnwindTierStats tiers[STATOR_JIT_UNWIND_TIER_COUNT];
 } StatorJitUnwindStats;
+
+/**
+ * Per-tier release-safe CFG/CET counters, mirroring
+ * [`stator_jse::jit_mitigations::JitMitigationsTierSnapshot`].
+ *
+ * `cfg_supported` / `cet_compatible` are `false` for every tier in this
+ * build; see `docs/edge_diagnostics.md` for the support matrix and the
+ * conditions under which a future tier flips the flag.
+ */
+typedef struct StatorJitMitigationsTierStats {
+  /**
+   * Stable tier index (matches `JitMitigationsTier` discriminant).
+   */
+  uint32_t tier;
+  /**
+   * Whether this tier produces verified CFG call-target metadata.
+   */
+  bool cfg_supported;
+  /**
+   * Whether this tier emits CET shadow-stack/IBT-compatible code.
+   */
+  bool cet_compatible;
+  /**
+   * Number of CFG registration attempts (including unsupported/failed).
+   */
+  uint64_t cfg_register_attempts;
+  /**
+   * Number of CFG registrations that successfully delivered targets.
+   */
+  uint64_t cfg_register_successes;
+  /**
+   * Number of CFG registrations rejected by the OS after the
+   * supported-tier check passed.
+   */
+  uint64_t cfg_register_failures;
+  /**
+   * Number of CFG registrations rejected because the tier or platform
+   * does not yet produce safe call-target metadata.  Fail-closed
+   * sentinel.
+   */
+  uint64_t cfg_unsupported_tier_attempts;
+  /**
+   * Total individual CFG call targets registered via successful
+   * registrations.
+   */
+  uint64_t cfg_targets_registered;
+  /**
+   * JIT pages observed to be CET-compatible.  Stays at zero while
+   * every tier reports `cet_compatible == false`.
+   */
+  uint64_t cet_pages_marked_compatible;
+  /**
+   * JIT pages observed to be CET-incompatible (fail-closed bucket).
+   */
+  uint64_t cet_pages_marked_incompatible;
+} StatorJitMitigationsTierStats;
+
+/**
+ * Aggregate release-safe CFG/CET counter snapshot exposed to embedders.
+ *
+ * `process_cfg_status` and the two `process_cet_*_status` fields are
+ * encoded using `STATOR_MITIGATION_STATUS_*` constants.
+ */
+typedef struct StatorJitMitigationsStats {
+  /**
+   * Whether the build target is a Windows target.
+   */
+  bool platform_supported;
+  /**
+   * Process-level CFG status reported by Windows (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cfg_status;
+  /**
+   * Process-level CET user shadow-stack status (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cet_shadow_stack_status;
+  /**
+   * Process-level CET user shadow-stack *strict* mode status
+   * (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cet_user_shadow_stack_strict_status;
+  /**
+   * Number of per-tier rows that follow.
+   */
+  uint32_t tier_row_count;
+  /**
+   * Per-tier counters, indexed by `JitMitigationsTier` discriminant.
+   */
+  struct StatorJitMitigationsTierStats tiers[STATOR_JIT_MITIGATIONS_TIER_COUNT];
+} StatorJitMitigationsStats;
 
 /**
  * Read-only view of the browser policy/origin metadata associated with a
@@ -3815,6 +3930,30 @@ void stator_isolate_get_jit_unwind_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_jit_unwind_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with the current process-global JIT CFG/CET counters.
+ *
+ * `isolate` may be null; the counters are process-global diagnostics
+ * rather than heap-owned state.  Does nothing when `stats` is null.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes of a `StatorJitMitigationsStats`.
+ */
+void stator_isolate_get_jit_mitigations_stats(const struct StatorIsolate *_isolate,
+                                              struct StatorJitMitigationsStats *stats);
+
+/**
+ * Reset every JIT CFG/CET counter visible through
+ * [`stator_isolate_get_jit_mitigations_stats`].
+ *
+ * `isolate` may be null; the counters are process-global.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_jit_mitigations_stats(struct StatorIsolate *_isolate);
 
 /**
  * Enable or disable JIT tiers for scripts run in `isolate`.

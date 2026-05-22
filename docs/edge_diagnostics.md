@@ -471,6 +471,133 @@ snapshot with:
 If OSR counters are all zero while `true_osr_supported == false`, report the
 build as "no true OSR support" rather than "zero OSR churn".
 
+## JIT Control-Flow Guard / CET shadow-stack diagnostics
+
+### Scope
+
+Chromium/Edge ship with Windows Control-Flow Guard (CFG) enabled and
+rely on hardware CET shadow stacks plus Indirect Branch Tracking
+(`ENDBR64` prologues) on capable CPUs.  Any JIT-emitted executable
+region must comply with both mitigations: every valid indirect call
+target must be registered with the CFG bitmap
+(`SetProcessValidCallTargets`), and every indirect-call target must
+begin with `ENDBR64` so that CET does not trip on the first instruction.
+
+The `stator_jse::jit_mitigations` module exposes a release-safe,
+fail-closed diagnostic surface that reports — per JIT tier — whether
+the build currently has the metadata needed to perform either
+registration, and a process-level probe for the OS-side mitigation
+policy (`GetProcessMitigationPolicy`).
+
+The module deliberately does **not** call `SetProcessValidCallTargets`
+on behalf of any tier today: handing the OS an unverified target list
+would *claim* mitigation coverage we have not actually produced.  When
+a tier learns to emit a verified target list and CET-compatible
+prologues, flip [`JitMitigationsTier::cfg_supported`] /
+[`JitMitigationsTier::cet_compatible`] for that arm and route the
+registration through a new helper that performs the real OS call.
+
+### Current tier support matrix
+
+| Tier      | `cfg_supported` | `cet_compatible` | Notes |
+| --------- | --------------- | ---------------- | ----- |
+| Baseline  | **no**          | **no**           | Handcrafted `masm_x64` prologue/epilogue, no `ENDBR64`, no exported target list. |
+| Maglev    | **no**          | **no**           | Same in-tree assembler. |
+| Turbofan  | **no**          | **no**           | Reserved row; current Stator native backend is Cranelift. |
+| Cranelift | **no**          | **no**           | Standalone Cranelift code shares the JIT pool; targets are not enumerated and `ENDBR64` prologue emission is not yet wired in. |
+
+Until a tier flips an arm, [`jit_mitigations::record_cfg_registration`]
+returns `MitigationError::UnsupportedTier` (or
+`MitigationError::UnsupportedPlatform` off Windows) and bumps the
+fail-closed `cfg_unsupported_tier_attempts` counter.
+[`jit_mitigations::record_cet_page`] called with `compatible = true`
+still lands in the **incompatible** bucket while every tier reports
+`cet_compatible == false`.
+
+### Counters
+
+Per tier (Baseline / Maglev / Turbofan / Cranelift):
+
+| Field | Meaning |
+| ----- | ------- |
+| `cfg_supported` | Mirrors `JitMitigationsTier::cfg_supported`.  Currently always `false`. |
+| `cet_compatible` | Mirrors `JitMitigationsTier::cet_compatible`.  Currently always `false`. |
+| `cfg_register_attempts` | Every call into `record_cfg_registration`. |
+| `cfg_register_successes` | Calls that successfully delivered the target list to the OS (zero while every tier is `cfg_supported == false`). |
+| `cfg_register_failures` | Empty region / OS-rejected outcomes after the supported-tier check passed. |
+| `cfg_unsupported_tier_attempts` | Fail-closed sentinel: the platform or tier had no real registration backend. |
+| `cfg_targets_registered` | Sum of individual targets successfully registered. |
+| `cet_pages_marked_compatible` | JIT pages observed and verified CET-compatible. |
+| `cet_pages_marked_incompatible` | JIT pages observed CET-incompatible (also the fail-closed bucket for unverified claims). |
+
+Aggregate process-level fields:
+
+| Field | Meaning |
+| ----- | ------- |
+| `platform_supported` | Whether the build target is a Windows target.  Off Windows, every other status is `UnsupportedPlatform`. |
+| `process_cfg_status` | `GetProcessMitigationPolicy(ProcessControlFlowGuardPolicy)` result encoded as `STATOR_MITIGATION_STATUS_*`. |
+| `process_cet_shadow_stack_status` | `ProcessUserShadowStackPolicy`'s `EnableUserShadowStack` bit. |
+| `process_cet_user_shadow_stack_strict_status` | `ProcessUserShadowStackPolicy`'s strict-mode bit (only `Enabled` when both the base policy and strict mode are on). |
+
+The `STATOR_MITIGATION_STATUS_*` encoding (stable across the ABI
+minor):
+
+| Value | Constant | Meaning |
+| ----- | -------- | ------- |
+| 0 | `STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM` | Non-Windows build; mitigation does not apply. |
+| 1 | `STATOR_MITIGATION_STATUS_DISABLED` | OS confirms mitigation is off for this process. |
+| 2 | `STATOR_MITIGATION_STATUS_ENABLED` | OS confirms mitigation is on for this process. |
+| 3 | `STATOR_MITIGATION_STATUS_UNKNOWN` | Probe failed (e.g. pre-Win8 host or `GetProcessMitigationPolicy` error). |
+
+### Rust API
+
+```rust
+use stator_jse::jit_mitigations::{self, JitMitigationsTier, MitigationStatus};
+
+let snapshot = jit_mitigations::snapshot();
+assert!(!snapshot.tier(JitMitigationsTier::Baseline).cfg_supported);
+let unsupported = snapshot.total_cfg_unsupported_tier_attempts();
+let cfg_on = matches!(snapshot.process_cfg_status, MitigationStatus::Enabled);
+```
+
+### C FFI
+
+```c
+StatorJitMitigationsStats stats = {0};
+stator_isolate_reset_jit_mitigations_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_jit_mitigations_stats(NULL, &stats);
+if (!stats.platform_supported) {
+    /* Non-Windows build — CFG/CET do not apply. */
+}
+if (stats.process_cfg_status == STATOR_MITIGATION_STATUS_ENABLED &&
+    !stats.tiers[/*Baseline=*/0].cfg_supported) {
+    /* OS has CFG on but Stator's baseline tier does not yet register
+       its call targets — flag this in Edge crash diagnostics. */
+}
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the counters are
+process-global.  Adding the symbol surface bumps the ABI minor version
+to 19 (additive, backwards-compatible).
+
+### Edge usage notes
+
+* Pair this snapshot with `stator_isolate_get_jit_unwind_stats` and
+  `stator_isolate_get_jit_memory_stats` to build a complete "is the
+  JIT compatible with Chromium/Windows exploit mitigations?" report.
+* A `process_cfg_status == Enabled` plus a tier with
+  `cfg_supported == false` is *not* a regression; it is the documented
+  state until a tier emits a CFG target list.  Edge crash triage
+  should treat it as "Stator JIT runs without CFG coverage" rather
+  than "CFG broke".
+* A monotonically growing `cfg_register_failures` while
+  `cfg_supported == true` for some tier indicates the OS is rejecting
+  registrations — escalate as an ABI/OS bug.
+* `cet_pages_marked_incompatible` will be non-zero on every workload
+  that hits the JIT today; that is expected until a tier emits
+  `ENDBR64` prologues and audited returns.
+
 ## Win64 JIT unwind registration counters
 
 ### Scope
