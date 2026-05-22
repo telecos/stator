@@ -3537,9 +3537,11 @@ typedef enum StatorStatus (*StatorDomNamedDeleterCb)(const char *name_utf8,
 /**
  * V2 named-property **enumerator** callback.
  *
- * The callback should push each enumerable name into `buf` via
+ * The callback should push each materializable own string name into `buf` via
  * [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
- * on success.  Any other status is treated as "no names produced".
+ * on success.  Query or descriptor callbacks provide attributes that determine
+ * which returned names are enumerable.  Any other status is treated as
+ * "no names produced".
  *
  * # Safety
  * `buf` must be the non-null pointer the FFI bridge passed in and must not
@@ -6463,6 +6465,8 @@ void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
  *
  * Returns:
  * * [`StatorStatus::StatorStatusOk`] when the global was installed.
+ * * [`StatorStatus::StatorStatusException`] when materializing the wrapper's
+ *   own properties triggers a descriptor callback exception.
  * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
  *   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
  *   different isolate than `ctx`.

@@ -176,6 +176,40 @@ fn private_setter_key(storage_key: &str) -> String {
     format!("__set_{storage_key}__")
 }
 
+fn accessor_getter_key(property_key: &str) -> String {
+    format!("__get_{property_key}__")
+}
+
+fn accessor_setter_key(property_key: &str) -> String {
+    format!("__set_{property_key}__")
+}
+
+fn accessor_delete_targets(pm: &PropertyMap, property_key: &str) -> Option<Vec<String>> {
+    if !pm.is_accessor_property(property_key) {
+        return None;
+    }
+
+    let getter_key = accessor_getter_key(property_key);
+    let setter_key = accessor_setter_key(property_key);
+    let has_getter = pm.contains_key(&getter_key);
+    let has_setter = pm.contains_key(&setter_key);
+    if !has_getter && !has_setter {
+        return None;
+    }
+
+    let mut targets = Vec::new();
+    if pm.contains_key(property_key) {
+        targets.push(property_key.to_string());
+    }
+    if has_getter {
+        targets.push(getter_key);
+    }
+    if has_setter {
+        targets.push(setter_key);
+    }
+    Some(targets)
+}
+
 fn private_display_name(storage_key: &str) -> String {
     format!("#{}", storage_key.rsplit('.').next().unwrap_or(storage_key))
 }
@@ -6308,17 +6342,25 @@ fn handle_for_in_enumerate(
                     // to the actual property name X.
                     if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string().into()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        let raw_inserted = seen.insert(k.clone());
+                        if borrow.is_accessor_property(prop) {
+                            if seen.insert(prop.to_string().into()) && is_enumerable {
+                                all_keys.push(JsValue::String(prop.to_string().into()));
+                            }
+                        } else if raw_inserted && is_enumerable {
+                            all_keys.push(JsValue::String(k.clone()));
                         }
                         continue;
                     }
                     if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string().into()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        let raw_inserted = seen.insert(k.clone());
+                        if borrow.is_accessor_property(prop) {
+                            if seen.insert(prop.to_string().into()) && is_enumerable {
+                                all_keys.push(JsValue::String(prop.to_string().into()));
+                            }
+                        } else if raw_inserted && is_enumerable {
+                            all_keys.push(JsValue::String(k.clone()));
                         }
                         continue;
                     }
@@ -6366,6 +6408,18 @@ fn handle_for_in_enumerate(
 }
 
 fn is_for_in_excluded_key(key: &str) -> bool {
+    if key
+        .strip_prefix("__get_")
+        .and_then(|s| s.strip_suffix("__"))
+        .is_some()
+        || key
+            .strip_prefix("__set_")
+            .and_then(|s| s.strip_suffix("__"))
+            .is_some()
+    {
+        return false;
+    }
+
     (key.starts_with("__") && key.ends_with("__"))
         || crate::builtins::symbol::is_symbol_property_key(key)
         || key.starts_with('.')
@@ -6518,7 +6572,19 @@ fn handle_delete_property_sloppy(
         proxy_delete_property(&mut p.borrow_mut(), &key)?
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
-        if pm.contains_key(&key) {
+        if let Some(targets) = accessor_delete_targets(&pm, &key) {
+            if targets.iter().any(|target| !pm.is_configurable(target)) {
+                // Non-configurable: silently fail in sloppy mode.
+                false
+            } else {
+                drop(pm);
+                let mut pm = map.borrow_mut();
+                for target in targets {
+                    pm.remove(&target);
+                }
+                true
+            }
+        } else if pm.contains_key(&key) {
             if !pm.is_configurable(&key) {
                 // Non-configurable: silently fail in sloppy mode.
                 false
@@ -6570,13 +6636,25 @@ fn handle_delete_property_strict(
         }
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
-        if pm.contains_key(&key) && !pm.is_configurable(&key) {
+        if let Some(targets) = accessor_delete_targets(&pm, &key) {
+            if targets.iter().any(|target| !pm.is_configurable(target)) {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot delete property '{key}' of object"
+                )));
+            }
+            drop(pm);
+            let mut pm = map.borrow_mut();
+            for target in targets {
+                pm.remove(&target);
+            }
+        } else if pm.contains_key(&key) && !pm.is_configurable(&key) {
             return Err(StatorError::TypeError(format!(
                 "Cannot delete property '{key}' of object"
             )));
+        } else {
+            drop(pm);
+            map.borrow_mut().remove(&key);
         }
-        drop(pm);
-        map.borrow_mut().remove(&key);
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {
             return Err(StatorError::TypeError(
@@ -8113,8 +8191,9 @@ fn handle_define_getter_property(
         } else {
             PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8149,8 +8228,9 @@ fn handle_define_setter_property(
         } else {
             PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8175,8 +8255,9 @@ fn handle_define_keyed_getter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8201,8 +8282,9 @@ fn handle_define_keyed_setter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8269,8 +8351,9 @@ fn handle_define_class_getter_property(
         } else {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8305,8 +8388,9 @@ fn handle_define_class_setter_property(
         } else {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8353,8 +8437,9 @@ fn handle_define_class_keyed_getter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8379,8 +8464,9 @@ fn handle_define_class_keyed_setter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -9825,6 +9911,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_delete_configurable_accessor_removes_backing_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var before = Object.keys(o).join(','); \
+             var deleted = delete o.x; \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             before + '|' + deleted + '|' + (desc === undefined) + '|' + (o.x === undefined)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x|true|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_delete_missing_property_preserves_accessor_shaped_user_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             var before = '__get_x__' in o; \
+             var deleted = delete o.x; \
+             var after = '__get_x__' in o; \
+             '' + before + '|' + deleted + '|' + after + '|' + o.__get_x__",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|true|true|1".into()));
+    }
+
+    #[test]
+    fn e2e_accessor_shaped_user_key_does_not_create_accessor_property() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = function() { return 3; }; \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + (o.x === undefined) + '|' + (desc === undefined) + '|' + (typeof o.__get_x__)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|true|function".into()));
+    }
+
+    #[test]
+    fn e2e_define_property_data_preserves_accessor_shaped_user_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             Object.defineProperty(o, 'x', { value: 2, configurable: true }); \
+             '' + ('__get_x__' in o) + '|' + o.__get_x__ + '|' + o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|1|2".into()));
+    }
+
+    #[test]
+    fn e2e_accessor_shaped_user_keys_do_not_enumerate_as_accessor_names() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             o.__set_y__ = 2; \
+             var own = Reflect.ownKeys(o).join(','); \
+             var names = Object.getOwnPropertyNames(o).join(','); \
+             var iter = ''; \
+             for (var k in o) { iter += k + ','; } \
+             [own, names, iter, own.split(',').indexOf('x'), own.split(',').indexOf('y'), names.split(',').indexOf('x'), names.split(',').indexOf('y'), iter.split(',').indexOf('x'), iter.split(',').indexOf('y')].join('|')",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(
+                "__get_x__,__set_y__|__get_x__,__set_y__|__get_x__,__set_y__,|-1|-1|-1|-1|-1|-1"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn e2e_marked_accessors_enumerate_as_canonical_names() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var own = Reflect.ownKeys(o).join(','); \
+             var names = Object.getOwnPropertyNames(o).join(','); \
+             [own, names].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x|x".into()));
+    }
+
+    #[test]
+    fn e2e_object_literal_accessors_are_marked() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { get x() { return 1; }, set y(v) { this.z = v; } }; \
+             o.y = 5; \
+             [o.x, o.z, Reflect.ownKeys(o).indexOf('x') !== -1, Reflect.ownKeys(o).indexOf('y') !== -1].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1|5|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_class_accessors_are_marked() {
+        let result = crate::builtins::global::global_eval(
+            "class C { get x() { return 2; } set y(v) { this.z = v; } } \
+             var o = new C(); \
+             o.y = 7; \
+             [o.x, o.z, Reflect.ownKeys(C.prototype).indexOf('x') !== -1, Reflect.ownKeys(C.prototype).indexOf('y') !== -1].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2|7|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_set_does_not_call_accessor_shaped_user_key() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             var called = false; \
+             o.__set_x__ = function(v) { called = true; }; \
+             var ok = Reflect.set(o, 'x', 7); \
+             [ok, called, o.x].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|false|7".into()));
+    }
+
+    #[test]
+    fn e2e_delete_non_configurable_accessor_rejects_backing_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             var sloppy = delete o.x; \
+             var strict = (function() { 'use strict'; try { delete o.x; return 'no error'; } catch (e) { return 'threw'; } })(); \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + sloppy + '|' + strict + '|' + desc.configurable + '|' + o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false|threw|false|1".into()));
     }
 
     /// Object.freeze makes properties non-writable AND non-configurable.

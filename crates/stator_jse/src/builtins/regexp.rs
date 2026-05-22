@@ -471,6 +471,7 @@ fn insert_regexp_getter(props: &mut PropertyMap, name: &str, getter: JsValue) {
         getter,
         PropertyAttributes::CONFIGURABLE,
     );
+    props.mark_accessor_property(name);
 }
 
 fn bool_getter(re: &Rc<JsRegExp>, flag: RegExpFlags) -> JsValue {

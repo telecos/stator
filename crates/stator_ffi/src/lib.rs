@@ -13898,6 +13898,61 @@ unsafe fn take_callback_output(out: *mut StatorValue) -> JsValue {
     }
 }
 
+struct MaterializedDomProperty {
+    attrs: PropertyAttributes,
+    setter_allowed: bool,
+}
+
+fn default_materialized_dom_property() -> MaterializedDomProperty {
+    MaterializedDomProperty {
+        attrs: PropertyAttributes::WRITABLE
+            | PropertyAttributes::ENUMERABLE
+            | PropertyAttributes::CONFIGURABLE,
+        setter_allowed: true,
+    }
+}
+
+fn accessor_materialization_attrs(attrs: PropertyAttributes) -> PropertyAttributes {
+    attrs & (PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE)
+}
+
+unsafe fn dom_object_wrap_materialized_property(
+    wrap: *mut StatorDomObjectWrap,
+    name: &str,
+) -> Result<MaterializedDomProperty, StatorStatus> {
+    if wrap.is_null() {
+        return Ok(default_materialized_dom_property());
+    }
+    // SAFETY: caller guarantees `wrap` is a valid DOM wrapper pointer.
+    match unsafe { (*wrap).inner.get_property_descriptor(name) } {
+        DomPropertyDescriptorResult::Descriptor(descriptor) => {
+            let attrs = descriptor.attributes();
+            let setter_allowed = if descriptor.value().is_some() {
+                attrs.contains(PropertyAttributes::WRITABLE)
+            } else {
+                descriptor.set().is_some()
+            };
+            Ok(MaterializedDomProperty {
+                attrs,
+                setter_allowed,
+            })
+        }
+        DomPropertyDescriptorResult::Exception => Err(StatorStatus::StatorStatusException),
+        DomPropertyDescriptorResult::NotIntercepted | DomPropertyDescriptorResult::Rejected => {
+            Ok(unsafe {
+                (*wrap)
+                    .inner
+                    .get_property_attributes(name)
+                    .map(|attrs| MaterializedDomProperty {
+                        attrs,
+                        setter_allowed: attrs.contains(PropertyAttributes::WRITABLE),
+                    })
+                    .unwrap_or_else(default_materialized_dom_property)
+            })
+        }
+    }
+}
+
 fn status_to_dom_call_result(
     status: StatorStatus,
     out: *mut StatorValue,
@@ -13923,14 +13978,14 @@ fn status_to_dom_call_result(
 
 fn dom_object_wrap_plain_object(
     wrap: *mut StatorDomObjectWrap,
-) -> Option<Rc<RefCell<PropertyMap>>> {
+) -> Result<Rc<RefCell<PropertyMap>>, StatorStatus> {
     if wrap.is_null() {
-        return None;
+        return Err(StatorStatus::StatorStatusInvalidArg);
     }
 
     // SAFETY: caller guarantees `wrap` is valid.
     if let Some(existing) = unsafe { (*wrap).materialized.borrow().as_ref().cloned() } {
-        return Some(existing);
+        return Ok(existing);
     }
 
     let wrap_addr = wrap as usize;
@@ -13960,7 +14015,14 @@ fn dom_object_wrap_plain_object(
                         "DOM wrapper is no longer callable".to_string(),
                     ));
                 }
-                let receiver = dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined);
+                let receiver = match dom_object_wrap_js_value(wrap) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(StatorError::TypeError(
+                            "DOM wrapper materialization failed".to_string(),
+                        ));
+                    }
+                };
                 // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
                 unsafe { (*wrap).inner.call_as_function(receiver, args) }
             })),
@@ -13984,7 +14046,14 @@ fn dom_object_wrap_plain_object(
                         "DOM wrapper is no longer constructible".to_string(),
                     ));
                 }
-                let new_target = dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined);
+                let new_target = match dom_object_wrap_js_value(wrap) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(StatorError::TypeError(
+                            "DOM wrapper materialization failed".to_string(),
+                        ));
+                    }
+                };
                 // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
                 unsafe { (*wrap).inner.construct(new_target, args) }
             })),
@@ -14000,10 +14069,12 @@ fn dom_object_wrap_plain_object(
         }
         installed_names.push(name.clone());
 
+        let materialized = unsafe { dom_object_wrap_materialized_property(wrap, &name)? };
+        let accessor_attrs = accessor_materialization_attrs(materialized.attrs);
         let getter_name = name.clone();
         let getter_wrap_addr = wrap_addr;
         let getter_alive = Rc::clone(&alive);
-        object.insert_builtin(
+        object.insert_with_attrs(
             format!("__get_{name}__"),
             JsValue::NativeFunction(Rc::new(move |_args| {
                 if !getter_alive.get() {
@@ -14022,13 +14093,14 @@ fn dom_object_wrap_plain_object(
                 }
                 Ok(value)
             })),
+            accessor_attrs,
         );
 
-        if unsafe { (*wrap).has_named_setter } {
+        if materialized.setter_allowed && unsafe { (*wrap).has_named_setter } {
             let setter_name = name.clone();
             let setter_wrap_addr = wrap_addr;
             let setter_alive = Rc::clone(&alive);
-            object.insert_builtin(
+            object.insert_with_attrs(
                 format!("__set_{name}__"),
                 JsValue::NativeFunction(Rc::new(move |args| {
                     if !setter_alive.get() {
@@ -14049,10 +14121,12 @@ fn dom_object_wrap_plain_object(
                     }
                     Ok(JsValue::Undefined)
                 })),
+                accessor_attrs,
             );
         }
 
-        object.insert_with_attrs(name, JsValue::Undefined, PropertyAttributes::ENUMERABLE);
+        object.insert_with_attrs(name.clone(), JsValue::Undefined, accessor_attrs);
+        object.mark_accessor_property(name);
     }
 
     // SAFETY: caller guarantees `wrap` is valid.
@@ -14075,10 +14149,10 @@ fn dom_object_wrap_plain_object(
     });
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { *(*wrap).materialized.borrow_mut() = Some(Rc::clone(&plain)) };
-    Some(plain)
+    Ok(plain)
 }
 
-fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
+fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Result<JsValue, StatorStatus> {
     dom_object_wrap_plain_object(wrap).map(JsValue::PlainObject)
 }
 
@@ -14107,8 +14181,9 @@ pub unsafe extern "C" fn stator_dom_object_wrap_as_value(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    let Some(plain) = dom_object_wrap_plain_object(wrap) else {
-        return std::ptr::null_mut();
+    let plain = match dom_object_wrap_plain_object(wrap) {
+        Ok(plain) => plain,
+        Err(_) => return std::ptr::null_mut(),
     };
     // SAFETY: `isolate` is the wrapper's owning isolate and is live while the
     // wrapper is live.
@@ -14197,6 +14272,8 @@ unsafe fn stator_dom_object_wrap_drop_materialized_cache(wrap: *mut StatorDomObj
 ///
 /// Returns:
 /// * [`StatorStatus::StatorStatusOk`] when the global was installed.
+/// * [`StatorStatus::StatorStatusException`] when materializing the wrapper's
+///   own properties triggers a descriptor callback exception.
 /// * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
 ///   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
 ///   different isolate than `ctx`.
@@ -14230,8 +14307,9 @@ pub unsafe extern "C" fn stator_context_global_set_dom_object_wrap(
         Err(_) => return StatorStatus::StatorStatusInvalidArg,
     };
 
-    let Some(js_value) = dom_object_wrap_js_value(wrap) else {
-        return StatorStatus::StatorStatusInvalidArg;
+    let js_value = match dom_object_wrap_js_value(wrap) {
+        Ok(value) => value,
+        Err(status) => return status,
     };
 
     // SAFETY: caller guarantees `ctx` is valid.
@@ -19742,9 +19820,11 @@ pub type StatorDomNamedDeleterCb = unsafe extern "C" fn(
 
 /// V2 named-property **enumerator** callback.
 ///
-/// The callback should push each enumerable name into `buf` via
+/// The callback should push each materializable own string name into `buf` via
 /// [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
-/// on success.  Any other status is treated as "no names produced".
+/// on success.  Query or descriptor callbacks provide attributes that determine
+/// which returned names are enumerable.  Any other status is treated as
+/// "no names produced".
 ///
 /// # Safety
 /// `buf` must be the non-null pointer the FFI bridge passed in and must not
@@ -20876,7 +20956,10 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_call_as_function(
         return StatorStatus::StatorStatusUnsupported;
     }
     let receiver_js = if receiver.is_null() {
-        dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined)
+        match dom_object_wrap_js_value(wrap) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
     } else {
         // SAFETY: caller guarantees `receiver` is valid.
         stator_value_inner_to_jsvalue(unsafe { &(*receiver).inner })
@@ -20937,7 +21020,10 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_construct(
         return StatorStatus::StatorStatusUnsupported;
     }
     let new_target_js = if new_target.is_null() {
-        dom_object_wrap_js_value(wrap).unwrap_or(JsValue::Undefined)
+        match dom_object_wrap_js_value(wrap) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
     } else {
         // SAFETY: caller guarantees `new_target` is valid.
         stator_value_inner_to_jsvalue(unsafe { &(*new_target).inner })
@@ -39146,6 +39232,31 @@ mod tests {
         }
     }
 
+    const V8_TEST_PROPERTY_ATTRIBUTE_READ_ONLY: u32 = 1 << 0;
+    const V8_TEST_PROPERTY_ATTRIBUTE_DONT_ENUM: u32 = 1 << 1;
+    const V8_TEST_PROPERTY_ATTRIBUTE_DONT_DELETE: u32 = 1 << 2;
+
+    unsafe extern "C" fn named_query_document_attrs(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out_attrs: *mut u32,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        let attrs = match key {
+            "title" => 0,
+            "URL" => {
+                V8_TEST_PROPERTY_ATTRIBUTE_READ_ONLY
+                    | V8_TEST_PROPERTY_ATTRIBUTE_DONT_ENUM
+                    | V8_TEST_PROPERTY_ATTRIBUTE_DONT_DELETE
+            }
+            _ => return StatorStatus::StatorStatusFalse,
+        };
+        unsafe { *out_attrs = attrs };
+        StatorStatus::StatorStatusOk
+    }
+
     unsafe extern "C" fn named_delete_id(
         name: *const c_char,
         name_len: usize,
@@ -39323,6 +39434,21 @@ mod tests {
         name_len: usize,
         _data: *mut c_void,
         _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "boom" {
+            StatorStatus::StatorStatusException
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
+    unsafe extern "C" fn named_descriptor_status_exception(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        _out: *mut StatorDomPropertyDescriptor,
     ) -> StatorStatus {
         let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
         let key = std::str::from_utf8(slice).unwrap();
@@ -39691,6 +39817,84 @@ mod tests {
         unsafe {
             stator_value_destroy(rejected_write_result);
             stator_script_free(rejected_write_script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_context_global_set_dom_object_wrap_preserves_query_attrs() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| *title.borrow_mut() = "Initial".to_string());
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_document_property),
+            setter: Some(named_set_document_property),
+            query: Some(named_query_document_attrs),
+            deleter: None,
+            enumerator: Some(named_enumerate_document),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = br#"
+            var titleDesc = Object.getOwnPropertyDescriptor(document, 'title');
+            var urlDesc = Object.getOwnPropertyDescriptor(document, 'URL');
+            var beforeUrl = document.URL;
+            document.URL = 'https://spoof.invalid/';
+            var deletedUrl = delete document.URL;
+            var keys = Object.keys(document).join(',');
+            var reflectSetTitle = Reflect.set(document, 'title', 'Reflect Title');
+            var afterReflectSet = document.title;
+            var deletedTitle = delete document.title;
+            [
+                titleDesc.enumerable,
+                titleDesc.configurable,
+                typeof titleDesc.set,
+                urlDesc.enumerable,
+                urlDesc.configurable,
+                typeof urlDesc.set,
+                beforeUrl === document.URL,
+                deletedUrl,
+                keys.indexOf('URL') === -1,
+                keys.indexOf('title') !== -1,
+                reflectSetTitle,
+                afterReflectSet,
+                deletedTitle,
+                typeof document.title
+            ].join('|')
+        "#;
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(
+            actual,
+            "true|true|function|false|false|undefined|true|false|true|true|true|Reflect Title|true|undefined"
+        );
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
             stator_context_destroy(ctx);
             stator_dom_object_wrap_destroy(wrap);
         }
@@ -40243,6 +40447,57 @@ mod tests {
             stator_script_free(followup_script);
             stator_value_destroy(result);
             stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_context_global_dom_named_descriptor_exception_fails_materialization() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let named = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &named) },
+            StatorStatus::StatorStatusOk
+        );
+        let descriptors = StatorDomNamedDefinerDescriptorHandler {
+            definer: None,
+            descriptor: Some(named_descriptor_status_exception),
+            symbol_definer: None,
+            symbol_descriptor: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_definer_descriptor_handler(wrap, &descriptors)
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusException
+        );
+        let exception = unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        assert!(!exception.is_null());
+        let ptr = unsafe { stator_value_as_string(exception) };
+        let message = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(message, "DOM named descriptor exception");
+
+        unsafe {
+            stator_value_destroy(exception);
             stator_context_destroy(ctx);
             stator_dom_object_wrap_destroy(wrap);
         }

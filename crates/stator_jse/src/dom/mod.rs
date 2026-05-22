@@ -57,7 +57,31 @@ pub type NamedQueryCallback = Box<dyn Fn(&str, *mut c_void) -> Option<u32>>;
 pub type NamedDeleterCallback = Box<dyn Fn(&str, *mut c_void) -> bool>;
 
 /// Callback that enumerates intercepted named properties.
+///
+/// The returned names are the wrapper's materializable own string names.
+/// Query or descriptor callbacks provide the attributes that determine which
+/// of those names are enumerable.
 pub type NamedEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<String>>;
+
+const V8_PROPERTY_ATTRIBUTE_READ_ONLY: u32 = 1 << 0;
+const V8_PROPERTY_ATTRIBUTE_DONT_ENUM: u32 = 1 << 1;
+const V8_PROPERTY_ATTRIBUTE_DONT_DELETE: u32 = 1 << 2;
+
+fn property_attrs_from_v8_query_bits(bits: u32) -> PropertyAttributes {
+    let mut attrs = PropertyAttributes::WRITABLE
+        | PropertyAttributes::ENUMERABLE
+        | PropertyAttributes::CONFIGURABLE;
+    if bits & V8_PROPERTY_ATTRIBUTE_READ_ONLY != 0 {
+        attrs.remove(PropertyAttributes::WRITABLE);
+    }
+    if bits & V8_PROPERTY_ATTRIBUTE_DONT_ENUM != 0 {
+        attrs.remove(PropertyAttributes::ENUMERABLE);
+    }
+    if bits & V8_PROPERTY_ATTRIBUTE_DONT_DELETE != 0 {
+        attrs.remove(PropertyAttributes::CONFIGURABLE);
+    }
+    attrs
+}
 
 // ── Symbol-keyed named handler callbacks ────────────────────────────────────
 
@@ -1780,6 +1804,37 @@ impl DomObjectWrap {
         self.properties.borrow().contains_key(key)
     }
 
+    /// Return named property attributes from the query interceptor or own map.
+    ///
+    /// Named query callbacks report V8-style negative attributes
+    /// (`ReadOnly`, `DontEnum`, `DontDelete`).  This API converts them to
+    /// Stator's positive descriptor flags (`WRITABLE`, `ENUMERABLE`,
+    /// `CONFIGURABLE`) so DOM wrapper materialization and descriptor reporting
+    /// can share one attribute representation.
+    pub fn get_property_attributes(&self, key: &str) -> Option<PropertyAttributes> {
+        let allowed =
+            self.check_access(AccessCheckOperation::NamedQuery, AccessCheckKey::Named(key));
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        let non_masking = flags.contains(NamedPropertyHandlerFlags::NON_MASKING);
+        if let Some(cfg) = &self.named_handler
+            && let Some(query) = cfg.query()
+            && (allowed || all_can_read)
+            && (!non_masking || !self.properties.borrow().contains_key(key))
+            && let Some(bits) = query(key, self.data_ptr())
+        {
+            return Some(property_attrs_from_v8_query_bits(bits));
+        }
+        if !allowed {
+            return None;
+        }
+        self.properties.borrow().attrs(key)
+    }
+
     /// Define a named property through the definer interceptor.
     ///
     /// Access-check denial fails closed as [`DomPropertyDefineResult::Rejected`].
@@ -1835,14 +1890,11 @@ impl DomObjectWrap {
         }
         self.properties
             .borrow()
-            .get(key)
-            .cloned()
-            .map(|value| {
+            .get_with_attrs(key)
+            .map(|(value, attrs)| {
                 DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
-                    value,
-                    PropertyAttributes::WRITABLE
-                        | PropertyAttributes::ENUMERABLE
-                        | PropertyAttributes::CONFIGURABLE,
+                    value.clone(),
+                    attrs,
                 ))
             })
             .unwrap_or(DomPropertyDescriptorResult::NotIntercepted)
@@ -3856,6 +3908,58 @@ mod tests {
         );
         assert_eq!(defined.borrow().len(), 1);
         assert_eq!(defined.borrow()[0].0, "id");
+    }
+
+    #[test]
+    fn test_named_query_attributes_convert_v8_bits() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .query(|name, _| match name {
+                    "roHiddenFixed" => Some(
+                        V8_PROPERTY_ATTRIBUTE_READ_ONLY
+                            | V8_PROPERTY_ATTRIBUTE_DONT_ENUM
+                            | V8_PROPERTY_ATTRIBUTE_DONT_DELETE,
+                    ),
+                    "normal" => Some(0),
+                    _ => None,
+                })
+                .build(),
+        );
+
+        let attrs = wrap
+            .get_property_attributes("roHiddenFixed")
+            .expect("query should report property attrs");
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(!attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!attrs.contains(PropertyAttributes::CONFIGURABLE));
+
+        let normal = wrap
+            .get_property_attributes("normal")
+            .expect("zero v8 attrs should mean default attrs");
+        assert!(normal.contains(PropertyAttributes::WRITABLE));
+        assert!(normal.contains(PropertyAttributes::ENUMERABLE));
+        assert!(normal.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_named_descriptor_fallback_preserves_own_property_attrs() {
+        let wrap = DomObjectWrap::new(1);
+        wrap.properties.borrow_mut().insert_with_attrs(
+            "hidden".to_string(),
+            JsValue::Smi(9),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        match wrap.get_property_descriptor("hidden") {
+            DomPropertyDescriptorResult::Descriptor(desc) => {
+                assert_eq!(desc.value(), Some(&JsValue::Smi(9)));
+                assert!(!desc.attributes().contains(PropertyAttributes::WRITABLE));
+                assert!(!desc.attributes().contains(PropertyAttributes::ENUMERABLE));
+                assert!(desc.attributes().contains(PropertyAttributes::CONFIGURABLE));
+            }
+            other => panic!("unexpected descriptor result: {other:?}"),
+        }
     }
 
     #[test]

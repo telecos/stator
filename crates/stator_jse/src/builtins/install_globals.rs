@@ -136,8 +136,9 @@ use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
     current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
     dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
-    function_display_name, function_length_value, function_to_string_value, get_object_prototype,
-    has_prototype_in_chain, ordinary_set_prototype_of, plain_object_has_own_property,
+    dispatch_setter, function_display_name, function_length_value, function_to_string_value,
+    get_object_prototype, has_prototype_in_chain, ordinary_set_prototype_of,
+    plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -316,16 +317,22 @@ fn parse_integer_index_key(key: &str) -> Option<u32> {
     if n < u32::MAX { Some(n) } else { None }
 }
 
-fn visible_string_property_name(raw_key: &str) -> Option<String> {
+fn visible_string_property_name(map: &PropertyMap, raw_key: &str) -> Option<String> {
     let visible = if let Some(prop) = raw_key
         .strip_prefix("__get_")
         .and_then(|s| s.strip_suffix("__"))
     {
+        if !map.is_accessor_property(prop) {
+            return Some(raw_key.to_string());
+        }
         prop
     } else if let Some(prop) = raw_key
         .strip_prefix("__set_")
         .and_then(|s| s.strip_suffix("__"))
     {
+        if !map.is_accessor_property(prop) {
+            return Some(raw_key.to_string());
+        }
         prop
     } else {
         if raw_key.starts_with("__") || raw_key.starts_with('#') {
@@ -355,7 +362,7 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
             continue;
         }
 
-        if let Some(visible) = visible_string_property_name(raw_key)
+        if let Some(visible) = visible_string_property_name(map, raw_key)
             && seen.insert(visible.clone())
         {
             ordered.push(visible);
@@ -968,17 +975,20 @@ fn define_plain_own_property(
         let borrow = map.borrow();
         let getter_key = format!("__get_{key}__");
         let setter_key = format!("__set_{key}__");
-        let is_existing_accessor =
-            borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+        let is_existing_accessor = borrow.is_accessor_property(key);
         let property_exists = borrow.contains_key(key) || is_existing_accessor;
 
         if property_exists {
             let currently_configurable = if borrow.contains_key(key) {
                 borrow.is_configurable(key)
-            } else if borrow.contains_key(&getter_key) {
-                borrow.is_configurable(&getter_key)
+            } else if is_existing_accessor {
+                if borrow.contains_key(&getter_key) {
+                    borrow.is_configurable(&getter_key)
+                } else {
+                    borrow.is_configurable(&setter_key)
+                }
             } else {
-                borrow.is_configurable(&setter_key)
+                false
             };
 
             if !currently_configurable {
@@ -1021,10 +1031,14 @@ fn define_plain_own_property(
                     let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
                     let current_e = if borrow.contains_key(key) {
                         borrow.is_enumerable(key)
-                    } else if borrow.contains_key(&getter_key) {
-                        borrow.is_enumerable(&getter_key)
+                    } else if is_existing_accessor {
+                        if borrow.contains_key(&getter_key) {
+                            borrow.is_enumerable(&getter_key)
+                        } else {
+                            borrow.is_enumerable(&setter_key)
+                        }
                     } else {
-                        borrow.is_enumerable(&setter_key)
+                        false
                     };
                     if new_e != current_e {
                         return Err(crate::error::StatorError::TypeError(format!(
@@ -1070,12 +1084,7 @@ fn define_plain_own_property(
     if has_get || has_set {
         {
             let borrow = map.borrow();
-            let getter_key = format!("__get_{key}__");
-            let setter_key = format!("__set_{key}__");
-            if !borrow.extensible
-                && !borrow.contains_key(key)
-                && !borrow.contains_key(&getter_key)
-                && !borrow.contains_key(&setter_key)
+            if !borrow.extensible && !borrow.contains_key(key) && !borrow.is_accessor_property(key)
             {
                 return Err(crate::error::StatorError::TypeError(format!(
                     "Cannot define property {key}, object is not extensible"
@@ -1102,6 +1111,7 @@ fn define_plain_own_property(
                 .insert_with_attrs(setter_key, setter, accessor_attrs);
         }
         map.borrow_mut().remove(key);
+        map.borrow_mut().mark_accessor_property(key);
     } else {
         let writable_val = desc.get("writable").map(|v| v.to_boolean());
         let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
@@ -1112,7 +1122,7 @@ fn define_plain_own_property(
             let setter_key = format!("__set_{key}__");
             let is_existing_accessor = {
                 let borrow = map.borrow();
-                borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key)
+                borrow.is_accessor_property(key)
             };
             if !map.borrow().extensible && !is_existing_accessor {
                 return Err(crate::error::StatorError::TypeError(format!(
@@ -1124,8 +1134,11 @@ fn define_plain_own_property(
             } else {
                 JsValue::Undefined
             };
-            map.borrow_mut().remove(&getter_key);
-            map.borrow_mut().remove(&setter_key);
+            if is_existing_accessor {
+                map.borrow_mut().remove(&getter_key);
+                map.borrow_mut().remove(&setter_key);
+                map.borrow_mut().unmark_accessor_property(key);
+            }
             let mut attrs = PropertyAttributes::empty();
             if writable_val.unwrap_or(false) {
                 attrs |= PropertyAttributes::WRITABLE;
@@ -1143,8 +1156,11 @@ fn define_plain_own_property(
                 let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
                 let getter_key = format!("__get_{key}__");
                 let setter_key = format!("__set_{key}__");
-                map.borrow_mut().remove(&getter_key);
-                map.borrow_mut().remove(&setter_key);
+                if map.borrow().is_accessor_property(key) {
+                    map.borrow_mut().remove(&getter_key);
+                    map.borrow_mut().remove(&setter_key);
+                    map.borrow_mut().unmark_accessor_property(key);
+                }
                 map.borrow_mut().insert(key.to_string(), value);
             }
             if let Some(w) = writable_val {
@@ -1165,9 +1181,8 @@ fn plain_descriptor_as_object(map: &Rc<RefCell<PropertyMap>>, key: &str) -> JsVa
     let borrowed = map.borrow();
     let getter_key = format!("__get_{key}__");
     let setter_key = format!("__set_{key}__");
-    let has_getter = borrowed.contains_key(&getter_key);
-    let has_setter = borrowed.contains_key(&setter_key);
-    if has_getter || has_setter {
+    if borrowed.is_accessor_property(key) {
+        let has_getter = borrowed.contains_key(&getter_key);
         let mut desc = PropertyMap::new();
         desc.insert(
             "get".into(),
@@ -1220,9 +1235,12 @@ fn plain_get(target: &JsValue, key: &str, receiver: &JsValue) -> StatorResult<Js
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
             let getter_key = format!("__get_{key}__");
-            if let Some(getter) = borrow.get(&getter_key).cloned() {
-                drop(borrow);
-                return dispatch_call_with_this(&getter, receiver.clone(), vec![]);
+            if borrow.is_accessor_property(key) {
+                if let Some(getter) = borrow.get(&getter_key).cloned() {
+                    drop(borrow);
+                    return dispatch_call_with_this(&getter, receiver.clone(), vec![]);
+                }
+                return Ok(JsValue::Undefined);
             }
             if let Some(value) = borrow.get(key).cloned() {
                 return Ok(value);
@@ -1242,15 +1260,14 @@ fn plain_set_on_receiver(receiver: &JsValue, key: &str, value: JsValue) -> Stato
     match receiver {
         JsValue::PlainObject(map) => {
             let setter_key = format!("__set_{key}__");
-            let getter_key = format!("__get_{key}__");
             {
                 let borrow = map.borrow();
-                if let Some(setter) = borrow.get(&setter_key).cloned() {
-                    drop(borrow);
-                    dispatch_call_with_this(&setter, receiver.clone(), vec![value])?;
-                    return Ok(true);
-                }
-                if borrow.contains_key(&getter_key) {
+                if borrow.is_accessor_property(key) {
+                    if let Some(setter) = borrow.get(&setter_key).cloned() {
+                        drop(borrow);
+                        dispatch_setter(&setter, receiver, value)?;
+                        return Ok(true);
+                    }
                     return Ok(false);
                 }
                 if borrow.contains_key(key) && !borrow.is_writable(key) {
@@ -1281,13 +1298,12 @@ fn plain_set(
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
             let setter_key = format!("__set_{key}__");
-            let getter_key = format!("__get_{key}__");
-            if let Some(setter) = borrow.get(&setter_key).cloned() {
-                drop(borrow);
-                dispatch_call_with_this(&setter, receiver.clone(), vec![value])?;
-                return Ok(true);
-            }
-            if borrow.contains_key(&getter_key) {
+            if borrow.is_accessor_property(key) {
+                if let Some(setter) = borrow.get(&setter_key).cloned() {
+                    drop(borrow);
+                    dispatch_setter(&setter, receiver, value)?;
+                    return Ok(true);
+                }
                 return Ok(false);
             }
             if borrow.contains_key(key) {
@@ -1313,10 +1329,7 @@ fn plain_has(target: &JsValue, key: &str) -> bool {
     for _ in 0..256 {
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
-            if borrow.contains_key(key)
-                || borrow.contains_key(&format!("__get_{key}__"))
-                || borrow.contains_key(&format!("__set_{key}__"))
-            {
+            if borrow.contains_key(key) || borrow.is_accessor_property(key) {
                 return true;
             }
             if let Some(proto) = borrow.get("__proto__").cloned() {
@@ -1334,8 +1347,7 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
     let getter_key = format!("__get_{key}__");
     let setter_key = format!("__set_{key}__");
     let mut borrow = map.borrow_mut();
-    let has_accessor = borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
-    if has_accessor {
+    if borrow.is_accessor_property(key) {
         let configurable = if borrow.contains_key(&getter_key) {
             borrow.is_configurable(&getter_key)
         } else {
@@ -1347,6 +1359,7 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
         borrow.remove(&getter_key);
         borrow.remove(&setter_key);
         borrow.remove(key);
+        borrow.unmark_accessor_property(key);
         true
     } else if borrow.contains_key(key) {
         if !borrow.is_configurable(key) {
@@ -1372,8 +1385,12 @@ fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
             continue;
         }
         if let Some(name) = accessor_property_name(key) {
-            if seen.insert(name.to_string()) {
-                string_parts.push(JsValue::String(name.to_string().into()));
+            if map.is_accessor_property(name) {
+                if seen.insert(name.to_string()) {
+                    string_parts.push(JsValue::String(name.to_string().into()));
+                }
+            } else if seen.insert(key.to_string()) {
+                string_parts.push(JsValue::String(key.to_string().into()));
             }
             continue;
         }
@@ -2979,6 +2996,9 @@ fn make_dom_exception_constructor() -> JsValue {
     proto.insert_with_attrs("__get_message__".into(), message_getter, accessor_attrs);
     proto.insert_with_attrs("__get_name__".into(), name_getter, accessor_attrs);
     proto.insert_with_attrs("__get_code__".into(), code_getter, accessor_attrs);
+    proto.mark_accessor_property("message");
+    proto.mark_accessor_property("name");
+    proto.mark_accessor_property("code");
     proto.insert_with_attrs(
         "toString".into(),
         builtin_fn("toString", 0, |args| {
@@ -5260,6 +5280,7 @@ fn make_storage_builtin() -> JsValue {
 
     let mut proto = PropertyMap::new();
     proto.insert("__get_length__".into(), storage_length_getter());
+    proto.mark_accessor_property("length");
     proto.insert(
         "key".into(),
         builtin_fn("key", 1, |args| {
@@ -15096,18 +15117,21 @@ fn make_object() -> JsValue {
                 let borrow = map.borrow();
                 let getter_key = format!("__get_{key}__");
                 let setter_key = format!("__set_{key}__");
-                let is_existing_accessor =
-                    borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+                let is_existing_accessor = borrow.is_accessor_property(key);
                 let property_exists = borrow.contains_key(key) || is_existing_accessor;
 
                 if property_exists {
                     // Resolve configurability from the correct backing key.
                     let currently_configurable = if borrow.contains_key(key) {
                         borrow.is_configurable(key)
-                    } else if borrow.contains_key(&getter_key) {
-                        borrow.is_configurable(&getter_key)
+                    } else if is_existing_accessor {
+                        if borrow.contains_key(&getter_key) {
+                            borrow.is_configurable(&getter_key)
+                        } else {
+                            borrow.is_configurable(&setter_key)
+                        }
                     } else {
-                        borrow.is_configurable(&setter_key)
+                        false
                     };
 
                     if !currently_configurable {
@@ -15157,10 +15181,14 @@ fn make_object() -> JsValue {
                             let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
                             let current_e = if borrow.contains_key(key) {
                                 borrow.is_enumerable(key)
-                            } else if borrow.contains_key(&getter_key) {
-                                borrow.is_enumerable(&getter_key)
+                            } else if is_existing_accessor {
+                                if borrow.contains_key(&getter_key) {
+                                    borrow.is_enumerable(&getter_key)
+                                } else {
+                                    borrow.is_enumerable(&setter_key)
+                                }
                             } else {
-                                borrow.is_enumerable(&setter_key)
+                                false
                             };
                             if new_e != current_e {
                                 return Err(crate::error::StatorError::TypeError(format!(
@@ -15213,12 +15241,9 @@ fn make_object() -> JsValue {
                 // don't already have this key as an accessor.
                 {
                     let borrow = map.borrow();
-                    let getter_key = format!("__get_{key}__");
-                    let setter_key = format!("__set_{key}__");
                     if !borrow.extensible
                         && !borrow.contains_key(key)
-                        && !borrow.contains_key(&getter_key)
-                        && !borrow.contains_key(&setter_key)
+                        && !borrow.is_accessor_property(key)
                     {
                         return Err(crate::error::StatorError::TypeError(format!(
                             "Cannot define property {key}, object is not extensible"
@@ -15245,6 +15270,7 @@ fn make_object() -> JsValue {
                         .insert_with_attrs(setter_key, setter, accessor_attrs);
                 }
                 map.borrow_mut().remove(key);
+                map.borrow_mut().mark_accessor_property(key);
             } else {
                 let writable_val = desc.get("writable").map(|v| v.to_boolean());
                 let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
@@ -15260,7 +15286,7 @@ fn make_object() -> JsValue {
                     let setter_key = format!("__set_{key}__");
                     let is_existing_accessor = {
                         let borrow = map.borrow();
-                        borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key)
+                        borrow.is_accessor_property(key)
                     };
                     if !map.borrow().extensible && !is_existing_accessor {
                         return Err(crate::error::StatorError::TypeError(format!(
@@ -15272,8 +15298,11 @@ fn make_object() -> JsValue {
                     } else {
                         JsValue::Undefined
                     };
-                    map.borrow_mut().remove(&getter_key);
-                    map.borrow_mut().remove(&setter_key);
+                    if is_existing_accessor {
+                        map.borrow_mut().remove(&getter_key);
+                        map.borrow_mut().remove(&setter_key);
+                        map.borrow_mut().unmark_accessor_property(key);
+                    }
                     let mut attrs = PropertyAttributes::empty();
                     if writable_val.unwrap_or(false) {
                         attrs |= PropertyAttributes::WRITABLE;
@@ -15291,8 +15320,11 @@ fn make_object() -> JsValue {
                         let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
                         let getter_key = format!("__get_{key}__");
                         let setter_key = format!("__set_{key}__");
-                        map.borrow_mut().remove(&getter_key);
-                        map.borrow_mut().remove(&setter_key);
+                        if map.borrow().is_accessor_property(key) {
+                            map.borrow_mut().remove(&getter_key);
+                            map.borrow_mut().remove(&setter_key);
+                            map.borrow_mut().unmark_accessor_property(key);
+                        }
                         map.borrow_mut().insert(key.to_string(), value);
                     }
                     if let Some(w) = writable_val {
@@ -15449,9 +15481,8 @@ fn make_object() -> JsValue {
                         // Check for accessor property first
                         let getter_key = format!("__get_{key}__");
                         let setter_key = format!("__set_{key}__");
-                        let has_getter = borrowed.contains_key(&getter_key);
-                        let has_setter = borrowed.contains_key(&setter_key);
-                        if has_getter || has_setter {
+                        if borrowed.is_accessor_property(&key) {
+                            let has_getter = borrowed.contains_key(&getter_key);
                             let mut desc = PropertyMap::new();
                             desc.insert(
                                 "get".into(),
@@ -15619,19 +15650,13 @@ fn make_object() -> JsValue {
                         let mut names: Vec<String> = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for k in borrow.keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
-                                }
-                                continue;
-                            }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
+                            if let Some(prop) = accessor_property_name(k) {
+                                if borrow.is_accessor_property(prop) {
+                                    if seen.insert(prop.to_string()) {
+                                        names.push(prop.to_string());
+                                    }
+                                } else if seen.insert(k.to_string()) {
+                                    names.push(k.to_string());
                                 }
                                 continue;
                             }
@@ -16080,11 +16105,13 @@ fn make_object() -> JsValue {
                         for k in borrow.keys() {
                             if let Some(name) = k.strip_prefix("__get_")
                                 && let Some(name) = name.strip_suffix("__")
+                                && borrow.is_accessor_property(name)
                                 && !accessor_names.contains(&name.to_string())
                             {
                                 accessor_names.push(name.to_string());
                             } else if let Some(name) = k.strip_prefix("__set_")
                                 && let Some(name) = name.strip_suffix("__")
+                                && borrow.is_accessor_property(name)
                                 && !accessor_names.contains(&name.to_string())
                             {
                                 accessor_names.push(name.to_string());
@@ -16293,9 +16320,8 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
-                let getter_key = format!("__getter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
-                    if let Some(g) = map.borrow().get(&getter_key) {
+                    if let Some(g) = map.borrow().get_getter_for(&prop) {
                         return Ok(g.clone());
                     }
                     // Walk the prototype chain.
@@ -16303,7 +16329,7 @@ fn make_object() -> JsValue {
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
-                                if let Some(g) = p.borrow().get(&getter_key) {
+                                if let Some(g) = p.borrow().get_getter_for(&prop) {
                                     return Ok(g.clone());
                                 }
                                 current = p.borrow().get("__proto__").cloned();
@@ -16323,9 +16349,8 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
-                let setter_key = format!("__setter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
-                    if let Some(s) = map.borrow().get(&setter_key) {
+                    if let Some(s) = map.borrow().get_setter_for(&prop) {
                         return Ok(s.clone());
                     }
                     // Walk the prototype chain.
@@ -16333,7 +16358,7 @@ fn make_object() -> JsValue {
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
-                                if let Some(s) = p.borrow().get(&setter_key) {
+                                if let Some(s) = p.borrow().get_setter_for(&prop) {
                                     return Ok(s.clone());
                                 }
                                 current = p.borrow().get("__proto__").cloned();
@@ -16355,8 +16380,9 @@ fn make_object() -> JsValue {
                 let getter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
-                    map.borrow_mut()
-                        .insert(format!("__getter_{prop}__"), getter);
+                    let mut borrow = map.borrow_mut();
+                    borrow.insert(format!("__get_{prop}__"), getter);
+                    borrow.mark_accessor_property(prop);
                 }
                 Ok(JsValue::Undefined)
             }),
@@ -16371,8 +16397,9 @@ fn make_object() -> JsValue {
                 let setter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
-                    map.borrow_mut()
-                        .insert(format!("__setter_{prop}__"), setter);
+                    let mut borrow = map.borrow_mut();
+                    borrow.insert(format!("__set_{prop}__"), setter);
+                    borrow.mark_accessor_property(prop);
                 }
                 Ok(JsValue::Undefined)
             }),

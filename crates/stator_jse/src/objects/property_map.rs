@@ -614,6 +614,10 @@ pub struct PropertyMap {
     /// Whether this map contains any accessor properties (`__get_*__` or `__set_*__` keys).
     /// Once set to `true` it is never cleared, so it is a conservative over-approximation.
     pub has_accessors: bool,
+    /// Canonical property names that are represented by internal accessor
+    /// backing keys. This prevents user-created `__get_*__` data properties
+    /// from being mistaken for engine-created accessors.
+    accessor_properties: Rc<Vec<Rc<str>>>,
     /// Offset of the next property expected to be filled when this map was
     /// created via [`clone_shape`](Self::clone_shape),
     /// [`clone_template`](Self::clone_template), or
@@ -645,6 +649,7 @@ pub struct PropertyMap {
 pub(crate) struct ObjectLiteralTemplate {
     keys: Rc<Vec<Rc<str>>>,
     attrs: Rc<Vec<PropertyAttributes>>,
+    accessor_properties: Rc<Vec<Rc<str>>>,
     integer_key_count: usize,
     layout_id: u64,
     extensible: bool,
@@ -661,12 +666,13 @@ pub(crate) struct ObjectLiteralTemplate {
     cached_shape_id: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShapeMetadata {
     integer_key_count: usize,
     layout_id: u64,
     extensible: bool,
     has_accessors: bool,
+    accessor_properties: Rc<Vec<Rc<str>>>,
     capacity_hint: usize,
 }
 
@@ -680,6 +686,7 @@ impl ObjectLiteralTemplate {
             Self {
                 keys,
                 attrs: Rc::clone(&map.attrs),
+                accessor_properties: Rc::clone(&map.accessor_properties),
                 integer_key_count: map.integer_key_count,
                 layout_id: map.layout_id,
                 extensible: map.extensible,
@@ -710,6 +717,7 @@ impl ObjectLiteralTemplate {
             keys: Rc::clone(&self.keys),
             values: acquire_values_vec(cap),
             attrs: Rc::clone(&self.attrs),
+            accessor_properties: Rc::clone(&self.accessor_properties),
             integer_key_count: self.integer_key_count,
             index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
                 PropertyIndex::Inline
@@ -754,6 +762,7 @@ impl ObjectLiteralTemplate {
             keys: Rc::clone(&self.keys),
             values,
             attrs: Rc::clone(&self.attrs),
+            accessor_properties: Rc::clone(&self.accessor_properties),
             integer_key_count: self.integer_key_count,
             index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
                 PropertyIndex::Inline
@@ -787,6 +796,7 @@ impl ObjectLiteralTemplate {
             keys: Rc::clone(&self.keys),
             values: vals,
             attrs: Rc::clone(&self.attrs),
+            accessor_properties: Rc::clone(&self.accessor_properties),
             integer_key_count: self.integer_key_count,
             index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
                 PropertyIndex::Inline
@@ -833,6 +843,7 @@ impl PartialEq for PropertyMap {
             && self.index == other.index
             && self.extensible == other.extensible
             && self.has_accessors == other.has_accessors
+            && self.accessor_properties == other.accessor_properties
     }
 }
 
@@ -855,10 +866,17 @@ impl Clone for PropertyMap {
             proto_global_epoch: Cell::new(self.proto_global_epoch.get()),
             extensible: self.extensible,
             has_accessors: self.has_accessors,
+            accessor_properties: Rc::clone(&self.accessor_properties),
             template_next_slot: self.template_next_slot,
             capacity_hint: self.capacity_hint,
         }
     }
+}
+
+fn accessor_backing_property_name(key: &str) -> Option<&str> {
+    key.strip_prefix("__get_")
+        .or_else(|| key.strip_prefix("__set_"))
+        .and_then(|name| name.strip_suffix("__"))
 }
 
 impl PropertyMap {
@@ -884,6 +902,7 @@ impl PropertyMap {
             proto_global_epoch: Cell::new(0),
             extensible: true,
             has_accessors: false,
+            accessor_properties: Rc::new(Vec::new()),
             template_next_slot: usize::MAX,
             capacity_hint: capacity,
         }
@@ -950,6 +969,7 @@ impl PropertyMap {
         self.proto_global_epoch.set(0);
         self.extensible = template.extensible;
         self.has_accessors = template.has_accessors;
+        self.accessor_properties = Rc::clone(&template.accessor_properties);
         self.template_next_slot = 0;
         self.capacity_hint = capacity_hint;
     }
@@ -1014,6 +1034,7 @@ impl PropertyMap {
         self.proto_global_epoch.set(0);
         self.extensible = template.extensible;
         self.has_accessors = template.has_accessors;
+        self.accessor_properties = Rc::clone(&template.accessor_properties);
         self.template_next_slot = filled;
         self.capacity_hint = capacity_hint;
     }
@@ -1128,6 +1149,7 @@ impl PropertyMap {
                 has_accessors: keys
                     .iter()
                     .any(|key| key.starts_with("__get_") || key.starts_with("__set_")),
+                accessor_properties: Rc::new(Vec::new()),
                 capacity_hint: keys.len(),
             },
             0,
@@ -1158,6 +1180,7 @@ impl PropertyMap {
                 layout_id: self.layout_id,
                 extensible: self.extensible,
                 has_accessors: self.has_accessors,
+                accessor_properties: Rc::clone(&self.accessor_properties),
                 capacity_hint: self.capacity_hint,
             },
             0,
@@ -1243,6 +1266,7 @@ impl PropertyMap {
             proto_global_epoch: Cell::new(0),
             extensible: metadata.extensible,
             has_accessors: metadata.has_accessors,
+            accessor_properties: Rc::clone(&metadata.accessor_properties),
             template_next_slot,
             capacity_hint,
         }
@@ -1611,11 +1635,52 @@ impl PropertyMap {
         self.lookup_slot_cached(key).is_some()
     }
 
+    /// Marks `key` as an accessor property represented by internal backing keys.
+    pub fn mark_accessor_property(&mut self, key: impl Into<Rc<str>>) {
+        let key = key.into();
+        if self
+            .accessor_properties
+            .iter()
+            .any(|existing| existing.as_ref() == key.as_ref())
+        {
+            return;
+        }
+
+        Rc::make_mut(&mut self.accessor_properties).push(key);
+        self.has_accessors = true;
+        self.bump_shape_id();
+        self.touch_proto_generation();
+    }
+
+    /// Removes `key` from the internal accessor-property marker set.
+    pub fn unmark_accessor_property(&mut self, key: &str) {
+        let Some(pos) = self
+            .accessor_properties
+            .iter()
+            .position(|existing| existing.as_ref() == key)
+        else {
+            return;
+        };
+
+        Rc::make_mut(&mut self.accessor_properties).remove(pos);
+        self.bump_shape_id();
+        self.touch_proto_generation();
+    }
+
+    /// Returns `true` when `key` is represented by accessor backing keys.
+    pub fn is_accessor_property(&self, key: &str) -> bool {
+        self.has_accessors
+            && self
+                .accessor_properties
+                .iter()
+                .any(|existing| existing.as_ref() == key)
+    }
+
     /// Returns `true` if an accessor getter `__get_{key}__` exists in this
     /// map.  Uses a stack-allocated buffer to avoid heap `format!()`.
     #[inline]
     pub fn has_getter_for(&self, key: &str) -> bool {
-        if !self.has_accessors {
+        if !self.is_accessor_property(key) {
             return false;
         }
         // Build "__get_{key}__" on the stack (max 128 bytes, fall back to
@@ -1640,7 +1705,7 @@ impl PropertyMap {
     /// map.  Uses a stack-allocated buffer to avoid heap `format!()`.
     #[inline]
     pub fn has_setter_for(&self, key: &str) -> bool {
-        if !self.has_accessors {
+        if !self.is_accessor_property(key) {
             return false;
         }
         let prefix = "__set_";
@@ -1663,7 +1728,7 @@ impl PropertyMap {
     /// exists.  Stack-allocated key avoids heap `format!()`.
     #[inline]
     pub fn get_getter_for(&self, key: &str) -> Option<&JsValue> {
-        if !self.has_accessors {
+        if !self.is_accessor_property(key) {
             return None;
         }
         let prefix = "__get_";
@@ -1686,7 +1751,7 @@ impl PropertyMap {
     /// exists.  Stack-allocated key avoids heap `format!()`.
     #[inline]
     pub fn get_setter_for(&self, key: &str) -> Option<&JsValue> {
-        if !self.has_accessors {
+        if !self.is_accessor_property(key) {
             return None;
         }
         let prefix = "__set_";
@@ -1782,6 +1847,14 @@ impl PropertyMap {
     /// Called after populating built-in prototype objects whose methods
     /// should not appear in `for…in` or `Object.keys()`.
     pub fn make_all_non_enumerable(&mut self) {
+        let accessor_names: Vec<Rc<str>> = self
+            .keys
+            .iter()
+            .filter_map(|key| accessor_backing_property_name(key).map(Rc::<str>::from))
+            .collect();
+        for name in accessor_names {
+            self.mark_accessor_property(name);
+        }
         for attr in Rc::make_mut(&mut self.attrs).iter_mut() {
             attr.remove(PropertyAttributes::ENUMERABLE);
         }
@@ -1807,6 +1880,22 @@ impl PropertyMap {
             Rc::make_mut(&mut self.keys).remove(i);
             self.values.remove(i);
             Rc::make_mut(&mut self.attrs).remove(i);
+            if let Some(accessor_name) = accessor_backing_property_name(key) {
+                let getter_key = format!("__get_{accessor_name}__");
+                let setter_key = format!("__set_{accessor_name}__");
+                if self.is_accessor_property(accessor_name)
+                    && !self.contains_key(&getter_key)
+                    && !self.contains_key(&setter_key)
+                {
+                    self.unmark_accessor_property(accessor_name);
+                }
+            } else if self.is_accessor_property(key) {
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                if !self.contains_key(&getter_key) && !self.contains_key(&setter_key) {
+                    self.unmark_accessor_property(key);
+                }
+            }
             // Decrement indices for every slot that shifted left.
             if let PropertyIndex::Map(index) = &mut self.index {
                 for idx in index.values_mut() {
@@ -2896,6 +2985,16 @@ mod tests {
         assert!(!pm.is_enumerable("b"));
     }
 
+    #[test]
+    fn test_make_all_non_enumerable_marks_internal_accessors() {
+        let mut pm = PropertyMap::new();
+        pm.insert("__get_x__".to_string(), JsValue::Smi(1));
+        assert!(!pm.is_accessor_property("x"));
+        pm.make_all_non_enumerable();
+        assert!(pm.is_accessor_property("x"));
+        assert!(pm.has_getter_for("x"));
+    }
+
     // ── proto_generation ─────────────────────────────────────────────────
 
     #[test]
@@ -3264,5 +3363,38 @@ mod tests {
         assert_eq!(Rc::as_ptr(&pm.keys), keys_ptr_before);
         assert_eq!(pm.values[0], JsValue::Smi(42));
         assert_eq!(pm.values[1], JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_reinitialize_from_template_copies_accessor_markers() {
+        let mut template_map = PropertyMap::new();
+        template_map.insert("__get_x__".to_string(), JsValue::Smi(1));
+        template_map.mark_accessor_property("x");
+        let template = ObjectLiteralTemplate::capture(&template_map).unwrap();
+
+        let mut pm = PropertyMap::new();
+        pm.reinitialize_from_template(&template);
+        assert!(pm.is_accessor_property("x"));
+        assert!(pm.has_getter_for("x"));
+
+        let mut data_map = PropertyMap::new();
+        data_map.insert("y".to_string(), JsValue::Smi(2));
+        let data_template = ObjectLiteralTemplate::capture(&data_map).unwrap();
+        pm.reinitialize_from_template(&data_template);
+        assert!(!pm.is_accessor_property("x"));
+        assert!(!pm.has_getter_for("x"));
+    }
+
+    #[test]
+    fn test_reinitialize_from_template_with_values_copies_accessor_markers() {
+        let mut template_map = PropertyMap::new();
+        template_map.insert("__get_x__".to_string(), JsValue::Undefined);
+        template_map.mark_accessor_property("x");
+        let template = ObjectLiteralTemplate::capture(&template_map).unwrap();
+
+        let mut pm = PropertyMap::new();
+        pm.reinitialize_from_template_with_values(&template, &[JsValue::Smi(1)]);
+        assert!(pm.is_accessor_property("x"));
+        assert_eq!(pm.get_getter_for("x"), Some(&JsValue::Smi(1)));
     }
 }

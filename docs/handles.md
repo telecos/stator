@@ -584,6 +584,14 @@ Indexed-handler flags (`STATOR_DOM_INDEXED_HANDLER_FLAG_*`):
 | `NON_MASKING` | Stored-only metadata. Indexed wrappers do not maintain a per-index own-property map today, so this flag is reserved for future symmetry with named handlers. |
 | `HAS_NO_SIDE_EFFECT` | Stored-only metadata; no runtime effect today. |
 
+Named-handler enumerators return **materializable own string names**, not
+only enumerable names. Stator derives each materialized property's
+`enumerable`, `configurable`, and setter availability from a descriptor
+callback first, then from the named query callback's V8-style
+`ReadOnly` / `DontEnum` / `DontDelete` bits. This lets Edge expose
+non-enumerable and non-configurable DOM properties without hiding them from
+`Object.getOwnPropertyDescriptor`.
+
 Indexed-handler callbacks (parallel to the named surface):
 
 - **Getter / setter / query / length** — historical Stator behaviour.
