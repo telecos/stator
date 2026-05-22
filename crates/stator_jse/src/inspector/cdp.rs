@@ -61,6 +61,81 @@ use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use crate::objects::value::JsValue;
 use crate::parser;
 
+/// Stable CDP-visible execution context metadata.
+///
+/// Instances are owned by the inspector context registry and cloned into each
+/// dispatcher so `Runtime.enable` and lifecycle events use a deterministic
+/// payload shape across WebSocket and in-process transports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionContextDescription {
+    /// CDP `Runtime.ExecutionContextDescription.id`.
+    pub id: u32,
+    /// Inspector context-group identifier that owns this context.
+    pub group_id: u32,
+    /// Origin string reported to DevTools.
+    pub origin: String,
+    /// Human-readable context name.
+    pub name: String,
+    /// Stable unique identifier for this context lifetime.
+    pub unique_id: String,
+    /// CDP `auxData` metadata object.
+    pub aux_data: Value,
+}
+
+impl ExecutionContextDescription {
+    /// Build a context description with a deterministic `uniqueId`.
+    pub fn new(
+        id: u32,
+        group_id: u32,
+        origin: impl Into<String>,
+        name: impl Into<String>,
+        aux_data: Value,
+    ) -> Self {
+        Self {
+            id,
+            group_id,
+            origin: origin.into(),
+            name: name.into(),
+            unique_id: format!("stator-{group_id}-{id}"),
+            aux_data: normalize_aux_data(group_id, aux_data),
+        }
+    }
+
+    /// Convert this description into the CDP event payload object.
+    pub fn to_cdp_context(&self) -> Value {
+        json!({
+            "id": self.id,
+            "origin": self.origin,
+            "name": self.name,
+            "uniqueId": self.unique_id,
+            "auxData": self.aux_data,
+        })
+    }
+}
+
+/// Return the default single-context metadata used by standalone CDP sessions.
+pub fn default_execution_context() -> ExecutionContextDescription {
+    ExecutionContextDescription::new(
+        1,
+        1,
+        "stator",
+        "stator",
+        json!({
+            "isDefault": true,
+            "type": "default",
+        }),
+    )
+}
+
+fn normalize_aux_data(group_id: u32, aux_data: Value) -> Value {
+    let mut object = match aux_data {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    object.entry("groupId").or_insert_with(|| json!(group_id));
+    Value::Object(object)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // JSON-RPC message types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +210,10 @@ pub enum DispatchOutcome {
 pub struct CdpDispatcher {
     globals: Rc<RefCell<GlobalEnv>>,
     profiler: CpuProfiler,
+    /// CDP-visible execution contexts currently known to this session.
+    contexts: Vec<ExecutionContextDescription>,
+    /// Whether the `Runtime` domain is currently enabled for this session.
+    runtime_enabled: bool,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
@@ -156,9 +235,19 @@ impl CdpDispatcher {
     /// Build a dispatcher that shares the supplied globals environment with
     /// its owner (typically a [`StatorContext`](crate::inspector) FFI handle).
     pub fn with_globals(globals: Rc<RefCell<GlobalEnv>>) -> Self {
+        Self::with_globals_and_contexts(globals, vec![default_execution_context()])
+    }
+
+    /// Build a dispatcher with an explicit execution-context registry snapshot.
+    pub fn with_globals_and_contexts(
+        globals: Rc<RefCell<GlobalEnv>>,
+        contexts: Vec<ExecutionContextDescription>,
+    ) -> Self {
         Self {
             globals,
             profiler: CpuProfiler::new(),
+            contexts,
+            runtime_enabled: false,
             console_enabled: false,
             debugger_enabled: false,
             next_breakpoint_id: 1,
@@ -195,6 +284,46 @@ impl CdpDispatcher {
     /// Returns `true` if the `Debugger` domain is currently enabled.
     pub fn debugger_enabled(&self) -> bool {
         self.debugger_enabled
+    }
+
+    /// Returns `true` if the `Runtime` domain is currently enabled.
+    pub fn runtime_enabled(&self) -> bool {
+        self.runtime_enabled
+    }
+
+    /// Add a context to this session's registry and emit `created` if enabled.
+    pub fn add_execution_context(&mut self, context: ExecutionContextDescription) {
+        if self
+            .contexts
+            .iter()
+            .any(|existing| existing.id == context.id)
+        {
+            return;
+        }
+        self.contexts.push(context.clone());
+        self.emit_execution_context_created(&context);
+    }
+
+    /// Remove a context from this session's registry and emit `destroyed`.
+    pub fn remove_execution_context(&mut self, context_id: u32) {
+        if let Some(index) = self
+            .contexts
+            .iter()
+            .position(|context| context.id == context_id)
+        {
+            self.contexts.remove(index);
+            self.emit_execution_context_destroyed(context_id);
+        }
+    }
+
+    /// Remove every context in `context_ids` and emit one `contextsCleared`.
+    pub fn clear_execution_contexts(&mut self, context_ids: &[u32]) {
+        let before = self.contexts.len();
+        self.contexts
+            .retain(|context| !context_ids.contains(&context.id));
+        if self.contexts.len() != before && self.runtime_enabled {
+            self.push_event("Runtime.executionContextsCleared", json!({}));
+        }
     }
 
     /// Parse `text` as a JSON-RPC request, dispatch it, and enqueue the
@@ -250,6 +379,24 @@ impl CdpDispatcher {
         }
     }
 
+    fn emit_execution_context_created(&mut self, context: &ExecutionContextDescription) {
+        if self.runtime_enabled {
+            self.push_event(
+                "Runtime.executionContextCreated",
+                json!({ "context": context.to_cdp_context() }),
+            );
+        }
+    }
+
+    fn emit_execution_context_destroyed(&mut self, context_id: u32) {
+        if self.runtime_enabled {
+            self.push_event(
+                "Runtime.executionContextDestroyed",
+                json!({ "executionContextId": context_id }),
+            );
+        }
+    }
+
     /// Route a parsed request to the correct domain handler.
     fn dispatch(&mut self, req: &CdpRequest) -> StatorResult<Value> {
         match req.method.as_str() {
@@ -302,19 +449,12 @@ impl CdpDispatcher {
     // ── Runtime.enable ────────────────────────────────────────────────────────
 
     fn runtime_enable(&mut self) -> StatorResult<Value> {
+        self.runtime_enabled = true;
         // Emit executionContextCreated event before the ack so the peer sees
         // the context before the response is correlated.
-        self.push_event(
-            "Runtime.executionContextCreated",
-            json!({
-                "context": {
-                    "id": 1,
-                    "origin": "stator",
-                    "name": "stator",
-                    "uniqueId": "1"
-                }
-            }),
-        );
+        for context in self.contexts.clone() {
+            self.emit_execution_context_created(&context);
+        }
         Ok(json!({}))
     }
 
@@ -818,6 +958,11 @@ mod tests {
         })
         .expect("parse event");
         assert_eq!(event["method"], "Runtime.executionContextCreated");
+        assert_eq!(event["params"]["context"]["id"], 1);
+        assert_eq!(event["params"]["context"]["origin"], "stator");
+        assert_eq!(event["params"]["context"]["name"], "stator");
+        assert_eq!(event["params"]["context"]["uniqueId"], "stator-1-1");
+        assert_eq!(event["params"]["context"]["auxData"]["groupId"], 1);
 
         let ack: Value = serde_json::from_str(&match msg2 {
             Message::Text(t) => t.to_string(),

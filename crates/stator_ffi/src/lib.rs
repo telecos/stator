@@ -90,7 +90,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 16;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 17;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -20508,6 +20508,178 @@ pub unsafe extern "C" fn stator_inspector_register_script(
     unsafe { (*inspector).inner.register_script(text) }
 }
 
+/// Return the default inspector context-group ID, or `0` when `inspector` is null.
+///
+/// # Safety
+/// `inspector` must be either null or a live [`StatorInspector`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_context_group_id(
+    inspector: *const StatorInspector,
+) -> u32 {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.default_context_group_id() }
+}
+
+/// Return the default execution context ID, or `0` when `inspector` is null.
+///
+/// # Safety
+/// `inspector` must be either null or a live [`StatorInspector`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_context_id(inspector: *const StatorInspector) -> u32 {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.default_context_id() }
+}
+
+/// Return the number of live execution contexts in `inspector`.
+///
+/// Returns `0` when `inspector` is null.
+///
+/// # Safety
+/// `inspector` must be either null or a live [`StatorInspector`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_context_count(
+    inspector: *const StatorInspector,
+) -> usize {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.contexts().len() }
+}
+
+/// Create a new inspector context group and return its stable ID.
+///
+/// `origin` and `name` are UTF-8 byte spans. Passing null for either span uses
+/// `"stator"`. Returns `0` when `inspector` is null or either span is invalid
+/// UTF-8.
+///
+/// # Safety
+/// - `inspector` must be a non-null pointer returned by
+///   [`stator_inspector_create`].
+/// - `origin` and `name` must be null or valid for reads of their byte lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_create_context_group(
+    inspector: *mut StatorInspector,
+    origin: *const c_char,
+    origin_len: usize,
+    name: *const c_char,
+    name_len: usize,
+) -> u32 {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees non-null spans are readable for their lengths.
+    let Some(origin) = (unsafe { ffi_utf8_or_default(origin, origin_len, "stator") }) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees non-null spans are readable for their lengths.
+    let Some(name) = (unsafe { ffi_utf8_or_default(name, name_len, "stator") }) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.create_context_group(origin, name) }
+}
+
+/// Create a new execution context in `group_id` and return its stable ID.
+///
+/// Runtime-enabled sessions receive `Runtime.executionContextCreated` before
+/// the next request response. Passing null for `origin` or `name` uses
+/// `"stator"`. Returns `0` for null inspector, unknown group, or invalid UTF-8.
+///
+/// # Safety
+/// - `inspector` must be a non-null pointer returned by
+///   [`stator_inspector_create`].
+/// - `origin` and `name` must be null or valid for reads of their byte lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_create_context(
+    inspector: *mut StatorInspector,
+    group_id: u32,
+    origin: *const c_char,
+    origin_len: usize,
+    name: *const c_char,
+    name_len: usize,
+) -> u32 {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees non-null spans are readable for their lengths.
+    let Some(origin) = (unsafe { ffi_utf8_or_default(origin, origin_len, "stator") }) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees non-null spans are readable for their lengths.
+    let Some(name) = (unsafe { ffi_utf8_or_default(name, name_len, "stator") }) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe {
+        (*inspector).inner.create_context(
+            group_id,
+            origin,
+            name,
+            serde_json::json!({
+                "isDefault": false,
+                "type": "default",
+            }),
+        )
+    }
+}
+
+/// Destroy one live execution context.
+///
+/// Returns `true` only for the first destruction of a live context. Runtime-
+/// enabled sessions receive exactly one `Runtime.executionContextDestroyed`
+/// event for a successful teardown.
+///
+/// # Safety
+/// `inspector` must be either null or a live [`StatorInspector`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_destroy_context(
+    inspector: *mut StatorInspector,
+    context_id: u32,
+) -> bool {
+    if inspector.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.destroy_context(context_id) }
+}
+
+/// Clear every live execution context in a context group.
+///
+/// Returns the number of contexts removed. Runtime-enabled sessions receive one
+/// `Runtime.executionContextsCleared` event if at least one context was live in
+/// the group. Repeated calls for the same already-cleared group return `0` and
+/// do not emit another event.
+///
+/// # Safety
+/// `inspector` must be either null or a live [`StatorInspector`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_inspector_clear_context_group(
+    inspector: *mut StatorInspector,
+    group_id: u32,
+) -> usize {
+    if inspector.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `inspector` is valid.
+    unsafe { (*inspector).inner.clear_context_group(group_id) }
+}
+
+unsafe fn ffi_utf8_or_default(ptr: *const c_char, len: usize, default: &str) -> Option<String> {
+    if ptr.is_null() {
+        return Some(default.to_string());
+    }
+    // SAFETY: caller guarantees `ptr` is valid for `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    std::str::from_utf8(bytes).map(str::to_string).ok()
+}
+
 // ── Persistent handles ───────────────────────────────────────────────────────
 //
 // A `StatorPersistent` is an embedder-rooted strong handle that survives the
@@ -39512,6 +39684,11 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         let event: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(event["method"], "Runtime.executionContextCreated");
+        assert_eq!(event["params"]["context"]["id"], 1);
+        assert_eq!(event["params"]["context"]["origin"], "stator");
+        assert_eq!(event["params"]["context"]["name"], "stator");
+        assert_eq!(event["params"]["context"]["uniqueId"], "stator-1-1");
+        assert_eq!(event["params"]["context"]["auxData"]["groupId"], 1);
         let ack: serde_json::Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(ack["id"], 7u64);
         assert!(ack.get("error").is_none());
@@ -39699,6 +39876,217 @@ mod tests {
             )
         };
         assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn test_inspector_context_lookup_and_no_session_lifecycle() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+
+        assert_eq!(unsafe { stator_inspector_context_group_id(inspector) }, 1);
+        assert_eq!(unsafe { stator_inspector_context_id(inspector) }, 1);
+        assert_eq!(unsafe { stator_inspector_context_count(inspector) }, 1);
+
+        let origin = b"https://edge.example";
+        let name = b"edge-page";
+        let group_id = unsafe {
+            stator_inspector_create_context_group(
+                inspector,
+                origin.as_ptr() as *const c_char,
+                origin.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+            )
+        };
+        assert_eq!(group_id, 2);
+        let context_id = unsafe {
+            stator_inspector_create_context(
+                inspector,
+                group_id,
+                origin.as_ptr() as *const c_char,
+                origin.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+            )
+        };
+        assert_eq!(context_id, 2);
+        assert_eq!(unsafe { stator_inspector_context_count(inspector) }, 2);
+
+        assert!(unsafe { stator_inspector_destroy_context(inspector, context_id) });
+        assert!(!unsafe { stator_inspector_destroy_context(inspector, context_id) });
+        assert_eq!(unsafe { stator_inspector_context_count(inspector) }, 1);
+
+        unsafe {
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_ffi_context_lifecycle_event_payloads() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+
+        let enable = br#"{"id":1,"method":"Runtime.enable","params":{}}"#;
+        assert_eq!(
+            unsafe {
+                stator_inspector_dispatch(session, enable.as_ptr() as *const c_char, enable.len())
+            },
+            0
+        );
+        let _ = drain_inspector_session(session);
+
+        let origin = b"https://edge.example";
+        let name = b"isolated-world";
+        let group_id = unsafe {
+            stator_inspector_create_context_group(
+                inspector,
+                origin.as_ptr() as *const c_char,
+                origin.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+            )
+        };
+        let context_id = unsafe {
+            stator_inspector_create_context(
+                inspector,
+                group_id,
+                origin.as_ptr() as *const c_char,
+                origin.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+            )
+        };
+        assert_eq!(context_id, 2);
+        assert_eq!(unsafe { stator_inspector_pending_count(session) }, 1);
+
+        let created_msgs = drain_inspector_session(session);
+        let created: serde_json::Value = serde_json::from_str(&created_msgs[0]).unwrap();
+        assert_eq!(created["method"], "Runtime.executionContextCreated");
+        assert_eq!(created["params"]["context"]["id"], context_id);
+        assert_eq!(
+            created["params"]["context"]["origin"],
+            "https://edge.example"
+        );
+        assert_eq!(created["params"]["context"]["name"], "isolated-world");
+        assert_eq!(created["params"]["context"]["uniqueId"], "stator-2-2");
+        assert_eq!(created["params"]["context"]["auxData"]["groupId"], group_id);
+
+        assert!(unsafe { stator_inspector_destroy_context(inspector, context_id) });
+        assert!(!unsafe { stator_inspector_destroy_context(inspector, context_id) });
+        let destroyed_msgs = drain_inspector_session(session);
+        assert_eq!(destroyed_msgs.len(), 1);
+        let destroyed: serde_json::Value = serde_json::from_str(&destroyed_msgs[0]).unwrap();
+        assert_eq!(destroyed["method"], "Runtime.executionContextDestroyed");
+        assert_eq!(destroyed["params"]["executionContextId"], context_id);
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_inspector_ffi_context_group_clear_isolated_and_idempotent() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let inspector = unsafe { stator_inspector_create(ctx) };
+        let session = unsafe { stator_inspector_connect(inspector, 1) };
+
+        let enable = br#"{"id":1,"method":"Runtime.enable","params":{}}"#;
+        assert_eq!(
+            unsafe {
+                stator_inspector_dispatch(session, enable.as_ptr() as *const c_char, enable.len())
+            },
+            0
+        );
+        let _ = drain_inspector_session(session);
+
+        let origin_a = b"a";
+        let origin_b = b"b";
+        let group_a = unsafe {
+            stator_inspector_create_context_group(
+                inspector,
+                origin_a.as_ptr() as *const c_char,
+                origin_a.len(),
+                origin_a.as_ptr() as *const c_char,
+                origin_a.len(),
+            )
+        };
+        let group_b = unsafe {
+            stator_inspector_create_context_group(
+                inspector,
+                origin_b.as_ptr() as *const c_char,
+                origin_b.len(),
+                origin_b.as_ptr() as *const c_char,
+                origin_b.len(),
+            )
+        };
+        assert_eq!(
+            unsafe {
+                stator_inspector_create_context(
+                    inspector,
+                    group_a,
+                    origin_a.as_ptr() as *const c_char,
+                    origin_a.len(),
+                    origin_a.as_ptr() as *const c_char,
+                    origin_a.len(),
+                )
+            },
+            2
+        );
+        assert_eq!(
+            unsafe {
+                stator_inspector_create_context(
+                    inspector,
+                    group_a,
+                    origin_a.as_ptr() as *const c_char,
+                    origin_a.len(),
+                    origin_a.as_ptr() as *const c_char,
+                    origin_a.len(),
+                )
+            },
+            3
+        );
+        assert_eq!(
+            unsafe {
+                stator_inspector_create_context(
+                    inspector,
+                    group_b,
+                    origin_b.as_ptr() as *const c_char,
+                    origin_b.len(),
+                    origin_b.as_ptr() as *const c_char,
+                    origin_b.len(),
+                )
+            },
+            4
+        );
+        let _ = drain_inspector_session(session);
+
+        assert_eq!(
+            unsafe { stator_inspector_clear_context_group(inspector, group_a) },
+            2
+        );
+        assert_eq!(
+            unsafe { stator_inspector_clear_context_group(inspector, group_a) },
+            0
+        );
+        assert_eq!(unsafe { stator_inspector_context_count(inspector) }, 2);
+
+        let msgs = drain_inspector_session(session);
+        assert_eq!(msgs.len(), 1);
+        let cleared: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(cleared["method"], "Runtime.executionContextsCleared");
+
+        unsafe {
+            stator_inspector_disconnect(inspector, session);
+            stator_inspector_destroy(inspector);
+            stator_context_destroy(ctx);
+        }
     }
 
     // ── Persistent handles ────────────────────────────────────────────────────

@@ -24,7 +24,9 @@ use std::rc::Rc;
 
 use serde_json::json;
 
-use crate::inspector::cdp::{CdpDispatcher, DispatchOutcome};
+use crate::inspector::cdp::{
+    CdpDispatcher, DispatchOutcome, ExecutionContextDescription, default_execution_context,
+};
 use crate::interpreter::GlobalEnv;
 
 /// One CDP session within an [`InProcessInspector`].
@@ -47,10 +49,14 @@ pub struct InProcessInspectorSession {
 
 impl InProcessInspectorSession {
     /// Build a session that shares `globals` with its parent context.
-    fn new(id: u32, globals: Rc<RefCell<GlobalEnv>>) -> Self {
+    fn new(
+        id: u32,
+        globals: Rc<RefCell<GlobalEnv>>,
+        contexts: Vec<ExecutionContextDescription>,
+    ) -> Self {
         Self {
             id,
-            dispatcher: CdpDispatcher::with_globals(globals),
+            dispatcher: CdpDispatcher::with_globals_and_contexts(globals, contexts),
             cached: None,
         }
     }
@@ -123,6 +129,19 @@ pub struct RegisteredScript {
     pub source: String,
 }
 
+/// Metadata for one inspector context group.
+#[derive(Debug, Clone)]
+pub struct InspectorContextGroup {
+    /// Stable group identifier.
+    pub id: u32,
+    /// Origin inherited by contexts that do not override it.
+    pub origin: String,
+    /// Human-readable group name.
+    pub name: String,
+    /// Live context IDs owned by this group.
+    pub context_ids: Vec<u32>,
+}
+
 /// Owning container for a set of CDP sessions sharing a single context.
 ///
 /// `InProcessInspector` is the engine-side type behind the FFI
@@ -132,10 +151,18 @@ pub struct InProcessInspector {
     /// Globals environment shared with the embedder's context.
     globals: Rc<RefCell<GlobalEnv>>,
     /// Active sessions, in insertion order.  Iteration is used by
-    /// `register_script` for `Debugger.scriptParsed` fan-out.
+    /// producer events for deterministic fan-out.
     // Boxed sessions keep FFI session handles stable across Vec reallocations.
     #[allow(clippy::vec_box)]
     sessions: Vec<Box<InProcessInspectorSession>>,
+    /// Stable context-group registry.
+    context_groups: Vec<InspectorContextGroup>,
+    /// Stable execution-context registry.
+    contexts: Vec<ExecutionContextDescription>,
+    /// Next group ID to assign; always greater than every live group ID.
+    next_group_id: u32,
+    /// Next context ID to assign; always greater than every live context ID.
+    next_context_id: u32,
     /// Cached script registry, keyed by monotonically increasing ID.
     scripts: Vec<RegisteredScript>,
     /// Next script ID to assign; always non-zero.
@@ -146,9 +173,20 @@ impl InProcessInspector {
     /// Build a fresh inspector that shares `globals` with the embedder's
     /// context.
     pub fn new(globals: Rc<RefCell<GlobalEnv>>) -> Self {
+        let default_context = default_execution_context();
+        let default_group = InspectorContextGroup {
+            id: default_context.group_id,
+            origin: default_context.origin.clone(),
+            name: default_context.name.clone(),
+            context_ids: vec![default_context.id],
+        };
         Self {
             globals,
             sessions: Vec::new(),
+            context_groups: vec![default_group],
+            contexts: vec![default_context],
+            next_group_id: 2,
+            next_context_id: 2,
             scripts: Vec::new(),
             next_script_id: 1,
         }
@@ -162,6 +200,7 @@ impl InProcessInspector {
         let session = Box::new(InProcessInspectorSession::new(
             session_id,
             Rc::clone(&self.globals),
+            self.contexts.clone(),
         ));
         self.sessions.push(session);
         // SAFETY: just pushed; the box is alive and uniquely owned.
@@ -198,6 +237,131 @@ impl InProcessInspector {
             .map(|s| s.as_mut())
     }
 
+    /// Return the default context group ID.
+    pub fn default_context_group_id(&self) -> u32 {
+        self.context_groups
+            .first()
+            .map(|group| group.id)
+            .unwrap_or(0)
+    }
+
+    /// Return the default execution context ID.
+    pub fn default_context_id(&self) -> u32 {
+        self.contexts.first().map(|context| context.id).unwrap_or(0)
+    }
+
+    /// Return the live context groups in deterministic creation order.
+    pub fn context_groups(&self) -> &[InspectorContextGroup] {
+        &self.context_groups
+    }
+
+    /// Return the live execution contexts in deterministic creation order.
+    pub fn contexts(&self) -> &[ExecutionContextDescription] {
+        &self.contexts
+    }
+
+    /// Lookup a live execution context by ID.
+    pub fn context_by_id(&self, context_id: u32) -> Option<&ExecutionContextDescription> {
+        self.contexts
+            .iter()
+            .find(|context| context.id == context_id)
+    }
+
+    /// Create a new context group and return its stable ID.
+    pub fn create_context_group(
+        &mut self,
+        origin: impl Into<String>,
+        name: impl Into<String>,
+    ) -> u32 {
+        let id = self.next_group_id;
+        let Some(next_group_id) = self.next_group_id.checked_add(1) else {
+            return 0;
+        };
+        self.next_group_id = next_group_id;
+        self.context_groups.push(InspectorContextGroup {
+            id,
+            origin: origin.into(),
+            name: name.into(),
+            context_ids: Vec::new(),
+        });
+        id
+    }
+
+    /// Create a new execution context inside an existing group.
+    ///
+    /// Returns `0` when `group_id` is not live or the context ID space is
+    /// exhausted. Runtime-enabled sessions receive exactly one
+    /// `Runtime.executionContextCreated` event.
+    pub fn create_context(
+        &mut self,
+        group_id: u32,
+        origin: impl Into<String>,
+        name: impl Into<String>,
+        aux_data: serde_json::Value,
+    ) -> u32 {
+        let Some(group_index) = self
+            .context_groups
+            .iter()
+            .position(|group| group.id == group_id)
+        else {
+            return 0;
+        };
+        let id = self.next_context_id;
+        let Some(next_context_id) = self.next_context_id.checked_add(1) else {
+            return 0;
+        };
+        self.next_context_id = next_context_id;
+        let context = ExecutionContextDescription::new(id, group_id, origin, name, aux_data);
+        self.context_groups[group_index].context_ids.push(id);
+        self.contexts.push(context.clone());
+        self.fan_out_context_created(context);
+        id
+    }
+
+    /// Destroy one execution context.
+    ///
+    /// Returns `true` only for the first destruction of a live context. A
+    /// runtime-enabled session receives exactly one
+    /// `Runtime.executionContextDestroyed` event for that successful teardown.
+    pub fn destroy_context(&mut self, context_id: u32) -> bool {
+        let Some(index) = self
+            .contexts
+            .iter()
+            .position(|context| context.id == context_id)
+        else {
+            return false;
+        };
+        self.contexts.remove(index);
+        for group in &mut self.context_groups {
+            group.context_ids.retain(|id| *id != context_id);
+        }
+        self.fan_out_context_destroyed(context_id);
+        true
+    }
+
+    /// Clear every live execution context in a context group.
+    ///
+    /// Returns the number of contexts removed. Runtime-enabled sessions receive
+    /// one `Runtime.executionContextsCleared` event if at least one context was
+    /// live in the group, and repeated calls are no-ops.
+    pub fn clear_context_group(&mut self, group_id: u32) -> usize {
+        let Some(group_index) = self
+            .context_groups
+            .iter()
+            .position(|group| group.id == group_id)
+        else {
+            return 0;
+        };
+        let context_ids = std::mem::take(&mut self.context_groups[group_index].context_ids);
+        if context_ids.is_empty() {
+            return 0;
+        }
+        self.contexts
+            .retain(|context| !context_ids.contains(&context.id));
+        self.fan_out_contexts_cleared(&context_ids);
+        context_ids.len()
+    }
+
     /// Register `source` as the next script in the inspector's registry.
     ///
     /// Returns the freshly assigned, non-zero script ID.  Every session
@@ -232,7 +396,7 @@ impl InProcessInspector {
             "startColumn": 0,
             "endLine": line_count.saturating_sub(1),
             "endColumn": last_line_columns,
-            "executionContextId": 1,
+            "executionContextId": self.default_context_id(),
             "hash": "",
         });
         let event = json!({
@@ -252,6 +416,30 @@ impl InProcessInspector {
     /// Returns a snapshot view of the registered scripts.  Used by tests.
     pub fn scripts(&self) -> &[RegisteredScript] {
         &self.scripts
+    }
+
+    fn fan_out_context_created(&mut self, context: ExecutionContextDescription) {
+        for session in &mut self.sessions {
+            session
+                .dispatcher_mut()
+                .add_execution_context(context.clone());
+        }
+    }
+
+    fn fan_out_context_destroyed(&mut self, context_id: u32) {
+        for session in &mut self.sessions {
+            session
+                .dispatcher_mut()
+                .remove_execution_context(context_id);
+        }
+    }
+
+    fn fan_out_contexts_cleared(&mut self, context_ids: &[u32]) {
+        for session in &mut self.sessions {
+            session
+                .dispatcher_mut()
+                .clear_execution_contexts(context_ids);
+        }
     }
 }
 
@@ -290,9 +478,156 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         let event: Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(event["method"], "Runtime.executionContextCreated");
+        assert_eq!(event["params"]["context"]["id"], 1);
+        assert_eq!(event["params"]["context"]["origin"], "stator");
+        assert_eq!(event["params"]["context"]["name"], "stator");
+        assert_eq!(event["params"]["context"]["uniqueId"], "stator-1-1");
+        assert_eq!(event["params"]["context"]["auxData"]["groupId"], 1);
+        assert_eq!(event["params"]["context"]["auxData"]["isDefault"], true);
         let ack: Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(ack["id"], 7u64);
         assert!(ack.get("error").is_none(), "ack should not carry error");
+    }
+
+    #[test]
+    fn context_group_registry_has_stable_default_metadata() {
+        let inspector = new_inspector();
+
+        assert_eq!(inspector.default_context_group_id(), 1);
+        assert_eq!(inspector.default_context_id(), 1);
+        assert_eq!(inspector.context_groups().len(), 1);
+        assert_eq!(inspector.contexts().len(), 1);
+        let context = inspector.context_by_id(1).expect("default context");
+        assert_eq!(context.group_id, 1);
+        assert_eq!(context.origin, "stator");
+        assert_eq!(context.name, "stator");
+        assert_eq!(context.unique_id, "stator-1-1");
+        assert_eq!(context.aux_data["groupId"], 1);
+    }
+
+    #[test]
+    fn create_context_notifies_runtime_enabled_sessions_and_propagates_metadata() {
+        let mut inspector = new_inspector();
+        let group_id = inspector.create_context_group("https://example.test", "page");
+        {
+            let session = inspector.connect(30);
+            assert_eq!(
+                session.dispatch_json(r#"{"id":1,"method":"Runtime.enable","params":{}}"#),
+                DispatchOutcome::Ok
+            );
+            drain_to_strings(session);
+        }
+
+        let context_id = inspector.create_context(
+            group_id,
+            "https://example.test",
+            "main frame",
+            json!({
+                "isDefault": false,
+                "type": "page",
+                "frameId": "frame-1",
+            }),
+        );
+
+        assert_eq!(context_id, 2);
+        let context = inspector.context_by_id(context_id).expect("new context");
+        assert_eq!(context.group_id, group_id);
+        assert_eq!(context.unique_id, format!("stator-{group_id}-{context_id}"));
+
+        let session = inspector.session_by_id_mut(30).expect("session");
+        let msgs = drain_to_strings(session);
+        assert_eq!(msgs.len(), 1);
+        let event: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Runtime.executionContextCreated");
+        let payload = &event["params"]["context"];
+        assert_eq!(payload["id"], context_id);
+        assert_eq!(payload["origin"], "https://example.test");
+        assert_eq!(payload["name"], "main frame");
+        assert_eq!(payload["auxData"]["groupId"], group_id);
+        assert_eq!(payload["auxData"]["frameId"], "frame-1");
+    }
+
+    #[test]
+    fn destroy_context_emits_once_and_never_reuses_live_ids() {
+        let mut inspector = new_inspector();
+        let group_id = inspector.default_context_group_id();
+        {
+            let session = inspector.connect(31);
+            assert_eq!(
+                session.dispatch_json(r#"{"id":1,"method":"Runtime.enable","params":{}}"#),
+                DispatchOutcome::Ok
+            );
+            drain_to_strings(session);
+        }
+
+        let destroyed_id = inspector.create_context(group_id, "stator", "worker", json!({}));
+        let next_id = inspector.create_context(group_id, "stator", "worker-2", json!({}));
+        assert_eq!(destroyed_id, 2);
+        assert_eq!(next_id, 3);
+        drain_to_strings(inspector.session_by_id_mut(31).unwrap());
+
+        assert!(inspector.destroy_context(destroyed_id));
+        assert!(!inspector.destroy_context(destroyed_id));
+        let replacement_id = inspector.create_context(group_id, "stator", "replacement", json!({}));
+        assert_eq!(replacement_id, 4);
+
+        let session = inspector.session_by_id_mut(31).expect("session");
+        let msgs = drain_to_strings(session);
+        assert_eq!(msgs.len(), 2);
+        let destroyed: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(destroyed["method"], "Runtime.executionContextDestroyed");
+        assert_eq!(destroyed["params"]["executionContextId"], destroyed_id);
+        let created: Value = serde_json::from_str(&msgs[1]).unwrap();
+        assert_eq!(created["method"], "Runtime.executionContextCreated");
+        assert_eq!(created["params"]["context"]["id"], replacement_id);
+    }
+
+    #[test]
+    fn clear_context_group_is_isolated_and_repeated_teardown_is_noop() {
+        let mut inspector = new_inspector();
+        let group_a = inspector.create_context_group("a", "a");
+        let group_b = inspector.create_context_group("b", "b");
+        let ctx_a1 = inspector.create_context(group_a, "a", "a1", json!({}));
+        let ctx_a2 = inspector.create_context(group_a, "a", "a2", json!({}));
+        let ctx_b = inspector.create_context(group_b, "b", "b1", json!({}));
+        {
+            let session = inspector.connect(32);
+            assert_eq!(
+                session.dispatch_json(r#"{"id":1,"method":"Runtime.enable","params":{}}"#),
+                DispatchOutcome::Ok
+            );
+            drain_to_strings(session);
+        }
+
+        assert_eq!(inspector.clear_context_group(group_a), 2);
+        assert_eq!(inspector.clear_context_group(group_a), 0);
+        assert!(inspector.context_by_id(ctx_a1).is_none());
+        assert!(inspector.context_by_id(ctx_a2).is_none());
+        assert!(inspector.context_by_id(ctx_b).is_some());
+
+        let session = inspector.session_by_id_mut(32).expect("session");
+        let msgs = drain_to_strings(session);
+        assert_eq!(msgs.len(), 1);
+        let cleared: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(cleared["method"], "Runtime.executionContextsCleared");
+        assert_eq!(
+            session.pending_count(),
+            0,
+            "repeated clear must not emit a second event"
+        );
+    }
+
+    #[test]
+    fn context_lifecycle_without_sessions_is_fail_closed() {
+        let mut inspector = new_inspector();
+        let group_id = inspector.create_context_group("edge", "edge");
+        let context_id = inspector.create_context(group_id, "edge", "hidden", json!({}));
+
+        assert_ne!(group_id, 0);
+        assert_ne!(context_id, 0);
+        assert_eq!(inspector.session_count(), 0);
+        assert!(inspector.destroy_context(context_id));
+        assert_eq!(inspector.clear_context_group(group_id), 0);
     }
 
     #[test]

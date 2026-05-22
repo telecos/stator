@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 16
+#define STATOR_FFI_ABI_VERSION_MINOR 17
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -8062,6 +8062,94 @@ uint32_t stator_inspector_register_script(struct StatorInspector *inspector,
                                           struct StatorScript *_script,
                                           const char *source,
                                           size_t source_len);
+
+/**
+ * Return the default inspector context-group ID, or `0` when `inspector` is null.
+ *
+ * # Safety
+ * `inspector` must be either null or a live [`StatorInspector`] pointer.
+ */
+uint32_t stator_inspector_context_group_id(const struct StatorInspector *inspector);
+
+/**
+ * Return the default execution context ID, or `0` when `inspector` is null.
+ *
+ * # Safety
+ * `inspector` must be either null or a live [`StatorInspector`] pointer.
+ */
+uint32_t stator_inspector_context_id(const struct StatorInspector *inspector);
+
+/**
+ * Return the number of live execution contexts in `inspector`.
+ *
+ * Returns `0` when `inspector` is null.
+ *
+ * # Safety
+ * `inspector` must be either null or a live [`StatorInspector`] pointer.
+ */
+size_t stator_inspector_context_count(const struct StatorInspector *inspector);
+
+/**
+ * Create a new inspector context group and return its stable ID.
+ *
+ * `origin` and `name` are UTF-8 byte spans. Passing null for either span uses
+ * `"stator"`. Returns `0` when `inspector` is null or either span is invalid
+ * UTF-8.
+ *
+ * # Safety
+ * - `inspector` must be a non-null pointer returned by
+ *   [`stator_inspector_create`].
+ * - `origin` and `name` must be null or valid for reads of their byte lengths.
+ */
+uint32_t stator_inspector_create_context_group(struct StatorInspector *inspector,
+                                               const char *origin,
+                                               size_t origin_len,
+                                               const char *name,
+                                               size_t name_len);
+
+/**
+ * Create a new execution context in `group_id` and return its stable ID.
+ *
+ * Runtime-enabled sessions receive `Runtime.executionContextCreated` before
+ * the next request response. Passing null for `origin` or `name` uses
+ * `"stator"`. Returns `0` for null inspector, unknown group, or invalid UTF-8.
+ *
+ * # Safety
+ * - `inspector` must be a non-null pointer returned by
+ *   [`stator_inspector_create`].
+ * - `origin` and `name` must be null or valid for reads of their byte lengths.
+ */
+uint32_t stator_inspector_create_context(struct StatorInspector *inspector,
+                                         uint32_t group_id,
+                                         const char *origin,
+                                         size_t origin_len,
+                                         const char *name,
+                                         size_t name_len);
+
+/**
+ * Destroy one live execution context.
+ *
+ * Returns `true` only for the first destruction of a live context. Runtime-
+ * enabled sessions receive exactly one `Runtime.executionContextDestroyed`
+ * event for a successful teardown.
+ *
+ * # Safety
+ * `inspector` must be either null or a live [`StatorInspector`] pointer.
+ */
+bool stator_inspector_destroy_context(struct StatorInspector *inspector, uint32_t context_id);
+
+/**
+ * Clear every live execution context in a context group.
+ *
+ * Returns the number of contexts removed. Runtime-enabled sessions receive one
+ * `Runtime.executionContextsCleared` event if at least one context was live in
+ * the group. Repeated calls for the same already-cleared group return `0` and
+ * do not emit another event.
+ *
+ * # Safety
+ * `inspector` must be either null or a live [`StatorInspector`] pointer.
+ */
+size_t stator_inspector_clear_context_group(struct StatorInspector *inspector, uint32_t group_id);
 
 /**
  * Create a new persistent (embedder-rooted) handle that keeps `value` alive

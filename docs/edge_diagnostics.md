@@ -6,6 +6,26 @@ described below are intended to be enabled in release builds: each
 update is a handful of relaxed atomic operations and (where timing is
 involved) a single `Instant::now()` pair per public entry point.
 
+## Inspector context groups and lifecycle events
+
+The in-process inspector used by Edge DevTools exposes a stable CDP
+execution-context registry. Each inspector starts with context group `1` and
+execution context `1` (`origin = "stator"`, `name = "stator"`), and additional
+groups/contexts receive monotonically increasing IDs that are not reused while
+live. `Runtime.enable` deterministically emits `Runtime.executionContextCreated`
+for every live context before its acknowledgement.
+
+Embedders can query the default group/context IDs through
+`stator_inspector_context_group_id` and `stator_inspector_context_id`, create
+new groups/contexts with `stator_inspector_create_context_group` and
+`stator_inspector_create_context`, and tear contexts down with
+`stator_inspector_destroy_context` or `stator_inspector_clear_context_group`.
+Runtime-enabled sessions observe one `Runtime.executionContextCreated`,
+`Runtime.executionContextDestroyed`, or `Runtime.executionContextsCleared`
+event per successful lifecycle transition; repeated teardown is a no-op.
+Creating or destroying contexts with no attached inspector session is
+fail-closed and only updates the registry.
+
 ## Tier-promotion latency counters
 
 ### Scope
