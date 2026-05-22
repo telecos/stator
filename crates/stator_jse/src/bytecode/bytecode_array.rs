@@ -218,7 +218,11 @@ impl JitExecutableCode {
     /// The caller must ensure `code` contains valid x86-64 machine code
     /// following the JIT calling convention.
     pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
-        let mem = crate::executable_memory::ExecutableMemory::new(code).ok()?;
+        let mem = crate::executable_memory::ExecutableMemory::new_for_tier(
+            code,
+            crate::compiler::jit_memory::JitMemoryTier::Baseline,
+        )
+        .ok()?;
         Some(Self {
             mem,
             register_file_slots,

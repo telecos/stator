@@ -92,6 +92,81 @@ points are reflected directly in the tier-latency counters. This makes
 the counters useful for deterministic Edge proof runs that force a
 specific tier rather than relying on the heuristic tier-up path.
 
+## JIT code memory counters
+
+`stator_jse::compiler::jit_memory` exposes release-safe aggregate
+counters for native-code footprint:
+
+| Field | Meaning |
+| --- | --- |
+| `code_bytes_emitted` | Native instruction bytes emitted by the compiler tier. |
+| `executable_bytes_committed` | Bytes successfully copied into executable memory. |
+| `executable_bytes_freed` | Executable bytes observed by teardown/drop hooks. |
+| `executable_pages_committed` | Page-rounded executable allocations. |
+| `executable_pages_reserved` | Page-rounded reservations; currently equal to committed pages for Stator's allocation APIs. |
+| `executable_pages_freed` | Page-rounded executable releases. |
+| `live_code_bytes` | Current live executable-code bytes after observed frees. |
+| `code_cache_artifact_bytes` | Native code-cache artifact bytes produced by this tier. |
+
+The stable tier rows are `baseline`, `maglev`, `turbofan`, and
+`cranelift`.  The current top-tier compiler is Cranelift-backed, so
+Cranelift rows receive emitted-code samples from that backend and the
+plain `turbofan` row remains zero until a distinct Turbofan emitter is
+wired in.  Native code-cache artifacts are not produced today; those
+fields are stable zeroes until `baseline-code` / `jit-code` artifacts
+are implemented.  Script/module bytecode cache blobs are intentionally
+not counted as native-code artifacts.
+
+### Scope limitations
+
+Counters are process-global aggregates, not true per-isolate rows:
+executable-memory allocation and code-cache ownership currently happen
+below the FFI isolate boundary.  The FFI snapshot therefore reports
+`isolate_scoped = false`; Edge should reset or diff snapshots around the
+proof workload being measured.  Executable page counts use Stator's
+observed allocation sizes rounded to 4 KiB pages, matching current Edge
+proof targets; they are not OS working-set measurements.
+
+Temporary `ExecutableMemory::new` allocations are not attributed unless
+the caller uses `ExecutableMemory::new_for_tier`.  Persistent Baseline
+and Maglev executable caches are attributed and update live/freed bytes
+on drop.  Cranelift code bytes are emitted-code counters only today
+because Cranelift's internal code memory is managed by `cranelift-jit`
+without a stable teardown hook in Stator.
+
+### Rust API
+
+```rust
+use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
+
+jit_memory::reset();
+// ... run workload ...
+let snap = jit_memory::snapshot();
+let maglev = snap.for_tier(JitMemoryTier::Maglev);
+println!(
+    "maglev emitted={} live_exec={}",
+    maglev.code_bytes_emitted,
+    maglev.live_code_bytes,
+);
+```
+
+### C FFI
+
+```c
+StatorJitMemoryStats stats = {0};
+stator_isolate_reset_jit_memory_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_jit_memory_stats(NULL, &stats);
+printf("maglev emitted=%llu live=%llu isolate_scoped=%d\n",
+       (unsigned long long) stats.tiers[1].code_bytes_emitted,
+       (unsigned long long) stats.tiers[1].live_code_bytes,
+       (int) stats.isolate_scoped);
+```
+
+`STATOR_JIT_MEMORY_TIER_COUNT` mirrors the Rust tier count and is
+enforced by FFI tests.  The FFI ABI minor version was bumped when this
+surface was added.
+
 ## Deopt reason histogram counters
 
 The `stator_jse::compiler::deopt_counters` module records release-safe

@@ -1905,6 +1905,10 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
                 unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) }
             {
                 ba.store_jit_code(cached);
+                crate::compiler::jit_memory::record_code_emitted(
+                    crate::compiler::jit_memory::JitMemoryTier::Baseline,
+                    code_len,
+                );
                 JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
                 JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
             }
@@ -1942,6 +1946,10 @@ fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
         match unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) } {
             Ok(cached) => {
                 ba.store_jit_code(cached);
+                crate::compiler::jit_memory::record_code_emitted(
+                    crate::compiler::jit_memory::JitMemoryTier::Baseline,
+                    cc.code.len(),
+                );
                 JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
                 JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(cc.code.len())));
                 timer.record_success();
@@ -2168,12 +2176,17 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                                     if let Ok(mut guard) = input.result_cache.lock() {
                                         // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
                                         if let Ok(cached) = unsafe {
-                                            crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
+                                            crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled_for_tier(
                                             &cc.code,
                                             cc.register_file_slots,
+                                            crate::compiler::jit_memory::JitMemoryTier::Maglev,
                                         )
                                         } {
                                             *guard = Some(cached);
+                                            crate::compiler::jit_memory::record_code_emitted(
+                                                crate::compiler::jit_memory::JitMemoryTier::Maglev,
+                                                cc.native_code_len,
+                                            );
                                         }
                                         drop(guard);
                                     }
@@ -2304,6 +2317,10 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     match unsafe { CachedMaglevCode::new(&cc.code, cc.register_file_slots) } {
         Some(exec) => {
             *maglev_cache.borrow_mut() = Some(exec);
+            crate::compiler::jit_memory::record_code_emitted(
+                crate::compiler::jit_memory::JitMemoryTier::Maglev,
+                cc.native_code_len,
+            );
             // Mirror the background path so embedders observe the same
             // `maglev_function_count` / `maglev_code_bytes` regardless of
             // which compile path produced the cached entry.  Without this,
@@ -2572,6 +2589,10 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
                         *guard = Some(tc);
                         drop(guard);
                     }
+                    crate::compiler::jit_memory::record_code_emitted(
+                        crate::compiler::jit_memory::JitMemoryTier::Cranelift,
+                        code_size,
+                    );
                     // Record Turbofan stats atomically (readable from any thread).
                     TURBOFAN_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     TURBOFAN_CODE_BYTES.fetch_add(code_size, std::sync::atomic::Ordering::Relaxed);
@@ -2635,6 +2656,10 @@ fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
             *guard = Some(tc);
             ba.turbofan_jit_code_flag()
                 .store(true, std::sync::atomic::Ordering::Release);
+            crate::compiler::jit_memory::record_code_emitted(
+                crate::compiler::jit_memory::JitMemoryTier::Cranelift,
+                code_size,
+            );
             TURBOFAN_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             TURBOFAN_CODE_BYTES.fetch_add(code_size, std::sync::atomic::Ordering::Relaxed);
             timer.record_success();

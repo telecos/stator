@@ -31,6 +31,7 @@ use stator_jse::compiler::baseline::compiler::{
     stub_deopt_counts,
 };
 use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
+use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
 use stator_jse::compiler::osr_counters::{self, OsrExitReason, OsrTier};
 use stator_jse::dom::{
     AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
@@ -85,7 +86,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 14;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 15;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -1181,6 +1182,125 @@ pub const STATOR_OSR_EXIT_REASON_COUNT: usize = 4;
 
 /// Number of JIT tier rows carried by [`StatorJitUnwindStats`].
 pub const STATOR_JIT_UNWIND_TIER_COUNT: usize = 4;
+
+/// Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+pub const STATOR_JIT_MEMORY_TIER_COUNT: usize = 4;
+
+/// Per-tier release-safe JIT code memory counters.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMemoryTierStats {
+    /// Stable tier index (matches `JitMemoryTier` discriminant).
+    pub tier: u32,
+    /// Native instruction bytes emitted by this tier.
+    pub code_bytes_emitted: u64,
+    /// Executable bytes successfully committed for cached/live code.
+    pub executable_bytes_committed: u64,
+    /// Executable bytes released by teardown/drop hooks.
+    pub executable_bytes_freed: u64,
+    /// Executable pages committed by successful allocations.
+    pub executable_pages_committed: u64,
+    /// Executable pages reserved by successful allocations.
+    pub executable_pages_reserved: u64,
+    /// Executable pages released by teardown/drop hooks.
+    pub executable_pages_freed: u64,
+    /// Current live executable-code bytes after observed frees.
+    pub live_code_bytes: u64,
+    /// Native code-cache artifact bytes produced by this tier.
+    pub code_cache_artifact_bytes: u64,
+}
+
+/// Aggregate release-safe JIT code memory diagnostic snapshot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMemoryStats {
+    /// Whether counters are scoped to the requested isolate.  Currently false:
+    /// executable allocation happens below the isolate boundary.
+    pub isolate_scoped: bool,
+    /// Whether executable page counters are populated on this target.
+    pub executable_page_accounting_supported: bool,
+    /// Number of per-tier rows that follow.
+    pub tier_row_count: u32,
+    /// Per-tier counters, indexed by `JitMemoryTier` discriminant.
+    pub tiers: [StatorJitMemoryTierStats; STATOR_JIT_MEMORY_TIER_COUNT],
+}
+
+impl StatorJitMemoryStats {
+    fn from_engine_snapshot(snapshot: &jit_memory::JitMemorySnapshot) -> Self {
+        let mut tiers = [StatorJitMemoryTierStats::default(); STATOR_JIT_MEMORY_TIER_COUNT];
+        for tier in JitMemoryTier::all() {
+            let src = snapshot.for_tier(tier);
+            tiers[tier as usize] = StatorJitMemoryTierStats {
+                tier: tier as u32,
+                code_bytes_emitted: src.code_bytes_emitted,
+                executable_bytes_committed: src.executable_bytes_committed,
+                executable_bytes_freed: src.executable_bytes_freed,
+                executable_pages_committed: src.executable_pages_committed,
+                executable_pages_reserved: src.executable_pages_reserved,
+                executable_pages_freed: src.executable_pages_freed,
+                live_code_bytes: src.live_code_bytes,
+                code_cache_artifact_bytes: src.code_cache_artifact_bytes,
+            };
+        }
+        Self {
+            isolate_scoped: snapshot.isolate_scoped,
+            executable_page_accounting_supported: snapshot.executable_page_accounting_supported,
+            tier_row_count: STATOR_JIT_MEMORY_TIER_COUNT as u32,
+            tiers,
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.tiers
+            .iter()
+            .map(|tier| {
+                tier.code_bytes_emitted
+                    + tier.executable_bytes_committed
+                    + tier.executable_bytes_freed
+                    + tier.executable_pages_committed
+                    + tier.executable_pages_reserved
+                    + tier.executable_pages_freed
+                    + tier.live_code_bytes
+                    + tier.code_cache_artifact_bytes
+            })
+            .sum()
+    }
+}
+
+/// Fill `*stats` with current process-global JIT code memory counters.
+///
+/// Does nothing when `stats` is null. Passing a null isolate is permitted; the
+/// returned snapshot reports `isolate_scoped = false` until allocation hooks
+/// carry isolate identity.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes of a `StatorJitMemoryStats`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_jit_memory_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorJitMemoryStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = jit_memory::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorJitMemoryStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset every JIT code memory counter visible through
+/// [`stator_isolate_get_jit_memory_stats`].
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_jit_memory_stats(_isolate: *mut StatorIsolate) {
+    jit_memory::reset();
+}
 
 /// Per-source/target true-OSR entry counters.
 #[repr(C)]
@@ -30909,6 +31029,86 @@ mod tests {
         for b in after.maglev.success_buckets {
             assert_eq!(b, 0);
         }
+    }
+
+    #[test]
+    fn test_jit_memory_stats_null_safety_and_roundtrip_via_ffi() {
+        use std::sync::Mutex;
+        static FFI_JIT_MEMORY_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_JIT_MEMORY_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_jit_memory_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted; we reset before recording.
+        unsafe { stator_isolate_reset_jit_memory_stats(std::ptr::null_mut()) };
+
+        assert_eq!(
+            STATOR_JIT_MEMORY_TIER_COUNT,
+            stator_jse::compiler::jit_memory::JitMemoryTier::COUNT
+        );
+
+        use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
+        jit_memory::record_code_emitted(JitMemoryTier::Maglev, 64);
+        jit_memory::record_executable_allocated(JitMemoryTier::Maglev, 4097);
+        jit_memory::record_executable_freed(JitMemoryTier::Maglev, 4097);
+        jit_memory::record_code_cache_artifact(JitMemoryTier::Cranelift, 17);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorJitMemoryStats>() };
+        // SAFETY: `stats` is valid for writes and a null isolate is accepted.
+        unsafe { stator_isolate_get_jit_memory_stats(std::ptr::null(), &mut stats) };
+
+        assert!(!stats.isolate_scoped);
+        assert_eq!(stats.tier_row_count, JitMemoryTier::COUNT as u32);
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].tier,
+            JitMemoryTier::Maglev as u32
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].code_bytes_emitted,
+            64
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].executable_bytes_committed,
+            4097
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].executable_pages_committed,
+            2
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].executable_pages_reserved,
+            2
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].executable_pages_freed,
+            2
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Maglev as usize].live_code_bytes,
+            0
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Cranelift as usize].code_cache_artifact_bytes,
+            17
+        );
+        assert_eq!(
+            stats.tiers[JitMemoryTier::Turbofan as usize],
+            StatorJitMemoryTierStats {
+                tier: JitMemoryTier::Turbofan as u32,
+                ..StatorJitMemoryTierStats::default()
+            }
+        );
+
+        // SAFETY: null isolate is accepted.
+        unsafe { stator_isolate_reset_jit_memory_stats(std::ptr::null_mut()) };
+        let mut after = unsafe { std::mem::zeroed::<StatorJitMemoryStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_jit_memory_stats(std::ptr::null(), &mut after) };
+        assert_eq!(after.total(), 0);
+        assert!(!after.isolate_scoped);
     }
 
     #[test]

@@ -12441,9 +12441,11 @@ impl CompiledCode {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        let mem = ExecutableMemory::new(&self.code).map_err(|e| {
-            StatorError::Internal(format!("executable memory allocation failed: {e}"))
-        })?;
+        let mem = ExecutableMemory::new_for_tier(
+            &self.code,
+            crate::compiler::jit_memory::JitMemoryTier::Baseline,
+        )
+        .map_err(|e| StatorError::Internal(format!("executable memory allocation failed: {e}")))?;
 
         // Keep small register files on the stack to avoid per-call heap churn
         // on hot JIT entry paths.
@@ -12550,13 +12552,33 @@ impl CachedExecutableCode {
     /// `code` must be valid x86-64 machine code emitted by the baseline or
     /// Maglev compiler.
     pub unsafe fn from_compiled(code: &[u8], register_file_slots: usize) -> StatorResult<Self> {
+        // SAFETY: the caller's safety contract is forwarded unchanged.
+        unsafe {
+            Self::from_compiled_for_tier(
+                code,
+                register_file_slots,
+                crate::compiler::jit_memory::JitMemoryTier::Baseline,
+            )
+        }
+    }
+
+    /// Allocate executable memory and attribute the allocation to `tier`.
+    ///
+    /// # Safety
+    ///
+    /// `code` must be valid x86-64 machine code emitted by the requested tier.
+    pub unsafe fn from_compiled_for_tier(
+        code: &[u8],
+        register_file_slots: usize,
+        tier: crate::compiler::jit_memory::JitMemoryTier,
+    ) -> StatorResult<Self> {
         use crate::executable_memory::ExecutableMemory;
 
         if code.is_empty() {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        let mem = ExecutableMemory::new(code).map_err(|e| {
+        let mem = ExecutableMemory::new_for_tier(code, tier).map_err(|e| {
             StatorError::Internal(format!("executable memory allocation failed: {e}"))
         })?;
 

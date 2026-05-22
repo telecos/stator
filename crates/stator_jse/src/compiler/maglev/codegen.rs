@@ -370,9 +370,11 @@ impl MaglevCompiledCode {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        let mem = ExecutableMemory::new(&self.code[..code_size]).map_err(|e| {
-            StatorError::Internal(format!("executable memory allocation failed: {e}"))
-        })?;
+        let mem = ExecutableMemory::new_for_tier(
+            &self.code[..code_size],
+            crate::compiler::jit_memory::JitMemoryTier::Maglev,
+        )
+        .map_err(|e| StatorError::Internal(format!("executable memory allocation failed: {e}")))?;
 
         let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; self.register_file_slots];
         for (i, &value) in args.iter().enumerate().take(regs.len()) {
@@ -460,7 +462,11 @@ impl CachedMaglevCode {
     /// `code` must contain valid x86-64 machine code produced by
     /// [`compile`].
     pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
-        let mem = crate::executable_memory::ExecutableMemory::new(code).ok()?;
+        let mem = crate::executable_memory::ExecutableMemory::new_for_tier(
+            code,
+            crate::compiler::jit_memory::JitMemoryTier::Maglev,
+        )
+        .ok()?;
         Some(Self {
             mem,
             register_file_slots,

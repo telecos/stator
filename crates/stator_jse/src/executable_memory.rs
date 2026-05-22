@@ -24,6 +24,8 @@
 use std::fmt;
 use std::ptr::NonNull;
 
+use crate::compiler::jit_memory::{self, JitMemoryTier};
+
 /// Failure modes reported by [`ExecutableMemory::new`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutableMemoryError {
@@ -67,6 +69,7 @@ impl std::error::Error for ExecutableMemoryError {}
 pub struct ExecutableMemory {
     ptr: NonNull<u8>,
     len: usize,
+    tier: Option<JitMemoryTier>,
 }
 
 // SAFETY: The owned region is read-only-executable after construction.
@@ -92,10 +95,24 @@ impl ExecutableMemory {
     /// do not have a backend (currently any non-Unix, non-Windows-x86_64
     /// target).
     pub fn new(code: &[u8]) -> Result<Self, ExecutableMemoryError> {
+        Self::new_inner(code, None)
+    }
+
+    /// Allocate a fresh executable region and attribute it to `tier`.
+    pub fn new_for_tier(code: &[u8], tier: JitMemoryTier) -> Result<Self, ExecutableMemoryError> {
+        Self::new_inner(code, Some(tier))
+    }
+
+    fn new_inner(code: &[u8], tier: Option<JitMemoryTier>) -> Result<Self, ExecutableMemoryError> {
         if code.is_empty() {
             return Err(ExecutableMemoryError::ZeroSize);
         }
-        imp::allocate(code).map(|(ptr, len)| Self { ptr, len })
+        imp::allocate(code).map(|(ptr, len)| {
+            if let Some(tier) = tier {
+                jit_memory::record_executable_allocated(tier, len);
+            }
+            Self { ptr, len, tier }
+        })
     }
 
     /// Returns a read-only pointer to the start of the executable region.
@@ -143,6 +160,9 @@ impl ExecutableMemory {
 
 impl Drop for ExecutableMemory {
     fn drop(&mut self) {
+        if let Some(tier) = self.tier {
+            jit_memory::record_executable_freed(tier, self.len);
+        }
         // SAFETY: `ptr` and `len` were established by `imp::allocate` and
         // have not been mutated since.
         unsafe { imp::release(self.ptr, self.len) };
@@ -289,6 +309,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Allocating an empty buffer is rejected on every target.
     #[test]
@@ -318,6 +341,7 @@ mod tests {
     #[cfg(any(unix, all(target_arch = "x86_64", windows)))]
     #[test]
     fn allocates_and_exposes_code_bytes() {
+        let _g = TEST_LOCK.lock().unwrap();
         // Single `ret` byte on x86-64 (`0xC3`).  On other architectures
         // the value is irrelevant — we only assert the byte round-trips.
         let payload: [u8; 4] = [0xC3, 0x90, 0x90, 0x90];
@@ -335,6 +359,7 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     #[test]
     fn executes_tiny_x86_64_blob() {
+        let _g = TEST_LOCK.lock().unwrap();
         // mov eax, 0x2A     ; B8 2A 00 00 00
         // ret               ; C3
         let code: [u8; 6] = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
@@ -346,5 +371,34 @@ mod tests {
             f()
         };
         assert_eq!(result, 42);
+    }
+
+    /// Tier-attributed executable allocations update live bytes and teardown
+    /// decrements them when the handle is dropped.
+    #[cfg(any(unix, all(target_arch = "x86_64", windows)))]
+    #[test]
+    fn attributed_allocation_tracks_live_bytes_until_drop() {
+        let _g = TEST_LOCK.lock().unwrap();
+        crate::compiler::jit_memory::reset();
+        let payload: [u8; 4] = [0xC3, 0x90, 0x90, 0x90];
+        {
+            let mem = ExecutableMemory::new_for_tier(
+                &payload,
+                crate::compiler::jit_memory::JitMemoryTier::Baseline,
+            )
+            .expect("allocation must succeed");
+            assert_eq!(mem.len(), payload.len());
+            let snap = crate::compiler::jit_memory::snapshot();
+            let base = snap.for_tier(crate::compiler::jit_memory::JitMemoryTier::Baseline);
+            assert_eq!(base.executable_bytes_committed, payload.len() as u64);
+            assert_eq!(base.live_code_bytes, payload.len() as u64);
+            assert_eq!(base.executable_pages_committed, 1);
+        }
+        let snap = crate::compiler::jit_memory::snapshot();
+        let base = snap.for_tier(crate::compiler::jit_memory::JitMemoryTier::Baseline);
+        assert_eq!(base.executable_bytes_freed, payload.len() as u64);
+        assert_eq!(base.executable_pages_freed, 1);
+        assert_eq!(base.live_code_bytes, 0);
+        crate::compiler::jit_memory::reset();
     }
 }

@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 14
+#define STATOR_FFI_ABI_VERSION_MINOR 15
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -99,6 +99,11 @@
  * Number of JIT tier rows carried by [`StatorJitUnwindStats`].
  */
 #define STATOR_JIT_UNWIND_TIER_COUNT 4
+
+/**
+ * Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+ */
+#define STATOR_JIT_MEMORY_TIER_COUNT 4
 
 /**
  * Default named-property handler behaviour; no flag bits set.
@@ -1534,6 +1539,71 @@ typedef struct StatorTierLatencyStats {
    */
   struct StatorTierLatencyTier turbofan;
 } StatorTierLatencyStats;
+
+/**
+ * Per-tier release-safe JIT code memory counters.
+ */
+typedef struct StatorJitMemoryTierStats {
+  /**
+   * Stable tier index (matches `JitMemoryTier` discriminant).
+   */
+  uint32_t tier;
+  /**
+   * Native instruction bytes emitted by this tier.
+   */
+  uint64_t code_bytes_emitted;
+  /**
+   * Executable bytes successfully committed for cached/live code.
+   */
+  uint64_t executable_bytes_committed;
+  /**
+   * Executable bytes released by teardown/drop hooks.
+   */
+  uint64_t executable_bytes_freed;
+  /**
+   * Executable pages committed by successful allocations.
+   */
+  uint64_t executable_pages_committed;
+  /**
+   * Executable pages reserved by successful allocations.
+   */
+  uint64_t executable_pages_reserved;
+  /**
+   * Executable pages released by teardown/drop hooks.
+   */
+  uint64_t executable_pages_freed;
+  /**
+   * Current live executable-code bytes after observed frees.
+   */
+  uint64_t live_code_bytes;
+  /**
+   * Native code-cache artifact bytes produced by this tier.
+   */
+  uint64_t code_cache_artifact_bytes;
+} StatorJitMemoryTierStats;
+
+/**
+ * Aggregate release-safe JIT code memory diagnostic snapshot.
+ */
+typedef struct StatorJitMemoryStats {
+  /**
+   * Whether counters are scoped to the requested isolate.  Currently false:
+   * executable allocation happens below the isolate boundary.
+   */
+  bool isolate_scoped;
+  /**
+   * Whether executable page counters are populated on this target.
+   */
+  bool executable_page_accounting_supported;
+  /**
+   * Number of per-tier rows that follow.
+   */
+  uint32_t tier_row_count;
+  /**
+   * Per-tier counters, indexed by `JitMemoryTier` discriminant.
+   */
+  struct StatorJitMemoryTierStats tiers[STATOR_JIT_MEMORY_TIER_COUNT];
+} StatorJitMemoryStats;
 
 /**
  * Per-source/target true-OSR entry counters.
@@ -3178,6 +3248,29 @@ void stator_isolate_get_tier_latency_stats(const struct StatorIsolate *_isolate,
  * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_reset_tier_latency_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Fill `*stats` with current process-global JIT code memory counters.
+ *
+ * Does nothing when `stats` is null. Passing a null isolate is permitted; the
+ * returned snapshot reports `isolate_scoped = false` until allocation hooks
+ * carry isolate identity.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes of a `StatorJitMemoryStats`.
+ */
+void stator_isolate_get_jit_memory_stats(const struct StatorIsolate *_isolate,
+                                         struct StatorJitMemoryStats *stats);
+
+/**
+ * Reset every JIT code memory counter visible through
+ * [`stator_isolate_get_jit_memory_stats`].
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_jit_memory_stats(struct StatorIsolate *_isolate);
 
 /**
  * Fill `*stats` with current release-safe true-OSR counters.

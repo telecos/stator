@@ -46,6 +46,8 @@ pub mod baseline;
 pub mod compile_counters;
 /// Release-safe deopt and bailout histograms broken down by tier and reason.
 pub mod deopt_counters;
+/// Release-safe JIT code memory and native-byte diagnostics.
+pub mod jit_memory;
 /// Maglev optimising compiler tier.
 pub mod maglev;
 /// On-Stack Replacement: mid-execution tier-up for hot loops.
