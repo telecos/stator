@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 19
+#define STATOR_FFI_ABI_VERSION_MINOR 20
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1280,6 +1280,15 @@ typedef struct StatorMessage StatorMessage;
  * current module linking/evaluation status.
  */
 typedef struct StatorModule StatorModule;
+
+/**
+ * Retained, queryable module-record handle.
+ *
+ * The handle keeps a linked module record alive after the embedder releases its
+ * raw `StatorModule` pointer. Queries fail closed once the handle is released
+ * or the underlying module lifetime has ended.
+ */
+typedef struct StatorModuleHandle StatorModuleHandle;
 
 /**
  * An opaque handle to a JavaScript object.
@@ -5444,6 +5453,67 @@ enum StatorModuleStatus stator_module_get_status(const struct StatorModule *modu
  * `module` must be either null or a valid, live [`StatorModule`] pointer.
  */
 enum StatorModuleType stator_module_get_type(const struct StatorModule *module);
+
+/**
+ * Retain a module record and return a fail-closed handle for later queries.
+ *
+ * The returned handle keeps `module` alive even if the embedder subsequently
+ * calls [`stator_module_free`] on the raw module pointer. Release it with
+ * [`stator_module_handle_release`] and then destroy the handle with
+ * [`stator_module_handle_destroy`].
+ *
+ * # Safety
+ * `module` must be null or a valid, live [`StatorModule`] pointer.
+ */
+struct StatorModuleHandle *stator_module_retain(struct StatorModule *module);
+
+/**
+ * Return whether a retained module handle still refers to a live module.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+bool stator_module_handle_is_valid(const struct StatorModuleHandle *handle);
+
+/**
+ * Return the retained raw module pointer, or null for a stale handle.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+struct StatorModule *stator_module_handle_get_module(const struct StatorModuleHandle *handle);
+
+/**
+ * Query a retained module handle's current status.
+ *
+ * Stale handles fail closed as [`StatorModuleStatus::StatorModuleStatusErrored`].
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+enum StatorModuleStatus stator_module_handle_get_status(const struct StatorModuleHandle *handle);
+
+/**
+ * Release the module record retained by `handle`.
+ *
+ * The handle remains allocated as a stale tombstone so subsequent queries fail
+ * closed. Call [`stator_module_handle_destroy`] to free the handle storage.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+bool stator_module_handle_release(struct StatorModuleHandle *handle);
+
+/**
+ * Destroy a retained module handle.
+ *
+ * If the handle was not released yet, this releases it first.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`] and
+ * must not be used again after this call.
+ */
+void stator_module_handle_destroy(struct StatorModuleHandle *handle);
 
 /**
  * Resolve and consume a dynamic-import request with a compiled module.

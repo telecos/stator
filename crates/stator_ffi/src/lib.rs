@@ -92,7 +92,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 19;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 20;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -1862,6 +1862,8 @@ pub struct StatorContext {
     /// Optional host callback used to start dynamic `import()` work. The host
     /// later settles the request with a module namespace or structured error.
     dynamic_import_resolver: Option<StatorDynamicImportResolver>,
+    /// Linked module records retained by this context for browser module-graph reuse.
+    module_retention: HashSet<*mut StatorModule>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -1897,6 +1899,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         module_url_resolver: None,
         import_meta_populator: None,
         dynamic_import_resolver: None,
+        module_retention: HashSet::new(),
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -1925,6 +1928,8 @@ pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
                 }
             }
         }
+        // SAFETY: caller guarantees `ctx` is valid and uniquely owned for destruction.
+        unsafe { release_context_module_retention(ctx) };
         // SAFETY: pointer was created by `Box::into_raw` in `stator_context_new`.
         drop(unsafe { Box::from_raw(ctx) });
     }
@@ -3910,6 +3915,12 @@ pub struct StatorModule {
     /// one step). The continuation is dropped on completion, rejection,
     /// or [`stator_module_free`].
     pending_eval: Option<stator_jse::interpreter::ModuleTopLevelContinuation>,
+    /// Internal strong-retain count held by contexts and module handles.
+    internal_retain_count: usize,
+    /// Whether the embedder has called `stator_module_free` on this record.
+    host_released: bool,
+    /// Shared liveness flag used by retained handles to fail closed after teardown.
+    lifetime: Rc<Cell<bool>>,
 }
 
 /// A single `export { local as exported } from "src"` indirect re-export.
@@ -4456,6 +4467,17 @@ pub struct StatorDynamicImportRequest {
     specifier: String,
 }
 
+/// Retained, queryable module-record handle.
+///
+/// The handle keeps a linked module record alive after the embedder releases its
+/// raw `StatorModule` pointer. Queries fail closed once the handle is released
+/// or the underlying module lifetime has ended.
+pub struct StatorModuleHandle {
+    module: *mut StatorModule,
+    lifetime: Rc<Cell<bool>>,
+    released: bool,
+}
+
 /// Host callback used to start async dynamic `import()` work.
 ///
 /// The callback receives the canonical specifier (after URL resolution, when a
@@ -4925,6 +4947,9 @@ fn module_error_record(
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     })
 }
 
@@ -5056,6 +5081,9 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(error) => module_error_record(
@@ -5155,6 +5183,9 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(error) => module_error_record(
@@ -6584,6 +6615,9 @@ fn module_from_js_cache_payload(
         namespace: None,
         indirect_reexports,
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     }))
 }
 
@@ -6630,6 +6664,9 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     }))
 }
 
@@ -6943,6 +6980,9 @@ unsafe fn compile_module_source(
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
+            internal_retain_count: 0,
+            host_released: false,
+            lifetime: Rc::new(Cell::new(true)),
         });
         return Box::into_raw(module);
     }
@@ -6991,6 +7031,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             });
             return Box::into_raw(module);
         }
@@ -7044,6 +7087,9 @@ unsafe fn compile_module_source(
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
+            internal_retain_count: 0,
+            host_released: false,
+            lifetime: Rc::new(Cell::new(true)),
         });
         return Box::into_raw(module);
     }
@@ -7100,6 +7146,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports,
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(e) => {
@@ -7140,6 +7189,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
     };
@@ -8733,6 +8785,130 @@ pub unsafe extern "C" fn stator_module_get_type(module: *const StatorModule) -> 
     unsafe { (*module).source_type }
 }
 
+/// Retain a module record and return a fail-closed handle for later queries.
+///
+/// The returned handle keeps `module` alive even if the embedder subsequently
+/// calls [`stator_module_free`] on the raw module pointer. Release it with
+/// [`stator_module_handle_release`] and then destroy the handle with
+/// [`stator_module_handle_destroy`].
+///
+/// # Safety
+/// `module` must be null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_retain(
+    module: *mut StatorModule,
+) -> *mut StatorModuleHandle {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid for this retain operation.
+    let module_ref = unsafe { &mut *module };
+    if !module_ref.lifetime.get() {
+        return std::ptr::null_mut();
+    }
+    module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_add(1);
+    Box::into_raw(Box::new(StatorModuleHandle {
+        module,
+        lifetime: Rc::clone(&module_ref.lifetime),
+        released: false,
+    }))
+}
+
+/// Return whether a retained module handle still refers to a live module.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_is_valid(handle: *const StatorModuleHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `handle` is valid when non-null.
+    let handle_ref = unsafe { &*handle };
+    !handle_ref.released && !handle_ref.module.is_null() && handle_ref.lifetime.get()
+}
+
+/// Return the retained raw module pointer, or null for a stale handle.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_get_module(
+    handle: *const StatorModuleHandle,
+) -> *mut StatorModule {
+    // SAFETY: forwards the same handle validity preconditions.
+    if unsafe { stator_module_handle_is_valid(handle) } {
+        // SAFETY: validity above checked `handle` is non-null.
+        unsafe { (*handle).module }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Query a retained module handle's current status.
+///
+/// Stale handles fail closed as [`StatorModuleStatus::StatorModuleStatusErrored`].
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_get_status(
+    handle: *const StatorModuleHandle,
+) -> StatorModuleStatus {
+    // SAFETY: forwards the same handle validity preconditions.
+    let module = unsafe { stator_module_handle_get_module(handle) };
+    if module.is_null() {
+        StatorModuleStatus::StatorModuleStatusErrored
+    } else {
+        // SAFETY: the handle validity check returned a live module pointer.
+        unsafe { (*module).status }
+    }
+}
+
+/// Release the module record retained by `handle`.
+///
+/// The handle remains allocated as a stale tombstone so subsequent queries fail
+/// closed. Call [`stator_module_handle_destroy`] to free the handle storage.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_release(handle: *mut StatorModuleHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `handle` is valid when non-null.
+    let handle_ref = unsafe { &mut *handle };
+    if handle_ref.released {
+        return false;
+    }
+    let module = handle_ref.module;
+    handle_ref.module = std::ptr::null_mut();
+    handle_ref.released = true;
+    if !module.is_null() && handle_ref.lifetime.get() {
+        // SAFETY: this handle owns one internal retain on `module`.
+        unsafe { release_module_record(module) };
+    }
+    true
+}
+
+/// Destroy a retained module handle.
+///
+/// If the handle was not released yet, this releases it first.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`] and
+/// must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_destroy(handle: *mut StatorModuleHandle) {
+    if !handle.is_null() {
+        // SAFETY: `handle` is valid and may still own a retain.
+        let _ = unsafe { stator_module_handle_release(handle) };
+        // SAFETY: pointer was created by `Box::into_raw` in `stator_module_retain`.
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
 unsafe fn module_result_to_value(ctx: *mut StatorContext, val: &JsValue) -> *mut StatorValue {
     let isolate = if ctx.is_null() {
         std::ptr::null_mut()
@@ -8986,6 +9162,10 @@ pub unsafe extern "C" fn stator_dynamic_import_request_resolve_module(
         request.inner.reject(js_error_from_stator_error(error));
         return StatorResolveStatus::StatorResolveStatusTypeError;
     }
+    // SAFETY: the dynamic-import graph is now linked; retain it on the request
+    // context so delayed host settlement and browser graph reuse keep records
+    // and metadata alive until context teardown.
+    unsafe { retain_linked_module_graph(request.ctx, module) };
 
     // SAFETY: caller guarantees `module` is live for this settlement.
     let result = unsafe { stator_module_evaluate(module, request.ctx) };
@@ -8997,11 +9177,15 @@ pub unsafe extern "C" fn stator_dynamic_import_request_resolve_module(
     }
     // SAFETY: `stator_module_evaluate` returned a value owned by us.
     unsafe { stator_value_destroy(result) };
-    request
-        .inner
-        .resolve(JsValue::PlainObject(Rc::new(RefCell::new(
-            PropertyMap::new(),
-        ))));
+    let namespace = if request.ctx.is_null() {
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
+    } else {
+        // SAFETY: `request.ctx` and `module` are live for settlement.
+        let global_env = unsafe { &(*request.ctx).globals };
+        // SAFETY: module evaluation succeeded and export cells are populated.
+        unsafe { module_namespace_value(module, global_env) }
+    };
+    request.inner.resolve(namespace);
     StatorResolveStatus::StatorResolveStatusOk
 }
 
@@ -9544,6 +9728,79 @@ fn set_module_link_error(module: &mut StatorModule, error: &stator_jse::error::S
     module.last_result = None;
     module.error = Some(CString::new(error.to_string()).unwrap_or_else(|_| c"module error".into()));
     module.error_kind = message_kind_for_error(error, false);
+}
+
+unsafe fn retain_module_record(module: *mut StatorModule) {
+    if module.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &mut *module };
+    if module_ref.lifetime.get() {
+        module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_add(1);
+    }
+}
+
+unsafe fn release_module_record(module: *mut StatorModule) {
+    if module.is_null() {
+        return;
+    }
+    // SAFETY: caller owns one internal retain on this live module pointer.
+    let module_ref = unsafe { &mut *module };
+    module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_sub(1);
+    if module_ref.internal_retain_count == 0 && module_ref.host_released {
+        module_ref.lifetime.set(false);
+        // SAFETY: host ownership was already released and this was the final
+        // internal retain, so no context/handle can observe the record again.
+        drop(unsafe { Box::from_raw(module) });
+    }
+}
+
+unsafe fn release_context_module_retention(ctx: *mut StatorContext) {
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable.
+    let retained: Vec<*mut StatorModule> = unsafe { (*ctx).module_retention.drain().collect() };
+    for module in retained {
+        // SAFETY: every retained module pointer owns one context retain.
+        unsafe { release_module_record(module) };
+    }
+}
+
+unsafe fn collect_linked_module_graph(
+    module: *mut StatorModule,
+    out: &mut HashSet<*mut StatorModule>,
+) {
+    if module.is_null() || !out.insert(module) {
+        return;
+    }
+    // SAFETY: caller guarantees `module` is a live linked/evaluated module.
+    let module_ref = unsafe { &*module };
+    for request in &module_ref.module_requests {
+        let dep = request.resolved.get();
+        if !dep.is_null() {
+            // SAFETY: `dep` was populated by successful graph instantiation.
+            unsafe { collect_linked_module_graph(dep, out) };
+        }
+    }
+}
+
+unsafe fn retain_linked_module_graph(ctx: *mut StatorContext, root: *mut StatorModule) {
+    if ctx.is_null() || root.is_null() {
+        return;
+    }
+    let mut graph = HashSet::new();
+    // SAFETY: called only after successful link/validation.
+    unsafe { collect_linked_module_graph(root, &mut graph) };
+    // SAFETY: caller guarantees `ctx` is valid and serialized.
+    let retention = unsafe { &mut (*ctx).module_retention };
+    for module in graph {
+        if retention.insert(module) {
+            // SAFETY: context owns one retain for each newly inserted module.
+            unsafe { retain_module_record(module) };
+        }
+    }
 }
 
 fn module_stored_error(module: &StatorModule) -> stator_jse::error::StatorError {
@@ -10110,23 +10367,24 @@ unsafe fn collect_module_export_names_inner(
 ///   backed by read-through cells — the object is frozen via
 ///   [`PropertyMap::freeze`], which transitively makes assignments and `delete`
 ///   throw `TypeError` in strict code (modules are always strict).
-/// * Adding new properties throws because the object is non-extensible.
-fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCell<GlobalEnv>>) {
-    let dep = request.resolved.get();
-    if dep.is_null() {
-        return;
+unsafe fn module_namespace_value(
+    module: *mut StatorModule,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> JsValue {
+    if module.is_null() {
+        return JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
     }
     // SAFETY: `dep` is a borrowed pointer kept alive by the linked module
     // graph. We hold the only mutable borrow of the module record while
     // caching the namespace value below.
-    let dep_module = unsafe { &mut *dep };
-    let ns_value = if let Some(ns) = dep_module.namespace.as_ref() {
+    let dep_module = unsafe { &mut *module };
+    if let Some(ns) = dep_module.namespace.as_ref() {
         ns.cheap_clone()
     } else {
         // SAFETY: `dep` is a live module pointer; `collect_module_export_names`
         // only reads immutable metadata.
         let mut exports: Vec<String> =
-            unsafe { collect_module_export_names(dep).into_iter().collect() };
+            unsafe { collect_module_export_names(module).into_iter().collect() };
         // ES §10.4.6.12 (SortCompare on `[[OwnPropertyKeys]]`): sort export
         // names lexicographically by Unicode code-point order so the
         // observable enumeration order is deterministic and spec-compliant.
@@ -10135,7 +10393,8 @@ fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCe
         for name in exports {
             // SAFETY: `dep` is a live module pointer; `name` came from the
             // unambiguous namespace export set collected above.
-            let provider = unsafe { resolve_module_export_provider(dep, &name) }.unwrap_or(dep);
+            let provider =
+                unsafe { resolve_module_export_provider(module, &name) }.unwrap_or(module);
             let value_key = module_export_cell_key(provider, &name);
             let value = JsValue::ModuleBinding(Rc::new(ModuleBindingCell {
                 global_env: Rc::clone(global_env),
@@ -10147,7 +10406,17 @@ fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCe
         let ns_value = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
         dep_module.namespace = Some(ns_value.cheap_clone());
         ns_value
-    };
+    }
+}
+
+/// * Adding new properties throws because the object is non-extensible.
+fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCell<GlobalEnv>>) {
+    let dep = request.resolved.get();
+    if dep.is_null() {
+        return;
+    }
+    // SAFETY: `dep` is a live linked module pointer retained by the graph.
+    let ns_value = unsafe { module_namespace_value(dep, global_env) };
     let specifier = request.specifier.to_string_lossy();
     let ns_key = format!("__mod_ns:{specifier}");
     global_env.borrow_mut().insert(ns_key, ns_value);
@@ -10252,7 +10521,12 @@ pub unsafe extern "C" fn stator_module_instantiate(
             let mut validated = HashSet::new();
             // SAFETY: `module` is a non-null, fully-linked module record.
             match unsafe { validate_module_graph_exports(module, &mut validated) } {
-                Ok(()) => true,
+                Ok(()) => {
+                    // SAFETY: the graph is fully linked and validated; the
+                    // context now retains each record for browser graph reuse.
+                    unsafe { retain_linked_module_graph(ctx, module) };
+                    true
+                }
                 Err(error) => {
                     // SAFETY: `module` is non-null and valid by function contract.
                     let module_ref = unsafe { &mut *module };
@@ -11333,9 +11607,18 @@ pub unsafe extern "C" fn stator_module_evaluate(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_module_free(module: *mut StatorModule) {
     if !module.is_null() {
-        // SAFETY: pointer was created by `Box::into_raw` in
-        // `stator_module_compile`.
-        drop(unsafe { Box::from_raw(module) });
+        // SAFETY: caller guarantees `module` is valid for this release.
+        let module_ref = unsafe { &mut *module };
+        if module_ref.host_released {
+            return;
+        }
+        module_ref.host_released = true;
+        if module_ref.internal_retain_count == 0 {
+            module_ref.lifetime.set(false);
+            // SAFETY: pointer was created by `Box::into_raw` in
+            // `stator_module_compile`, and no internal context/handle retains remain.
+            drop(unsafe { Box::from_raw(module) });
+        }
     }
 }
 
@@ -24601,6 +24884,73 @@ mod tests {
         // SAFETY: tests pass a valid mutable `TestGraphResolverData` pointer.
         let data = unsafe { &mut *(user_data as *mut TestGraphResolverData) };
         data.cleanup_calls += 1;
+    }
+
+    #[test]
+    fn test_module_retain_handle_keeps_record_until_release_and_fails_closed() {
+        let module = compile_module_src("export const value = 1;");
+        // SAFETY: `module` is a live module pointer.
+        let handle = unsafe { stator_module_retain(module) };
+        assert!(!handle.is_null());
+        // SAFETY: `handle` is live.
+        assert!(unsafe { stator_module_handle_is_valid(handle) });
+        // SAFETY: retained handle keeps the module alive after host release.
+        unsafe { stator_module_free(module) };
+        // SAFETY: `handle` is still live and owns a retain.
+        assert!(unsafe { stator_module_handle_is_valid(handle) });
+        assert_eq!(
+            // SAFETY: `handle` is live.
+            unsafe { stator_module_handle_get_status(handle) },
+            StatorModuleStatus::StatorModuleStatusUnlinked
+        );
+        // SAFETY: release invalidates the handle without freeing its tombstone.
+        assert!(unsafe { stator_module_handle_release(handle) });
+        // SAFETY: stale handle queries fail closed.
+        assert!(!unsafe { stator_module_handle_is_valid(handle) });
+        // SAFETY: stale handle returns a null module pointer.
+        assert!(unsafe { stator_module_handle_get_module(handle) }.is_null());
+        // SAFETY: destroys the stale handle allocation.
+        unsafe { stator_module_handle_destroy(handle) };
+    }
+
+    #[test]
+    fn test_linked_context_retains_dependency_after_host_release() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { value } from './dep.js'; value + 1;");
+        let dep = compile_module_src("export const value = 41;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live; instantiation retains the graph on `ctx`.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let dep = data.modules.remove("./dep.js").unwrap();
+            stator_module_free(dep);
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
     }
 
     struct TestDetailResolverData {

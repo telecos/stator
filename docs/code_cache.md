@@ -179,6 +179,16 @@ present each must be valid for one write. Cache bytes are untrusted input and
 must fail closed: accepted blobs may skip parsing and bytecode generation, but
 must never weaken source, origin, option, or version validation.
 
+## Module record lifetime
+
+Linked module graphs are retained by their `StatorContext` until context
+teardown so Edge may reuse module records, namespace objects, and source metadata
+after the embedder releases individual raw `StatorModule *` pointers. Embedders
+that need a queryable edge to one record can call `stator_module_retain`, use
+`stator_module_handle_get_module` / `stator_module_handle_get_status`, then call
+`stator_module_handle_release` and `stator_module_handle_destroy`. Released or
+otherwise stale handles fail closed by returning null or `Errored`.
+
 ### Parity and differences versus module cache
 
 Script and module caches share the same key schema, manifest invalidation rules,
