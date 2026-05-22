@@ -26,6 +26,68 @@ event per successful lifecycle transition; repeated teardown is a no-op.
 Creating or destroying contexts with no attached inspector session is
 fail-closed and only updates the registry.
 
+## Inspector RemoteObject registry
+
+Each inspector session owns a per-session `RemoteObjectRegistry` that mints
+stable decimal `objectId` strings (`"1"`, `"2"`, ...) for every non-primitive
+[`JsValue`] surfaced through CDP. Primitive values (`undefined`, `null`,
+booleans, numbers, strings, BigInt, the internal `TheHole` sentinel) are
+serialised by value and **never** mint an `objectId`. Heap values
+(`PlainObject`, `Array`, `Function`, `NativeFunction`, `Error`, `Promise`,
+`Proxy`, `ArrayBuffer`, `TypedArray`, `DataView`, `Generator`, `Iterator`,
+`ModuleBinding`, raw `Object`, `Symbol`, `Context`) always do.
+
+`Runtime.evaluate` and `Runtime.callFunctionOn` honour the optional
+`objectGroup` parameter; every `RemoteObject` minted while producing the
+result inherits that group. `Runtime.getProperties` registers nested child
+values under the parent's group so that `Runtime.releaseObjectGroup`
+cascades.
+
+### Lifetime and identity
+
+- IDs are scoped to one CDP session. Two sessions never observe each other's
+  IDs, and an ID minted in session A always fails closed when used in
+  session B with a structured error.
+- IDs are monotonically increasing and never reused while live.
+- `Runtime.releaseObject` with an unknown or already-released ID returns a
+  structured error rather than silently succeeding, so embedders catch
+  double-release bugs early.
+- `Runtime.releaseObjectGroup` with an unknown group is a no-op success,
+  matching V8 inspector semantics.
+- Dropping the inspector session (and therefore the dispatcher) drops the
+  registry; no out-of-band cleanup is required.
+- The registry holds `JsValue` clones, which for heap variants is an `Rc`
+  bump — it does not introduce additional GC strong roots beyond the entry
+  itself.
+
+### `Runtime.getProperties` coverage
+
+Stator's `Runtime.getProperties` returns own properties for the following
+shapes:
+
+| `JsValue` variant | Properties returned                                       |
+|-------------------|-----------------------------------------------------------|
+| `PlainObject`     | Every entry in insertion order with the engine's `writable` / `enumerable` / `configurable` attributes |
+| `Array`           | Indexed elements `0..n` followed by a non-enumerable, non-configurable `length` |
+| `Function`        | Synthetic `length` (parameter count) and `name`           |
+| Other heap classes (Promise, Proxy, ArrayBuffer, TypedArray, DataView, Generator, Iterator, Error, NativeFunction, ModuleBinding, raw `Object`, `Context`) | Empty own-property list — DevTools renders the `className`/`description` from the RemoteObject payload |
+
+The inspector does not yet emit structured `preview` / `customPreview`
+objects; the `description` field provides a short label only. DevTools
+falls back to lazy `Runtime.getProperties` calls for full inspection.
+
+### CDP method coverage
+
+| Method                       | Behaviour                                          |
+|------------------------------|---------------------------------------------------|
+| `Runtime.getProperties`      | Required `objectId`. Unknown/stale ID → error.    |
+| `Runtime.releaseObject`      | Required `objectId`. Unknown/stale ID → error.    |
+| `Runtime.releaseObjectGroup` | Required `objectGroup`. Unknown group → no-op OK. |
+
+No new FFI symbols are required — CDP requests/responses flow through the
+existing `stator_inspector_dispatch` and `stator_inspector_next_message`
+entry points.
+
 ## Tier-promotion latency counters
 
 ### Scope

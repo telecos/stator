@@ -15,7 +15,9 @@
 //! | `Runtime`      | `enable`                  | Acknowledges; emits context-created event |
 //! | `Runtime`      | `evaluate`                | Parses and executes JavaScript; returns result |
 //! | `Runtime`      | `callFunctionOn`          | Evaluates a function call expression |
-//! | `Runtime`      | `getProperties`           | Lists properties of the globals object |
+//! | `Runtime`      | `getProperties`           | Lists own properties of a previously-minted `RemoteObject` |
+//! | `Runtime`      | `releaseObject`           | Drops one `RemoteObject` from the per-session registry |
+//! | `Runtime`      | `releaseObjectGroup`      | Drops every `RemoteObject` tagged with a given group |
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state   |
 //! | `Debugger`     | `setBreakpointByUrl`      | Sets a breakpoint (stub, returns id) |
@@ -43,7 +45,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
@@ -174,6 +176,99 @@ pub struct CdpEvent {
     pub params: Value,
 }
 
+/// Per-session registry of inspector-visible heap [`JsValue`]s.
+///
+/// CDP `Runtime.RemoteObject` payloads reference non-primitive values by an
+/// opaque `objectId` string.  This registry mints stable decimal IDs for
+/// every non-primitive value surfaced to the inspector and holds a clone of
+/// the [`JsValue`] (cheap because heap variants are reference-counted), so
+/// later `Runtime.getProperties` and `Runtime.releaseObject` calls can
+/// resolve the same value without leaking strong roots into the engine
+/// heap beyond the registry itself.
+///
+/// IDs are scoped to a single [`CdpDispatcher`] (and therefore to a single
+/// inspector session): two sessions never observe each other's IDs, and an
+/// ID that has been released or that was never minted always fails closed
+/// with a structured `Internal` error rather than fabricating properties.
+///
+/// Optional `objectGroup` labels mirror the V8 inspector convention used by
+/// DevTools to bulk-release every object minted during the evaluation of a
+/// single console expression.
+#[derive(Default)]
+pub struct RemoteObjectRegistry {
+    entries: HashMap<String, RemoteObjectEntry>,
+    next_id: u64,
+}
+
+struct RemoteObjectEntry {
+    value: JsValue,
+    group: Option<String>,
+}
+
+impl RemoteObjectRegistry {
+    /// Build an empty registry.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Register `value` with an optional `group` and return the freshly
+    /// minted decimal object ID.
+    ///
+    /// IDs are session-local, monotonically increasing, and never reused
+    /// while live.  Each call clones `value`; for heap variants this is an
+    /// `Rc` bump, so the registry does not introduce additional strong
+    /// references into the GC heap beyond the entry itself.
+    pub fn register(&mut self, value: JsValue, group: Option<String>) -> String {
+        let id = self.next_id;
+        // Saturating add keeps the registry safe under pathological session
+        // lifetimes; the limit is 2^64 IDs which is unreachable in practice.
+        self.next_id = self.next_id.saturating_add(1);
+        let id_str = id.to_string();
+        self.entries
+            .insert(id_str.clone(), RemoteObjectEntry { value, group });
+        id_str
+    }
+
+    /// Look up `id` and return a clone of the stored value, or `None` if
+    /// the ID is unknown or has been released.
+    pub fn get(&self, id: &str) -> Option<JsValue> {
+        self.entries.get(id).map(|e| e.value.clone())
+    }
+
+    /// Drop the entry for `id`.  Returns `true` when an entry was removed
+    /// and `false` when the ID was unknown or already released.
+    pub fn release(&mut self, id: &str) -> bool {
+        self.entries.remove(id).is_some()
+    }
+
+    /// Drop every entry tagged with `group` and return the count removed.
+    pub fn release_group(&mut self, group: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| entry.group.as_deref() != Some(group));
+        before - self.entries.len()
+    }
+
+    /// Returns the optional `objectGroup` label associated with `id`, or
+    /// `None` when the ID is unknown or the entry has no group.
+    pub fn group_of(&self, id: &str) -> Option<&str> {
+        self.entries.get(id).and_then(|e| e.group.as_deref())
+    }
+
+    /// Number of live entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no live entries remain.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,6 +316,8 @@ pub struct CdpDispatcher {
     debugger_enabled: bool,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
+    /// Per-session registry of inspector-visible heap values.
+    remote_objects: RemoteObjectRegistry,
     /// FIFO queue of serialised JSON-RPC messages waiting to be drained by
     /// the transport (or by an embedder via the in-process inspector API).
     outbox: VecDeque<String>,
@@ -251,6 +348,7 @@ impl CdpDispatcher {
             console_enabled: false,
             debugger_enabled: false,
             next_breakpoint_id: 1,
+            remote_objects: RemoteObjectRegistry::new(),
             outbox: VecDeque::new(),
         }
     }
@@ -289,6 +387,12 @@ impl CdpDispatcher {
     /// Returns `true` if the `Runtime` domain is currently enabled.
     pub fn runtime_enabled(&self) -> bool {
         self.runtime_enabled
+    }
+
+    /// Borrow the per-session remote-object registry.  Used by tests and
+    /// by the inspector to assert that releases actually drop entries.
+    pub fn remote_objects(&self) -> &RemoteObjectRegistry {
+        &self.remote_objects
     }
 
     /// Add a context to this session's registry and emit `created` if enabled.
@@ -405,6 +509,8 @@ impl CdpDispatcher {
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
             "Runtime.callFunctionOn" => self.runtime_call_function_on(&req.params),
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
+            "Runtime.releaseObject" => self.runtime_release_object(&req.params),
+            "Runtime.releaseObjectGroup" => self.runtime_release_object_group(&req.params),
 
             // ── Debugger ──────────────────────────────────────────────────
             "Debugger.enable" => {
@@ -470,6 +576,10 @@ impl CdpDispatcher {
                 ));
             }
         };
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let bytecodes =
             parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
@@ -481,9 +591,12 @@ impl CdpDispatcher {
         );
         let js_result = Interpreter::run(&mut frame)?;
 
-        Ok(json!({
-            "result": js_value_to_remote_object(&js_result)
-        }))
+        let remote = js_value_to_remote_object(
+            &js_result,
+            &mut self.remote_objects,
+            object_group.as_deref(),
+        );
+        Ok(json!({ "result": remote }))
     }
 
     // ── Runtime.callFunctionOn ───────────────────────────────────────────────
@@ -498,6 +611,10 @@ impl CdpDispatcher {
                 ));
             }
         };
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         // Build a call expression: wrap the declaration and invoke it with
         // any supplied arguments serialised as literals.
@@ -529,31 +646,92 @@ impl CdpDispatcher {
         );
         let js_result = Interpreter::run(&mut frame)?;
 
-        Ok(json!({
-            "result": js_value_to_remote_object(&js_result)
-        }))
+        let remote = js_value_to_remote_object(
+            &js_result,
+            &mut self.remote_objects,
+            object_group.as_deref(),
+        );
+        Ok(json!({ "result": remote }))
     }
 
     // ── Runtime.getProperties ────────────────────────────────────────────────
 
-    fn runtime_get_properties(&self, _params: &Value) -> StatorResult<Value> {
-        let globals = self.globals.borrow();
-        let descriptors: Vec<Value> = globals
-            .vars
-            .iter()
-            .map(|(name, value)| {
-                json!({
-                    "name": name,
-                    "value": js_value_to_remote_object(value),
-                    "writable": true,
-                    "configurable": true,
-                    "enumerable": true,
-                    "isOwn": true,
-                })
-            })
-            .collect();
+    fn runtime_get_properties(&mut self, params: &Value) -> StatorResult<Value> {
+        let object_id = match params.get("objectId").and_then(Value::as_str) {
+            Some(s) => s,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.getProperties: required parameter 'objectId' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        let own_properties = params
+            .get("ownProperties")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        let value = match self.remote_objects.get(object_id) {
+            Some(v) => v,
+            None => {
+                return Err(crate::error::StatorError::Internal(format!(
+                    "Runtime.getProperties: unknown or released objectId `{object_id}`"
+                )));
+            }
+        };
+
+        // Preview helper: register child values under the same group so
+        // they share the parent's lifetime in releaseObjectGroup.
+        let parent_group = self.remote_objects.group_of(object_id).map(str::to_string);
+
+        let descriptors = build_property_descriptors(
+            &value,
+            own_properties,
+            &mut self.remote_objects,
+            parent_group.as_deref(),
+        );
 
         Ok(json!({ "result": descriptors }))
+    }
+
+    // ── Runtime.releaseObject ────────────────────────────────────────────────
+
+    fn runtime_release_object(&mut self, params: &Value) -> StatorResult<Value> {
+        let object_id = match params.get("objectId").and_then(Value::as_str) {
+            Some(s) => s,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.releaseObject: required parameter 'objectId' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        if !self.remote_objects.release(object_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Runtime.releaseObject: unknown or already-released objectId `{object_id}`"
+            )));
+        }
+        Ok(json!({}))
+    }
+
+    // ── Runtime.releaseObjectGroup ───────────────────────────────────────────
+
+    fn runtime_release_object_group(&mut self, params: &Value) -> StatorResult<Value> {
+        let group = match params.get("objectGroup").and_then(Value::as_str) {
+            Some(g) => g,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.releaseObjectGroup: required parameter 'objectGroup' is missing or \
+                     not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        // Releasing an unknown group is a no-op per V8 inspector semantics.
+        let _released = self.remote_objects.release_group(group);
+        Ok(json!({}))
     }
 
     // ── Debugger.setPauseOnExceptions ────────────────────────────────────────
@@ -749,8 +927,20 @@ impl CdpSession {
     }
 }
 
-/// Convert a [`JsValue`] to a CDP `Runtime.RemoteObject` description.
-fn js_value_to_remote_object(value: &JsValue) -> Value {
+/// Convert a [`JsValue`] to a CDP `Runtime.RemoteObject` description,
+/// registering non-primitive values in `registry` under `object_group` so
+/// that follow-up `Runtime.getProperties` / `Runtime.releaseObject` calls
+/// can resolve them.
+///
+/// Primitive variants never allocate an `objectId`; heap variants always
+/// do.  Unsupported / opaque heap variants are described by class name with
+/// no fabricated properties, so later `getProperties` returns an empty
+/// own-property list.
+fn js_value_to_remote_object(
+    value: &JsValue,
+    registry: &mut RemoteObjectRegistry,
+    object_group: Option<&str>,
+) -> Value {
     match value {
         JsValue::Undefined => json!({"type": "undefined"}),
         JsValue::Null => json!({"type": "object", "subtype": "null", "value": Value::Null}),
@@ -774,14 +964,270 @@ fn js_value_to_remote_object(value: &JsValue) -> Value {
         JsValue::String(s) => {
             json!({"type": "string", "value": &**s})
         }
-        _ => {
-            // Complex objects / functions: return a generic description.
-            let desc = value
-                .to_js_string()
-                .unwrap_or_else(|_| "[object Object]".to_string());
-            json!({"type": "object", "description": desc})
+        JsValue::BigInt(b) => {
+            // BigInt is a primitive: report value as the canonical literal
+            // form, no objectId minted.
+            json!({"type": "bigint", "description": format!("{}n", **b), "unserializableValue": format!("{}n", **b)})
         }
+        JsValue::Symbol(id) => {
+            let group = object_group.map(str::to_string);
+            let oid = registry.register(value.clone(), group);
+            json!({
+                "type": "symbol",
+                "description": format!("Symbol({id})"),
+                "objectId": oid,
+            })
+        }
+        JsValue::TheHole => {
+            // Internal sentinel; never user-visible. Report as undefined so
+            // DevTools does not render a special placeholder.
+            json!({"type": "undefined"})
+        }
+        _ => non_primitive_remote_object(value, registry, object_group),
     }
+}
+
+/// Mint a RemoteObject payload for a heap-backed [`JsValue`].
+fn non_primitive_remote_object(
+    value: &JsValue,
+    registry: &mut RemoteObjectRegistry,
+    object_group: Option<&str>,
+) -> Value {
+    let (kind, subtype, class_name, description) = describe_heap_value(value);
+    let group = object_group.map(str::to_string);
+    let object_id = registry.register(value.clone(), group);
+    let mut payload = json!({
+        "type": kind,
+        "className": class_name,
+        "description": description,
+        "objectId": object_id,
+    });
+    if let Some(sub) = subtype {
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("subtype".to_string(), Value::String(sub.to_string()));
+    }
+    payload
+}
+
+/// Return CDP `(type, subtype, className, description)` for `value`.
+///
+/// `description` is a best-effort short label used by DevTools when no
+/// preview is available; the project documents in
+/// `docs/edge_diagnostics.md` that this is not a structured preview yet.
+fn describe_heap_value(value: &JsValue) -> (&'static str, Option<&'static str>, String, String) {
+    match value {
+        JsValue::Array(arr) => {
+            let len = arr.borrow().len();
+            (
+                "object",
+                Some("array"),
+                "Array".to_string(),
+                format!("Array({len})"),
+            )
+        }
+        JsValue::Function(bc) => {
+            let name = bc.function_name();
+            let label = if name.is_empty() {
+                "function () { … }".to_string()
+            } else {
+                format!("function {name}() {{ … }}")
+            };
+            ("function", None, "Function".to_string(), label)
+        }
+        JsValue::NativeFunction(_) => (
+            "function",
+            None,
+            "Function".to_string(),
+            "function () { [native code] }".to_string(),
+        ),
+        JsValue::PlainObject(map) => {
+            let count = map.borrow().len();
+            (
+                "object",
+                None,
+                "Object".to_string(),
+                format!("Object({count} props)"),
+            )
+        }
+        JsValue::Error(err) => (
+            "object",
+            Some("error"),
+            "Error".to_string(),
+            format!("{err:?}"),
+        ),
+        JsValue::Promise(_) => (
+            "object",
+            Some("promise"),
+            "Promise".to_string(),
+            "[object Promise]".to_string(),
+        ),
+        JsValue::Proxy(_) => (
+            "object",
+            Some("proxy"),
+            "Proxy".to_string(),
+            "[object Proxy]".to_string(),
+        ),
+        JsValue::ArrayBuffer(_) => (
+            "object",
+            Some("arraybuffer"),
+            "ArrayBuffer".to_string(),
+            "[object ArrayBuffer]".to_string(),
+        ),
+        JsValue::TypedArray(_) => (
+            "object",
+            Some("typedarray"),
+            "TypedArray".to_string(),
+            "[object TypedArray]".to_string(),
+        ),
+        JsValue::DataView(_) => (
+            "object",
+            Some("dataview"),
+            "DataView".to_string(),
+            "[object DataView]".to_string(),
+        ),
+        JsValue::Generator(_) => (
+            "object",
+            Some("generator"),
+            "Generator".to_string(),
+            "[object Generator]".to_string(),
+        ),
+        JsValue::Iterator(_) => (
+            "object",
+            Some("iterator"),
+            "Iterator".to_string(),
+            "[object Iterator]".to_string(),
+        ),
+        JsValue::ModuleBinding(_) => (
+            "object",
+            None,
+            "Module".to_string(),
+            "[module binding]".to_string(),
+        ),
+        JsValue::Context(_) => (
+            "object",
+            None,
+            "Context".to_string(),
+            "[internal context]".to_string(),
+        ),
+        JsValue::Object(_) => (
+            "object",
+            None,
+            "Object".to_string(),
+            "[object Object]".to_string(),
+        ),
+        // Primitive variants never reach this helper.
+        _ => (
+            "object",
+            None,
+            "Object".to_string(),
+            value
+                .to_js_string()
+                .unwrap_or_else(|_| "[object Object]".to_string()),
+        ),
+    }
+}
+
+/// Build the `result[]` array returned by `Runtime.getProperties` for
+/// `value`.  Children registered for nested `RemoteObject`s share the
+/// parent's `objectGroup` so that releasing the group cascades.
+///
+/// Unsupported / opaque variants return an empty descriptor list rather
+/// than fabricating properties; this matches the conservative default
+/// documented in `docs/edge_diagnostics.md`.
+fn build_property_descriptors(
+    value: &JsValue,
+    own_properties: bool,
+    registry: &mut RemoteObjectRegistry,
+    object_group: Option<&str>,
+) -> Vec<Value> {
+    let mut descriptors: Vec<Value> = Vec::new();
+    match value {
+        JsValue::PlainObject(map_ref) => {
+            // Clone keys/values out of the borrow before re-entering the
+            // registry; this avoids RefCell reentrancy when child values
+            // happen to alias the parent map.
+            let entries: Vec<(String, JsValue, crate::objects::map::PropertyAttributes)> = map_ref
+                .borrow()
+                .iter_with_attrs()
+                .map(|(k, v, a)| (k.to_string(), v.clone(), a))
+                .collect();
+            for (key, child, attrs) in entries {
+                let remote = js_value_to_remote_object(&child, registry, object_group);
+                descriptors.push(json!({
+                    "name": key,
+                    "value": remote,
+                    "writable": attrs.contains(crate::objects::map::PropertyAttributes::WRITABLE),
+                    "configurable": attrs.contains(crate::objects::map::PropertyAttributes::CONFIGURABLE),
+                    "enumerable": attrs.contains(crate::objects::map::PropertyAttributes::ENUMERABLE),
+                    "isOwn": true,
+                }));
+            }
+        }
+        JsValue::Array(arr_ref) => {
+            let items: Vec<JsValue> = arr_ref.borrow().clone();
+            let len = items.len();
+            for (idx, item) in items.into_iter().enumerate() {
+                let remote = js_value_to_remote_object(&item, registry, object_group);
+                descriptors.push(json!({
+                    "name": idx.to_string(),
+                    "value": remote,
+                    "writable": true,
+                    "configurable": true,
+                    "enumerable": true,
+                    "isOwn": true,
+                }));
+            }
+            // Non-enumerable `length` property mirrors ECMA-262 semantics.
+            descriptors.push(json!({
+                "name": "length",
+                "value": {
+                    "type": "number",
+                    "value": len,
+                    "description": len.to_string(),
+                },
+                "writable": true,
+                "configurable": false,
+                "enumerable": false,
+                "isOwn": true,
+            }));
+        }
+        JsValue::Function(bc) => {
+            let length = bc.function_length();
+            let name = bc.function_name().to_string();
+            // Synthetic `length` and `name` mirror the standard own
+            // properties of every Function object.
+            descriptors.push(json!({
+                "name": "length",
+                "value": {
+                    "type": "number",
+                    "value": length,
+                    "description": length.to_string(),
+                },
+                "writable": false,
+                "configurable": true,
+                "enumerable": false,
+                "isOwn": true,
+            }));
+            descriptors.push(json!({
+                "name": "name",
+                "value": {"type": "string", "value": name},
+                "writable": false,
+                "configurable": true,
+                "enumerable": false,
+                "isOwn": true,
+            }));
+        }
+        // Opaque / unsupported classes: return an empty own-property list
+        // rather than fabricating descriptors.  `own_properties=false` is
+        // accepted but currently never produces inherited descriptors
+        // because Stator does not expose a per-object prototype chain to
+        // the inspector.
+        _ => {}
+    }
+    let _ = own_properties;
+    descriptors
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1133,11 +1579,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cdp_runtime_get_properties_empty() {
+    fn test_cdp_runtime_get_properties_unknown_object_id_errors() {
         let (handle, mut ws, _port) = start_server();
 
         ws.send(Message::Text(
-            r#"{"id":11,"method":"Runtime.getProperties","params":{"objectId":"1"}}"#.into(),
+            r#"{"id":11,"method":"Runtime.getProperties","params":{"objectId":"does-not-exist"}}"#
+                .into(),
         ))
         .expect("send");
 
@@ -1152,7 +1599,16 @@ mod tests {
         .expect("parse reply");
 
         assert_eq!(json["id"], 11u64);
-        assert!(json["result"]["result"].is_array());
+        let err = json["error"]
+            .as_object()
+            .expect("getProperties on unknown id must return a structured error");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("does-not-exist"),
+            "error message should name the stale id"
+        );
     }
 
     #[test]
@@ -1341,5 +1797,400 @@ mod tests {
             json.get("error").is_some(),
             "should have error for missing param"
         );
+    }
+
+    // ── RemoteObject registry tests (in-process, no WebSocket) ──────────────
+
+    fn dispatch(d: &mut CdpDispatcher, json_text: &str) -> Value {
+        let before = d.pending_count();
+        assert_eq!(d.dispatch_json(json_text), DispatchOutcome::Ok);
+        // The most recent reply is the last pushed message.
+        let mut last = None;
+        while d.pending_count() > before {
+            last = d.take_next();
+        }
+        serde_json::from_str(&last.expect("response was queued")).expect("valid JSON")
+    }
+
+    #[test]
+    fn remote_object_registry_mints_unique_monotonic_ids() {
+        let mut reg = RemoteObjectRegistry::new();
+        let a = reg.register(JsValue::Boolean(true), None);
+        let b = reg.register(JsValue::Smi(7), Some("g".into()));
+        let c = reg.register(JsValue::Null, None);
+        assert_eq!(a, "1");
+        assert_eq!(b, "2");
+        assert_eq!(c, "3");
+        assert_eq!(reg.len(), 3);
+        assert!(reg.get("1").is_some());
+        assert!(reg.get("99").is_none());
+        assert_eq!(reg.group_of("2"), Some("g"));
+        assert_eq!(reg.group_of("1"), None);
+    }
+
+    #[test]
+    fn remote_object_release_drops_only_target_id() {
+        let mut reg = RemoteObjectRegistry::new();
+        let a = reg.register(JsValue::Smi(1), None);
+        let b = reg.register(JsValue::Smi(2), None);
+        assert!(reg.release(&a));
+        assert!(!reg.release(&a), "double release returns false");
+        assert!(reg.get(&a).is_none());
+        assert!(reg.get(&b).is_some());
+    }
+
+    #[test]
+    fn remote_object_release_group_drops_matching_entries_only() {
+        let mut reg = RemoteObjectRegistry::new();
+        let _x = reg.register(JsValue::Smi(1), Some("evalA".into()));
+        let _y = reg.register(JsValue::Smi(2), Some("evalA".into()));
+        let z = reg.register(JsValue::Smi(3), Some("evalB".into()));
+        let keep = reg.register(JsValue::Smi(4), None);
+        assert_eq!(reg.release_group("evalA"), 2);
+        assert!(reg.get(&z).is_some());
+        assert!(reg.get(&keep).is_some());
+        assert_eq!(reg.release_group("nonexistent"), 0);
+    }
+
+    fn fresh_dispatcher() -> CdpDispatcher {
+        CdpDispatcher::with_globals(Rc::new(RefCell::new(GlobalEnv::new())))
+    }
+
+    #[test]
+    fn evaluate_primitive_does_not_mint_object_id() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"42"}}"#,
+        );
+        assert_eq!(resp["result"]["result"]["type"], "number");
+        assert_eq!(resp["result"]["result"]["value"], 42);
+        assert!(resp["result"]["result"].get("objectId").is_none());
+        assert_eq!(d.remote_objects().len(), 0);
+    }
+
+    #[test]
+    fn evaluate_object_mints_object_id_under_group() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({a:1,b:2})","objectGroup":"console"}}"#,
+        );
+        let oid = resp["result"]["result"]["objectId"]
+            .as_str()
+            .expect("objectId present")
+            .to_string();
+        assert_eq!(resp["result"]["result"]["type"], "object");
+        assert_eq!(resp["result"]["result"]["className"], "Object");
+        assert_eq!(d.remote_objects().len(), 1);
+        assert_eq!(d.remote_objects().group_of(&oid), Some("console"));
+    }
+
+    #[test]
+    fn evaluate_object_id_is_stable_across_get_properties_calls() {
+        let mut d = fresh_dispatcher();
+        let r1 = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({x:10})"}}"#,
+        );
+        let oid = r1["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let p1 = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let p2 = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        // Both calls succeed against the same id.
+        assert!(p1["result"]["result"].is_array());
+        assert!(p2["result"]["result"].is_array());
+        let names1: Vec<&str> = p1["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        let names2: Vec<&str> = p2["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names1, names2);
+        assert!(names1.contains(&"x"));
+    }
+
+    #[test]
+    fn get_properties_plain_object_returns_descriptors_with_attrs() {
+        let mut d = fresh_dispatcher();
+        let r = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({foo:1, bar:'hi'})"}}"#,
+        );
+        let oid = r["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let p = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let arr = p["result"]["result"].as_array().expect("array");
+        let by_name: std::collections::HashMap<&str, &Value> = arr
+            .iter()
+            .map(|d| (d["name"].as_str().unwrap(), d))
+            .collect();
+        let foo = by_name.get("foo").expect("foo prop");
+        assert_eq!(foo["value"]["type"], "number");
+        assert_eq!(foo["value"]["value"], 1);
+        assert_eq!(foo["isOwn"], true);
+        assert_eq!(foo["enumerable"], true);
+        assert_eq!(foo["writable"], true);
+        let bar = by_name.get("bar").expect("bar prop");
+        assert_eq!(bar["value"]["type"], "string");
+        assert_eq!(bar["value"]["value"], "hi");
+    }
+
+    #[test]
+    fn get_properties_array_returns_indexed_props_and_length() {
+        let mut d = fresh_dispatcher();
+        let r = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"[10, 20, 30]"}}"#,
+        );
+        let oid = r["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(r["result"]["result"]["subtype"], "array");
+        let p = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let arr = p["result"]["result"].as_array().unwrap();
+        let names: Vec<&str> = arr.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["0", "1", "2", "length"]);
+        let length_desc = arr.iter().find(|d| d["name"] == "length").unwrap();
+        assert_eq!(length_desc["enumerable"], false);
+        assert_eq!(length_desc["configurable"], false);
+        assert_eq!(length_desc["value"]["value"], 3);
+    }
+
+    #[test]
+    fn get_properties_function_returns_length_and_name() {
+        let mut d = fresh_dispatcher();
+        let r = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"(function add(a,b){return a+b})"}}"#,
+        );
+        assert_eq!(r["result"]["result"]["type"], "function");
+        let oid = r["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let p = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let arr = p["result"]["result"].as_array().unwrap();
+        let by_name: std::collections::HashMap<&str, &Value> = arr
+            .iter()
+            .map(|d| (d["name"].as_str().unwrap(), d))
+            .collect();
+        let length = by_name.get("length").expect("length own prop");
+        assert_eq!(length["value"]["type"], "number");
+        let name = by_name.get("name").expect("name own prop");
+        assert_eq!(name["value"]["type"], "string");
+        assert_eq!(name["value"]["value"], "add");
+        assert_eq!(name["writable"], false);
+    }
+
+    #[test]
+    fn release_object_then_get_properties_fails_closed() {
+        let mut d = fresh_dispatcher();
+        let r = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({k:1})"}}"#,
+        );
+        let oid = r["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let rel = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.releaseObject","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        assert!(rel.get("error").is_none(), "release should succeed");
+        assert_eq!(d.remote_objects().len(), 0);
+
+        let p = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let err = p["error"]
+            .as_object()
+            .expect("must fail closed on released id");
+        assert!(err["message"].as_str().unwrap().contains(&oid));
+    }
+
+    #[test]
+    fn release_object_double_release_returns_error() {
+        let mut d = fresh_dispatcher();
+        let r = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({})"}}"#,
+        );
+        let oid = r["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ok = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.releaseObject","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        let again = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.releaseObject","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        assert!(again.get("error").is_some(), "double release must error");
+    }
+
+    #[test]
+    fn release_object_group_drops_all_matching_entries() {
+        let mut d = fresh_dispatcher();
+        let _r1 = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({a:1})","objectGroup":"gA"}}"#,
+        );
+        let _r2 = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"[1,2,3]","objectGroup":"gA"}}"#,
+        );
+        let r3 = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"({z:9})","objectGroup":"gB"}}"#,
+        );
+        let oid_b = r3["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(d.remote_objects().len(), 3);
+
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Runtime.releaseObjectGroup","params":{"objectGroup":"gA"}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.remote_objects().len(), 1);
+        assert!(d.remote_objects().get(&oid_b).is_some());
+
+        // Releasing an unknown group is a no-op success.
+        let noop = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Runtime.releaseObjectGroup","params":{"objectGroup":"unknown"}}"#,
+        );
+        assert!(noop.get("error").is_none());
+    }
+
+    #[test]
+    fn get_properties_missing_object_id_param_errors() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.getProperties","params":{}}"#,
+        );
+        assert!(resp["error"].as_object().is_some());
+    }
+
+    #[test]
+    fn release_object_missing_param_errors() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.releaseObject","params":{}}"#,
+        );
+        assert!(resp["error"].as_object().is_some());
+    }
+
+    #[test]
+    fn release_object_group_missing_param_errors() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.releaseObjectGroup","params":{}}"#,
+        );
+        assert!(resp["error"].as_object().is_some());
+    }
+
+    #[test]
+    fn remote_object_ids_are_isolated_between_dispatchers() {
+        // Two dispatchers (i.e. two sessions) share no registry: an
+        // objectId minted in one must not resolve in the other.
+        let mut da = fresh_dispatcher();
+        let mut db = fresh_dispatcher();
+        let ra = dispatch(
+            &mut da,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({a:1})"}}"#,
+        );
+        let oid = ra["result"]["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cross = dispatch(
+            &mut db,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#
+            ),
+        );
+        assert!(
+            cross["error"].as_object().is_some(),
+            "objectId from dispatcher A must not resolve in dispatcher B"
+        );
+    }
+
+    #[test]
+    fn dispatcher_drop_releases_registry() {
+        // The registry is owned by the dispatcher; dropping the dispatcher
+        // drops every registered value with no further bookkeeping.
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({k:1})"}}"#,
+        );
+        assert_eq!(d.remote_objects().len(), 1);
+        drop(d);
+        // No assertion beyond "did not leak"; this test exists to document
+        // the teardown contract and to ensure no panic on drop.
+    }
+
+    #[test]
+    fn no_session_means_no_remote_object_entries() {
+        // A bare dispatcher with no dispatched messages must have an empty
+        // registry; nothing else is implicitly registered.
+        let d = fresh_dispatcher();
+        assert!(d.remote_objects().is_empty());
     }
 }

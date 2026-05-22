@@ -3,7 +3,8 @@
 //! This module contains [`cdp`], a minimal WebSocket server that implements
 //! enough of the Chrome DevTools Protocol to support:
 //!
-//! - **Runtime**: `enable`, `evaluate`, `callFunctionOn`, `getProperties`
+//! - **Runtime**: `enable`, `evaluate`, `callFunctionOn`, `getProperties`,
+//!   `releaseObject`, `releaseObjectGroup`
 //! - **Debugger**: `enable`, `setPauseOnExceptions`, `setBreakpointByUrl`,
 //!   `resume`
 //! - **Console**: `enable`, `disable` (with buffered `messageAdded` events)
