@@ -1086,7 +1086,7 @@ pub(super) fn set_pending_exception(val: JsValue) {
 }
 
 /// Take the pending thrown [`JsValue`], if any.
-pub(super) fn take_pending_exception() -> Option<JsValue> {
+pub(crate) fn take_pending_exception() -> Option<JsValue> {
     PENDING_EXCEPTION.with(|p| p.borrow_mut().take())
 }
 

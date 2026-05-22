@@ -60,7 +60,7 @@ cascades.
   bump — it does not introduce additional GC strong roots beyond the entry
   itself.
 
-### `Runtime.getProperties` coverage
+### `Runtime.getProperties` and preview coverage
 
 Stator's `Runtime.getProperties` returns own properties for the following
 shapes:
@@ -70,16 +70,45 @@ shapes:
 | `PlainObject`     | Every entry in insertion order with the engine's `writable` / `enumerable` / `configurable` attributes |
 | `Array`           | Indexed elements `0..n` followed by a non-enumerable, non-configurable `length` |
 | `Function`        | Synthetic `length` (parameter count) and `name`           |
-| Other heap classes (Promise, Proxy, ArrayBuffer, TypedArray, DataView, Generator, Iterator, Error, NativeFunction, ModuleBinding, raw `Object`, `Context`) | Empty own-property list — DevTools renders the `className`/`description` from the RemoteObject payload |
+| `Error`           | No lazy own properties yet; preview exposes derived `name` / `message` |
+| Other heap classes (Promise, Proxy, ArrayBuffer, TypedArray, DataView, Generator, Iterator, NativeFunction, ModuleBinding, raw `Object`, `Context`) | Empty own-property list — DevTools renders the `className`/`description` from the RemoteObject payload |
 
-The inspector does not yet emit structured `preview` / `customPreview`
-objects; the `description` field provides a short label only. DevTools
-falls back to lazy `Runtime.getProperties` calls for full inspection.
+When `Runtime.evaluate` or `Runtime.callFunctionOn` receives
+`generatePreview: true`, Stator emits CDP `preview` objects for
+`PlainObject`, `Array`, `Function`, and `Error` results/exceptions. Previews
+are intentionally shallow: at most five properties are included, nested
+object previews stop after one level, and unsupported host/native values do
+not fabricate preview data. `customPreview` is not emitted.
+
+### `Runtime.ExceptionDetails` coverage
+
+`Runtime.evaluate` and `Runtime.callFunctionOn` surface parse/compile/runtime
+failures as successful CDP replies containing `exceptionDetails` plus an
+`undefined` result, matching DevTools' expected Runtime shape. Details use
+per-session monotonically increasing `exceptionId` values, include the
+requested `executionContextId`, report `lineNumber` / `columnNumber` as `0`
+unless source locations are available, and carry `url` when the request
+supplies `sourceURL` or a trailing `//# sourceURL=` comment.
+
+For uncaught JavaScript `throw` completions, the original thrown `JsValue` is
+also exposed as `exception` with the same RemoteObject/preview rules and
+object-group lifetime as normal results. Engine/parser errors that do not
+have a thrown JavaScript value omit `exception` rather than inventing one.
+Error stack strings are exposed as `stackTrace.description`; call frames are
+included only from the currently captured JavaScript call stack.
+
+Runtime-enabled sessions receive `Runtime.exceptionThrown` before the
+corresponding response. Sessions that have not sent `Runtime.enable` still
+receive `exceptionDetails` in the response but no event is queued. Stator has
+no exception-clearing lifecycle today, so `Runtime.exceptionRevoked` is not
+emitted.
 
 ### CDP method coverage
 
 | Method                       | Behaviour                                          |
 |------------------------------|---------------------------------------------------|
+| `Runtime.evaluate`           | Returns `result`; failures return `exceptionDetails`. |
+| `Runtime.callFunctionOn`     | Returns `result`; failures return `exceptionDetails`. |
 | `Runtime.getProperties`      | Required `objectId`. Unknown/stale ID → error.    |
 | `Runtime.releaseObject`      | Required `objectId`. Unknown/stale ID → error.    |
 | `Runtime.releaseObjectGroup` | Required `objectGroup`. Unknown group → no-op OK. |

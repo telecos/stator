@@ -55,11 +55,11 @@ use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, accept};
 
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
-use crate::error::StatorResult;
+use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::drain_messages;
 use crate::inspector::heap_snapshot::HeapSnapshotBuilder;
 use crate::inspector::profiler::CpuProfiler;
-use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
+use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
 use crate::objects::value::JsValue;
 use crate::parser;
 
@@ -318,6 +318,8 @@ pub struct CdpDispatcher {
     next_breakpoint_id: u32,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
+    /// Monotonically increasing ID for `Runtime.ExceptionDetails`.
+    next_exception_id: u32,
     /// FIFO queue of serialised JSON-RPC messages waiting to be drained by
     /// the transport (or by an embedder via the in-process inspector API).
     outbox: VecDeque<String>,
@@ -349,6 +351,7 @@ impl CdpDispatcher {
             debugger_enabled: false,
             next_breakpoint_id: 1,
             remote_objects: RemoteObjectRegistry::new(),
+            next_exception_id: 1,
             outbox: VecDeque::new(),
         }
     }
@@ -580,21 +583,56 @@ impl CdpDispatcher {
             .get("objectGroup")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let generate_preview = params
+            .get("generatePreview")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let execution_context_id = self.resolve_execution_context_id(params)?;
+        let source_url = exception_source_url(params, expression);
 
         let bytecodes =
-            parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
+            match parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p)) {
+                Ok(bytecodes) => bytecodes,
+                Err(err) => {
+                    return Ok(self.exception_response(
+                        &err,
+                        ExceptionRequest {
+                            expression,
+                            source_url: source_url.as_deref(),
+                            execution_context_id,
+                            object_group: object_group.as_deref(),
+                            generate_preview,
+                        },
+                    ));
+                }
+            };
 
         let mut frame = InterpreterFrame::new_with_globals(
             Rc::new(bytecodes),
             vec![],
             Rc::clone(&self.globals),
         );
-        let js_result = Interpreter::run(&mut frame)?;
+        let js_result = match Interpreter::run(&mut frame) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(self.exception_response(
+                    &err,
+                    ExceptionRequest {
+                        expression,
+                        source_url: source_url.as_deref(),
+                        execution_context_id,
+                        object_group: object_group.as_deref(),
+                        generate_preview,
+                    },
+                ));
+            }
+        };
 
         let remote = js_value_to_remote_object(
             &js_result,
             &mut self.remote_objects,
             object_group.as_deref(),
+            generate_preview,
         );
         Ok(json!({ "result": remote }))
     }
@@ -615,6 +653,11 @@ impl CdpDispatcher {
             .get("objectGroup")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let generate_preview = params
+            .get("generatePreview")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let execution_context_id = self.resolve_execution_context_id(params)?;
 
         // Build a call expression: wrap the declaration and invoke it with
         // any supplied arguments serialised as literals.
@@ -636,22 +679,123 @@ impl CdpDispatcher {
             .unwrap_or_default();
 
         let expression = format!("({declaration})({args})");
+        let source_url = exception_source_url(params, &expression);
         let bytecodes =
-            parser::parse(&expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
+            match parser::parse(&expression).and_then(|p| BytecodeGenerator::compile_program(&p)) {
+                Ok(bytecodes) => bytecodes,
+                Err(err) => {
+                    return Ok(self.exception_response(
+                        &err,
+                        ExceptionRequest {
+                            expression: &expression,
+                            source_url: source_url.as_deref(),
+                            execution_context_id,
+                            object_group: object_group.as_deref(),
+                            generate_preview,
+                        },
+                    ));
+                }
+            };
 
         let mut frame = InterpreterFrame::new_with_globals(
             Rc::new(bytecodes),
             vec![],
             Rc::clone(&self.globals),
         );
-        let js_result = Interpreter::run(&mut frame)?;
+        let js_result = match Interpreter::run(&mut frame) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(self.exception_response(
+                    &err,
+                    ExceptionRequest {
+                        expression: &expression,
+                        source_url: source_url.as_deref(),
+                        execution_context_id,
+                        object_group: object_group.as_deref(),
+                        generate_preview,
+                    },
+                ));
+            }
+        };
 
         let remote = js_value_to_remote_object(
             &js_result,
             &mut self.remote_objects,
             object_group.as_deref(),
+            generate_preview,
         );
         Ok(json!({ "result": remote }))
+    }
+
+    fn resolve_execution_context_id(&self, params: &Value) -> StatorResult<u32> {
+        match params.get("contextId").and_then(Value::as_u64) {
+            Some(id) if self.contexts.iter().any(|ctx| ctx.id == id as u32) => Ok(id as u32),
+            Some(id) => Err(StatorError::Internal(format!(
+                "Runtime: unknown execution context id `{id}`"
+            ))),
+            None => Ok(self.contexts.first().map(|ctx| ctx.id).unwrap_or(1)),
+        }
+    }
+
+    fn exception_response(&mut self, err: &StatorError, request: ExceptionRequest<'_>) -> Value {
+        let exception_id = self.next_exception_id;
+        self.next_exception_id = self.next_exception_id.saturating_add(1);
+        let thrown = take_pending_exception();
+        let details = self.build_exception_details(exception_id, err, request, thrown.as_ref());
+        if self.runtime_enabled {
+            self.push_event(
+                "Runtime.exceptionThrown",
+                json!({
+                    "timestamp": 0.0,
+                    "exceptionDetails": details.clone(),
+                }),
+            );
+        }
+        json!({
+            "result": {"type": "undefined"},
+            "exceptionDetails": details,
+        })
+    }
+
+    fn build_exception_details(
+        &mut self,
+        exception_id: u32,
+        err: &StatorError,
+        request: ExceptionRequest<'_>,
+        thrown: Option<&JsValue>,
+    ) -> Value {
+        let mut details = json!({
+            "exceptionId": exception_id,
+            "text": exception_text(err, thrown),
+            "lineNumber": request_line_number(request.expression),
+            "columnNumber": 0,
+            "executionContextId": request.execution_context_id,
+        });
+        if let Some(url) = request.source_url {
+            details
+                .as_object_mut()
+                .expect("details is an object")
+                .insert("url".to_string(), Value::String(url.to_string()));
+        }
+        if let Some(value) = thrown {
+            let exception = js_value_to_remote_object(
+                value,
+                &mut self.remote_objects,
+                request.object_group,
+                request.generate_preview,
+            );
+            details
+                .as_object_mut()
+                .expect("details is an object")
+                .insert("exception".to_string(), exception);
+        }
+        if let Some(stack_trace) = stack_trace_from_thrown(thrown) {
+            details
+                .as_object_mut()
+                .expect("details is an object")
+                .insert("stackTrace".to_string(), stack_trace);
+        }
+        details
     }
 
     // ── Runtime.getProperties ────────────────────────────────────────────────
@@ -927,6 +1071,67 @@ impl CdpSession {
     }
 }
 
+const MAX_PREVIEW_PROPERTIES: usize = 5;
+const MAX_PREVIEW_DEPTH: usize = 1;
+
+struct ExceptionRequest<'a> {
+    expression: &'a str,
+    source_url: Option<&'a str>,
+    execution_context_id: u32,
+    object_group: Option<&'a str>,
+    generate_preview: bool,
+}
+
+fn exception_source_url(params: &Value, expression: &str) -> Option<String> {
+    if let Some(url) = params.get("sourceURL").and_then(Value::as_str) {
+        return Some(url.to_string());
+    }
+    expression.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("//# sourceURL=")
+            .or_else(|| trimmed.strip_prefix("//@ sourceURL="))
+            .map(str::to_string)
+    })
+}
+
+fn request_line_number(expression: &str) -> u32 {
+    expression
+        .lines()
+        .position(|line| !line.trim().is_empty())
+        .unwrap_or(0) as u32
+}
+
+fn exception_text(err: &StatorError, thrown: Option<&JsValue>) -> String {
+    match thrown {
+        Some(JsValue::Error(error)) => error.to_error_string(),
+        Some(value) => value.to_display_string(),
+        None => err.to_string(),
+    }
+}
+
+fn stack_trace_from_thrown(thrown: Option<&JsValue>) -> Option<Value> {
+    let JsValue::Error(error) = thrown? else {
+        return None;
+    };
+    let stack = error.stack();
+    let mut lines = stack.lines();
+    let description = lines.next().unwrap_or_default().to_string();
+    let call_frames: Vec<Value> = lines
+        .filter_map(|line| line.trim().strip_prefix("at "))
+        .map(|function_name| {
+            json!({
+                "functionName": function_name,
+                "scriptId": "0",
+                "url": "",
+                "lineNumber": 0,
+                "columnNumber": 0,
+            })
+        })
+        .collect();
+    Some(json!({ "description": description, "callFrames": call_frames }))
+}
+
 /// Convert a [`JsValue`] to a CDP `Runtime.RemoteObject` description,
 /// registering non-primitive values in `registry` under `object_group` so
 /// that follow-up `Runtime.getProperties` / `Runtime.releaseObject` calls
@@ -940,6 +1145,7 @@ fn js_value_to_remote_object(
     value: &JsValue,
     registry: &mut RemoteObjectRegistry,
     object_group: Option<&str>,
+    generate_preview: bool,
 ) -> Value {
     match value {
         JsValue::Undefined => json!({"type": "undefined"}),
@@ -983,7 +1189,7 @@ fn js_value_to_remote_object(
             // DevTools does not render a special placeholder.
             json!({"type": "undefined"})
         }
-        _ => non_primitive_remote_object(value, registry, object_group),
+        _ => non_primitive_remote_object(value, registry, object_group, generate_preview),
     }
 }
 
@@ -992,6 +1198,7 @@ fn non_primitive_remote_object(
     value: &JsValue,
     registry: &mut RemoteObjectRegistry,
     object_group: Option<&str>,
+    generate_preview: bool,
 ) -> Value {
     let (kind, subtype, class_name, description) = describe_heap_value(value);
     let group = object_group.map(str::to_string);
@@ -1008,14 +1215,19 @@ fn non_primitive_remote_object(
             .expect("payload is an object")
             .insert("subtype".to_string(), Value::String(sub.to_string()));
     }
+    if generate_preview && let Some(preview) = build_object_preview(value, 0) {
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("preview".to_string(), preview);
+    }
     payload
 }
 
 /// Return CDP `(type, subtype, className, description)` for `value`.
 ///
-/// `description` is a best-effort short label used by DevTools when no
-/// preview is available; the project documents in
-/// `docs/edge_diagnostics.md` that this is not a structured preview yet.
+/// `description` is a best-effort short label used by DevTools when a
+/// structured preview is not requested or not available.
 fn describe_heap_value(value: &JsValue) -> (&'static str, Option<&'static str>, String, String) {
     match value {
         JsValue::Array(arr) => {
@@ -1055,7 +1267,7 @@ fn describe_heap_value(value: &JsValue) -> (&'static str, Option<&'static str>, 
             "object",
             Some("error"),
             "Error".to_string(),
-            format!("{err:?}"),
+            err.to_error_string(),
         ),
         JsValue::Promise(_) => (
             "object",
@@ -1129,6 +1341,160 @@ fn describe_heap_value(value: &JsValue) -> (&'static str, Option<&'static str>, 
     }
 }
 
+fn build_object_preview(value: &JsValue, depth: usize) -> Option<Value> {
+    let (kind, subtype, _class_name, description) = describe_heap_value(value);
+    let (properties, overflow) = match value {
+        JsValue::PlainObject(map_ref) => {
+            let entries: Vec<(String, JsValue)> = map_ref
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            let overflow = entries.len() > MAX_PREVIEW_PROPERTIES;
+            let properties = entries
+                .into_iter()
+                .take(MAX_PREVIEW_PROPERTIES)
+                .map(|(name, child)| build_property_preview(name, &child, depth))
+                .collect();
+            (properties, overflow)
+        }
+        JsValue::Array(arr_ref) => {
+            let items: Vec<JsValue> = arr_ref.borrow().clone();
+            let overflow = items.len() > MAX_PREVIEW_PROPERTIES;
+            let properties = items
+                .into_iter()
+                .enumerate()
+                .take(MAX_PREVIEW_PROPERTIES)
+                .map(|(idx, child)| build_property_preview(idx.to_string(), &child, depth))
+                .collect();
+            (properties, overflow)
+        }
+        JsValue::Function(bc) => {
+            let properties = vec![
+                json!({
+                    "name": "length",
+                    "type": "number",
+                    "value": bc.function_length().to_string(),
+                }),
+                json!({
+                    "name": "name",
+                    "type": "string",
+                    "value": bc.function_name(),
+                }),
+            ];
+            (properties, false)
+        }
+        JsValue::Error(err) => {
+            let properties = vec![
+                json!({
+                    "name": "name",
+                    "type": "string",
+                    "value": err.name(),
+                }),
+                json!({
+                    "name": "message",
+                    "type": "string",
+                    "value": err.message(),
+                }),
+            ];
+            (properties, false)
+        }
+        _ => return None,
+    };
+
+    let mut preview = json!({
+        "type": kind,
+        "description": description,
+        "overflow": overflow,
+        "properties": properties,
+    });
+    if let Some(subtype) = subtype {
+        preview
+            .as_object_mut()
+            .expect("preview is an object")
+            .insert("subtype".to_string(), Value::String(subtype.to_string()));
+    }
+    Some(preview)
+}
+
+fn build_property_preview(name: String, value: &JsValue, depth: usize) -> Value {
+    let mut property = json!({
+        "name": name,
+        "type": preview_type(value),
+    });
+    if let Some(subtype) = preview_subtype(value) {
+        property
+            .as_object_mut()
+            .expect("property preview is an object")
+            .insert("subtype".to_string(), Value::String(subtype.to_string()));
+    }
+    if let Some(value_text) = preview_value(value) {
+        property
+            .as_object_mut()
+            .expect("property preview is an object")
+            .insert("value".to_string(), Value::String(value_text));
+    } else if depth < MAX_PREVIEW_DEPTH
+        && let Some(value_preview) = build_object_preview(value, depth + 1)
+    {
+        property
+            .as_object_mut()
+            .expect("property preview is an object")
+            .insert("valuePreview".to_string(), value_preview);
+    }
+    property
+}
+
+fn preview_type(value: &JsValue) -> &'static str {
+    match value {
+        JsValue::Undefined | JsValue::TheHole => "undefined",
+        JsValue::Null => "object",
+        JsValue::Boolean(_) => "boolean",
+        JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+        JsValue::String(_) => "string",
+        JsValue::BigInt(_) => "bigint",
+        JsValue::Symbol(_) => "symbol",
+        JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
+        _ => "object",
+    }
+}
+
+fn preview_subtype(value: &JsValue) -> Option<&'static str> {
+    match value {
+        JsValue::Null => Some("null"),
+        JsValue::Array(_) => Some("array"),
+        JsValue::Error(_) => Some("error"),
+        JsValue::Promise(_) => Some("promise"),
+        JsValue::Proxy(_) => Some("proxy"),
+        JsValue::ArrayBuffer(_) => Some("arraybuffer"),
+        JsValue::TypedArray(_) => Some("typedarray"),
+        JsValue::DataView(_) => Some("dataview"),
+        JsValue::Generator(_) => Some("generator"),
+        JsValue::Iterator(_) => Some("iterator"),
+        _ => None,
+    }
+}
+
+fn preview_value(value: &JsValue) -> Option<String> {
+    match value {
+        JsValue::Undefined | JsValue::TheHole => Some("undefined".to_string()),
+        JsValue::Null => Some("null".to_string()),
+        JsValue::Boolean(b) => Some(b.to_string()),
+        JsValue::Smi(n) => Some(n.to_string()),
+        JsValue::HeapNumber(n) => Some(n.to_string()),
+        JsValue::String(s) => Some(s.to_string()),
+        JsValue::BigInt(n) => Some(format!("{}n", **n)),
+        JsValue::Symbol(id) => Some(format!("Symbol({id})")),
+        JsValue::Function(bc) => Some(if bc.function_name().is_empty() {
+            "function () { … }".to_string()
+        } else {
+            format!("function {}() {{ … }}", bc.function_name())
+        }),
+        JsValue::NativeFunction(_) => Some("function () { [native code] }".to_string()),
+        JsValue::Error(err) => Some(err.to_error_string()),
+        _ => None,
+    }
+}
+
 /// Build the `result[]` array returned by `Runtime.getProperties` for
 /// `value`.  Children registered for nested `RemoteObject`s share the
 /// parent's `objectGroup` so that releasing the group cascades.
@@ -1154,7 +1520,7 @@ fn build_property_descriptors(
                 .map(|(k, v, a)| (k.to_string(), v.clone(), a))
                 .collect();
             for (key, child, attrs) in entries {
-                let remote = js_value_to_remote_object(&child, registry, object_group);
+                let remote = js_value_to_remote_object(&child, registry, object_group, false);
                 descriptors.push(json!({
                     "name": key,
                     "value": remote,
@@ -1169,7 +1535,7 @@ fn build_property_descriptors(
             let items: Vec<JsValue> = arr_ref.borrow().clone();
             let len = items.len();
             for (idx, item) in items.into_iter().enumerate() {
-                let remote = js_value_to_remote_object(&item, registry, object_group);
+                let remote = js_value_to_remote_object(&item, registry, object_group, false);
                 descriptors.push(json!({
                     "name": idx.to_string(),
                     "value": remote,
@@ -1549,7 +1915,10 @@ mod tests {
         .expect("parse reply");
 
         assert_eq!(json["id"], 8u64);
-        assert!(json.get("error").is_some(), "should have error");
+        assert!(
+            json["result"]["exceptionDetails"].is_object(),
+            "syntax failures should have Runtime.ExceptionDetails"
+        );
     }
 
     // ── New domain tests ─────────────────────────────────────────────────────
@@ -1812,6 +2181,17 @@ mod tests {
         serde_json::from_str(&last.expect("response was queued")).expect("valid JSON")
     }
 
+    fn dispatch_all(d: &mut CdpDispatcher, json_text: &str) -> Vec<Value> {
+        let before = d.pending_count();
+        assert_eq!(d.dispatch_json(json_text), DispatchOutcome::Ok);
+        let mut messages = Vec::new();
+        while d.pending_count() > before {
+            let message = d.take_next().expect("message was queued");
+            messages.push(serde_json::from_str(&message).expect("valid JSON"));
+        }
+        messages
+    }
+
     #[test]
     fn remote_object_registry_mints_unique_monotonic_ids() {
         let mut reg = RemoteObjectRegistry::new();
@@ -1884,6 +2264,150 @@ mod tests {
         assert_eq!(resp["result"]["result"]["className"], "Object");
         assert_eq!(d.remote_objects().len(), 1);
         assert_eq!(d.remote_objects().group_of(&oid), Some("console"));
+    }
+
+    #[test]
+    fn evaluate_thrown_error_returns_exception_details_and_event() {
+        let mut d = fresh_dispatcher();
+        let _enable = dispatch_all(&mut d, r#"{"id":0,"method":"Runtime.enable","params":{}}"#);
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"throw new Error('boom')","generatePreview":true,"sourceURL":"stator://eval.js"}}"#,
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["method"], "Runtime.exceptionThrown");
+        assert_eq!(messages[1]["id"], 1);
+        let details = &messages[1]["result"]["exceptionDetails"];
+        assert_eq!(details["exceptionId"], 1);
+        assert_eq!(details["url"], "stator://eval.js");
+        assert_eq!(details["executionContextId"], 1);
+        assert_eq!(details["exception"]["subtype"], "error");
+        assert_eq!(details["exception"]["preview"]["subtype"], "error");
+        assert!(details["text"].as_str().unwrap().contains("boom"));
+        assert_eq!(
+            messages[0]["params"]["exceptionDetails"]["exceptionId"],
+            details["exceptionId"]
+        );
+    }
+
+    #[test]
+    fn evaluate_thrown_primitive_returns_exception_details_without_handle() {
+        let mut d = fresh_dispatcher();
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"throw 7"}}"#,
+        );
+        assert_eq!(messages.len(), 1, "Runtime disabled means no event");
+        let details = &messages[0]["result"]["exceptionDetails"];
+        assert_eq!(details["exceptionId"], 1);
+        assert_eq!(details["text"], "7");
+        assert_eq!(details["exception"]["type"], "number");
+        assert!(details["exception"].get("objectId").is_none());
+    }
+
+    #[test]
+    fn evaluate_thrown_object_returns_remote_exception_handle() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"throw {name:'CustomError', message:'boom'}","generatePreview":true}}"#,
+        );
+        let details = &resp["result"]["exceptionDetails"];
+        assert_eq!(details["exception"]["type"], "object");
+        assert!(details["exception"]["objectId"].as_str().is_some());
+        assert_eq!(
+            details["exception"]["preview"]["properties"][0]["name"],
+            "name"
+        );
+    }
+
+    #[test]
+    fn call_function_on_throw_returns_exception_details() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.callFunctionOn","params":{"functionDeclaration":"function(){throw new TypeError('bad call')}"}}"#,
+        );
+        let details = &resp["result"]["exceptionDetails"];
+        assert_eq!(details["exceptionId"], 1);
+        assert!(details["text"].as_str().unwrap().contains("bad call"));
+        assert_eq!(details["exception"]["subtype"], "error");
+    }
+
+    #[test]
+    fn evaluate_syntax_error_returns_exception_details_without_remote_exception() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"var ="}}"#,
+        );
+        let details = &resp["result"]["exceptionDetails"];
+        assert_eq!(details["exceptionId"], 1);
+        assert!(details["text"].as_str().unwrap().contains("SyntaxError"));
+        assert!(details.get("exception").is_none());
+    }
+
+    #[test]
+    fn exception_details_respect_requested_context_id() {
+        let contexts = vec![
+            default_execution_context(),
+            ExecutionContextDescription::new(2, 1, "stator", "secondary", json!({})),
+        ];
+        let mut d = CdpDispatcher::with_globals_and_contexts(
+            Rc::new(RefCell::new(GlobalEnv::new())),
+            contexts,
+        );
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"contextId":2,"expression":"throw 'ctx2'"}}"#,
+        );
+        assert_eq!(resp["result"]["exceptionDetails"]["executionContextId"], 2);
+    }
+
+    #[test]
+    fn object_preview_plain_object_array_and_function() {
+        let mut d = fresh_dispatcher();
+        let object = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({a:1,b:'x'})","generatePreview":true}}"#,
+        );
+        assert_eq!(object["result"]["result"]["preview"]["type"], "object");
+        assert_eq!(
+            object["result"]["result"]["preview"]["properties"][0]["name"],
+            "a"
+        );
+
+        let array = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"[10,20]","generatePreview":true}}"#,
+        );
+        assert_eq!(array["result"]["result"]["preview"]["subtype"], "array");
+        assert_eq!(
+            array["result"]["result"]["preview"]["properties"][1]["value"],
+            "20"
+        );
+
+        let function = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"(function named(a,b){return a})","generatePreview":true}}"#,
+        );
+        assert_eq!(function["result"]["result"]["preview"]["type"], "function");
+        assert_eq!(
+            function["result"]["result"]["preview"]["properties"][1]["value"],
+            "named"
+        );
+    }
+
+    #[test]
+    fn object_preview_truncates_after_limit() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({a:1,b:2,c:3,d:4,e:5,f:6})","generatePreview":true}}"#,
+        );
+        let preview = &resp["result"]["result"]["preview"];
+        assert_eq!(preview["overflow"], true);
+        assert_eq!(preview["properties"].as_array().unwrap().len(), 5);
     }
 
     #[test]
