@@ -16,6 +16,7 @@
 //! | `Runtime`      | `evaluate`                | Parses and executes JavaScript; returns result |
 //! | `Runtime`      | `callFunctionOn`          | Evaluates a function call expression |
 //! | `Runtime`      | `getProperties`           | Lists own properties of a previously-minted `RemoteObject` |
+//! | `Runtime`      | `queryObjects`            | Finds reachable objects with the requested prototype |
 //! | `Runtime`      | `releaseObject`           | Drops one `RemoteObject` from the per-session registry |
 //! | `Runtime`      | `releaseObjectGroup`      | Drops every `RemoteObject` tagged with a given group |
 //! | `Runtime`      | `compileScript`           | Compiles and optionally persists a script for later `runScript` |
@@ -646,6 +647,7 @@ impl CdpDispatcher {
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
             "Runtime.callFunctionOn" => self.runtime_call_function_on(&req.params),
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
+            "Runtime.queryObjects" => self.runtime_query_objects(&req.params),
             "Runtime.releaseObject" => self.runtime_release_object(&req.params),
             "Runtime.releaseObjectGroup" => self.runtime_release_object_group(&req.params),
             "Runtime.compileScript" => self.runtime_compile_script(&req.params),
@@ -773,6 +775,55 @@ impl CdpDispatcher {
             "usedSize": used_size,
             "totalSize": used_size,
         }))
+    }
+
+    fn runtime_query_objects(&mut self, params: &Value) -> StatorResult<Value> {
+        let prototype_object_id = match params.get("prototypeObjectId").and_then(Value::as_str) {
+            Some(id) => id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.queryObjects: required parameter 'prototypeObjectId' is missing or \
+                     not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        let prototype = self
+            .remote_objects
+            .get(prototype_object_id)
+            .ok_or_else(|| {
+                crate::error::StatorError::Internal(format!(
+                    "Runtime.queryObjects: unknown or released prototypeObjectId \
+                     `{prototype_object_id}`"
+                ))
+            })?;
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let mut roots: Vec<JsValue> = self.globals.borrow().vars.values().cloned().collect();
+        roots.extend(
+            self.remote_objects
+                .entries
+                .values()
+                .map(|entry| entry.value.clone()),
+        );
+
+        let mut seen = HashSet::new();
+        let mut matches = Vec::new();
+        for root in roots {
+            collect_objects_with_prototype(&root, &prototype, &mut seen, &mut matches);
+        }
+
+        let objects = JsValue::Array(Rc::new(RefCell::new(matches)));
+        let remote = js_value_to_remote_object(
+            &objects,
+            &mut self.remote_objects,
+            object_group.as_deref(),
+            false,
+        );
+        Ok(json!({ "objects": remote }))
     }
 
     fn runtime_add_binding(&mut self, params: &Value) -> StatorResult<Value> {
@@ -1623,6 +1674,69 @@ fn schema_get_domains() -> Value {
             { "name": "Schema", "version": "1.3" }
         ]
     })
+}
+
+fn collect_objects_with_prototype(
+    value: &JsValue,
+    prototype: &JsValue,
+    seen: &mut HashSet<usize>,
+    matches: &mut Vec<JsValue>,
+) {
+    match value {
+        JsValue::PlainObject(map_ref) => {
+            let id = Rc::as_ptr(map_ref) as usize;
+            if !seen.insert(id) {
+                return;
+            }
+            let entries: Vec<JsValue> = map_ref.borrow().iter().map(|(_, v)| v.clone()).collect();
+            if !same_heap_identity(value, prototype) && direct_prototype_is(value, prototype) {
+                matches.push(value.clone());
+            }
+            for child in entries {
+                collect_objects_with_prototype(&child, prototype, seen, matches);
+            }
+        }
+        JsValue::Array(array_ref) => {
+            let id = Rc::as_ptr(array_ref) as usize;
+            if !seen.insert(id) {
+                return;
+            }
+            let entries = array_ref.borrow().clone();
+            for child in entries {
+                collect_objects_with_prototype(&child, prototype, seen, matches);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn direct_prototype_is(value: &JsValue, prototype: &JsValue) -> bool {
+    let JsValue::PlainObject(map_ref) = value else {
+        return false;
+    };
+    map_ref
+        .borrow()
+        .get("__proto__")
+        .is_some_and(|proto| same_heap_identity(proto, prototype))
+}
+
+fn same_heap_identity(left: &JsValue, right: &JsValue) -> bool {
+    match (left, right) {
+        (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
+        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Generator(a), JsValue::Generator(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Iterator(a), JsValue::Iterator(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
+        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Context(a), JsValue::Context(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Proxy(a), JsValue::Proxy(b)) => Rc::ptr_eq(a, b),
+        (JsValue::ArrayBuffer(a), JsValue::ArrayBuffer(b)) => Rc::ptr_eq(a, b),
+        (JsValue::TypedArray(a), JsValue::TypedArray(b)) => Rc::ptr_eq(a, b),
+        (JsValue::DataView(a), JsValue::DataView(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
 }
 
 fn unsupported_debugger_method(method: &str, detail: &str) -> StatorError {
@@ -2919,6 +3033,49 @@ mod tests {
         let total = resp["result"]["totalSize"].as_u64().expect("total size");
         assert!(used > 0);
         assert!(total >= used);
+    }
+
+    #[test]
+    fn runtime_query_objects_returns_reachable_matching_prototypes() {
+        let mut d = fresh_dispatcher();
+        let proto = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"var proto = {marker: true}; var a = Object.create(proto); var b = Object.create(proto); var c = {}; proto","objectGroup":"query"}}"#,
+        );
+        let proto_id = proto["result"]["result"]["objectId"].as_str().unwrap();
+        let query = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.queryObjects","params":{{"prototypeObjectId":"{proto_id}","objectGroup":"query"}}}}"#
+            ),
+        );
+        let objects_id = query["result"]["objects"]["objectId"].as_str().unwrap();
+        let props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.getProperties","params":{{"objectId":"{objects_id}","ownProperties":true}}}}"#
+            ),
+        );
+        let entries = props["result"]["result"].as_array().unwrap();
+        let indexed_count = entries
+            .iter()
+            .filter(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_some_and(|name| name.chars().all(|ch| ch.is_ascii_digit()))
+            })
+            .count();
+        assert_eq!(indexed_count, 2);
+    }
+
+    #[test]
+    fn runtime_query_objects_unknown_prototype_errors() {
+        let mut d = fresh_dispatcher();
+        let query = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.queryObjects","params":{"prototypeObjectId":"missing"}}"#,
+        );
+        assert!(query["error"].is_object());
     }
 
     #[test]
