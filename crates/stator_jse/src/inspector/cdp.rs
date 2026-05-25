@@ -363,6 +363,8 @@ pub struct CdpDispatcher {
     script_sources: HashMap<String, String>,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
+    /// CDP breakpoint IDs returned by `Debugger.setBreakpointByUrl`.
+    cdp_breakpoints: HashSet<String>,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
     /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
@@ -428,6 +430,7 @@ impl CdpDispatcher {
             target_session_id: None,
             script_sources: HashMap::new(),
             next_breakpoint_id: 1,
+            cdp_breakpoints: HashSet::new(),
             remote_objects: RemoteObjectRegistry::new(),
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
@@ -823,6 +826,7 @@ impl CdpDispatcher {
             }
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
+            "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
             "Debugger.resume" => self.debugger_resume(),
             "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
@@ -1592,6 +1596,7 @@ impl CdpDispatcher {
             self.next_breakpoint_id, line_number, column_number
         );
         self.next_breakpoint_id += 1;
+        self.cdp_breakpoints.insert(bp_id.clone());
 
         Ok(json!({
             "breakpointId": bp_id,
@@ -1601,6 +1606,25 @@ impl CdpDispatcher {
                 "columnNumber": column_number,
             }]
         }))
+    }
+
+    fn debugger_remove_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
+        let breakpoint_id = match params.get("breakpointId").and_then(Value::as_str) {
+            Some(breakpoint_id) => breakpoint_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Debugger.removeBreakpoint: required parameter 'breakpointId' is missing or \
+                     not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        if !self.cdp_breakpoints.remove(breakpoint_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.removeBreakpoint: unknown breakpointId `{breakpoint_id}`"
+            )));
+        }
+        Ok(json!({}))
     }
 
     fn debugger_get_script_source(&mut self, params: &Value) -> StatorResult<Value> {
@@ -3630,6 +3654,40 @@ mod tests {
         assert_eq!(json["id"], 13u64);
         assert!(json["result"]["breakpointId"].is_string());
         assert!(json["result"]["locations"].is_array());
+    }
+
+    #[test]
+    fn debugger_remove_breakpoint_removes_known_cdp_breakpoint() {
+        let mut d = fresh_dispatcher();
+        let set = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"lineNumber":5,"columnNumber":0}}"#,
+        );
+        let breakpoint_id = set["result"]["breakpointId"].as_str().unwrap();
+        assert!(d.cdp_breakpoints.contains(breakpoint_id));
+
+        let remove = dispatch(
+            &mut d,
+            &json!({
+                "id": 2,
+                "method": "Debugger.removeBreakpoint",
+                "params": { "breakpointId": breakpoint_id }
+            })
+            .to_string(),
+        );
+        assert!(remove.get("error").is_none());
+        assert!(!d.cdp_breakpoints.contains(breakpoint_id));
+
+        let again = dispatch(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Debugger.removeBreakpoint",
+                "params": { "breakpointId": breakpoint_id }
+            })
+            .to_string(),
+        );
+        assert!(again["error"].is_object());
     }
 
     #[test]
