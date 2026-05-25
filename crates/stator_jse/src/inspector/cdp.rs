@@ -40,6 +40,7 @@
 //! | `Console`      | `enable`                  | Flushes buffered messages as events |
 //! | `Console`      | `disable`                 | Acknowledges                       |
 //! | `Profiler`     | `enable`                  | Acknowledges                       |
+//! | `Profiler`     | `setSamplingInterval`     | Sets interval for the next profile |
 //! | `Profiler`     | `start`                   | Starts CPU profiling               |
 //! | `Profiler`     | `stop`                    | Stops profiling; returns profile    |
 //! | `HeapProfiler` | `enable`                  | Acknowledges                       |
@@ -342,6 +343,7 @@ pub enum DispatchOutcome {
 pub struct CdpDispatcher {
     globals: Rc<RefCell<GlobalEnv>>,
     profiler: CpuProfiler,
+    profiler_sampling_interval_micros: u64,
     /// CDP-visible execution contexts currently known to this session.
     contexts: Vec<ExecutionContextDescription>,
     /// Whether the `Runtime` domain is currently enabled for this session.
@@ -400,6 +402,7 @@ impl CdpDispatcher {
         Self {
             globals,
             profiler: CpuProfiler::new(),
+            profiler_sampling_interval_micros: 1_000,
             contexts,
             runtime_enabled: false,
             console_enabled: false,
@@ -711,6 +714,7 @@ impl CdpDispatcher {
 
             // ── Profiler ──────────────────────────────────────────────────
             "Profiler.enable" => Ok(json!({})),
+            "Profiler.setSamplingInterval" => self.profiler_set_sampling_interval(&req.params),
             "Profiler.start" => self.profiler_start(&req.params),
             "Profiler.stop" => self.profiler_stop(),
 
@@ -1466,14 +1470,22 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
-    // ── Profiler.start ───────────────────────────────────────────────────────
+    // ── Profiler.setSamplingInterval / Profiler.start ───────────────────────
+
+    fn profiler_set_sampling_interval(&mut self, params: &Value) -> StatorResult<Value> {
+        let interval = sampling_interval_param(params, "Profiler.setSamplingInterval")?;
+        self.profiler_sampling_interval_micros = interval;
+        Ok(json!({}))
+    }
 
     fn profiler_start(&mut self, params: &Value) -> StatorResult<Value> {
-        // Optional `samplingInterval` parameter in microseconds (default 1 ms).
-        let interval_micros = params
-            .get("samplingInterval")
-            .and_then(Value::as_u64)
-            .unwrap_or(1_000);
+        // Non-standard compatibility: still honour a direct start parameter if
+        // one is supplied, otherwise use Profiler.setSamplingInterval state.
+        let interval_micros = if params.get("samplingInterval").is_some() {
+            sampling_interval_param(params, "Profiler.start")?
+        } else {
+            self.profiler_sampling_interval_micros
+        };
         self.profiler.start(interval_micros)?;
         Ok(json!({}))
     }
@@ -1736,6 +1748,18 @@ fn same_heap_identity(left: &JsValue, right: &JsValue) -> bool {
         (JsValue::TypedArray(a), JsValue::TypedArray(b)) => Rc::ptr_eq(a, b),
         (JsValue::DataView(a), JsValue::DataView(b)) => Rc::ptr_eq(a, b),
         _ => false,
+    }
+}
+
+fn sampling_interval_param(params: &Value, method: &str) -> StatorResult<u64> {
+    match params.get("samplingInterval").and_then(Value::as_u64) {
+        Some(0) => Err(crate::error::StatorError::TypeError(format!(
+            "{method}: samplingInterval must be greater than zero"
+        ))),
+        Some(interval) => Ok(interval),
+        None => Err(crate::error::StatorError::TypeError(format!(
+            "{method}: required parameter 'samplingInterval' is missing or not a number"
+        ))),
     }
 }
 
@@ -2529,6 +2553,28 @@ mod tests {
 
         assert_eq!(json["id"], 5u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn profiler_set_sampling_interval_updates_next_start_interval() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.setSamplingInterval","params":{"samplingInterval":2500}}"#,
+        );
+        assert!(resp.get("error").is_none());
+        assert_eq!(d.profiler_sampling_interval_micros, 2_500);
+    }
+
+    #[test]
+    fn profiler_set_sampling_interval_rejects_zero() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.setSamplingInterval","params":{"samplingInterval":0}}"#,
+        );
+        assert!(resp["error"].is_object());
+        assert_eq!(d.profiler_sampling_interval_micros, 1_000);
     }
 
     #[test]
