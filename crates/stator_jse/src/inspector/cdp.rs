@@ -63,7 +63,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
 
@@ -2325,6 +2325,8 @@ fn build_property_descriptors(
 // Server
 // ─────────────────────────────────────────────────────────────────────────────
 
+const DEFAULT_TARGET_ID: &str = "stator-1";
+
 /// A CDP WebSocket server bound to a local TCP address.
 ///
 /// Call [`CdpServer::accept_one`] to accept and serve a single connection to
@@ -2360,8 +2362,7 @@ impl CdpServer {
     /// messages, and the connection is closed.
     pub fn accept_one(&self) -> io::Result<()> {
         let (stream, _peer) = self.listener.accept()?;
-        let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
-        CdpSession::new(ws).run()
+        self.serve_stream(stream)
     }
 
     /// Accept and serve connections in a loop, blocking the calling thread.
@@ -2372,15 +2373,124 @@ impl CdpServer {
     pub fn accept_loop(&self) -> io::Result<()> {
         for stream in self.listener.incoming() {
             let stream = stream?;
-            let ws = match accept(stream) {
-                Ok(ws) => ws,
-                Err(_) => continue,
-            };
             // Ignore per-session errors; move on to the next connection.
-            let _ = CdpSession::new(ws).run();
+            let _ = self.serve_stream(stream);
         }
         Ok(())
     }
+
+    fn serve_stream(&self, stream: TcpStream) -> io::Result<()> {
+        if is_websocket_upgrade(&stream)? {
+            let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
+            return CdpSession::new(ws).run();
+        }
+        serve_http_discovery(stream, self.local_addr()?)
+    }
+}
+
+fn is_websocket_upgrade(stream: &TcpStream) -> io::Result<bool> {
+    let mut buf = [0u8; 1024];
+    let len = stream.peek(&mut buf)?;
+    let request = String::from_utf8_lossy(&buf[..len]).to_ascii_lowercase();
+    Ok(request.contains("upgrade: websocket"))
+}
+
+fn serve_http_discovery(mut stream: TcpStream, local_addr: std::net::SocketAddr) -> io::Result<()> {
+    let mut request = Vec::with_capacity(1024);
+    let mut buf = [0u8; 512];
+    loop {
+        let len = stream.read(&mut buf)?;
+        if len == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..len]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let ws_url = format!("ws://{local_addr}/devtools/page/{DEFAULT_TARGET_ID}");
+    let (status, content_type, body) = discovery_response(path, &ws_url);
+    write_http_response(&mut stream, status, content_type, &body)
+}
+
+fn discovery_response(
+    path: &str,
+    web_socket_debugger_url: &str,
+) -> (&'static str, &'static str, String) {
+    match path {
+        "/json/version" => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            json!({
+                "Browser": "Stator",
+                "Protocol-Version": "1.3",
+                "V8-Version": "stator",
+                "WebKit-Version": "stator",
+                "webSocketDebuggerUrl": web_socket_debugger_url,
+            })
+            .to_string(),
+        ),
+        "/json" | "/json/list" => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            Value::Array(vec![discovery_target(web_socket_debugger_url)]).to_string(),
+        ),
+        "/json/protocol" => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            schema_get_domains().to_string(),
+        ),
+        "/json/new" => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            discovery_target(web_socket_debugger_url).to_string(),
+        ),
+        path if path == format!("/json/activate/{DEFAULT_TARGET_ID}") => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            json!({ "result": true }).to_string(),
+        ),
+        path if path == format!("/json/close/{DEFAULT_TARGET_ID}") => (
+            "200 OK",
+            "application/json; charset=UTF-8",
+            json!({ "result": true }).to_string(),
+        ),
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=UTF-8",
+            "Not Found".to_string(),
+        ),
+    }
+}
+
+fn discovery_target(web_socket_debugger_url: &str) -> Value {
+    json!({
+        "id": DEFAULT_TARGET_ID,
+        "type": "page",
+        "title": "Stator",
+        "description": "Stator JavaScript inspector target",
+        "url": "stator://inspector",
+        "webSocketDebuggerUrl": web_socket_debugger_url,
+    })
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2389,6 +2499,7 @@ impl CdpServer {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;
@@ -2416,6 +2527,23 @@ mod tests {
         let (ws, _resp) = connect(url).expect("connect");
 
         (handle, ws, port)
+    }
+
+    fn http_get(path: &str) -> (thread::JoinHandle<io::Result<()>>, String) {
+        let server = CdpServer::bind("127.0.0.1:0").expect("bind");
+        let port = server.local_addr().expect("local_addr").port();
+        let handle = thread::spawn(move || server.accept_one());
+        thread::sleep(Duration::from_millis(20));
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        (handle, response)
     }
 
     #[test]
@@ -2507,6 +2635,51 @@ mod tests {
         })
         .expect("parse ack");
         assert_eq!(ack["id"], 3u64);
+    }
+
+    #[test]
+    fn test_cdp_http_json_version() {
+        let (handle, response) = http_get("/json/version");
+        handle.join().expect("thread panic").expect("server ok");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).expect("body");
+        let json: Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(json["Browser"], "Stator");
+        assert_eq!(json["Protocol-Version"], "1.3");
+        assert!(
+            json["webSocketDebuggerUrl"]
+                .as_str()
+                .unwrap()
+                .contains("/devtools/page/stator-1")
+        );
+    }
+
+    #[test]
+    fn test_cdp_http_json_list() {
+        let (handle, response) = http_get("/json/list");
+        handle.join().expect("thread panic").expect("server ok");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).expect("body");
+        let targets: Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(targets[0]["id"], "stator-1");
+        assert_eq!(targets[0]["type"], "page");
+        assert!(
+            targets[0]["webSocketDebuggerUrl"]
+                .as_str()
+                .unwrap()
+                .contains("/devtools/page/stator-1")
+        );
+    }
+
+    #[test]
+    fn test_cdp_http_json_protocol() {
+        let (handle, response) = http_get("/json/protocol");
+        handle.join().expect("thread panic").expect("server ok");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).expect("body");
+        let json: Value = serde_json::from_str(body).expect("json body");
+        let domains = json["domains"].as_array().expect("domains");
+        assert!(domains.iter().any(|domain| domain["name"] == "Runtime"));
     }
 
     #[test]
