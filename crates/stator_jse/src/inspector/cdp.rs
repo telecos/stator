@@ -18,6 +18,11 @@
 //! | `Runtime`      | `getProperties`           | Lists own properties of a previously-minted `RemoteObject` |
 //! | `Runtime`      | `releaseObject`           | Drops one `RemoteObject` from the per-session registry |
 //! | `Runtime`      | `releaseObjectGroup`      | Drops every `RemoteObject` tagged with a given group |
+//! | `Runtime`      | `runIfWaitingForDebugger` | Acknowledges DevTools startup handshake |
+//! | `Runtime`      | `discardConsoleEntries`   | Clears buffered console messages |
+//! | `Runtime`      | `globalLexicalScopeNames` | Reports current global binding names |
+//! | `Runtime`      | `getIsolateId`            | Reports a stable Stator isolate identifier |
+//! | `Runtime`      | `getHeapUsage`            | Reports reachable heap-size estimates |
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
 //! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state (typed error on invalid `state`) |
@@ -39,6 +44,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Network`      | `enable`                  | Acknowledges (stub)                |
 //! | `Network`      | `disable`                 | Acknowledges (stub)                |
+//! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
 //!
@@ -610,6 +616,13 @@ impl CdpDispatcher {
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
             "Runtime.releaseObject" => self.runtime_release_object(&req.params),
             "Runtime.releaseObjectGroup" => self.runtime_release_object_group(&req.params),
+            "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
+            "Runtime.discardConsoleEntries" => self.runtime_discard_console_entries(),
+            "Runtime.globalLexicalScopeNames" => {
+                self.runtime_global_lexical_scope_names(&req.params)
+            }
+            "Runtime.getIsolateId" => Ok(json!({ "id": "stator-isolate-0" })),
+            "Runtime.getHeapUsage" => self.runtime_get_heap_usage(),
 
             // ── Debugger ──────────────────────────────────────────────────
             "Debugger.enable" => {
@@ -673,6 +686,9 @@ impl CdpDispatcher {
             "Network.enable" => Ok(json!({})),
             "Network.disable" => Ok(json!({})),
 
+            // ── Schema ────────────────────────────────────────────────────
+            "Schema.getDomains" => Ok(schema_get_domains()),
+
             // ── Unknown ───────────────────────────────────────────────────
             other => Err(crate::error::StatorError::Internal(format!(
                 "CDP method not implemented: {other}"
@@ -690,6 +706,37 @@ impl CdpDispatcher {
             self.emit_execution_context_created(&context);
         }
         Ok(json!({}))
+    }
+
+    // ── Runtime handshake/introspection helpers ──────────────────────────────
+
+    fn runtime_discard_console_entries(&mut self) -> StatorResult<Value> {
+        let _ = drain_messages();
+        Ok(json!({}))
+    }
+
+    fn runtime_global_lexical_scope_names(&self, params: &Value) -> StatorResult<Value> {
+        let _context_id = self.resolve_execution_context_id(params)?;
+        let mut names: Vec<String> = self.globals.borrow().vars.keys().cloned().collect();
+        names.sort();
+        Ok(json!({ "names": names }))
+    }
+
+    fn runtime_get_heap_usage(&self) -> StatorResult<Value> {
+        const NODE_FIELDS: usize = 5;
+        const SELF_SIZE_INDEX: usize = 3;
+
+        let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow().vars);
+        let used_size: u64 = snapshot
+            .nodes
+            .chunks(NODE_FIELDS)
+            .filter_map(|node| node.get(SELF_SIZE_INDEX))
+            .map(|size| u64::from(*size))
+            .sum();
+        Ok(json!({
+            "usedSize": used_size,
+            "totalSize": used_size,
+        }))
     }
 
     // ── Runtime.evaluate ─────────────────────────────────────────────────────
@@ -853,7 +900,11 @@ impl CdpDispatcher {
     }
 
     fn resolve_execution_context_id(&self, params: &Value) -> StatorResult<u32> {
-        match params.get("contextId").and_then(Value::as_u64) {
+        let requested_id = params
+            .get("contextId")
+            .or_else(|| params.get("executionContextId"))
+            .and_then(Value::as_u64);
+        match requested_id {
             Some(id) if self.contexts.iter().any(|ctx| ctx.id == id as u32) => Ok(id as u32),
             Some(id) => Err(StatorError::Internal(format!(
                 "Runtime: unknown execution context id `{id}`"
@@ -1317,6 +1368,20 @@ impl PauseOnExceptionsState {
     pub fn enabled(self) -> bool {
         !matches!(self, Self::None)
     }
+}
+
+fn schema_get_domains() -> Value {
+    json!({
+        "domains": [
+            { "name": "Runtime", "version": "1.3" },
+            { "name": "Debugger", "version": "1.3" },
+            { "name": "Console", "version": "1.3" },
+            { "name": "Profiler", "version": "1.3" },
+            { "name": "HeapProfiler", "version": "1.3" },
+            { "name": "Network", "version": "1.3" },
+            { "name": "Schema", "version": "1.3" }
+        ]
+    })
 }
 
 fn unsupported_debugger_method(method: &str, detail: &str) -> StatorError {
@@ -2515,6 +2580,104 @@ mod tests {
 
     fn fresh_dispatcher() -> CdpDispatcher {
         CdpDispatcher::with_globals(Rc::new(RefCell::new(GlobalEnv::new())))
+    }
+
+    #[test]
+    fn schema_get_domains_lists_supported_domains() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Schema.getDomains","params":{}}"#,
+        );
+        let names: Vec<_> = resp["result"]["domains"]
+            .as_array()
+            .expect("domains array")
+            .iter()
+            .filter_map(|domain| domain["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Runtime"));
+        assert!(names.contains(&"Debugger"));
+        assert!(names.contains(&"Schema"));
+    }
+
+    #[test]
+    fn runtime_handshake_compat_methods_ack() {
+        let mut d = fresh_dispatcher();
+        let run = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.runIfWaitingForDebugger","params":{}}"#,
+        );
+        assert!(run["result"].is_object());
+        assert!(run.get("error").is_none());
+
+        let isolate = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.getIsolateId","params":{}}"#,
+        );
+        assert_eq!(isolate["result"]["id"], "stator-isolate-0");
+    }
+
+    #[test]
+    fn runtime_discard_console_entries_clears_buffer() {
+        use crate::inspector::console::{ConsoleMessage, MessageLevel, push_console_message};
+
+        let _ = drain_messages();
+        push_console_message(ConsoleMessage {
+            level: MessageLevel::Log,
+            text: "discard me".to_string(),
+        });
+
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.discardConsoleEntries","params":{}}"#,
+        );
+        assert!(resp.get("error").is_none());
+        assert!(drain_messages().is_empty());
+    }
+
+    #[test]
+    fn runtime_global_lexical_scope_names_returns_sorted_globals() {
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        {
+            let mut env = globals.borrow_mut();
+            env.insert("zeta".to_string(), JsValue::Smi(1));
+            env.insert("alpha".to_string(), JsValue::Boolean(true));
+        }
+        let mut d = CdpDispatcher::with_globals(globals);
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.globalLexicalScopeNames","params":{}}"#,
+        );
+        assert_eq!(resp["result"]["names"], json!(["alpha", "zeta"]));
+    }
+
+    #[test]
+    fn runtime_global_lexical_scope_names_validates_context() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.globalLexicalScopeNames","params":{"executionContextId":99}}"#,
+        );
+        assert!(resp["error"].is_object(), "unknown context should error");
+    }
+
+    #[test]
+    fn runtime_get_heap_usage_reports_reachable_heap_estimate() {
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        globals.borrow_mut().insert(
+            "message".to_string(),
+            JsValue::String("hello inspector".to_string().into()),
+        );
+        let mut d = CdpDispatcher::with_globals(globals);
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.getHeapUsage","params":{}}"#,
+        );
+        let used = resp["result"]["usedSize"].as_u64().expect("used size");
+        let total = resp["result"]["totalSize"].as_u64().expect("total size");
+        assert!(used > 0);
+        assert!(total >= used);
     }
 
     #[test]
