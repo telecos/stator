@@ -5718,7 +5718,20 @@ struct ModuleCacheRecord {
     edge_cache_metadata: Vec<u8>,
 }
 
+struct ScriptCacheRecord {
+    source_hash: u64,
+    source_len: u64,
+    line_offset: i32,
+    column_offset: i32,
+    resource_name: Vec<u8>,
+    source_url: Vec<u8>,
+    origin_url: Vec<u8>,
+    source_map_url: Vec<u8>,
+    cache_policy: Vec<u8>,
+}
+
 const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
+const SCRIPT_CACHE_MAGIC: &[u8] = b"STATOR_SCRIPT_CACHE\0";
 /// Bumped when the on-disk cache layout (validation record or payload encoding)
 /// changes in any incompatible way. Older blobs are rejected with
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
@@ -5743,6 +5756,7 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// distinct from metadata/source/options mismatches which keep using
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
 const MODULE_CACHE_FORMAT_VERSION: u32 = 7;
+const SCRIPT_CACHE_FORMAT_VERSION: u32 = code_cache_key::SCRIPT_CACHE_FORMAT_VERSION;
 
 /// Byte offset, inside a serialized cache blob, at which the corruption
 /// checksum is written. Immediately follows the magic and format version
@@ -5751,6 +5765,8 @@ const MODULE_CACHE_FORMAT_VERSION: u32 = 7;
 const MODULE_CACHE_CHECKSUM_OFFSET: usize = MODULE_CACHE_MAGIC.len() + 4;
 /// Byte offset of the first byte covered by the integrity checksum.
 const MODULE_CACHE_CHECKSUM_END: usize = MODULE_CACHE_CHECKSUM_OFFSET + 8;
+const SCRIPT_CACHE_CHECKSUM_OFFSET: usize = SCRIPT_CACHE_MAGIC.len() + 4;
+const SCRIPT_CACHE_CHECKSUM_END: usize = SCRIPT_CACHE_CHECKSUM_OFFSET + 8;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
@@ -5879,6 +5895,30 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
     Some(out)
 }
 
+fn serialize_script_cache_record(record: &ScriptCacheRecord) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SCRIPT_CACHE_MAGIC);
+    push_u32(&mut out, SCRIPT_CACHE_FORMAT_VERSION);
+    push_u64(&mut out, 0);
+    debug_assert_eq!(out.len(), SCRIPT_CACHE_CHECKSUM_END);
+    if !push_bytes(&mut out, env!("CARGO_PKG_VERSION").as_bytes()) {
+        return None;
+    }
+    push_u64(&mut out, record.source_hash);
+    push_u64(&mut out, record.source_len);
+    push_i32(&mut out, record.line_offset);
+    push_i32(&mut out, record.column_offset);
+    if !push_bytes(&mut out, &record.resource_name)
+        || !push_bytes(&mut out, &record.source_url)
+        || !push_bytes(&mut out, &record.origin_url)
+        || !push_bytes(&mut out, &record.source_map_url)
+        || !push_bytes(&mut out, &record.cache_policy)
+    {
+        return None;
+    }
+    Some(out)
+}
+
 /// Compute and write the corruption-detection checksum trailer for a fully
 /// assembled cache blob. Must be called exactly once after both the record
 /// header and the payload bytes have been appended. The checksum covers every
@@ -5888,6 +5928,13 @@ fn finalize_module_cache_blob(bytes: &mut [u8]) {
     debug_assert!(bytes.len() >= MODULE_CACHE_CHECKSUM_END);
     let checksum = fnv1a64(&bytes[MODULE_CACHE_CHECKSUM_END..]);
     bytes[MODULE_CACHE_CHECKSUM_OFFSET..MODULE_CACHE_CHECKSUM_END]
+        .copy_from_slice(&checksum.to_le_bytes());
+}
+
+fn finalize_script_cache_blob(bytes: &mut [u8]) {
+    debug_assert!(bytes.len() >= SCRIPT_CACHE_CHECKSUM_END);
+    let checksum = fnv1a64(&bytes[SCRIPT_CACHE_CHECKSUM_END..]);
+    bytes[SCRIPT_CACHE_CHECKSUM_OFFSET..SCRIPT_CACHE_CHECKSUM_END]
         .copy_from_slice(&checksum.to_le_bytes());
 }
 
@@ -6934,6 +6981,82 @@ unsafe fn module_cache_record_from_options(
     })
 }
 
+unsafe fn script_cache_record_from_options(
+    source: &[u8],
+    script: &StatorScript,
+    options: *const StatorScriptCompileOptions,
+) -> Option<ScriptCacheRecord> {
+    if options.is_null() {
+        return Some(ScriptCacheRecord {
+            source_hash: fnv1a64(source),
+            source_len: source.len() as u64,
+            line_offset: script.resource_line_offset,
+            column_offset: script.resource_column_offset,
+            resource_name: script
+                .resource_name
+                .as_ref()
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_default(),
+            source_url: Vec::new(),
+            origin_url: Vec::new(),
+            source_map_url: Vec::new(),
+            cache_policy: Vec::new(),
+        });
+    }
+
+    // SAFETY: caller guarantees `options` is readable when non-null.
+    let options_ref = unsafe { &*options };
+    Some(ScriptCacheRecord {
+        source_hash: fnv1a64(source),
+        source_len: source.len() as u64,
+        line_offset: options_ref.line_offset,
+        column_offset: options_ref.column_offset,
+        // SAFETY: validates and copies option byte buffers.
+        resource_name: unsafe {
+            owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
+        },
+        // SAFETY: validates and copies option byte buffers.
+        source_url: unsafe { owned_ffi_bytes(options_ref.source_url, options_ref.source_url_len)? },
+        // SAFETY: validates and copies option byte buffers.
+        origin_url: unsafe { owned_ffi_bytes(options_ref.origin_url, options_ref.origin_url_len)? },
+        // SAFETY: validates and copies option byte buffers.
+        source_map_url: unsafe {
+            owned_ffi_bytes(options_ref.source_map_url, options_ref.source_map_url_len)?
+        },
+        // SAFETY: validates and copies option byte buffers.
+        cache_policy: unsafe {
+            owned_ffi_bytes(options_ref.cache_policy, options_ref.cache_policy_len)?
+        },
+    })
+}
+
+fn script_cache_telemetry(
+    status: StatorScriptCacheStatus,
+    diagnostic: StatorScriptCacheDiagnostic,
+    source_len: usize,
+    cache_input_len: usize,
+    cache_output_len: usize,
+) -> StatorScriptCacheTelemetry {
+    StatorScriptCacheTelemetry {
+        status,
+        diagnostic,
+        source_len,
+        cache_input_len,
+        cache_output_len,
+        format_version: SCRIPT_CACHE_FORMAT_VERSION,
+    }
+}
+
+unsafe fn write_script_cache_telemetry(
+    out: *mut StatorScriptCacheTelemetry,
+    telemetry: StatorScriptCacheTelemetry,
+) {
+    if !out.is_null() {
+        // SAFETY: caller guarantees `out` is valid for one write when non-null.
+        unsafe { *out = telemetry };
+    }
+}
+
 fn module_cache_record_from_module(source: &[u8], module: &StatorModule) -> ModuleCacheRecord {
     ModuleCacheRecord {
         source_hash: fnv1a64(source),
@@ -7048,6 +7171,98 @@ pub unsafe extern "C" fn stator_script_compile(
         }
     };
     Box::into_raw(script)
+}
+
+/// Create an engine-owned classic-script code-cache blob for `script`.
+///
+/// The returned [`StatorString`] owns a versioned cache blob containing
+/// validation metadata (engine crate version, source hash/length, resource
+/// name/offsets, and browser source metadata) plus serialized bytecode. On
+/// success `out_telemetry`, when non-null, reports
+/// [`StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata`].
+///
+/// # Safety
+/// - `script` must be either null or a valid, live [`StatorScript`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes when non-null.
+/// - `options`, when non-null, must point to readable compile options.
+/// - `out_telemetry`, when non-null, must be valid for one telemetry write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_create_code_cache(
+    script: *const StatorScript,
+    source: *const c_char,
+    source_len: usize,
+    options: *const StatorScriptCompileOptions,
+    out_telemetry: *mut StatorScriptCacheTelemetry,
+) -> *mut StatorString {
+    let mut telemetry = script_cache_telemetry(
+        StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+        StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+        source_len,
+        0,
+        0,
+    );
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+
+    if script.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let script_ref = unsafe { &*script };
+    // SAFETY: validates the caller-provided source pointer/length pair.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return std::ptr::null_mut();
+    };
+    telemetry.source_len = source_bytes.len();
+
+    let Some(bytecodes) = script_ref.bytecodes.as_ref() else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCompileError;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+    if script_ref.error.is_some() {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCompileError;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: copies and validates option byte buffers.
+    let Some(record) =
+        (unsafe { script_cache_record_from_options(source_bytes, script_ref, options) })
+    else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+
+    let Some(mut bytes) = serialize_script_cache_record(&record) else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+    let bytecode = serialize_bytecode_array(bytecodes);
+    if !push_bytes(&mut bytes, &bytecode) {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    }
+    finalize_script_cache_blob(&mut bytes);
+
+    telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata;
+    telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone;
+    telemetry.cache_output_len = bytes.len();
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+    Box::into_raw(Box::new(StatorString { bytes }))
 }
 
 /// Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
@@ -24799,6 +25014,118 @@ mod tests {
         );
         assert_eq!(telemetry.source_len, 10);
         assert_eq!(telemetry.cache_input_len, 20);
+    }
+
+    #[test]
+    fn test_script_create_code_cache_produces_blob_and_telemetry() {
+        let source = b"var x = 1 + 2; x";
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, and telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone
+        );
+        assert_eq!(telemetry.source_len, source.len());
+        assert_eq!(telemetry.cache_input_len, 0);
+        assert!(telemetry.cache_output_len > source.len());
+        assert_eq!(
+            telemetry.format_version,
+            code_cache_key::SCRIPT_CACHE_FORMAT_VERSION
+        );
+
+        // SAFETY: cache is live and returned by Stator.
+        let cache_len = unsafe { stator_string_len(cache) };
+        // SAFETY: cache is live and returned by Stator.
+        let cache_data = unsafe { stator_string_data(cache) };
+        assert_eq!(cache_len, telemetry.cache_output_len);
+        assert!(!cache_data.is_null());
+        // SAFETY: cache_data/cache_len are valid for the live cache handle.
+        let cache_bytes = unsafe { std::slice::from_raw_parts(cache_data as *const u8, cache_len) };
+        assert!(cache_bytes.starts_with(SCRIPT_CACHE_MAGIC));
+
+        // SAFETY: both handles were returned by Stator constructors.
+        unsafe {
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_create_code_cache_compile_error_reports_status() {
+        let source = b"var =";
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, and telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusCompileError
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError
+        );
+        assert_eq!(telemetry.source_len, source.len());
+        assert_eq!(telemetry.cache_output_len, 0);
+
+        // SAFETY: script was returned by Stator.
+        unsafe { stator_script_free(script) };
     }
 
     #[test]

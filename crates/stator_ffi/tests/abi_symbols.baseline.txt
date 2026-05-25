@@ -282,6 +282,7 @@ stator_property_names_get
 stator_register_native_function
 stator_script_bytecode_count
 stator_script_compile
+stator_script_create_code_cache
 stator_script_disable_jit
 stator_script_error_kind
 stator_script_force_maglev_compile
