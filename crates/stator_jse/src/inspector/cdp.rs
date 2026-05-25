@@ -25,6 +25,7 @@
 //! | `Runtime`      | `globalLexicalScopeNames` | Reports current global binding names |
 //! | `Runtime`      | `getIsolateId`            | Reports a stable Stator isolate identifier |
 //! | `Runtime`      | `getHeapUsage`            | Reports reachable heap-size estimates |
+//! | `Runtime`      | `addBinding`/`removeBinding` | Installs/removes global binding callbacks |
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
 //! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state (typed error on invalid `state`) |
@@ -59,7 +60,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
@@ -229,6 +230,17 @@ struct CompiledScript {
     execution_context_id: u32,
 }
 
+#[derive(Default)]
+struct RuntimeBindingState {
+    active_names: HashSet<String>,
+    pending_calls: Vec<RuntimeBindingCall>,
+}
+
+struct RuntimeBindingCall {
+    name: String,
+    payload: String,
+}
+
 impl RemoteObjectRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
@@ -346,6 +358,8 @@ pub struct CdpDispatcher {
     next_compiled_script_id: u64,
     /// Per-session script cache populated by `Runtime.compileScript`.
     compiled_scripts: HashMap<String, CompiledScript>,
+    /// Shared state for functions installed through `Runtime.addBinding`.
+    runtime_bindings: Rc<RefCell<RuntimeBindingState>>,
     /// Monotonically increasing ID for `Runtime.ExceptionDetails`.
     next_exception_id: u32,
     /// Optional handle to the interpreter [`Debugger`] driving this session.
@@ -393,6 +407,7 @@ impl CdpDispatcher {
             remote_objects: RemoteObjectRegistry::new(),
             next_compiled_script_id: 1,
             compiled_scripts: HashMap::new(),
+            runtime_bindings: Rc::new(RefCell::new(RuntimeBindingState::default())),
             next_exception_id: 1,
             debugger: None,
             pause_on_exceptions: PauseOnExceptionsState::None,
@@ -642,6 +657,8 @@ impl CdpDispatcher {
             }
             "Runtime.getIsolateId" => Ok(json!({ "id": "stator-isolate-0" })),
             "Runtime.getHeapUsage" => self.runtime_get_heap_usage(),
+            "Runtime.addBinding" => self.runtime_add_binding(&req.params),
+            "Runtime.removeBinding" => self.runtime_remove_binding(&req.params),
 
             // ── Debugger ──────────────────────────────────────────────────
             "Debugger.enable" => {
@@ -758,6 +775,73 @@ impl CdpDispatcher {
         }))
     }
 
+    fn runtime_add_binding(&mut self, params: &Value) -> StatorResult<Value> {
+        let name = match params.get("name").and_then(Value::as_str) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.addBinding: required parameter 'name' is missing or empty".to_string(),
+                ));
+            }
+        };
+        let _context_id = self.resolve_execution_context_id(params)?;
+        self.runtime_bindings
+            .borrow_mut()
+            .active_names
+            .insert(name.clone());
+
+        let binding_state = Rc::clone(&self.runtime_bindings);
+        let binding_name = name.clone();
+        let callback = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            let payload = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let mut state = binding_state.borrow_mut();
+            if state.active_names.contains(&binding_name) {
+                state.pending_calls.push(RuntimeBindingCall {
+                    name: binding_name.clone(),
+                    payload,
+                });
+            }
+            Ok(JsValue::Undefined)
+        }));
+        self.globals.borrow_mut().insert(name, callback);
+        Ok(json!({}))
+    }
+
+    fn runtime_remove_binding(&mut self, params: &Value) -> StatorResult<Value> {
+        let name = match params.get("name").and_then(Value::as_str) {
+            Some(name) if !name.is_empty() => name,
+            _ => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.removeBinding: required parameter 'name' is missing or empty"
+                        .to_string(),
+                ));
+            }
+        };
+        self.runtime_bindings.borrow_mut().active_names.remove(name);
+        self.globals.borrow_mut().remove(name);
+        Ok(json!({}))
+    }
+
+    fn emit_pending_binding_calls(&mut self, execution_context_id: u32) {
+        let calls = {
+            let mut state = self.runtime_bindings.borrow_mut();
+            std::mem::take(&mut state.pending_calls)
+        };
+        if !self.runtime_enabled {
+            return;
+        }
+        for call in calls {
+            self.push_event(
+                "Runtime.bindingCalled",
+                json!({
+                    "name": call.name,
+                    "payload": call.payload,
+                    "executionContextId": execution_context_id,
+                }),
+            );
+        }
+    }
+
     // ── Runtime.compileScript / Runtime.runScript ────────────────────────────
 
     fn runtime_compile_script(&mut self, params: &Value) -> StatorResult<Value> {
@@ -858,6 +942,7 @@ impl CdpDispatcher {
         let js_result = match Interpreter::run(&mut frame) {
             Ok(value) => value,
             Err(err) => {
+                self.emit_pending_binding_calls(execution_context_id);
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -870,6 +955,7 @@ impl CdpDispatcher {
                 ));
             }
         };
+        self.emit_pending_binding_calls(execution_context_id);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -928,6 +1014,7 @@ impl CdpDispatcher {
         let js_result = match Interpreter::run(&mut frame) {
             Ok(value) => value,
             Err(err) => {
+                self.emit_pending_binding_calls(execution_context_id);
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -940,6 +1027,7 @@ impl CdpDispatcher {
                 ));
             }
         };
+        self.emit_pending_binding_calls(execution_context_id);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1018,6 +1106,7 @@ impl CdpDispatcher {
         let js_result = match Interpreter::run(&mut frame) {
             Ok(value) => value,
             Err(err) => {
+                self.emit_pending_binding_calls(execution_context_id);
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -1030,6 +1119,7 @@ impl CdpDispatcher {
                 ));
             }
         };
+        self.emit_pending_binding_calls(execution_context_id);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -2891,6 +2981,52 @@ mod tests {
                 .unwrap()
                 .contains("missing")
         );
+    }
+
+    #[test]
+    fn runtime_add_binding_emits_binding_called_event() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch_all(&mut d, r#"{"id":0,"method":"Runtime.enable","params":{}}"#);
+        let add = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.addBinding","params":{"name":"statorBinding"}}"#,
+        );
+        assert!(add.get("error").is_none());
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"statorBinding('payload')","contextId":1}}"#,
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["method"], "Runtime.bindingCalled");
+        assert_eq!(messages[0]["params"]["name"], "statorBinding");
+        assert_eq!(messages[0]["params"]["payload"], "payload");
+        assert_eq!(messages[0]["params"]["executionContextId"], 1);
+        assert_eq!(messages[1]["id"], 2);
+        assert_eq!(messages[1]["result"]["result"]["type"], "undefined");
+    }
+
+    #[test]
+    fn runtime_remove_binding_removes_global_callback() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch_all(&mut d, r#"{"id":0,"method":"Runtime.enable","params":{}}"#);
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.addBinding","params":{"name":"statorBinding"}}"#,
+        );
+        let remove = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.removeBinding","params":{"name":"statorBinding"}}"#,
+        );
+        assert!(remove.get("error").is_none());
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"typeof statorBinding"}}"#,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["result"]["result"]["type"], "string");
+        assert_eq!(messages[0]["result"]["result"]["value"], "undefined");
     }
 
     #[test]
