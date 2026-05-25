@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 21;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 22;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -3735,6 +3735,104 @@ pub struct StatorScript {
     /// 1-based column offset of the script within `resource_name`.  Defaults
     /// to 0.  Mirrors `v8::ScriptOrigin::ResourceColumnOffset`.
     resource_column_offset: i32,
+}
+
+/// Compile options that participate in classic-script code-cache identity.
+///
+/// All pointer/length pairs are optional when their length is zero. Non-empty
+/// buffers are copied by Stator before cache production/consumption APIs return.
+/// `resource_name` is the stable URL/resource identity used by diagnostics and
+/// cache validation; source-map and origin metadata mirror browser script
+/// compilation metadata.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorScriptCompileOptions {
+    /// Pointer to `resource_name_len` bytes of the resource URL/name.
+    pub resource_name: *const c_char,
+    /// Number of bytes in `resource_name`.
+    pub resource_name_len: usize,
+    /// 1-based line offset within the resource.
+    pub line_offset: i32,
+    /// 1-based column offset within the resource.
+    pub column_offset: i32,
+    /// Optional source URL / sourceURL directive bytes.
+    pub source_url: *const c_char,
+    /// Number of bytes in `source_url`.
+    pub source_url_len: usize,
+    /// Optional browser origin URL bytes.
+    pub origin_url: *const c_char,
+    /// Number of bytes in `origin_url`.
+    pub origin_url_len: usize,
+    /// Optional source map URL bytes.
+    pub source_map_url: *const c_char,
+    /// Number of bytes in `source_map_url`.
+    pub source_map_url_len: usize,
+    /// Optional cache-policy token bytes.
+    pub cache_policy: *const c_char,
+    /// Number of bytes in `cache_policy`.
+    pub cache_policy_len: usize,
+}
+
+/// Status for classic-script code-cache operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorScriptCacheStatus {
+    /// Operation succeeded and produced a versioned classic-script cache blob.
+    StatorScriptCacheStatusProducedMetadata = 0,
+    /// Cache blob matched and restored executable bytecode directly.
+    StatorScriptCacheStatusAcceptedBytecodeRestored = 1,
+    /// Cache blob metadata matched but executable representation was rebuilt.
+    StatorScriptCacheStatusAcceptedValidatedRecompiled = 2,
+    /// A pointer/length pair or output argument was invalid.
+    StatorScriptCacheStatusInvalidArgument = 3,
+    /// The source script was not successfully compiled.
+    StatorScriptCacheStatusCompileError = 4,
+    /// Cache bytes were malformed or failed source/options validation.
+    StatorScriptCacheStatusRejected = 5,
+    /// Script code-cache production/consumption is unsupported by this build.
+    StatorScriptCacheStatusUnsupported = 6,
+    /// Cache payload checksum failed after the header and metadata matched.
+    StatorScriptCacheStatusCorruptPayload = 7,
+}
+
+/// Diagnostic reason for classic-script code-cache acceptance or rejection.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorScriptCacheDiagnostic {
+    /// No additional diagnostic; status is sufficient.
+    StatorScriptCacheDiagnosticNone = 0,
+    /// Cache magic was missing or did not identify a Stator script cache blob.
+    StatorScriptCacheDiagnosticMagicMismatch = 1,
+    /// Cache format version is unsupported by this engine.
+    StatorScriptCacheDiagnosticVersionMismatch = 2,
+    /// Source bytes or source digest did not match the cache metadata.
+    StatorScriptCacheDiagnosticSourceMismatch = 3,
+    /// Script compile options did not match the cache metadata.
+    StatorScriptCacheDiagnosticOptionsMismatch = 4,
+    /// Payload checksum failed after metadata validation succeeded.
+    StatorScriptCacheDiagnosticCorruptPayload = 5,
+    /// Source compiled with an error, so no cache can be produced/restored.
+    StatorScriptCacheDiagnosticCompileError = 6,
+    /// Operation is unsupported for this build or input shape.
+    StatorScriptCacheDiagnosticUnsupported = 7,
+}
+
+/// Telemetry returned by classic-script code-cache APIs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorScriptCacheTelemetry {
+    /// High-level status of the cache operation.
+    pub status: StatorScriptCacheStatus,
+    /// Detailed diagnostic reason for status-specific logging.
+    pub diagnostic: StatorScriptCacheDiagnostic,
+    /// Size of the source input in bytes.
+    pub source_len: usize,
+    /// Size of the cache input in bytes, or zero for production APIs.
+    pub cache_input_len: usize,
+    /// Size of the produced cache blob in bytes, or zero when none was produced.
+    pub cache_output_len: usize,
+    /// Stable cache format version used or observed.
+    pub format_version: u32,
 }
 
 /// Owned UTF-8 string handle used by module resolver out-parameters.
@@ -24638,6 +24736,69 @@ mod tests {
     fn test_isolate_destroy_null_is_safe() {
         // SAFETY: passing null is explicitly documented as a no-op.
         unsafe { stator_isolate_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_script_code_cache_ffi_status_discriminants_are_stable() {
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata as u32,
+            0
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored as u32,
+            1
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedValidatedRecompiled as u32,
+            2
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload as u32,
+            7
+        );
+        assert_eq!(
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone as u32,
+            0
+        );
+        assert_eq!(
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported as u32,
+            7
+        );
+    }
+
+    #[test]
+    fn test_script_code_cache_ffi_structs_are_plain_c_abi_values() {
+        let options = StatorScriptCompileOptions {
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 1,
+            column_offset: 1,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+        };
+        assert_eq!(options.line_offset, 1);
+        assert_eq!(options.column_offset, 1);
+
+        let telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported,
+            source_len: 10,
+            cache_input_len: 20,
+            cache_output_len: 0,
+            format_version: 1,
+        };
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported
+        );
+        assert_eq!(telemetry.source_len, 10);
+        assert_eq!(telemetry.cache_input_len, 20);
     }
 
     #[test]

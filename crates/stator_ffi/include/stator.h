@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 21
+#define STATOR_FFI_ABI_VERSION_MINOR 22
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1062,6 +1062,82 @@ typedef enum StatorNativeCodeCacheTier {
    */
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
+
+/**
+ * Status for classic-script code-cache operations.
+ */
+typedef enum StatorScriptCacheStatus {
+  /**
+   * Operation succeeded and produced a versioned classic-script cache blob.
+   */
+  StatorScriptCacheStatusProducedMetadata = 0,
+  /**
+   * Cache blob matched and restored executable bytecode directly.
+   */
+  StatorScriptCacheStatusAcceptedBytecodeRestored = 1,
+  /**
+   * Cache blob metadata matched but executable representation was rebuilt.
+   */
+  StatorScriptCacheStatusAcceptedValidatedRecompiled = 2,
+  /**
+   * A pointer/length pair or output argument was invalid.
+   */
+  StatorScriptCacheStatusInvalidArgument = 3,
+  /**
+   * The source script was not successfully compiled.
+   */
+  StatorScriptCacheStatusCompileError = 4,
+  /**
+   * Cache bytes were malformed or failed source/options validation.
+   */
+  StatorScriptCacheStatusRejected = 5,
+  /**
+   * Script code-cache production/consumption is unsupported by this build.
+   */
+  StatorScriptCacheStatusUnsupported = 6,
+  /**
+   * Cache payload checksum failed after the header and metadata matched.
+   */
+  StatorScriptCacheStatusCorruptPayload = 7,
+} StatorScriptCacheStatus;
+
+/**
+ * Diagnostic reason for classic-script code-cache acceptance or rejection.
+ */
+typedef enum StatorScriptCacheDiagnostic {
+  /**
+   * No additional diagnostic; status is sufficient.
+   */
+  StatorScriptCacheDiagnosticNone = 0,
+  /**
+   * Cache magic was missing or did not identify a Stator script cache blob.
+   */
+  StatorScriptCacheDiagnosticMagicMismatch = 1,
+  /**
+   * Cache format version is unsupported by this engine.
+   */
+  StatorScriptCacheDiagnosticVersionMismatch = 2,
+  /**
+   * Source bytes or source digest did not match the cache metadata.
+   */
+  StatorScriptCacheDiagnosticSourceMismatch = 3,
+  /**
+   * Script compile options did not match the cache metadata.
+   */
+  StatorScriptCacheDiagnosticOptionsMismatch = 4,
+  /**
+   * Payload checksum failed after metadata validation succeeded.
+   */
+  StatorScriptCacheDiagnosticCorruptPayload = 5,
+  /**
+   * Source compiled with an error, so no cache can be produced/restored.
+   */
+  StatorScriptCacheDiagnosticCompileError = 6,
+  /**
+   * Operation is unsupported for this build or input shape.
+   */
+  StatorScriptCacheDiagnosticUnsupported = 7,
+} StatorScriptCacheDiagnostic;
 
 typedef struct Option_StatorDomCallAsFunctionCb Option_StatorDomCallAsFunctionCb;
 
@@ -3278,6 +3354,96 @@ typedef struct StatorNativeCodeCacheCompatibility {
    */
   uint8_t source_key_digest[STATOR_NATIVE_CODE_CACHE_DIGEST_LEN];
 } StatorNativeCodeCacheCompatibility;
+
+/**
+ * Compile options that participate in classic-script code-cache identity.
+ *
+ * All pointer/length pairs are optional when their length is zero. Non-empty
+ * buffers are copied by Stator before cache production/consumption APIs return.
+ * `resource_name` is the stable URL/resource identity used by diagnostics and
+ * cache validation; source-map and origin metadata mirror browser script
+ * compilation metadata.
+ */
+typedef struct StatorScriptCompileOptions {
+  /**
+   * Pointer to `resource_name_len` bytes of the resource URL/name.
+   */
+  const char *resource_name;
+  /**
+   * Number of bytes in `resource_name`.
+   */
+  size_t resource_name_len;
+  /**
+   * 1-based line offset within the resource.
+   */
+  int32_t line_offset;
+  /**
+   * 1-based column offset within the resource.
+   */
+  int32_t column_offset;
+  /**
+   * Optional source URL / sourceURL directive bytes.
+   */
+  const char *source_url;
+  /**
+   * Number of bytes in `source_url`.
+   */
+  size_t source_url_len;
+  /**
+   * Optional browser origin URL bytes.
+   */
+  const char *origin_url;
+  /**
+   * Number of bytes in `origin_url`.
+   */
+  size_t origin_url_len;
+  /**
+   * Optional source map URL bytes.
+   */
+  const char *source_map_url;
+  /**
+   * Number of bytes in `source_map_url`.
+   */
+  size_t source_map_url_len;
+  /**
+   * Optional cache-policy token bytes.
+   */
+  const char *cache_policy;
+  /**
+   * Number of bytes in `cache_policy`.
+   */
+  size_t cache_policy_len;
+} StatorScriptCompileOptions;
+
+/**
+ * Telemetry returned by classic-script code-cache APIs.
+ */
+typedef struct StatorScriptCacheTelemetry {
+  /**
+   * High-level status of the cache operation.
+   */
+  enum StatorScriptCacheStatus status;
+  /**
+   * Detailed diagnostic reason for status-specific logging.
+   */
+  enum StatorScriptCacheDiagnostic diagnostic;
+  /**
+   * Size of the source input in bytes.
+   */
+  size_t source_len;
+  /**
+   * Size of the cache input in bytes, or zero for production APIs.
+   */
+  size_t cache_input_len;
+  /**
+   * Size of the produced cache blob in bytes, or zero when none was produced.
+   */
+  size_t cache_output_len;
+  /**
+   * Stable cache format version used or observed.
+   */
+  uint32_t format_version;
+} StatorScriptCacheTelemetry;
 
 /**
  * Free callback for resolver-owned embedder data.
