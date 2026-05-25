@@ -353,6 +353,12 @@ pub struct CdpDispatcher {
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
+    /// Whether `Target.setDiscoverTargets` is enabled.
+    target_discovery_enabled: bool,
+    /// Monotonically increasing ID for attached Target sessions.
+    next_target_session_id: u64,
+    /// Active single-target Target session, if any.
+    target_session_id: Option<String>,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
     /// Per-session registry of inspector-visible heap values.
@@ -415,6 +421,9 @@ impl CdpDispatcher {
             runtime_enabled: false,
             console_enabled: false,
             debugger_enabled: false,
+            target_discovery_enabled: false,
+            next_target_session_id: 1,
+            target_session_id: None,
             next_breakpoint_id: 1,
             remote_objects: RemoteObjectRegistry::new(),
             next_heap_object_id: 1,
@@ -654,6 +663,122 @@ impl CdpDispatcher {
         }
     }
 
+    fn target_set_discover_targets(&mut self, params: &Value) -> StatorResult<Value> {
+        self.target_discovery_enabled = params
+            .get("discover")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if self.target_discovery_enabled {
+            self.push_event(
+                "Target.targetCreated",
+                json!({ "targetInfo": target_info() }),
+            );
+        }
+        Ok(json!({}))
+    }
+
+    fn target_attach_to_target(&mut self, params: &Value) -> StatorResult<Value> {
+        let target_id = match params.get("targetId").and_then(Value::as_str) {
+            Some(target_id) => target_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Target.attachToTarget: required parameter 'targetId' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        if target_id != DEFAULT_TARGET_ID {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Target.attachToTarget: unknown targetId `{target_id}`"
+            )));
+        }
+        let session_id = format!("stator-target-session-{}", self.next_target_session_id);
+        self.next_target_session_id = self.next_target_session_id.saturating_add(1);
+        self.target_session_id = Some(session_id.clone());
+        if params
+            .get("flatten")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.push_event(
+                "Target.attachedToTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetInfo": target_info(),
+                    "waitingForDebugger": false,
+                }),
+            );
+        }
+        Ok(json!({ "sessionId": session_id }))
+    }
+
+    fn target_detach_from_target(&mut self, params: &Value) -> StatorResult<Value> {
+        let session_id = match params.get("sessionId").and_then(Value::as_str) {
+            Some(session_id) => session_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Target.detachFromTarget: required parameter 'sessionId' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        if self.target_session_id.as_deref() != Some(session_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Target.detachFromTarget: unknown sessionId `{session_id}`"
+            )));
+        }
+        self.target_session_id = None;
+        self.push_event(
+            "Target.detachedFromTarget",
+            json!({ "sessionId": session_id, "targetId": DEFAULT_TARGET_ID }),
+        );
+        Ok(json!({}))
+    }
+
+    fn target_send_message_to_target(&mut self, params: &Value) -> StatorResult<Value> {
+        let session_id = match params.get("sessionId").and_then(Value::as_str) {
+            Some(session_id) => session_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Target.sendMessageToTarget: required parameter 'sessionId' is missing or \
+                     not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        if self.target_session_id.as_deref() != Some(session_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Target.sendMessageToTarget: unknown sessionId `{session_id}`"
+            )));
+        }
+        let message = match params.get("message").and_then(Value::as_str) {
+            Some(message) => message,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Target.sendMessageToTarget: required parameter 'message' is missing or not \
+                     a string"
+                        .to_string(),
+                ));
+            }
+        };
+        let before = self.outbox.len();
+        let _ = self.dispatch_json(message);
+        let nested = self.outbox.split_off(before);
+        for message in nested {
+            self.push_event(
+                "Target.receivedMessageFromTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetId": DEFAULT_TARGET_ID,
+                    "message": message,
+                }),
+            );
+        }
+        Ok(json!({}))
+    }
+
     /// Route a parsed request to the correct domain handler.
     fn dispatch(&mut self, req: &CdpRequest) -> StatorResult<Value> {
         match req.method.as_str() {
@@ -749,6 +874,13 @@ impl CdpDispatcher {
             // ── Network (stubs) ───────────────────────────────────────────
             "Network.enable" => Ok(json!({})),
             "Network.disable" => Ok(json!({})),
+
+            // ── Target ────────────────────────────────────────────────────
+            "Target.getTargets" => Ok(json!({ "targetInfos": [target_info()] })),
+            "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
+            "Target.attachToTarget" => self.target_attach_to_target(&req.params),
+            "Target.detachFromTarget" => self.target_detach_from_target(&req.params),
+            "Target.sendMessageToTarget" => self.target_send_message_to_target(&req.params),
 
             // ── Schema ────────────────────────────────────────────────────
             "Schema.getDomains" => Ok(schema_get_domains()),
@@ -2736,6 +2868,17 @@ fn discovery_response(
     }
 }
 
+fn target_info() -> Value {
+    json!({
+        "targetId": DEFAULT_TARGET_ID,
+        "type": "page",
+        "title": "Stator",
+        "url": "stator://inspector",
+        "attached": false,
+        "canAccessOpener": false,
+    })
+}
+
 fn discovery_target(web_socket_debugger_url: &str) -> Value {
     json!({
         "id": DEFAULT_TARGET_ID,
@@ -3632,6 +3775,85 @@ mod tests {
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Schema"));
+    }
+
+    #[test]
+    fn target_get_targets_lists_default_target() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.getTargets","params":{}}"#,
+        );
+        assert_eq!(
+            resp["result"]["targetInfos"][0]["targetId"],
+            DEFAULT_TARGET_ID
+        );
+        assert_eq!(resp["result"]["targetInfos"][0]["type"], "page");
+    }
+
+    #[test]
+    fn target_discovery_emits_target_created_event() {
+        let mut d = fresh_dispatcher();
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+        );
+        assert_eq!(messages[0]["method"], "Target.targetCreated");
+        assert_eq!(
+            messages[0]["params"]["targetInfo"]["targetId"],
+            DEFAULT_TARGET_ID
+        );
+        assert_eq!(messages[1]["id"], 1);
+    }
+
+    #[test]
+    fn target_attach_send_message_and_detach_roundtrip() {
+        let mut d = fresh_dispatcher();
+        let attached = dispatch_all(
+            &mut d,
+            &json!({
+                "id": 1,
+                "method": "Target.attachToTarget",
+                "params": {"targetId": DEFAULT_TARGET_ID, "flatten": true}
+            })
+            .to_string(),
+        );
+        assert_eq!(attached[0]["method"], "Target.attachedToTarget");
+        let session_id = attached[1]["result"]["sessionId"].as_str().unwrap();
+
+        let inner = json!({
+            "id": 99,
+            "method": "Runtime.evaluate",
+            "params": {"expression": "1 + 2"}
+        })
+        .to_string();
+        let messages = dispatch_all(
+            &mut d,
+            &json!({
+                "id": 2,
+                "method": "Target.sendMessageToTarget",
+                "params": {"sessionId": session_id, "message": inner}
+            })
+            .to_string(),
+        );
+        assert_eq!(messages[0]["method"], "Target.receivedMessageFromTarget");
+        let nested: Value =
+            serde_json::from_str(messages[0]["params"]["message"].as_str().unwrap()).unwrap();
+        assert_eq!(nested["id"], 99);
+        assert_eq!(nested["result"]["result"]["value"], 3);
+        assert_eq!(messages[1]["id"], 2);
+
+        let detached = dispatch_all(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Target.detachFromTarget",
+                "params": {"sessionId": session_id}
+            })
+            .to_string(),
+        );
+        assert_eq!(detached[0]["method"], "Target.detachedFromTarget");
+        assert_eq!(detached[1]["id"], 3);
     }
 
     #[test]
