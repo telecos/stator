@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 22
+#define STATOR_FFI_ABI_VERSION_MINOR 23
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5135,6 +5135,32 @@ struct StatorString *stator_script_create_code_cache(const struct StatorScript *
                                                      size_t source_len,
                                                      const struct StatorScriptCompileOptions *options,
                                                      struct StatorScriptCacheTelemetry *out_telemetry);
+
+/**
+ * Compile a classic script from `source` using a previously produced cache blob.
+ *
+ * The cache is accepted only when its magic, format version, engine crate
+ * version, source length/hash, resource name, offsets, and source metadata
+ * match. On a clean match Stator restores bytecode from the cache and reports
+ * [`StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored`].
+ * Rejected, invalid, unsupported, or corrupt cache inputs never execute cached
+ * bytes; Stator falls back to normal source compilation and reports the cache
+ * status through `out_telemetry`.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes.
+ * - `cache_data` must be valid for reads of `cache_len` bytes.
+ * - `options`, when non-null, must point to readable compile options.
+ * - `out_telemetry`, when non-null, must be valid for one telemetry write.
+ */
+struct StatorScript *stator_script_compile_cached(struct StatorContext *ctx,
+                                                  const char *source,
+                                                  size_t source_len,
+                                                  const char *cache_data,
+                                                  size_t cache_len,
+                                                  const struct StatorScriptCompileOptions *options,
+                                                  struct StatorScriptCacheTelemetry *out_telemetry);
 
 /**
  * Compile `source` (a UTF-8 string of `source_len` bytes) as a JavaScript ES module.

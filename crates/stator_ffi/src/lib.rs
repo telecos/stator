@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 22;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 23;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -5718,6 +5718,7 @@ struct ModuleCacheRecord {
     edge_cache_metadata: Vec<u8>,
 }
 
+#[derive(PartialEq, Eq)]
 struct ScriptCacheRecord {
     source_hash: u64,
     source_len: u64,
@@ -6476,6 +6477,11 @@ enum ModuleCacheParseError {
     ChecksumMismatch,
 }
 
+enum ScriptCacheParseError {
+    Malformed,
+    ChecksumMismatch,
+}
+
 fn parse_module_cache_blob(
     bytes: &[u8],
 ) -> Result<(ModuleCacheRecord, ModuleCachePayload), ModuleCacheParseError> {
@@ -6583,6 +6589,64 @@ fn parse_module_cache_blob(
         },
         payload,
     ))
+}
+
+fn parse_script_cache_blob(
+    bytes: &[u8],
+) -> Result<(ScriptCacheRecord, Vec<u8>), ScriptCacheParseError> {
+    let mut reader = CacheReader::new(bytes);
+    if reader
+        .take(SCRIPT_CACHE_MAGIC.len())
+        .ok_or(ScriptCacheParseError::Malformed)?
+        != SCRIPT_CACHE_MAGIC
+    {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    if reader.read_u32().ok_or(ScriptCacheParseError::Malformed)? != SCRIPT_CACHE_FORMAT_VERSION {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    let stored_checksum = reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?;
+    debug_assert_eq!(reader.offset, SCRIPT_CACHE_CHECKSUM_END);
+    if bytes.len() < SCRIPT_CACHE_CHECKSUM_END {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    if fnv1a64(&bytes[SCRIPT_CACHE_CHECKSUM_END..]) != stored_checksum {
+        return Err(ScriptCacheParseError::ChecksumMismatch);
+    }
+    let engine_version = reader
+        .read_bytes()
+        .ok_or(ScriptCacheParseError::Malformed)?;
+    if engine_version != env!("CARGO_PKG_VERSION").as_bytes() {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    let record = ScriptCacheRecord {
+        source_hash: reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?,
+        source_len: reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?,
+        line_offset: reader.read_i32().ok_or(ScriptCacheParseError::Malformed)?,
+        column_offset: reader.read_i32().ok_or(ScriptCacheParseError::Malformed)?,
+        resource_name: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        source_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        origin_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        source_map_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        cache_policy: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+    };
+    let bytecode = reader
+        .read_bytes()
+        .ok_or(ScriptCacheParseError::Malformed)?;
+    if !reader.is_finished() {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    Ok((record, bytecode))
 }
 
 fn module_cache_payload_from_module(
@@ -7057,6 +7121,82 @@ unsafe fn write_script_cache_telemetry(
     }
 }
 
+fn script_cache_error_record(message: &str) -> *mut StatorScript {
+    let error = CString::new(message).unwrap_or_else(|_| c"script code-cache error".into());
+    Box::into_raw(Box::new(StatorScript {
+        bytecodes: None,
+        error: Some(error),
+        error_kind: StatorMessageKind::StatorMessageKindInternal,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+    }))
+}
+
+unsafe fn apply_script_compile_options(
+    script: *mut StatorScript,
+    options: *const StatorScriptCompileOptions,
+) -> bool {
+    if script.is_null() || options.is_null() {
+        return !script.is_null();
+    }
+    // SAFETY: caller guarantees `options` is readable when non-null.
+    let options_ref = unsafe { &*options };
+    // SAFETY: validates and copies option byte buffers.
+    let Some(resource_name) =
+        (unsafe { owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len) })
+    else {
+        return false;
+    };
+    let resource_name = if resource_name.is_empty() {
+        None
+    } else {
+        match CString::new(resource_name) {
+            Ok(name) => Some(name),
+            Err(_) => return false,
+        }
+    };
+    // Validate the remaining pointer/length pairs even though the classic
+    // script handle currently stores only the v8::ScriptOrigin resource name
+    // and offsets. Cache identity still depends on all of them.
+    // SAFETY: validates and copies option byte buffers.
+    if unsafe { owned_ffi_bytes(options_ref.source_url, options_ref.source_url_len) }.is_none()
+        || unsafe { owned_ffi_bytes(options_ref.origin_url, options_ref.origin_url_len) }.is_none()
+        || unsafe { owned_ffi_bytes(options_ref.source_map_url, options_ref.source_map_url_len) }
+            .is_none()
+        || unsafe { owned_ffi_bytes(options_ref.cache_policy, options_ref.cache_policy_len) }
+            .is_none()
+    {
+        return false;
+    }
+
+    // SAFETY: caller guarantees `script` is valid and uniquely mutable.
+    unsafe {
+        (*script).resource_name = resource_name;
+        (*script).resource_line_offset = options_ref.line_offset;
+        (*script).resource_column_offset = options_ref.column_offset;
+    }
+    true
+}
+
+unsafe fn compile_script_fallback(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    options: *const StatorScriptCompileOptions,
+) -> *mut StatorScript {
+    // SAFETY: caller has already validated the source pointer/length pair.
+    let script = unsafe { stator_script_compile(ctx, source, source_len) };
+    if !unsafe { apply_script_compile_options(script, options) } {
+        if !script.is_null() {
+            // SAFETY: script was returned by `stator_script_compile`.
+            unsafe { stator_script_free(script) };
+        }
+        return script_cache_error_record("invalid script compile options");
+    }
+    script
+}
+
 fn module_cache_record_from_module(source: &[u8], module: &StatorModule) -> ModuleCacheRecord {
     ModuleCacheRecord {
         source_hash: fnv1a64(source),
@@ -7263,6 +7403,139 @@ pub unsafe extern "C" fn stator_script_create_code_cache(
     // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
     unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
     Box::into_raw(Box::new(StatorString { bytes }))
+}
+
+/// Compile a classic script from `source` using a previously produced cache blob.
+///
+/// The cache is accepted only when its magic, format version, engine crate
+/// version, source length/hash, resource name, offsets, and source metadata
+/// match. On a clean match Stator restores bytecode from the cache and reports
+/// [`StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored`].
+/// Rejected, invalid, unsupported, or corrupt cache inputs never execute cached
+/// bytes; Stator falls back to normal source compilation and reports the cache
+/// status through `out_telemetry`.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes.
+/// - `cache_data` must be valid for reads of `cache_len` bytes.
+/// - `options`, when non-null, must point to readable compile options.
+/// - `out_telemetry`, when non-null, must be valid for one telemetry write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_compile_cached(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    cache_data: *const c_char,
+    cache_len: usize,
+    options: *const StatorScriptCompileOptions,
+    out_telemetry: *mut StatorScriptCacheTelemetry,
+) -> *mut StatorScript {
+    let mut telemetry = script_cache_telemetry(
+        StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+        StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+        source_len,
+        cache_len,
+        0,
+    );
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+
+    // SAFETY: validates caller-provided source pointer/length pair.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return script_cache_error_record("invalid script source pointer");
+    };
+    telemetry.source_len = source_bytes.len();
+
+    let empty_script = StatorScript {
+        bytecodes: None,
+        error: None,
+        error_kind: StatorMessageKind::StatorMessageKindUnknown,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+    };
+    // SAFETY: copies and validates option byte buffers.
+    let Some(expected) =
+        (unsafe { script_cache_record_from_options(source_bytes, &empty_script, options) })
+    else {
+        return script_cache_error_record("invalid script compile options");
+    };
+
+    // SAFETY: validates caller-provided cache pointer/length pair.
+    let Some(cache_bytes) = (unsafe { ffi_bytes(cache_data, cache_len) }) else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument;
+        telemetry.cache_input_len = cache_len;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        // SAFETY: source was validated above.
+        return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+    };
+    telemetry.cache_input_len = cache_bytes.len();
+
+    let (actual, bytecode_payload) = match parse_script_cache_blob(cache_bytes) {
+        Ok(parsed) => parsed,
+        Err(ScriptCacheParseError::Malformed) => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusRejected;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticMagicMismatch;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+        Err(ScriptCacheParseError::ChecksumMismatch) => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+    };
+
+    if actual != expected {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusRejected;
+        telemetry.diagnostic = if actual.source_hash != expected.source_hash
+            || actual.source_len != expected.source_len
+        {
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch
+        } else {
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticOptionsMismatch
+        };
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        // SAFETY: source was validated above.
+        return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+    }
+
+    let mut cursor = 0usize;
+    let bytecodes = match deserialize_bytecode_array(&bytecode_payload, &mut cursor) {
+        Ok(bytecodes) if cursor == bytecode_payload.len() => bytecodes,
+        _ => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+    };
+
+    telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored;
+    telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone;
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+    Box::into_raw(Box::new(StatorScript {
+        bytecodes: Some(Rc::new(bytecodes)),
+        error: None,
+        error_kind: StatorMessageKind::StatorMessageKindUnknown,
+        resource_name: CString::new(actual.resource_name).ok(),
+        resource_line_offset: actual.line_offset,
+        resource_column_offset: actual.column_offset,
+    }))
 }
 
 /// Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
@@ -25126,6 +25399,194 @@ mod tests {
 
         // SAFETY: script was returned by Stator.
         unsafe { stator_script_free(script) };
+    }
+
+    fn make_script_cache(source: &[u8]) -> (*mut StatorScript, *mut StatorString) {
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata
+        );
+        (script, cache)
+    }
+
+    fn cache_bytes(cache: *const StatorString) -> Vec<u8> {
+        // SAFETY: cache is live and returned by Stator.
+        let len = unsafe { stator_string_len(cache) };
+        // SAFETY: cache is live and returned by Stator.
+        let data = unsafe { stator_string_data(cache) };
+        assert!(!data.is_null());
+        // SAFETY: data/len are valid for the live cache handle.
+        unsafe { std::slice::from_raw_parts(data as *const u8, len).to_vec() }
+    }
+
+    #[test]
+    fn test_script_compile_cached_restores_bytecode_on_hit() {
+        let source = b"var x = 1 + 2; x";
+        let (script, cache) = make_script_cache(source);
+        let bytes = cache_bytes(cache);
+        let expected_count = unsafe { stator_script_bytecode_count(script) };
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: source/cache buffers are readable and telemetry is writable.
+        let restored = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone
+        );
+        assert_eq!(
+            unsafe { stator_script_bytecode_count(restored) },
+            expected_count
+        );
+        assert!(unsafe { stator_script_get_error(restored) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(restored);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_cached_stale_source_falls_back_to_compile() {
+        let source = b"var x = 1 + 2; x";
+        let stale = b"var y = 4; y";
+        let (script, cache) = make_script_cache(source);
+        let bytes = cache_bytes(cache);
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: stale/cache buffers are readable and telemetry is writable.
+        let fallback = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                stale.as_ptr() as *const c_char,
+                stale.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!fallback.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusRejected
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch
+        );
+        assert!(unsafe { stator_script_get_error(fallback) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(fallback);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_cached_corrupt_payload_falls_back_to_compile() {
+        let source = b"var x = 1 + 2; x";
+        let (script, cache) = make_script_cache(source);
+        let mut bytes = cache_bytes(cache);
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x5a;
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: source/cache buffers are readable and telemetry is writable.
+        let fallback = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!fallback.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload
+        );
+        assert!(unsafe { stator_script_get_error(fallback) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(fallback);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
     }
 
     #[test]

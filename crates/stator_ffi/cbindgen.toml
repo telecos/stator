@@ -140,6 +140,7 @@ include = [
     "stator_object_get",
     "stator_script_compile",
     "stator_script_create_code_cache",
+    "stator_script_compile_cached",
     "stator_module_compile",
     "stator_module_compile_typed",
     "stator_module_compile_with_options",
