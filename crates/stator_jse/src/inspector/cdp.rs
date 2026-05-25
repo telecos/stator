@@ -243,6 +243,14 @@ struct RuntimeBindingCall {
     payload: String,
 }
 
+#[derive(Clone)]
+struct CoverageScript {
+    script_id: String,
+    url: String,
+    source: String,
+    count: u32,
+}
+
 impl RemoteObjectRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
@@ -344,6 +352,9 @@ pub struct CdpDispatcher {
     globals: Rc<RefCell<GlobalEnv>>,
     profiler: CpuProfiler,
     profiler_sampling_interval_micros: u64,
+    profiler_precise_coverage_enabled: bool,
+    next_coverage_script_id: u64,
+    coverage_scripts: HashMap<String, CoverageScript>,
     /// CDP-visible execution contexts currently known to this session.
     contexts: Vec<ExecutionContextDescription>,
     /// Whether the `Runtime` domain is currently enabled for this session.
@@ -421,6 +432,9 @@ impl CdpDispatcher {
             globals,
             profiler: CpuProfiler::new(),
             profiler_sampling_interval_micros: 1_000,
+            profiler_precise_coverage_enabled: false,
+            next_coverage_script_id: 1,
+            coverage_scripts: HashMap::new(),
             contexts,
             runtime_enabled: false,
             console_enabled: false,
@@ -859,6 +873,10 @@ impl CdpDispatcher {
             "Profiler.setSamplingInterval" => self.profiler_set_sampling_interval(&req.params),
             "Profiler.start" => self.profiler_start(&req.params),
             "Profiler.stop" => self.profiler_stop(),
+            "Profiler.startPreciseCoverage" => self.profiler_start_precise_coverage(),
+            "Profiler.stopPreciseCoverage" => self.profiler_stop_precise_coverage(),
+            "Profiler.takePreciseCoverage" => self.profiler_take_precise_coverage(),
+            "Profiler.getBestEffortCoverage" => self.profiler_get_best_effort_coverage(),
 
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
@@ -1157,6 +1175,11 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.record_coverage(
+                    &script.expression,
+                    script.source_url.as_deref(),
+                    Some(script_id),
+                );
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -1170,6 +1193,11 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.record_coverage(
+            &script.expression,
+            script.source_url.as_deref(),
+            Some(script_id),
+        );
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1229,6 +1257,7 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.record_coverage(expression, source_url.as_deref(), None);
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -1242,6 +1271,7 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.record_coverage(expression, source_url.as_deref(), None);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1321,6 +1351,7 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.record_coverage(&expression, source_url.as_deref(), None);
                 return Ok(self.exception_response(
                     &err,
                     ExceptionRequest {
@@ -1334,6 +1365,7 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.record_coverage(&expression, source_url.as_deref(), None);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1759,6 +1791,58 @@ impl CdpDispatcher {
         let profile_value = serde_json::to_value(&profile)
             .map_err(|e| crate::error::StatorError::Internal(e.to_string()))?;
         Ok(json!({ "profile": profile_value }))
+    }
+
+    fn profiler_start_precise_coverage(&mut self) -> StatorResult<Value> {
+        self.profiler_precise_coverage_enabled = true;
+        self.coverage_scripts.clear();
+        Ok(json!({}))
+    }
+
+    fn profiler_stop_precise_coverage(&mut self) -> StatorResult<Value> {
+        self.profiler_precise_coverage_enabled = false;
+        Ok(json!({}))
+    }
+
+    fn profiler_take_precise_coverage(&mut self) -> StatorResult<Value> {
+        Ok(json!({
+            "result": self.coverage_payload(),
+            "timestamp": 0.0,
+        }))
+    }
+
+    fn profiler_get_best_effort_coverage(&mut self) -> StatorResult<Value> {
+        Ok(json!({ "result": self.coverage_payload() }))
+    }
+
+    fn record_coverage(&mut self, source: &str, source_url: Option<&str>, script_id: Option<&str>) {
+        if !self.profiler_precise_coverage_enabled {
+            return;
+        }
+        let id = script_id.map(str::to_string).unwrap_or_else(|| {
+            let id = format!("runtime-eval-{}", self.next_coverage_script_id);
+            self.next_coverage_script_id = self.next_coverage_script_id.saturating_add(1);
+            id
+        });
+        let entry = self
+            .coverage_scripts
+            .entry(id.clone())
+            .or_insert_with(|| CoverageScript {
+                script_id: id,
+                url: source_url.unwrap_or_default().to_string(),
+                source: source.to_string(),
+                count: 0,
+            });
+        entry.count = entry.count.saturating_add(1);
+    }
+
+    fn coverage_payload(&self) -> Vec<Value> {
+        let mut scripts: Vec<_> = self.coverage_scripts.values().cloned().collect();
+        scripts.sort_by(|a, b| a.script_id.cmp(&b.script_id));
+        scripts
+            .into_iter()
+            .map(|script| coverage_script_to_value(&script))
+            .collect()
     }
 
     // ── HeapProfiler.takeHeapSnapshot ────────────────────────────────────────
@@ -2244,6 +2328,22 @@ fn build_heap_sampling_profile(records: &[AllocationRecord]) -> Value {
     json!({
         "head": sampling_node_to_value(&nodes, 0),
         "samples": samples,
+    })
+}
+
+fn coverage_script_to_value(script: &CoverageScript) -> Value {
+    json!({
+        "scriptId": script.script_id,
+        "url": script.url,
+        "functions": [{
+            "functionName": "(script)",
+            "ranges": [{
+                "startOffset": 0,
+                "endOffset": script.source.len(),
+                "count": script.count,
+            }],
+            "isBlockCoverage": false,
+        }],
     })
 }
 
@@ -3264,6 +3364,82 @@ mod tests {
         );
         assert!(resp["error"].is_object());
         assert_eq!(d.profiler_sampling_interval_micros, 1_000);
+    }
+
+    #[test]
+    fn profiler_precise_coverage_records_runtime_evaluate() {
+        let mut d = fresh_dispatcher();
+        let start = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.startPreciseCoverage","params":{"callCount":true}}"#,
+        );
+        assert!(start.get("error").is_none());
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"1 + 2","sourceURL":"stator://coverage.js"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 3);
+
+        let coverage = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Profiler.takePreciseCoverage","params":{}}"#,
+        );
+        let scripts = coverage["result"]["result"].as_array().unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0]["url"], "stator://coverage.js");
+        assert_eq!(scripts[0]["functions"][0]["ranges"][0]["count"], 1);
+    }
+
+    #[test]
+    fn profiler_precise_coverage_uses_persisted_script_id() {
+        let mut d = fresh_dispatcher();
+        let compiled = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.compileScript","params":{"expression":"21 * 2","persistScript":true}}"#,
+        );
+        let script_id = compiled["result"]["scriptId"].as_str().unwrap();
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Profiler.startPreciseCoverage","params":{}}"#,
+        );
+        let run = dispatch(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Runtime.runScript",
+                "params": { "scriptId": script_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(run["result"]["result"]["value"], 42);
+        let coverage = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Profiler.getBestEffortCoverage","params":{}}"#,
+        );
+        assert_eq!(coverage["result"]["result"][0]["scriptId"], script_id);
+    }
+
+    #[test]
+    fn profiler_stop_precise_coverage_disables_recording() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.startPreciseCoverage","params":{}}"#,
+        );
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Profiler.stopPreciseCoverage","params":{}}"#,
+        );
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"1 + 2"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 3);
+        let coverage = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Profiler.takePreciseCoverage","params":{}}"#,
+        );
+        assert!(coverage["result"]["result"].as_array().unwrap().is_empty());
     }
 
     #[test]
