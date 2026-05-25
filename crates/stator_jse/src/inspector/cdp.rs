@@ -1505,21 +1505,22 @@ impl CdpDispatcher {
 
     fn heap_profiler_take_snapshot(&mut self) -> StatorResult<Value> {
         let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow().vars);
-        let chunk = snapshot.to_json();
-        // Emit the snapshot as an addHeapSnapshotChunk event.
-        self.push_event(
-            "HeapProfiler.addHeapSnapshotChunk",
-            json!({ "chunk": chunk }),
-        );
-        // Emit reportHeapSnapshotProgress to signal completion.
-        self.push_event(
-            "HeapProfiler.reportHeapSnapshotProgress",
-            json!({
-                "done": snapshot.snapshot.node_count,
-                "total": snapshot.snapshot.node_count,
-                "finished": true
-            }),
-        );
+        let chunks = split_snapshot_chunks(&snapshot.to_json(), HEAP_SNAPSHOT_CHUNK_SIZE);
+        let total = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            self.push_event(
+                "HeapProfiler.addHeapSnapshotChunk",
+                json!({ "chunk": chunk }),
+            );
+            self.push_event(
+                "HeapProfiler.reportHeapSnapshotProgress",
+                json!({
+                    "done": index + 1,
+                    "total": total,
+                    "finished": index + 1 == total
+                }),
+            );
+        }
         Ok(json!({}))
     }
 
@@ -1610,6 +1611,7 @@ impl CdpSession {
 
 const MAX_PREVIEW_PROPERTIES: usize = 5;
 const MAX_PREVIEW_DEPTH: usize = 1;
+const HEAP_SNAPSHOT_CHUNK_SIZE: usize = 64 * 1024;
 
 struct ExceptionRequest<'a> {
     expression: &'a str,
@@ -1761,6 +1763,32 @@ fn sampling_interval_param(params: &Value, method: &str) -> StatorResult<u64> {
             "{method}: required parameter 'samplingInterval' is missing or not a number"
         ))),
     }
+}
+
+fn split_snapshot_chunks(snapshot: &str, max_bytes: usize) -> Vec<String> {
+    debug_assert!(max_bytes > 0);
+    if snapshot.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < snapshot.len() {
+        let mut end = (start + max_bytes).min(snapshot.len());
+        while end > start && !snapshot.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = snapshot[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(snapshot.len());
+        }
+        chunks.push(snapshot[start..end].to_string());
+        start = end;
+    }
+    chunks
 }
 
 fn unsupported_debugger_method(method: &str, detail: &str) -> StatorError {
@@ -2771,6 +2799,43 @@ mod tests {
 
         assert_eq!(json["id"], 6u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn heap_snapshot_is_streamed_in_chunks_with_progress() {
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        globals.borrow_mut().insert(
+            "large".to_string(),
+            JsValue::String("x".repeat(HEAP_SNAPSHOT_CHUNK_SIZE + 1024).into()),
+        );
+        let mut d = CdpDispatcher::with_globals(globals);
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"HeapProfiler.takeHeapSnapshot","params":{}}"#,
+        );
+        let chunk_count = messages
+            .iter()
+            .filter(|message| message["method"] == "HeapProfiler.addHeapSnapshotChunk")
+            .count();
+        assert!(chunk_count > 1, "expected multiple chunks: {messages:?}");
+        let progress: Vec<_> = messages
+            .iter()
+            .filter(|message| message["method"] == "HeapProfiler.reportHeapSnapshotProgress")
+            .collect();
+        assert_eq!(progress.len(), chunk_count);
+        assert_eq!(progress.last().unwrap()["params"]["finished"], true);
+        assert_eq!(messages.last().unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn split_snapshot_chunks_preserves_utf8_boundaries() {
+        let chunks = split_snapshot_chunks("αβγδε", 3);
+        assert_eq!(chunks.concat(), "αβγδε");
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| std::str::from_utf8(chunk.as_bytes()).is_ok())
+        );
     }
 
     #[test]
