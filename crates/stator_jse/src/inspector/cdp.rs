@@ -18,6 +18,8 @@
 //! | `Runtime`      | `getProperties`           | Lists own properties of a previously-minted `RemoteObject` |
 //! | `Runtime`      | `releaseObject`           | Drops one `RemoteObject` from the per-session registry |
 //! | `Runtime`      | `releaseObjectGroup`      | Drops every `RemoteObject` tagged with a given group |
+//! | `Runtime`      | `compileScript`           | Compiles and optionally persists a script for later `runScript` |
+//! | `Runtime`      | `runScript`               | Executes a script persisted by `compileScript` |
 //! | `Runtime`      | `runIfWaitingForDebugger` | Acknowledges DevTools startup handshake |
 //! | `Runtime`      | `discardConsoleEntries`   | Clears buffered console messages |
 //! | `Runtime`      | `globalLexicalScopeNames` | Reports current global binding names |
@@ -66,6 +68,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, accept};
 
+use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::drain_messages;
@@ -218,6 +221,14 @@ struct RemoteObjectEntry {
     group: Option<String>,
 }
 
+#[derive(Clone)]
+struct CompiledScript {
+    bytecodes: Rc<BytecodeArray>,
+    expression: String,
+    source_url: Option<String>,
+    execution_context_id: u32,
+}
+
 impl RemoteObjectRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
@@ -331,6 +342,10 @@ pub struct CdpDispatcher {
     next_breakpoint_id: u32,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
+    /// Monotonically increasing ID for `Runtime.compileScript` cache entries.
+    next_compiled_script_id: u64,
+    /// Per-session script cache populated by `Runtime.compileScript`.
+    compiled_scripts: HashMap<String, CompiledScript>,
     /// Monotonically increasing ID for `Runtime.ExceptionDetails`.
     next_exception_id: u32,
     /// Optional handle to the interpreter [`Debugger`] driving this session.
@@ -376,6 +391,8 @@ impl CdpDispatcher {
             debugger_enabled: false,
             next_breakpoint_id: 1,
             remote_objects: RemoteObjectRegistry::new(),
+            next_compiled_script_id: 1,
+            compiled_scripts: HashMap::new(),
             next_exception_id: 1,
             debugger: None,
             pause_on_exceptions: PauseOnExceptionsState::None,
@@ -616,6 +633,8 @@ impl CdpDispatcher {
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
             "Runtime.releaseObject" => self.runtime_release_object(&req.params),
             "Runtime.releaseObjectGroup" => self.runtime_release_object_group(&req.params),
+            "Runtime.compileScript" => self.runtime_compile_script(&req.params),
+            "Runtime.runScript" => self.runtime_run_script(&req.params),
             "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
             "Runtime.discardConsoleEntries" => self.runtime_discard_console_entries(),
             "Runtime.globalLexicalScopeNames" => {
@@ -737,6 +756,128 @@ impl CdpDispatcher {
             "usedSize": used_size,
             "totalSize": used_size,
         }))
+    }
+
+    // ── Runtime.compileScript / Runtime.runScript ────────────────────────────
+
+    fn runtime_compile_script(&mut self, params: &Value) -> StatorResult<Value> {
+        let expression = match params.get("expression").and_then(Value::as_str) {
+            Some(expression) => expression,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.compileScript: required parameter 'expression' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        let execution_context_id = self.resolve_execution_context_id(params)?;
+        let persist_script = params
+            .get("persistScript")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let source_url = exception_source_url(params, expression);
+
+        let bytecodes =
+            match parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p)) {
+                Ok(bytecodes) => Rc::new(bytecodes),
+                Err(err) => {
+                    return Ok(json!({
+                        "exceptionDetails": self.exception_details_only(
+                            &err,
+                            ExceptionRequest {
+                                expression,
+                                source_url: source_url.as_deref(),
+                                execution_context_id,
+                                object_group: None,
+                                generate_preview: false,
+                            },
+                        )
+                    }));
+                }
+            };
+
+        if !persist_script {
+            return Ok(json!({}));
+        }
+
+        let script_id = format!("runtime-script-{}", self.next_compiled_script_id);
+        self.next_compiled_script_id = self.next_compiled_script_id.saturating_add(1);
+        self.compiled_scripts.insert(
+            script_id.clone(),
+            CompiledScript {
+                bytecodes,
+                expression: expression.to_string(),
+                source_url,
+                execution_context_id,
+            },
+        );
+        Ok(json!({ "scriptId": script_id }))
+    }
+
+    fn runtime_run_script(&mut self, params: &Value) -> StatorResult<Value> {
+        let script_id = match params.get("scriptId").and_then(Value::as_str) {
+            Some(script_id) => script_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.runScript: required parameter 'scriptId' is missing or not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        let script = self
+            .compiled_scripts
+            .get(script_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::error::StatorError::Internal(format!(
+                    "Runtime.runScript: unknown or expired scriptId `{script_id}`"
+                ))
+            })?;
+
+        let execution_context_id =
+            if params.get("contextId").is_some() || params.get("executionContextId").is_some() {
+                self.resolve_execution_context_id(params)?
+            } else {
+                script.execution_context_id
+            };
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let generate_preview = params
+            .get("generatePreview")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::clone(&script.bytecodes),
+            vec![],
+            Rc::clone(&self.globals),
+        );
+        let js_result = match Interpreter::run(&mut frame) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(self.exception_response(
+                    &err,
+                    ExceptionRequest {
+                        expression: &script.expression,
+                        source_url: script.source_url.as_deref(),
+                        execution_context_id,
+                        object_group: object_group.as_deref(),
+                        generate_preview,
+                    },
+                ));
+            }
+        };
+
+        let remote = js_value_to_remote_object(
+            &js_result,
+            &mut self.remote_objects,
+            object_group.as_deref(),
+            generate_preview,
+        );
+        Ok(json!({ "result": remote }))
     }
 
     // ── Runtime.evaluate ─────────────────────────────────────────────────────
@@ -931,6 +1072,16 @@ impl CdpDispatcher {
             "result": {"type": "undefined"},
             "exceptionDetails": details,
         })
+    }
+
+    fn exception_details_only(
+        &mut self,
+        err: &StatorError,
+        request: ExceptionRequest<'_>,
+    ) -> Value {
+        let exception_id = self.next_exception_id;
+        self.next_exception_id = self.next_exception_id.saturating_add(1);
+        self.build_exception_details(exception_id, err, request, None)
     }
 
     fn build_exception_details(
@@ -2678,6 +2829,68 @@ mod tests {
         let total = resp["result"]["totalSize"].as_u64().expect("total size");
         assert!(used > 0);
         assert!(total >= used);
+    }
+
+    #[test]
+    fn runtime_compile_script_persists_and_run_script_executes() {
+        let mut d = fresh_dispatcher();
+        let compiled = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.compileScript","params":{"expression":"var n = 40; n + 2","sourceURL":"stator://compiled.js","persistScript":true}}"#,
+        );
+        let script_id = compiled["result"]["scriptId"]
+            .as_str()
+            .expect("scriptId")
+            .to_string();
+
+        let run = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.runScript","params":{{"scriptId":"{script_id}"}}}}"#
+            ),
+        );
+        assert_eq!(run["result"]["result"]["type"], "number");
+        assert_eq!(run["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn runtime_compile_script_without_persist_does_not_cache() {
+        let mut d = fresh_dispatcher();
+        let compiled = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.compileScript","params":{"expression":"1 + 1","persistScript":false}}"#,
+        );
+        assert!(compiled["result"].is_object());
+        assert!(compiled["result"].get("scriptId").is_none());
+    }
+
+    #[test]
+    fn runtime_compile_script_syntax_error_returns_exception_details() {
+        let mut d = fresh_dispatcher();
+        let compiled = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.compileScript","params":{"expression":"var =","sourceURL":"stator://bad.js","persistScript":true}}"#,
+        );
+        let details = &compiled["result"]["exceptionDetails"];
+        assert_eq!(details["url"], "stator://bad.js");
+        assert!(details["text"].as_str().unwrap().contains("SyntaxError"));
+        assert!(compiled["result"].get("scriptId").is_none());
+    }
+
+    #[test]
+    fn runtime_run_script_unknown_id_errors() {
+        let mut d = fresh_dispatcher();
+        let run = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.runScript","params":{"scriptId":"missing"}}"#,
+        );
+        assert!(run["error"].is_object());
+        assert!(
+            run["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
     }
 
     #[test]
