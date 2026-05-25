@@ -251,6 +251,14 @@ struct CoverageScript {
     count: u32,
 }
 
+#[derive(Clone)]
+struct TypeProfileScript {
+    script_id: String,
+    url: String,
+    offset: usize,
+    types: HashSet<String>,
+}
+
 impl RemoteObjectRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
@@ -355,6 +363,9 @@ pub struct CdpDispatcher {
     profiler_precise_coverage_enabled: bool,
     next_coverage_script_id: u64,
     coverage_scripts: HashMap<String, CoverageScript>,
+    profiler_type_profile_enabled: bool,
+    next_type_profile_script_id: u64,
+    type_profile_scripts: HashMap<String, TypeProfileScript>,
     /// CDP-visible execution contexts currently known to this session.
     contexts: Vec<ExecutionContextDescription>,
     /// Whether the `Runtime` domain is currently enabled for this session.
@@ -435,6 +446,9 @@ impl CdpDispatcher {
             profiler_precise_coverage_enabled: false,
             next_coverage_script_id: 1,
             coverage_scripts: HashMap::new(),
+            profiler_type_profile_enabled: false,
+            next_type_profile_script_id: 1,
+            type_profile_scripts: HashMap::new(),
             contexts,
             runtime_enabled: false,
             console_enabled: false,
@@ -877,6 +891,9 @@ impl CdpDispatcher {
             "Profiler.stopPreciseCoverage" => self.profiler_stop_precise_coverage(),
             "Profiler.takePreciseCoverage" => self.profiler_take_precise_coverage(),
             "Profiler.getBestEffortCoverage" => self.profiler_get_best_effort_coverage(),
+            "Profiler.startTypeProfile" => self.profiler_start_type_profile(),
+            "Profiler.stopTypeProfile" => self.profiler_stop_type_profile(),
+            "Profiler.takeTypeProfile" => self.profiler_take_type_profile(),
 
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
@@ -1198,6 +1215,12 @@ impl CdpDispatcher {
             script.source_url.as_deref(),
             Some(script_id),
         );
+        self.record_type_profile(
+            &script.expression,
+            script.source_url.as_deref(),
+            Some(script_id),
+            &js_result,
+        );
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1272,6 +1295,7 @@ impl CdpDispatcher {
         };
         self.emit_pending_binding_calls(execution_context_id);
         self.record_coverage(expression, source_url.as_deref(), None);
+        self.record_type_profile(expression, source_url.as_deref(), None, &js_result);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1366,6 +1390,7 @@ impl CdpDispatcher {
         };
         self.emit_pending_binding_calls(execution_context_id);
         self.record_coverage(&expression, source_url.as_deref(), None);
+        self.record_type_profile(&expression, source_url.as_deref(), None, &js_result);
 
         let remote = js_value_to_remote_object(
             &js_result,
@@ -1815,6 +1840,21 @@ impl CdpDispatcher {
         Ok(json!({ "result": self.coverage_payload() }))
     }
 
+    fn profiler_start_type_profile(&mut self) -> StatorResult<Value> {
+        self.profiler_type_profile_enabled = true;
+        self.type_profile_scripts.clear();
+        Ok(json!({}))
+    }
+
+    fn profiler_stop_type_profile(&mut self) -> StatorResult<Value> {
+        self.profiler_type_profile_enabled = false;
+        Ok(json!({}))
+    }
+
+    fn profiler_take_type_profile(&mut self) -> StatorResult<Value> {
+        Ok(json!({ "result": self.type_profile_payload() }))
+    }
+
     fn record_coverage(&mut self, source: &str, source_url: Option<&str>, script_id: Option<&str>) {
         if !self.profiler_precise_coverage_enabled {
             return;
@@ -1842,6 +1882,42 @@ impl CdpDispatcher {
         scripts
             .into_iter()
             .map(|script| coverage_script_to_value(&script))
+            .collect()
+    }
+
+    fn record_type_profile(
+        &mut self,
+        source: &str,
+        source_url: Option<&str>,
+        script_id: Option<&str>,
+        value: &JsValue,
+    ) {
+        if !self.profiler_type_profile_enabled {
+            return;
+        }
+        let id = script_id.map(str::to_string).unwrap_or_else(|| {
+            let id = format!("runtime-type-{}", self.next_type_profile_script_id);
+            self.next_type_profile_script_id = self.next_type_profile_script_id.saturating_add(1);
+            id
+        });
+        let entry = self
+            .type_profile_scripts
+            .entry(id.clone())
+            .or_insert_with(|| TypeProfileScript {
+                script_id: id,
+                url: source_url.unwrap_or_default().to_string(),
+                offset: source.len(),
+                types: HashSet::new(),
+            });
+        entry.types.insert(type_profile_name(value).to_string());
+    }
+
+    fn type_profile_payload(&self) -> Vec<Value> {
+        let mut scripts: Vec<_> = self.type_profile_scripts.values().cloned().collect();
+        scripts.sort_by(|a, b| a.script_id.cmp(&b.script_id));
+        scripts
+            .into_iter()
+            .map(|script| type_profile_script_to_value(&script))
             .collect()
     }
 
@@ -2345,6 +2421,33 @@ fn coverage_script_to_value(script: &CoverageScript) -> Value {
             "isBlockCoverage": false,
         }],
     })
+}
+
+fn type_profile_script_to_value(script: &TypeProfileScript) -> Value {
+    let mut types: Vec<_> = script.types.iter().cloned().collect();
+    types.sort();
+    json!({
+        "scriptId": script.script_id,
+        "url": script.url,
+        "entries": [{
+            "offset": script.offset,
+            "types": types.into_iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
+        }],
+    })
+}
+
+fn type_profile_name(value: &JsValue) -> &'static str {
+    match value {
+        JsValue::Undefined | JsValue::TheHole => "Undefined",
+        JsValue::Null => "Null",
+        JsValue::Boolean(_) => "Boolean",
+        JsValue::Smi(_) | JsValue::HeapNumber(_) => "Number",
+        JsValue::String(_) => "String",
+        JsValue::BigInt(_) => "BigInt",
+        JsValue::Symbol(_) => "Symbol",
+        JsValue::Function(_) | JsValue::NativeFunction(_) => "Function",
+        _ => "Object",
+    }
 }
 
 fn sampling_node_to_value(nodes: &[SamplingNodeBuilder], index: usize) -> Value {
@@ -3440,6 +3543,52 @@ mod tests {
             r#"{"id":4,"method":"Profiler.takePreciseCoverage","params":{}}"#,
         );
         assert!(coverage["result"]["result"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn profiler_type_profile_records_runtime_result_types() {
+        let mut d = fresh_dispatcher();
+        let start = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.startTypeProfile","params":{}}"#,
+        );
+        assert!(start.get("error").is_none());
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"'typed'","sourceURL":"stator://types.js"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], "typed");
+        let profile = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Profiler.takeTypeProfile","params":{}}"#,
+        );
+        let result = profile["result"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["url"], "stator://types.js");
+        assert_eq!(result[0]["entries"][0]["types"][0]["name"], "String");
+    }
+
+    #[test]
+    fn profiler_stop_type_profile_disables_recording() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Profiler.startTypeProfile","params":{}}"#,
+        );
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Profiler.stopTypeProfile","params":{}}"#,
+        );
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"123"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 123);
+        let profile = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Profiler.takeTypeProfile","params":{}}"#,
+        );
+        assert!(profile["result"]["result"].as_array().unwrap().is_empty());
     }
 
     #[test]
