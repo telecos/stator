@@ -357,6 +357,12 @@ pub struct CdpDispatcher {
     next_breakpoint_id: u32,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
+    /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
+    next_heap_object_id: u64,
+    /// Heap-snapshot object IDs minted from remote objects.
+    heap_objects: HashMap<String, JsValue>,
+    /// Heap object IDs pinned as inspected by `HeapProfiler.addInspectedHeapObject`.
+    inspected_heap_objects: HashSet<String>,
     /// Monotonically increasing ID for `Runtime.compileScript` cache entries.
     next_compiled_script_id: u64,
     /// Per-session script cache populated by `Runtime.compileScript`.
@@ -409,6 +415,9 @@ impl CdpDispatcher {
             debugger_enabled: false,
             next_breakpoint_id: 1,
             remote_objects: RemoteObjectRegistry::new(),
+            next_heap_object_id: 1,
+            heap_objects: HashMap::new(),
+            inspected_heap_objects: HashSet::new(),
             next_compiled_script_id: 1,
             compiled_scripts: HashMap::new(),
             runtime_bindings: Rc::new(RefCell::new(RuntimeBindingState::default())),
@@ -721,6 +730,13 @@ impl CdpDispatcher {
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
             "HeapProfiler.takeHeapSnapshot" => self.heap_profiler_take_snapshot(),
+            "HeapProfiler.getHeapObjectId" => self.heap_profiler_get_heap_object_id(&req.params),
+            "HeapProfiler.getObjectByHeapObjectId" => {
+                self.heap_profiler_get_object_by_heap_object_id(&req.params)
+            }
+            "HeapProfiler.addInspectedHeapObject" => {
+                self.heap_profiler_add_inspected_heap_object(&req.params)
+            }
             "HeapProfiler.startTrackingHeapObjects" => self.heap_profiler_start_tracking(),
             "HeapProfiler.stopTrackingHeapObjects" => self.heap_profiler_stop_tracking(),
 
@@ -1522,6 +1538,98 @@ impl CdpDispatcher {
             );
         }
         Ok(json!({}))
+    }
+
+    fn heap_profiler_get_heap_object_id(&mut self, params: &Value) -> StatorResult<Value> {
+        let object_id = match params.get("objectId").and_then(Value::as_str) {
+            Some(object_id) => object_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "HeapProfiler.getHeapObjectId: required parameter 'objectId' is missing or \
+                     not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        let value = self.remote_objects.get(object_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "HeapProfiler.getHeapObjectId: unknown or released objectId `{object_id}`"
+            ))
+        })?;
+        let heap_snapshot_object_id = self.heap_object_id_for_value(value);
+        Ok(json!({ "heapSnapshotObjectId": heap_snapshot_object_id }))
+    }
+
+    fn heap_profiler_get_object_by_heap_object_id(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let heap_object_id = match params.get("objectId").and_then(Value::as_str) {
+            Some(object_id) => object_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "HeapProfiler.getObjectByHeapObjectId: required parameter 'objectId' is \
+                     missing or not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        let value = self
+            .heap_objects
+            .get(heap_object_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::error::StatorError::Internal(format!(
+                    "HeapProfiler.getObjectByHeapObjectId: unknown heap object id \
+                     `{heap_object_id}`"
+                ))
+            })?;
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let result = js_value_to_remote_object(
+            &value,
+            &mut self.remote_objects,
+            object_group.as_deref(),
+            false,
+        );
+        Ok(json!({ "result": result }))
+    }
+
+    fn heap_profiler_add_inspected_heap_object(&mut self, params: &Value) -> StatorResult<Value> {
+        let heap_object_id = match params.get("heapObjectId").and_then(Value::as_str) {
+            Some(object_id) => object_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "HeapProfiler.addInspectedHeapObject: required parameter 'heapObjectId' is \
+                     missing or not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        if !self.heap_objects.contains_key(heap_object_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "HeapProfiler.addInspectedHeapObject: unknown heap object id `{heap_object_id}`"
+            )));
+        }
+        self.inspected_heap_objects
+            .insert(heap_object_id.to_string());
+        Ok(json!({}))
+    }
+
+    fn heap_object_id_for_value(&mut self, value: JsValue) -> String {
+        if let Some((id, _)) = self
+            .heap_objects
+            .iter()
+            .find(|(_, existing)| same_heap_identity(existing, &value))
+        {
+            return id.clone();
+        }
+        let id = format!("heap-{}", self.next_heap_object_id);
+        self.next_heap_object_id = self.next_heap_object_id.saturating_add(1);
+        self.heap_objects.insert(id.clone(), value);
+        id
     }
 
     // ── HeapProfiler.startTrackingHeapObjects ────────────────────────────────
@@ -2836,6 +2944,91 @@ mod tests {
                 .iter()
                 .all(|chunk| std::str::from_utf8(chunk.as_bytes()).is_ok())
         );
+    }
+
+    #[test]
+    fn heap_object_id_roundtrips_to_remote_object() {
+        let mut d = fresh_dispatcher();
+        let object = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({answer: 42})","objectGroup":"heap"}}"#,
+        );
+        let object_id = object["result"]["result"]["objectId"].as_str().unwrap();
+        let heap_id_response = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"HeapProfiler.getHeapObjectId","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        let heap_id = heap_id_response["result"]["heapSnapshotObjectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(heap_id.starts_with("heap-"));
+
+        let again = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"HeapProfiler.getHeapObjectId","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        assert_eq!(again["result"]["heapSnapshotObjectId"], heap_id);
+
+        let remote = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":4,"method":"HeapProfiler.getObjectByHeapObjectId","params":{{"objectId":"{heap_id}","objectGroup":"heap"}}}}"#
+            ),
+        );
+        assert_eq!(remote["result"]["result"]["type"], "object");
+        let roundtrip_id = remote["result"]["result"]["objectId"].as_str().unwrap();
+        let props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":5,"method":"Runtime.getProperties","params":{{"objectId":"{roundtrip_id}","ownProperties":true}}}}"#
+            ),
+        );
+        let answer = props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "answer")
+            .expect("answer property");
+        assert_eq!(answer["value"]["value"], 42);
+    }
+
+    #[test]
+    fn heap_add_inspected_object_validates_heap_id() {
+        let mut d = fresh_dispatcher();
+        let object = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({})"}}"#,
+        );
+        let object_id = object["result"]["result"]["objectId"].as_str().unwrap();
+        let heap_id_response = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"HeapProfiler.getHeapObjectId","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        let heap_id = heap_id_response["result"]["heapSnapshotObjectId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ok = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"HeapProfiler.addInspectedHeapObject","params":{{"heapObjectId":"{heap_id}"}}}}"#
+            ),
+        );
+        assert!(ok.get("error").is_none());
+        assert!(d.inspected_heap_objects.contains(&heap_id));
+
+        let missing = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"HeapProfiler.addInspectedHeapObject","params":{"heapObjectId":"missing"}}"#,
+        );
+        assert!(missing["error"].is_object());
     }
 
     #[test]
