@@ -1672,12 +1672,33 @@ impl CdpDispatcher {
 
     fn heap_profiler_stop_tracking(&mut self) -> StatorResult<Value> {
         let records = crate::inspector::heap_snapshot::stop_tracking();
+        self.emit_heap_tracking_events(&records);
         // Return a summary of the allocation records collected.
         let stats: Vec<Value> = records
             .iter()
             .map(|r| json!({ "id": r.id, "size": r.size }))
             .collect();
         Ok(json!({ "stats": stats }))
+    }
+
+    fn emit_heap_tracking_events(&mut self, records: &[AllocationRecord]) {
+        let Some(last_seen_object_id) = records.iter().map(|record| record.id).max() else {
+            return;
+        };
+        let total_size: usize = records.iter().map(|record| record.size).sum();
+        self.push_event(
+            "HeapProfiler.heapStatsUpdate",
+            json!({
+                "statsUpdate": [0, records.len(), total_size],
+            }),
+        );
+        self.push_event(
+            "HeapProfiler.lastSeenObjectId",
+            json!({
+                "lastSeenObjectId": last_seen_object_id,
+                "timestamp": 0.0,
+            }),
+        );
     }
 }
 
@@ -3186,6 +3207,30 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn heap_tracking_stop_emits_stats_and_last_seen_events() {
+        use crate::inspector::heap_snapshot::record_allocation;
+
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"HeapProfiler.startTrackingHeapObjects","params":{}}"#,
+        );
+        record_allocation(10);
+        record_allocation(20);
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":2,"method":"HeapProfiler.stopTrackingHeapObjects","params":{}}"#,
+        );
+        assert_eq!(messages[0]["method"], "HeapProfiler.heapStatsUpdate");
+        assert_eq!(messages[0]["params"]["statsUpdate"], json!([0, 2, 30]));
+        assert_eq!(messages[1]["method"], "HeapProfiler.lastSeenObjectId");
+        assert_eq!(messages[1]["params"]["lastSeenObjectId"], 2);
+        assert_eq!(messages[2]["id"], 2);
+        assert_eq!(messages[2]["result"]["stats"].as_array().unwrap().len(), 2);
     }
 
     #[test]
