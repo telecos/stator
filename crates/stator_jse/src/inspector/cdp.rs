@@ -76,7 +76,7 @@ use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::drain_messages;
 use crate::inspector::debugger::{DebugAction, Debugger, PauseReason};
-use crate::inspector::heap_snapshot::HeapSnapshotBuilder;
+use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
 use crate::objects::value::JsValue;
@@ -363,6 +363,8 @@ pub struct CdpDispatcher {
     heap_objects: HashMap<String, JsValue>,
     /// Heap object IDs pinned as inspected by `HeapProfiler.addInspectedHeapObject`.
     inspected_heap_objects: HashSet<String>,
+    /// Last sampling heap profile returned by `HeapProfiler.stopSampling`.
+    last_heap_sampling_profile: Value,
     /// Monotonically increasing ID for `Runtime.compileScript` cache entries.
     next_compiled_script_id: u64,
     /// Per-session script cache populated by `Runtime.compileScript`.
@@ -418,6 +420,7 @@ impl CdpDispatcher {
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
             inspected_heap_objects: HashSet::new(),
+            last_heap_sampling_profile: empty_heap_sampling_profile(),
             next_compiled_script_id: 1,
             compiled_scripts: HashMap::new(),
             runtime_bindings: Rc::new(RefCell::new(RuntimeBindingState::default())),
@@ -737,6 +740,9 @@ impl CdpDispatcher {
             "HeapProfiler.addInspectedHeapObject" => {
                 self.heap_profiler_add_inspected_heap_object(&req.params)
             }
+            "HeapProfiler.startSampling" => self.heap_profiler_start_sampling(),
+            "HeapProfiler.stopSampling" => self.heap_profiler_stop_sampling(),
+            "HeapProfiler.getSamplingProfile" => self.heap_profiler_get_sampling_profile(),
             "HeapProfiler.startTrackingHeapObjects" => self.heap_profiler_start_tracking(),
             "HeapProfiler.stopTrackingHeapObjects" => self.heap_profiler_stop_tracking(),
 
@@ -1618,6 +1624,29 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
+    fn heap_profiler_start_sampling(&mut self) -> StatorResult<Value> {
+        crate::inspector::heap_snapshot::start_tracking();
+        self.last_heap_sampling_profile = empty_heap_sampling_profile();
+        Ok(json!({}))
+    }
+
+    fn heap_profiler_stop_sampling(&mut self) -> StatorResult<Value> {
+        let records = crate::inspector::heap_snapshot::stop_tracking();
+        let profile = build_heap_sampling_profile(&records);
+        self.last_heap_sampling_profile = profile.clone();
+        Ok(json!({ "profile": profile }))
+    }
+
+    fn heap_profiler_get_sampling_profile(&mut self) -> StatorResult<Value> {
+        let records = crate::inspector::heap_snapshot::snapshot_tracking();
+        let profile = if records.is_empty() {
+            self.last_heap_sampling_profile.clone()
+        } else {
+            build_heap_sampling_profile(&records)
+        };
+        Ok(json!({ "profile": profile }))
+    }
+
     fn heap_object_id_for_value(&mut self, value: JsValue) -> String {
         if let Some((id, _)) = self
             .heap_objects
@@ -1897,6 +1926,87 @@ fn split_snapshot_chunks(snapshot: &str, max_bytes: usize) -> Vec<String> {
         start = end;
     }
     chunks
+}
+
+struct SamplingNodeBuilder {
+    id: u32,
+    function_name: String,
+    self_size: usize,
+    children: Vec<usize>,
+}
+
+fn empty_heap_sampling_profile() -> Value {
+    build_heap_sampling_profile(&[])
+}
+
+fn build_heap_sampling_profile(records: &[AllocationRecord]) -> Value {
+    let mut nodes = vec![SamplingNodeBuilder {
+        id: 1,
+        function_name: "(root)".to_string(),
+        self_size: 0,
+        children: Vec::new(),
+    }];
+    let mut samples = Vec::with_capacity(records.len());
+
+    for record in records {
+        let stack = if record.stack.is_empty() {
+            vec!["(program)"]
+        } else {
+            record.stack.clone()
+        };
+        let mut parent = 0usize;
+        for frame in stack {
+            let child = nodes[parent]
+                .children
+                .iter()
+                .copied()
+                .find(|idx| nodes[*idx].function_name == frame)
+                .unwrap_or_else(|| {
+                    let idx = nodes.len();
+                    nodes.push(SamplingNodeBuilder {
+                        id: idx as u32 + 1,
+                        function_name: frame.to_string(),
+                        self_size: 0,
+                        children: Vec::new(),
+                    });
+                    nodes[parent].children.push(idx);
+                    idx
+                });
+            parent = child;
+        }
+        nodes[parent].self_size = nodes[parent].self_size.saturating_add(record.size);
+        samples.push(json!({
+            "size": record.size,
+            "nodeId": nodes[parent].id,
+            "ordinal": record.id,
+        }));
+    }
+
+    json!({
+        "head": sampling_node_to_value(&nodes, 0),
+        "samples": samples,
+    })
+}
+
+fn sampling_node_to_value(nodes: &[SamplingNodeBuilder], index: usize) -> Value {
+    let node = &nodes[index];
+    let children: Vec<Value> = node
+        .children
+        .iter()
+        .map(|idx| sampling_node_to_value(nodes, *idx))
+        .collect();
+    json!({
+        "id": node.id,
+        "selfSize": node.self_size,
+        "callFrame": {
+            "functionName": node.function_name,
+            "scriptId": "0",
+            "url": "",
+            "lineNumber": 0,
+            "columnNumber": 0,
+        },
+        "children": children,
+    })
 }
 
 fn unsupported_debugger_method(method: &str, detail: &str) -> StatorError {
@@ -3029,6 +3139,53 @@ mod tests {
             r#"{"id":4,"method":"HeapProfiler.addInspectedHeapObject","params":{"heapObjectId":"missing"}}"#,
         );
         assert!(missing["error"].is_object());
+    }
+
+    #[test]
+    fn heap_sampling_profile_tracks_recorded_allocations() {
+        use crate::inspector::heap_snapshot::record_allocation;
+
+        let mut d = fresh_dispatcher();
+        let start = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"HeapProfiler.startSampling","params":{}}"#,
+        );
+        assert!(start.get("error").is_none());
+        record_allocation(64);
+        record_allocation(32);
+
+        let current = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"HeapProfiler.getSamplingProfile","params":{}}"#,
+        );
+        assert_eq!(
+            current["result"]["profile"]["samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let stopped = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"HeapProfiler.stopSampling","params":{}}"#,
+        );
+        let samples = stopped["result"]["profile"]["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["size"], 64);
+        assert_eq!(samples[1]["size"], 32);
+
+        let after = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"HeapProfiler.getSamplingProfile","params":{}}"#,
+        );
+        assert_eq!(
+            after["result"]["profile"]["samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
