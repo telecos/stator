@@ -36,7 +36,7 @@
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
-//! | `Debugger`     | `getPossibleBreakpoints`  | Fail-closed: enumeration not bridged through CDP yet |
+//! | `Debugger`     | `getPossibleBreakpoints`  | Returns breakpointable locations for registered scripts |
 //! | `Console`      | `enable`                  | Flushes buffered messages as events |
 //! | `Console`      | `disable`                 | Acknowledges                       |
 //! | `Profiler`     | `enable`                  | Acknowledges                       |
@@ -839,11 +839,9 @@ impl CdpDispatcher {
                  through CDP. Use `Runtime.evaluate` while paused for now.",
             )),
             "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
-            "Debugger.getPossibleBreakpoints" => Err(unsupported_debugger_method(
-                "Debugger.getPossibleBreakpoints",
-                "Breakpoint-location enumeration over CDP is not implemented \
-                 yet; use `Debugger::breakpoint_locations` directly.",
-            )),
+            "Debugger.getPossibleBreakpoints" => {
+                self.debugger_get_possible_breakpoints(&req.params)
+            }
 
             // ── Console ───────────────────────────────────────────────────
             "Console.enable" => self.console_enable(),
@@ -1622,6 +1620,68 @@ impl CdpDispatcher {
             ))
         })?;
         Ok(json!({ "scriptSource": source }))
+    }
+
+    fn debugger_get_possible_breakpoints(&mut self, params: &Value) -> StatorResult<Value> {
+        let start = params.get("start").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.getPossibleBreakpoints: required parameter 'start' is missing"
+                    .to_string(),
+            )
+        })?;
+        let script_id = start
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.getPossibleBreakpoints: start.scriptId is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        let source = self.script_sources.get(script_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.getPossibleBreakpoints: unknown scriptId `{script_id}`"
+            ))
+        })?;
+        let start_line = start.get("lineNumber").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let start_column = start
+            .get("columnNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let end = params.get("end");
+        let end_line = end
+            .and_then(|value| value.get("lineNumber"))
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        let end_column = end
+            .and_then(|value| value.get("columnNumber"))
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+
+        let bytecodes = parser::parse(source)
+            .and_then(|program| BytecodeGenerator::compile_program(&program))?;
+        let locations: Vec<Value> = Debugger::breakpoint_locations(&bytecodes)
+            .into_iter()
+            .filter_map(|location| {
+                let line = location.line.saturating_sub(1);
+                let column = location.column.saturating_sub(1);
+                if line < start_line || (line == start_line && column < start_column) {
+                    return None;
+                }
+                if let Some(end_line) = end_line
+                    && (line > end_line
+                        || (line == end_line && end_column.is_some_and(|end| column > end)))
+                {
+                    return None;
+                }
+                Some(json!({
+                    "scriptId": script_id,
+                    "lineNumber": line,
+                    "columnNumber": column,
+                }))
+            })
+            .collect();
+        Ok(json!({ "locations": locations }))
     }
 
     // ── Console.enable ───────────────────────────────────────────────────────
@@ -4859,6 +4919,29 @@ mod tests {
         let resp = dispatch(
             &mut d,
             r#"{"id":1,"method":"Debugger.getScriptSource","params":{"scriptId":"missing"}}"#,
+        );
+        assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn get_possible_breakpoints_returns_registered_source_locations() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "var a = 1;\nvar b = a + 2;".to_string());
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"7","lineNumber":0,"columnNumber":0}}}"#,
+        );
+        let locations = resp["result"]["locations"].as_array().unwrap();
+        assert!(!locations.is_empty());
+        assert!(locations.iter().all(|location| location["scriptId"] == "7"));
+    }
+
+    #[test]
+    fn get_possible_breakpoints_unknown_script_errors() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"missing","lineNumber":0,"columnNumber":0}}}"#,
         );
         assert!(resp["error"].is_object());
     }
