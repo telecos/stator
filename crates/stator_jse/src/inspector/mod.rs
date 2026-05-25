@@ -6,9 +6,9 @@
 //! - **Runtime**: `enable`, `evaluate`, `callFunctionOn`, `getProperties`,
 //!   `releaseObject`, `releaseObjectGroup`
 //! - **Debugger**: `enable`, `disable`, `setPauseOnExceptions`,
-//!   `setBreakpointByUrl`, `resume`, `stepInto`, `stepOver`, `stepOut`.
-//!   Unsupported methods (`pause`, `evaluateOnCallFrame`, `getScriptSource`,
-//!   `getPossibleBreakpoints`) return typed CDP errors.
+//!   `setBreakpointByUrl`, `getScriptSource`, `resume`, `stepInto`,
+//!   `stepOver`, `stepOut`. Unsupported methods (`pause`,
+//!   `evaluateOnCallFrame`, `getPossibleBreakpoints`) return typed CDP errors.
 //! - **Console**: `enable`, `disable` (with buffered `messageAdded` events)
 //! - **Profiler**: `enable`, `start`, `stop`
 //! - **HeapProfiler**: `enable`, `takeHeapSnapshot`,

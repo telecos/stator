@@ -261,12 +261,17 @@ impl InProcessInspector {
     /// [`InProcessInspector::disconnect`] is called for it or the inspector
     /// itself is dropped.
     pub fn connect(&mut self, session_id: u32) -> &mut InProcessInspectorSession {
-        let session = Box::new(InProcessInspectorSession::new(
+        let mut session = Box::new(InProcessInspectorSession::new(
             session_id,
             Rc::clone(&self.globals),
             self.contexts.clone(),
             Rc::clone(&self.debugger),
         ));
+        for script in &self.scripts {
+            session
+                .dispatcher_mut()
+                .register_script_source(script.id, script.source.clone());
+        }
         self.sessions.push(session);
         // SAFETY: just pushed; the box is alive and uniquely owned.
         self.sessions.last_mut().expect("just pushed").as_mut()
@@ -470,6 +475,9 @@ impl InProcessInspector {
         });
         let serialised = event.to_string();
         for session in self.sessions.iter_mut() {
+            session
+                .dispatcher_mut()
+                .register_script_source(id, source.clone());
             if session.debugger_enabled() {
                 session.dispatcher_mut().push_raw(serialised.clone());
             }
@@ -809,6 +817,54 @@ mod tests {
 
         assert_eq!(id, 0);
         assert!(inspector.scripts().is_empty());
+    }
+
+    #[test]
+    fn registered_script_source_is_available_to_existing_and_late_sessions() {
+        let mut inspector = new_inspector();
+        let source = "let registered = 42;".to_string();
+        {
+            let session = inspector.connect(12);
+            drain_to_strings(session);
+        }
+
+        let script_id = inspector.register_script(source.clone());
+
+        {
+            let session = inspector.session_by_id_mut(12).expect("existing session");
+            assert_eq!(
+                session.dispatch_json(
+                    &json!({
+                        "id": 1,
+                        "method": "Debugger.getScriptSource",
+                        "params": { "scriptId": script_id.to_string() }
+                    })
+                    .to_string()
+                ),
+                DispatchOutcome::Ok
+            );
+            let messages = drain_to_strings(session);
+            let response: Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+            assert_eq!(response["result"]["scriptSource"], source);
+        }
+
+        {
+            let session = inspector.connect(13);
+            assert_eq!(
+                session.dispatch_json(
+                    &json!({
+                        "id": 2,
+                        "method": "Debugger.getScriptSource",
+                        "params": { "scriptId": script_id.to_string() }
+                    })
+                    .to_string()
+                ),
+                DispatchOutcome::Ok
+            );
+            let messages = drain_to_strings(session);
+            let response: Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+            assert_eq!(response["result"]["scriptSource"], "let registered = 42;");
+        }
     }
 
     #[test]

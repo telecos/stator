@@ -35,7 +35,7 @@
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
-//! | `Debugger`     | `getScriptSource`         | Fail-closed: not bridged from the script registry yet |
+//! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
 //! | `Debugger`     | `getPossibleBreakpoints`  | Fail-closed: enumeration not bridged through CDP yet |
 //! | `Console`      | `enable`                  | Flushes buffered messages as events |
 //! | `Console`      | `disable`                 | Acknowledges                       |
@@ -359,6 +359,8 @@ pub struct CdpDispatcher {
     next_target_session_id: u64,
     /// Active single-target Target session, if any.
     target_session_id: Option<String>,
+    /// Script sources registered by the owning inspector, keyed by scriptId.
+    script_sources: HashMap<String, String>,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
     /// Per-session registry of inspector-visible heap values.
@@ -424,6 +426,7 @@ impl CdpDispatcher {
             target_discovery_enabled: false,
             next_target_session_id: 1,
             target_session_id: None,
+            script_sources: HashMap::new(),
             next_breakpoint_id: 1,
             remote_objects: RemoteObjectRegistry::new(),
             next_heap_object_id: 1,
@@ -455,6 +458,11 @@ impl CdpDispatcher {
     /// emit events outside a request/response turn.
     pub fn push_raw(&mut self, message: String) {
         self.outbox.push_back(message);
+    }
+
+    /// Register or replace a script source for `Debugger.getScriptSource`.
+    pub fn register_script_source(&mut self, script_id: u32, source: String) {
+        self.script_sources.insert(script_id.to_string(), source);
     }
 
     /// Push a JSON-RPC parse-error response onto the outbox.
@@ -830,12 +838,7 @@ impl CdpDispatcher {
                 "Stator does not yet expose interpreter call-frame snapshots \
                  through CDP. Use `Runtime.evaluate` while paused for now.",
             )),
-            "Debugger.getScriptSource" => Err(unsupported_debugger_method(
-                "Debugger.getScriptSource",
-                "Script source retrieval is not wired through the CDP \
-                 dispatcher yet; use the in-process inspector script \
-                 registry directly.",
-            )),
+            "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
             "Debugger.getPossibleBreakpoints" => Err(unsupported_debugger_method(
                 "Debugger.getPossibleBreakpoints",
                 "Breakpoint-location enumeration over CDP is not implemented \
@@ -1600,6 +1603,25 @@ impl CdpDispatcher {
                 "columnNumber": column_number,
             }]
         }))
+    }
+
+    fn debugger_get_script_source(&mut self, params: &Value) -> StatorResult<Value> {
+        let script_id = match params.get("scriptId").and_then(Value::as_str) {
+            Some(script_id) => script_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Debugger.getScriptSource: required parameter 'scriptId' is missing or not a \
+                     string"
+                        .to_string(),
+                ));
+            }
+        };
+        let source = self.script_sources.get(script_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.getScriptSource: unknown scriptId `{script_id}`"
+            ))
+        })?;
+        Ok(json!({ "scriptSource": source }))
     }
 
     // ── Console.enable ───────────────────────────────────────────────────────
@@ -4821,11 +4843,22 @@ mod tests {
     }
 
     #[test]
-    fn get_script_source_is_fail_closed() {
+    fn get_script_source_returns_registered_source() {
         let mut d = fresh_dispatcher();
+        d.register_script_source(1, "let answer = 42;".to_string());
         let resp = dispatch(
             &mut d,
             r#"{"id":1,"method":"Debugger.getScriptSource","params":{"scriptId":"1"}}"#,
+        );
+        assert_eq!(resp["result"]["scriptSource"], "let answer = 42;");
+    }
+
+    #[test]
+    fn get_script_source_unknown_id_errors() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.getScriptSource","params":{"scriptId":"missing"}}"#,
         );
         assert!(resp["error"].is_object());
     }
