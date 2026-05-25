@@ -133,6 +133,7 @@ use crate::builtins::weak_ref::{
     weak_ref_deref, weak_ref_new, weak_ref_new_plain, weak_ref_new_symbol,
 };
 use crate::error::{StatorError, StatorResult};
+use crate::inspector::console::{ProfileEvent, ProfileEventKind, push_profile_event};
 use crate::interpreter::{
     current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
     dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
@@ -13240,6 +13241,34 @@ fn make_console() -> JsValue {
         builtin_fn("info", 0, |args: Vec<JsValue>| {
             let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
             println!("{}", parts.join(" "));
+            Ok(JsValue::Undefined)
+        }),
+    );
+    props.insert(
+        "profile".into(),
+        builtin_fn("profile", 0, |args: Vec<JsValue>| {
+            let id = args
+                .first()
+                .map(JsValue::to_display_string)
+                .unwrap_or_default();
+            push_profile_event(ProfileEvent {
+                kind: ProfileEventKind::Started,
+                id,
+            });
+            Ok(JsValue::Undefined)
+        }),
+    );
+    props.insert(
+        "profileEnd".into(),
+        builtin_fn("profileEnd", 0, |args: Vec<JsValue>| {
+            let id = args
+                .first()
+                .map(JsValue::to_display_string)
+                .unwrap_or_default();
+            push_profile_event(ProfileEvent {
+                kind: ProfileEventKind::Finished,
+                id,
+            });
             Ok(JsValue::Undefined)
         }),
     );

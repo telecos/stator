@@ -74,7 +74,7 @@ use tungstenite::{Message, WebSocket, accept};
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
-use crate::inspector::console::drain_messages;
+use crate::inspector::console::{ProfileEventKind, drain_messages, drain_profile_events};
 use crate::inspector::debugger::{DebugAction, Debugger, PauseReason};
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
@@ -359,6 +359,7 @@ pub enum DispatchOutcome {
 pub struct CdpDispatcher {
     globals: Rc<RefCell<GlobalEnv>>,
     profiler: CpuProfiler,
+    profiler_enabled: bool,
     profiler_sampling_interval_micros: u64,
     profiler_precise_coverage_enabled: bool,
     next_coverage_script_id: u64,
@@ -442,6 +443,7 @@ impl CdpDispatcher {
         Self {
             globals,
             profiler: CpuProfiler::new(),
+            profiler_enabled: false,
             profiler_sampling_interval_micros: 1_000,
             profiler_precise_coverage_enabled: false,
             next_coverage_script_id: 1,
@@ -883,7 +885,14 @@ impl CdpDispatcher {
             }
 
             // ── Profiler ──────────────────────────────────────────────────
-            "Profiler.enable" => Ok(json!({})),
+            "Profiler.enable" => {
+                self.profiler_enabled = true;
+                Ok(json!({}))
+            }
+            "Profiler.disable" => {
+                self.profiler_enabled = false;
+                Ok(json!({}))
+            }
             "Profiler.setSamplingInterval" => self.profiler_set_sampling_interval(&req.params),
             "Profiler.start" => self.profiler_start(&req.params),
             "Profiler.stop" => self.profiler_stop(),
@@ -1091,6 +1100,34 @@ impl CdpDispatcher {
         }
     }
 
+    fn emit_pending_profile_events(&mut self) {
+        let events = drain_profile_events();
+        if !self.profiler_enabled {
+            return;
+        }
+        for event in events {
+            match event.kind {
+                ProfileEventKind::Started => self.push_event(
+                    "Profiler.consoleProfileStarted",
+                    json!({
+                        "id": event.id,
+                        "title": event.id,
+                        "location": console_profile_location(),
+                    }),
+                ),
+                ProfileEventKind::Finished => self.push_event(
+                    "Profiler.consoleProfileFinished",
+                    json!({
+                        "id": event.id,
+                        "title": event.id,
+                        "location": console_profile_location(),
+                        "profile": empty_console_profile(),
+                    }),
+                ),
+            }
+        }
+    }
+
     // ── Runtime.compileScript / Runtime.runScript ────────────────────────────
 
     fn runtime_compile_script(&mut self, params: &Value) -> StatorResult<Value> {
@@ -1192,6 +1229,7 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.emit_pending_profile_events();
                 self.record_coverage(
                     &script.expression,
                     script.source_url.as_deref(),
@@ -1210,6 +1248,7 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.emit_pending_profile_events();
         self.record_coverage(
             &script.expression,
             script.source_url.as_deref(),
@@ -1280,6 +1319,7 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.emit_pending_profile_events();
                 self.record_coverage(expression, source_url.as_deref(), None);
                 return Ok(self.exception_response(
                     &err,
@@ -1294,6 +1334,7 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.emit_pending_profile_events();
         self.record_coverage(expression, source_url.as_deref(), None);
         self.record_type_profile(expression, source_url.as_deref(), None, &js_result);
 
@@ -1375,6 +1416,7 @@ impl CdpDispatcher {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
+                self.emit_pending_profile_events();
                 self.record_coverage(&expression, source_url.as_deref(), None);
                 return Ok(self.exception_response(
                     &err,
@@ -1389,6 +1431,7 @@ impl CdpDispatcher {
             }
         };
         self.emit_pending_binding_calls(execution_context_id);
+        self.emit_pending_profile_events();
         self.record_coverage(&expression, source_url.as_deref(), None);
         self.record_type_profile(&expression, source_url.as_deref(), None, &js_result);
 
@@ -2448,6 +2491,34 @@ fn type_profile_name(value: &JsValue) -> &'static str {
         JsValue::Function(_) | JsValue::NativeFunction(_) => "Function",
         _ => "Object",
     }
+}
+
+fn console_profile_location() -> Value {
+    json!({
+        "scriptId": "0",
+        "lineNumber": 0,
+        "columnNumber": 0,
+    })
+}
+
+fn empty_console_profile() -> Value {
+    json!({
+        "nodes": [{
+            "id": 1,
+            "callFrame": {
+                "functionName": "(root)",
+                "scriptId": "0",
+                "url": "",
+                "lineNumber": 0,
+                "columnNumber": 0,
+            },
+            "hitCount": 0,
+        }],
+        "startTime": 0,
+        "endTime": 0,
+        "samples": [],
+        "timeDeltas": [],
+    })
 }
 
 fn sampling_node_to_value(nodes: &[SamplingNodeBuilder], index: usize) -> Value {
@@ -3589,6 +3660,34 @@ mod tests {
             r#"{"id":4,"method":"Profiler.takeTypeProfile","params":{}}"#,
         );
         assert!(profile["result"]["result"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn profiler_console_profile_events_are_emitted_from_runtime_execution() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(&mut d, r#"{"id":0,"method":"Profiler.enable","params":{}}"#);
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"console.profile('p'); console.profileEnd('p'); 42"}}"#,
+        );
+        assert_eq!(messages[0]["method"], "Profiler.consoleProfileStarted");
+        assert_eq!(messages[0]["params"]["id"], "p");
+        assert_eq!(messages[1]["method"], "Profiler.consoleProfileFinished");
+        assert_eq!(messages[1]["params"]["id"], "p");
+        assert!(messages[1]["params"]["profile"].is_object());
+        assert_eq!(messages[2]["id"], 1);
+        assert_eq!(messages[2]["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn profiler_console_profile_events_are_dropped_when_profiler_disabled() {
+        let mut d = fresh_dispatcher();
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"console.profile('p'); console.profileEnd('p'); 42"}}"#,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["id"], 1);
     }
 
     #[test]
