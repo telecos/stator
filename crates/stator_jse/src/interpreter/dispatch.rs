@@ -3722,7 +3722,8 @@ fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult
             // consume_exception_resume returns true on a
             // resume re-execution — skip the pause in that
             // case so the exception can propagate.
-            if dbg.pause_on_exceptions && !dbg.consume_exception_resume() {
+            let resumed_throw = dbg.consume_exception_resume();
+            if dbg.pause_on_exceptions && !dbg.skip_all_pauses() && !resumed_throw {
                 ctx.frame.pc = throw_idx as usize; // back up
                 Some(dbg.on_exception(throw_offset))
             } else {
@@ -5381,8 +5382,14 @@ fn handle_debugger(
     let stmt_offset = ctx.byte_offsets[ctx.frame.pc - 1] as u32;
     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
         let opt = d.borrow();
-        opt.as_ref()
-            .map(|rc| rc.borrow_mut().on_debugger_statement(stmt_offset))
+        opt.as_ref().and_then(|rc| {
+            let mut dbg = rc.borrow_mut();
+            if dbg.skip_all_pauses() {
+                None
+            } else {
+                Some(dbg.on_debugger_statement(stmt_offset))
+            }
+        })
     }) {
         return Err(pause_err);
     }

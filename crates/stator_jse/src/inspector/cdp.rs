@@ -30,7 +30,9 @@
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
 //! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state (typed error on invalid `state`) |
-//! | `Debugger`     | `setBreakpointByUrl`      | Sets a breakpoint (stub, returns id) |
+//! | `Debugger`     | `setBreakpointByUrl`      | Resolves URL breakpoints against registered scripts |
+//! | `Debugger`     | `setBreakpointsActive`    | Enables/disables installed breakpoint pauses |
+//! | `Debugger`     | `setSkipAllPauses`        | Suppresses/resumes all debugger pause sources |
 //! | `Debugger`     | `resume`                  | Resumes after a pause; emits `Debugger.resumed` when an active pause exists |
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
@@ -390,6 +392,10 @@ pub struct CdpDispatcher {
     next_breakpoint_id: u32,
     /// CDP breakpoint IDs returned by `Debugger.setBreakpointByUrl`.
     cdp_breakpoints: HashSet<String>,
+    /// CDP `Debugger.setBreakpointsActive` state mirrored onto the debugger.
+    breakpoints_active: bool,
+    /// CDP `Debugger.setSkipAllPauses` state mirrored onto the debugger.
+    skip_all_pauses: bool,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
     /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
@@ -464,6 +470,8 @@ impl CdpDispatcher {
             script_urls: HashMap::new(),
             next_breakpoint_id: 1,
             cdp_breakpoints: HashSet::new(),
+            breakpoints_active: true,
+            skip_all_pauses: false,
             remote_objects: RemoteObjectRegistry::new(),
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
@@ -540,9 +548,12 @@ impl CdpDispatcher {
         debugger: Rc<RefCell<Debugger>>,
     ) -> Option<Rc<RefCell<Debugger>>> {
         let pause_on_exceptions = self.pause_on_exceptions.enabled();
-        debugger
-            .borrow_mut()
-            .set_pause_on_exceptions(pause_on_exceptions);
+        {
+            let mut debugger_ref = debugger.borrow_mut();
+            debugger_ref.set_pause_on_exceptions(pause_on_exceptions);
+            debugger_ref.set_breakpoints_active(self.breakpoints_active);
+            debugger_ref.set_skip_all_pauses(self.skip_all_pauses);
+        }
         self.debugger.replace(debugger)
     }
 
@@ -863,6 +874,8 @@ impl CdpDispatcher {
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
             "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
+            "Debugger.setBreakpointsActive" => self.debugger_set_breakpoints_active(&req.params),
+            "Debugger.setSkipAllPauses" => self.debugger_set_skip_all_pauses(&req.params),
             "Debugger.resume" => self.debugger_resume(),
             "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
@@ -1636,6 +1649,39 @@ impl CdpDispatcher {
             debugger
                 .borrow_mut()
                 .set_pause_on_exceptions(state.enabled());
+        }
+        Ok(json!({}))
+    }
+
+    fn debugger_set_breakpoints_active(&mut self, params: &Value) -> StatorResult<Value> {
+        let active = params
+            .get("active")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBreakpointsActive: required parameter 'active' is missing or not \
+                     a boolean"
+                        .to_string(),
+                )
+            })?;
+        self.breakpoints_active = active;
+        if let Some(debugger) = self.debugger.as_ref() {
+            debugger.borrow_mut().set_breakpoints_active(active);
+        }
+        Ok(json!({}))
+    }
+
+    fn debugger_set_skip_all_pauses(&mut self, params: &Value) -> StatorResult<Value> {
+        let skip = params.get("skip").and_then(Value::as_bool).ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.setSkipAllPauses: required parameter 'skip' is missing or not a \
+                     boolean"
+                    .to_string(),
+            )
+        })?;
+        self.skip_all_pauses = skip;
+        if let Some(debugger) = self.debugger.as_ref() {
+            debugger.borrow_mut().set_skip_all_pauses(skip);
         }
         Ok(json!({}))
     }
@@ -5423,6 +5469,54 @@ mod tests {
             remaining.iter().all(|m| m.get("method").is_none()),
             "no event expected when there is no active pause; got: {remaining:?}"
         );
+    }
+
+    #[test]
+    fn set_breakpoints_active_propagates_to_attached_and_late_debuggers() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointsActive","params":{"active":false}}"#,
+        );
+        assert!(!dbg.borrow().breakpoints_active());
+
+        let late = Rc::new(RefCell::new(InterpreterDebugger::new()));
+        d.attach_debugger(Rc::clone(&late));
+        assert!(
+            !late.borrow().breakpoints_active(),
+            "late-attached debugger should inherit cached breakpoint-active state"
+        );
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointsActive","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
+    }
+
+    #[test]
+    fn set_skip_all_pauses_propagates_to_attached_and_late_debuggers() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setSkipAllPauses","params":{"skip":true}}"#,
+        );
+        assert!(dbg.borrow().skip_all_pauses());
+
+        let late = Rc::new(RefCell::new(InterpreterDebugger::new()));
+        d.attach_debugger(Rc::clone(&late));
+        assert!(
+            late.borrow().skip_all_pauses(),
+            "late-attached debugger should inherit cached skip-all-pauses state"
+        );
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setSkipAllPauses","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
     }
 
     #[test]

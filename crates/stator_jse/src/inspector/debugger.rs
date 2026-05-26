@@ -172,11 +172,15 @@ enum StepMode {
 pub struct Debugger {
     /// Active breakpoints, keyed by bytecode byte offset.
     breakpoints: HashMap<u32, Breakpoint>,
+    /// Whether user-installed breakpoints are allowed to pause execution.
+    breakpoints_active: bool,
     /// Monotonically increasing breakpoint ID counter.
     next_id: BreakpointId,
     /// When `true`, any `Throw` instruction causes a pause before the
     /// exception propagates.
     pub pause_on_exceptions: bool,
+    /// When `true`, all pause sources are ignored until cleared.
+    skip_all_pauses: bool,
     /// Current stepping state.
     step_mode: StepMode,
     /// When `true`, the next call to [`Self::check_pause_at`] is skipped
@@ -205,8 +209,10 @@ impl Debugger {
     pub fn new() -> Self {
         Self {
             breakpoints: HashMap::new(),
+            breakpoints_active: true,
             next_id: 1,
             pause_on_exceptions: false,
+            skip_all_pauses: false,
             step_mode: StepMode::None,
             skip_next: false,
             exception_resume: false,
@@ -272,6 +278,16 @@ impl Debugger {
         self.breakpoints.values()
     }
 
+    /// Enable or disable user-installed breakpoints without removing them.
+    pub fn set_breakpoints_active(&mut self, active: bool) {
+        self.breakpoints_active = active;
+    }
+
+    /// Return whether user-installed breakpoints are currently active.
+    pub fn breakpoints_active(&self) -> bool {
+        self.breakpoints_active
+    }
+
     // ── Source map ───────────────────────────────────────────────────────────
 
     /// Return all valid breakpoint locations in `bytecodes`, derived from its
@@ -301,6 +317,16 @@ impl Debugger {
     /// [`DebugAction::Continue`] allows the exception to propagate normally.
     pub fn set_pause_on_exceptions(&mut self, enable: bool) {
         self.pause_on_exceptions = enable;
+    }
+
+    /// Enable or disable the global "skip all pauses" state.
+    pub fn set_skip_all_pauses(&mut self, skip: bool) {
+        self.skip_all_pauses = skip;
+    }
+
+    /// Return whether every pause source is currently suppressed.
+    pub fn skip_all_pauses(&self) -> bool {
+        self.skip_all_pauses
     }
 
     // ── Last pause information ───────────────────────────────────────────────
@@ -338,6 +364,9 @@ impl Debugger {
     /// re-pausing at the same offset immediately after resuming from a
     /// breakpoint or step pause.
     pub fn check_pause_at(&mut self, offset: u32) -> Option<StatorError> {
+        if self.skip_all_pauses {
+            return None;
+        }
         // After a breakpoint or step pause, skip once to avoid re-pausing at
         // the same instruction when the interpreter is re-entered.
         if self.skip_next {
@@ -345,7 +374,9 @@ impl Debugger {
             return None;
         }
 
-        let reason = if let Some(bp) = self.breakpoints.get(&offset) {
+        let reason = if self.breakpoints_active
+            && let Some(bp) = self.breakpoints.get(&offset)
+        {
             PauseReason::Breakpoint(bp.id)
         } else {
             let depth = call_stack_depth();
@@ -533,6 +564,36 @@ mod tests {
 
         let mut dbg = Debugger::new();
         assert!(dbg.set_breakpoint_at_line(&ba, 99).is_none());
+    }
+
+    #[test]
+    fn test_breakpoints_active_suppresses_breakpoint_without_removing_it() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_breakpoint_at_offset(0, 1, 1);
+        dbg.set_breakpoints_active(false);
+
+        assert!(!dbg.breakpoints_active());
+        assert!(dbg.check_pause_at(0).is_none());
+        assert!(dbg.breakpoints().any(|bp| bp.id == id));
+
+        dbg.set_breakpoints_active(true);
+        assert!(dbg.check_pause_at(0).is_some());
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
+    }
+
+    #[test]
+    fn test_skip_all_pauses_suppresses_breakpoints_and_steps() {
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        dbg.apply_action(DebugAction::StepInto);
+        dbg.set_skip_all_pauses(true);
+
+        assert!(dbg.skip_all_pauses());
+        assert!(dbg.check_pause_at(0).is_none());
+        assert!(dbg.check_pause_at(1).is_none());
+
+        dbg.set_skip_all_pauses(false);
+        assert!(dbg.check_pause_at(0).is_some());
     }
 
     // ── Source map ────────────────────────────────────────────────────────────
