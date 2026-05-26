@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 25
+#define STATOR_FFI_ABI_VERSION_MINOR 26
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1525,6 +1525,15 @@ typedef struct StatorWasmInstance StatorWasmInstance;
 typedef struct StatorWasmModule StatorWasmModule;
 
 /**
+ * Opaque handle to a host-owned shared WebAssembly memory.
+ *
+ * Shared memories can be supplied as imports to [`stator_wasm_instantiate_with_memory_imports`].
+ * They are created against a module's Wasm engine so Wasmtime can safely bind
+ * them into instances of that module.
+ */
+typedef struct StatorWasmSharedMemory StatorWasmSharedMemory;
+
+/**
  * Opaque host-controlled compileStreaming/instantiateStreaming operation.
  */
 typedef struct StatorWasmStreamingOperation StatorWasmStreamingOperation;
@@ -2950,6 +2959,25 @@ typedef struct StatorWasmImports {
    */
   size_t funcs_len;
 } StatorWasmImports;
+
+/**
+ * A host shared-memory import passed to
+ * [`stator_wasm_instantiate_with_memory_imports`].
+ */
+typedef struct StatorWasmMemoryImport {
+  /**
+   * Import module name as a null-terminated UTF-8 string.
+   */
+  const char *module_name;
+  /**
+   * Import field name as a null-terminated UTF-8 string.
+   */
+  const char *field_name;
+  /**
+   * Shared memory handle to bind to this import.
+   */
+  const struct StatorWasmSharedMemory *memory;
+} StatorWasmMemoryImport;
 
 /**
  * C-callable named-property getter callback.
@@ -7454,6 +7482,67 @@ double stator_platform_monotonically_increasing_time(const struct StatorPlatform
 double stator_platform_current_clock_time_millis(const struct StatorPlatform *platform);
 
 /**
+ * Create a shared WebAssembly memory compatible with `module`'s engine.
+ *
+ * Returns null if `module` is null, `maximum_pages < minimum_pages`, or
+ * Wasmtime rejects the shared memory type.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorWasmModule`] pointer.
+ */
+struct StatorWasmSharedMemory *stator_wasm_shared_memory_new(const struct StatorWasmModule *module,
+                                                             uint32_t minimum_pages,
+                                                             uint32_t maximum_pages);
+
+/**
+ * Destroy a shared WebAssembly memory handle.
+ *
+ * # Safety
+ * `memory` must be either null or a pointer returned by
+ * [`stator_wasm_shared_memory_new`] that has not already been destroyed.
+ */
+void stator_wasm_shared_memory_destroy(struct StatorWasmSharedMemory *memory);
+
+/**
+ * Return the current shared-memory byte length.
+ *
+ * Returns 0 for null memory handles.
+ *
+ * # Safety
+ * `memory` must be either null or a valid, live [`StatorWasmSharedMemory`]
+ * pointer.
+ */
+size_t stator_wasm_shared_memory_byte_length(const struct StatorWasmSharedMemory *memory);
+
+/**
+ * Copy bytes out of a shared WebAssembly memory.
+ *
+ * Returns `false` for null pointers or out-of-bounds ranges.
+ *
+ * # Safety
+ * - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+ * - `out` must be writable for `len` bytes when `len > 0`.
+ */
+bool stator_wasm_shared_memory_read(const struct StatorWasmSharedMemory *memory,
+                                    size_t offset,
+                                    uint8_t *out,
+                                    size_t len);
+
+/**
+ * Copy bytes into a shared WebAssembly memory.
+ *
+ * Returns `false` for null pointers or out-of-bounds ranges.
+ *
+ * # Safety
+ * - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+ * - `data` must be readable for `len` bytes when `len > 0`.
+ */
+bool stator_wasm_shared_memory_write(struct StatorWasmSharedMemory *memory,
+                                     size_t offset,
+                                     const uint8_t *data,
+                                     size_t len);
+
+/**
  * Begin a host-controlled `WebAssembly.compileStreaming`-style operation.
  *
  * The returned operation starts pending. Stator does not fetch or buffer a
@@ -7618,6 +7707,25 @@ void stator_wasm_module_destroy(struct StatorWasmModule *module);
 struct StatorWasmInstance *stator_wasm_instantiate(struct StatorWasmModule *module,
                                                    struct StatorContext *ctx,
                                                    const struct StatorWasmImports *imports);
+
+/**
+ * Instantiate a compiled module with host functions and shared-memory imports.
+ *
+ * This additive entry point keeps [`StatorWasmImports`] ABI-stable while
+ * allowing embedders to bind real shared linear memories. Non-shared memories
+ * remain unsupported because Wasmtime cannot safely share them across stores.
+ *
+ * # Safety
+ * - `module`, `ctx`, and `imports` follow [`stator_wasm_instantiate`]'s
+ *   contract.
+ * - `memories` must point to `memories_len` readable
+ *   [`StatorWasmMemoryImport`] elements when `memories_len > 0`.
+ */
+struct StatorWasmInstance *stator_wasm_instantiate_with_memory_imports(struct StatorWasmModule *module,
+                                                                       struct StatorContext *ctx,
+                                                                       const struct StatorWasmImports *imports,
+                                                                       const struct StatorWasmMemoryImport *memories,
+                                                                       size_t memories_len);
 
 /**
  * Free a [`StatorWasmInstance`] previously returned by

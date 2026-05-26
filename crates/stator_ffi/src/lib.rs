@@ -66,8 +66,8 @@ use stator_jse::snapshot::{
     load_globals_stwc, reinstall_globals_with_manifest, serialize_bytecode_array,
 };
 use stator_jse::wasm::{
-    HostFunc, HostFuncCallback, HostGlobal, HostMemory, HostVal, HostValKind, WasmEngine,
-    WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
+    HostFunc, HostFuncCallback, HostGlobal, HostMemory, HostVal, HostValKind, MemoryType,
+    SharedMemory, WasmEngine, WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
 };
 
 // ── Stator FFI ABI version contract ──────────────────────────────────────────
@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 25;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 26;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -17680,6 +17680,138 @@ pub struct StatorWasmInstance {
 // for synchronisation if passed across threads.
 unsafe impl Send for StatorWasmInstance {}
 
+/// Opaque handle to a host-owned shared WebAssembly memory.
+///
+/// Shared memories can be supplied as imports to [`stator_wasm_instantiate_with_memory_imports`].
+/// They are created against a module's Wasm engine so Wasmtime can safely bind
+/// them into instances of that module.
+pub struct StatorWasmSharedMemory {
+    memory: SharedMemory,
+}
+
+// SAFETY: `SharedMemory` is Wasmtime's thread-safe shared linear memory handle.
+unsafe impl Send for StatorWasmSharedMemory {}
+
+/// Create a shared WebAssembly memory compatible with `module`'s engine.
+///
+/// Returns null if `module` is null, `maximum_pages < minimum_pages`, or
+/// Wasmtime rejects the shared memory type.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorWasmModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_new(
+    module: *const StatorWasmModule,
+    minimum_pages: u32,
+    maximum_pages: u32,
+) -> *mut StatorWasmSharedMemory {
+    if module.is_null() || maximum_pages < minimum_pages {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let module = unsafe { &*module };
+    let ty = MemoryType::shared(minimum_pages, maximum_pages);
+    match SharedMemory::new(module.engine.inner(), ty) {
+        Ok(memory) => Box::into_raw(Box::new(StatorWasmSharedMemory { memory })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Destroy a shared WebAssembly memory handle.
+///
+/// # Safety
+/// `memory` must be either null or a pointer returned by
+/// [`stator_wasm_shared_memory_new`] that has not already been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_destroy(memory: *mut StatorWasmSharedMemory) {
+    if !memory.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(memory) });
+    }
+}
+
+/// Return the current shared-memory byte length.
+///
+/// Returns 0 for null memory handles.
+///
+/// # Safety
+/// `memory` must be either null or a valid, live [`StatorWasmSharedMemory`]
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_byte_length(
+    memory: *const StatorWasmSharedMemory,
+) -> usize {
+    if memory.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    unsafe { (*memory).memory.data().len() }
+}
+
+/// Copy bytes out of a shared WebAssembly memory.
+///
+/// Returns `false` for null pointers or out-of-bounds ranges.
+///
+/// # Safety
+/// - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+/// - `out` must be writable for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_read(
+    memory: *const StatorWasmSharedMemory,
+    offset: usize,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    if memory.is_null() || (out.is_null() && len != 0) {
+        return false;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    let data = unsafe { (*memory).memory.data() };
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    if end > data.len() {
+        return false;
+    }
+    for idx in 0..len {
+        // SAFETY: range and output pointer were validated above.
+        unsafe { *out.add(idx) = *data[offset + idx].get() };
+    }
+    true
+}
+
+/// Copy bytes into a shared WebAssembly memory.
+///
+/// Returns `false` for null pointers or out-of-bounds ranges.
+///
+/// # Safety
+/// - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+/// - `data` must be readable for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_write(
+    memory: *mut StatorWasmSharedMemory,
+    offset: usize,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    if memory.is_null() || (data.is_null() && len != 0) {
+        return false;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    let mem_data = unsafe { (*memory).memory.data() };
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    if end > mem_data.len() {
+        return false;
+    }
+    for idx in 0..len {
+        // SAFETY: range and input pointer were validated above.
+        unsafe { *mem_data[offset + idx].get() = *data.add(idx) };
+    }
+    true
+}
+
 /// Host-controlled WebAssembly streaming operation kind.
 ///
 /// Stator does not fetch network responses or pretend to incrementally compile
@@ -18399,6 +18531,18 @@ pub struct StatorWasmImports {
     pub funcs_len: usize,
 }
 
+/// A host shared-memory import passed to
+/// [`stator_wasm_instantiate_with_memory_imports`].
+#[repr(C)]
+pub struct StatorWasmMemoryImport {
+    /// Import module name as a null-terminated UTF-8 string.
+    pub module_name: *const c_char,
+    /// Import field name as a null-terminated UTF-8 string.
+    pub field_name: *const c_char,
+    /// Shared memory handle to bind to this import.
+    pub memory: *const StatorWasmSharedMemory,
+}
+
 /// Instantiate a compiled [`StatorWasmModule`] into a live
 /// [`StatorWasmInstance`].
 ///
@@ -18450,6 +18594,56 @@ pub unsafe extern "C" fn stator_wasm_instantiate(
     };
 
     match WasmInstance::new_with_imports(&m.engine, &m.module, host_imports) {
+        Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Instantiate a compiled module with host functions and shared-memory imports.
+///
+/// This additive entry point keeps [`StatorWasmImports`] ABI-stable while
+/// allowing embedders to bind real shared linear memories. Non-shared memories
+/// remain unsupported because Wasmtime cannot safely share them across stores.
+///
+/// # Safety
+/// - `module`, `ctx`, and `imports` follow [`stator_wasm_instantiate`]'s
+///   contract.
+/// - `memories` must point to `memories_len` readable
+///   [`StatorWasmMemoryImport`] elements when `memories_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instantiate_with_memory_imports(
+    module: *mut StatorWasmModule,
+    ctx: *mut StatorContext,
+    imports: *const StatorWasmImports,
+    memories: *const StatorWasmMemoryImport,
+    memories_len: usize,
+) -> *mut StatorWasmInstance {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let m = unsafe { &*module };
+    let host_imports = if imports.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees `imports` is valid for one read.
+        match unsafe { build_host_imports(ctx, imports) } {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let host_memories = match unsafe { build_host_memory_imports(memories, memories_len) } {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+
+    match WasmInstance::new_with_extern_imports_full(
+        &m.engine,
+        &m.module,
+        host_imports,
+        Vec::new(),
+        host_memories,
+    ) {
         Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -18576,6 +18770,44 @@ unsafe fn build_host_imports(
             params,
             results,
             callback,
+        });
+    }
+    Some(out)
+}
+
+unsafe fn build_host_memory_imports(
+    memories: *const StatorWasmMemoryImport,
+    memories_len: usize,
+) -> Option<Vec<HostMemory>> {
+    if memories_len == 0 {
+        return Some(Vec::new());
+    }
+    if memories.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the slice is valid for `memories_len` reads.
+    let memories = unsafe { std::slice::from_raw_parts(memories, memories_len) };
+    let mut out = Vec::with_capacity(memories.len());
+    for memory in memories {
+        if memory.module_name.is_null() || memory.field_name.is_null() || memory.memory.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees strings are valid C strings.
+        let module_name = match unsafe { CStr::from_ptr(memory.module_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        // SAFETY: caller guarantees strings are valid C strings.
+        let field_name = match unsafe { CStr::from_ptr(memory.field_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        // SAFETY: caller guarantees the memory handle is valid.
+        let shared_memory = unsafe { (*memory.memory).memory.clone() };
+        out.push(HostMemory {
+            module: module_name,
+            name: field_name,
+            memory: shared_memory,
         });
     }
     Some(out)
@@ -39656,6 +39888,135 @@ mod tests {
             stator_value_destroy(b);
             stator_wasm_instance_destroy(inst);
             stator_wasm_module_destroy(m);
+        }
+    }
+
+    #[test]
+    fn test_ffi_wasm_shared_memory_import_roundtrips_through_handle() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "mem" (memory 1 1 shared))
+                (func (export "store") (param i32 i32)
+                    local.get 0
+                    local.get 1
+                    i32.store)
+                (func (export "load") (param i32) (result i32)
+                    local.get 0
+                    i32.load))
+        "#;
+        let module = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!module.is_null());
+        let memory = unsafe { stator_wasm_shared_memory_new(module, 1, 1) };
+        assert!(!memory.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_shared_memory_byte_length(memory) },
+            65_536
+        );
+        let memory_import = StatorWasmMemoryImport {
+            module_name: c"env".as_ptr(),
+            field_name: c"mem".as_ptr(),
+            memory,
+        };
+        let instance = unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &memory_import,
+                1,
+            )
+        };
+        assert!(!instance.is_null());
+
+        let offset = unsafe { stator_value_new_number(iso.as_ptr(), 0.0) };
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 0x12345678 as f64) };
+        let argv: [*const StatorValue; 2] = [offset, value];
+        let store_result = unsafe {
+            stator_wasm_instance_call(instance, iso.as_ptr(), c"store".as_ptr(), argv.as_ptr(), 2)
+        };
+        assert!(!store_result.is_null());
+        let mut bytes = [0u8; 4];
+        assert!(unsafe { stator_wasm_shared_memory_read(memory, 0, bytes.as_mut_ptr(), 4) });
+        assert_eq!(u32::from_le_bytes(bytes), 0x12345678);
+
+        let patch = 0x11223344u32.to_le_bytes();
+        assert!(unsafe { stator_wasm_shared_memory_write(memory, 4, patch.as_ptr(), patch.len()) });
+        let load_offset = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let load_argv: [*const StatorValue; 1] = [load_offset];
+        let load_result = unsafe {
+            stator_wasm_instance_call(
+                instance,
+                iso.as_ptr(),
+                c"load".as_ptr(),
+                load_argv.as_ptr(),
+                load_argv.len(),
+            )
+        };
+        assert!(!load_result.is_null());
+        assert_eq!(
+            unsafe { stator_value_as_number(load_result) },
+            0x11223344 as f64
+        );
+
+        assert!(!unsafe { stator_wasm_shared_memory_read(memory, 65_535, bytes.as_mut_ptr(), 4) });
+        assert!(!unsafe { stator_wasm_shared_memory_write(memory, 65_535, patch.as_ptr(), 4) });
+
+        unsafe {
+            stator_value_destroy(load_result);
+            stator_value_destroy(load_offset);
+            stator_value_destroy(store_result);
+            stator_value_destroy(value);
+            stator_value_destroy(offset);
+            stator_wasm_instance_destroy(instance);
+            stator_wasm_shared_memory_destroy(memory);
+            stator_wasm_module_destroy(module);
+        }
+    }
+
+    #[test]
+    fn test_ffi_wasm_shared_memory_import_rejects_malformed_inputs() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "mem" (memory 1 1 shared)))
+        "#;
+        let module = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!module.is_null());
+        assert!(unsafe { stator_wasm_shared_memory_new(module, 2, 1) }.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_shared_memory_byte_length(std::ptr::null()) },
+            0
+        );
+
+        let malformed = StatorWasmMemoryImport {
+            module_name: c"env".as_ptr(),
+            field_name: c"mem".as_ptr(),
+            memory: std::ptr::null(),
+        };
+        let instance = unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &malformed,
+                1,
+            )
+        };
+        assert!(instance.is_null());
+        assert!(unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+            .is_null()
+        });
+        unsafe {
+            stator_wasm_shared_memory_destroy(std::ptr::null_mut());
+            stator_wasm_module_destroy(module);
         }
     }
 
