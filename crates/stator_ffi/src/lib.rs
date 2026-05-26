@@ -21,7 +21,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use stator_jse::builtins::error::{ErrorKind, JsError};
 use stator_jse::builtins::promise::PromiseState;
@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 24;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 25;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -2368,9 +2368,15 @@ enum StatorValueInner {
 
 type MaterializedDomWrapRegistry = HashMap<usize, (*mut StatorDomObjectWrap, Rc<Cell<bool>>)>;
 
+static NEXT_FUNCTION_TEMPLATE_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
     static DOM_WRAP_MATERIALIZED_REGISTRY: RefCell<MaterializedDomWrapRegistry> =
         RefCell::new(HashMap::new());
+}
+
+fn next_function_template_id() -> u64 {
+    NEXT_FUNCTION_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn clone_stator_value_inner(inner: &StatorValueInner) -> StatorValueInner {
@@ -2414,6 +2420,55 @@ fn dom_wrap_inner_for_plain_object(plain: &Rc<RefCell<PropertyMap>>) -> Option<S
             alive: Rc::clone(alive),
         })
     })
+}
+
+fn dom_wrap_ptr_for_plain_object(
+    plain: &Rc<RefCell<PropertyMap>>,
+) -> Option<*mut StatorDomObjectWrap> {
+    let key = Rc::as_ptr(plain) as usize;
+    DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let (wrap, alive) = registry.get(&key)?;
+        if wrap.is_null() || !alive.get() {
+            return None;
+        }
+        Some(*wrap)
+    })
+}
+
+fn dom_wrap_ptr_for_js_value(value: &JsValue) -> Option<*mut StatorDomObjectWrap> {
+    match value {
+        JsValue::PlainObject(plain) => dom_wrap_ptr_for_plain_object(plain),
+        _ => None,
+    }
+}
+
+fn dom_wrap_ptr_for_value_inner(inner: &StatorValueInner) -> Option<*mut StatorDomObjectWrap> {
+    match inner {
+        StatorValueInner::DomWrapHandle { wrap, alive, .. } if !wrap.is_null() && alive.get() => {
+            Some(*wrap)
+        }
+        _ => None,
+    }
+}
+
+fn dom_wrap_has_function_template_id(wrap: *mut StatorDomObjectWrap, template_id: u64) -> bool {
+    if wrap.is_null() {
+        return false;
+    }
+    // SAFETY: callers only pass live wrapper pointers recovered from FFI values
+    // or the materialized-wrapper registry.
+    let wrap_ref = unsafe { &*wrap };
+    wrap_ref.alive.get() && wrap_ref.function_template_ids.contains(&template_id)
+}
+
+fn function_template_instance_ids(tmpl: &StatorFunctionTemplate) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(tmpl.ancestor_template_ids.len() + 1);
+    ids.push(tmpl.template_id);
+    ids.extend(tmpl.ancestor_template_ids.iter().copied());
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// An opaque handle to a JavaScript value (number or string).
@@ -14157,6 +14212,9 @@ pub unsafe extern "C" fn stator_function_callback_info_get_isolate(
 /// global environment via [`stator_context_global_set`].
 pub struct StatorFunctionTemplate {
     isolate: *mut StatorIsolate,
+    template_id: u64,
+    ancestor_template_ids: Vec<u64>,
+    signature_template_id: Option<u64>,
     callback: StatorFunctionTemplateCallback,
     instance_template: Box<StatorObjectTemplate>,
     prototype_template: Box<StatorObjectTemplate>,
@@ -14185,6 +14243,9 @@ pub unsafe extern "C" fn stator_function_template_new(
     }
     Box::into_raw(Box::new(StatorFunctionTemplate {
         isolate,
+        template_id: next_function_template_id(),
+        ancestor_template_ids: Vec::new(),
+        signature_template_id: None,
         callback,
         instance_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
         prototype_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
@@ -14271,9 +14332,115 @@ pub unsafe extern "C" fn stator_function_template_inherit(
     child
         .instance_template
         .merge_missing_properties_from(&parent.instance_template);
+    child.ancestor_template_ids = function_template_instance_ids(parent);
     child.prototype_template.prototype_template =
         Some(Box::new(parent.prototype_template.clone_deep()));
     StatorStatus::StatorStatusOk
+}
+
+/// An opaque receiver signature for function-template callbacks.
+///
+/// Signatures snapshot the receiver template id when created. Assigning a
+/// signature to a function template makes callbacks fail closed with a
+/// `TypeError` unless their JavaScript receiver is a DOM wrapper that was
+/// created from the receiver template or one of its descendants.
+pub struct StatorSignature {
+    isolate: *mut StatorIsolate,
+    receiver_template_id: u64,
+}
+
+/// Create a signature requiring receivers created from `receiver`.
+///
+/// Returns null when `receiver` is null.
+///
+/// # Safety
+/// `receiver` must be either null or a valid, live [`StatorFunctionTemplate`]
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_signature_new(
+    receiver: *const StatorFunctionTemplate,
+) -> *mut StatorSignature {
+    if receiver.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `receiver` is valid.
+    let receiver = unsafe { &*receiver };
+    Box::into_raw(Box::new(StatorSignature {
+        isolate: receiver.isolate,
+        receiver_template_id: receiver.template_id,
+    }))
+}
+
+/// Destroy a signature created by [`stator_signature_new`].
+///
+/// # Safety
+/// `signature` must be either null or a pointer returned by
+/// [`stator_signature_new`] that has not already been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_signature_destroy(signature: *mut StatorSignature) {
+    if !signature.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(signature) });
+    }
+}
+
+/// Attach a receiver signature to a function template.
+///
+/// The receiver template id is copied into `tmpl`, so the caller may destroy
+/// `signature` immediately after this call. Passing a null signature clears any
+/// existing signature. Cross-isolate signatures are rejected.
+///
+/// # Safety
+/// `tmpl` must be a valid, live [`StatorFunctionTemplate`] pointer. `signature`
+/// must be either null or a valid [`StatorSignature`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_set_signature(
+    tmpl: *mut StatorFunctionTemplate,
+    signature: *const StatorSignature,
+) -> StatorStatus {
+    if tmpl.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let tmpl_ref = unsafe { &mut *tmpl };
+    if signature.is_null() {
+        tmpl_ref.signature_template_id = None;
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `signature` is valid.
+    let signature = unsafe { &*signature };
+    if tmpl_ref.isolate != signature.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    tmpl_ref.signature_template_id = Some(signature.receiver_template_id);
+    StatorStatus::StatorStatusOk
+}
+
+/// Test whether `value` is an instance of `tmpl`.
+///
+/// This checks DOM wrappers created by applying `tmpl` or a function template
+/// that inherited from `tmpl`. Non-wrapper values, null pointers, and invalidated
+/// wrappers return `false`.
+///
+/// # Safety
+/// `tmpl` and `value` must be either null or valid, live pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_has_instance(
+    tmpl: *const StatorFunctionTemplate,
+    value: *const StatorValue,
+) -> bool {
+    if tmpl.is_null() || value.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let tmpl_ref = unsafe { &*tmpl };
+    let value_ref = unsafe { &*value };
+    if tmpl_ref.isolate != value_ref.isolate {
+        return false;
+    }
+    dom_wrap_ptr_for_value_inner(&value_ref.inner)
+        .map(|wrap| dom_wrap_has_function_template_id(wrap, tmpl_ref.template_id))
+        .unwrap_or(false)
 }
 
 /// Produce a [`StatorValue`] representing the function described by `tmpl`.
@@ -14301,9 +14468,22 @@ pub unsafe extern "C" fn stator_function_template_get_function(
     // SAFETY: caller guarantees `tmpl` is valid.
     let isolate = unsafe { (*tmpl).isolate };
     let callback = unsafe { (*tmpl).callback };
+    let signature_template_id = unsafe { (*tmpl).signature_template_id };
 
     // Build a NativeFn closure that wraps the C callback.
     let native: NativeFn = Rc::new(move |args: Vec<JsValue>| {
+        if let Some(required_template_id) = signature_template_id {
+            let this = stator_jse::interpreter::current_this();
+            let allowed = this
+                .as_ref()
+                .and_then(dom_wrap_ptr_for_js_value)
+                .map(|wrap| dom_wrap_has_function_template_id(wrap, required_template_id))
+                .unwrap_or(false);
+            if !allowed {
+                return Err(StatorError::TypeError("Illegal invocation".to_string()));
+            }
+        }
+
         // Convert JsValue args into temporary StatorValue structs on the stack.
         let c_vals: Vec<StatorValue> = args
             .iter()
@@ -14971,6 +15151,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_apply_function_template(
 
     wrap_ref.instance_template = Some(tmpl_ref.instance_template.clone_deep());
     wrap_ref.prototype_template = Some(tmpl_ref.prototype_template.clone_deep());
+    wrap_ref.function_template_ids = function_template_instance_ids(tmpl_ref);
 
     if let Some(handler) = wrap_ref
         .instance_template
@@ -19086,6 +19267,8 @@ pub struct StatorDomObjectWrap {
     instance_template: Option<StatorObjectTemplate>,
     /// FunctionTemplate prototype template snapshotted onto this wrapper.
     prototype_template: Option<StatorObjectTemplate>,
+    /// FunctionTemplate ids whose instances this DOM wrapper should match.
+    function_template_ids: Vec<u64>,
 }
 
 // SAFETY: `StatorDomObjectWrap` is single-threaded; see [`StatorValue`].
@@ -19120,6 +19303,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
         alive: Rc::new(Cell::new(true)),
         instance_template: None,
         prototype_template: None,
+        function_template_ids: Vec::new(),
     }))
 }
 
@@ -38153,6 +38337,164 @@ mod tests {
             stator_value_destroy(child_value);
             stator_function_template_destroy(child);
             stator_function_template_destroy(parent);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_has_instance_exact_and_inherited_dom_wrappers() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let parent = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let child = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        assert_eq!(
+            unsafe { stator_function_template_inherit(child, parent) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, child) },
+            StatorStatus::StatorStatusOk
+        );
+        let value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let number = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+
+        assert!(unsafe { stator_function_template_has_instance(child, value) });
+        assert!(unsafe { stator_function_template_has_instance(parent, value) });
+        assert!(!unsafe { stator_function_template_has_instance(other, value) });
+        assert!(!unsafe { stator_function_template_has_instance(parent, number) });
+        assert!(!unsafe { stator_function_template_has_instance(std::ptr::null(), value) });
+        assert!(!unsafe { stator_function_template_has_instance(parent, std::ptr::null()) });
+
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert!(!unsafe { stator_function_template_has_instance(child, value) });
+
+        unsafe {
+            stator_value_destroy(number);
+            stator_value_destroy(value);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(other);
+            stator_function_template_destroy(child);
+            stator_function_template_destroy(parent);
+        }
+    }
+
+    #[test]
+    fn test_function_template_signature_rejects_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+
+        assert!(unsafe { stator_signature_new(std::ptr::null()) }.is_null());
+        unsafe { stator_signature_destroy(std::ptr::null_mut()) };
+
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let receiver = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other_receiver = unsafe { stator_function_template_new(other.as_ptr(), noop) };
+        let signature = unsafe { stator_signature_new(receiver) };
+        let other_signature = unsafe { stator_signature_new(other_receiver) };
+
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(std::ptr::null_mut(), signature) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, other_signature) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, signature) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusOk
+        );
+
+        unsafe {
+            stator_signature_destroy(other_signature);
+            stator_signature_destroy(signature);
+            stator_function_template_destroy(other_receiver);
+            stator_function_template_destroy(receiver);
+            stator_function_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_function_template_signature_restricts_callback_receiver() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        static SIGNATURE_CALLS: AtomicI32 = AtomicI32::new(0);
+
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn signed_callback(
+            info: *const StatorFunctionCallbackInfo,
+        ) -> *mut StatorValue {
+            SIGNATURE_CALLS.fetch_add(1, Ordering::SeqCst);
+            let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+            unsafe { stator_value_new_number(isolate, 123.0) }
+        }
+
+        SIGNATURE_CALLS.store(0, Ordering::SeqCst);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let receiver_tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let method_tmpl = unsafe { stator_function_template_new(iso.as_ptr(), signed_callback) };
+        let signature = unsafe { stator_signature_new(receiver_tmpl) };
+        assert!(!signature.is_null());
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(method_tmpl, signature) },
+            StatorStatus::StatorStatusOk
+        );
+        unsafe { stator_signature_destroy(signature) };
+        let fn_val = unsafe { stator_function_template_get_function(method_tmpl, ctx) };
+        let instance = unsafe { stator_function_template_instance_template(receiver_tmpl) };
+        unsafe { stator_object_template_set(instance, c"method".as_ptr(), fn_val) };
+        unsafe { stator_value_destroy(fn_val) };
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, receiver_tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let ok_src = b"node.method()";
+        let ok_script =
+            unsafe { stator_script_compile(ctx, ok_src.as_ptr() as *const c_char, ok_src.len()) };
+        let ok_result = unsafe { stator_script_run(ok_script, ctx) };
+        assert!(!ok_result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(ok_result) }, 123.0);
+        assert_eq!(SIGNATURE_CALLS.load(Ordering::SeqCst), 1);
+
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let bad_src = b"var method = node.method; method()";
+        let bad_script =
+            unsafe { stator_script_compile(ctx, bad_src.as_ptr() as *const c_char, bad_src.len()) };
+        let bad_result = unsafe { stator_script_run(bad_script, ctx) };
+        assert!(bad_result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        assert_eq!(SIGNATURE_CALLS.load(Ordering::SeqCst), 1);
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_script_free(bad_script);
+            stator_value_destroy(ok_result);
+            stator_script_free(ok_script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(method_tmpl);
+            stator_function_template_destroy(receiver_tmpl);
             stator_context_destroy(ctx);
         }
     }

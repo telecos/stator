@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 24
+#define STATOR_FFI_ABI_VERSION_MINOR 25
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -1450,6 +1450,16 @@ typedef struct StatorPropertyNames StatorPropertyNames;
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
  */
 typedef struct StatorScript StatorScript;
+
+/**
+ * An opaque receiver signature for function-template callbacks.
+ *
+ * Signatures snapshot the receiver template id when created. Assigning a
+ * signature to a function template makes callbacks fail closed with a
+ * `TypeError` unless their JavaScript receiver is a DOM wrapper that was
+ * created from the receiver template or one of its descendants.
+ */
+typedef struct StatorSignature StatorSignature;
 
 /**
  * STWC build/ABI binding used to fail closed on incompatible warm-context blobs.
@@ -6580,6 +6590,53 @@ struct StatorObjectTemplate *stator_function_template_prototype_template(struct 
  */
 enum StatorStatus stator_function_template_inherit(struct StatorFunctionTemplate *tmpl,
                                                    const struct StatorFunctionTemplate *parent);
+
+/**
+ * Create a signature requiring receivers created from `receiver`.
+ *
+ * Returns null when `receiver` is null.
+ *
+ * # Safety
+ * `receiver` must be either null or a valid, live [`StatorFunctionTemplate`]
+ * pointer.
+ */
+struct StatorSignature *stator_signature_new(const struct StatorFunctionTemplate *receiver);
+
+/**
+ * Destroy a signature created by [`stator_signature_new`].
+ *
+ * # Safety
+ * `signature` must be either null or a pointer returned by
+ * [`stator_signature_new`] that has not already been destroyed.
+ */
+void stator_signature_destroy(struct StatorSignature *signature);
+
+/**
+ * Attach a receiver signature to a function template.
+ *
+ * The receiver template id is copied into `tmpl`, so the caller may destroy
+ * `signature` immediately after this call. Passing a null signature clears any
+ * existing signature. Cross-isolate signatures are rejected.
+ *
+ * # Safety
+ * `tmpl` must be a valid, live [`StatorFunctionTemplate`] pointer. `signature`
+ * must be either null or a valid [`StatorSignature`] pointer.
+ */
+enum StatorStatus stator_function_template_set_signature(struct StatorFunctionTemplate *tmpl,
+                                                         const struct StatorSignature *signature);
+
+/**
+ * Test whether `value` is an instance of `tmpl`.
+ *
+ * This checks DOM wrappers created by applying `tmpl` or a function template
+ * that inherited from `tmpl`. Non-wrapper values, null pointers, and invalidated
+ * wrappers return `false`.
+ *
+ * # Safety
+ * `tmpl` and `value` must be either null or valid, live pointers.
+ */
+bool stator_function_template_has_instance(const struct StatorFunctionTemplate *tmpl,
+                                           const struct StatorValue *value);
 
 /**
  * Produce a [`StatorValue`] representing the function described by `tmpl`.
