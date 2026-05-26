@@ -384,6 +384,8 @@ pub struct CdpDispatcher {
     target_session_id: Option<String>,
     /// Script sources registered by the owning inspector, keyed by scriptId.
     script_sources: HashMap<String, String>,
+    /// Script URLs extracted from registered sources, keyed by scriptId.
+    script_urls: HashMap<String, String>,
     /// Monotonically increasing ID for breakpoints set via CDP.
     next_breakpoint_id: u32,
     /// CDP breakpoint IDs returned by `Debugger.setBreakpointByUrl`.
@@ -459,6 +461,7 @@ impl CdpDispatcher {
             next_target_session_id: 1,
             target_session_id: None,
             script_sources: HashMap::new(),
+            script_urls: HashMap::new(),
             next_breakpoint_id: 1,
             cdp_breakpoints: HashSet::new(),
             remote_objects: RemoteObjectRegistry::new(),
@@ -495,7 +498,10 @@ impl CdpDispatcher {
 
     /// Register or replace a script source for `Debugger.getScriptSource`.
     pub fn register_script_source(&mut self, script_id: u32, source: String) {
-        self.script_sources.insert(script_id.to_string(), source);
+        let script_id = script_id.to_string();
+        let url = registered_script_url(&source);
+        self.script_sources.insert(script_id.clone(), source);
+        self.script_urls.insert(script_id, url);
     }
 
     /// Push a JSON-RPC parse-error response onto the outbox.
@@ -1691,6 +1697,8 @@ impl CdpDispatcher {
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32;
 
+        let requested_url = params.get("url").and_then(Value::as_str);
+        let requested_url_regex = params.get("urlRegex").and_then(Value::as_str);
         let bp_id = format!(
             "{}:{}:{}",
             self.next_breakpoint_id, line_number, column_number
@@ -1698,13 +1706,50 @@ impl CdpDispatcher {
         self.next_breakpoint_id += 1;
         self.cdp_breakpoints.insert(bp_id.clone());
 
-        Ok(json!({
-            "breakpointId": bp_id,
-            "locations": [{
+        let mut locations = Vec::new();
+        if requested_url.is_some() || requested_url_regex.is_some() {
+            let mut script_ids: Vec<String> = self.script_sources.keys().cloned().collect();
+            script_ids.sort();
+            for script_id in script_ids {
+                let Some(source) = self.script_sources.get(&script_id) else {
+                    continue;
+                };
+                let script_url = self
+                    .script_urls
+                    .get(&script_id)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let url_matches = requested_url.is_some_and(|url| url == script_url)
+                    || requested_url_regex.is_some_and(|pattern| script_url.contains(pattern));
+                if !url_matches {
+                    continue;
+                }
+                if let Some(location) =
+                    breakpoint_location_for_source(&script_id, source, line_number, column_number)
+                {
+                    if self.debugger_enabled {
+                        self.push_event(
+                            "Debugger.breakpointResolved",
+                            json!({
+                                "breakpointId": bp_id,
+                                "location": location.clone(),
+                            }),
+                        );
+                    }
+                    locations.push(location);
+                }
+            }
+        } else {
+            locations.push(json!({
                 "scriptId": "0",
                 "lineNumber": line_number,
                 "columnNumber": column_number,
-            }]
+            }));
+        }
+
+        Ok(json!({
+            "breakpointId": bp_id,
+            "locations": locations,
         }))
     }
 
@@ -2231,6 +2276,30 @@ fn exception_source_url(params: &Value, expression: &str) -> Option<String> {
             .or_else(|| trimmed.strip_prefix("//@ sourceURL="))
             .map(str::to_string)
     })
+}
+
+pub(crate) fn registered_script_url(source: &str) -> String {
+    exception_source_url(&Value::Null, source).unwrap_or_default()
+}
+
+fn breakpoint_location_for_source(
+    script_id: &str,
+    source: &str,
+    line_number: u32,
+    column_number: u32,
+) -> Option<Value> {
+    let lines: Vec<&str> = source.lines().collect();
+    let line = if source.is_empty() {
+        ""
+    } else {
+        *lines.get(line_number as usize)?
+    };
+    let column = column_number.min(line.chars().count() as u32);
+    Some(json!({
+        "scriptId": script_id,
+        "lineNumber": line_number,
+        "columnNumber": column,
+    }))
 }
 
 fn request_line_number(expression: &str) -> u32 {
@@ -4112,6 +4181,54 @@ mod tests {
             .to_string(),
         );
         assert!(again["error"].is_object());
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_resolves_registered_script_url() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":1,"columnNumber":50}}"#,
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["method"], "Debugger.breakpointResolved");
+        assert_eq!(messages[0]["params"]["location"]["scriptId"], "7");
+
+        let response = messages.last().unwrap();
+        let locations = response["result"]["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["scriptId"], "7");
+        assert_eq!(locations[0]["lineNumber"], 1);
+        assert_eq!(locations[0]["columnNumber"], 14);
+        assert_eq!(
+            response["result"]["breakpointId"],
+            messages[0]["params"]["breakpointId"]
+        );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_unknown_url_is_future_breakpoint() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "var a = 1;\n//# sourceURL=stator://app.js".to_string());
+
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://missing.js","lineNumber":0,"columnNumber":0}}"#,
+        );
+        assert!(response["result"]["breakpointId"].is_string());
+        assert!(
+            response["result"]["locations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

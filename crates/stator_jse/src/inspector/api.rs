@@ -444,6 +444,7 @@ impl InProcessInspector {
         };
         self.next_script_id = next_script_id;
 
+        let source_url = crate::inspector::cdp::registered_script_url(&source);
         let line_count = source.lines().count().max(1) as u32;
         let last_line_columns = source
             .lines()
@@ -461,7 +462,7 @@ impl InProcessInspector {
         // receive no notification, matching V8 inspector semantics.
         let params = json!({
             "scriptId": id.to_string(),
-            "url": "",
+            "url": source_url,
             "startLine": 0,
             "startColumn": 0,
             "endLine": line_count.saturating_sub(1),
@@ -785,7 +786,8 @@ mod tests {
             let _s2 = inspector.connect(11);
         }
 
-        let id_a = inspector.register_script("var a = 1;\nvar b = 2;\n".to_string());
+        let id_a = inspector
+            .register_script("var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js".to_string());
         let id_b = inspector.register_script("// second".to_string());
         assert_eq!(id_a, 1);
         assert_eq!(id_b, 2);
@@ -797,6 +799,7 @@ mod tests {
         let first: Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(first["method"], "Debugger.scriptParsed");
         assert_eq!(first["params"]["scriptId"], "1");
+        assert_eq!(first["params"]["url"], "stator://first.js");
         let second: Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(second["params"]["scriptId"], "2");
 
