@@ -93,7 +93,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 23;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 24;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -14715,6 +14715,44 @@ fn dom_object_wrap_plain_object(
         object.mark_accessor_property(name);
     }
 
+    for index in unsafe { (*wrap).inner.indexed_property_keys() } {
+        let name = index.to_string();
+        if installed_names.iter().any(|installed| installed == &name) {
+            continue;
+        }
+        installed_names.push(name.clone());
+
+        let getter_wrap_addr = wrap_addr;
+        let getter_alive = Rc::clone(&alive);
+        object.insert_with_attrs(
+            format!("__get_{name}__"),
+            JsValue::NativeFunction(Rc::new(move |_args| {
+                if !getter_alive.get() {
+                    return Ok(JsValue::Undefined);
+                }
+                let wrap = getter_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Ok(JsValue::Undefined);
+                }
+                // SAFETY: the embedder must keep the wrapper alive for as long
+                // as the installed global can be observed.
+                let value = unsafe { (*wrap).inner.get_indexed(index) };
+                // SAFETY: the wrapper owns the isolate pointer for this DOM object.
+                if let Some(error) = unsafe { pending_dom_interceptor_error((*wrap).isolate) } {
+                    return Err(error);
+                }
+                Ok(value)
+            })),
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        object.insert_with_attrs(
+            name.clone(),
+            JsValue::Undefined,
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        object.mark_accessor_property(name);
+    }
+
     // SAFETY: caller guarantees `wrap` is valid.
     if let Some(instance_template) = unsafe { (*wrap).instance_template.as_ref() } {
         install_object_template_on_property_map(&mut object, instance_template);
@@ -14933,6 +14971,27 @@ pub unsafe extern "C" fn stator_dom_object_wrap_apply_function_template(
 
     wrap_ref.instance_template = Some(tmpl_ref.instance_template.clone_deep());
     wrap_ref.prototype_template = Some(tmpl_ref.prototype_template.clone_deep());
+
+    if let Some(handler) = wrap_ref
+        .instance_template
+        .as_ref()
+        .and_then(|template| template.named_handler)
+    {
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) };
+        if status != StatorStatus::StatorStatusOk {
+            return status;
+        }
+    }
+    if let Some(handler) = wrap_ref
+        .instance_template
+        .as_ref()
+        .and_then(|template| template.indexed_handler)
+    {
+        let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) };
+        if status != StatorStatus::StatorStatusOk {
+            return status;
+        }
+    }
 
     if let Some(plain) = wrap_ref.materialized.borrow().as_ref().cloned() {
         let mut map = plain.borrow_mut();
@@ -16352,6 +16411,10 @@ pub struct StatorObjectTemplate {
     properties: HashMap<String, StatorValueInner>,
     /// Prototype template used for objects created from this template.
     prototype_template: Option<Box<StatorObjectTemplate>>,
+    /// Named property handler installed on DOM wrappers created from this template.
+    named_handler: Option<StatorDomNamedHandler>,
+    /// Indexed property handler installed on DOM wrappers created from this template.
+    indexed_handler: Option<StatorDomIndexedHandler>,
     /// The number of internal fields reserved for embedder data.
     internal_field_count: i32,
 }
@@ -16362,6 +16425,8 @@ impl StatorObjectTemplate {
             isolate,
             properties: HashMap::new(),
             prototype_template: None,
+            named_handler: None,
+            indexed_handler: None,
             internal_field_count: 0,
         }
     }
@@ -16378,6 +16443,8 @@ impl StatorObjectTemplate {
                 .prototype_template
                 .as_ref()
                 .map(|prototype| Box::new(prototype.clone_deep())),
+            named_handler: self.named_handler,
+            indexed_handler: self.indexed_handler,
             internal_field_count: self.internal_field_count,
         }
     }
@@ -16387,6 +16454,12 @@ impl StatorObjectTemplate {
             self.properties
                 .entry(key.clone())
                 .or_insert_with(|| clone_stator_value_inner(value));
+        }
+        if self.named_handler.is_none() {
+            self.named_handler = parent.named_handler;
+        }
+        if self.indexed_handler.is_none() {
+            self.indexed_handler = parent.indexed_handler;
         }
     }
 }
@@ -16453,6 +16526,77 @@ pub unsafe extern "C" fn stator_object_template_set(
         .into_owned();
     let inner = clone_stator_value_inner(unsafe { &(*val).inner });
     unsafe { (*tmpl).properties.insert(key_str, inner) };
+}
+
+fn named_handler_is_empty(handler: &StatorDomNamedHandler) -> bool {
+    handler.getter.is_none()
+        && handler.setter.is_none()
+        && handler.query.is_none()
+        && handler.deleter.is_none()
+        && handler.enumerator.is_none()
+}
+
+fn indexed_handler_is_empty(handler: &StatorDomIndexedHandler) -> bool {
+    handler.getter.is_none()
+        && handler.setter.is_none()
+        && handler.query.is_none()
+        && handler.length.is_none()
+        && handler.deleter.is_none()
+        && handler.enumerator.is_none()
+}
+
+/// Install an aggregated named-property handler on an object template.
+///
+/// Function templates snapshot this handler onto DOM wrappers when their
+/// instance template is applied. Returns InvalidArg for null pointers or an
+/// all-null handler.
+///
+/// # Safety
+/// - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+/// - `handler` must point to a readable [`StatorDomNamedHandler`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_install_named_handler(
+    tmpl: *mut StatorObjectTemplate,
+    handler: *const StatorDomNamedHandler,
+) -> StatorStatus {
+    if tmpl.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let handler = unsafe { *handler };
+    if named_handler_is_empty(&handler) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).named_handler = Some(handler) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Install an aggregated indexed-property handler on an object template.
+///
+/// Function templates snapshot this handler onto DOM wrappers when their
+/// instance template is applied. Returns InvalidArg for null pointers or an
+/// all-null handler.
+///
+/// # Safety
+/// - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+/// - `handler` must point to a readable [`StatorDomIndexedHandler`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_install_indexed_handler(
+    tmpl: *mut StatorObjectTemplate,
+    handler: *const StatorDomIndexedHandler,
+) -> StatorStatus {
+    if tmpl.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let handler = unsafe { *handler };
+    if indexed_handler_is_empty(&handler) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).indexed_handler = Some(handler) };
+    StatorStatus::StatorStatusOk
 }
 
 /// Set the number of internal fields on objects created from this template.
@@ -37835,6 +37979,129 @@ mod tests {
     }
 
     #[test]
+    fn test_object_template_install_handlers_reject_null_and_empty_inputs() {
+        let iso = IsolateGuard::new();
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        let empty_named = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let empty_indexed = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+
+        assert_eq!(
+            unsafe {
+                stator_object_template_install_named_handler(std::ptr::null_mut(), &empty_named)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(tmpl, &empty_named) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe {
+                stator_object_template_install_indexed_handler(std::ptr::null_mut(), &empty_indexed)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(tmpl, &empty_indexed) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        unsafe { stator_object_template_destroy(tmpl) };
+    }
+
+    #[test]
+    fn test_function_template_instance_template_handlers_apply_to_dom_wrapper() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let instance = unsafe { stator_function_template_instance_template(tmpl) };
+
+        let named = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_id),
+            data: std::ptr::null_mut(),
+        };
+        let indexed = StatorDomIndexedHandler {
+            getter: Some(indexed_get_zero),
+            setter: None,
+            query: None,
+            length: Some(indexed_length_three),
+            deleter: None,
+            enumerator: Some(indexed_enumerate_zero),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(instance, &named) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(instance, &indexed) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { (*wrap).inner.property_names() },
+            vec!["id".to_string()]
+        );
+        assert_eq!(unsafe { (*wrap).inner.indexed_property_keys() }, vec![0]);
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let src = b"node.id + node[0]";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 106.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_function_template_inherit_links_dom_prototype_chain() {
         let iso = IsolateGuard::new();
         unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
@@ -40235,6 +40502,14 @@ mod tests {
         StatorStatus::StatorStatusOk
     }
 
+    unsafe extern "C" fn named_enumerate_id(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let name = b"id";
+        unsafe { stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len()) }
+    }
+
     unsafe extern "C" fn named_get_document_property(
         name: *const c_char,
         name_len: usize,
@@ -40517,6 +40792,13 @@ mod tests {
     ) -> StatorStatus {
         unsafe { *out_len = 3 };
         StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn indexed_enumerate_zero(
+        buf: *mut StatorDomIndexBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        unsafe { stator_dom_index_buffer_push(buf, 0) }
     }
 
     unsafe extern "C" fn dom_call_sum(

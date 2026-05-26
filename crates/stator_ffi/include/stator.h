@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 23
+#define STATOR_FFI_ABI_VERSION_MINOR 24
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -2700,6 +2700,93 @@ typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
 typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct StatorFunctionCallbackInfo*);
 
 /**
+ * POD bundle of named-property interceptors, installed in one call by
+ * [`stator_dom_object_wrap_install_named_handler`].
+ *
+ * Each callback field is optional: pass `NULL` from C (or `None` from Rust)
+ * to leave a particular interceptor uninstalled.  At least one callback
+ * must be non-null for the install call to succeed.
+ *
+ * `data` is an opaque embedder pointer passed verbatim to each callback;
+ * the engine never dereferences it.  It is independent of internal-field 0
+ * (which the legacy `set_named_getter` family uses for `data`).
+ */
+typedef struct StatorDomNamedHandler {
+  /**
+   * Named-property getter, or null.
+   */
+  enum StatorStatus (*getter)(const char *name_utf8,
+                              size_t name_len,
+                              void *data,
+                              struct StatorValue **out);
+  /**
+   * Named-property setter, or null.
+   */
+  enum StatorStatus (*setter)(const char *name_utf8,
+                              size_t name_len,
+                              const struct StatorValue *value,
+                              void *data);
+  /**
+   * Named-property `in`/query callback, or null.
+   */
+  enum StatorStatus (*query)(const char *name_utf8, size_t name_len, void *data, uint32_t *out_attrs);
+  /**
+   * Named-property `delete` callback, or null.
+   */
+  enum StatorStatus (*deleter)(const char *name_utf8, size_t name_len, void *data, bool *out_deleted);
+  /**
+   * Named-property enumerator callback, or null.
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomNameBuffer *buf, void *data);
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomNamedHandler;
+
+/**
+ * POD bundle of indexed-property interceptors, installed in one call by
+ * [`stator_dom_object_wrap_install_indexed_handler`].
+ *
+ * Each callback field is optional (`NULL` to skip).  At least one callback
+ * must be non-null for the install call to succeed.
+ */
+typedef struct StatorDomIndexedHandler {
+  /**
+   * Indexed-property getter, or null.
+   */
+  enum StatorStatus (*getter)(uint32_t index, void *data, struct StatorValue **out);
+  /**
+   * Indexed-property setter, or null.
+   */
+  enum StatorStatus (*setter)(uint32_t index, const struct StatorValue *value, void *data);
+  /**
+   * Indexed-property query callback, or null.
+   */
+  enum StatorStatus (*query)(uint32_t index, void *data, uint32_t *out_attrs);
+  /**
+   * Indexed-collection length callback, or null.
+   */
+  enum StatorStatus (*length)(void *data, uint32_t *out_len);
+  /**
+   * Indexed-property `delete` callback, or null.  See
+   * [`StatorDomIndexedDeleterCb`] for the three-way result encoding
+   * (deleted / explicitly-refused / no-intercept).
+   */
+  enum StatorStatus (*deleter)(uint32_t index, void *data, bool *out_deleted);
+  /**
+   * Indexed-property enumerator callback, or null.  Pushes onto a
+   * caller-borrowed [`StatorDomIndexBuffer`] via
+   * [`stator_dom_index_buffer_push`].
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomIndexBuffer *buf, void *data);
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomIndexedHandler;
+
+/**
  * C-compatible vtable that embedders fill in to customise engine behaviour.
  *
  * All fields are optional (`Option<…>`).  When a field is `None` the engine
@@ -2980,93 +3067,6 @@ typedef struct StatorDomPropertyDescriptor {
    */
   struct StatorValue *setter;
 } StatorDomPropertyDescriptor;
-
-/**
- * POD bundle of named-property interceptors, installed in one call by
- * [`stator_dom_object_wrap_install_named_handler`].
- *
- * Each callback field is optional: pass `NULL` from C (or `None` from Rust)
- * to leave a particular interceptor uninstalled.  At least one callback
- * must be non-null for the install call to succeed.
- *
- * `data` is an opaque embedder pointer passed verbatim to each callback;
- * the engine never dereferences it.  It is independent of internal-field 0
- * (which the legacy `set_named_getter` family uses for `data`).
- */
-typedef struct StatorDomNamedHandler {
-  /**
-   * Named-property getter, or null.
-   */
-  enum StatorStatus (*getter)(const char *name_utf8,
-                              size_t name_len,
-                              void *data,
-                              struct StatorValue **out);
-  /**
-   * Named-property setter, or null.
-   */
-  enum StatorStatus (*setter)(const char *name_utf8,
-                              size_t name_len,
-                              const struct StatorValue *value,
-                              void *data);
-  /**
-   * Named-property `in`/query callback, or null.
-   */
-  enum StatorStatus (*query)(const char *name_utf8, size_t name_len, void *data, uint32_t *out_attrs);
-  /**
-   * Named-property `delete` callback, or null.
-   */
-  enum StatorStatus (*deleter)(const char *name_utf8, size_t name_len, void *data, bool *out_deleted);
-  /**
-   * Named-property enumerator callback, or null.
-   */
-  enum StatorStatus (*enumerator)(struct StatorDomNameBuffer *buf, void *data);
-  /**
-   * Opaque embedder data passed to every callback.
-   */
-  void *data;
-} StatorDomNamedHandler;
-
-/**
- * POD bundle of indexed-property interceptors, installed in one call by
- * [`stator_dom_object_wrap_install_indexed_handler`].
- *
- * Each callback field is optional (`NULL` to skip).  At least one callback
- * must be non-null for the install call to succeed.
- */
-typedef struct StatorDomIndexedHandler {
-  /**
-   * Indexed-property getter, or null.
-   */
-  enum StatorStatus (*getter)(uint32_t index, void *data, struct StatorValue **out);
-  /**
-   * Indexed-property setter, or null.
-   */
-  enum StatorStatus (*setter)(uint32_t index, const struct StatorValue *value, void *data);
-  /**
-   * Indexed-property query callback, or null.
-   */
-  enum StatorStatus (*query)(uint32_t index, void *data, uint32_t *out_attrs);
-  /**
-   * Indexed-collection length callback, or null.
-   */
-  enum StatorStatus (*length)(void *data, uint32_t *out_len);
-  /**
-   * Indexed-property `delete` callback, or null.  See
-   * [`StatorDomIndexedDeleterCb`] for the three-way result encoding
-   * (deleted / explicitly-refused / no-intercept).
-   */
-  enum StatorStatus (*deleter)(uint32_t index, void *data, bool *out_deleted);
-  /**
-   * Indexed-property enumerator callback, or null.  Pushes onto a
-   * caller-borrowed [`StatorDomIndexBuffer`] via
-   * [`stator_dom_index_buffer_push`].
-   */
-  enum StatorStatus (*enumerator)(struct StatorDomIndexBuffer *buf, void *data);
-  /**
-   * Opaque embedder data passed to every callback.
-   */
-  void *data;
-} StatorDomIndexedHandler;
 
 /**
  * Additive callable/constructible handler bundle for a DOM wrapper.
@@ -7040,6 +7040,34 @@ void stator_object_template_destroy(struct StatorObjectTemplate *tmpl);
 void stator_object_template_set(struct StatorObjectTemplate *tmpl,
                                 const char *key,
                                 const struct StatorValue *val);
+
+/**
+ * Install an aggregated named-property handler on an object template.
+ *
+ * Function templates snapshot this handler onto DOM wrappers when their
+ * instance template is applied. Returns InvalidArg for null pointers or an
+ * all-null handler.
+ *
+ * # Safety
+ * - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ * - `handler` must point to a readable [`StatorDomNamedHandler`].
+ */
+enum StatorStatus stator_object_template_install_named_handler(struct StatorObjectTemplate *tmpl,
+                                                               const struct StatorDomNamedHandler *handler);
+
+/**
+ * Install an aggregated indexed-property handler on an object template.
+ *
+ * Function templates snapshot this handler onto DOM wrappers when their
+ * instance template is applied. Returns InvalidArg for null pointers or an
+ * all-null handler.
+ *
+ * # Safety
+ * - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ * - `handler` must point to a readable [`StatorDomIndexedHandler`].
+ */
+enum StatorStatus stator_object_template_install_indexed_handler(struct StatorObjectTemplate *tmpl,
+                                                                 const struct StatorDomIndexedHandler *handler);
 
 /**
  * Set the number of internal fields on objects created from this template.

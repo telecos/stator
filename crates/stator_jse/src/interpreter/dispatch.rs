@@ -4562,6 +4562,15 @@ fn handle_lda_keyed_property(
             if borrow.get("__typed_array__").is_none() {
                 let key_str = itoa_stack(idx_val as u32);
                 if let Some(val) = borrow.get(key_str.as_str()) {
+                    if borrow.has_accessors
+                        && let Some(getter) = borrow.get_getter_for(key_str.as_str()).cloned()
+                    {
+                        drop(borrow);
+                        let this_obj = JsValue::PlainObject(Rc::clone(map));
+                        ctx.frame.accumulator = dispatch_getter(&getter, &this_obj)?;
+                        ic_counters::record(IcTier::Interpreter, IcOp::IndexedLoad, IcEvent::Hit);
+                        return Ok(DispatchAction::Continue);
+                    }
                     let result = val.resolve_live_binding();
                     drop(borrow);
                     ctx.frame.accumulator = result;
