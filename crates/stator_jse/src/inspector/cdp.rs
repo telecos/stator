@@ -49,6 +49,7 @@
 //! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
+//! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`                  | Acknowledges (stub)                |
 //! | `Network`      | `disable`                 | Acknowledges (stub)                |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -380,6 +381,8 @@ pub struct CdpDispatcher {
     debugger_enabled: bool,
     /// Whether `Target.setDiscoverTargets` is enabled.
     target_discovery_enabled: bool,
+    /// Whether the compatibility single target is still live.
+    target_alive: bool,
     /// Monotonically increasing ID for attached Target sessions.
     next_target_session_id: u64,
     /// Active single-target Target session, if any.
@@ -464,6 +467,7 @@ impl CdpDispatcher {
             console_enabled: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
+            target_alive: true,
             next_target_session_id: 1,
             target_session_id: None,
             script_sources: HashMap::new(),
@@ -726,13 +730,22 @@ impl CdpDispatcher {
             .get("discover")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if self.target_discovery_enabled {
+        if self.target_discovery_enabled && self.target_alive {
             self.push_event(
                 "Target.targetCreated",
                 json!({ "targetInfo": target_info() }),
             );
         }
         Ok(json!({}))
+    }
+
+    fn target_get_targets(&mut self) -> StatorResult<Value> {
+        let target_infos = if self.target_alive {
+            vec![target_info()]
+        } else {
+            Vec::new()
+        };
+        Ok(json!({ "targetInfos": target_infos }))
     }
 
     fn target_attach_to_target(&mut self, params: &Value) -> StatorResult<Value> {
@@ -746,7 +759,7 @@ impl CdpDispatcher {
                 ));
             }
         };
-        if target_id != DEFAULT_TARGET_ID {
+        if target_id != DEFAULT_TARGET_ID || !self.target_alive {
             return Err(crate::error::StatorError::Internal(format!(
                 "Target.attachToTarget: unknown targetId `{target_id}`"
             )));
@@ -793,6 +806,36 @@ impl CdpDispatcher {
             json!({ "sessionId": session_id, "targetId": DEFAULT_TARGET_ID }),
         );
         Ok(json!({}))
+    }
+
+    fn target_close_target(&mut self, params: &Value) -> StatorResult<Value> {
+        let target_id = match params.get("targetId").and_then(Value::as_str) {
+            Some(target_id) => target_id,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Target.closeTarget: required parameter 'targetId' is missing or not a string"
+                        .to_string(),
+                ));
+            }
+        };
+        if target_id != DEFAULT_TARGET_ID || !self.target_alive {
+            return Ok(json!({ "success": false }));
+        }
+
+        if let Some(session_id) = self.target_session_id.take() {
+            self.push_event(
+                "Target.detachedFromTarget",
+                json!({ "sessionId": session_id, "targetId": DEFAULT_TARGET_ID }),
+            );
+        }
+        self.target_alive = false;
+        if self.target_discovery_enabled {
+            self.push_event(
+                "Target.targetDestroyed",
+                json!({ "targetId": DEFAULT_TARGET_ID }),
+            );
+        }
+        Ok(json!({ "success": true }))
     }
 
     fn target_send_message_to_target(&mut self, params: &Value) -> StatorResult<Value> {
@@ -944,10 +987,11 @@ impl CdpDispatcher {
             "Network.disable" => Ok(json!({})),
 
             // ── Target ────────────────────────────────────────────────────
-            "Target.getTargets" => Ok(json!({ "targetInfos": [target_info()] })),
+            "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
             "Target.attachToTarget" => self.target_attach_to_target(&req.params),
             "Target.detachFromTarget" => self.target_detach_from_target(&req.params),
+            "Target.closeTarget" => self.target_close_target(&req.params),
             "Target.sendMessageToTarget" => self.target_send_message_to_target(&req.params),
 
             // ── Schema ────────────────────────────────────────────────────
@@ -4581,6 +4625,62 @@ mod tests {
         );
         assert_eq!(detached[0]["method"], "Target.detachedFromTarget");
         assert_eq!(detached[1]["id"], 3);
+    }
+
+    #[test]
+    fn target_close_emits_lifecycle_events_and_removes_default_target() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch_all(
+            &mut d,
+            r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+        );
+        let attached = dispatch_all(
+            &mut d,
+            &json!({
+                "id": 2,
+                "method": "Target.attachToTarget",
+                "params": {"targetId": DEFAULT_TARGET_ID, "flatten": true}
+            })
+            .to_string(),
+        );
+        let session_id = attached[1]["result"]["sessionId"].as_str().unwrap();
+
+        let closed = dispatch_all(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Target.closeTarget",
+                "params": {"targetId": DEFAULT_TARGET_ID}
+            })
+            .to_string(),
+        );
+        assert_eq!(closed[0]["method"], "Target.detachedFromTarget");
+        assert_eq!(closed[0]["params"]["sessionId"], session_id);
+        assert_eq!(closed[1]["method"], "Target.targetDestroyed");
+        assert_eq!(closed[1]["params"]["targetId"], DEFAULT_TARGET_ID);
+        assert_eq!(closed[2]["result"]["success"], true);
+
+        let targets = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Target.getTargets","params":{}}"#,
+        );
+        assert!(
+            targets["result"]["targetInfos"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let attach_after_close = dispatch(
+            &mut d,
+            &json!({
+                "id": 5,
+                "method": "Target.attachToTarget",
+                "params": {"targetId": DEFAULT_TARGET_ID, "flatten": true}
+            })
+            .to_string(),
+        );
+        assert!(attach_after_close["error"].is_object());
     }
 
     #[test]
