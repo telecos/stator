@@ -383,12 +383,14 @@ pub struct CdpDispatcher {
     debugger_enabled: bool,
     /// Whether `Target.setDiscoverTargets` is enabled.
     target_discovery_enabled: bool,
-    /// Whether the compatibility single target is still live.
-    target_alive: bool,
+    /// Target IDs closed through `Target.closeTarget`.
+    closed_target_ids: HashSet<String>,
     /// Monotonically increasing ID for attached Target sessions.
     next_target_session_id: u64,
     /// Active single-target Target session, if any.
     target_session_id: Option<String>,
+    /// Target ID attached by the active Target session, if any.
+    target_session_target_id: Option<String>,
     /// Script sources registered by the owning inspector, keyed by scriptId.
     script_sources: HashMap<String, String>,
     /// Script URLs extracted from registered sources, keyed by scriptId.
@@ -475,9 +477,10 @@ impl CdpDispatcher {
             console_enabled: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
-            target_alive: true,
+            closed_target_ids: HashSet::new(),
             next_target_session_id: 1,
             target_session_id: None,
+            target_session_target_id: None,
             script_sources: HashMap::new(),
             script_urls: HashMap::new(),
             next_breakpoint_id: 1,
@@ -741,22 +744,51 @@ impl CdpDispatcher {
             .get("discover")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if self.target_discovery_enabled && self.target_alive {
-            self.push_event(
-                "Target.targetCreated",
-                json!({ "targetInfo": target_info() }),
-            );
+        if self.target_discovery_enabled {
+            for target_info in self.target_infos() {
+                self.push_event("Target.targetCreated", json!({ "targetInfo": target_info }));
+            }
         }
         Ok(json!({}))
     }
 
     fn target_get_targets(&mut self) -> StatorResult<Value> {
-        let target_infos = if self.target_alive {
-            vec![target_info()]
-        } else {
-            Vec::new()
-        };
+        let target_infos = self.target_infos();
         Ok(json!({ "targetInfos": target_infos }))
+    }
+
+    fn target_infos(&self) -> Vec<Value> {
+        let mut groups: Vec<(u32, String, String)> = self
+            .contexts
+            .iter()
+            .map(|context| {
+                (
+                    context.group_id,
+                    context.name.clone(),
+                    context.origin.clone(),
+                )
+            })
+            .collect();
+        if groups.is_empty() {
+            groups.push((1, "stator".to_string(), "stator".to_string()));
+        }
+        groups.sort_by_key(|(group_id, _, _)| *group_id);
+        groups.dedup_by_key(|(group_id, _, _)| *group_id);
+        groups
+            .into_iter()
+            .map(|(group_id, name, origin)| target_info_for_group(group_id, &name, &origin))
+            .filter(|info| {
+                info.get("targetId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|target_id| !self.closed_target_ids.contains(target_id))
+            })
+            .collect()
+    }
+
+    fn is_live_target(&self, target_id: &str) -> bool {
+        self.target_infos()
+            .iter()
+            .any(|info| info.get("targetId").and_then(Value::as_str) == Some(target_id))
     }
 
     fn target_attach_to_target(&mut self, params: &Value) -> StatorResult<Value> {
@@ -770,14 +802,20 @@ impl CdpDispatcher {
                 ));
             }
         };
-        if target_id != DEFAULT_TARGET_ID || !self.target_alive {
+        if !self.is_live_target(target_id) {
             return Err(crate::error::StatorError::Internal(format!(
                 "Target.attachToTarget: unknown targetId `{target_id}`"
             )));
         }
+        let target_info = self
+            .target_infos()
+            .into_iter()
+            .find(|info| info.get("targetId").and_then(Value::as_str) == Some(target_id))
+            .unwrap_or_else(target_info);
         let session_id = format!("stator-target-session-{}", self.next_target_session_id);
         self.next_target_session_id = self.next_target_session_id.saturating_add(1);
         self.target_session_id = Some(session_id.clone());
+        self.target_session_target_id = Some(target_id.to_string());
         if params
             .get("flatten")
             .and_then(Value::as_bool)
@@ -787,7 +825,7 @@ impl CdpDispatcher {
                 "Target.attachedToTarget",
                 json!({
                     "sessionId": session_id,
-                    "targetInfo": target_info(),
+                    "targetInfo": target_info,
                     "waitingForDebugger": false,
                 }),
             );
@@ -812,9 +850,13 @@ impl CdpDispatcher {
             )));
         }
         self.target_session_id = None;
+        let target_id = self
+            .target_session_target_id
+            .take()
+            .unwrap_or_else(|| DEFAULT_TARGET_ID.to_string());
         self.push_event(
             "Target.detachedFromTarget",
-            json!({ "sessionId": session_id, "targetId": DEFAULT_TARGET_ID }),
+            json!({ "sessionId": session_id, "targetId": target_id }),
         );
         Ok(json!({}))
     }
@@ -829,22 +871,25 @@ impl CdpDispatcher {
                 ));
             }
         };
-        if target_id != DEFAULT_TARGET_ID || !self.target_alive {
+        if !self.is_live_target(target_id) {
             return Ok(json!({ "success": false }));
         }
 
-        if let Some(session_id) = self.target_session_id.take() {
+        if self.target_session_target_id.as_deref() == Some(target_id)
+            && let Some(session_id) = self.target_session_id.take()
+        {
+            let target_id = self
+                .target_session_target_id
+                .take()
+                .unwrap_or_else(|| DEFAULT_TARGET_ID.to_string());
             self.push_event(
                 "Target.detachedFromTarget",
-                json!({ "sessionId": session_id, "targetId": DEFAULT_TARGET_ID }),
+                json!({ "sessionId": session_id, "targetId": target_id }),
             );
         }
-        self.target_alive = false;
+        self.closed_target_ids.insert(target_id.to_string());
         if self.target_discovery_enabled {
-            self.push_event(
-                "Target.targetDestroyed",
-                json!({ "targetId": DEFAULT_TARGET_ID }),
-            );
+            self.push_event("Target.targetDestroyed", json!({ "targetId": target_id }));
         }
         Ok(json!({ "success": true }))
     }
@@ -865,6 +910,10 @@ impl CdpDispatcher {
                 "Target.sendMessageToTarget: unknown sessionId `{session_id}`"
             )));
         }
+        let target_id = self
+            .target_session_target_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TARGET_ID.to_string());
         let message = match params.get("message").and_then(Value::as_str) {
             Some(message) => message,
             None => {
@@ -883,7 +932,7 @@ impl CdpDispatcher {
                 "Target.receivedMessageFromTarget",
                 json!({
                     "sessionId": session_id,
-                    "targetId": DEFAULT_TARGET_ID,
+                    "targetId": target_id,
                     "message": message,
                 }),
             );
@@ -3582,14 +3631,29 @@ fn discovery_response(
 }
 
 fn target_info() -> Value {
+    target_info_for_group(1, "Stator", "stator://inspector")
+}
+
+fn target_info_for_group(group_id: u32, name: &str, origin: &str) -> Value {
+    let target_id = target_id_for_group(group_id);
+    let title = if name.is_empty() { "Stator" } else { name };
+    let url = if origin.is_empty() {
+        "stator://inspector"
+    } else {
+        origin
+    };
     json!({
-        "targetId": DEFAULT_TARGET_ID,
+        "targetId": target_id,
         "type": "page",
-        "title": "Stator",
-        "url": "stator://inspector",
+        "title": title,
+        "url": url,
         "attached": false,
         "canAccessOpener": false,
     })
+}
+
+fn target_id_for_group(group_id: u32) -> String {
+    format!("stator-{group_id}")
 }
 
 fn discovery_target(web_socket_debugger_url: &str) -> Value {
@@ -4775,6 +4839,37 @@ mod tests {
             DEFAULT_TARGET_ID
         );
         assert_eq!(resp["result"]["targetInfos"][0]["type"], "page");
+    }
+
+    #[test]
+    fn target_get_targets_lists_one_target_per_context_group() {
+        let contexts = vec![
+            ExecutionContextDescription::new(1, 1, "https://a.test", "main", json!({})),
+            ExecutionContextDescription::new(2, 2, "https://b.test", "isolated", json!({})),
+            ExecutionContextDescription::new(3, 2, "https://b.test", "isolated-2", json!({})),
+        ];
+        let mut d = CdpDispatcher::with_globals_and_contexts(
+            Rc::new(RefCell::new(GlobalEnv::new())),
+            contexts,
+        );
+
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.getTargets","params":{}}"#,
+        );
+        let target_infos = resp["result"]["targetInfos"].as_array().unwrap();
+        let target_ids: Vec<_> = target_infos
+            .iter()
+            .map(|info| info["targetId"].as_str().unwrap())
+            .collect();
+        assert_eq!(target_ids, vec!["stator-1", "stator-2"]);
+
+        let attach = dispatch_all(
+            &mut d,
+            r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"stator-2","flatten":true}}"#,
+        );
+        assert_eq!(attach[0]["method"], "Target.attachedToTarget");
+        assert_eq!(attach[0]["params"]["targetInfo"]["targetId"], "stator-2");
     }
 
     #[test]
