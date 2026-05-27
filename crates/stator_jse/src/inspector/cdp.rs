@@ -26,6 +26,7 @@
 //! | `Runtime`      | `globalLexicalScopeNames` | Reports current global binding names |
 //! | `Runtime`      | `getIsolateId`            | Reports a stable Stator isolate identifier |
 //! | `Runtime`      | `getHeapUsage`            | Reports reachable heap-size estimates |
+//! | `Runtime`      | `collectGarbage`          | Triggers the thread-local Stator GC runtime |
 //! | `Runtime`      | `addBinding`/`removeBinding` | Installs/removes global binding callbacks |
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
@@ -51,6 +52,7 @@
 //! | `Profiler`     | `start`                   | Starts CPU profiling               |
 //! | `Profiler`     | `stop`                    | Stops profiling; returns profile    |
 //! | `HeapProfiler` | `enable`                  | Acknowledges                       |
+//! | `HeapProfiler` | `collectGarbage`          | Triggers the thread-local Stator GC runtime |
 //! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
@@ -986,6 +988,7 @@ impl CdpDispatcher {
             }
             "Runtime.getIsolateId" => Ok(json!({ "id": "stator-isolate-0" })),
             "Runtime.getHeapUsage" => self.runtime_get_heap_usage(),
+            "Runtime.collectGarbage" => self.collect_garbage(),
             "Runtime.addBinding" => self.runtime_add_binding(&req.params),
             "Runtime.removeBinding" => self.runtime_remove_binding(&req.params),
 
@@ -1071,6 +1074,7 @@ impl CdpDispatcher {
 
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
+            "HeapProfiler.collectGarbage" => self.collect_garbage(),
             "HeapProfiler.takeHeapSnapshot" => self.heap_profiler_take_snapshot(),
             "HeapProfiler.getHeapObjectId" => self.heap_profiler_get_heap_object_id(&req.params),
             "HeapProfiler.getObjectByHeapObjectId" => {
@@ -1148,6 +1152,11 @@ impl CdpDispatcher {
             "usedSize": used_size,
             "totalSize": used_size,
         }))
+    }
+
+    fn collect_garbage(&mut self) -> StatorResult<Value> {
+        crate::gc::runtime::gc_collect();
+        Ok(json!({}))
     }
 
     fn runtime_query_objects(&mut self, params: &Value) -> StatorResult<Value> {
@@ -5383,6 +5392,34 @@ mod tests {
         let total = resp["result"]["totalSize"].as_u64().expect("total size");
         assert!(used > 0);
         assert!(total >= used);
+    }
+
+    #[test]
+    fn collect_garbage_methods_trigger_gc_runtime() {
+        use std::alloc::Layout;
+
+        let mut d = fresh_dispatcher();
+        let before = crate::gc::runtime::gc_stats().collections;
+        let _ = crate::gc::runtime::gc_alloc_raw(Layout::from_size_align(128, 8).unwrap());
+
+        let runtime = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.collectGarbage","params":{}}"#,
+        );
+        assert!(runtime.get("error").is_none());
+        let after_runtime = crate::gc::runtime::gc_stats();
+        assert_eq!(after_runtime.collections, before + 1);
+        assert_eq!(after_runtime.bytes_allocated, 0);
+
+        let heap = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"HeapProfiler.collectGarbage","params":{}}"#,
+        );
+        assert!(heap.get("error").is_none());
+        assert_eq!(
+            crate::gc::runtime::gc_stats().collections,
+            after_runtime.collections + 1
+        );
     }
 
     #[test]
