@@ -36,6 +36,7 @@
 //! | `Debugger`     | `setSkipAllPauses`        | Suppresses/resumes all debugger pause sources |
 //! | `Debugger`     | `setBlackboxPatterns`/`setBlackboxedRanges` | Stores blackbox filters for debugger setup |
 //! | `Debugger`     | `resume`                  | Resumes after a pause; emits `Debugger.resumed` when an active pause exists |
+//! | `Debugger`     | `continueToLocation`      | Resumes to a one-shot breakpoint at a registered script location |
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
@@ -984,6 +985,7 @@ impl CdpDispatcher {
             "Debugger.setBlackboxPatterns" => self.debugger_set_blackbox_patterns(&req.params),
             "Debugger.setBlackboxedRanges" => self.debugger_set_blackboxed_ranges(&req.params),
             "Debugger.resume" => self.debugger_resume(),
+            "Debugger.continueToLocation" => self.debugger_continue_to_location(&req.params),
             "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
             "Debugger.stepOut" => self.debugger_step(DebugAction::StepOut),
@@ -1867,6 +1869,68 @@ impl CdpDispatcher {
         if emitted {
             self.notify_resumed();
         }
+        Ok(json!({}))
+    }
+
+    fn debugger_continue_to_location(&mut self, params: &Value) -> StatorResult<Value> {
+        let location = params.get("location").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.continueToLocation: required parameter 'location' is missing".to_string(),
+            )
+        })?;
+        let script_id = location
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.continueToLocation: location.scriptId is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        let line_number = location
+            .get("lineNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let column_number = location
+            .get("columnNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let source = self.script_sources.get(script_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.continueToLocation: unknown scriptId `{script_id}`"
+            ))
+        })?;
+        let Some((bytecode_offset, actual_location)) =
+            breakpoint_location_for_source(script_id, source, line_number, column_number)?
+        else {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.continueToLocation: no breakpointable location in scriptId `{script_id}`"
+            )));
+        };
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.continueToLocation",
+                "no interpreter Debugger is attached to this session; continueToLocation requires \
+                 an attached debugger plus an active pause.",
+            ));
+        };
+        {
+            let mut debugger = debugger.borrow_mut();
+            if debugger.last_pause_reason().is_none() {
+                return Err(unsupported_debugger_method(
+                    "Debugger.continueToLocation",
+                    "no active pause; continueToLocation is only valid after a Debugger.paused \
+                     event has been emitted.",
+                ));
+            }
+            debugger.set_one_shot_breakpoint_at_offset(
+                bytecode_offset,
+                actual_location["lineNumber"].as_u64().unwrap_or(0) as u32 + 1,
+                actual_location["columnNumber"].as_u64().unwrap_or(0) as u32 + 1,
+            );
+            debugger.apply_action(DebugAction::Continue);
+        }
+        self.notify_resumed();
         Ok(json!({}))
     }
 
@@ -6092,6 +6156,56 @@ mod tests {
             methods.contains(&"Debugger.resumed"),
             "step should emit Debugger.resumed; got: {methods:?}"
         );
+    }
+
+    #[test]
+    fn continue_to_location_installs_one_shot_breakpoint_and_emits_resumed() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0}}}"#,
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["method"] == "Debugger.resumed"),
+            "continueToLocation should emit Debugger.resumed; got: {messages:?}"
+        );
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
+
+        let offset = dbg
+            .borrow()
+            .breakpoints()
+            .next()
+            .expect("one-shot breakpoint")
+            .bytecode_offset;
+        assert!(dbg.borrow_mut().check_pause_at(offset).is_some());
+        assert_eq!(
+            dbg.borrow().breakpoints().count(),
+            0,
+            "one-shot breakpoint should remove itself after the pause"
+        );
+    }
+
+    #[test]
+    fn continue_to_location_requires_active_pause() {
+        let mut d = fresh_dispatcher();
+        let _dbg = attach_test_debugger(&mut d);
+        d.register_script_source(7, "var a = 1;".to_string());
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":0,"columnNumber":0}}}"#,
+        );
+        assert!(response["error"].is_object());
     }
 
     #[test]

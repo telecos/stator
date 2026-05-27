@@ -60,7 +60,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::builtins::error::call_stack_depth;
 use crate::bytecode::bytecode_array::BytecodeArray;
@@ -172,6 +172,8 @@ enum StepMode {
 pub struct Debugger {
     /// Active breakpoints, keyed by bytecode byte offset.
     breakpoints: HashMap<u32, Breakpoint>,
+    /// Breakpoints that remove themselves after the first pause.
+    one_shot_breakpoints: HashSet<BreakpointId>,
     /// Whether user-installed breakpoints are allowed to pause execution.
     breakpoints_active: bool,
     /// Monotonically increasing breakpoint ID counter.
@@ -209,6 +211,7 @@ impl Debugger {
     pub fn new() -> Self {
         Self {
             breakpoints: HashMap::new(),
+            one_shot_breakpoints: HashSet::new(),
             breakpoints_active: true,
             next_id: 1,
             pause_on_exceptions: false,
@@ -246,6 +249,20 @@ impl Debugger {
         id
     }
 
+    /// Install a breakpoint that removes itself after its first pause.
+    ///
+    /// Returns the new breakpoint's [`BreakpointId`].
+    pub fn set_one_shot_breakpoint_at_offset(
+        &mut self,
+        offset: u32,
+        line: u32,
+        column: u32,
+    ) -> BreakpointId {
+        let id = self.set_breakpoint_at_offset(offset, line, column);
+        self.one_shot_breakpoints.insert(id);
+        id
+    }
+
     /// Install a breakpoint at the first bytecode position that maps to
     /// `line` in the source-position table of `bytecodes`.
     ///
@@ -270,6 +287,7 @@ impl Debugger {
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> bool {
         let before = self.breakpoints.len();
         self.breakpoints.retain(|_, bp| bp.id != id);
+        self.one_shot_breakpoints.remove(&id);
         self.breakpoints.len() < before
     }
 
@@ -374,10 +392,13 @@ impl Debugger {
             return None;
         }
 
-        let reason = if self.breakpoints_active
-            && let Some(bp) = self.breakpoints.get(&offset)
-        {
-            PauseReason::Breakpoint(bp.id)
+        let hit_breakpoint_id = if self.breakpoints_active {
+            self.breakpoints.get(&offset).map(|bp| bp.id)
+        } else {
+            None
+        };
+        let reason = if let Some(id) = hit_breakpoint_id {
+            PauseReason::Breakpoint(id)
         } else {
             let depth = call_stack_depth();
             match self.step_mode {
@@ -390,6 +411,11 @@ impl Debugger {
         };
 
         self.record_pause(reason, offset);
+        if let Some(id) = hit_breakpoint_id
+            && self.one_shot_breakpoints.remove(&id)
+        {
+            self.breakpoints.remove(&offset);
+        }
         Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
         })
@@ -579,6 +605,17 @@ mod tests {
         dbg.set_breakpoints_active(true);
         assert!(dbg.check_pause_at(0).is_some());
         assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
+    }
+
+    #[test]
+    fn test_one_shot_breakpoint_removes_itself_after_pause() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_one_shot_breakpoint_at_offset(0, 1, 1);
+
+        assert!(dbg.check_pause_at(0).is_some());
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
+        assert!(!dbg.breakpoints().any(|bp| bp.id == id));
+        assert!(dbg.check_pause_at(0).is_none());
     }
 
     #[test]
