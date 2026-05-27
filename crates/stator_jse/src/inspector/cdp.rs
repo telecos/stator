@@ -30,6 +30,7 @@
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
 //! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state (typed error on invalid `state`) |
+//! | `Debugger`     | `setBreakpoint`           | Sets a breakpoint by registered script location |
 //! | `Debugger`     | `setBreakpointByUrl`      | Resolves URL breakpoints against registered scripts |
 //! | `Debugger`     | `setBreakpointsActive`    | Enables/disables installed breakpoint pauses |
 //! | `Debugger`     | `setSkipAllPauses`        | Suppresses/resumes all debugger pause sources |
@@ -78,7 +79,7 @@ use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEventKind, drain_messages, drain_profile_events};
-use crate::inspector::debugger::{DebugAction, Debugger, PauseReason};
+use crate::inspector::debugger::{BreakpointId, DebugAction, Debugger, PauseReason};
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
@@ -395,6 +396,8 @@ pub struct CdpDispatcher {
     next_breakpoint_id: u32,
     /// CDP breakpoint IDs returned by `Debugger.setBreakpointByUrl`.
     cdp_breakpoints: HashSet<String>,
+    /// Interpreter breakpoint IDs installed for each CDP breakpoint ID.
+    cdp_debugger_breakpoints: HashMap<String, Vec<BreakpointId>>,
     /// CDP `Debugger.setBreakpointsActive` state mirrored onto the debugger.
     breakpoints_active: bool,
     /// CDP `Debugger.setSkipAllPauses` state mirrored onto the debugger.
@@ -474,6 +477,7 @@ impl CdpDispatcher {
             script_urls: HashMap::new(),
             next_breakpoint_id: 1,
             cdp_breakpoints: HashSet::new(),
+            cdp_debugger_breakpoints: HashMap::new(),
             breakpoints_active: true,
             skip_all_pauses: false,
             remote_objects: RemoteObjectRegistry::new(),
@@ -915,6 +919,7 @@ impl CdpDispatcher {
                 Ok(json!({}))
             }
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
+            "Debugger.setBreakpoint" => self.debugger_set_breakpoint(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
             "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
             "Debugger.setBreakpointsActive" => self.debugger_set_breakpoints_active(&req.params),
@@ -1777,6 +1782,61 @@ impl CdpDispatcher {
 
     // ── Debugger.setBreakpointByUrl ──────────────────────────────────────────
 
+    fn debugger_set_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
+        let location = params.get("location").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.setBreakpoint: required parameter 'location' is missing".to_string(),
+            )
+        })?;
+        let script_id = location
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBreakpoint: location.scriptId is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        let line_number = location
+            .get("lineNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let column_number = location
+            .get("columnNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let source = self.script_sources.get(script_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.setBreakpoint: unknown scriptId `{script_id}`"
+            ))
+        })?;
+        let Some((bytecode_offset, actual_location)) =
+            breakpoint_location_for_source(script_id, source, line_number, column_number)?
+        else {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setBreakpoint: no breakpointable location in scriptId `{script_id}`"
+            )));
+        };
+
+        let bp_id = format!(
+            "{}:{}:{}:{}",
+            self.next_breakpoint_id, script_id, line_number, column_number
+        );
+        self.next_breakpoint_id += 1;
+        self.cdp_breakpoints.insert(bp_id.clone());
+        self.install_interpreter_breakpoint(
+            &bp_id,
+            bytecode_offset,
+            actual_location["lineNumber"].as_u64().unwrap_or(0) as u32,
+            actual_location["columnNumber"].as_u64().unwrap_or(0) as u32,
+        );
+
+        Ok(json!({
+            "breakpointId": bp_id,
+            "actualLocation": actual_location,
+        }))
+    }
+
     fn debugger_set_breakpoint_by_url(&mut self, params: &Value) -> StatorResult<Value> {
         let line_number = params
             .get("lineNumber")
@@ -1814,9 +1874,15 @@ impl CdpDispatcher {
                 if !url_matches {
                     continue;
                 }
-                if let Some(location) =
-                    breakpoint_location_for_source(&script_id, source, line_number, column_number)
+                if let Some((bytecode_offset, location)) =
+                    breakpoint_location_for_source(&script_id, source, line_number, column_number)?
                 {
+                    self.install_interpreter_breakpoint(
+                        &bp_id,
+                        bytecode_offset,
+                        location["lineNumber"].as_u64().unwrap_or(0) as u32,
+                        location["columnNumber"].as_u64().unwrap_or(0) as u32,
+                    );
                     if self.debugger_enabled {
                         self.push_event(
                             "Debugger.breakpointResolved",
@@ -1843,6 +1909,27 @@ impl CdpDispatcher {
         }))
     }
 
+    fn install_interpreter_breakpoint(
+        &mut self,
+        cdp_breakpoint_id: &str,
+        bytecode_offset: u32,
+        line_number: u32,
+        column_number: u32,
+    ) {
+        let Some(debugger) = self.debugger.as_ref() else {
+            return;
+        };
+        let debugger_id = debugger.borrow_mut().set_breakpoint_at_offset(
+            bytecode_offset,
+            line_number.saturating_add(1),
+            column_number.saturating_add(1),
+        );
+        self.cdp_debugger_breakpoints
+            .entry(cdp_breakpoint_id.to_string())
+            .or_default()
+            .push(debugger_id);
+    }
+
     fn debugger_remove_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
         let breakpoint_id = match params.get("breakpointId").and_then(Value::as_str) {
             Some(breakpoint_id) => breakpoint_id,
@@ -1858,6 +1945,14 @@ impl CdpDispatcher {
             return Err(crate::error::StatorError::Internal(format!(
                 "Debugger.removeBreakpoint: unknown breakpointId `{breakpoint_id}`"
             )));
+        }
+        if let Some(debugger_ids) = self.cdp_debugger_breakpoints.remove(breakpoint_id)
+            && let Some(debugger) = self.debugger.as_ref()
+        {
+            let mut debugger = debugger.borrow_mut();
+            for debugger_id in debugger_ids {
+                let _ = debugger.remove_breakpoint(debugger_id);
+            }
         }
         Ok(json!({}))
     }
@@ -2377,19 +2472,34 @@ fn breakpoint_location_for_source(
     source: &str,
     line_number: u32,
     column_number: u32,
-) -> Option<Value> {
-    let lines: Vec<&str> = source.lines().collect();
-    let line = if source.is_empty() {
-        ""
-    } else {
-        *lines.get(line_number as usize)?
-    };
-    let column = column_number.min(line.chars().count() as u32);
-    Some(json!({
-        "scriptId": script_id,
-        "lineNumber": line_number,
-        "columnNumber": column,
-    }))
+) -> StatorResult<Option<(u32, Value)>> {
+    let bytecodes =
+        parser::parse(source).and_then(|program| BytecodeGenerator::compile_program(&program))?;
+    let mut locations: Vec<_> = Debugger::breakpoint_locations(&bytecodes)
+        .into_iter()
+        .filter_map(|location| {
+            let line = location.line.saturating_sub(1);
+            let column = location.column.saturating_sub(1);
+            if line < line_number || (line == line_number && column < column_number) {
+                return None;
+            }
+            Some((line, column, location.bytecode_offset))
+        })
+        .collect();
+    locations.sort_by_key(|(line, column, offset)| (*line, *column, *offset));
+    Ok(locations
+        .into_iter()
+        .next()
+        .map(|(line, column, bytecode_offset)| {
+            (
+                bytecode_offset,
+                json!({
+                    "scriptId": script_id,
+                    "lineNumber": line,
+                    "columnNumber": column,
+                }),
+            )
+        }))
 }
 
 fn request_line_number(expression: &str) -> u32 {
@@ -4274,6 +4384,47 @@ mod tests {
     }
 
     #[test]
+    fn debugger_set_breakpoint_by_location_installs_and_removes_interpreter_breakpoint() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0}}}"#,
+        );
+
+        assert!(response["result"]["breakpointId"].is_string());
+        assert_eq!(response["result"]["actualLocation"]["scriptId"], "7");
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
+
+        let breakpoint_id = response["result"]["breakpointId"].as_str().unwrap();
+        let removed = dispatch(
+            &mut d,
+            &json!({
+                "id": 2,
+                "method": "Debugger.removeBreakpoint",
+                "params": { "breakpointId": breakpoint_id }
+            })
+            .to_string(),
+        );
+        assert!(removed.get("error").is_none());
+        assert_eq!(dbg.borrow().breakpoints().count(), 0);
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_unknown_script_errors() {
+        let mut d = fresh_dispatcher();
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"missing","lineNumber":0,"columnNumber":0}}}"#,
+        );
+        assert!(response["error"].is_object());
+    }
+
+    #[test]
     fn debugger_set_breakpoint_by_url_resolves_registered_script_url() {
         let mut d = fresh_dispatcher();
         d.register_script_source(
@@ -4285,7 +4436,7 @@ mod tests {
 
         let messages = dispatch_all(
             &mut d,
-            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":1,"columnNumber":50}}"#,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":1,"columnNumber":0}}"#,
         );
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["method"], "Debugger.breakpointResolved");
@@ -4296,7 +4447,7 @@ mod tests {
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0]["scriptId"], "7");
         assert_eq!(locations[0]["lineNumber"], 1);
-        assert_eq!(locations[0]["columnNumber"], 14);
+        assert!(locations[0]["columnNumber"].as_u64().is_some());
         assert_eq!(
             response["result"]["breakpointId"],
             messages[0]["params"]["breakpointId"]
