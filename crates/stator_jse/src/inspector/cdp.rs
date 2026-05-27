@@ -27,6 +27,7 @@
 //! | `Runtime`      | `getIsolateId`            | Reports a stable Stator isolate identifier |
 //! | `Runtime`      | `getHeapUsage`            | Reports reachable heap-size estimates |
 //! | `Runtime`      | `collectGarbage`          | Triggers the thread-local Stator GC runtime |
+//! | `Runtime`      | `terminateExecution`      | Requests termination for dispatcher-run scripts |
 //! | `Runtime`      | `addBinding`/`removeBinding` | Installs/removes global binding callbacks |
 //! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
 //! | `Debugger`     | `disable`                 | Clears the `Debugger` domain enabled state |
@@ -76,6 +77,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -439,6 +441,8 @@ pub struct CdpDispatcher {
     /// can mutate real interpreter state, and so that the dispatcher can
     /// translate interpreter pauses into `Debugger.paused` events.
     debugger: Option<Rc<RefCell<Debugger>>>,
+    /// Dispatcher-owned termination flag published to interpreter runs.
+    termination_requested: AtomicBool,
     /// CDP `Debugger.setPauseOnExceptions` state. Mirrored on the attached
     /// debugger when present; cached here so a `setPauseOnExceptions` call
     /// issued before a debugger is attached still takes effect at attach
@@ -505,6 +509,7 @@ impl CdpDispatcher {
             runtime_bindings: Rc::new(RefCell::new(RuntimeBindingState::default())),
             next_exception_id: 1,
             debugger: None,
+            termination_requested: AtomicBool::new(false),
             pause_on_exceptions: PauseOnExceptionsState::None,
             outbox: VecDeque::new(),
         }
@@ -989,6 +994,7 @@ impl CdpDispatcher {
             "Runtime.getIsolateId" => Ok(json!({ "id": "stator-isolate-0" })),
             "Runtime.getHeapUsage" => self.runtime_get_heap_usage(),
             "Runtime.collectGarbage" => self.collect_garbage(),
+            "Runtime.terminateExecution" => self.runtime_terminate_execution(),
             "Runtime.addBinding" => self.runtime_add_binding(&req.params),
             "Runtime.removeBinding" => self.runtime_remove_binding(&req.params),
 
@@ -1157,6 +1163,21 @@ impl CdpDispatcher {
     fn collect_garbage(&mut self) -> StatorResult<Value> {
         crate::gc::runtime::gc_collect();
         Ok(json!({}))
+    }
+
+    fn runtime_terminate_execution(&mut self) -> StatorResult<Value> {
+        self.termination_requested.store(true, Ordering::SeqCst);
+        Ok(json!({}))
+    }
+
+    fn run_interpreter_frame(&self, frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // SAFETY: the pointer references `self.termination_requested`, which
+        // remains valid until this method clears the thread-local association.
+        unsafe { crate::interpreter::set_interrupt_flag(&self.termination_requested) };
+        let result = Interpreter::run(frame);
+        crate::interpreter::clear_interrupt_flag();
+        self.termination_requested.store(false, Ordering::SeqCst);
+        result
     }
 
     fn runtime_query_objects(&mut self, params: &Value) -> StatorResult<Value> {
@@ -1400,7 +1421,7 @@ impl CdpDispatcher {
             vec![],
             Rc::clone(&self.globals),
         );
-        let js_result = match Interpreter::run(&mut frame) {
+        let js_result = match self.run_interpreter_frame(&mut frame) {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
@@ -1490,7 +1511,7 @@ impl CdpDispatcher {
             vec![],
             Rc::clone(&self.globals),
         );
-        let js_result = match Interpreter::run(&mut frame) {
+        let js_result = match self.run_interpreter_frame(&mut frame) {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
@@ -1587,7 +1608,7 @@ impl CdpDispatcher {
             vec![],
             Rc::clone(&self.globals),
         );
-        let js_result = match Interpreter::run(&mut frame) {
+        let js_result = match self.run_interpreter_frame(&mut frame) {
             Ok(value) => value,
             Err(err) => {
                 self.emit_pending_binding_calls(execution_context_id);
@@ -5420,6 +5441,34 @@ mod tests {
             crate::gc::runtime::gc_stats().collections,
             after_runtime.collections + 1
         );
+    }
+
+    #[test]
+    fn terminate_execution_interrupts_next_dispatcher_script_run() {
+        let mut d = fresh_dispatcher();
+        let terminate = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.terminateExecution","params":{}}"#,
+        );
+        assert!(terminate.get("error").is_none());
+
+        let interrupted = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"1 + 2"}}"#,
+        );
+        assert!(interrupted["result"]["exceptionDetails"].is_object());
+        assert!(
+            interrupted["result"]["exceptionDetails"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+
+        let after = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"1 + 2"}}"#,
+        );
+        assert_eq!(after["result"]["result"]["value"], 3);
     }
 
     #[test]
