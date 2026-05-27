@@ -34,6 +34,7 @@
 //! | `Debugger`     | `setBreakpointByUrl`      | Resolves URL breakpoints against registered scripts |
 //! | `Debugger`     | `setBreakpointsActive`    | Enables/disables installed breakpoint pauses |
 //! | `Debugger`     | `setSkipAllPauses`        | Suppresses/resumes all debugger pause sources |
+//! | `Debugger`     | `setBlackboxPatterns`/`setBlackboxedRanges` | Stores blackbox filters for debugger setup |
 //! | `Debugger`     | `resume`                  | Resumes after a pause; emits `Debugger.resumed` when an active pause exists |
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
@@ -402,6 +403,10 @@ pub struct CdpDispatcher {
     breakpoints_active: bool,
     /// CDP `Debugger.setSkipAllPauses` state mirrored onto the debugger.
     skip_all_pauses: bool,
+    /// CDP blackbox URL regex patterns supplied by DevTools.
+    blackbox_patterns: Vec<String>,
+    /// CDP blackboxed ranges keyed by scriptId.
+    blackboxed_ranges: HashMap<String, Vec<Value>>,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
     /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
@@ -480,6 +485,8 @@ impl CdpDispatcher {
             cdp_debugger_breakpoints: HashMap::new(),
             breakpoints_active: true,
             skip_all_pauses: false,
+            blackbox_patterns: Vec::new(),
+            blackboxed_ranges: HashMap::new(),
             remote_objects: RemoteObjectRegistry::new(),
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
@@ -924,6 +931,8 @@ impl CdpDispatcher {
             "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
             "Debugger.setBreakpointsActive" => self.debugger_set_breakpoints_active(&req.params),
             "Debugger.setSkipAllPauses" => self.debugger_set_skip_all_pauses(&req.params),
+            "Debugger.setBlackboxPatterns" => self.debugger_set_blackbox_patterns(&req.params),
+            "Debugger.setBlackboxedRanges" => self.debugger_set_blackboxed_ranges(&req.params),
             "Debugger.resume" => self.debugger_resume(),
             "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
@@ -1732,6 +1741,61 @@ impl CdpDispatcher {
         if let Some(debugger) = self.debugger.as_ref() {
             debugger.borrow_mut().set_skip_all_pauses(skip);
         }
+        Ok(json!({}))
+    }
+
+    fn debugger_set_blackbox_patterns(&mut self, params: &Value) -> StatorResult<Value> {
+        let patterns = params
+            .get("patterns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBlackboxPatterns: required parameter 'patterns' is missing or \
+                     not an array"
+                        .to_string(),
+                )
+            })?;
+        let mut parsed = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let Some(pattern) = pattern.as_str() else {
+                return Err(crate::error::StatorError::TypeError(
+                    "Debugger.setBlackboxPatterns: every pattern must be a string".to_string(),
+                ));
+            };
+            parsed.push(pattern.to_string());
+        }
+        self.blackbox_patterns = parsed;
+        Ok(json!({}))
+    }
+
+    fn debugger_set_blackboxed_ranges(&mut self, params: &Value) -> StatorResult<Value> {
+        let script_id = params
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBlackboxedRanges: required parameter 'scriptId' is missing or \
+                     not a string"
+                        .to_string(),
+                )
+            })?;
+        if !self.script_sources.contains_key(script_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setBlackboxedRanges: unknown scriptId `{script_id}`"
+            )));
+        }
+        let positions = params
+            .get("positions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBlackboxedRanges: required parameter 'positions' is missing or \
+                     not an array"
+                        .to_string(),
+                )
+            })?;
+        self.blackboxed_ranges
+            .insert(script_id.to_string(), positions.clone());
         Ok(json!({}))
     }
 
@@ -5766,6 +5830,44 @@ mod tests {
         let bad = dispatch(
             &mut d,
             r#"{"id":2,"method":"Debugger.setSkipAllPauses","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
+    }
+
+    #[test]
+    fn set_blackbox_patterns_stores_patterns_and_rejects_bad_input() {
+        let mut d = fresh_dispatcher();
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBlackboxPatterns","params":{"patterns":["node_modules",".*vendor.*"]}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.blackbox_patterns, vec!["node_modules", ".*vendor.*"]);
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBlackboxPatterns","params":{"patterns":[7]}}"#,
+        );
+        assert!(bad["error"].is_object());
+    }
+
+    #[test]
+    fn set_blackboxed_ranges_stores_ranges_for_registered_script() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "function hidden() {}\n//# sourceURL=stator://hidden.js".to_string(),
+        );
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBlackboxedRanges","params":{"scriptId":"7","positions":[{"lineNumber":0,"columnNumber":0},{"lineNumber":0,"columnNumber":20}]}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.blackboxed_ranges.get("7").unwrap().len(), 2);
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBlackboxedRanges","params":{"scriptId":"missing","positions":[]}}"#,
         );
         assert!(bad["error"].is_object());
     }
