@@ -42,7 +42,8 @@
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Evaluates against the synthetic paused frame globals |
-//! | `Debugger`     | `restartFrame`/`setReturnValue`/`setVariableValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
+//! | `Debugger`     | `setVariableValue`        | Mutates globals on Stator synthetic paused frames |
+//! | `Debugger`     | `restartFrame`/`setReturnValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
 //! | `Debugger`     | `setScriptSource`         | Validates and updates registered script source text |
 //! | `Debugger`     | `getPossibleBreakpoints`  | Returns breakpointable locations for registered scripts |
@@ -1070,10 +1071,7 @@ impl CdpDispatcher {
                 "Debugger.setReturnValue",
                 "Stator does not yet support mutating the return value of a paused frame.",
             )),
-            "Debugger.setVariableValue" => Err(unsupported_debugger_method(
-                "Debugger.setVariableValue",
-                "Stator does not yet expose mutable call-frame scopes through CDP.",
-            )),
+            "Debugger.setVariableValue" => self.debugger_set_variable_value(&req.params),
             "Debugger.setBreakpointOnFunctionCall" => Err(unsupported_debugger_method(
                 "Debugger.setBreakpointOnFunctionCall",
                 "Stator does not yet support pausing on calls to an arbitrary function object.",
@@ -2062,6 +2060,71 @@ impl CdpDispatcher {
             ));
         }
         self.runtime_evaluate(params)
+    }
+
+    fn debugger_set_variable_value(&mut self, params: &Value) -> StatorResult<Value> {
+        let scope_number = params
+            .get("scopeNumber")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setVariableValue: required parameter 'scopeNumber' is missing or \
+                     not a number"
+                        .to_string(),
+                )
+            })?;
+        if scope_number != 0 {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
+            )));
+        }
+        let variable_name = params
+            .get("variableName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setVariableValue: required parameter 'variableName' is missing or \
+                     not a string"
+                        .to_string(),
+                )
+            })?;
+        let call_frame_id = params
+            .get("callFrameId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setVariableValue: required parameter 'callFrameId' is missing or \
+                     not a string"
+                        .to_string(),
+                )
+            })?;
+        if !call_frame_id.starts_with("stator-pause-frame-") {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown callFrameId `{call_frame_id}`"
+            )));
+        }
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.setVariableValue",
+                "no interpreter Debugger is attached to this session.",
+            ));
+        };
+        if debugger.borrow().last_pause_reason().is_none() {
+            return Err(unsupported_debugger_method(
+                "Debugger.setVariableValue",
+                "no active pause; variable mutation is only valid after a Debugger.paused event.",
+            ));
+        }
+        let new_value = params.get("newValue").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.setVariableValue: required parameter 'newValue' is missing".to_string(),
+            )
+        })?;
+        let value = call_argument_to_js_value(new_value, &self.remote_objects)?;
+        self.globals
+            .borrow_mut()
+            .insert(variable_name.to_string(), value);
+        Ok(json!({}))
     }
 
     // ── Debugger.stepInto / stepOver / stepOut ───────────────────────────────
@@ -3344,6 +3407,52 @@ fn js_value_to_remote_object(
             json!({"type": "undefined"})
         }
         _ => non_primitive_remote_object(value, registry, object_group, generate_preview),
+    }
+}
+
+fn call_argument_to_js_value(
+    argument: &Value,
+    registry: &RemoteObjectRegistry,
+) -> StatorResult<JsValue> {
+    if let Some(object_id) = argument.get("objectId").and_then(Value::as_str) {
+        return registry.get(object_id).ok_or_else(|| {
+            StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown objectId `{object_id}`"
+            ))
+        });
+    }
+    if let Some(unserializable) = argument.get("unserializableValue").and_then(Value::as_str) {
+        return match unserializable {
+            "NaN" => Ok(JsValue::HeapNumber(f64::NAN)),
+            "Infinity" => Ok(JsValue::HeapNumber(f64::INFINITY)),
+            "-Infinity" => Ok(JsValue::HeapNumber(f64::NEG_INFINITY)),
+            "-0" => Ok(JsValue::HeapNumber(-0.0)),
+            _ if unserializable.ends_with('n') => {
+                Ok(JsValue::String(unserializable.to_string().into()))
+            }
+            _ => Err(StatorError::TypeError(format!(
+                "Debugger.setVariableValue: unsupported unserializableValue `{unserializable}`"
+            ))),
+        };
+    }
+    match argument.get("value").unwrap_or(&Value::Null) {
+        Value::Null => Ok(JsValue::Null),
+        Value::Bool(value) => Ok(JsValue::Boolean(*value)),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64()
+                && let Ok(smi) = i32::try_from(value)
+            {
+                return Ok(JsValue::Smi(smi));
+            }
+            let value = number.as_f64().ok_or_else(|| {
+                StatorError::TypeError("Debugger.setVariableValue: invalid numeric value".into())
+            })?;
+            Ok(JsValue::HeapNumber(value))
+        }
+        Value::String(value) => Ok(JsValue::String(value.clone().into())),
+        other => Err(StatorError::TypeError(format!(
+            "Debugger.setVariableValue: unsupported value payload `{other}`"
+        ))),
     }
 }
 
@@ -6544,7 +6653,6 @@ mod tests {
         for method in [
             "Debugger.restartFrame",
             "Debugger.setReturnValue",
-            "Debugger.setVariableValue",
             "Debugger.setBreakpointOnFunctionCall",
         ] {
             let mut d = fresh_dispatcher();
@@ -6561,6 +6669,36 @@ mod tests {
             let message = response["error"]["message"].as_str().unwrap_or("");
             assert!(message.contains(method), "message for {method}: {message}");
         }
+    }
+
+    #[test]
+    fn set_variable_value_mutates_synthetic_global_scope() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"changed","callFrameId":"stator-pause-frame-0","newValue":{"value":42}}}"#,
+        );
+        assert!(ok.get("error").is_none());
+
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"changed"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn set_variable_value_requires_active_pause() {
+        let mut d = fresh_dispatcher();
+        let _dbg = attach_test_debugger(&mut d);
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"x","callFrameId":"stator-pause-frame-0","newValue":{"value":1}}}"#,
+        );
+        assert!(response["error"].is_object());
     }
 
     #[test]
