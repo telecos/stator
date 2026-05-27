@@ -390,8 +390,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "explicit-resource-management",
     // Atomics.waitAsync — promise integration not implemented
     "Atomics.waitAsync",
-    // ArrayBuffer.prototype.transfer not implemented
-    "arraybuffer-transfer",
     // Float16Array typed array not implemented
     "Float16Array",
     // Tail-call optimisation not implemented in the interpreter
