@@ -999,6 +999,10 @@ mod tests {
     #[test]
     fn notify_paused_fans_out_to_debugger_enabled_sessions_only() {
         let mut inspector = new_inspector();
+        inspector
+            .globals
+            .borrow_mut()
+            .insert("pausedGlobal".to_string(), JsValue::Smi(42));
         let _ = inspector.connect(1);
         let _ = inspector.connect(2);
 
@@ -1024,6 +1028,28 @@ mod tests {
         let event: Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(event["method"], "Debugger.paused");
         assert_eq!(event["params"]["reason"], "debuggerStatement");
+        let scope_object_id =
+            event["params"]["callFrames"][0]["scopeChain"][0]["object"]["objectId"]
+                .as_str()
+                .expect("global scope object id")
+                .to_string();
+        let props = dispatch_direct(
+            &mut s1.dispatcher,
+            &json!({
+                "id": 2,
+                "method": "Runtime.getProperties",
+                "params": { "objectId": scope_object_id }
+            })
+            .to_string(),
+        );
+        assert!(
+            props["result"]["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|property| property["name"] == "pausedGlobal"
+                    && property["value"]["value"] == 42)
+        );
 
         let s2 = inspector.session_by_id_mut(2).unwrap();
         let msgs2 = drain_to_strings(s2);

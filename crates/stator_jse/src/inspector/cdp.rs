@@ -91,6 +91,7 @@ use crate::inspector::debugger::{BreakpointId, DebugAction, Debugger, PauseEvent
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 use crate::parser;
 
@@ -634,9 +635,10 @@ impl CdpDispatcher {
         let line = dbg.last_pause_line();
         drop(dbg);
 
+        let scope_chain = self.synthetic_pause_scope_chain();
         self.push_event(
             "Debugger.paused",
-            paused_event_params(&reason, offset, line),
+            paused_event_params(&reason, offset, line, scope_chain),
         );
         true
     }
@@ -646,11 +648,42 @@ impl CdpDispatcher {
         if !self.debugger_enabled {
             return false;
         }
+        let scope_chain = self.synthetic_pause_scope_chain();
         self.push_event(
             "Debugger.paused",
-            paused_event_params(&event.reason, event.bytecode_offset, event.line),
+            paused_event_params(
+                &event.reason,
+                event.bytecode_offset,
+                event.line,
+                scope_chain,
+            ),
         );
         true
+    }
+
+    fn synthetic_pause_scope_chain(&mut self) -> Value {
+        let globals: Vec<_> = self
+            .globals
+            .borrow()
+            .vars
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let mut map = PropertyMap::new();
+        for (name, value) in globals {
+            map.insert(name, value);
+        }
+        let remote = js_value_to_remote_object(
+            &JsValue::PlainObject(Rc::new(RefCell::new(map))),
+            &mut self.remote_objects,
+            Some("debugger-scope"),
+            false,
+        );
+        json!([{
+            "type": "global",
+            "object": remote,
+            "name": "Global",
+        }])
     }
 
     /// Emit a `Debugger.resumed` event into the outbox.
@@ -3184,7 +3217,7 @@ fn paused_reason_str(reason: &PauseReason) -> &'static str {
     }
 }
 
-fn paused_event_params(reason: &PauseReason, offset: u32, line: u32) -> Value {
+fn paused_event_params(reason: &PauseReason, offset: u32, line: u32, scope_chain: Value) -> Value {
     // We cannot reconstruct the live JS call stack here yet: the interpreter
     // does not retain a portable per-frame snapshot at pause time. To avoid
     // emitting success-shaped placeholder frames we instead emit a single
@@ -3200,7 +3233,7 @@ fn paused_event_params(reason: &PauseReason, offset: u32, line: u32) -> Value {
             "lineNumber": line_number,
             "columnNumber": 0,
         },
-        "scopeChain": [],
+        "scopeChain": scope_chain,
         "this": {"type": "undefined"},
         "url": "",
     });
