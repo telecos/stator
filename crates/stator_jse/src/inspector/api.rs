@@ -226,6 +226,25 @@ impl InProcessInspector {
         Rc::clone(&self.debugger)
     }
 
+    /// Build a transport dispatcher that shares this inspector's embedder state.
+    ///
+    /// The returned dispatcher borrows the same globals, execution-context
+    /// snapshot, debugger handle, and registered script sources that in-process
+    /// sessions use. It is intended for single-threaded WebSocket serving via
+    /// [`CdpServer::accept_one_with_dispatcher`](crate::inspector::cdp::CdpServer::accept_one_with_dispatcher),
+    /// avoiding cross-thread movement of `Rc<RefCell<_>>` embedder state.
+    pub fn transport_dispatcher(&self) -> CdpDispatcher {
+        let mut dispatcher = CdpDispatcher::with_globals_and_contexts(
+            Rc::clone(&self.globals),
+            self.contexts.clone(),
+        );
+        dispatcher.attach_debugger(Rc::clone(&self.debugger));
+        for script in &self.scripts {
+            dispatcher.register_script_source(script.id, script.source.clone());
+        }
+        dispatcher
+    }
+
     /// Emit a `Debugger.paused` event into every connected session whose
     /// `Debugger` domain is enabled. Returns the number of sessions that
     /// received an event.
@@ -524,6 +543,7 @@ impl InProcessInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::value::JsValue;
     use serde_json::Value;
 
     fn new_inspector() -> InProcessInspector {
@@ -536,6 +556,15 @@ mod tests {
             out.push(std::str::from_utf8(bytes).unwrap().to_string());
         }
         out
+    }
+
+    fn dispatch_direct(dispatcher: &mut CdpDispatcher, text: &str) -> Value {
+        assert_eq!(dispatcher.dispatch_json(text), DispatchOutcome::Ok);
+        let mut last = None;
+        while let Some(message) = dispatcher.take_next() {
+            last = Some(message);
+        }
+        serde_json::from_str(&last.expect("response")).expect("valid JSON")
     }
 
     #[test]
@@ -868,6 +897,60 @@ mod tests {
             let response: Value = serde_json::from_str(messages.last().unwrap()).unwrap();
             assert_eq!(response["result"]["scriptSource"], "let registered = 42;");
         }
+    }
+
+    #[test]
+    fn transport_dispatcher_shares_globals_contexts_debugger_and_scripts() {
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        globals
+            .borrow_mut()
+            .insert("shared".to_string(), JsValue::Smi(41));
+        let mut inspector = InProcessInspector::new(Rc::clone(&globals));
+        let group_id = inspector.create_context_group("https://edge.test", "edge");
+        let context_id = inspector.create_context(
+            group_id,
+            "https://edge.test",
+            "main",
+            json!({"frameId": "frame-1"}),
+        );
+        let source = "let registered = 42;\n//# sourceURL=stator://transport.js".to_string();
+        let script_id = inspector.register_script(source.clone());
+
+        let mut dispatcher = inspector.transport_dispatcher();
+        let eval = dispatch_direct(
+            &mut dispatcher,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"shared + 1"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 42);
+
+        let source_response = dispatch_direct(
+            &mut dispatcher,
+            &json!({
+                "id": 2,
+                "method": "Debugger.getScriptSource",
+                "params": { "scriptId": script_id.to_string() }
+            })
+            .to_string(),
+        );
+        assert_eq!(source_response["result"]["scriptSource"], source);
+
+        let targets = dispatch_direct(
+            &mut dispatcher,
+            r#"{"id":3,"method":"Target.getTargets","params":{}}"#,
+        );
+        let target_ids: Vec<_> = targets["result"]["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["targetId"].as_str().unwrap())
+            .collect();
+        let expected_target_id = format!("stator-{group_id}");
+        assert!(
+            target_ids
+                .iter()
+                .any(|target_id| *target_id == expected_target_id)
+        );
+        assert_ne!(context_id, 0);
     }
 
     #[test]
