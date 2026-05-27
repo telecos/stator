@@ -83,7 +83,7 @@ use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEventKind, drain_messages, drain_profile_events};
-use crate::inspector::debugger::{BreakpointId, DebugAction, Debugger, PauseReason};
+use crate::inspector::debugger::{BreakpointId, DebugAction, Debugger, PauseEvent, PauseReason};
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
@@ -607,10 +607,19 @@ impl CdpDispatcher {
         if !self.debugger_enabled {
             return false;
         }
-        let Some(debugger) = self.debugger.as_ref() else {
+        let Some(debugger_rc) = self.debugger.as_ref().cloned() else {
             return false;
         };
-        let dbg = debugger.borrow();
+
+        let mut dbg = debugger_rc.borrow_mut();
+        let events = dbg.take_pause_events();
+        if !events.is_empty() {
+            drop(dbg);
+            for event in &events {
+                self.notify_pause_event(event);
+            }
+            return true;
+        }
         let Some(reason) = dbg.last_pause_reason().cloned() else {
             return false;
         };
@@ -618,8 +627,22 @@ impl CdpDispatcher {
         let line = dbg.last_pause_line();
         drop(dbg);
 
-        let params = paused_event_params(&reason, offset, line);
-        self.push_event("Debugger.paused", params);
+        self.push_event(
+            "Debugger.paused",
+            paused_event_params(&reason, offset, line),
+        );
+        true
+    }
+
+    /// Emit a `Debugger.paused` event from a recorded interpreter pause event.
+    pub fn notify_pause_event(&mut self, event: &PauseEvent) -> bool {
+        if !self.debugger_enabled {
+            return false;
+        }
+        self.push_event(
+            "Debugger.paused",
+            paused_event_params(&event.reason, event.bytecode_offset, event.line),
+        );
         true
     }
 

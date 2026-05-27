@@ -60,7 +60,7 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::builtins::error::call_stack_depth;
 use crate::bytecode::bytecode_array::BytecodeArray;
@@ -86,6 +86,17 @@ pub enum PauseReason {
     Step,
     /// An exception was thrown and `pause_on_exceptions` is enabled.
     Exception,
+}
+
+/// A single pause event recorded by the interpreter debugger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseEvent {
+    /// Reason for the pause.
+    pub reason: PauseReason,
+    /// Bytecode byte offset where the pause happened.
+    pub bytecode_offset: u32,
+    /// Best-effort 1-based source line for the pause.
+    pub line: u32,
 }
 
 /// What to do after handling a pause.
@@ -197,6 +208,8 @@ pub struct Debugger {
     last_pause_reason: Option<PauseReason>,
     /// Cached bytecode offset from the most recent pause.
     last_pause_offset: u32,
+    /// FIFO pause events waiting for inspector fan-out.
+    pause_events: VecDeque<PauseEvent>,
 }
 
 impl Default for Debugger {
@@ -221,6 +234,7 @@ impl Debugger {
             exception_resume: false,
             last_pause_reason: None,
             last_pause_offset: 0,
+            pause_events: VecDeque::new(),
         }
     }
 
@@ -369,6 +383,11 @@ impl Debugger {
             .unwrap_or(0)
     }
 
+    /// Drain recorded pause events in FIFO order.
+    pub fn take_pause_events(&mut self) -> Vec<PauseEvent> {
+        self.pause_events.drain(..).collect()
+    }
+
     // ── Interpreter callbacks ────────────────────────────────────────────────
 
     /// Called by the interpreter **before** each instruction is fetched and
@@ -500,6 +519,17 @@ impl Debugger {
         self.last_pause_reason = Some(reason);
         self.last_pause_offset = offset;
         self.step_mode = StepMode::None;
+        let line = self.last_pause_line();
+        let reason = self
+            .last_pause_reason
+            .as_ref()
+            .expect("just stored pause reason")
+            .clone();
+        self.pause_events.push_back(PauseEvent {
+            reason,
+            bytecode_offset: offset,
+            line,
+        });
     }
 }
 
@@ -616,6 +646,23 @@ mod tests {
         assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
         assert!(!dbg.breakpoints().any(|bp| bp.id == id));
         assert!(dbg.check_pause_at(0).is_none());
+    }
+
+    #[test]
+    fn test_pause_events_drain_in_fifo_order() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_breakpoint_at_offset(0, 3, 1);
+
+        assert!(dbg.check_pause_at(0).is_some());
+        let _ = dbg.on_debugger_statement(9);
+
+        let events = dbg.take_pause_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].reason, PauseReason::Breakpoint(id));
+        assert_eq!(events[0].bytecode_offset, 0);
+        assert_eq!(events[0].line, 3);
+        assert_eq!(events[1].reason, PauseReason::DebuggerStatement);
+        assert!(dbg.take_pause_events().is_empty());
     }
 
     #[test]

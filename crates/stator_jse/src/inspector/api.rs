@@ -27,7 +27,7 @@ use serde_json::json;
 use crate::inspector::cdp::{
     CdpDispatcher, DispatchOutcome, ExecutionContextDescription, default_execution_context,
 };
-use crate::inspector::debugger::Debugger;
+use crate::inspector::debugger::{Debugger, PauseEvent};
 use crate::interpreter::GlobalEnv;
 
 /// One CDP session within an [`InProcessInspector`].
@@ -118,6 +118,12 @@ impl InProcessInspectorSession {
     pub fn notify_paused(&mut self) -> bool {
         self.cached = None;
         self.dispatcher.notify_paused()
+    }
+
+    /// Emit a specific recorded pause event into this session's outbox.
+    pub fn notify_pause_event(&mut self, event: &PauseEvent) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_pause_event(event)
     }
 
     /// Emit a `Debugger.resumed` event into this session's outbox.
@@ -253,6 +259,19 @@ impl InProcessInspector {
     /// [`crate::interpreter::Interpreter::run`] returns
     /// [`crate::error::StatorError::DebuggerPaused`].
     pub fn notify_paused(&mut self) -> usize {
+        let events = self.debugger.borrow_mut().take_pause_events();
+        if !events.is_empty() {
+            let mut emitted = 0;
+            for event in &events {
+                for session in &mut self.sessions {
+                    if session.notify_pause_event(event) {
+                        emitted += 1;
+                    }
+                }
+            }
+            return emitted;
+        }
+
         let mut emitted = 0;
         for session in &mut self.sessions {
             if session.notify_paused() {
@@ -1009,6 +1028,36 @@ mod tests {
         let s2 = inspector.session_by_id_mut(2).unwrap();
         let msgs2 = drain_to_strings(s2);
         assert!(msgs2.is_empty(), "session 2 should receive nothing");
+    }
+
+    #[test]
+    fn notify_paused_fans_out_queued_pauses_to_every_enabled_session() {
+        let mut inspector = new_inspector();
+        for id in [1, 2] {
+            let session = inspector.connect(id);
+            assert_eq!(
+                session.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+                DispatchOutcome::Ok
+            );
+            drain_to_strings(session);
+        }
+
+        let dbg = inspector.debugger();
+        let _ = dbg.borrow_mut().on_debugger_statement(11);
+        let _ = dbg.borrow_mut().on_debugger_statement(22);
+
+        let emitted = inspector.notify_paused();
+        assert_eq!(emitted, 4, "two queued pauses fan out to two sessions");
+        for id in [1, 2] {
+            let session = inspector.session_by_id_mut(id).unwrap();
+            let messages = drain_to_strings(session);
+            assert_eq!(messages.len(), 2);
+            for message in messages {
+                let event: Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(event["method"], "Debugger.paused");
+                assert_eq!(event["params"]["reason"], "debuggerStatement");
+            }
+        }
     }
 
     #[test]
