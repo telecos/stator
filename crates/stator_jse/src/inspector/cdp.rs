@@ -39,7 +39,7 @@
 //! | `Debugger`     | `continueToLocation`      | Resumes to a one-shot breakpoint at a registered script location |
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
-//! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
+//! | `Debugger`     | `evaluateOnCallFrame`     | Evaluates against the synthetic paused frame globals |
 //! | `Debugger`     | `restartFrame`/`setReturnValue`/`setVariableValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
 //! | `Debugger`     | `setScriptSource`         | Validates and updates registered script source text |
@@ -996,11 +996,7 @@ impl CdpDispatcher {
                  inspector cannot interrupt a running script. Use `debugger;` \
                  statements or `Debugger.setBreakpointByUrl` to pause instead.",
             )),
-            "Debugger.evaluateOnCallFrame" => Err(unsupported_debugger_method(
-                "Debugger.evaluateOnCallFrame",
-                "Stator does not yet expose interpreter call-frame snapshots \
-                 through CDP. Use `Runtime.evaluate` while paused for now.",
-            )),
+            "Debugger.evaluateOnCallFrame" => self.debugger_evaluate_on_call_frame(&req.params),
             "Debugger.restartFrame" => Err(unsupported_debugger_method(
                 "Debugger.restartFrame",
                 "Stator does not yet support rewinding a paused interpreter frame.",
@@ -1949,6 +1945,37 @@ impl CdpDispatcher {
         }
         self.notify_resumed();
         Ok(json!({}))
+    }
+
+    fn debugger_evaluate_on_call_frame(&mut self, params: &Value) -> StatorResult<Value> {
+        let call_frame_id = params
+            .get("callFrameId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.evaluateOnCallFrame: required parameter 'callFrameId' is missing or \
+                     not a string"
+                        .to_string(),
+                )
+            })?;
+        if !call_frame_id.starts_with("stator-pause-frame-") {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.evaluateOnCallFrame: unknown callFrameId `{call_frame_id}`"
+            )));
+        }
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.evaluateOnCallFrame",
+                "no interpreter Debugger is attached to this session.",
+            ));
+        };
+        if debugger.borrow().last_pause_reason().is_none() {
+            return Err(unsupported_debugger_method(
+                "Debugger.evaluateOnCallFrame",
+                "no active pause; evaluation is only valid after a Debugger.paused event.",
+            ));
+        }
+        self.runtime_evaluate(params)
     }
 
     // ── Debugger.stepInto / stepOver / stepOut ───────────────────────────────
@@ -6344,15 +6371,30 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_on_call_frame_is_fail_closed() {
+    fn evaluate_on_call_frame_evaluates_against_paused_globals() {
         let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.globals
+            .borrow_mut()
+            .insert("pausedValue".to_string(), JsValue::Smi(41));
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
         let resp = dispatch(
             &mut d,
-            r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{}}"#,
+            r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"pausedValue + 1"}}"#,
+        );
+        assert_eq!(resp["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn evaluate_on_call_frame_requires_active_pause() {
+        let mut d = fresh_dispatcher();
+        let _dbg = attach_test_debugger(&mut d);
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"1"}}"#,
         );
         assert!(resp["error"].is_object());
-        let msg = resp["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("Debugger.evaluateOnCallFrame"), "msg: {msg}");
     }
 
     #[test]
