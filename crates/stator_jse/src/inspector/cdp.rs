@@ -3693,6 +3693,18 @@ impl CdpServer {
         self.serve_stream_with_dispatcher(stream, dispatcher)
     }
 
+    /// Accept and serve a single CDP connection using a dispatcher factory.
+    ///
+    /// The factory is invoked only for WebSocket upgrades.  Plain HTTP
+    /// discovery requests are answered without constructing a dispatcher.
+    pub fn accept_one_with_dispatcher_factory<F>(&self, dispatcher_factory: F) -> io::Result<()>
+    where
+        F: FnOnce() -> CdpDispatcher,
+    {
+        let (stream, _peer) = self.listener.accept()?;
+        self.serve_stream_with_dispatcher_factory(stream, dispatcher_factory)
+    }
+
     /// Accept and serve connections in a loop, blocking the calling thread.
     ///
     /// Each incoming connection is served to completion before the next is
@@ -3703,6 +3715,31 @@ impl CdpServer {
             let stream = stream?;
             // Ignore per-session errors; move on to the next connection.
             let _ = self.serve_stream(stream);
+        }
+        Ok(())
+    }
+
+    /// Accept and serve connections using a fresh dispatcher per WebSocket.
+    ///
+    /// This is the long-lived counterpart to
+    /// [`Self::accept_one_with_dispatcher`].  The loop remains single-threaded:
+    /// embedders can capture non-`Send` isolate state in the factory as long as
+    /// they call this method from the isolate/inspector owner thread.
+    pub fn accept_loop_with_dispatcher_factory<F>(
+        &self,
+        mut dispatcher_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut() -> CdpDispatcher,
+    {
+        for stream in self.listener.incoming() {
+            let stream = stream?;
+            if is_websocket_upgrade(&stream)? {
+                let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
+                let _ = CdpSession::with_dispatcher(ws, dispatcher_factory()).run();
+            } else {
+                let _ = serve_http_discovery(stream, self.local_addr()?);
+            }
         }
         Ok(())
     }
@@ -3720,9 +3757,20 @@ impl CdpServer {
         stream: TcpStream,
         dispatcher: CdpDispatcher,
     ) -> io::Result<()> {
+        self.serve_stream_with_dispatcher_factory(stream, || dispatcher)
+    }
+
+    fn serve_stream_with_dispatcher_factory<F>(
+        &self,
+        stream: TcpStream,
+        dispatcher_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> CdpDispatcher,
+    {
         if is_websocket_upgrade(&stream)? {
             let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
-            return CdpSession::with_dispatcher(ws, dispatcher).run();
+            return CdpSession::with_dispatcher(ws, dispatcher_factory()).run();
         }
         serve_http_discovery(stream, self.local_addr()?)
     }
@@ -3947,7 +3995,7 @@ mod tests {
         });
 
         server
-            .accept_one_with_dispatcher(dispatcher)
+            .accept_one_with_dispatcher_factory(move || dispatcher)
             .expect("server");
         let response = client.join().expect("client thread");
         assert_eq!(response["id"], 1);
