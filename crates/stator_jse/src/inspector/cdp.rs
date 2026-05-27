@@ -2663,10 +2663,12 @@ pub struct CdpSession {
 impl CdpSession {
     /// Wrap an accepted WebSocket connection in a new session.
     fn new(ws: WebSocket<TcpStream>) -> Self {
-        Self {
-            ws,
-            dispatcher: CdpDispatcher::new(),
-        }
+        Self::with_dispatcher(ws, CdpDispatcher::new())
+    }
+
+    /// Wrap an accepted WebSocket connection using a caller-provided dispatcher.
+    fn with_dispatcher(ws: WebSocket<TcpStream>, dispatcher: CdpDispatcher) -> Self {
+        Self { ws, dispatcher }
     }
 
     /// Drive the session until the client disconnects or a fatal error occurs.
@@ -3679,6 +3681,18 @@ impl CdpServer {
         self.serve_stream(stream)
     }
 
+    /// Accept and serve a single CDP connection using `dispatcher`.
+    ///
+    /// This single-threaded entry point lets embedders share their isolate's
+    /// globals and script registry with a WebSocket session without moving
+    /// `Rc<RefCell<_>>` state across threads. HTTP discovery requests are
+    /// still answered normally; the dispatcher is only consumed for WebSocket
+    /// upgrades.
+    pub fn accept_one_with_dispatcher(&self, dispatcher: CdpDispatcher) -> io::Result<()> {
+        let (stream, _peer) = self.listener.accept()?;
+        self.serve_stream_with_dispatcher(stream, dispatcher)
+    }
+
     /// Accept and serve connections in a loop, blocking the calling thread.
     ///
     /// Each incoming connection is served to completion before the next is
@@ -3697,6 +3711,18 @@ impl CdpServer {
         if is_websocket_upgrade(&stream)? {
             let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
             return CdpSession::new(ws).run();
+        }
+        serve_http_discovery(stream, self.local_addr()?)
+    }
+
+    fn serve_stream_with_dispatcher(
+        &self,
+        stream: TcpStream,
+        dispatcher: CdpDispatcher,
+    ) -> io::Result<()> {
+        if is_websocket_upgrade(&stream)? {
+            let ws = accept(stream).map_err(|e| io::Error::other(e.to_string()))?;
+            return CdpSession::with_dispatcher(ws, dispatcher).run();
         }
         serve_http_discovery(stream, self.local_addr()?)
     }
@@ -3891,6 +3917,41 @@ mod tests {
         let (handle, mut ws, _port) = start_server();
         ws.close(None).expect("close");
         handle.join().expect("thread panic").expect("server error");
+    }
+
+    #[test]
+    fn websocket_session_can_use_supplied_shared_globals_dispatcher() {
+        let server = CdpServer::bind("127.0.0.1:0").expect("bind");
+        let port = server.local_addr().expect("local_addr").port();
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        globals
+            .borrow_mut()
+            .insert("shared".to_string(), JsValue::Smi(41));
+        let dispatcher = CdpDispatcher::with_globals(globals);
+
+        let client = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let url = format!("ws://127.0.0.1:{port}");
+            let (mut ws, _resp) = connect(url).expect("connect");
+            ws.send(Message::Text(
+                r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"shared + 1"}}"#
+                    .into(),
+            ))
+            .expect("send");
+            let reply = ws.read().expect("read");
+            ws.close(None).ok();
+            match reply {
+                Message::Text(text) => serde_json::from_str::<Value>(&text).expect("valid JSON"),
+                other => panic!("unexpected websocket reply: {other:?}"),
+            }
+        });
+
+        server
+            .accept_one_with_dispatcher(dispatcher)
+            .expect("server");
+        let response = client.join().expect("client thread");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["result"]["value"], 42);
     }
 
     #[test]
