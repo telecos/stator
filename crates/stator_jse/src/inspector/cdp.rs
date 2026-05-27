@@ -40,6 +40,7 @@
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
+//! | `Debugger`     | `setScriptSource`         | Validates and updates registered script source text |
 //! | `Debugger`     | `getPossibleBreakpoints`  | Returns breakpointable locations for registered scripts |
 //! | `Console`      | `enable`                  | Flushes buffered messages as events |
 //! | `Console`      | `disable`                 | Acknowledges                       |
@@ -998,6 +999,7 @@ impl CdpDispatcher {
                  through CDP. Use `Runtime.evaluate` while paused for now.",
             )),
             "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
+            "Debugger.setScriptSource" => self.debugger_set_script_source(&req.params),
             "Debugger.getPossibleBreakpoints" => {
                 self.debugger_get_possible_breakpoints(&req.params)
             }
@@ -2087,6 +2089,76 @@ impl CdpDispatcher {
             ))
         })?;
         Ok(json!({ "scriptSource": source }))
+    }
+
+    fn debugger_set_script_source(&mut self, params: &Value) -> StatorResult<Value> {
+        let script_id = params
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setScriptSource: required parameter 'scriptId' is missing or not a \
+                     string"
+                        .to_string(),
+                )
+            })?
+            .to_string();
+        let script_source = params
+            .get("scriptSource")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setScriptSource: required parameter 'scriptSource' is missing or \
+                     not a string"
+                        .to_string(),
+                )
+            })?
+            .to_string();
+        if !self.script_sources.contains_key(&script_id) {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setScriptSource: unknown scriptId `{script_id}`"
+            )));
+        }
+
+        if let Err(err) = parser::parse(&script_source)
+            .and_then(|program| BytecodeGenerator::compile_program(&program))
+        {
+            let source_url = registered_script_url(&script_source);
+            let execution_context_id = self.contexts.first().map(|context| context.id).unwrap_or(1);
+            let details = self.exception_details_only(
+                &err,
+                ExceptionRequest {
+                    expression: &script_source,
+                    source_url: if source_url.is_empty() {
+                        None
+                    } else {
+                        Some(source_url.as_str())
+                    },
+                    execution_context_id,
+                    object_group: None,
+                    generate_preview: false,
+                },
+            );
+            return Ok(json!({
+                "status": "CompileError",
+                "exceptionDetails": details,
+            }));
+        }
+
+        let dry_run = params
+            .get("dryRun")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !dry_run {
+            let source_url = registered_script_url(&script_source);
+            self.script_sources.insert(script_id.clone(), script_source);
+            self.script_urls.insert(script_id, source_url);
+        }
+        Ok(json!({
+            "status": "Ok",
+            "callFrames": [],
+            "stackChanged": false,
+        }))
     }
 
     fn debugger_get_possible_breakpoints(&mut self, params: &Value) -> StatorResult<Value> {
@@ -6062,6 +6134,51 @@ mod tests {
             r#"{"id":1,"method":"Debugger.getScriptSource","params":{"scriptId":"missing"}}"#,
         );
         assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn set_script_source_updates_registered_source_and_url() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "let oldValue = 1;\n//# sourceURL=stator://old.js".to_string(),
+        );
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let newValue = 2;\n//# sourceURL=stator://new.js"}}"#,
+        );
+        assert_eq!(resp["result"]["status"], "Ok");
+        assert_eq!(resp["result"]["stackChanged"], false);
+
+        let source = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.getScriptSource","params":{"scriptId":"7"}}"#,
+        );
+        assert_eq!(
+            source["result"]["scriptSource"],
+            "let newValue = 2;\n//# sourceURL=stator://new.js"
+        );
+        assert_eq!(d.script_urls.get("7").unwrap(), "stator://new.js");
+    }
+
+    #[test]
+    fn set_script_source_dry_run_and_compile_error_do_not_mutate_source() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "let original = 1;".to_string());
+        let dry_run = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let dryRun = 2;","dryRun":true}}"#,
+        );
+        assert_eq!(dry_run["result"]["status"], "Ok");
+        assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"function {"}}"#,
+        );
+        assert_eq!(bad["result"]["status"], "CompileError");
+        assert!(bad["result"]["exceptionDetails"].is_object());
+        assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
     }
 
     #[test]
