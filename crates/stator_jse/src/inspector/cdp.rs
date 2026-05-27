@@ -40,6 +40,7 @@
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
 //! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Fail-closed: call-frame snapshots not implemented yet |
+//! | `Debugger`     | `restartFrame`/`setReturnValue`/`setVariableValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
 //! | `Debugger`     | `setScriptSource`         | Validates and updates registered script source text |
 //! | `Debugger`     | `getPossibleBreakpoints`  | Returns breakpointable locations for registered scripts |
@@ -999,6 +1000,22 @@ impl CdpDispatcher {
                 "Debugger.evaluateOnCallFrame",
                 "Stator does not yet expose interpreter call-frame snapshots \
                  through CDP. Use `Runtime.evaluate` while paused for now.",
+            )),
+            "Debugger.restartFrame" => Err(unsupported_debugger_method(
+                "Debugger.restartFrame",
+                "Stator does not yet support rewinding a paused interpreter frame.",
+            )),
+            "Debugger.setReturnValue" => Err(unsupported_debugger_method(
+                "Debugger.setReturnValue",
+                "Stator does not yet support mutating the return value of a paused frame.",
+            )),
+            "Debugger.setVariableValue" => Err(unsupported_debugger_method(
+                "Debugger.setVariableValue",
+                "Stator does not yet expose mutable call-frame scopes through CDP.",
+            )),
+            "Debugger.setBreakpointOnFunctionCall" => Err(unsupported_debugger_method(
+                "Debugger.setBreakpointOnFunctionCall",
+                "Stator does not yet support pausing on calls to an arbitrary function object.",
             )),
             "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
             "Debugger.setScriptSource" => self.debugger_set_script_source(&req.params),
@@ -6227,6 +6244,30 @@ mod tests {
         assert!(resp["error"].is_object());
         let msg = resp["error"]["message"].as_str().unwrap_or("");
         assert!(msg.contains("Debugger.evaluateOnCallFrame"), "msg: {msg}");
+    }
+
+    #[test]
+    fn call_frame_mutation_methods_are_fail_closed() {
+        for method in [
+            "Debugger.restartFrame",
+            "Debugger.setReturnValue",
+            "Debugger.setVariableValue",
+            "Debugger.setBreakpointOnFunctionCall",
+        ] {
+            let mut d = fresh_dispatcher();
+            let response = dispatch(
+                &mut d,
+                &json!({
+                    "id": 1,
+                    "method": method,
+                    "params": {}
+                })
+                .to_string(),
+            );
+            assert!(response["error"].is_object(), "{method} must error");
+            let message = response["error"]["message"].as_str().unwrap_or("");
+            assert!(message.contains(method), "message for {method}: {message}");
+        }
     }
 
     #[test]
