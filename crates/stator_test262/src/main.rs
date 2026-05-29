@@ -370,8 +370,6 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Resizable ArrayBuffer — not yet implemented
-    "resizable-arraybuffer",
     // TC39 Stage 3 / new built-ins not yet implemented
     "Temporal",
     "decorators",
@@ -1814,7 +1812,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_symbol() {
         assert!(has_unsupported_feature(&[
-            "resizable-arraybuffer".to_string(),
+            "Temporal".to_string(),
             "other".to_string()
         ]));
     }
