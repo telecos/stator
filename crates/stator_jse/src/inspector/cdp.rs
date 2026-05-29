@@ -1188,6 +1188,7 @@ impl CdpDispatcher {
             "Debugger.setAsyncCallStackDepth" => {
                 self.debugger_set_async_call_stack_depth(&req.params)
             }
+            "Debugger.getStackTrace" => self.debugger_get_stack_trace(&req.params),
             "Debugger.setBreakpoint" => self.debugger_set_breakpoint(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
             "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
@@ -2086,6 +2087,26 @@ impl CdpDispatcher {
         };
         self.async_call_stack_depth = max_depth.min(u32::MAX as u64) as u32;
         Ok(json!({}))
+    }
+
+    fn debugger_get_stack_trace(&self, params: &Value) -> StatorResult<Value> {
+        let stack_trace_id = params.get("stackTraceId").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.getStackTrace: required parameter 'stackTraceId' is missing".to_string(),
+            )
+        })?;
+        let id = stack_trace_id
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.getStackTrace: stackTraceId.id is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        Err(crate::error::StatorError::Internal(format!(
+            "Debugger.getStackTrace: unknown stackTraceId `{id}`"
+        )))
     }
 
     fn debugger_set_breakpoints_active(&mut self, params: &Value) -> StatorResult<Value> {
@@ -6737,6 +6758,34 @@ mod tests {
         }
         bridge.disconnect();
         panic!("pause bridge did not enter paused state");
+    }
+
+    #[test]
+    fn debugger_get_stack_trace_rejects_missing_or_unknown_id() {
+        let mut d = fresh_dispatcher();
+        let missing = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.getStackTrace","params":{}}"#,
+        );
+        assert!(missing["error"].is_object());
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.getStackTrace","params":{"stackTraceId":{}}}"#,
+        );
+        assert!(bad["error"].is_object());
+
+        let unknown = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.getStackTrace","params":{"stackTraceId":{"id":"missing"}}}"#,
+        );
+        assert!(unknown["error"].is_object());
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
     }
 
     #[test]
