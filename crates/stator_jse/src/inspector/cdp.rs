@@ -64,6 +64,7 @@
 //! | `Network`      | `enable`/`disable`        | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled` | Minimal standalone page metadata |
+//! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -441,6 +442,10 @@ pub struct CdpDispatcher {
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
     page_lifecycle_events_enabled: bool,
+    /// Whether the Log domain is currently enabled for this session.
+    log_enabled: bool,
+    /// Number of cached violation-report settings from `Log.startViolationsReport`.
+    log_violation_setting_count: usize,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -552,6 +557,8 @@ impl CdpDispatcher {
             network_bypass_service_worker: false,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
+            log_enabled: false,
+            log_violation_setting_count: 0,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -662,6 +669,16 @@ impl CdpDispatcher {
     /// Returns the cached `Page.setLifecycleEventsEnabled` value.
     pub fn page_lifecycle_events_enabled(&self) -> bool {
         self.page_lifecycle_events_enabled
+    }
+
+    /// Returns `true` if the Log domain is currently enabled.
+    pub fn log_enabled(&self) -> bool {
+        self.log_enabled
+    }
+
+    /// Returns the cached violation-report setting count.
+    pub fn log_violation_setting_count(&self) -> usize {
+        self.log_violation_setting_count
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1339,6 +1356,19 @@ impl CdpDispatcher {
             "Page.getFrameTree" => self.page_get_frame_tree(),
             "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
 
+            // ── Log ───────────────────────────────────────────────────────
+            "Log.enable" => {
+                self.log_enabled = true;
+                Ok(json!({}))
+            }
+            "Log.disable" => {
+                self.log_enabled = false;
+                Ok(json!({}))
+            }
+            "Log.clear" => Ok(json!({})),
+            "Log.startViolationsReport" => self.log_start_violations_report(&req.params),
+            "Log.stopViolationsReport" => self.log_stop_violations_report(),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1424,6 +1454,32 @@ impl CdpDispatcher {
             ));
         };
         self.page_lifecycle_events_enabled = enabled;
+        Ok(json!({}))
+    }
+
+    fn log_start_violations_report(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(config) = params.get("config").and_then(Value::as_array) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Log.startViolationsReport: required parameter 'config' is missing or not an array"
+                    .to_string(),
+            ));
+        };
+        for setting in config {
+            let name = setting.get("name").and_then(Value::as_str);
+            let threshold = setting.get("threshold").and_then(Value::as_i64);
+            if name.is_none() || threshold.is_none() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Log.startViolationsReport: every config entry requires string 'name' and numeric 'threshold'"
+                        .to_string(),
+                ));
+            }
+        }
+        self.log_violation_setting_count = config.len();
+        Ok(json!({}))
+    }
+
+    fn log_stop_violations_report(&mut self) -> StatorResult<Value> {
+        self.log_violation_setting_count = 0;
         Ok(json!({}))
     }
 
@@ -3550,6 +3606,8 @@ fn schema_get_domains() -> Value {
             { "name": "Profiler", "version": "1.3" },
             { "name": "HeapProfiler", "version": "1.3" },
             { "name": "Network", "version": "1.3" },
+            { "name": "Page", "version": "1.3" },
+            { "name": "Log", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -5796,6 +5854,41 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn log_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Log.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.log_enabled());
+
+        let start = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Log.startViolationsReport","params":{"config":[{"name":"longTask","threshold":200}]}}"#,
+        );
+        assert!(start.get("error").is_none());
+        assert_eq!(d.log_violation_setting_count(), 1);
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Log.startViolationsReport","params":{"config":[{"name":"longTask"}]}}"#,
+        );
+        assert!(bad["error"].is_object());
+
+        let clear = dispatch(&mut d, r#"{"id":4,"method":"Log.clear","params":{}}"#);
+        assert!(clear.get("error").is_none());
+
+        let stop = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Log.stopViolationsReport","params":{}}"#,
+        );
+        assert!(stop.get("error").is_none());
+        assert_eq!(d.log_violation_setting_count(), 0);
+
+        let disable = dispatch(&mut d, r#"{"id":6,"method":"Log.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.log_enabled());
     }
 
     #[test]
