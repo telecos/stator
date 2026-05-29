@@ -422,6 +422,10 @@ pub struct CdpDispatcher {
     contexts: Vec<ExecutionContextDescription>,
     /// Whether the `Runtime` domain is currently enabled for this session.
     runtime_enabled: bool,
+    /// Whether custom object formatters are enabled for this session.
+    custom_object_formatter_enabled: bool,
+    /// Maximum stack frame count requested for captured call stacks.
+    max_call_stack_size_to_capture: u32,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
@@ -527,6 +531,8 @@ impl CdpDispatcher {
             type_profile_scripts: HashMap::new(),
             contexts,
             runtime_enabled: false,
+            custom_object_formatter_enabled: false,
+            max_call_stack_size_to_capture: 0,
             console_enabled: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
@@ -603,6 +609,16 @@ impl CdpDispatcher {
     /// Returns `true` if the `Runtime` domain is currently enabled.
     pub fn runtime_enabled(&self) -> bool {
         self.runtime_enabled
+    }
+
+    /// Returns `true` if custom object formatters are enabled for this session.
+    pub fn custom_object_formatter_enabled(&self) -> bool {
+        self.custom_object_formatter_enabled
+    }
+
+    /// Returns the requested maximum stack size for captured call stacks.
+    pub fn max_call_stack_size_to_capture(&self) -> u32 {
+        self.max_call_stack_size_to_capture
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1140,6 +1156,12 @@ impl CdpDispatcher {
             "Runtime.compileScript" => self.runtime_compile_script(&req.params),
             "Runtime.runScript" => self.runtime_run_script(&req.params),
             "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
+            "Runtime.setCustomObjectFormatterEnabled" => {
+                self.runtime_set_custom_object_formatter_enabled(&req.params)
+            }
+            "Runtime.setMaxCallStackSizeToCapture" => {
+                self.runtime_set_max_call_stack_size_to_capture(&req.params)
+            }
             "Runtime.discardConsoleEntries" => self.runtime_discard_console_entries(),
             "Runtime.globalLexicalScopeNames" => {
                 self.runtime_global_lexical_scope_names(&req.params)
@@ -1278,6 +1300,34 @@ impl CdpDispatcher {
     }
 
     // ── Runtime handshake/introspection helpers ──────────────────────────────
+
+    fn runtime_set_custom_object_formatter_enabled(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Runtime.setCustomObjectFormatterEnabled: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.custom_object_formatter_enabled = enabled;
+        Ok(json!({}))
+    }
+
+    fn runtime_set_max_call_stack_size_to_capture(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let Some(size) = params.get("size").and_then(Value::as_u64) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Runtime.setMaxCallStackSizeToCapture: required parameter 'size' is missing or not a number"
+                    .to_string(),
+            ));
+        };
+        self.max_call_stack_size_to_capture = size.min(u32::MAX as u64) as u32;
+        Ok(json!({}))
+    }
 
     fn runtime_discard_console_entries(&mut self) -> StatorResult<Value> {
         let _ = drain_messages();
@@ -5824,6 +5874,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_setup_compat_methods_store_settings_and_reject_bad_input() {
+        let mut d = fresh_dispatcher();
+        let formatter = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.setCustomObjectFormatterEnabled","params":{"enabled":true}}"#,
+        );
+        assert!(formatter.get("error").is_none());
+        assert!(d.custom_object_formatter_enabled());
+
+        let formatter_bad = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.setCustomObjectFormatterEnabled","params":{}}"#,
+        );
+        assert!(formatter_bad["error"].is_object());
+
+        let stack = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.setMaxCallStackSizeToCapture","params":{"size":32}}"#,
+        );
+        assert!(stack.get("error").is_none());
+        assert_eq!(d.max_call_stack_size_to_capture(), 32);
+
+        let stack_huge = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Runtime.setMaxCallStackSizeToCapture","params":{"size":9999999999}}"#,
+        );
+        assert!(stack_huge.get("error").is_none());
+        assert_eq!(d.max_call_stack_size_to_capture(), u32::MAX);
+
+        let stack_bad = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Runtime.setMaxCallStackSizeToCapture","params":{}}"#,
+        );
+        assert!(stack_bad["error"].is_object());
+    }
+
+    #[test]
     fn runtime_handshake_compat_methods_ack() {
         let mut d = fresh_dispatcher();
         let run = dispatch(
@@ -7137,12 +7224,11 @@ mod tests {
     }
 
     #[test]
-    fn pause_method_is_fail_closed() {
+    fn pause_method_acknowledges_next_poll_request() {
         let mut d = fresh_dispatcher();
         let resp = dispatch(&mut d, r#"{"id":1,"method":"Debugger.pause","params":{}}"#);
-        assert!(resp["error"].is_object(), "Debugger.pause must error");
-        let msg = resp["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("Debugger.pause"), "error message: {msg}");
+        assert!(resp["result"].is_object());
+        assert!(resp.get("error").is_none());
     }
 
     #[test]
