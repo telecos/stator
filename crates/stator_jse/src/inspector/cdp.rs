@@ -65,6 +65,7 @@
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
+//! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -446,6 +447,10 @@ pub struct CdpDispatcher {
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
     log_violation_setting_count: usize,
+    /// Whether the Security domain is currently enabled for this session.
+    security_enabled: bool,
+    /// Cached `Security.setIgnoreCertificateErrors` state.
+    security_ignore_certificate_errors: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -559,6 +564,8 @@ impl CdpDispatcher {
             page_lifecycle_events_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
+            security_enabled: false,
+            security_ignore_certificate_errors: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -679,6 +686,16 @@ impl CdpDispatcher {
     /// Returns the cached violation-report setting count.
     pub fn log_violation_setting_count(&self) -> usize {
         self.log_violation_setting_count
+    }
+
+    /// Returns `true` if the Security domain is currently enabled.
+    pub fn security_enabled(&self) -> bool {
+        self.security_enabled
+    }
+
+    /// Returns the cached certificate-error ignore setting.
+    pub fn security_ignore_certificate_errors(&self) -> bool {
+        self.security_ignore_certificate_errors
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1369,6 +1386,19 @@ impl CdpDispatcher {
             "Log.startViolationsReport" => self.log_start_violations_report(&req.params),
             "Log.stopViolationsReport" => self.log_stop_violations_report(),
 
+            // ── Security ──────────────────────────────────────────────────
+            "Security.enable" => {
+                self.security_enabled = true;
+                Ok(json!({}))
+            }
+            "Security.disable" => {
+                self.security_enabled = false;
+                Ok(json!({}))
+            }
+            "Security.setIgnoreCertificateErrors" => {
+                self.security_set_ignore_certificate_errors(&req.params)
+            }
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1480,6 +1510,17 @@ impl CdpDispatcher {
 
     fn log_stop_violations_report(&mut self) -> StatorResult<Value> {
         self.log_violation_setting_count = 0;
+        Ok(json!({}))
+    }
+
+    fn security_set_ignore_certificate_errors(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(ignore) = params.get("ignore").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Security.setIgnoreCertificateErrors: required parameter 'ignore' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.security_ignore_certificate_errors = ignore;
         Ok(json!({}))
     }
 
@@ -3608,6 +3649,7 @@ fn schema_get_domains() -> Value {
             { "name": "Network", "version": "1.3" },
             { "name": "Page", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
+            { "name": "Security", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -5854,6 +5896,34 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn security_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Security.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.security_enabled());
+
+        let ignore = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Security.setIgnoreCertificateErrors","params":{"ignore":true}}"#,
+        );
+        assert!(ignore.get("error").is_none());
+        assert!(d.security_ignore_certificate_errors());
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Security.setIgnoreCertificateErrors","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Security.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.security_enabled());
     }
 
     #[test]
