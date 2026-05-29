@@ -61,8 +61,9 @@
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
-//! | `Network`      | `enable`                  | Acknowledges (stub)                |
-//! | `Network`      | `disable`                 | Acknowledges (stub)                |
+//! | `Network`      | `enable`/`disable`        | Acknowledges and tracks state      |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
+//! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled` | Minimal standalone page metadata |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -436,6 +437,10 @@ pub struct CdpDispatcher {
     network_cache_disabled: bool,
     /// Cached `Network.setBypassServiceWorker` state.
     network_bypass_service_worker: bool,
+    /// Whether the Page domain is currently enabled for this session.
+    page_enabled: bool,
+    /// Cached `Page.setLifecycleEventsEnabled` state.
+    page_lifecycle_events_enabled: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -545,6 +550,8 @@ impl CdpDispatcher {
             network_enabled: false,
             network_cache_disabled: false,
             network_bypass_service_worker: false,
+            page_enabled: false,
+            page_lifecycle_events_enabled: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -645,6 +652,16 @@ impl CdpDispatcher {
     /// Returns the cached `Network.setBypassServiceWorker` value.
     pub fn network_bypass_service_worker(&self) -> bool {
         self.network_bypass_service_worker
+    }
+
+    /// Returns `true` if the Page domain is currently enabled.
+    pub fn page_enabled(&self) -> bool {
+        self.page_enabled
+    }
+
+    /// Returns the cached `Page.setLifecycleEventsEnabled` value.
+    pub fn page_lifecycle_events_enabled(&self) -> bool {
+        self.page_lifecycle_events_enabled
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1309,6 +1326,19 @@ impl CdpDispatcher {
             "Network.setCacheDisabled" => self.network_set_cache_disabled(&req.params),
             "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
 
+            // ── Page ──────────────────────────────────────────────────────
+            "Page.enable" => {
+                self.page_enabled = true;
+                Ok(json!({}))
+            }
+            "Page.disable" => {
+                self.page_enabled = false;
+                Ok(json!({}))
+            }
+            "Page.getResourceTree" => self.page_get_resource_tree(),
+            "Page.getFrameTree" => self.page_get_frame_tree(),
+            "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1346,6 +1376,54 @@ impl CdpDispatcher {
             ));
         };
         self.network_bypass_service_worker = bypass;
+        Ok(json!({}))
+    }
+
+    fn page_frame_tree(&self) -> Value {
+        let context = self
+            .contexts
+            .first()
+            .cloned()
+            .unwrap_or_else(default_execution_context);
+        let url = if context.origin.is_empty() {
+            "stator://page".to_string()
+        } else {
+            context.origin.clone()
+        };
+        json!({
+            "frame": {
+                "id": format!("stator-frame-{}", context.id),
+                "loaderId": format!("stator-loader-{}", context.id),
+                "url": url,
+                "domainAndRegistry": "",
+                "securityOrigin": context.origin,
+                "mimeType": "text/html",
+            },
+            "childFrames": [],
+            "resources": [],
+        })
+    }
+
+    fn page_get_resource_tree(&self) -> StatorResult<Value> {
+        Ok(json!({
+            "frameTree": self.page_frame_tree(),
+        }))
+    }
+
+    fn page_get_frame_tree(&self) -> StatorResult<Value> {
+        Ok(json!({
+            "frameTree": self.page_frame_tree(),
+        }))
+    }
+
+    fn page_set_lifecycle_events_enabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Page.setLifecycleEventsEnabled: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.page_lifecycle_events_enabled = enabled;
         Ok(json!({}))
     }
 
@@ -5718,6 +5796,69 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn page_setup_methods_return_minimal_frame_tree_and_validate_input() {
+        let mut d = CdpDispatcher::with_globals_and_contexts(
+            Rc::new(RefCell::new(GlobalEnv::new())),
+            vec![ExecutionContextDescription::new(
+                7,
+                1,
+                "stator://test-page",
+                "test-page",
+                json!({"isDefault": true}),
+            )],
+        );
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Page.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.page_enabled());
+
+        let resource_tree = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Page.getResourceTree","params":{}}"#,
+        );
+        assert_eq!(
+            resource_tree["result"]["frameTree"]["frame"]["id"],
+            "stator-frame-7"
+        );
+        assert_eq!(
+            resource_tree["result"]["frameTree"]["frame"]["url"],
+            "stator://test-page"
+        );
+        assert_eq!(
+            resource_tree["result"]["frameTree"]["resources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let frame_tree = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Page.getFrameTree","params":{}}"#,
+        );
+        assert_eq!(
+            frame_tree["result"]["frameTree"]["frame"]["id"],
+            "stator-frame-7"
+        );
+
+        let lifecycle = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Page.setLifecycleEventsEnabled","params":{"enabled":true}}"#,
+        );
+        assert!(lifecycle.get("error").is_none());
+        assert!(d.page_lifecycle_events_enabled());
+
+        let lifecycle_bad = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Page.setLifecycleEventsEnabled","params":{}}"#,
+        );
+        assert!(lifecycle_bad["error"].is_object());
+
+        let disable = dispatch(&mut d, r#"{"id":6,"method":"Page.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.page_enabled());
     }
 
     #[test]
