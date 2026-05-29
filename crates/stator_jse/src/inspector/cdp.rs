@@ -1178,12 +1178,7 @@ impl CdpDispatcher {
             "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
             "Debugger.stepOut" => self.debugger_step(DebugAction::StepOut),
-            "Debugger.pause" => Err(unsupported_debugger_method(
-                "Debugger.pause",
-                "Stator runs scripts synchronously on the embedder thread; the \
-                 inspector cannot interrupt a running script. Use `debugger;` \
-                 statements or `Debugger.setBreakpointByUrl` to pause instead.",
-            )),
+            "Debugger.pause" => self.debugger_pause(),
             "Debugger.evaluateOnCallFrame" => self.debugger_evaluate_on_call_frame(&req.params),
             "Debugger.restartFrame" => Err(unsupported_debugger_method(
                 "Debugger.restartFrame",
@@ -2150,6 +2145,16 @@ impl CdpDispatcher {
         }
         if emitted {
             self.notify_resumed();
+        }
+        Ok(json!({}))
+    }
+
+    fn debugger_pause(&mut self) -> StatorResult<Value> {
+        if let Some(bridge) = &self.pause_bridge {
+            bridge.request_pause();
+        }
+        if let Some(debugger) = self.debugger.as_ref() {
+            debugger.borrow_mut().request_pause();
         }
         Ok(json!({}))
     }
@@ -6842,6 +6847,37 @@ mod tests {
                 .any(|msg| msg["method"] == "Debugger.resumed"),
             "expected Debugger.resumed event, got {messages:?}"
         );
+    }
+
+    #[test]
+    fn debugger_pause_requests_bridge_pause_at_next_poll() {
+        let bridge = DebuggerPauseBridge::new();
+        let mut d = fresh_dispatcher();
+        d.attach_pause_bridge(bridge.clone());
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let resp = dispatch(&mut d, r#"{"id":2,"method":"Debugger.pause","params":{}}"#);
+        assert!(resp.get("error").is_none());
+
+        let worker_bridge = bridge.clone();
+        let handle = thread::spawn(move || {
+            let mut dbg = InterpreterDebugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.check_pause_at_with_frame(0, sample_pause_frame_snapshot)
+                .is_none()
+        });
+
+        wait_until_bridge_paused(&bridge);
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        assert_eq!(paused.len(), 1);
+        assert_eq!(paused[0]["method"], "Debugger.paused");
+        assert_eq!(paused[0]["params"]["reason"], "other");
+
+        let resume = dispatch(&mut d, r#"{"id":3,"method":"Debugger.resume","params":{}}"#);
+        assert!(resume.get("error").is_none());
+        assert!(handle.join().unwrap());
     }
 
     #[test]

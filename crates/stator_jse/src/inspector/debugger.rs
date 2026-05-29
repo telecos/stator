@@ -151,6 +151,7 @@ struct DebuggerPauseBridgeState {
     events: VecDeque<PauseEvent>,
     paused: bool,
     resume_action: Option<DebugAction>,
+    pause_requested: bool,
     disconnected: bool,
 }
 
@@ -210,6 +211,32 @@ impl DebuggerPauseBridge {
         true
     }
 
+    /// Request that the interpreter pause at its next debugger poll.
+    pub fn request_pause(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if !state.disconnected {
+            state.pause_requested = true;
+        }
+    }
+
+    fn take_pause_request(&self) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if state.disconnected {
+            return false;
+        }
+        let requested = state.pause_requested;
+        state.pause_requested = false;
+        requested
+    }
+
     /// Wake any blocked interpreter and prevent future waits.
     pub fn disconnect(&self) {
         let mut state = self
@@ -219,6 +246,7 @@ impl DebuggerPauseBridge {
             .expect("debugger pause bridge mutex poisoned");
         state.disconnected = true;
         state.paused = false;
+        state.pause_requested = false;
         state.resume_action = Some(DebugAction::Continue);
         state.events.clear();
         self.inner.resumed.notify_all();
@@ -361,6 +389,8 @@ pub struct Debugger {
     pause_events: VecDeque<PauseEvent>,
     /// Optional cross-thread bridge used by transport-backed CDP sessions.
     pause_bridge: Option<DebuggerPauseBridge>,
+    /// One-shot request from `Debugger.pause`.
+    pause_requested: bool,
     /// Snapshot of the top frame at the most recent pause, when available.
     last_pause_frame: Option<PauseFrameSnapshot>,
 }
@@ -389,6 +419,7 @@ impl Debugger {
             last_pause_offset: 0,
             pause_events: VecDeque::new(),
             pause_bridge: None,
+            pause_requested: false,
             last_pause_frame: None,
         }
     }
@@ -559,6 +590,11 @@ impl Debugger {
         self.pause_bridge = Some(bridge);
     }
 
+    /// Request a pause at the next debugger poll.
+    pub fn request_pause(&mut self) {
+        self.pause_requested = true;
+    }
+
     // ── Interpreter callbacks ────────────────────────────────────────────────
 
     /// Called by the interpreter **before** each instruction is fetched and
@@ -599,6 +635,16 @@ impl Debugger {
         if self.skip_next {
             self.skip_next = false;
             return None;
+        }
+
+        if self.pause_requested
+            || self
+                .pause_bridge
+                .as_ref()
+                .is_some_and(DebuggerPauseBridge::take_pause_request)
+        {
+            self.pause_requested = false;
+            return Some((PauseReason::Step, None));
         }
 
         let hit_breakpoint_id = if self.breakpoints_active {
@@ -888,6 +934,24 @@ mod tests {
         bridge.disconnect();
         assert!(handle.join().unwrap());
         assert!(!bridge.is_paused());
+    }
+
+    #[test]
+    fn test_pause_request_pauses_at_next_offset() {
+        let mut dbg = Debugger::new();
+        dbg.request_pause();
+        assert!(
+            dbg.check_pause_at_with_frame(0, || PauseFrameSnapshot {
+                parameter_count: 0,
+                frame_size: 0,
+                registers: vec![],
+                accumulator: JsValue::Smi(1),
+            })
+            .is_some()
+        );
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Step));
+        assert_eq!(dbg.last_pause_offset(), 0);
+        assert!(dbg.last_pause_frame_snapshot().is_some());
     }
 
     #[test]
