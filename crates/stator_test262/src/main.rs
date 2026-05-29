@@ -396,8 +396,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "tail-call-optimization",
     // cross-realm — requires full realm support
     "cross-realm",
-    // Symbol.species — defined but constructor integration incomplete
-    "Symbol.species",
     // Intl not implemented
     "Intl-enumeration",
     "Intl.DateTimeFormat-datetimestyle",
