@@ -374,8 +374,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "resizable-arraybuffer",
     // Module features that need runtime module loader
     "arbitrary-module-namespace-names",
-    "import-assertions",
-    "import-attributes",
     // TC39 Stage 3 / new built-ins not yet implemented
     "Temporal",
     "decorators",
