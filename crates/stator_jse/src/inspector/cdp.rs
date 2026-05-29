@@ -46,6 +46,7 @@
 //! | `Debugger`     | `setVariableValue`        | Mutates globals on Stator synthetic paused frames |
 //! | `Debugger`     | `restartFrame`/`setReturnValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
+//! | `Debugger`     | `searchInContent`         | Searches registered script source content |
 //! | `Debugger`     | `setScriptSource`         | Validates and updates registered script source text |
 //! | `Debugger`     | `getPossibleBreakpoints`  | Returns breakpointable locations for registered scripts |
 //! | `Console`      | `enable`                  | Flushes buffered messages as events |
@@ -1222,6 +1223,7 @@ impl CdpDispatcher {
                 "Stator does not yet support instrumentation breakpoints before script execution.",
             )),
             "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
+            "Debugger.searchInContent" => self.debugger_search_in_content(&req.params),
             "Debugger.setScriptSource" => self.debugger_set_script_source(&req.params),
             "Debugger.getPossibleBreakpoints" => {
                 self.debugger_get_possible_breakpoints(&req.params)
@@ -2636,6 +2638,39 @@ impl CdpDispatcher {
         Ok(json!({ "scriptSource": source }))
     }
 
+    fn debugger_search_in_content(&mut self, params: &Value) -> StatorResult<Value> {
+        let script_id = params
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                "Debugger.searchInContent: required parameter 'scriptId' is missing or not a string"
+                    .to_string(),
+            )
+            })?;
+        let query = params.get("query").and_then(Value::as_str).ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.searchInContent: required parameter 'query' is missing or not a string"
+                    .to_string(),
+            )
+        })?;
+        let source = self.script_sources.get(script_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.searchInContent: unknown scriptId `{script_id}`"
+            ))
+        })?;
+        let case_sensitive = params
+            .get("caseSensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let is_regex = params
+            .get("isRegex")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let result = search_script_content(source, query, case_sensitive, is_regex)?;
+        Ok(json!({ "result": result }))
+    }
+
     fn debugger_set_script_source(&mut self, params: &Value) -> StatorResult<Value> {
         let script_id = params
             .get("scriptId")
@@ -3239,6 +3274,62 @@ fn exception_source_url(params: &Value, expression: &str) -> Option<String> {
 
 pub(crate) fn registered_script_url(source: &str) -> String {
     exception_source_url(&Value::Null, source).unwrap_or_default()
+}
+
+fn search_script_content(
+    source: &str,
+    query: &str,
+    case_sensitive: bool,
+    is_regex: bool,
+) -> StatorResult<Vec<Value>> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    if is_regex {
+        let pattern = if case_sensitive {
+            query.to_string()
+        } else {
+            format!("(?i:{query})")
+        };
+        let regex = stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+            regress::Regex::new(&pattern)
+        })
+        .map_err(|err| {
+            crate::error::StatorError::SyntaxError(format!(
+                "Debugger.searchInContent: invalid regular expression `{query}`: {err}"
+            ))
+        })?;
+        for (line_number, line) in source.lines().enumerate() {
+            if regex.find(line).is_some() {
+                matches.push(json!({
+                    "lineNumber": line_number,
+                    "lineContent": line,
+                }));
+            }
+        }
+        return Ok(matches);
+    }
+
+    let query_cmp = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    for (line_number, line) in source.lines().enumerate() {
+        let line_cmp = if case_sensitive {
+            line.to_string()
+        } else {
+            line.to_lowercase()
+        };
+        if line_cmp.contains(&query_cmp) {
+            matches.push(json!({
+                "lineNumber": line_number,
+                "lineContent": line,
+            }));
+        }
+    }
+    Ok(matches)
 }
 
 fn breakpoint_location_for_source(
@@ -7438,6 +7529,55 @@ mod tests {
             r#"{"id":1,"method":"Debugger.getScriptSource","params":{"scriptId":"missing"}}"#,
         );
         assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn search_in_content_finds_literal_and_regex_matches() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            1,
+            "let answer = 42;\nconst other = answer + 1;\nANSWER;".to_string(),
+        );
+
+        let literal = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.searchInContent","params":{"scriptId":"1","query":"answer","caseSensitive":true}}"#,
+        );
+        let literal_matches = literal["result"]["result"].as_array().unwrap();
+        assert_eq!(literal_matches.len(), 2);
+        assert_eq!(literal_matches[0]["lineNumber"], 0);
+        assert_eq!(literal_matches[1]["lineNumber"], 1);
+
+        let insensitive = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.searchInContent","params":{"scriptId":"1","query":"answer","caseSensitive":false}}"#,
+        );
+        assert_eq!(insensitive["result"]["result"].as_array().unwrap().len(), 3);
+
+        let regex = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.searchInContent","params":{"scriptId":"1","query":"\\d+","isRegex":true}}"#,
+        );
+        let regex_matches = regex["result"]["result"].as_array().unwrap();
+        assert_eq!(regex_matches.len(), 2);
+        assert_eq!(regex_matches[0]["lineContent"], "let answer = 42;");
+    }
+
+    #[test]
+    fn search_in_content_rejects_unknown_script_and_invalid_regex() {
+        let mut d = fresh_dispatcher();
+        let missing = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.searchInContent","params":{"scriptId":"missing","query":"x"}}"#,
+        );
+        assert!(missing["error"].is_object());
+
+        d.register_script_source(1, "let x = 1;".to_string());
+        let bad_regex = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.searchInContent","params":{"scriptId":"1","query":"(","isRegex":true}}"#,
+        );
+        assert!(bad_regex["error"].is_object());
     }
 
     #[test]
