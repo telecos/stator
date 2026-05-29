@@ -61,6 +61,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::builtins::error::call_stack_depth;
 use crate::bytecode::bytecode_array::BytecodeArray;
@@ -97,6 +98,126 @@ pub struct PauseEvent {
     pub bytecode_offset: u32,
     /// Best-effort 1-based source line for the pause.
     pub line: u32,
+}
+
+/// Cross-thread pause/resume bridge for a debugger attached to an interpreter.
+///
+/// The interpreter thread publishes a [`PauseEvent`] and blocks in
+/// [`DebuggerPauseBridge::publish_and_wait`] until a CDP transport thread calls
+/// [`DebuggerPauseBridge::resume`].  This lets a WebSocket session deliver
+/// `Debugger.paused` and `Debugger.resume` without moving the interpreter's
+/// non-`Send` state across threads.
+#[derive(Debug, Clone)]
+pub struct DebuggerPauseBridge {
+    inner: Arc<DebuggerPauseBridgeInner>,
+}
+
+#[derive(Debug)]
+struct DebuggerPauseBridgeInner {
+    state: Mutex<DebuggerPauseBridgeState>,
+    resumed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DebuggerPauseBridgeState {
+    events: VecDeque<PauseEvent>,
+    paused: bool,
+    resume_action: Option<DebugAction>,
+    disconnected: bool,
+}
+
+impl Default for DebuggerPauseBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DebuggerPauseBridge {
+    /// Create a new pause bridge with no pending pause.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DebuggerPauseBridgeInner {
+                state: Mutex::new(DebuggerPauseBridgeState::default()),
+                resumed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// Returns `true` while an interpreter thread is blocked in a pause.
+    pub fn is_paused(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned")
+            .paused
+    }
+
+    /// Drain queued pause events in FIFO order.
+    pub fn take_pause_events(&self) -> Vec<PauseEvent> {
+        self.inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned")
+            .events
+            .drain(..)
+            .collect()
+    }
+
+    /// Resume a currently blocked interpreter pause.
+    ///
+    /// Returns `false` when there is no active pause, avoiding stale resume
+    /// actions being consumed by a future pause.
+    pub fn resume(&self, action: DebugAction) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if !state.paused {
+            return false;
+        }
+        state.resume_action = Some(action);
+        state.paused = false;
+        self.inner.resumed.notify_all();
+        true
+    }
+
+    /// Wake any blocked interpreter and prevent future waits.
+    pub fn disconnect(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        state.disconnected = true;
+        state.paused = false;
+        state.resume_action = Some(DebugAction::Continue);
+        state.events.clear();
+        self.inner.resumed.notify_all();
+    }
+
+    fn publish_and_wait(&self, event: PauseEvent) -> DebugAction {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if state.disconnected {
+            return DebugAction::Continue;
+        }
+        state.events.push_back(event);
+        state.paused = true;
+        state.resume_action = None;
+        self.inner.resumed.notify_all();
+        while state.paused && !state.disconnected {
+            state = self
+                .inner
+                .resumed
+                .wait(state)
+                .expect("debugger pause bridge mutex poisoned");
+        }
+        state.resume_action.take().unwrap_or(DebugAction::Continue)
+    }
 }
 
 /// What to do after handling a pause.
@@ -210,6 +331,8 @@ pub struct Debugger {
     last_pause_offset: u32,
     /// FIFO pause events waiting for inspector fan-out.
     pause_events: VecDeque<PauseEvent>,
+    /// Optional cross-thread bridge used by transport-backed CDP sessions.
+    pause_bridge: Option<DebuggerPauseBridge>,
 }
 
 impl Default for Debugger {
@@ -235,6 +358,7 @@ impl Debugger {
             last_pause_reason: None,
             last_pause_offset: 0,
             pause_events: VecDeque::new(),
+            pause_bridge: None,
         }
     }
 
@@ -388,6 +512,16 @@ impl Debugger {
         self.pause_events.drain(..).collect()
     }
 
+    /// Attach an opt-in cross-thread pause bridge.
+    ///
+    /// When attached, pause sites block until the bridge receives a resume or
+    /// step action.  Without a bridge, the historical in-process behaviour is
+    /// preserved: pause sites return [`StatorError::DebuggerPaused`] and the
+    /// embedder re-enters the interpreter manually.
+    pub fn set_pause_bridge(&mut self, bridge: DebuggerPauseBridge) {
+        self.pause_bridge = Some(bridge);
+    }
+
     // ── Interpreter callbacks ────────────────────────────────────────────────
 
     /// Called by the interpreter **before** each instruction is fetched and
@@ -429,11 +563,15 @@ impl Debugger {
             }
         };
 
-        self.record_pause(reason, offset);
+        let bridge_action = self.record_pause(reason, offset);
         if let Some(id) = hit_breakpoint_id
             && self.one_shot_breakpoints.remove(&id)
         {
             self.breakpoints.remove(&offset);
+        }
+        if let Some(action) = bridge_action {
+            self.apply_blocking_resume_action(action);
+            return None;
         }
         Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
@@ -442,33 +580,40 @@ impl Debugger {
 
     /// Called by the interpreter when a `debugger;` statement is executed.
     ///
-    /// Always returns `StatorError::DebuggerPaused` (the debugger is only
-    /// called when the hook is active).
-    pub fn on_debugger_statement(&mut self, offset: u32) -> StatorError {
-        self.record_pause(PauseReason::DebuggerStatement, offset);
+    /// Returns `Some(StatorError::DebuggerPaused)` for the historical
+    /// in-process pause path, or `None` after an attached cross-thread bridge
+    /// has synchronously resumed execution.
+    pub fn on_debugger_statement(&mut self, offset: u32) -> Option<StatorError> {
+        if let Some(action) = self.record_pause(PauseReason::DebuggerStatement, offset) {
+            self.apply_blocking_resume_action(action);
+            return None;
+        }
         // Debugger statements do not need skip_next: the program counter is
         // already past the statement when the pause fires.
-        StatorError::DebuggerPaused {
+        Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
-        }
+        })
     }
 
     /// Called by the interpreter when a `Throw` instruction is about to
     /// execute and `pause_on_exceptions` is `true`.
     ///
-    /// Returns `StatorError::DebuggerPaused`.  The program counter will have
-    /// been backed up to the `Throw` instruction so that resuming with
-    /// [`DebugAction::Continue`] allows the exception to propagate.
-    pub fn on_exception(&mut self, offset: u32) -> StatorError {
+    /// Returns `Some(StatorError::DebuggerPaused)` for the historical
+    /// in-process pause path, or `None` after an attached cross-thread bridge
+    /// has synchronously resumed execution.
+    pub fn on_exception(&mut self, offset: u32) -> Option<StatorError> {
+        if let Some(action) = self.record_pause(PauseReason::Exception, offset) {
+            self.apply_blocking_resume_action(action);
+            return None;
+        }
         // skip_next is set so that the pre-fetch check skips the Throw
         // instruction when execution is resumed.  exception_resume prevents
         // the Throw handler from re-pausing on the second execution.
         self.skip_next = true;
         self.exception_resume = true;
-        self.record_pause(PauseReason::Exception, offset);
-        StatorError::DebuggerPaused {
+        Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
-        }
+        })
     }
 
     /// Query whether the current `Throw` execution is a *resume* after an
@@ -509,13 +654,23 @@ impl Debugger {
         };
     }
 
+    fn apply_blocking_resume_action(&mut self, action: DebugAction) {
+        let depth = call_stack_depth();
+        self.step_mode = match action {
+            DebugAction::Continue => StepMode::None,
+            DebugAction::StepInto => StepMode::Into,
+            DebugAction::StepOver => StepMode::Over { depth },
+            DebugAction::StepOut => StepMode::Out { depth },
+        };
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Record a pause event (updates `last_pause_reason` and
     /// `last_pause_offset`).  Resets the step mode to `None` so that a fresh
     /// [`apply_action`](Self::apply_action) call is required to set the next
     /// step direction.
-    fn record_pause(&mut self, reason: PauseReason, offset: u32) {
+    fn record_pause(&mut self, reason: PauseReason, offset: u32) -> Option<DebugAction> {
         self.last_pause_reason = Some(reason);
         self.last_pause_offset = offset;
         self.step_mode = StepMode::None;
@@ -525,11 +680,16 @@ impl Debugger {
             .as_ref()
             .expect("just stored pause reason")
             .clone();
-        self.pause_events.push_back(PauseEvent {
+        let event = PauseEvent {
             reason,
             bytecode_offset: offset,
             line,
-        });
+        };
+        if let Some(bridge) = &self.pause_bridge {
+            return Some(bridge.publish_and_wait(event));
+        }
+        self.pause_events.push_back(event);
+        None
     }
 }
 
@@ -541,6 +701,9 @@ impl Debugger {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use crate::bytecode::bytecode_array::{BytecodeArray, SourcePosition};
     use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
@@ -552,6 +715,18 @@ mod tests {
     use super::*;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn wait_until_paused(bridge: &DebuggerPauseBridge) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if bridge.is_paused() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        bridge.disconnect();
+        panic!("debugger pause bridge did not enter paused state");
+    }
 
     /// Build a `BytecodeArray` from a list of instructions, with source
     /// positions mapping instruction index N → line N+1.
@@ -577,6 +752,56 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         )
+    }
+
+    #[test]
+    fn test_pause_bridge_blocks_until_resume() {
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut dbg = Debugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 7, 1);
+            tx.send(()).unwrap();
+            assert!(dbg.check_pause_at(0).is_none());
+            dbg.last_pause_reason().cloned()
+        });
+
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until_paused(&bridge);
+        let events = bridge.take_pause_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, PauseReason::Breakpoint(1));
+        assert_eq!(events[0].line, 7);
+        assert!(bridge.resume(DebugAction::Continue));
+        assert_eq!(handle.join().unwrap(), Some(PauseReason::Breakpoint(1)));
+    }
+
+    #[test]
+    fn test_pause_bridge_resume_without_pause_is_noop() {
+        let bridge = DebuggerPauseBridge::new();
+        assert!(!bridge.resume(DebugAction::Continue));
+    }
+
+    #[test]
+    fn test_pause_bridge_disconnect_unblocks_interpreter() {
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut dbg = Debugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 1, 1);
+            tx.send(()).unwrap();
+            dbg.check_pause_at(0).is_none()
+        });
+
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until_paused(&bridge);
+        bridge.disconnect();
+        assert!(handle.join().unwrap());
+        assert!(!bridge.is_paused());
     }
 
     // ── Breakpoint management ─────────────────────────────────────────────────

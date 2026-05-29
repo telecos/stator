@@ -75,10 +75,11 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -88,7 +89,9 @@ use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEventKind, drain_messages, drain_profile_events};
-use crate::inspector::debugger::{BreakpointId, DebugAction, Debugger, PauseEvent, PauseReason};
+use crate::inspector::debugger::{
+    BreakpointId, DebugAction, Debugger, DebuggerPauseBridge, PauseEvent, PauseReason,
+};
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, take_pending_exception};
@@ -443,6 +446,9 @@ pub struct CdpDispatcher {
     /// can mutate real interpreter state, and so that the dispatcher can
     /// translate interpreter pauses into `Debugger.paused` events.
     debugger: Option<Rc<RefCell<Debugger>>>,
+    /// Optional cross-thread pause bridge used by WebSocket transports that
+    /// cannot borrow the interpreter's non-`Send` debugger state.
+    pause_bridge: Option<DebuggerPauseBridge>,
     /// Dispatcher-owned termination flag published to interpreter runs.
     termination_requested: AtomicBool,
     /// CDP `Debugger.setPauseOnExceptions` state. Mirrored on the attached
@@ -511,6 +517,7 @@ impl CdpDispatcher {
             runtime_bindings: Rc::new(RefCell::new(RuntimeBindingState::default())),
             next_exception_id: 1,
             debugger: None,
+            pause_bridge: None,
             termination_requested: AtomicBool::new(false),
             pause_on_exceptions: PauseOnExceptionsState::None,
             outbox: VecDeque::new(),
@@ -593,6 +600,28 @@ impl CdpDispatcher {
         self.debugger.take()
     }
 
+    /// Install a cross-thread pause bridge for transport-backed debugger
+    /// sessions.
+    pub fn attach_pause_bridge(
+        &mut self,
+        bridge: DebuggerPauseBridge,
+    ) -> Option<DebuggerPauseBridge> {
+        self.pause_bridge.replace(bridge)
+    }
+
+    /// Drop the cross-thread pause bridge, waking any blocked interpreter.
+    pub fn detach_pause_bridge(&mut self) -> Option<DebuggerPauseBridge> {
+        let bridge = self.pause_bridge.take();
+        if let Some(bridge) = &bridge {
+            bridge.disconnect();
+        }
+        bridge
+    }
+
+    fn has_pause_bridge(&self) -> bool {
+        self.pause_bridge.is_some()
+    }
+
     /// Returns the current `Debugger.setPauseOnExceptions` state for this
     /// session.
     pub fn pause_on_exceptions(&self) -> PauseOnExceptionsState {
@@ -615,6 +644,9 @@ impl CdpDispatcher {
     pub fn notify_paused(&mut self) -> bool {
         if !self.debugger_enabled {
             return false;
+        }
+        if self.drain_pause_bridge_events() {
+            return true;
         }
         let Some(debugger_rc) = self.debugger.as_ref().cloned() else {
             return false;
@@ -641,6 +673,20 @@ impl CdpDispatcher {
             "Debugger.paused",
             paused_event_params(&reason, offset, line, scope_chain),
         );
+        true
+    }
+
+    fn drain_pause_bridge_events(&mut self) -> bool {
+        let Some(bridge) = self.pause_bridge.clone() else {
+            return false;
+        };
+        let events = bridge.take_pause_events();
+        if events.is_empty() {
+            return false;
+        }
+        for event in &events {
+            self.notify_pause_event(event);
+        }
         true
     }
 
@@ -1956,6 +2002,9 @@ impl CdpDispatcher {
         // pause as a no-op success; mirror that so DevTools teardown does not
         // surface spurious errors.
         let mut emitted = false;
+        if let Some(bridge) = &self.pause_bridge {
+            emitted |= bridge.resume(DebugAction::Continue);
+        }
         if let Some(debugger) = self.debugger.as_ref() {
             let mut dbg = debugger.borrow_mut();
             if dbg.last_pause_reason().is_some() {
@@ -2130,6 +2179,12 @@ impl CdpDispatcher {
     // ── Debugger.stepInto / stepOver / stepOut ───────────────────────────────
 
     fn debugger_step(&mut self, action: DebugAction) -> StatorResult<Value> {
+        if let Some(bridge) = &self.pause_bridge
+            && bridge.resume(action)
+        {
+            self.notify_resumed();
+            return Ok(json!({}));
+        }
         let Some(debugger) = self.debugger.as_ref() else {
             return Err(unsupported_debugger_method(
                 debug_step_method_name(action),
@@ -2843,8 +2898,28 @@ impl CdpSession {
     }
 
     /// Wrap an accepted WebSocket connection using a caller-provided dispatcher.
-    fn with_dispatcher(ws: WebSocket<TcpStream>, dispatcher: CdpDispatcher) -> Self {
+    fn with_dispatcher(mut ws: WebSocket<TcpStream>, dispatcher: CdpDispatcher) -> Self {
+        if dispatcher.has_pause_bridge() {
+            let _ = ws
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(50)));
+        }
         Self { ws, dispatcher }
+    }
+
+    fn drain_outbox(&mut self) -> io::Result<()> {
+        while let Some(out) = self.dispatcher.take_next() {
+            self.ws
+                .send(Message::Text(out.into()))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn close_pause_bridge(&mut self) {
+        if let Some(bridge) = &self.dispatcher.pause_bridge {
+            bridge.disconnect();
+        }
     }
 
     /// Drive the session until the client disconnects or a fatal error occurs.
@@ -2855,12 +2930,26 @@ impl CdpSession {
     /// order.
     pub fn run(&mut self) -> io::Result<()> {
         loop {
+            let _ = self.dispatcher.notify_paused();
+            self.drain_outbox()?;
             let msg = match self.ws.read() {
                 Ok(m) => m,
                 Err(tungstenite::Error::ConnectionClosed)
-                | Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
-                Err(tungstenite::Error::Io(e)) => return Err(e),
+                | Err(tungstenite::Error::AlreadyClosed) => {
+                    self.close_pause_bridge();
+                    return Ok(());
+                }
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    continue;
+                }
+                Err(tungstenite::Error::Io(e)) => {
+                    self.close_pause_bridge();
+                    return Err(e);
+                }
                 Err(e) => {
+                    self.close_pause_bridge();
                     return Err(io::Error::other(e.to_string()));
                 }
             };
@@ -2868,13 +2957,13 @@ impl CdpSession {
             match msg {
                 Message::Text(text) => {
                     let _ = self.dispatcher.dispatch_json(&text);
-                    while let Some(out) = self.dispatcher.take_next() {
-                        self.ws
-                            .send(Message::Text(out.into()))
-                            .map_err(|e| io::Error::other(e.to_string()))?;
-                    }
+                    let _ = self.dispatcher.notify_paused();
+                    self.drain_outbox()?;
                 }
-                Message::Close(_) => return Ok(()),
+                Message::Close(_) => {
+                    self.close_pause_bridge();
+                    return Ok(());
+                }
                 // Ignore binary / ping / pong frames.
                 _ => {}
             }
@@ -4222,6 +4311,80 @@ mod tests {
         let response = client.join().expect("client thread");
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn websocket_session_sends_pause_bridge_events_without_client_request() {
+        let server = CdpServer::bind("127.0.0.1:0").expect("bind");
+        let port = server.local_addr().expect("local_addr").port();
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut dbg = InterpreterDebugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 1, 1);
+            dbg.check_pause_at(0).is_none()
+        });
+
+        let client = thread::spawn(move || {
+            let url = format!("ws://127.0.0.1:{port}");
+            let (mut ws, _resp) = connect(url).expect("connect");
+            if let MaybeTlsStream::Plain(stream) = ws.get_mut() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set client read timeout");
+            }
+            let read_json = |ws: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>| match ws
+                .read()
+                .expect("read websocket message")
+            {
+                Message::Text(text) => serde_json::from_str::<Value>(&text).expect("valid JSON"),
+                other => panic!("unexpected websocket reply: {other:?}"),
+            };
+
+            ws.send(Message::Text(
+                r#"{"id":1,"method":"Debugger.enable","params":{}}"#.into(),
+            ))
+            .expect("send enable");
+            let enable = read_json(&mut ws);
+            assert_eq!(enable["id"], 1);
+
+            let paused = read_json(&mut ws);
+            assert_eq!(paused["method"], "Debugger.paused");
+            assert_eq!(paused["params"]["data"]["bytecodeOffset"], 0);
+
+            ws.send(Message::Text(
+                r#"{"id":2,"method":"Debugger.resume","params":{}}"#.into(),
+            ))
+            .expect("send resume");
+            let first = read_json(&mut ws);
+            let second = read_json(&mut ws);
+            ws.close(None).ok();
+            assert!(
+                [first.clone(), second.clone()]
+                    .iter()
+                    .any(|msg| msg["method"] == "Debugger.resumed"),
+                "expected resumed event, got {first:?} and {second:?}"
+            );
+            assert!(
+                [first, second]
+                    .iter()
+                    .any(|msg| msg["id"] == 2u64 && msg.get("error").is_none()),
+                "expected resume ack"
+            );
+        });
+
+        server
+            .accept_one_with_dispatcher_factory(move || {
+                let mut dispatcher = CdpDispatcher::new();
+                dispatcher.attach_pause_bridge(bridge);
+                dispatcher
+            })
+            .expect("server");
+        client.join().expect("client thread");
+        assert!(worker.join().expect("worker thread"));
     }
 
     #[test]
@@ -6267,6 +6430,17 @@ mod tests {
         out
     }
 
+    fn wait_until_bridge_paused(bridge: &DebuggerPauseBridge) {
+        for _ in 0..200 {
+            if bridge.is_paused() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        bridge.disconnect();
+        panic!("pause bridge did not enter paused state");
+    }
+
     #[test]
     fn debugger_disable_clears_enabled_flag() {
         let mut d = fresh_dispatcher();
@@ -6354,6 +6528,53 @@ mod tests {
         );
         assert_eq!(msgs[0]["params"]["hitBreakpoints"][0], "1");
         assert_eq!(msgs[0]["params"]["data"]["pausedFrame"], true);
+    }
+
+    #[test]
+    fn pause_bridge_emits_paused_and_resume_without_rc_debugger() {
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+        let handle = thread::spawn(move || {
+            let mut dbg = InterpreterDebugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 3, 1);
+            dbg.check_pause_at(0).is_none()
+        });
+
+        let mut d = fresh_dispatcher();
+        d.attach_pause_bridge(bridge.clone());
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        wait_until_bridge_paused(&bridge);
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        assert_eq!(paused.len(), 1);
+        assert_eq!(paused[0]["method"], "Debugger.paused");
+        assert_eq!(paused[0]["params"]["data"]["bytecodeOffset"], 0);
+        assert_eq!(
+            paused[0]["params"]["callFrames"][0]["location"]["lineNumber"],
+            2
+        );
+
+        assert_eq!(
+            d.dispatch_json(r#"{"id":2,"method":"Debugger.resume","params":{}}"#),
+            DispatchOutcome::Ok
+        );
+        assert!(handle.join().unwrap());
+        let messages = drain_all(&mut d);
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg["id"] == 2u64 && msg.get("error").is_none()),
+            "expected successful resume response, got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg["method"] == "Debugger.resumed"),
+            "expected Debugger.resumed event, got {messages:?}"
+        );
     }
 
     #[test]

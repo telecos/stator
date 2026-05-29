@@ -3725,7 +3725,7 @@ fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult
             let resumed_throw = dbg.consume_exception_resume();
             if dbg.pause_on_exceptions && !dbg.skip_all_pauses() && !resumed_throw {
                 ctx.frame.pc = throw_idx as usize; // back up
-                Some(dbg.on_exception(throw_offset))
+                dbg.on_exception(throw_offset)
             } else {
                 None
             }
@@ -5387,7 +5387,7 @@ fn handle_debugger(
             if dbg.skip_all_pauses() {
                 None
             } else {
-                Some(dbg.on_debugger_statement(stmt_offset))
+                dbg.on_debugger_statement(stmt_offset)
             }
         })
     }) {
