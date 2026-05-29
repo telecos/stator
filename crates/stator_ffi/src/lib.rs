@@ -49,6 +49,7 @@ use stator_jse::host::{
 use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
+    decode_string_constant,
 };
 use stator_jse::jit_mitigations::{self, JitMitigationsTier};
 use stator_jse::jit_unwind;
@@ -4916,10 +4917,10 @@ fn module_request_for(
     })
 }
 
-fn module_export_name_str(name: &ModuleExportName) -> &str {
+fn module_export_name_string(name: &ModuleExportName) -> String {
     match name {
-        ModuleExportName::Ident(id) => &id.name,
-        ModuleExportName::Str(s) => &s.value,
+        ModuleExportName::Ident(id) => id.name.clone(),
+        ModuleExportName::Str(s) => decode_string_constant(&s.value),
     }
 }
 
@@ -4989,7 +4990,7 @@ fn collect_module_requests(
                     .iter()
                     .map(|spec| match spec {
                         ImportSpecifier::Named(n) => {
-                            RequestedExport::Named(module_export_name_str(&n.imported).to_string())
+                            RequestedExport::Named(module_export_name_string(&n.imported))
                         }
                         ImportSpecifier::Default(_) => RequestedExport::Default,
                         ImportSpecifier::Namespace(_) => RequestedExport::Namespace,
@@ -5002,7 +5003,7 @@ fn collect_module_requests(
             }
             ProgramItem::ModuleDecl(ModuleDecl::ExportAll(decl)) => {
                 let imports = if let Some(name) = &decl.exported {
-                    exports.insert(module_export_name_str(name).to_string());
+                    exports.insert(module_export_name_string(name));
                     vec![RequestedExport::Namespace]
                 } else {
                     vec![RequestedExport::Star]
@@ -5018,8 +5019,8 @@ fn collect_module_requests(
                     let source_specifier =
                         module_request_specifier_value(&source.value).to_string();
                     for spec in &decl.specifiers {
-                        let local = module_export_name_str(&spec.local).to_string();
-                        let exported = module_export_name_str(&spec.exported).to_string();
+                        let local = module_export_name_string(&spec.local);
+                        let exported = module_export_name_string(&spec.exported);
                         imports.push(if local == "default" {
                             RequestedExport::Default
                         } else {
@@ -5038,7 +5039,7 @@ fn collect_module_requests(
                     }
                 } else {
                     for spec in &decl.specifiers {
-                        exports.insert(module_export_name_str(&spec.exported).to_string());
+                        exports.insert(module_export_name_string(&spec.exported));
                     }
                     if let Some(stmt) = &decl.declaration {
                         collect_decl_export_names(stmt, &mut exports);
@@ -30656,6 +30657,26 @@ mod tests {
             ));
             stator_module_free(module);
         }
+    }
+
+    #[test]
+    fn test_module_request_collection_decodes_string_literal_export_names() {
+        let program = parser::parse_module(
+            "import { \"not an id\" as local } from './dep.js';
+             export { local as \"local name\" };
+             export { \"dep name\" as \"exported dep name\" } from './dep.js';",
+        )
+        .unwrap();
+        let (requests, exports, indirect_reexports) = collect_module_requests(&program);
+
+        assert!(matches!(
+            requests[0].imports.as_slice(),
+            [RequestedExport::Named(name)] if name == "not an id"
+        ));
+        assert!(exports.contains("local name"));
+        assert_eq!(indirect_reexports.len(), 1);
+        assert_eq!(indirect_reexports[0].local_name, "dep name");
+        assert_eq!(indirect_reexports[0].exported_name, "exported dep name");
     }
 
     #[test]
