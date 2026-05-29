@@ -40,7 +40,8 @@
 //! | `Debugger`     | `resume`                  | Resumes after a pause; emits `Debugger.resumed` when an active pause exists |
 //! | `Debugger`     | `continueToLocation`      | Resumes to a one-shot breakpoint at a registered script location |
 //! | `Debugger`     | `stepInto`/`stepOver`/`stepOut` | Applies the step on the attached interpreter debugger; errors when not attached or no active pause |
-//! | `Debugger`     | `pause`                   | Fail-closed: synchronous interpreter cannot be interrupted |
+//! | `Debugger`     | `pause`                   | Requests a pause at the next debugger poll |
+//! | `Debugger`     | `setInstrumentationBreakpoint` | Fail-closed: instrumentation breakpoints not implemented yet |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Evaluates against the synthetic paused frame globals |
 //! | `Debugger`     | `setVariableValue`        | Mutates globals on Stator synthetic paused frames |
 //! | `Debugger`     | `restartFrame`/`setReturnValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
@@ -1215,6 +1216,10 @@ impl CdpDispatcher {
             "Debugger.setBreakpointOnFunctionCall" => Err(unsupported_debugger_method(
                 "Debugger.setBreakpointOnFunctionCall",
                 "Stator does not yet support pausing on calls to an arbitrary function object.",
+            )),
+            "Debugger.setInstrumentationBreakpoint" => Err(unsupported_debugger_method(
+                "Debugger.setInstrumentationBreakpoint",
+                "Stator does not yet support instrumentation breakpoints before script execution.",
             )),
             "Debugger.getScriptSource" => self.debugger_get_script_source(&req.params),
             "Debugger.setScriptSource" => self.debugger_set_script_source(&req.params),
@@ -7338,6 +7343,7 @@ mod tests {
             "Debugger.restartFrame",
             "Debugger.setReturnValue",
             "Debugger.setBreakpointOnFunctionCall",
+            "Debugger.setInstrumentationBreakpoint",
         ] {
             let mut d = fresh_dispatcher();
             let response = dispatch(
