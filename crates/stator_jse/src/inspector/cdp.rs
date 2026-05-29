@@ -449,6 +449,8 @@ pub struct CdpDispatcher {
     /// Optional cross-thread pause bridge used by WebSocket transports that
     /// cannot borrow the interpreter's non-`Send` debugger state.
     pause_bridge: Option<DebuggerPauseBridge>,
+    /// Requested async call-stack depth for future async scheduling points.
+    async_call_stack_depth: u32,
     /// Dispatcher-owned termination flag published to interpreter runs.
     termination_requested: AtomicBool,
     /// CDP `Debugger.setPauseOnExceptions` state. Mirrored on the attached
@@ -518,6 +520,7 @@ impl CdpDispatcher {
             next_exception_id: 1,
             debugger: None,
             pause_bridge: None,
+            async_call_stack_depth: 0,
             termination_requested: AtomicBool::new(false),
             pause_on_exceptions: PauseOnExceptionsState::None,
             outbox: VecDeque::new(),
@@ -620,6 +623,11 @@ impl CdpDispatcher {
 
     fn has_pause_bridge(&self) -> bool {
         self.pause_bridge.is_some()
+    }
+
+    /// Return the requested async call-stack depth for future async scheduling points.
+    pub fn async_call_stack_depth(&self) -> u32 {
+        self.async_call_stack_depth
     }
 
     /// Returns the current `Debugger.setPauseOnExceptions` state for this
@@ -1090,6 +1098,9 @@ impl CdpDispatcher {
                 Ok(json!({}))
             }
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
+            "Debugger.setAsyncCallStackDepth" => {
+                self.debugger_set_async_call_stack_depth(&req.params)
+            }
             "Debugger.setBreakpoint" => self.debugger_set_breakpoint(&req.params),
             "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
             "Debugger.removeBreakpoint" => self.debugger_remove_breakpoint(&req.params),
@@ -1904,6 +1915,17 @@ impl CdpDispatcher {
                 .borrow_mut()
                 .set_pause_on_exceptions(state.enabled());
         }
+        Ok(json!({}))
+    }
+
+    fn debugger_set_async_call_stack_depth(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(max_depth) = params.get("maxDepth").and_then(Value::as_u64) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Debugger.setAsyncCallStackDepth: required parameter 'maxDepth' is missing or not a number"
+                    .to_string(),
+            ));
+        };
+        self.async_call_stack_depth = max_depth.min(u32::MAX as u64) as u32;
         Ok(json!({}))
     }
 
@@ -6439,6 +6461,30 @@ mod tests {
         }
         bridge.disconnect();
         panic!("pause bridge did not enter paused state");
+    }
+
+    #[test]
+    fn debugger_set_async_call_stack_depth_stores_depth_and_rejects_bad_input() {
+        let mut d = fresh_dispatcher();
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setAsyncCallStackDepth","params":{"maxDepth":8}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.async_call_stack_depth(), 8);
+
+        let huge = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setAsyncCallStackDepth","params":{"maxDepth":9999999999}}"#,
+        );
+        assert!(huge.get("error").is_none());
+        assert_eq!(d.async_call_stack_depth(), u32::MAX);
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setAsyncCallStackDepth","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
     }
 
     #[test]
