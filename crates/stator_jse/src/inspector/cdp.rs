@@ -1414,6 +1414,44 @@ impl CdpDispatcher {
 
     // ── Runtime.compileScript / Runtime.runScript ────────────────────────────
 
+    fn emit_script_failed_to_parse(
+        &mut self,
+        script_id: String,
+        source: &str,
+        source_url: Option<&str>,
+        execution_context_id: u32,
+        exception_details: Value,
+    ) {
+        if !self.debugger_enabled {
+            return;
+        }
+        let url = source_url
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| registered_script_url(source));
+        let line_count = source.lines().count().max(1) as u32;
+        let last_line_columns = source
+            .lines()
+            .last()
+            .map(|line| line.chars().count() as u32)
+            .unwrap_or(0);
+        self.push_event(
+            "Debugger.scriptFailedToParse",
+            json!({
+                "scriptId": script_id,
+                "url": url,
+                "startLine": 0,
+                "startColumn": 0,
+                "endLine": line_count.saturating_sub(1),
+                "endColumn": last_line_columns,
+                "executionContextId": execution_context_id,
+                "hash": "",
+                "scriptLanguage": "JavaScript",
+                "exceptionDetails": exception_details,
+            }),
+        );
+    }
+
     fn runtime_compile_script(&mut self, params: &Value) -> StatorResult<Value> {
         let expression = match params.get("expression").and_then(Value::as_str) {
             Some(expression) => expression,
@@ -1436,17 +1474,28 @@ impl CdpDispatcher {
             match parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p)) {
                 Ok(bytecodes) => Rc::new(bytecodes),
                 Err(err) => {
+                    let details = self.exception_details_only(
+                        &err,
+                        ExceptionRequest {
+                            expression,
+                            source_url: source_url.as_deref(),
+                            execution_context_id,
+                            object_group: None,
+                            generate_preview: false,
+                        },
+                    );
+                    let failed_script_id =
+                        format!("runtime-script-failed-{}", self.next_compiled_script_id);
+                    self.next_compiled_script_id = self.next_compiled_script_id.saturating_add(1);
+                    self.emit_script_failed_to_parse(
+                        failed_script_id,
+                        expression,
+                        source_url.as_deref(),
+                        execution_context_id,
+                        details.clone(),
+                    );
                     return Ok(json!({
-                        "exceptionDetails": self.exception_details_only(
-                            &err,
-                            ExceptionRequest {
-                                expression,
-                                source_url: source_url.as_deref(),
-                                execution_context_id,
-                                object_group: None,
-                                generate_preview: false,
-                            },
-                        )
+                        "exceptionDetails": details
                     }));
                 }
             };
@@ -2459,19 +2508,27 @@ impl CdpDispatcher {
         {
             let source_url = registered_script_url(&script_source);
             let execution_context_id = self.contexts.first().map(|context| context.id).unwrap_or(1);
+            let source_url = if source_url.is_empty() {
+                None
+            } else {
+                Some(source_url.as_str())
+            };
             let details = self.exception_details_only(
                 &err,
                 ExceptionRequest {
                     expression: &script_source,
-                    source_url: if source_url.is_empty() {
-                        None
-                    } else {
-                        Some(source_url.as_str())
-                    },
+                    source_url,
                     execution_context_id,
                     object_group: None,
                     generate_preview: false,
                 },
+            );
+            self.emit_script_failed_to_parse(
+                script_id.clone(),
+                &script_source,
+                source_url,
+                execution_context_id,
+                details.clone(),
             );
             return Ok(json!({
                 "status": "CompileError",
@@ -5888,6 +5945,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_compile_script_syntax_error_emits_script_failed_to_parse() {
+        let mut d = fresh_dispatcher();
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        assert_eq!(
+            d.dispatch_json(r#"{"id":2,"method":"Runtime.compileScript","params":{"expression":"var =","sourceURL":"stator://bad.js","persistScript":true}}"#),
+            DispatchOutcome::Ok
+        );
+        let messages = drain_all(&mut d);
+        assert!(messages.iter().any(|msg| msg["id"] == 2u64));
+        let event = messages
+            .iter()
+            .find(|msg| msg["method"] == "Debugger.scriptFailedToParse")
+            .expect("scriptFailedToParse event");
+        assert_eq!(event["params"]["url"], "stator://bad.js");
+        assert!(event["params"]["exceptionDetails"].is_object());
+    }
+
+    #[test]
     fn runtime_run_script_unknown_id_errors() {
         let mut d = fresh_dispatcher();
         let run = dispatch(
@@ -7032,6 +7108,35 @@ mod tests {
         assert_eq!(bad["result"]["status"], "CompileError");
         assert!(bad["result"]["exceptionDetails"].is_object());
         assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
+    }
+
+    #[test]
+    fn set_script_source_compile_error_emits_script_failed_to_parse() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "let original = 1;\n//# sourceURL=stator://old.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        assert_eq!(
+            d.dispatch_json(r#"{"id":2,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"function {\n//# sourceURL=stator://new-bad.js"}}"#),
+            DispatchOutcome::Ok
+        );
+        let messages = drain_all(&mut d);
+        assert!(messages.iter().any(|msg| msg["id"] == 2u64));
+        let event = messages
+            .iter()
+            .find(|msg| msg["method"] == "Debugger.scriptFailedToParse")
+            .expect("scriptFailedToParse event");
+        assert_eq!(event["params"]["scriptId"], "7");
+        assert_eq!(event["params"]["url"], "stator://new-bad.js");
+        assert!(event["params"]["exceptionDetails"].is_object());
+        assert_eq!(
+            d.script_sources.get("7").unwrap(),
+            "let original = 1;
+//# sourceURL=stator://old.js"
+        );
     }
 
     #[test]
