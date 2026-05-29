@@ -10279,6 +10279,25 @@ mod tests {
     }
 
     #[test]
+    fn test_re_export_named_with_string_literal_names() {
+        let prog =
+            parse_module("export { \"not an id\" as \"also not an id\" } from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[0] {
+            assert_eq!(en.specifiers.len(), 1);
+            assert!(matches!(
+                en.specifiers[0].local,
+                ModuleExportName::Str(ref s) if s.value == "\"not an id\""
+            ));
+            assert!(matches!(
+                en.specifiers[0].exported,
+                ModuleExportName::Str(ref s) if s.value == "\"also not an id\""
+            ));
+        } else {
+            panic!("expected re-export with string literal names");
+        }
+    }
+
+    #[test]
     fn test_re_export_all() {
         let prog = parse_module("export * from 'module';").unwrap();
         if let ProgramItem::ModuleDecl(ModuleDecl::ExportAll(ea)) = &prog.body[0] {

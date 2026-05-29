@@ -372,8 +372,6 @@ impl HarnessCache {
 const UNSUPPORTED_FEATURES: &[&str] = &[
     // Resizable ArrayBuffer — not yet implemented
     "resizable-arraybuffer",
-    // Module features that need runtime module loader
-    "arbitrary-module-namespace-names",
     // TC39 Stage 3 / new built-ins not yet implemented
     "Temporal",
     "decorators",

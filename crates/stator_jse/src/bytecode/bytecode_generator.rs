@@ -81,6 +81,13 @@ fn prop_key_name_from_str_lit(s: &crate::parser::ast::StringLit) -> String {
     crate::interpreter::decode_string_constant(&s.value)
 }
 
+fn module_export_name_string(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(id) => id.name.clone(),
+        ModuleExportName::Str(s) => prop_key_name_from_str_lit(s),
+    }
+}
+
 /// Minimum number of bytes required to encode `op` as a single operand field.
 fn operand_bytes_needed(op: Operand) -> usize {
     match op {
@@ -6944,15 +6951,13 @@ impl FunctionCompiler {
         for spec in &decl.specifiers {
             match spec {
                 ImportSpecifier::Named(named) => {
-                    let imported_name = match &named.imported {
-                        ModuleExportName::Ident(id) => id.name.as_str(),
-                        ModuleExportName::Str(s) => s.value.as_str(),
-                    };
+                    let imported_name = module_export_name_string(&named.imported);
                     self.imported_module_bindings.insert(
                         named.local.name.clone(),
-                        (source.to_string(), imported_name.to_string()),
+                        (source.to_string(), imported_name.clone()),
                     );
-                    let (req_idx, cell) = self.get_or_create_module_variable(source, imported_name);
+                    let (req_idx, cell) =
+                        self.get_or_create_module_variable(source, &imported_name);
                     // Emit the load so the local binding is initialized.
                     self.emit(Instruction::new_unchecked(
                         Opcode::LdaModuleVariable,
@@ -7029,20 +7034,14 @@ impl FunctionCompiler {
 
         // Local re-export: `export { x, y as z }`
         for spec in &decl.specifiers {
-            let local_name = match &spec.local {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            if let Some(binding) = self.lookup_var(local_name) {
+            let local_name = module_export_name_string(&spec.local);
+            if let Some(binding) = self.lookup_var(&local_name) {
                 self.emit_ldar(binding.reg);
             } else {
-                self.compile_ident_load(local_name);
+                self.compile_ident_load(&local_name);
             }
-            let exported_name = match &spec.exported {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            let (req_idx, cell) = self.get_or_create_module_variable("", exported_name);
+            let exported_name = module_export_name_string(&spec.exported);
+            let (req_idx, cell) = self.get_or_create_module_variable("", &exported_name);
             self.emit(Instruction::new_unchecked(
                 Opcode::StaModuleVariable,
                 vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
@@ -7078,11 +7077,8 @@ impl FunctionCompiler {
         ));
         if let Some(ref exported) = decl.exported {
             // `export * as ns from "source"`
-            let name = match exported {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            let (out_req, out_cell) = self.get_or_create_module_variable("", name);
+            let name = module_export_name_string(exported);
+            let (out_req, out_cell) = self.get_or_create_module_variable("", &name);
             self.emit(Instruction::new_unchecked(
                 Opcode::StaModuleVariable,
                 vec![
@@ -7174,7 +7170,7 @@ impl FunctionCompiler {
                 };
                 let exported_name = match &spec.exported {
                     ModuleExportName::Ident(id) => id.name.clone(),
-                    ModuleExportName::Str(s) => s.value.clone(),
+                    ModuleExportName::Str(_) => module_export_name_string(&spec.exported),
                 };
                 add(local_id.name.clone(), exported_name, &mut aliases);
             }
@@ -11684,6 +11680,16 @@ mod tests {
             loc: span(),
             value: s.to_owned(),
         }
+    }
+
+    #[test]
+    fn test_module_export_name_string_decodes_string_literals() {
+        use crate::parser::ast::ModuleExportName;
+
+        assert_eq!(
+            module_export_name_string(&ModuleExportName::Str(string_lit("'not an id'"))),
+            "not an id"
+        );
     }
 
     #[test]
