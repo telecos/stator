@@ -90,7 +90,8 @@ use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEventKind, drain_messages, drain_profile_events};
 use crate::inspector::debugger::{
-    BreakpointId, DebugAction, Debugger, DebuggerPauseBridge, PauseEvent, PauseReason,
+    BreakpointId, DebugAction, Debugger, DebuggerPauseBridge, PauseEvent, PauseFrameSnapshot,
+    PauseReason,
 };
 use crate::inspector::heap_snapshot::{AllocationRecord, HeapSnapshotBuilder};
 use crate::inspector::profiler::CpuProfiler;
@@ -247,6 +248,39 @@ struct CompiledScript {
     expression: String,
     source_url: Option<String>,
     execution_context_id: u32,
+}
+
+struct TemporaryGlobalBindings {
+    globals: Rc<RefCell<GlobalEnv>>,
+    saved: Vec<(String, Option<JsValue>)>,
+}
+
+impl TemporaryGlobalBindings {
+    fn new(globals: Rc<RefCell<GlobalEnv>>, bindings: Vec<(String, JsValue)>) -> Self {
+        let mut saved = Vec::with_capacity(bindings.len());
+        {
+            let mut env = globals.borrow_mut();
+            for (name, value) in bindings {
+                let previous = env.get(&name).map(JsValue::cheap_clone);
+                env.insert(name.clone(), value);
+                saved.push((name, previous));
+            }
+        }
+        Self { globals, saved }
+    }
+}
+
+impl Drop for TemporaryGlobalBindings {
+    fn drop(&mut self) {
+        let mut env = self.globals.borrow_mut();
+        for (name, previous) in self.saved.drain(..).rev() {
+            if let Some(value) = previous {
+                env.insert(name, value);
+            } else {
+                env.remove(&name);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -661,11 +695,12 @@ impl CdpDispatcher {
         };
 
         let mut dbg = debugger_rc.borrow_mut();
+        let frame_snapshot = dbg.last_pause_frame_snapshot().cloned();
         let events = dbg.take_pause_events();
         if !events.is_empty() {
             drop(dbg);
             for event in &events {
-                self.notify_pause_event(event);
+                self.notify_pause_event_with_frame(event, frame_snapshot.as_ref());
             }
             return true;
         }
@@ -676,7 +711,7 @@ impl CdpDispatcher {
         let line = dbg.last_pause_line();
         drop(dbg);
 
-        let scope_chain = self.synthetic_pause_scope_chain();
+        let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot.as_ref());
         self.push_event(
             "Debugger.paused",
             paused_event_params(&reason, offset, line, scope_chain),
@@ -700,10 +735,18 @@ impl CdpDispatcher {
 
     /// Emit a `Debugger.paused` event from a recorded interpreter pause event.
     pub fn notify_pause_event(&mut self, event: &PauseEvent) -> bool {
+        self.notify_pause_event_with_frame(event, None)
+    }
+
+    fn notify_pause_event_with_frame(
+        &mut self,
+        event: &PauseEvent,
+        frame_snapshot: Option<&PauseFrameSnapshot>,
+    ) -> bool {
         if !self.debugger_enabled {
             return false;
         }
-        let scope_chain = self.synthetic_pause_scope_chain();
+        let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot);
         self.push_event(
             "Debugger.paused",
             paused_event_params(
@@ -716,7 +759,28 @@ impl CdpDispatcher {
         true
     }
 
-    fn synthetic_pause_scope_chain(&mut self) -> Value {
+    fn synthetic_pause_scope_chain(
+        &mut self,
+        frame_snapshot: Option<&PauseFrameSnapshot>,
+    ) -> Value {
+        let mut scopes = Vec::new();
+        if let Some(snapshot) = frame_snapshot {
+            let mut local_map = PropertyMap::new();
+            for (name, value) in frame_snapshot_bindings(snapshot) {
+                local_map.insert(name, value);
+            }
+            let remote = js_value_to_remote_object(
+                &JsValue::PlainObject(Rc::new(RefCell::new(local_map))),
+                &mut self.remote_objects,
+                Some("debugger-local-scope"),
+                false,
+            );
+            scopes.push(json!({
+                "type": "local",
+                "object": remote,
+                "name": "Locals",
+            }));
+        }
         let globals: Vec<_> = self
             .globals
             .borrow()
@@ -734,11 +798,12 @@ impl CdpDispatcher {
             Some("debugger-scope"),
             false,
         );
-        json!([{
+        scopes.push(json!({
             "type": "global",
             "object": remote,
             "name": "Global",
-        }])
+        }));
+        Value::Array(scopes)
     }
 
     /// Emit a `Debugger.resumed` event into the outbox.
@@ -2179,6 +2244,14 @@ impl CdpDispatcher {
                 "no active pause; evaluation is only valid after a Debugger.paused event.",
             ));
         }
+        let frame_snapshot = debugger.borrow().last_pause_frame_snapshot().cloned();
+        if let Some(snapshot) = frame_snapshot {
+            let _bindings = TemporaryGlobalBindings::new(
+                Rc::clone(&self.globals),
+                frame_snapshot_bindings(&snapshot),
+            );
+            return self.runtime_evaluate(params);
+        }
         self.runtime_evaluate(params)
     }
 
@@ -2193,11 +2266,6 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
-        if scope_number != 0 {
-            return Err(crate::error::StatorError::Internal(format!(
-                "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
-            )));
-        }
         let variable_name = params
             .get("variableName")
             .and_then(Value::as_str)
@@ -2234,6 +2302,19 @@ impl CdpDispatcher {
                 "Debugger.setVariableValue",
                 "no active pause; variable mutation is only valid after a Debugger.paused event.",
             ));
+        }
+        let has_local_scope = debugger.borrow().last_pause_frame_snapshot().is_some();
+        let global_scope_number = if has_local_scope { 1 } else { 0 };
+        if scope_number == 0 && has_local_scope {
+            return Err(unsupported_debugger_method(
+                "Debugger.setVariableValue",
+                "mutating captured local register scopes is not yet supported.",
+            ));
+        }
+        if scope_number != global_scope_number {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
+            )));
         }
         let new_value = params.get("newValue").ok_or_else(|| {
             crate::error::StatorError::TypeError(
@@ -3446,6 +3527,24 @@ fn paused_reason_str(reason: &PauseReason) -> &'static str {
         PauseReason::Step => "other",
         PauseReason::Exception => "exception",
     }
+}
+
+fn frame_snapshot_bindings(snapshot: &PauseFrameSnapshot) -> Vec<(String, JsValue)> {
+    let mut bindings = Vec::with_capacity(snapshot.registers.len() + 1);
+    bindings.push((
+        "$accumulator".to_string(),
+        snapshot.accumulator.cheap_clone(),
+    ));
+    let parameter_count = snapshot.parameter_count as usize;
+    for (idx, value) in snapshot.registers.iter().enumerate() {
+        let name = if idx < parameter_count {
+            format!("$param{idx}")
+        } else {
+            format!("$local{}", idx - parameter_count)
+        };
+        bindings.push((name, value.cheap_clone()));
+    }
+    bindings
 }
 
 fn paused_event_params(reason: &PauseReason, offset: u32, line: u32, scope_chain: Value) -> Value {
@@ -6528,6 +6627,15 @@ mod tests {
         out
     }
 
+    fn sample_pause_frame_snapshot() -> PauseFrameSnapshot {
+        PauseFrameSnapshot {
+            parameter_count: 1,
+            frame_size: 1,
+            registers: vec![JsValue::Smi(3), JsValue::Smi(41)],
+            accumulator: JsValue::Smi(2),
+        }
+    }
+
     fn wait_until_bridge_paused(bridge: &DebuggerPauseBridge) {
         for _ in 0..200 {
             if bridge.is_paused() {
@@ -6650,6 +6758,43 @@ mod tests {
         );
         assert_eq!(msgs[0]["params"]["hitBreakpoints"][0], "1");
         assert_eq!(msgs[0]["params"]["data"]["pausedFrame"], true);
+    }
+
+    #[test]
+    fn notify_paused_includes_local_scope_when_frame_snapshot_exists() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .borrow_mut()
+            .check_pause_at_with_frame(0, sample_pause_frame_snapshot);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        let scope_chain = paused[0]["params"]["callFrames"][0]["scopeChain"]
+            .as_array()
+            .unwrap();
+        assert_eq!(scope_chain[0]["type"], "local");
+        assert_eq!(scope_chain[1]["type"], "global");
+
+        let object_id = scope_chain[0]["object"]["objectId"].as_str().unwrap();
+        let props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        let names: HashSet<_> = props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|prop| prop["name"].as_str())
+            .collect();
+        assert!(names.contains("$accumulator"));
+        assert!(names.contains("$param0"));
+        assert!(names.contains("$local0"));
     }
 
     #[test]
@@ -6981,6 +7126,31 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_on_call_frame_reads_synthetic_local_snapshot_bindings() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.globals
+            .borrow_mut()
+            .insert("$local0".to_string(), JsValue::Smi(100));
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .borrow_mut()
+            .check_pause_at_with_frame(0, sample_pause_frame_snapshot);
+
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"$accumulator + $param0 + $local0"}}"#,
+        );
+        assert_eq!(resp["result"]["result"]["value"], 46);
+
+        let restored = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"$local0"}}"#,
+        );
+        assert_eq!(restored["result"]["result"]["value"], 100);
+    }
+
+    #[test]
     fn evaluate_on_call_frame_requires_active_pause() {
         let mut d = fresh_dispatcher();
         let _dbg = attach_test_debugger(&mut d);
@@ -7029,6 +7199,34 @@ mod tests {
         let eval = dispatch(
             &mut d,
             r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"changed"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn set_variable_value_rejects_local_scope_and_mutates_global_after_snapshot() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .borrow_mut()
+            .check_pause_at_with_frame(0, sample_pause_frame_snapshot);
+
+        let local = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"$local0","callFrameId":"stator-pause-frame-0","newValue":{"value":9}}}"#,
+        );
+        assert!(local["error"].is_object());
+
+        let global = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"changed","callFrameId":"stator-pause-frame-0","newValue":{"value":42}}}"#,
+        );
+        assert!(global.get("error").is_none());
+
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"changed"}}"#,
         );
         assert_eq!(eval["result"]["result"]["value"], 42);
     }

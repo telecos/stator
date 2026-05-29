@@ -4628,8 +4628,14 @@ impl Interpreter {
                     let current_offset = byte_offsets[pc] as u32;
                     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                         let opt = d.borrow();
-                        opt.as_ref()
-                            .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+                        opt.as_ref().and_then(|rc| {
+                            rc.borrow_mut()
+                                .check_pause_at_with_frame(current_offset, || {
+                                    crate::inspector::debugger::PauseFrameSnapshot::from_frame(
+                                        frame, &acc,
+                                    )
+                                })
+                        })
                     }) {
                         frame.pc = pc;
                         frame.accumulator = acc;

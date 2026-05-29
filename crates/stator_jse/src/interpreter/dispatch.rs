@@ -47,6 +47,7 @@ use crate::bytecode::bytecode_array::{
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
 use crate::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
+use crate::inspector::debugger::PauseFrameSnapshot;
 use crate::objects::js_object::JsObject;
 use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
@@ -3725,7 +3726,8 @@ fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult
             let resumed_throw = dbg.consume_exception_resume();
             if dbg.pause_on_exceptions && !dbg.skip_all_pauses() && !resumed_throw {
                 ctx.frame.pc = throw_idx as usize; // back up
-                dbg.on_exception(throw_offset)
+                let snapshot = PauseFrameSnapshot::from_frame(ctx.frame, &ctx.frame.accumulator);
+                dbg.on_exception_with_frame(throw_offset, Some(snapshot))
             } else {
                 None
             }
@@ -5387,7 +5389,8 @@ fn handle_debugger(
             if dbg.skip_all_pauses() {
                 None
             } else {
-                dbg.on_debugger_statement(stmt_offset)
+                let snapshot = PauseFrameSnapshot::from_frame(ctx.frame, &ctx.frame.accumulator);
+                dbg.on_debugger_statement_with_frame(stmt_offset, Some(snapshot))
             }
         })
     }) {
