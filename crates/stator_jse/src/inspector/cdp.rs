@@ -430,6 +430,12 @@ pub struct CdpDispatcher {
     max_call_stack_size_to_capture: u32,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
+    /// Whether the Network domain is currently enabled for this session.
+    network_enabled: bool,
+    /// Cached `Network.setCacheDisabled` state.
+    network_cache_disabled: bool,
+    /// Cached `Network.setBypassServiceWorker` state.
+    network_bypass_service_worker: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -536,6 +542,9 @@ impl CdpDispatcher {
             custom_object_formatter_enabled: false,
             max_call_stack_size_to_capture: 0,
             console_enabled: false,
+            network_enabled: false,
+            network_cache_disabled: false,
+            network_bypass_service_worker: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -621,6 +630,21 @@ impl CdpDispatcher {
     /// Returns the requested maximum stack size for captured call stacks.
     pub fn max_call_stack_size_to_capture(&self) -> u32 {
         self.max_call_stack_size_to_capture
+    }
+
+    /// Returns `true` if the Network domain is currently enabled.
+    pub fn network_enabled(&self) -> bool {
+        self.network_enabled
+    }
+
+    /// Returns the cached `Network.setCacheDisabled` value.
+    pub fn network_cache_disabled(&self) -> bool {
+        self.network_cache_disabled
+    }
+
+    /// Returns the cached `Network.setBypassServiceWorker` value.
+    pub fn network_bypass_service_worker(&self) -> bool {
+        self.network_bypass_service_worker
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1274,8 +1298,16 @@ impl CdpDispatcher {
             "HeapProfiler.stopTrackingHeapObjects" => self.heap_profiler_stop_tracking(),
 
             // ── Network (stubs) ───────────────────────────────────────────
-            "Network.enable" => Ok(json!({})),
-            "Network.disable" => Ok(json!({})),
+            "Network.enable" => {
+                self.network_enabled = true;
+                Ok(json!({}))
+            }
+            "Network.disable" => {
+                self.network_enabled = false;
+                Ok(json!({}))
+            }
+            "Network.setCacheDisabled" => self.network_set_cache_disabled(&req.params),
+            "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
 
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
@@ -1293,6 +1325,28 @@ impl CdpDispatcher {
                 "CDP method not implemented: {other}"
             ))),
         }
+    }
+
+    fn network_set_cache_disabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(cache_disabled) = params.get("cacheDisabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setCacheDisabled: required parameter 'cacheDisabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.network_cache_disabled = cache_disabled;
+        Ok(json!({}))
+    }
+
+    fn network_set_bypass_service_worker(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(bypass) = params.get("bypass").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setBypassServiceWorker: required parameter 'bypass' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.network_bypass_service_worker = bypass;
+        Ok(json!({}))
     }
 
     // ── Runtime.enable ────────────────────────────────────────────────────────
@@ -5664,6 +5718,44 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn network_setup_methods_store_settings_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Network.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.network_enabled());
+
+        let cache = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Network.setCacheDisabled","params":{"cacheDisabled":true}}"#,
+        );
+        assert!(cache.get("error").is_none());
+        assert!(d.network_cache_disabled());
+
+        let bypass = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Network.setBypassServiceWorker","params":{"bypass":true}}"#,
+        );
+        assert!(bypass.get("error").is_none());
+        assert!(d.network_bypass_service_worker());
+
+        let cache_bad = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Network.setCacheDisabled","params":{}}"#,
+        );
+        assert!(cache_bad["error"].is_object());
+
+        let bypass_bad = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Network.setBypassServiceWorker","params":{}}"#,
+        );
+        assert!(bypass_bad["error"].is_object());
+
+        let disable = dispatch(&mut d, r#"{"id":6,"method":"Network.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.network_enabled());
     }
 
     #[test]
