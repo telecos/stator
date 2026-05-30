@@ -15,6 +15,7 @@
 //! | `Runtime`      | `enable`                  | Acknowledges; emits context-created event |
 //! | `Runtime`      | `evaluate`                | Parses and executes JavaScript; returns result |
 //! | `Runtime`      | `callFunctionOn`          | Evaluates a function call expression |
+//! | `Runtime`      | `awaitPromise`            | Drains microtasks and returns settled Promise results |
 //! | `Runtime`      | `getProperties`           | Lists own properties of a previously-minted `RemoteObject` |
 //! | `Runtime`      | `queryObjects`            | Finds reachable objects with the requested prototype |
 //! | `Runtime`      | `releaseObject`           | Drops one `RemoteObject` from the per-session registry |
@@ -90,6 +91,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, accept};
 
+use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::{StatorError, StatorResult};
@@ -1226,6 +1228,7 @@ impl CdpDispatcher {
             "Runtime.enable" => self.runtime_enable(),
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
             "Runtime.callFunctionOn" => self.runtime_call_function_on(&req.params),
+            "Runtime.awaitPromise" => self.runtime_await_promise(&req.params),
             "Runtime.getProperties" => self.runtime_get_properties(&req.params),
             "Runtime.queryObjects" => self.runtime_query_objects(&req.params),
             "Runtime.releaseObject" => self.runtime_release_object(&req.params),
@@ -2122,6 +2125,76 @@ impl CdpDispatcher {
             generate_preview,
         );
         Ok(json!({ "result": remote }))
+    }
+
+    fn runtime_await_promise(&mut self, params: &Value) -> StatorResult<Value> {
+        let promise_object_id =
+            params
+                .get("promiseObjectId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    crate::error::StatorError::TypeError(
+                        "Runtime.awaitPromise: required parameter 'promiseObjectId' is missing or not a string"
+                            .to_string(),
+                    )
+                })?;
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let generate_preview = params
+            .get("generatePreview")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let execution_context_id = self.resolve_execution_context_id(params)?;
+        let promise_value = self.remote_objects.get(promise_object_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Runtime.awaitPromise: unknown or released objectId `{promise_object_id}`"
+            ))
+        })?;
+        let JsValue::Promise(promise) = promise_value else {
+            return Err(crate::error::StatorError::TypeError(format!(
+                "Runtime.awaitPromise: objectId `{promise_object_id}` does not reference a Promise"
+            )));
+        };
+
+        drain_active_microtask_queue();
+        match promise.state() {
+            PromiseState::Fulfilled(value) => {
+                let remote = js_value_to_remote_object(
+                    &value,
+                    &mut self.remote_objects,
+                    object_group.as_deref(),
+                    generate_preview,
+                );
+                Ok(json!({ "result": remote }))
+            }
+            PromiseState::Rejected(reason) => {
+                let exception_id = self.next_exception_id;
+                self.next_exception_id = self.next_exception_id.saturating_add(1);
+                let err = StatorError::JsException(format!("{reason:?}"));
+                let details = self.build_exception_details(
+                    exception_id,
+                    &err,
+                    ExceptionRequest {
+                        expression: "Runtime.awaitPromise",
+                        source_url: None,
+                        execution_context_id,
+                        object_group: object_group.as_deref(),
+                        generate_preview,
+                    },
+                    Some(&reason),
+                );
+                Ok(json!({
+                    "result": {"type": "undefined"},
+                    "exceptionDetails": details,
+                }))
+            }
+            PromiseState::Pending => Err(crate::error::StatorError::Internal(
+                "Runtime.awaitPromise: promise is still pending after draining microtasks"
+                    .to_string(),
+            )),
+        }
     }
 
     fn resolve_execution_context_id(&self, params: &Value) -> StatorResult<u32> {
@@ -6825,6 +6898,46 @@ mod tests {
         assert_eq!(details["exceptionId"], 1);
         assert!(details["text"].as_str().unwrap().contains("bad call"));
         assert_eq!(details["exception"]["subtype"], "error");
+    }
+
+    #[test]
+    fn runtime_await_promise_returns_fulfilled_value() {
+        let mut d = fresh_dispatcher();
+        let promise = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"Promise.resolve(42)","objectGroup":"promises"}}"#,
+        );
+        let promise_object_id = promise["result"]["result"]["objectId"].as_str().unwrap();
+        let awaited = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.awaitPromise","params":{{"promiseObjectId":"{promise_object_id}","objectGroup":"promises"}}}}"#
+            ),
+        );
+        assert_eq!(awaited["result"]["result"]["value"], 42);
+    }
+
+    #[test]
+    fn runtime_await_promise_rejects_unknown_and_non_promise_objects() {
+        let mut d = fresh_dispatcher();
+        let unknown = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.awaitPromise","params":{"promiseObjectId":"missing"}}"#,
+        );
+        assert!(unknown["error"].is_object());
+
+        let object = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"({value: 1})"}}"#,
+        );
+        let object_id = object["result"]["result"]["objectId"].as_str().unwrap();
+        let non_promise = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.awaitPromise","params":{{"promiseObjectId":"{object_id}"}}}}"#
+            ),
+        );
+        assert!(non_promise["error"].is_object());
     }
 
     #[test]
