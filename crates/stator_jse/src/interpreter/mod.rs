@@ -4629,12 +4629,13 @@ impl Interpreter {
                     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                         let opt = d.borrow();
                         opt.as_ref().and_then(|rc| {
-                            rc.borrow_mut()
-                                .check_pause_at_with_frame(current_offset, || {
-                                    crate::inspector::debugger::PauseFrameSnapshot::from_frame(
-                                        frame, &acc,
-                                    )
-                                })
+                            let mut debugger = rc.borrow_mut();
+                            debugger.apply_pending_frame_mutations(frame, &mut acc);
+                            debugger.check_pause_at_with_frame(current_offset, || {
+                                crate::inspector::debugger::PauseFrameSnapshot::from_frame(
+                                    frame, &acc,
+                                )
+                            })
                         })
                     }) {
                         frame.pc = pc;

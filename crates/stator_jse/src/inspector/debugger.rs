@@ -338,6 +338,28 @@ enum StepMode {
     Out { depth: usize },
 }
 
+fn synthetic_register_binding_index(
+    name: &str,
+    parameter_count: usize,
+    register_len: usize,
+) -> Option<usize> {
+    if let Some(index) = name
+        .strip_prefix("$param")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+        .filter(|index| *index < parameter_count)
+    {
+        return (index < register_len).then_some(index);
+    }
+    if let Some(local_index) = name
+        .strip_prefix("$local")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+    {
+        let index = parameter_count.checked_add(local_index)?;
+        return (index < register_len).then_some(index);
+    }
+    None
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Debugger
 // ─────────────────────────────────────────────────────────────────────────────
@@ -393,6 +415,8 @@ pub struct Debugger {
     pause_requested: bool,
     /// Snapshot of the top frame at the most recent pause, when available.
     last_pause_frame: Option<PauseFrameSnapshot>,
+    /// Mutations requested for the current paused frame, applied on resume.
+    pending_frame_mutations: Vec<(String, JsValue)>,
 }
 
 impl Default for Debugger {
@@ -421,6 +445,7 @@ impl Debugger {
             pause_bridge: None,
             pause_requested: false,
             last_pause_frame: None,
+            pending_frame_mutations: Vec::new(),
         }
     }
 
@@ -578,6 +603,65 @@ impl Debugger {
     /// path that can observe the interpreter frame.
     pub fn last_pause_frame_snapshot(&self) -> Option<&PauseFrameSnapshot> {
         self.last_pause_frame.as_ref()
+    }
+
+    /// Mutate a synthetic paused-frame local binding.
+    ///
+    /// The visible snapshot is updated immediately so follow-up
+    /// `evaluateOnCallFrame` calls observe the new value.  The live
+    /// interpreter frame is updated later by
+    /// [`Self::apply_pending_frame_mutations`] when execution resumes.
+    pub fn set_paused_frame_binding(
+        &mut self,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), StatorError> {
+        let Some(snapshot) = self.last_pause_frame.as_mut() else {
+            return Err(StatorError::Internal(
+                "Debugger.setVariableValue: no paused frame snapshot is available".to_string(),
+            ));
+        };
+        let stored_value = value.cheap_clone();
+        if name == "$accumulator" {
+            snapshot.accumulator = stored_value;
+            self.pending_frame_mutations.push((name.to_string(), value));
+            return Ok(());
+        }
+        let Some(index) = synthetic_register_binding_index(
+            name,
+            snapshot.parameter_count as usize,
+            snapshot.registers.len(),
+        ) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown paused-frame binding `{name}`"
+            )));
+        };
+        snapshot.registers[index] = stored_value;
+        self.pending_frame_mutations.push((name.to_string(), value));
+        Ok(())
+    }
+
+    /// Apply pending paused-frame mutations to the live interpreter frame.
+    pub fn apply_pending_frame_mutations(
+        &mut self,
+        frame: &mut InterpreterFrame,
+        accumulator: &mut JsValue,
+    ) {
+        if self.pending_frame_mutations.is_empty() {
+            return;
+        }
+        let parameter_count = frame.bytecode_array.parameter_count() as usize;
+        let register_len = frame.registers.len();
+        for (name, value) in self.pending_frame_mutations.drain(..) {
+            if name == "$accumulator" {
+                *accumulator = value.cheap_clone();
+                frame.accumulator = value;
+            } else if let Some(index) =
+                synthetic_register_binding_index(&name, parameter_count, register_len)
+            {
+                frame.registers[index] = value;
+            }
+        }
     }
 
     /// Attach an opt-in cross-thread pause bridge.
@@ -803,6 +887,7 @@ impl Debugger {
     /// [`apply_action`](Self::apply_action) call is required to set the next
     /// step direction.
     fn record_pause(&mut self, reason: PauseReason, offset: u32) -> Option<DebugAction> {
+        self.pending_frame_mutations.clear();
         self.last_pause_reason = Some(reason);
         self.last_pause_offset = offset;
         self.step_mode = StepMode::None;
@@ -976,6 +1061,39 @@ mod tests {
         assert_eq!(snapshot.frame_size, 1);
         assert_eq!(snapshot.registers[0], JsValue::Smi(41));
         assert_eq!(snapshot.accumulator, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_paused_frame_binding_mutation_applies_on_resume() {
+        let ba = Rc::new(make_bytecodes_with_positions(vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]));
+        let mut frame = InterpreterFrame::new(Rc::clone(&ba), vec![]);
+        frame.registers[0] = JsValue::Smi(41);
+        let mut accumulator = JsValue::Smi(1);
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .check_pause_at_with_frame(0, || PauseFrameSnapshot::from_frame(&frame, &accumulator));
+
+        dbg.set_paused_frame_binding("$local0", JsValue::Smi(99))
+            .unwrap();
+        dbg.set_paused_frame_binding("$accumulator", JsValue::Smi(7))
+            .unwrap();
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().registers[0],
+            JsValue::Smi(99)
+        );
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().accumulator,
+            JsValue::Smi(7)
+        );
+
+        dbg.apply_pending_frame_mutations(&mut frame, &mut accumulator);
+        assert_eq!(frame.registers[0], JsValue::Smi(99));
+        assert_eq!(accumulator, JsValue::Smi(7));
+        assert_eq!(frame.accumulator, JsValue::Smi(7));
     }
 
     // ── Breakpoint management ─────────────────────────────────────────────────

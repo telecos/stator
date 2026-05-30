@@ -43,7 +43,7 @@
 //! | `Debugger`     | `pause`                   | Requests a pause at the next debugger poll |
 //! | `Debugger`     | `setInstrumentationBreakpoint` | Fail-closed: instrumentation breakpoints not implemented yet |
 //! | `Debugger`     | `evaluateOnCallFrame`     | Evaluates against the synthetic paused frame globals |
-//! | `Debugger`     | `setVariableValue`        | Mutates globals on Stator synthetic paused frames |
+//! | `Debugger`     | `setVariableValue`        | Mutates paused synthetic local/global scopes |
 //! | `Debugger`     | `restartFrame`/`setReturnValue`/`setBreakpointOnFunctionCall` | Fail-closed: call-frame/function-call mutation not implemented yet |
 //! | `Debugger`     | `getScriptSource`         | Returns a source registered by the in-process inspector |
 //! | `Debugger`     | `searchInContent`         | Searches registered script source content |
@@ -2615,25 +2615,25 @@ impl CdpDispatcher {
                 "no active pause; variable mutation is only valid after a Debugger.paused event.",
             ));
         }
-        let has_local_scope = debugger.borrow().last_pause_frame_snapshot().is_some();
-        let global_scope_number = if has_local_scope { 1 } else { 0 };
-        if scope_number == 0 && has_local_scope {
-            return Err(unsupported_debugger_method(
-                "Debugger.setVariableValue",
-                "mutating captured local register scopes is not yet supported.",
-            ));
-        }
-        if scope_number != global_scope_number {
-            return Err(crate::error::StatorError::Internal(format!(
-                "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
-            )));
-        }
         let new_value = params.get("newValue").ok_or_else(|| {
             crate::error::StatorError::TypeError(
                 "Debugger.setVariableValue: required parameter 'newValue' is missing".to_string(),
             )
         })?;
         let value = call_argument_to_js_value(new_value, &self.remote_objects)?;
+        let has_local_scope = debugger.borrow().last_pause_frame_snapshot().is_some();
+        let global_scope_number = if has_local_scope { 1 } else { 0 };
+        if scope_number == 0 && has_local_scope {
+            debugger
+                .borrow_mut()
+                .set_paused_frame_binding(variable_name, value)?;
+            return Ok(json!({}));
+        }
+        if scope_number != global_scope_number {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
+            )));
+        }
         self.globals
             .borrow_mut()
             .insert(variable_name.to_string(), value);
@@ -7868,7 +7868,7 @@ mod tests {
     }
 
     #[test]
-    fn set_variable_value_rejects_local_scope_and_mutates_global_after_snapshot() {
+    fn set_variable_value_mutates_local_snapshot_and_global_after_snapshot() {
         let mut d = fresh_dispatcher();
         let dbg = attach_test_debugger(&mut d);
         dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
@@ -7880,17 +7880,22 @@ mod tests {
             &mut d,
             r#"{"id":1,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"$local0","callFrameId":"stator-pause-frame-0","newValue":{"value":9}}}"#,
         );
-        assert!(local["error"].is_object());
+        assert!(local.get("error").is_none());
+        let local_eval = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"$local0"}}"#,
+        );
+        assert_eq!(local_eval["result"]["result"]["value"], 9);
 
         let global = dispatch(
             &mut d,
-            r#"{"id":2,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"changed","callFrameId":"stator-pause-frame-0","newValue":{"value":42}}}"#,
+            r#"{"id":3,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"changed","callFrameId":"stator-pause-frame-0","newValue":{"value":42}}}"#,
         );
         assert!(global.get("error").is_none());
 
         let eval = dispatch(
             &mut d,
-            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"changed"}}"#,
+            r#"{"id":4,"method":"Runtime.evaluate","params":{"expression":"changed"}}"#,
         );
         assert_eq!(eval["result"]["result"]["value"], 42);
     }
