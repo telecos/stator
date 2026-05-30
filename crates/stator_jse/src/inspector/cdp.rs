@@ -67,6 +67,7 @@
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
+//! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -453,6 +454,8 @@ pub struct CdpDispatcher {
     security_enabled: bool,
     /// Cached `Security.setIgnoreCertificateErrors` state.
     security_ignore_certificate_errors: bool,
+    /// Whether the Performance domain is currently enabled for this session.
+    performance_enabled: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -568,6 +571,7 @@ impl CdpDispatcher {
             log_violation_setting_count: 0,
             security_enabled: false,
             security_ignore_certificate_errors: false,
+            performance_enabled: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -698,6 +702,11 @@ impl CdpDispatcher {
     /// Returns the cached certificate-error ignore setting.
     pub fn security_ignore_certificate_errors(&self) -> bool {
         self.security_ignore_certificate_errors
+    }
+
+    /// Returns `true` if the Performance domain is currently enabled.
+    pub fn performance_enabled(&self) -> bool {
+        self.performance_enabled
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1402,6 +1411,17 @@ impl CdpDispatcher {
                 self.security_set_ignore_certificate_errors(&req.params)
             }
 
+            // ── Performance ───────────────────────────────────────────────
+            "Performance.enable" => {
+                self.performance_enabled = true;
+                Ok(json!({}))
+            }
+            "Performance.disable" => {
+                self.performance_enabled = false;
+                Ok(json!({}))
+            }
+            "Performance.getMetrics" => self.performance_get_metrics(),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1527,6 +1547,21 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
+    fn performance_get_metrics(&self) -> StatorResult<Value> {
+        let heap_used = self.estimated_heap_usage_bytes() as f64;
+        Ok(json!({
+            "metrics": [
+                { "name": "Timestamp", "value": 0.0 },
+                { "name": "Documents", "value": self.contexts.len() as f64 },
+                { "name": "Frames", "value": self.contexts.len().max(1) as f64 },
+                { "name": "JSHeapUsedSize", "value": heap_used },
+                { "name": "JSHeapTotalSize", "value": heap_used },
+                { "name": "ScriptDuration", "value": 0.0 },
+                { "name": "TaskDuration", "value": 0.0 },
+            ]
+        }))
+    }
+
     // ── Runtime.enable ────────────────────────────────────────────────────────
 
     fn runtime_enable(&mut self) -> StatorResult<Value> {
@@ -1581,17 +1616,21 @@ impl CdpDispatcher {
         Ok(json!({ "names": names }))
     }
 
-    fn runtime_get_heap_usage(&self) -> StatorResult<Value> {
+    fn estimated_heap_usage_bytes(&self) -> u64 {
         const NODE_FIELDS: usize = 5;
         const SELF_SIZE_INDEX: usize = 3;
 
         let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow().vars);
-        let used_size: u64 = snapshot
+        snapshot
             .nodes
             .chunks(NODE_FIELDS)
             .filter_map(|node| node.get(SELF_SIZE_INDEX))
             .map(|size| u64::from(*size))
-            .sum();
+            .sum()
+    }
+
+    fn runtime_get_heap_usage(&self) -> StatorResult<Value> {
+        let used_size = self.estimated_heap_usage_bytes();
         Ok(json!({
             "usedSize": used_size,
             "totalSize": used_size,
@@ -3723,6 +3762,7 @@ fn schema_get_domains() -> Value {
             { "name": "Page", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
+            { "name": "Performance", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -5969,6 +6009,41 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn performance_domain_reports_metrics_and_tracks_enable_state() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Performance.enable","params":{}}"#,
+        );
+        assert!(enable.get("error").is_none());
+        assert!(d.performance_enabled());
+
+        d.globals
+            .borrow_mut()
+            .insert("perfObject".to_string(), JsValue::Smi(1));
+        let metrics = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Performance.getMetrics","params":{}}"#,
+        );
+        let names: HashSet<_> = metrics["result"]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|metric| metric["name"].as_str())
+            .collect();
+        assert!(names.contains("Timestamp"));
+        assert!(names.contains("JSHeapUsedSize"));
+        assert!(names.contains("JSHeapTotalSize"));
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Performance.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.performance_enabled());
     }
 
     #[test]
