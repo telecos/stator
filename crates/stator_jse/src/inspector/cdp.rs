@@ -37,6 +37,7 @@
 //! | `Debugger`     | `setBreakpointByUrl`      | Resolves URL breakpoints against registered scripts |
 //! | `Debugger`     | `setBreakpointsActive`    | Enables/disables installed breakpoint pauses |
 //! | `Debugger`     | `setSkipAllPauses`        | Suppresses/resumes all debugger pause sources |
+//! | `Debugger`     | `setAsyncCallStackDepth`/`getStackTrace` | Emits and resolves pause stack trace IDs when async depth is requested |
 //! | `Debugger`     | `setBlackboxPatterns`/`setBlackboxedRanges` | Stores blackbox filters for debugger setup |
 //! | `Debugger`     | `resume`                  | Resumes after a pause; emits `Debugger.resumed` when an active pause exists |
 //! | `Debugger`     | `continueToLocation`      | Resumes to a one-shot breakpoint at a registered script location |
@@ -554,6 +555,12 @@ pub struct CdpDispatcher {
     pause_bridge: Option<DebuggerPauseBridge>,
     /// Requested async call-stack depth for future async scheduling points.
     async_call_stack_depth: u32,
+    /// Monotonically increasing ID for debugger stack traces exposed through CDP.
+    next_stack_trace_id: u64,
+    /// Stack traces addressable through `Debugger.getStackTrace`.
+    stack_traces: HashMap<String, Value>,
+    /// FIFO order used to cap retained stack traces.
+    stack_trace_order: VecDeque<String>,
     /// Dispatcher-owned termination flag published to interpreter runs.
     termination_requested: AtomicBool,
     /// CDP `Debugger.setPauseOnExceptions` state. Mirrored on the attached
@@ -655,6 +662,9 @@ impl CdpDispatcher {
             debugger: None,
             pause_bridge: None,
             async_call_stack_depth: 0,
+            next_stack_trace_id: 1,
+            stack_traces: HashMap::new(),
+            stack_trace_order: VecDeque::new(),
             termination_requested: AtomicBool::new(false),
             pause_on_exceptions: PauseOnExceptionsState::None,
             outbox: VecDeque::new(),
@@ -967,9 +977,17 @@ impl CdpDispatcher {
         drop(dbg);
 
         let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot.as_ref());
+        let async_stack_trace_id =
+            self.register_pause_stack_trace_if_requested(&reason, offset, line);
         self.push_event(
             "Debugger.paused",
-            paused_event_params(&reason, offset, line, scope_chain),
+            paused_event_params(
+                &reason,
+                offset,
+                line,
+                scope_chain,
+                async_stack_trace_id.as_deref(),
+            ),
         );
         true
     }
@@ -1002,6 +1020,11 @@ impl CdpDispatcher {
             return false;
         }
         let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot);
+        let async_stack_trace_id = self.register_pause_stack_trace_if_requested(
+            &event.reason,
+            event.bytecode_offset,
+            event.line,
+        );
         self.push_event(
             "Debugger.paused",
             paused_event_params(
@@ -1009,9 +1032,32 @@ impl CdpDispatcher {
                 event.bytecode_offset,
                 event.line,
                 scope_chain,
+                async_stack_trace_id.as_deref(),
             ),
         );
         true
+    }
+
+    fn register_pause_stack_trace_if_requested(
+        &mut self,
+        reason: &PauseReason,
+        offset: u32,
+        line: u32,
+    ) -> Option<String> {
+        if self.async_call_stack_depth == 0 {
+            return None;
+        }
+        let id = format!("stator-stack-trace-{}", self.next_stack_trace_id);
+        self.next_stack_trace_id = self.next_stack_trace_id.saturating_add(1);
+        self.stack_traces
+            .insert(id.clone(), pause_stack_trace(reason, offset, line));
+        self.stack_trace_order.push_back(id.clone());
+        while self.stack_trace_order.len() > MAX_STORED_STACK_TRACES {
+            if let Some(expired) = self.stack_trace_order.pop_front() {
+                self.stack_traces.remove(&expired);
+            }
+        }
+        Some(id)
     }
 
     fn synthetic_pause_scope_chain(
@@ -2860,6 +2906,9 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
+        if let Some(stack_trace) = self.stack_traces.get(id) {
+            return Ok(json!({ "stackTrace": stack_trace }));
+        }
         Err(crate::error::StatorError::Internal(format!(
             "Debugger.getStackTrace: unknown stackTraceId `{id}`"
         )))
@@ -3998,6 +4047,7 @@ impl CdpSession {
 
 const MAX_PREVIEW_PROPERTIES: usize = 5;
 const MAX_PREVIEW_DEPTH: usize = 1;
+const MAX_STORED_STACK_TRACES: usize = 128;
 const HEAP_SNAPSHOT_CHUNK_SIZE: usize = 64 * 1024;
 
 struct ExceptionRequest<'a> {
@@ -4489,7 +4539,13 @@ fn frame_snapshot_bindings(snapshot: &PauseFrameSnapshot) -> Vec<(String, JsValu
     bindings
 }
 
-fn paused_event_params(reason: &PauseReason, offset: u32, line: u32, scope_chain: Value) -> Value {
+fn paused_event_params(
+    reason: &PauseReason,
+    offset: u32,
+    line: u32,
+    scope_chain: Value,
+    async_stack_trace_id: Option<&str>,
+) -> Value {
     // We cannot reconstruct the live JS call stack here yet: the interpreter
     // does not retain a portable per-frame snapshot at pause time. To avoid
     // emitting success-shaped placeholder frames we instead emit a single
@@ -4525,7 +4581,26 @@ fn paused_event_params(reason: &PauseReason, offset: u32, line: u32, scope_chain
             Value::Array(vec![Value::String(id.to_string())]),
         );
     }
+    if let Some(id) = async_stack_trace_id
+        && let Some(obj) = params.as_object_mut()
+    {
+        obj.insert("asyncStackTraceId".to_string(), json!({ "id": id }));
+    }
     params
+}
+
+fn pause_stack_trace(reason: &PauseReason, offset: u32, line: u32) -> Value {
+    let line_number = line.saturating_sub(1);
+    json!({
+        "description": format!("Stator paused at bytecode {offset}: {}", paused_reason_str(reason)),
+        "callFrames": [{
+            "functionName": "(stator: paused-frame)",
+            "scriptId": "0",
+            "url": "",
+            "lineNumber": line_number,
+            "columnNumber": 0,
+        }],
+    })
 }
 
 fn exception_text(err: &StatorError, thrown: Option<&JsValue>) -> String {
@@ -8139,6 +8214,42 @@ mod tests {
             r#"{"id":3,"method":"Debugger.setAsyncCallStackDepth","params":{}}"#,
         );
         assert!(bad["error"].is_object());
+    }
+
+    #[test]
+    fn debugger_get_stack_trace_resolves_pause_async_stack_trace_id() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 7, 1);
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setAsyncCallStackDepth","params":{"maxDepth":4}}"#,
+        );
+        let _ = dispatch(&mut d, r#"{"id":2,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let _ = dbg.borrow_mut().check_pause_at(0);
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        let stack_trace_id = paused[0]["params"]["asyncStackTraceId"]["id"]
+            .as_str()
+            .expect("paused event stack trace id");
+        assert!(stack_trace_id.starts_with("stator-stack-trace-"));
+
+        let stack_trace = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Debugger.getStackTrace","params":{{"stackTraceId":{{"id":"{stack_trace_id}"}}}}}}"#
+            ),
+        );
+        assert_eq!(
+            stack_trace["result"]["stackTrace"]["callFrames"][0]["functionName"],
+            "(stator: paused-frame)"
+        );
+        assert_eq!(
+            stack_trace["result"]["stackTrace"]["callFrames"][0]["lineNumber"],
+            6
+        );
     }
 
     #[test]
