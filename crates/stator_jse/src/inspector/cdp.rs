@@ -3970,6 +3970,25 @@ impl CdpDispatcher {
             .and_then(|value| value.get("columnNumber"))
             .and_then(Value::as_u64)
             .map(|value| value as u32);
+        if let Some(end_script_id) = end
+            .and_then(|value| value.get("scriptId"))
+            .and_then(Value::as_str)
+            && end_script_id != script_id
+        {
+            return Err(crate::error::StatorError::Internal(format!(
+                "Debugger.getPossibleBreakpoints: end.scriptId `{end_script_id}` does not match start.scriptId `{script_id}`"
+            )));
+        }
+        if params
+            .get("restrictToFunction")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(unsupported_debugger_method(
+                "Debugger.getPossibleBreakpoints",
+                "restrictToFunction requires function boundary metadata that is not implemented yet.",
+            ));
+        }
 
         let bytecodes = parser::parse(source)
             .and_then(|program| BytecodeGenerator::compile_program(&program))?;
@@ -10154,6 +10173,29 @@ mod tests {
             r#"{"id":1,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"missing","lineNumber":0,"columnNumber":0}}}"#,
         );
         assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn get_possible_breakpoints_validates_range_and_restrict_to_function() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "function f() {\n  return 1;\n}".to_string());
+        let different_end_script = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"7","lineNumber":0,"columnNumber":0},"end":{"scriptId":"8","lineNumber":1,"columnNumber":0}}}"#,
+        );
+        assert!(different_end_script["error"].is_object());
+
+        let restrict = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"7","lineNumber":0,"columnNumber":0},"restrictToFunction":true}}"#,
+        );
+        assert!(restrict["error"].is_object());
+        assert!(
+            restrict["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("restrictToFunction")
+        );
     }
 
     #[test]
