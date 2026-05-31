@@ -1731,10 +1731,7 @@ impl CdpDispatcher {
                     "debuggerId": "stator-debugger-0"
                 }))
             }
-            "Debugger.disable" => {
-                self.debugger_enabled = false;
-                Ok(json!({}))
-            }
+            "Debugger.disable" => self.debugger_disable(),
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
             "Debugger.setAsyncCallStackDepth" => {
                 self.debugger_set_async_call_stack_depth(&req.params)
@@ -3209,6 +3206,34 @@ impl CdpDispatcher {
         self.blackboxed_ranges
             .insert(script_id.to_string(), positions.clone());
         Ok(json!({}))
+    }
+
+    fn debugger_disable(&mut self) -> StatorResult<Value> {
+        self.debugger_enabled = false;
+        self.clear_debugger_breakpoint_state();
+        self.paused_local_scope_object_id = None;
+        self.paused_context_scope_object_ids.clear();
+        self.paused_global_scope_object_id = None;
+        Ok(json!({}))
+    }
+
+    fn clear_debugger_breakpoint_state(&mut self) {
+        if let Some(debugger) = self.debugger.as_ref() {
+            let mut debugger = debugger.borrow_mut();
+            for debugger_id in self
+                .debugger_breakpoint_locations
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                let _ = debugger.remove_breakpoint(debugger_id);
+            }
+        }
+        self.cdp_breakpoints.clear();
+        self.cdp_script_breakpoints.clear();
+        self.cdp_debugger_breakpoints.clear();
+        self.cdp_url_breakpoints.clear();
+        self.debugger_breakpoint_locations.clear();
     }
 
     // ── Debugger.resume ──────────────────────────────────────────────────────
@@ -9287,13 +9312,28 @@ mod tests {
     #[test]
     fn debugger_disable_clears_enabled_flag() {
         let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
         let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let breakpoint = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0}}}"#,
+        );
+        assert!(breakpoint.get("error").is_none());
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
         assert!(d.debugger_enabled());
         let _ = dispatch(
             &mut d,
-            r#"{"id":2,"method":"Debugger.disable","params":{}}"#,
+            r#"{"id":3,"method":"Debugger.disable","params":{}}"#,
         );
         assert!(!d.debugger_enabled());
+        assert!(d.cdp_breakpoints.is_empty());
+        assert!(d.cdp_script_breakpoints.is_empty());
+        assert!(d.cdp_debugger_breakpoints.is_empty());
+        assert_eq!(dbg.borrow().breakpoints().count(), 0);
     }
 
     #[test]
