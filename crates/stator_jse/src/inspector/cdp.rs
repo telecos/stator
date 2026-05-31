@@ -322,6 +322,22 @@ struct TypeProfileScript {
     types: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct CdpBreakpointLocation {
+    script_id: String,
+    url: String,
+    line_number: u32,
+    column_number: u32,
+}
+
+#[derive(Clone)]
+struct PauseFrameLocation {
+    script_id: String,
+    url: String,
+    line_number: u32,
+    column_number: u32,
+}
+
 impl RemoteObjectRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
@@ -530,6 +546,8 @@ pub struct CdpDispatcher {
     cdp_breakpoints: HashSet<String>,
     /// Interpreter breakpoint IDs installed for each CDP breakpoint ID.
     cdp_debugger_breakpoints: HashMap<String, Vec<BreakpointId>>,
+    /// CDP location metadata for each installed interpreter breakpoint ID.
+    debugger_breakpoint_locations: HashMap<BreakpointId, CdpBreakpointLocation>,
     /// CDP `Debugger.setBreakpointsActive` state mirrored onto the debugger.
     breakpoints_active: bool,
     /// CDP `Debugger.setSkipAllPauses` state mirrored onto the debugger.
@@ -663,6 +681,7 @@ impl CdpDispatcher {
             next_breakpoint_id: 1,
             cdp_breakpoints: HashSet::new(),
             cdp_debugger_breakpoints: HashMap::new(),
+            debugger_breakpoint_locations: HashMap::new(),
             breakpoints_active: true,
             skip_all_pauses: false,
             blackbox_patterns: Vec::new(),
@@ -995,9 +1014,10 @@ impl CdpDispatcher {
         let line = dbg.last_pause_line();
         drop(dbg);
 
+        let pause_location = self.pause_frame_location_for_reason(&reason, line);
         let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot.as_ref());
         let async_stack_trace_id =
-            self.register_pause_stack_trace_if_requested(&reason, offset, line);
+            self.register_pause_stack_trace_if_requested(&reason, offset, &pause_location);
         self.push_event(
             "Debugger.paused",
             paused_event_params(
@@ -1006,6 +1026,7 @@ impl CdpDispatcher {
                 line,
                 scope_chain,
                 async_stack_trace_id.as_deref(),
+                &pause_location,
             ),
         );
         true
@@ -1038,11 +1059,12 @@ impl CdpDispatcher {
         if !self.debugger_enabled {
             return false;
         }
+        let pause_location = self.pause_frame_location_for_reason(&event.reason, event.line);
         let scope_chain = self.synthetic_pause_scope_chain(frame_snapshot);
         let async_stack_trace_id = self.register_pause_stack_trace_if_requested(
             &event.reason,
             event.bytecode_offset,
-            event.line,
+            &pause_location,
         );
         self.push_event(
             "Debugger.paused",
@@ -1052,16 +1074,40 @@ impl CdpDispatcher {
                 event.line,
                 scope_chain,
                 async_stack_trace_id.as_deref(),
+                &pause_location,
             ),
         );
         true
+    }
+
+    fn pause_frame_location_for_reason(
+        &self,
+        reason: &PauseReason,
+        fallback_line: u32,
+    ) -> PauseFrameLocation {
+        if let PauseReason::Breakpoint(id) = reason
+            && let Some(location) = self.debugger_breakpoint_locations.get(id)
+        {
+            return PauseFrameLocation {
+                script_id: location.script_id.clone(),
+                url: location.url.clone(),
+                line_number: location.line_number,
+                column_number: location.column_number,
+            };
+        }
+        PauseFrameLocation {
+            script_id: "0".to_string(),
+            url: String::new(),
+            line_number: fallback_line.saturating_sub(1),
+            column_number: 0,
+        }
     }
 
     fn register_pause_stack_trace_if_requested(
         &mut self,
         reason: &PauseReason,
         offset: u32,
-        line: u32,
+        location: &PauseFrameLocation,
     ) -> Option<String> {
         if self.async_call_stack_depth == 0 {
             return None;
@@ -1069,7 +1115,7 @@ impl CdpDispatcher {
         let id = format!("stator-stack-trace-{}", self.next_stack_trace_id);
         self.next_stack_trace_id = self.next_stack_trace_id.saturating_add(1);
         self.stack_traces
-            .insert(id.clone(), pause_stack_trace(reason, offset, line));
+            .insert(id.clone(), pause_stack_trace(reason, offset, location));
         self.stack_trace_order.push_back(id.clone());
         while self.stack_trace_order.len() > MAX_STORED_STACK_TRACES {
             if let Some(expired) = self.stack_trace_order.pop_front() {
@@ -3323,11 +3369,20 @@ impl CdpDispatcher {
         );
         self.next_breakpoint_id += 1;
         self.cdp_breakpoints.insert(bp_id.clone());
+        let actual_line = actual_location["lineNumber"].as_u64().unwrap_or(0) as u32;
+        let actual_column = actual_location["columnNumber"].as_u64().unwrap_or(0) as u32;
+        let breakpoint_location = CdpBreakpointLocation {
+            script_id: script_id.to_string(),
+            url: self.script_urls.get(script_id).cloned().unwrap_or_default(),
+            line_number: actual_line,
+            column_number: actual_column,
+        };
         self.install_interpreter_breakpoint(
             &bp_id,
             bytecode_offset,
-            actual_location["lineNumber"].as_u64().unwrap_or(0) as u32,
-            actual_location["columnNumber"].as_u64().unwrap_or(0) as u32,
+            actual_line,
+            actual_column,
+            breakpoint_location,
         );
 
         Ok(json!({
@@ -3376,11 +3431,19 @@ impl CdpDispatcher {
                 if let Some((bytecode_offset, location)) =
                     breakpoint_location_for_source(&script_id, source, line_number, column_number)?
                 {
+                    let actual_line = location["lineNumber"].as_u64().unwrap_or(0) as u32;
+                    let actual_column = location["columnNumber"].as_u64().unwrap_or(0) as u32;
                     self.install_interpreter_breakpoint(
                         &bp_id,
                         bytecode_offset,
-                        location["lineNumber"].as_u64().unwrap_or(0) as u32,
-                        location["columnNumber"].as_u64().unwrap_or(0) as u32,
+                        actual_line,
+                        actual_column,
+                        CdpBreakpointLocation {
+                            script_id: script_id.clone(),
+                            url: script_url.to_string(),
+                            line_number: actual_line,
+                            column_number: actual_column,
+                        },
                     );
                     if self.debugger_enabled {
                         self.push_event(
@@ -3414,6 +3477,7 @@ impl CdpDispatcher {
         bytecode_offset: u32,
         line_number: u32,
         column_number: u32,
+        location: CdpBreakpointLocation,
     ) {
         let Some(debugger) = self.debugger.as_ref() else {
             return;
@@ -3427,6 +3491,8 @@ impl CdpDispatcher {
             .entry(cdp_breakpoint_id.to_string())
             .or_default()
             .push(debugger_id);
+        self.debugger_breakpoint_locations
+            .insert(debugger_id, location);
     }
 
     fn debugger_remove_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
@@ -3451,6 +3517,7 @@ impl CdpDispatcher {
             let mut debugger = debugger.borrow_mut();
             for debugger_id in debugger_ids {
                 let _ = debugger.remove_breakpoint(debugger_id);
+                self.debugger_breakpoint_locations.remove(&debugger_id);
             }
         }
         Ok(json!({}))
@@ -4612,9 +4679,10 @@ fn frame_snapshot_bindings(snapshot: &PauseFrameSnapshot) -> Vec<(String, JsValu
 fn paused_event_params(
     reason: &PauseReason,
     offset: u32,
-    line: u32,
+    _line: u32,
     scope_chain: Value,
     async_stack_trace_id: Option<&str>,
+    location: &PauseFrameLocation,
 ) -> Value {
     // We cannot reconstruct the live JS call stack here yet: the interpreter
     // does not retain a portable per-frame snapshot at pause time. To avoid
@@ -4622,18 +4690,17 @@ fn paused_event_params(
     // synthetic top-level frame describing the paused source location. The
     // `(stator: paused-frame)` function name and `pausedFrame: true`
     // auxData entry signal to embedders that this is a derived frame.
-    let line_number = line.saturating_sub(1);
     let call_frame = json!({
         "callFrameId": format!("stator-pause-frame-{offset}"),
         "functionName": "(stator: paused-frame)",
         "location": {
-            "scriptId": "0",
-            "lineNumber": line_number,
-            "columnNumber": 0,
+            "scriptId": location.script_id.as_str(),
+            "lineNumber": location.line_number,
+            "columnNumber": location.column_number,
         },
         "scopeChain": scope_chain,
         "this": {"type": "undefined"},
-        "url": "",
+        "url": location.url.as_str(),
     });
     let mut params = json!({
         "callFrames": [call_frame],
@@ -4659,16 +4726,15 @@ fn paused_event_params(
     params
 }
 
-fn pause_stack_trace(reason: &PauseReason, offset: u32, line: u32) -> Value {
-    let line_number = line.saturating_sub(1);
+fn pause_stack_trace(reason: &PauseReason, offset: u32, location: &PauseFrameLocation) -> Value {
     json!({
         "description": format!("Stator paused at bytecode {offset}: {}", paused_reason_str(reason)),
         "callFrames": [{
             "functionName": "(stator: paused-frame)",
-            "scriptId": "0",
-            "url": "",
-            "lineNumber": line_number,
-            "columnNumber": 0,
+            "scriptId": location.script_id.as_str(),
+            "url": location.url.as_str(),
+            "lineNumber": location.line_number,
+            "columnNumber": location.column_number,
         }],
     })
 }
@@ -6452,6 +6518,59 @@ mod tests {
         );
         assert!(removed.get("error").is_none());
         assert_eq!(dbg.borrow().breakpoints().count(), 0);
+    }
+
+    #[test]
+    fn debugger_paused_uses_registered_breakpoint_script_location() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setAsyncCallStackDepth","params":{"maxDepth":4}}"#,
+        );
+        let response = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0}}}"#,
+        );
+        assert!(response.get("error").is_none());
+        let offset = dbg
+            .borrow()
+            .breakpoints()
+            .next()
+            .expect("installed breakpoint")
+            .bytecode_offset;
+        let _ = dispatch(&mut d, r#"{"id":3,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        assert!(dbg.borrow_mut().check_pause_at(offset).is_some());
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        let frame = &paused[0]["params"]["callFrames"][0];
+        assert_eq!(frame["location"]["scriptId"], "7");
+        assert_eq!(frame["location"]["lineNumber"], 1);
+        assert_eq!(frame["url"], "stator://app.js");
+
+        let stack_trace_id = paused[0]["params"]["asyncStackTraceId"]["id"]
+            .as_str()
+            .expect("stack trace id");
+        let stack_trace = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":4,"method":"Debugger.getStackTrace","params":{{"stackTraceId":{{"id":"{stack_trace_id}"}}}}}}"#
+            ),
+        );
+        assert_eq!(
+            stack_trace["result"]["stackTrace"]["callFrames"][0]["scriptId"],
+            "7"
+        );
+        assert_eq!(
+            stack_trace["result"]["stackTrace"]["callFrames"][0]["url"],
+            "stator://app.js"
+        );
     }
 
     #[test]
