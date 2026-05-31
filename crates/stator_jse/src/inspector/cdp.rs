@@ -3475,6 +3475,15 @@ impl CdpDispatcher {
 
         let requested_url = params.get("url").and_then(Value::as_str);
         let requested_url_regex = params.get("urlRegex").and_then(Value::as_str);
+        let url_regex = requested_url_regex
+            .map(|pattern| {
+                regress::Regex::new(pattern).map_err(|err| {
+                    StatorError::SyntaxError(format!(
+                        "Debugger.setBreakpointByUrl: invalid urlRegex `{pattern}`: {err}"
+                    ))
+                })
+            })
+            .transpose()?;
         let bp_id = format!(
             "{}:{}:{}",
             self.next_breakpoint_id, line_number, column_number
@@ -3496,7 +3505,9 @@ impl CdpDispatcher {
                     .map(String::as_str)
                     .unwrap_or_default();
                 let url_matches = requested_url.is_some_and(|url| url == script_url)
-                    || requested_url_regex.is_some_and(|pattern| script_url.contains(pattern));
+                    || url_regex
+                        .as_ref()
+                        .is_some_and(|regex| regex.find(script_url).is_some());
                 if !url_matches {
                     continue;
                 }
@@ -6743,6 +6754,35 @@ mod tests {
         assert_eq!(
             response["result"]["breakpointId"],
             messages[0]["params"]["breakpointId"]
+        );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_uses_real_url_regex() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"urlRegex":"stator://app\\.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        let locations = response["result"]["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["scriptId"], "7");
+
+        let invalid = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"urlRegex":"(","lineNumber":0,"columnNumber":0}}"#,
+        );
+        assert!(invalid["error"].is_object());
+        assert!(
+            invalid["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid urlRegex")
         );
     }
 
