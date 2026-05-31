@@ -21249,6 +21249,20 @@ fn make_promise() -> JsValue {
 
 // ── RegExp ────────────────────────────────────────────────────────────────────
 
+fn is_regexp_escape_whitespace_or_line_terminator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}' | '\u{000B}' | '\u{000C}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
 /// Build the `RegExp` constructor.
 #[inline(never)]
 fn make_regexp() -> JsValue {
@@ -21310,37 +21324,28 @@ fn make_regexp() -> JsValue {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let s = val.to_js_string()?;
                 let mut result = String::with_capacity(s.len() * 2);
-                for ch in s.chars() {
+                for (idx, ch) in s.chars().enumerate() {
                     match ch {
+                        _ if idx == 0 && ch.is_ascii_alphanumeric() => {
+                            write!(result, "\\x{:02x}", ch as u32).unwrap_or_default();
+                        }
                         // SyntaxCharacter: ^ $ \ . * + ? ( ) [ ] { } |
                         '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
                         | '}' | '|' | '/' => {
                             result.push('\\');
                             result.push(ch);
                         }
-                        // Characters that could be special at the start of a pattern.
-                        _ if result.is_empty()
-                            && (ch.is_ascii_whitespace()
-                                || ch.is_ascii_digit()
-                                || ch == ','
-                                || ch == '-'
-                                || ch == '='
-                                || ch == '<'
-                                || ch == '>'
-                                || ch == '#'
-                                || ch == '&'
-                                || ch == '!'
-                                || ch == '%'
-                                || ch == ':'
-                                || ch == ';'
-                                || ch == '@'
-                                || ch == '~'
-                                || ch == '`'
-                                || ch == '\u{200D}'
-                                || ch == '\u{FEFF}') =>
-                        {
-                            // Escape via unicode escape sequence.
-                            write!(result, "\\x{:02X}", ch as u32).unwrap_or_default();
+                        '\n' => result.push_str("\\n"),
+                        '\r' => result.push_str("\\r"),
+                        '\t' => result.push_str("\\t"),
+                        '\u{000B}' => result.push_str("\\v"),
+                        '\u{000C}' => result.push_str("\\f"),
+                        ' ' | ',' | '-' | '=' | '<' | '>' | '#' | '&' | '!' | '%' | ':' | ';'
+                        | '@' | '~' | '\'' | '"' | '`' => {
+                            write!(result, "\\x{:02x}", ch as u32).unwrap_or_default();
+                        }
+                        _ if is_regexp_escape_whitespace_or_line_terminator(ch) => {
+                            write!(result, "\\u{:04x}", ch as u32).unwrap_or_default();
                         }
                         _ => result.push(ch),
                     }
@@ -80273,7 +80278,27 @@ mod tests {
     /// RegExp.escape: escapes syntax characters.
     #[test]
     fn e2e_regexp_escape_syntax_chars() {
-        assert_eval_true(r#"RegExp.escape("a.b+c") === "a\\.b\\+c""#);
+        assert_eval_true(r#"RegExp.escape("a.b+c") === "\\x61\\.b\\+c""#);
+    }
+
+    /// RegExp.escape: escapes the leading ASCII letter or digit.
+    #[test]
+    fn e2e_regexp_escape_leading_alnum() {
+        assert_eval_true(r#"RegExp.escape("foo") === "\\x66oo""#);
+        assert_eval_true(r#"RegExp.escape("1foo") === "\\x31foo""#);
+    }
+
+    /// RegExp.escape: hex-escapes punctuators that cannot be identity-escaped.
+    #[test]
+    fn e2e_regexp_escape_punctuators() {
+        assert_eval_true(r#"RegExp.escape(",-=\"`") === "\\x2c\\x2d\\x3d\\x22\\x60""#);
+    }
+
+    /// RegExp.escape: uses canonical whitespace escapes.
+    #[test]
+    fn e2e_regexp_escape_whitespace() {
+        assert_eval_true(r#"RegExp.escape(" \n\t") === "\\x20\\n\\t""#);
+        assert_eval_true(r#"RegExp.escape("\u2028") === "\\u2028""#);
     }
 
     /// toString: returns /source/flags format.
