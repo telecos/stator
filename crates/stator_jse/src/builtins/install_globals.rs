@@ -40121,7 +40121,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_global_this_sees_declared_global_binding() {
         let result =
             global_eval("var conformanceGlobal = 9; globalThis.conformanceGlobal").unwrap();
