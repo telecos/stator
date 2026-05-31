@@ -1119,7 +1119,13 @@ impl CdpDispatcher {
         let async_parent_stack = current_async_stack_trace();
         self.stack_traces.insert(
             id.clone(),
-            pause_stack_trace(reason, offset, location, async_parent_stack.as_ref()),
+            pause_stack_trace(
+                reason,
+                offset,
+                location,
+                async_parent_stack.as_ref(),
+                self.async_call_stack_depth as usize,
+            ),
         );
         self.stack_trace_order.push_back(id.clone());
         while self.stack_trace_order.len() > MAX_STORED_STACK_TRACES {
@@ -4741,6 +4747,7 @@ fn pause_stack_trace(
     offset: u32,
     location: &PauseFrameLocation,
     async_parent_stack: Option<&AsyncStackTrace>,
+    async_parent_depth: usize,
 ) -> Value {
     let mut stack_trace = json!({
         "description": format!("Stator paused at bytecode {offset}: {}", paused_reason_str(reason)),
@@ -4753,18 +4760,23 @@ fn pause_stack_trace(
         }],
     });
     if let Some(parent) = async_parent_stack
+        && let Some(parent) = async_stack_trace_to_cdp(parent, async_parent_depth)
         && let Some(obj) = stack_trace.as_object_mut()
     {
-        obj.insert("parent".to_string(), async_stack_trace_to_cdp(parent));
+        obj.insert("parent".to_string(), parent);
     }
     stack_trace
 }
 
-fn async_stack_trace_to_cdp(trace: &AsyncStackTrace) -> Value {
+fn async_stack_trace_to_cdp(trace: &AsyncStackTrace, remaining_frames: usize) -> Option<Value> {
+    if remaining_frames == 0 {
+        return None;
+    }
     let call_frames: Vec<Value> = trace
         .frames
         .iter()
         .rev()
+        .take(remaining_frames)
         .map(|frame| {
             json!({
                 "functionName": frame,
@@ -4775,16 +4787,19 @@ fn async_stack_trace_to_cdp(trace: &AsyncStackTrace) -> Value {
             })
         })
         .collect();
+    let remaining_frames = remaining_frames.saturating_sub(call_frames.len());
     let mut value = json!({
         "description": trace.description,
         "callFrames": call_frames,
     });
     if let Some(parent) = trace.parent.as_deref()
+        && remaining_frames > 0
+        && let Some(parent) = async_stack_trace_to_cdp(parent, remaining_frames)
         && let Some(obj) = value.as_object_mut()
     {
-        obj.insert("parent".to_string(), async_stack_trace_to_cdp(parent));
+        obj.insert("parent".to_string(), parent);
     }
-    value
+    Some(value)
 }
 
 fn exception_text(err: &StatorError, thrown: Option<&JsValue>) -> String {
@@ -8528,6 +8543,49 @@ mod tests {
         let parent = &stack_trace["result"]["stackTrace"]["parent"];
         assert_eq!(parent["description"], "microtask");
         assert_eq!(parent["callFrames"][0]["functionName"], "scheduleMicrotask");
+    }
+
+    #[test]
+    fn debugger_async_call_stack_depth_limits_microtask_parent_frames() {
+        let queue = MicrotaskQueue::new();
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setAsyncCallStackDepth","params":{"maxDepth":1}}"#,
+        );
+        let _ = dispatch(&mut d, r#"{"id":2,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let dispatcher = Rc::new(RefCell::new(d));
+        let task_dispatcher = Rc::clone(&dispatcher);
+        let task_debugger = Rc::clone(&dbg);
+        push_call_frame("outerScheduler").expect("push outer scheduler frame");
+        push_call_frame("innerScheduler").expect("push inner scheduler frame");
+        queue.enqueue(Box::new(move || {
+            let _ = task_debugger.borrow_mut().on_debugger_statement(0);
+            assert!(task_dispatcher.borrow_mut().notify_paused());
+        }));
+        pop_call_frame();
+        pop_call_frame();
+
+        queue.drain();
+        let mut d = dispatcher.borrow_mut();
+        let paused = drain_all(&mut d);
+        let stack_trace_id = paused[0]["params"]["asyncStackTraceId"]["id"]
+            .as_str()
+            .expect("paused event stack trace id");
+        let stack_trace = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Debugger.getStackTrace","params":{{"stackTraceId":{{"id":"{stack_trace_id}"}}}}}}"#
+            ),
+        );
+        let parent = &stack_trace["result"]["stackTrace"]["parent"];
+        let frames = parent["callFrames"].as_array().expect("parent frames");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["functionName"], "innerScheduler");
+        assert!(parent.get("parent").is_none());
     }
 
     #[test]
