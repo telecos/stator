@@ -355,6 +355,19 @@ impl RemoteObjectRegistry {
         self.entries.get(id).map(|e| e.value.clone())
     }
 
+    /// Update a property on a registered plain object. Returns `true` when
+    /// the ID resolved to a live plain object and was updated.
+    pub fn set_plain_object_property(&mut self, id: &str, name: &str, value: JsValue) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        let JsValue::PlainObject(map_ref) = &entry.value else {
+            return false;
+        };
+        map_ref.borrow_mut().insert(name.to_string(), value);
+        true
+    }
+
     /// Drop the entry for `id`.  Returns `true` when an entry was removed
     /// and `false` when the ID was unknown or already released.
     pub fn release(&mut self, id: &str) -> bool {
@@ -527,6 +540,10 @@ pub struct CdpDispatcher {
     blackboxed_ranges: HashMap<String, Vec<Value>>,
     /// Per-session registry of inspector-visible heap values.
     remote_objects: RemoteObjectRegistry,
+    /// Remote object ID for the current paused local scope snapshot, if any.
+    paused_local_scope_object_id: Option<String>,
+    /// Remote object ID for the current paused global scope snapshot, if any.
+    paused_global_scope_object_id: Option<String>,
     /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
     next_heap_object_id: u64,
     /// Heap-snapshot object IDs minted from remote objects.
@@ -651,6 +668,8 @@ impl CdpDispatcher {
             blackbox_patterns: Vec::new(),
             blackboxed_ranges: HashMap::new(),
             remote_objects: RemoteObjectRegistry::new(),
+            paused_local_scope_object_id: None,
+            paused_global_scope_object_id: None,
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
             inspected_heap_objects: HashSet::new(),
@@ -1064,6 +1083,8 @@ impl CdpDispatcher {
         &mut self,
         frame_snapshot: Option<&PauseFrameSnapshot>,
     ) -> Value {
+        self.paused_local_scope_object_id = None;
+        self.paused_global_scope_object_id = None;
         let mut scopes = Vec::new();
         if let Some(snapshot) = frame_snapshot {
             let mut local_map = PropertyMap::new();
@@ -1076,6 +1097,10 @@ impl CdpDispatcher {
                 Some("debugger-local-scope"),
                 false,
             );
+            self.paused_local_scope_object_id = remote
+                .get("objectId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             scopes.push(json!({
                 "type": "local",
                 "object": remote,
@@ -1099,6 +1124,10 @@ impl CdpDispatcher {
             Some("debugger-scope"),
             false,
         );
+        self.paused_global_scope_object_id = remote
+            .get("objectId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         scopes.push(json!({
             "type": "global",
             "object": remote,
@@ -3190,9 +3219,17 @@ impl CdpDispatcher {
         };
         let global_scope_number = if has_local_scope { 1 } else { 0 };
         if scope_number == 0 && has_local_scope {
+            let scope_value = value.cheap_clone();
             debugger
                 .borrow_mut()
                 .set_paused_frame_binding(variable_name, value)?;
+            if let Some(object_id) = self.paused_local_scope_object_id.as_deref() {
+                self.remote_objects.set_plain_object_property(
+                    object_id,
+                    variable_name,
+                    scope_value,
+                );
+            }
             return Ok(json!({}));
         }
         if scope_number != global_scope_number {
@@ -3200,9 +3237,14 @@ impl CdpDispatcher {
                 "Debugger.setVariableValue: unsupported synthetic scopeNumber `{scope_number}`"
             )));
         }
+        let scope_value = value.cheap_clone();
         self.globals
             .borrow_mut()
             .insert(variable_name.to_string(), value);
+        if let Some(object_id) = self.paused_global_scope_object_id.as_deref() {
+            self.remote_objects
+                .set_plain_object_property(object_id, variable_name, scope_value);
+        }
         Ok(json!({}))
     }
 
@@ -8404,6 +8446,64 @@ mod tests {
         assert!(names.contains("$accumulator"));
         assert!(names.contains("$param0"));
         assert!(names.contains("$local0"));
+    }
+
+    #[test]
+    fn set_variable_value_updates_scope_chain_remote_objects() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .borrow_mut()
+            .check_pause_at_with_frame(0, sample_pause_frame_snapshot);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        let scope_chain = paused[0]["params"]["callFrames"][0]["scopeChain"]
+            .as_array()
+            .unwrap();
+        let local_object_id = scope_chain[0]["object"]["objectId"].as_str().unwrap();
+        let global_object_id = scope_chain[1]["object"]["objectId"].as_str().unwrap();
+
+        let local = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"$local0","callFrameId":"stator-pause-frame-0","newValue":{"value":9}}}"#,
+        );
+        assert!(local.get("error").is_none());
+        let local_props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.getProperties","params":{{"objectId":"{local_object_id}"}}}}"#
+            ),
+        );
+        let local_value = local_props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|prop| prop["name"] == "$local0")
+            .expect("$local0 property");
+        assert_eq!(local_value["value"]["value"], 9);
+
+        let global = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"changed","callFrameId":"stator-pause-frame-0","newValue":{"value":42}}}"#,
+        );
+        assert!(global.get("error").is_none());
+        let global_props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":5,"method":"Runtime.getProperties","params":{{"objectId":"{global_object_id}"}}}}"#
+            ),
+        );
+        let global_value = global_props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|prop| prop["name"] == "changed")
+            .expect("changed property");
+        assert_eq!(global_value["value"]["value"], 42);
     }
 
     #[test]
