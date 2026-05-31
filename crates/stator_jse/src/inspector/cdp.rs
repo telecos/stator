@@ -1427,6 +1427,9 @@ impl CdpDispatcher {
     /// Route a parsed request to the correct domain handler.
     fn dispatch(&mut self, req: &CdpRequest) -> StatorResult<Value> {
         match req.method.as_str() {
+            // ── Browser ───────────────────────────────────────────────────
+            "Browser.getVersion" => Ok(browser_get_version()),
+
             // ── Inspector ─────────────────────────────────────────────────
             "Inspector.enable" => {
                 self.inspector_enabled = true;
@@ -4158,6 +4161,7 @@ impl PauseOnExceptionsState {
 fn schema_get_domains() -> Value {
     json!({
         "domains": [
+            { "name": "Browser", "version": "1.3" },
             { "name": "Inspector", "version": "1.3" },
             { "name": "Runtime", "version": "1.3" },
             { "name": "Debugger", "version": "1.3" },
@@ -4175,6 +4179,17 @@ fn schema_get_domains() -> Value {
             { "name": "Target", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
+    })
+}
+
+fn browser_get_version() -> Value {
+    let version = env!("CARGO_PKG_VERSION");
+    json!({
+        "protocolVersion": "1.3",
+        "product": format!("StatorJSE/{version}"),
+        "revision": version,
+        "userAgent": format!("StatorJSE/{version}"),
+        "jsVersion": version,
     })
 }
 
@@ -6931,11 +6946,31 @@ mod tests {
             .iter()
             .filter_map(|domain| domain["name"].as_str())
             .collect();
+        assert!(names.contains(&"Browser"));
         assert!(names.contains(&"Inspector"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
         assert!(names.contains(&"Schema"));
+    }
+
+    #[test]
+    fn browser_get_version_reports_stator_metadata() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Browser.getVersion","params":{}}"#,
+        );
+        let result = &resp["result"];
+        assert_eq!(result["protocolVersion"], "1.3");
+        assert!(
+            result["product"]
+                .as_str()
+                .expect("product string")
+                .starts_with("StatorJSE/")
+        );
+        assert_eq!(result["revision"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(result["jsVersion"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
