@@ -40236,7 +40236,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_to_string_uses_symbol_to_string_tag() {
         let result =
             global_eval("var tagged = { [Symbol.toStringTag]: 'Tagged' }; Object.prototype.toString.call(tagged)")
