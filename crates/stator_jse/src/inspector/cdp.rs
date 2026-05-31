@@ -3171,6 +3171,11 @@ impl CdpDispatcher {
                     "Debugger.setBlackboxPatterns: every pattern must be a string".to_string(),
                 ));
             };
+            regress::Regex::new(pattern).map_err(|err| {
+                StatorError::SyntaxError(format!(
+                    "Debugger.setBlackboxPatterns: invalid pattern `{pattern}`: {err}"
+                ))
+            })?;
             parsed.push(pattern.to_string());
         }
         self.blackbox_patterns = parsed;
@@ -9807,6 +9812,18 @@ mod tests {
             r#"{"id":2,"method":"Debugger.setBlackboxPatterns","params":{"patterns":[7]}}"#,
         );
         assert!(bad["error"].is_object());
+
+        let invalid_regex = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setBlackboxPatterns","params":{"patterns":["("]}}"#,
+        );
+        assert!(invalid_regex["error"].is_object());
+        assert!(
+            invalid_regex["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid pattern")
+        );
     }
 
     #[test]
