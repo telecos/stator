@@ -1752,19 +1752,12 @@ impl CdpDispatcher {
             "Debugger.stepOut" => self.debugger_step(&req.params, DebugAction::StepOut),
             "Debugger.pause" => self.debugger_pause(),
             "Debugger.evaluateOnCallFrame" => self.debugger_evaluate_on_call_frame(&req.params),
-            "Debugger.restartFrame" => Err(unsupported_debugger_method(
-                "Debugger.restartFrame",
-                "Stator does not yet support rewinding a paused interpreter frame.",
-            )),
-            "Debugger.setReturnValue" => Err(unsupported_debugger_method(
-                "Debugger.setReturnValue",
-                "Stator does not yet support mutating the return value of a paused frame.",
-            )),
+            "Debugger.restartFrame" => self.debugger_restart_frame(&req.params),
+            "Debugger.setReturnValue" => self.debugger_set_return_value(&req.params),
             "Debugger.setVariableValue" => self.debugger_set_variable_value(&req.params),
-            "Debugger.setBreakpointOnFunctionCall" => Err(unsupported_debugger_method(
-                "Debugger.setBreakpointOnFunctionCall",
-                "Stator does not yet support pausing on calls to an arbitrary function object.",
-            )),
+            "Debugger.setBreakpointOnFunctionCall" => {
+                self.debugger_set_breakpoint_on_function_call(&req.params)
+            }
             "Debugger.setInstrumentationBreakpoint" => Err(unsupported_debugger_method(
                 "Debugger.setInstrumentationBreakpoint",
                 "Stator does not yet support instrumentation breakpoints before script execution.",
@@ -3517,6 +3510,99 @@ impl CdpDispatcher {
                 .set_plain_object_property(object_id, variable_name, scope_value);
         }
         Ok(json!({}))
+    }
+
+    fn debugger_restart_frame(&mut self, params: &Value) -> StatorResult<Value> {
+        let call_frame_id = params
+            .get("callFrameId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.restartFrame: required parameter 'callFrameId' is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        let requested_offset = parse_pause_call_frame_id("Debugger.restartFrame", call_frame_id)?;
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.restartFrame",
+                "no interpreter Debugger is attached to this session.",
+            ));
+        };
+        ensure_active_call_frame_id(
+            "Debugger.restartFrame",
+            requested_offset,
+            &debugger.borrow(),
+        )?;
+        Err(unsupported_debugger_method(
+            "Debugger.restartFrame",
+            "Stator does not yet support rewinding a paused interpreter frame.",
+        ))
+    }
+
+    fn debugger_set_return_value(&mut self, params: &Value) -> StatorResult<Value> {
+        let new_value = params.get("newValue").ok_or_else(|| {
+            crate::error::StatorError::TypeError(
+                "Debugger.setReturnValue: required parameter 'newValue' is missing".to_string(),
+            )
+        })?;
+        let _value = call_argument_to_js_value(new_value, &self.remote_objects)?;
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.setReturnValue",
+                "no interpreter Debugger is attached to this session.",
+            ));
+        };
+        if debugger.borrow().last_pause_reason().is_none() {
+            return Err(unsupported_debugger_method(
+                "Debugger.setReturnValue",
+                "no active pause; setReturnValue is only valid after a Debugger.paused event.",
+            ));
+        }
+        Err(unsupported_debugger_method(
+            "Debugger.setReturnValue",
+            "Stator does not yet support mutating the return value of a paused frame.",
+        ))
+    }
+
+    fn debugger_set_breakpoint_on_function_call(&mut self, params: &Value) -> StatorResult<Value> {
+        let object_id = params
+            .get("objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::error::StatorError::TypeError(
+                    "Debugger.setBreakpointOnFunctionCall: required parameter 'objectId' is missing or not a string"
+                        .to_string(),
+                )
+            })?;
+        if let Some(condition) = params.get("condition") {
+            let condition = condition.as_str().ok_or_else(|| {
+                StatorError::TypeError(
+                    "Debugger.setBreakpointOnFunctionCall: optional parameter 'condition' must be a string"
+                        .to_string(),
+                )
+            })?;
+            if !condition.is_empty() {
+                return Err(unsupported_debugger_method(
+                    "Debugger.setBreakpointOnFunctionCall",
+                    "conditional function-call breakpoints are not implemented yet.",
+                ));
+            }
+        }
+        let value = self.remote_objects.get(object_id).ok_or_else(|| {
+            crate::error::StatorError::Internal(format!(
+                "Debugger.setBreakpointOnFunctionCall: unknown or released objectId `{object_id}`"
+            ))
+        })?;
+        if !value.is_function() {
+            return Err(crate::error::StatorError::TypeError(format!(
+                "Debugger.setBreakpointOnFunctionCall: objectId `{object_id}` does not reference a callable function"
+            )));
+        }
+        Err(unsupported_debugger_method(
+            "Debugger.setBreakpointOnFunctionCall",
+            "Stator does not yet support pausing on calls to an arbitrary function object.",
+        ))
     }
 
     // ── Debugger.stepInto / stepOver / stepOut ───────────────────────────────
@@ -10284,6 +10370,103 @@ mod tests {
             let message = response["error"]["message"].as_str().unwrap_or("");
             assert!(message.contains(method), "message for {method}: {message}");
         }
+    }
+
+    #[test]
+    fn unsupported_call_frame_methods_validate_active_pause_inputs() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let restart = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.restartFrame","params":{"callFrameId":"stator-pause-frame-0"}}"#,
+        );
+        assert!(
+            restart["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("rewinding")
+        );
+
+        let stale_restart = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.restartFrame","params":{"callFrameId":"stator-pause-frame-1"}}"#,
+        );
+        assert!(
+            stale_restart["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stale callFrameId")
+        );
+
+        let return_value = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setReturnValue","params":{"newValue":{"value":7}}}"#,
+        );
+        assert!(
+            return_value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("return value")
+        );
+    }
+
+    #[test]
+    fn set_breakpoint_on_function_call_validates_function_object() {
+        let mut d = fresh_dispatcher();
+        let function_id = d.remote_objects.register(
+            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+            None,
+        );
+        let unsupported = dispatch(
+            &mut d,
+            &json!({
+                "id": 1,
+                "method": "Debugger.setBreakpointOnFunctionCall",
+                "params": { "objectId": function_id }
+            })
+            .to_string(),
+        );
+        assert!(
+            unsupported["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("arbitrary function object")
+        );
+
+        let object_id = d.remote_objects.register(JsValue::Smi(1), None);
+        let non_function = dispatch(
+            &mut d,
+            &json!({
+                "id": 2,
+                "method": "Debugger.setBreakpointOnFunctionCall",
+                "params": { "objectId": object_id }
+            })
+            .to_string(),
+        );
+        assert!(
+            non_function["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not reference a callable")
+        );
+
+        let conditional = dispatch(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Debugger.setBreakpointOnFunctionCall",
+                "params": { "objectId": function_id, "condition": "x > 0" }
+            })
+            .to_string(),
+        );
+        assert!(
+            conditional["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("conditional function-call")
+        );
     }
 
     #[test]
