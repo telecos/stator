@@ -336,6 +336,7 @@ struct CdpBreakpointLocation {
 struct CdpUrlBreakpoint {
     requested_url: Option<String>,
     requested_url_regex: Option<String>,
+    requested_script_hash: Option<String>,
     line_number: u32,
     column_number: u32,
 }
@@ -2496,7 +2497,7 @@ impl CdpDispatcher {
                 "endLine": line_count.saturating_sub(1),
                 "endColumn": last_line_columns,
                 "executionContextId": execution_context_id,
-                "hash": "",
+                "hash": script_hash(source),
                 "scriptLanguage": "JavaScript",
                 "exceptionDetails": exception_details,
             }),
@@ -3579,6 +3580,17 @@ impl CdpDispatcher {
 
         let requested_url = params.get("url").and_then(Value::as_str);
         let requested_url_regex = params.get("urlRegex").and_then(Value::as_str);
+        let requested_script_hash = params
+            .get("scriptHash")
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    StatorError::TypeError(
+                        "Debugger.setBreakpointByUrl: optional parameter 'scriptHash' must be a string"
+                            .to_string(),
+                    )
+                })
+            })
+            .transpose()?;
         if let Some(pattern) = requested_url_regex {
             compile_breakpoint_url_regex(pattern)?;
         }
@@ -3590,10 +3602,14 @@ impl CdpDispatcher {
         self.cdp_breakpoints.insert(bp_id.clone());
 
         let mut locations = Vec::new();
-        if requested_url.is_some() || requested_url_regex.is_some() {
+        if requested_url.is_some()
+            || requested_url_regex.is_some()
+            || requested_script_hash.is_some()
+        {
             let breakpoint = CdpUrlBreakpoint {
                 requested_url: requested_url.map(str::to_string),
                 requested_url_regex: requested_url_regex.map(str::to_string),
+                requested_script_hash: requested_script_hash.map(str::to_string),
                 line_number,
                 column_number,
             };
@@ -3668,7 +3684,7 @@ impl CdpDispatcher {
             return Ok(None);
         };
         let script_url = self.script_urls.get(script_id).cloned().unwrap_or_default();
-        if !url_breakpoint_matches(breakpoint, &script_url)? {
+        if !url_breakpoint_matches(breakpoint, &script_url, &source)? {
             return Ok(None);
         }
         let Some((bytecode_offset, location)) = breakpoint_location_for_source(
@@ -4482,6 +4498,15 @@ pub(crate) fn registered_script_url(source: &str) -> String {
     exception_source_url(&Value::Null, source).unwrap_or_default()
 }
 
+pub(crate) fn script_hash(source: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn search_script_content(
     source: &str,
     query: &str,
@@ -4546,14 +4571,25 @@ fn compile_breakpoint_url_regex(pattern: &str) -> StatorResult<regress::Regex> {
     })
 }
 
-fn url_breakpoint_matches(breakpoint: &CdpUrlBreakpoint, script_url: &str) -> StatorResult<bool> {
+fn url_breakpoint_matches(
+    breakpoint: &CdpUrlBreakpoint,
+    script_url: &str,
+    source: &str,
+) -> StatorResult<bool> {
     if breakpoint.requested_url.as_deref() == Some(script_url) {
         return Ok(true);
     }
-    if let Some(pattern) = breakpoint.requested_url_regex.as_deref() {
-        return Ok(compile_breakpoint_url_regex(pattern)?
+    if let Some(pattern) = breakpoint.requested_url_regex.as_deref()
+        && compile_breakpoint_url_regex(pattern)?
             .find(script_url)
-            .is_some());
+            .is_some()
+    {
+        return Ok(true);
+    }
+    if let Some(requested_hash) = breakpoint.requested_script_hash.as_deref()
+        && requested_hash == script_hash(source)
+    {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -7103,6 +7139,37 @@ mod tests {
                 .unwrap()
                 .contains("invalid urlRegex")
         );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_matches_script_hash() {
+        let mut d = fresh_dispatcher();
+        let source = "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js";
+        d.register_script_source(7, source.to_string());
+        let hash = script_hash(source);
+
+        let response = dispatch(
+            &mut d,
+            &json!({
+                "id": 1,
+                "method": "Debugger.setBreakpointByUrl",
+                "params": {
+                    "scriptHash": hash,
+                    "lineNumber": 1,
+                    "columnNumber": 0
+                }
+            })
+            .to_string(),
+        );
+        let locations = response["result"]["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["scriptId"], "7");
+
+        let bad_hash_type = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"scriptHash":true,"lineNumber":0,"columnNumber":0}}"#,
+        );
+        assert!(bad_hash_type["error"].is_object());
     }
 
     #[test]

@@ -506,7 +506,7 @@ impl InProcessInspector {
             "endLine": line_count.saturating_sub(1),
             "endColumn": last_line_columns,
             "executionContextId": self.default_context_id(),
-            "hash": "",
+            "hash": crate::inspector::cdp::script_hash(&source),
         });
         let event = json!({
             "method": "Debugger.scriptParsed",
@@ -848,6 +848,12 @@ mod tests {
         assert_eq!(first["method"], "Debugger.scriptParsed");
         assert_eq!(first["params"]["scriptId"], "1");
         assert_eq!(first["params"]["url"], "stator://first.js");
+        assert_eq!(
+            first["params"]["hash"],
+            crate::inspector::cdp::script_hash(
+                "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js"
+            )
+        );
         let second: Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(second["params"]["scriptId"], "2");
 
