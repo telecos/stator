@@ -758,10 +758,31 @@ impl CdpDispatcher {
         let url = registered_script_url(&source);
         self.script_sources.insert(script_id.clone(), source);
         self.script_urls.insert(script_id.clone(), url);
-        self.resolve_url_breakpoints_for_registered_script(&script_id);
+        self.refresh_breakpoints_for_registered_script(&script_id);
     }
 
-    fn resolve_url_breakpoints_for_registered_script(&mut self, script_id: &str) {
+    fn refresh_breakpoints_for_registered_script(&mut self, script_id: &str) {
+        self.remove_installed_breakpoints_for_script(script_id);
+        let script_breakpoints: Vec<_> = self
+            .cdp_script_breakpoints
+            .iter()
+            .filter(|(_, breakpoint)| breakpoint.script_id == script_id)
+            .map(|(id, breakpoint)| (id.clone(), breakpoint.clone()))
+            .collect();
+        for (breakpoint_id, breakpoint) in script_breakpoints {
+            if let Ok(Some(location)) = self.resolve_script_breakpoint(&breakpoint_id, &breakpoint)
+                && self.debugger_enabled
+            {
+                self.push_event(
+                    "Debugger.breakpointResolved",
+                    json!({
+                        "breakpointId": breakpoint_id,
+                        "location": location,
+                    }),
+                );
+            }
+        }
+
         let pending: Vec<_> = self
             .cdp_url_breakpoints
             .iter()
@@ -780,6 +801,33 @@ impl CdpDispatcher {
                     }),
                 );
             }
+        }
+    }
+
+    fn remove_installed_breakpoints_for_script(&mut self, script_id: &str) {
+        let mut removed = Vec::new();
+        for debugger_ids in self.cdp_debugger_breakpoints.values_mut() {
+            debugger_ids.retain(|debugger_id| {
+                let remove = self
+                    .debugger_breakpoint_locations
+                    .get(debugger_id)
+                    .is_some_and(|location| location.script_id == script_id);
+                if remove {
+                    removed.push(*debugger_id);
+                }
+                !remove
+            });
+        }
+        self.cdp_debugger_breakpoints
+            .retain(|_, debugger_ids| !debugger_ids.is_empty());
+        if let Some(debugger) = self.debugger.as_ref() {
+            let mut debugger = debugger.borrow_mut();
+            for debugger_id in &removed {
+                let _ = debugger.remove_breakpoint(*debugger_id);
+            }
+        }
+        for debugger_id in removed {
+            self.debugger_breakpoint_locations.remove(&debugger_id);
         }
     }
 
@@ -3878,7 +3926,7 @@ impl CdpDispatcher {
             let source_url = registered_script_url(&script_source);
             self.script_sources.insert(script_id.clone(), script_source);
             self.script_urls.insert(script_id.clone(), source_url);
-            self.resolve_url_breakpoints_for_registered_script(&script_id);
+            self.refresh_breakpoints_for_registered_script(&script_id);
         }
         Ok(json!({
             "status": "Ok",
@@ -9974,6 +10022,66 @@ mod tests {
         );
         assert!(messages.iter().any(|msg| msg["id"] == 3u64));
         assert_eq!(dbg.borrow().breakpoints().count(), 1);
+    }
+
+    #[test]
+    fn set_script_source_refreshes_installed_breakpoints_for_script() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "let oldValue = 1;\nlet next = 2;\n//# sourceURL=stator://same.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let direct = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":0,"columnNumber":0}}}"#,
+        );
+        assert!(direct.get("error").is_none());
+        let url = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://same.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        assert!(url.get("error").is_none());
+        assert_eq!(dbg.borrow().breakpoints().count(), 2);
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let newValue = 3;\nlet still = 4;\n//# sourceURL=stator://same.js"}}"#,
+        );
+        assert_eq!(dbg.borrow().breakpoints().count(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|msg| msg["method"] == "Debugger.breakpointResolved")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn set_script_source_removes_url_breakpoints_that_no_longer_match() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "let oldValue = 1;\nlet next = 2;\n//# sourceURL=stator://old.js".to_string(),
+        );
+        let url = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://old.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        assert!(url.get("error").is_none());
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
+
+        let edit = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let newValue = 3;\nlet still = 4;\n//# sourceURL=stator://new.js"}}"#,
+        );
+        assert!(edit.get("error").is_none());
+        assert_eq!(dbg.borrow().breakpoints().count(), 0);
     }
 
     #[test]
