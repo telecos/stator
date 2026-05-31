@@ -3980,10 +3980,16 @@ impl CdpDispatcher {
             }));
         }
 
-        let dry_run = params
-            .get("dryRun")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let dry_run =
+            optional_bool_param(params, "dryRun", "Debugger.setScriptSource")?.unwrap_or(false);
+        if optional_bool_param(params, "allowTopFrameEditing", "Debugger.setScriptSource")?
+            .unwrap_or(false)
+        {
+            return Err(unsupported_debugger_method(
+                "Debugger.setScriptSource",
+                "allowTopFrameEditing requires live top-frame edit support that is not implemented yet.",
+            ));
+        }
         if !dry_run {
             let source_url = registered_script_url(&script_source);
             self.script_sources.insert(script_id.clone(), script_source);
@@ -4630,6 +4636,19 @@ fn optional_u32_param(container: &Value, field: &str, method: &str) -> StatorRes
     container
         .get(field)
         .map(|value| u32_param(value, field, method))
+        .transpose()
+}
+
+fn optional_bool_param(container: &Value, field: &str, method: &str) -> StatorResult<Option<bool>> {
+    container
+        .get(field)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be a boolean"
+                ))
+            })
+        })
         .transpose()
 }
 
@@ -10537,6 +10556,32 @@ mod tests {
         );
         assert_eq!(bad["result"]["status"], "CompileError");
         assert!(bad["result"]["exceptionDetails"].is_object());
+        assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
+    }
+
+    #[test]
+    fn set_script_source_validates_optional_edit_flags() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "let original = 1;".to_string());
+
+        let bad_dry_run = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let changed = 2;","dryRun":"yes"}}"#,
+        );
+        assert!(bad_dry_run["error"].is_object());
+        assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
+
+        let top_frame = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let changed = 2;","allowTopFrameEditing":true}}"#,
+        );
+        assert!(top_frame["error"].is_object());
+        assert!(
+            top_frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("allowTopFrameEditing")
+        );
         assert_eq!(d.script_sources.get("7").unwrap(), "let original = 1;");
     }
 
