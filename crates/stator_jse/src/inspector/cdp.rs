@@ -3108,24 +3108,22 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
-        if !call_frame_id.starts_with("stator-pause-frame-") {
-            return Err(crate::error::StatorError::Internal(format!(
-                "Debugger.evaluateOnCallFrame: unknown callFrameId `{call_frame_id}`"
-            )));
-        }
+        let requested_offset =
+            parse_pause_call_frame_id("Debugger.evaluateOnCallFrame", call_frame_id)?;
         let Some(debugger) = self.debugger.as_ref() else {
             return Err(unsupported_debugger_method(
                 "Debugger.evaluateOnCallFrame",
                 "no interpreter Debugger is attached to this session.",
             ));
         };
-        if debugger.borrow().last_pause_reason().is_none() {
-            return Err(unsupported_debugger_method(
-                "Debugger.evaluateOnCallFrame",
-                "no active pause; evaluation is only valid after a Debugger.paused event.",
-            ));
-        }
-        let frame_snapshot = debugger.borrow().last_pause_frame_snapshot().cloned();
+        let debugger_ref = debugger.borrow();
+        ensure_active_call_frame_id(
+            "Debugger.evaluateOnCallFrame",
+            requested_offset,
+            &debugger_ref,
+        )?;
+        let frame_snapshot = debugger_ref.last_pause_frame_snapshot().cloned();
+        drop(debugger_ref);
         if let Some(snapshot) = frame_snapshot {
             let _bindings = TemporaryGlobalBindings::new(
                 Rc::clone(&self.globals),
@@ -3167,30 +3165,29 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
-        if !call_frame_id.starts_with("stator-pause-frame-") {
-            return Err(crate::error::StatorError::Internal(format!(
-                "Debugger.setVariableValue: unknown callFrameId `{call_frame_id}`"
-            )));
-        }
+        let requested_offset =
+            parse_pause_call_frame_id("Debugger.setVariableValue", call_frame_id)?;
         let Some(debugger) = self.debugger.as_ref() else {
             return Err(unsupported_debugger_method(
                 "Debugger.setVariableValue",
                 "no interpreter Debugger is attached to this session.",
             ));
         };
-        if debugger.borrow().last_pause_reason().is_none() {
-            return Err(unsupported_debugger_method(
-                "Debugger.setVariableValue",
-                "no active pause; variable mutation is only valid after a Debugger.paused event.",
-            ));
-        }
         let new_value = params.get("newValue").ok_or_else(|| {
             crate::error::StatorError::TypeError(
                 "Debugger.setVariableValue: required parameter 'newValue' is missing".to_string(),
             )
         })?;
         let value = call_argument_to_js_value(new_value, &self.remote_objects)?;
-        let has_local_scope = debugger.borrow().last_pause_frame_snapshot().is_some();
+        let has_local_scope = {
+            let debugger_ref = debugger.borrow();
+            ensure_active_call_frame_id(
+                "Debugger.setVariableValue",
+                requested_offset,
+                &debugger_ref,
+            )?;
+            debugger_ref.last_pause_frame_snapshot().is_some()
+        };
         let global_scope_number = if has_local_scope { 1 } else { 0 };
         if scope_number == 0 && has_local_scope {
             debugger
@@ -4498,6 +4495,37 @@ fn sampling_node_to_value(nodes: &[SamplingNodeBuilder], index: usize) -> Value 
 
 fn unsupported_debugger_method(method: &str, detail: &str) -> StatorError {
     StatorError::TypeError(format!("{method}: {detail}"))
+}
+
+fn parse_pause_call_frame_id(method: &str, call_frame_id: &str) -> StatorResult<u32> {
+    let Some(offset) = call_frame_id.strip_prefix("stator-pause-frame-") else {
+        return Err(StatorError::Internal(format!(
+            "{method}: unknown callFrameId `{call_frame_id}`"
+        )));
+    };
+    offset.parse::<u32>().map_err(|_| {
+        StatorError::Internal(format!("{method}: malformed callFrameId `{call_frame_id}`"))
+    })
+}
+
+fn ensure_active_call_frame_id(
+    method: &str,
+    requested_offset: u32,
+    debugger: &Debugger,
+) -> StatorResult<()> {
+    if debugger.last_pause_reason().is_none() {
+        return Err(unsupported_debugger_method(
+            method,
+            "no active pause; call-frame access is only valid after a Debugger.paused event.",
+        ));
+    }
+    let active_offset = debugger.last_pause_offset();
+    if active_offset != requested_offset {
+        return Err(StatorError::Internal(format!(
+            "{method}: stale callFrameId `stator-pause-frame-{requested_offset}`; active callFrameId is `stator-pause-frame-{active_offset}`"
+        )));
+    }
+    Ok(())
 }
 
 fn debug_step_method_name(action: DebugAction) -> &'static str {
@@ -8770,6 +8798,46 @@ mod tests {
             r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"1"}}"#,
         );
         assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn call_frame_methods_reject_stale_or_malformed_call_frame_ids() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(2);
+
+        let stale_eval = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"1"}}"#,
+        );
+        assert!(
+            stale_eval["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stale callFrameId")
+        );
+
+        let malformed_eval = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-nope","expression":"1"}}"#,
+        );
+        assert!(
+            malformed_eval["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("malformed callFrameId")
+        );
+
+        let stale_set = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"x","callFrameId":"stator-pause-frame-0","newValue":{"value":1}}}"#,
+        );
+        assert!(
+            stale_set["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stale callFrameId")
+        );
     }
 
     #[test]
