@@ -3260,14 +3260,11 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
-        let line_number = location
-            .get("lineNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let column_number = location
-            .get("columnNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let line_number =
+            required_u32_param(location, "lineNumber", "Debugger.continueToLocation")?;
+        let column_number =
+            optional_u32_param(location, "columnNumber", "Debugger.continueToLocation")?
+                .unwrap_or(0);
         let source = self.script_sources.get(script_id).ok_or_else(|| {
             crate::error::StatorError::Internal(format!(
                 "Debugger.continueToLocation: unknown scriptId `{script_id}`"
@@ -3511,14 +3508,9 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
-        let line_number = location
-            .get("lineNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let column_number = location
-            .get("columnNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let line_number = required_u32_param(location, "lineNumber", "Debugger.setBreakpoint")?;
+        let column_number =
+            optional_u32_param(location, "columnNumber", "Debugger.setBreakpoint")?.unwrap_or(0);
         let source = self.script_sources.get(script_id).ok_or_else(|| {
             crate::error::StatorError::Internal(format!(
                 "Debugger.setBreakpoint: unknown scriptId `{script_id}`"
@@ -3570,14 +3562,9 @@ impl CdpDispatcher {
 
     fn debugger_set_breakpoint_by_url(&mut self, params: &Value) -> StatorResult<Value> {
         reject_unsupported_breakpoint_condition("Debugger.setBreakpointByUrl", params)?;
-        let line_number = params
-            .get("lineNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let column_number = params
-            .get("columnNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let line_number = required_u32_param(params, "lineNumber", "Debugger.setBreakpointByUrl")?;
+        let column_number =
+            optional_u32_param(params, "columnNumber", "Debugger.setBreakpointByUrl")?.unwrap_or(0);
 
         let requested_url = params.get("url").and_then(Value::as_str);
         let requested_url_regex = params.get("urlRegex").and_then(Value::as_str);
@@ -3973,20 +3960,22 @@ impl CdpDispatcher {
                 "Debugger.getPossibleBreakpoints: unknown scriptId `{script_id}`"
             ))
         })?;
-        let start_line = start.get("lineNumber").and_then(Value::as_u64).unwrap_or(0) as u32;
-        let start_column = start
-            .get("columnNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let start_line =
+            required_u32_param(start, "lineNumber", "Debugger.getPossibleBreakpoints")?;
+        let start_column =
+            optional_u32_param(start, "columnNumber", "Debugger.getPossibleBreakpoints")?
+                .unwrap_or(0);
         let end = params.get("end");
         let end_line = end
-            .and_then(|value| value.get("lineNumber"))
-            .and_then(Value::as_u64)
-            .map(|value| value as u32);
+            .map(|value| optional_u32_param(value, "lineNumber", "Debugger.getPossibleBreakpoints"))
+            .transpose()?
+            .flatten();
         let end_column = end
-            .and_then(|value| value.get("columnNumber"))
-            .and_then(Value::as_u64)
-            .map(|value| value as u32);
+            .map(|value| {
+                optional_u32_param(value, "columnNumber", "Debugger.getPossibleBreakpoints")
+            })
+            .transpose()?
+            .flatten();
         if let Some(end_script_id) = end
             .and_then(|value| value.get("scriptId"))
             .and_then(Value::as_str)
@@ -4569,6 +4558,31 @@ fn compile_breakpoint_url_regex(pattern: &str) -> StatorResult<regress::Regex> {
         StatorError::SyntaxError(format!(
             "Debugger.setBreakpointByUrl: invalid urlRegex `{pattern}`: {err}"
         ))
+    })
+}
+
+fn required_u32_param(container: &Value, field: &str, method: &str) -> StatorResult<u32> {
+    let value = container.get(field).ok_or_else(|| {
+        StatorError::TypeError(format!("{method}: required parameter '{field}' is missing"))
+    })?;
+    u32_param(value, field, method)
+}
+
+fn optional_u32_param(container: &Value, field: &str, method: &str) -> StatorResult<Option<u32>> {
+    container
+        .get(field)
+        .map(|value| u32_param(value, field, method))
+        .transpose()
+}
+
+fn u32_param(value: &Value, field: &str, method: &str) -> StatorResult<u32> {
+    let value = value.as_u64().ok_or_else(|| {
+        StatorError::TypeError(format!(
+            "{method}: parameter '{field}' is not a non-negative integer"
+        ))
+    })?;
+    u32::try_from(value).map_err(|_| {
+        StatorError::RangeError(format!("{method}: parameter '{field}' exceeds u32::MAX"))
     })
 }
 
@@ -7086,6 +7100,30 @@ mod tests {
     }
 
     #[test]
+    fn debugger_set_breakpoint_validates_location_numbers() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(7, "var a = 1;\n//# sourceURL=stator://app.js".to_string());
+
+        let missing_line = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","columnNumber":0}}}"#,
+        );
+        assert!(missing_line["error"].is_object());
+
+        let bad_column = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":0,"columnNumber":-1}}}"#,
+        );
+        assert!(bad_column["error"].is_object());
+
+        let optional_column = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":0}}}"#,
+        );
+        assert!(optional_column.get("error").is_none());
+    }
+
+    #[test]
     fn debugger_set_breakpoint_rejects_unsupported_conditions() {
         let mut d = fresh_dispatcher();
         d.register_script_source(
@@ -7218,6 +7256,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_validates_location_numbers() {
+        let mut d = fresh_dispatcher();
+
+        let missing_line = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","columnNumber":0}}"#,
+        );
+        assert!(missing_line["error"].is_object());
+
+        let bad_column = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":0,"columnNumber":-1}}"#,
+        );
+        assert!(bad_column["error"].is_object());
+
+        let optional_column = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://missing.js","lineNumber":0}}"#,
+        );
+        assert!(optional_column.get("error").is_none());
     }
 
     #[test]
@@ -9831,6 +9892,25 @@ mod tests {
     }
 
     #[test]
+    fn continue_to_location_validates_location_numbers() {
+        let mut d = fresh_dispatcher();
+        let _dbg = attach_test_debugger(&mut d);
+        d.register_script_source(7, "var a = 1;".to_string());
+
+        let missing_line = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","columnNumber":0}}}"#,
+        );
+        assert!(missing_line["error"].is_object());
+
+        let bad_column = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":0,"columnNumber":-1}}}"#,
+        );
+        assert!(bad_column["error"].is_object());
+    }
+
+    #[test]
     fn pause_method_acknowledges_next_poll_request() {
         let mut d = fresh_dispatcher();
         let resp = dispatch(&mut d, r#"{"id":1,"method":"Debugger.pause","params":{}}"#);
@@ -10326,6 +10406,18 @@ mod tests {
                 .unwrap()
                 .contains("restrictToFunction")
         );
+
+        let missing_line = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"7","columnNumber":0}}}"#,
+        );
+        assert!(missing_line["error"].is_object());
+
+        let bad_end_column = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.getPossibleBreakpoints","params":{"start":{"scriptId":"7","lineNumber":0,"columnNumber":0},"end":{"scriptId":"7","lineNumber":1,"columnNumber":-1}}}"#,
+        );
+        assert!(bad_end_column["error"].is_object());
     }
 
     #[test]
