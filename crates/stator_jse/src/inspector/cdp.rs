@@ -333,6 +333,14 @@ struct CdpBreakpointLocation {
 }
 
 #[derive(Clone)]
+struct CdpUrlBreakpoint {
+    requested_url: Option<String>,
+    requested_url_regex: Option<String>,
+    line_number: u32,
+    column_number: u32,
+}
+
+#[derive(Clone)]
 struct PauseFrameLocation {
     script_id: String,
     url: String,
@@ -548,6 +556,8 @@ pub struct CdpDispatcher {
     cdp_breakpoints: HashSet<String>,
     /// Interpreter breakpoint IDs installed for each CDP breakpoint ID.
     cdp_debugger_breakpoints: HashMap<String, Vec<BreakpointId>>,
+    /// URL/regex breakpoint definitions that should resolve against future scripts.
+    cdp_url_breakpoints: HashMap<String, CdpUrlBreakpoint>,
     /// CDP location metadata for each installed interpreter breakpoint ID.
     debugger_breakpoint_locations: HashMap<BreakpointId, CdpBreakpointLocation>,
     /// CDP `Debugger.setBreakpointsActive` state mirrored onto the debugger.
@@ -685,6 +695,7 @@ impl CdpDispatcher {
             next_breakpoint_id: 1,
             cdp_breakpoints: HashSet::new(),
             cdp_debugger_breakpoints: HashMap::new(),
+            cdp_url_breakpoints: HashMap::new(),
             debugger_breakpoint_locations: HashMap::new(),
             breakpoints_active: true,
             skip_all_pauses: false,
@@ -736,7 +747,26 @@ impl CdpDispatcher {
         let script_id = script_id.to_string();
         let url = registered_script_url(&source);
         self.script_sources.insert(script_id.clone(), source);
-        self.script_urls.insert(script_id, url);
+        self.script_urls.insert(script_id.clone(), url);
+        let pending: Vec<_> = self
+            .cdp_url_breakpoints
+            .iter()
+            .map(|(id, breakpoint)| (id.clone(), breakpoint.clone()))
+            .collect();
+        for (breakpoint_id, breakpoint) in pending {
+            if let Ok(Some(location)) =
+                self.resolve_url_breakpoint_for_script(&breakpoint_id, &breakpoint, &script_id)
+                && self.debugger_enabled
+            {
+                self.push_event(
+                    "Debugger.breakpointResolved",
+                    json!({
+                        "breakpointId": breakpoint_id,
+                        "location": location,
+                    }),
+                );
+            }
+        }
     }
 
     /// Push a JSON-RPC parse-error response onto the outbox.
@@ -3475,15 +3505,9 @@ impl CdpDispatcher {
 
         let requested_url = params.get("url").and_then(Value::as_str);
         let requested_url_regex = params.get("urlRegex").and_then(Value::as_str);
-        let url_regex = requested_url_regex
-            .map(|pattern| {
-                regress::Regex::new(pattern).map_err(|err| {
-                    StatorError::SyntaxError(format!(
-                        "Debugger.setBreakpointByUrl: invalid urlRegex `{pattern}`: {err}"
-                    ))
-                })
-            })
-            .transpose()?;
+        if let Some(pattern) = requested_url_regex {
+            compile_breakpoint_url_regex(pattern)?;
+        }
         let bp_id = format!(
             "{}:{}:{}",
             self.next_breakpoint_id, line_number, column_number
@@ -3493,41 +3517,20 @@ impl CdpDispatcher {
 
         let mut locations = Vec::new();
         if requested_url.is_some() || requested_url_regex.is_some() {
+            let breakpoint = CdpUrlBreakpoint {
+                requested_url: requested_url.map(str::to_string),
+                requested_url_regex: requested_url_regex.map(str::to_string),
+                line_number,
+                column_number,
+            };
+            self.cdp_url_breakpoints
+                .insert(bp_id.clone(), breakpoint.clone());
             let mut script_ids: Vec<String> = self.script_sources.keys().cloned().collect();
             script_ids.sort();
             for script_id in script_ids {
-                let Some(source) = self.script_sources.get(&script_id) else {
-                    continue;
-                };
-                let script_url = self
-                    .script_urls
-                    .get(&script_id)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let url_matches = requested_url.is_some_and(|url| url == script_url)
-                    || url_regex
-                        .as_ref()
-                        .is_some_and(|regex| regex.find(script_url).is_some());
-                if !url_matches {
-                    continue;
-                }
-                if let Some((bytecode_offset, location)) =
-                    breakpoint_location_for_source(&script_id, source, line_number, column_number)?
+                if let Some(location) =
+                    self.resolve_url_breakpoint_for_script(&bp_id, &breakpoint, &script_id)?
                 {
-                    let actual_line = location["lineNumber"].as_u64().unwrap_or(0) as u32;
-                    let actual_column = location["columnNumber"].as_u64().unwrap_or(0) as u32;
-                    self.install_interpreter_breakpoint(
-                        &bp_id,
-                        bytecode_offset,
-                        actual_line,
-                        actual_column,
-                        CdpBreakpointLocation {
-                            script_id: script_id.clone(),
-                            url: script_url.to_string(),
-                            line_number: actual_line,
-                            column_number: actual_column,
-                        },
-                    );
                     if self.debugger_enabled {
                         self.push_event(
                             "Debugger.breakpointResolved",
@@ -3578,6 +3581,60 @@ impl CdpDispatcher {
             .insert(debugger_id, location);
     }
 
+    fn resolve_url_breakpoint_for_script(
+        &mut self,
+        cdp_breakpoint_id: &str,
+        breakpoint: &CdpUrlBreakpoint,
+        script_id: &str,
+    ) -> StatorResult<Option<Value>> {
+        if self.cdp_breakpoint_has_script_location(cdp_breakpoint_id, script_id) {
+            return Ok(None);
+        }
+        let Some(source) = self.script_sources.get(script_id).cloned() else {
+            return Ok(None);
+        };
+        let script_url = self.script_urls.get(script_id).cloned().unwrap_or_default();
+        if !url_breakpoint_matches(breakpoint, &script_url)? {
+            return Ok(None);
+        }
+        let Some((bytecode_offset, location)) = breakpoint_location_for_source(
+            script_id,
+            &source,
+            breakpoint.line_number,
+            breakpoint.column_number,
+        )?
+        else {
+            return Ok(None);
+        };
+        let actual_line = location["lineNumber"].as_u64().unwrap_or(0) as u32;
+        let actual_column = location["columnNumber"].as_u64().unwrap_or(0) as u32;
+        self.install_interpreter_breakpoint(
+            cdp_breakpoint_id,
+            bytecode_offset,
+            actual_line,
+            actual_column,
+            CdpBreakpointLocation {
+                script_id: script_id.to_string(),
+                url: script_url,
+                line_number: actual_line,
+                column_number: actual_column,
+            },
+        );
+        Ok(Some(location))
+    }
+
+    fn cdp_breakpoint_has_script_location(&self, cdp_breakpoint_id: &str, script_id: &str) -> bool {
+        self.cdp_debugger_breakpoints
+            .get(cdp_breakpoint_id)
+            .is_some_and(|breakpoints| {
+                breakpoints.iter().any(|debugger_id| {
+                    self.debugger_breakpoint_locations
+                        .get(debugger_id)
+                        .is_some_and(|location| location.script_id == script_id)
+                })
+            })
+    }
+
     fn debugger_remove_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
         let breakpoint_id = match params.get("breakpointId").and_then(Value::as_str) {
             Some(breakpoint_id) => breakpoint_id,
@@ -3594,6 +3651,7 @@ impl CdpDispatcher {
                 "Debugger.removeBreakpoint: unknown breakpointId `{breakpoint_id}`"
             )));
         }
+        self.cdp_url_breakpoints.remove(breakpoint_id);
         if let Some(debugger_ids) = self.cdp_debugger_breakpoints.remove(breakpoint_id)
             && let Some(debugger) = self.debugger.as_ref()
         {
@@ -4318,6 +4376,26 @@ fn search_script_content(
         }
     }
     Ok(matches)
+}
+
+fn compile_breakpoint_url_regex(pattern: &str) -> StatorResult<regress::Regex> {
+    regress::Regex::new(pattern).map_err(|err| {
+        StatorError::SyntaxError(format!(
+            "Debugger.setBreakpointByUrl: invalid urlRegex `{pattern}`: {err}"
+        ))
+    })
+}
+
+fn url_breakpoint_matches(breakpoint: &CdpUrlBreakpoint, script_url: &str) -> StatorResult<bool> {
+    if breakpoint.requested_url.as_deref() == Some(script_url) {
+        return Ok(true);
+    }
+    if let Some(pattern) = breakpoint.requested_url_regex.as_deref() {
+        return Ok(compile_breakpoint_url_regex(pattern)?
+            .find(script_url)
+            .is_some());
+    }
+    Ok(false)
 }
 
 fn breakpoint_location_for_source(
@@ -6802,6 +6880,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_resolves_future_registered_script() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let response = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://future.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        let breakpoint_id = response["result"]["breakpointId"]
+            .as_str()
+            .expect("breakpoint id")
+            .to_string();
+        assert!(
+            response["result"]["locations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(dbg.borrow().breakpoints().count(), 0);
+
+        d.register_script_source(
+            8,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://future.js".to_string(),
+        );
+        let events = drain_all(&mut d);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "Debugger.breakpointResolved");
+        assert_eq!(events[0]["params"]["breakpointId"], breakpoint_id);
+        assert_eq!(events[0]["params"]["location"]["scriptId"], "8");
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
+    }
+
+    #[test]
+    fn debugger_remove_breakpoint_clears_future_url_breakpoint() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let response = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://future.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        let breakpoint_id = response["result"]["breakpointId"].as_str().unwrap();
+        let removed = dispatch(
+            &mut d,
+            &json!({
+                "id": 3,
+                "method": "Debugger.removeBreakpoint",
+                "params": { "breakpointId": breakpoint_id }
+            })
+            .to_string(),
+        );
+        assert!(removed.get("error").is_none());
+
+        d.register_script_source(
+            8,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://future.js".to_string(),
+        );
+        assert!(drain_all(&mut d).is_empty());
+        assert_eq!(dbg.borrow().breakpoints().count(), 0);
     }
 
     #[test]
