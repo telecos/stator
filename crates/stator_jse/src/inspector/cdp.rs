@@ -3590,43 +3590,39 @@ impl CdpDispatcher {
         self.cdp_breakpoints.insert(bp_id.clone());
 
         let mut locations = Vec::new();
-        if requested_url.is_some()
-            || requested_url_regex.is_some()
-            || requested_script_hash.is_some()
-        {
-            let breakpoint = CdpUrlBreakpoint {
-                requested_url: requested_url.map(str::to_string),
-                requested_url_regex: requested_url_regex.map(str::to_string),
-                requested_script_hash: requested_script_hash.map(str::to_string),
-                line_number,
-                column_number,
-            };
-            self.cdp_url_breakpoints
-                .insert(bp_id.clone(), breakpoint.clone());
-            let mut script_ids: Vec<String> = self.script_sources.keys().cloned().collect();
-            script_ids.sort();
-            for script_id in script_ids {
-                if let Some(location) =
-                    self.resolve_url_breakpoint_for_script(&bp_id, &breakpoint, &script_id)?
-                {
-                    if self.debugger_enabled {
-                        self.push_event(
-                            "Debugger.breakpointResolved",
-                            json!({
-                                "breakpointId": bp_id,
-                                "location": location.clone(),
-                            }),
-                        );
-                    }
-                    locations.push(location);
+        let selectorless = requested_url.is_none()
+            && requested_url_regex.is_none()
+            && requested_script_hash.is_none();
+        let breakpoint = CdpUrlBreakpoint {
+            requested_url: if selectorless {
+                Some(String::new())
+            } else {
+                requested_url.map(str::to_string)
+            },
+            requested_url_regex: requested_url_regex.map(str::to_string),
+            requested_script_hash: requested_script_hash.map(str::to_string),
+            line_number,
+            column_number,
+        };
+        self.cdp_url_breakpoints
+            .insert(bp_id.clone(), breakpoint.clone());
+        let mut script_ids: Vec<String> = self.script_sources.keys().cloned().collect();
+        script_ids.sort();
+        for script_id in script_ids {
+            if let Some(location) =
+                self.resolve_url_breakpoint_for_script(&bp_id, &breakpoint, &script_id)?
+            {
+                if self.debugger_enabled {
+                    self.push_event(
+                        "Debugger.breakpointResolved",
+                        json!({
+                            "breakpointId": bp_id,
+                            "location": location.clone(),
+                        }),
+                    );
                 }
+                locations.push(location);
             }
-        } else {
-            locations.push(json!({
-                "scriptId": "0",
-                "lineNumber": line_number,
-                "columnNumber": column_number,
-            }));
         }
 
         Ok(json!({
@@ -7178,6 +7174,22 @@ mod tests {
             response["result"]["breakpointId"],
             messages[0]["params"]["breakpointId"]
         );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_without_selector_matches_anonymous_scripts() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(7, "var a = 1;\nvar b = a + 2;".to_string());
+
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"lineNumber":1,"columnNumber":0}}"#,
+        );
+        let locations = response["result"]["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["scriptId"], "7");
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
     }
 
     #[test]
