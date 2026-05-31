@@ -431,6 +431,8 @@ pub struct CdpDispatcher {
     type_profile_scripts: HashMap<String, TypeProfileScript>,
     /// CDP-visible execution contexts currently known to this session.
     contexts: Vec<ExecutionContextDescription>,
+    /// Whether the `Inspector` domain is currently enabled for this session.
+    inspector_enabled: bool,
     /// Whether the `Runtime` domain is currently enabled for this session.
     runtime_enabled: bool,
     /// Whether custom object formatters are enabled for this session.
@@ -593,6 +595,7 @@ impl CdpDispatcher {
             next_type_profile_script_id: 1,
             type_profile_scripts: HashMap::new(),
             contexts,
+            inspector_enabled: false,
             runtime_enabled: false,
             custom_object_formatter_enabled: false,
             max_call_stack_size_to_capture: 0,
@@ -850,6 +853,11 @@ impl CdpDispatcher {
     /// Returns the cached auto-attach filter entry count.
     pub fn target_auto_attach_filter_count(&self) -> usize {
         self.target_auto_attach_filter_count
+    }
+
+    /// Returns `true` if the Inspector domain is currently enabled.
+    pub fn inspector_enabled(&self) -> bool {
+        self.inspector_enabled
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1419,6 +1427,16 @@ impl CdpDispatcher {
     /// Route a parsed request to the correct domain handler.
     fn dispatch(&mut self, req: &CdpRequest) -> StatorResult<Value> {
         match req.method.as_str() {
+            // ── Inspector ─────────────────────────────────────────────────
+            "Inspector.enable" => {
+                self.inspector_enabled = true;
+                Ok(json!({}))
+            }
+            "Inspector.disable" => {
+                self.inspector_enabled = false;
+                Ok(json!({}))
+            }
+
             // ── Runtime ───────────────────────────────────────────────────
             "Runtime.enable" => self.runtime_enable(),
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
@@ -4140,6 +4158,7 @@ impl PauseOnExceptionsState {
 fn schema_get_domains() -> Value {
     json!({
         "domains": [
+            { "name": "Inspector", "version": "1.3" },
             { "name": "Runtime", "version": "1.3" },
             { "name": "Debugger", "version": "1.3" },
             { "name": "Console", "version": "1.3" },
@@ -6912,10 +6931,29 @@ mod tests {
             .iter()
             .filter_map(|domain| domain["name"].as_str())
             .collect();
+        assert!(names.contains(&"Inspector"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
         assert!(names.contains(&"Schema"));
+    }
+
+    #[test]
+    fn inspector_enable_disable_tracks_state() {
+        let mut d = fresh_dispatcher();
+        let enabled = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Inspector.enable","params":{}}"#,
+        );
+        assert!(enabled.get("error").is_none());
+        assert!(d.inspector_enabled());
+
+        let disabled = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Inspector.disable","params":{}}"#,
+        );
+        assert!(disabled.get("error").is_none());
+        assert!(!d.inspector_enabled());
     }
 
     #[test]
