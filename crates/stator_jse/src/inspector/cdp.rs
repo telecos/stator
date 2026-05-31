@@ -3289,6 +3289,7 @@ impl CdpDispatcher {
     }
 
     fn debugger_continue_to_location(&mut self, params: &Value) -> StatorResult<Value> {
+        validate_continue_to_location_options(params)?;
         let location = params.get("location").ok_or_else(|| {
             crate::error::StatorError::TypeError(
                 "Debugger.continueToLocation: required parameter 'location' is missing".to_string(),
@@ -5102,6 +5103,24 @@ fn validate_step_options(params: &Value, action: DebugAction) -> StatorResult<()
         }
     }
     Ok(())
+}
+
+fn validate_continue_to_location_options(params: &Value) -> StatorResult<()> {
+    let Some(target_call_frames) = params.get("targetCallFrames") else {
+        return Ok(());
+    };
+    let target_call_frames = target_call_frames.as_str().ok_or_else(|| {
+        StatorError::TypeError(
+            "Debugger.continueToLocation: optional parameter 'targetCallFrames' must be a string"
+                .to_string(),
+        )
+    })?;
+    match target_call_frames {
+        "any" | "current" => Ok(()),
+        other => Err(StatorError::TypeError(format!(
+            "Debugger.continueToLocation: unsupported targetCallFrames `{other}`"
+        ))),
+    }
 }
 
 fn paused_reason_str(reason: &PauseReason) -> &'static str {
@@ -9971,6 +9990,37 @@ mod tests {
             0,
             "one-shot breakpoint should remove itself after the pause"
         );
+    }
+
+    #[test]
+    fn continue_to_location_validates_target_call_frames() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let bad_enum = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0},"targetCallFrames":"invalid"}}"#,
+        );
+        assert!(bad_enum["error"].is_object());
+
+        let bad_type = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0},"targetCallFrames":true}}"#,
+        );
+        assert!(bad_type["error"].is_object());
+
+        let current = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.continueToLocation","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0},"targetCallFrames":"current"}}"#,
+        );
+        assert!(current.get("error").is_none());
     }
 
     #[test]
