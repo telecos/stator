@@ -111,7 +111,7 @@ use crate::builtins::symbol::{
     SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE,
     SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG,
     SYMBOL_UNSCOPABLES, property_key_to_symbol, symbol_create, symbol_description, symbol_for,
-    symbol_key_for,
+    symbol_key_for, symbol_to_property_key,
 };
 use crate::builtins::typed_array::{
     JsArrayBuffer, TypedArrayKind, arraybuffer_detached, arraybuffer_max_byte_length,
@@ -16019,7 +16019,10 @@ fn make_object() -> JsValue {
                 let result_rc = Rc::new(RefCell::new(result));
                 for (i, item) in elements.iter().enumerate() {
                     let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
-                    let group_key = key.to_js_string()?;
+                    let group_key = match key {
+                        JsValue::Symbol(id) => symbol_to_property_key(id),
+                        other => other.to_js_string()?,
+                    };
                     let mut borrow = result_rc.borrow_mut();
                     if let Some(JsValue::Array(existing)) = borrow.get(&group_key).cloned() {
                         existing.borrow_mut().push(item.clone());
@@ -63182,6 +63185,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.groupBy` preserves symbol callback keys as symbol properties.
+    #[test]
+    fn e2e_object_group_by_symbol_key() {
+        let result = global_eval(
+            r#"
+            var key = Symbol("group");
+            var r = Object.groupBy([1, 2], function() { return key; });
+            var symbols = Object.getOwnPropertySymbols(r);
+            symbols.length === 1 && symbols[0] === key && r[key].join(",") === "1,2"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     /// `Object.groupBy.length` is 2.
