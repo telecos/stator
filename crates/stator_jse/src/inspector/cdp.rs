@@ -4638,6 +4638,20 @@ pub(crate) fn registered_script_url(source: &str) -> String {
     exception_source_url(&Value::Null, source).unwrap_or_default()
 }
 
+pub(crate) fn registered_source_map_url(source: &str) -> String {
+    source
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("//# sourceMappingURL=")
+                .or_else(|| trimmed.strip_prefix("//@ sourceMappingURL="))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn script_hash(source: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in source.as_bytes() {

@@ -507,6 +507,7 @@ impl InProcessInspector {
             "endColumn": last_line_columns,
             "executionContextId": self.default_context_id(),
             "hash": crate::inspector::cdp::script_hash(&source),
+            "sourceMapURL": crate::inspector::cdp::registered_source_map_url(&source),
         });
         let event = json!({
             "method": "Debugger.scriptParsed",
@@ -834,8 +835,10 @@ mod tests {
             let _s2 = inspector.connect(11);
         }
 
-        let id_a = inspector
-            .register_script("var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js".to_string());
+        let id_a = inspector.register_script(
+            "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js\n//# sourceMappingURL=first.js.map"
+                .to_string(),
+        );
         let id_b = inspector.register_script("// second".to_string());
         assert_eq!(id_a, 1);
         assert_eq!(id_b, 2);
@@ -851,11 +854,13 @@ mod tests {
         assert_eq!(
             first["params"]["hash"],
             crate::inspector::cdp::script_hash(
-                "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js"
+                "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js\n//# sourceMappingURL=first.js.map"
             )
         );
+        assert_eq!(first["params"]["sourceMapURL"], "first.js.map");
         let second: Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(second["params"]["scriptId"], "2");
+        assert_eq!(second["params"]["sourceMapURL"], "");
 
         let s2 = inspector.session_by_id_mut(11).expect("s2");
         assert_eq!(
