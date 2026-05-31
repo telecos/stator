@@ -758,6 +758,10 @@ impl CdpDispatcher {
         let url = registered_script_url(&source);
         self.script_sources.insert(script_id.clone(), source);
         self.script_urls.insert(script_id.clone(), url);
+        self.resolve_url_breakpoints_for_registered_script(&script_id);
+    }
+
+    fn resolve_url_breakpoints_for_registered_script(&mut self, script_id: &str) {
         let pending: Vec<_> = self
             .cdp_url_breakpoints
             .iter()
@@ -765,7 +769,7 @@ impl CdpDispatcher {
             .collect();
         for (breakpoint_id, breakpoint) in pending {
             if let Ok(Some(location)) =
-                self.resolve_url_breakpoint_for_script(&breakpoint_id, &breakpoint, &script_id)
+                self.resolve_url_breakpoint_for_script(&breakpoint_id, &breakpoint, script_id)
                 && self.debugger_enabled
             {
                 self.push_event(
@@ -3873,7 +3877,8 @@ impl CdpDispatcher {
         if !dry_run {
             let source_url = registered_script_url(&script_source);
             self.script_sources.insert(script_id.clone(), script_source);
-            self.script_urls.insert(script_id, source_url);
+            self.script_urls.insert(script_id.clone(), source_url);
+            self.resolve_url_breakpoints_for_registered_script(&script_id);
         }
         Ok(json!({
             "status": "Ok",
@@ -9934,6 +9939,41 @@ mod tests {
             "let newValue = 2;\n//# sourceURL=stator://new.js"
         );
         assert_eq!(d.script_urls.get("7").unwrap(), "stator://new.js");
+    }
+
+    #[test]
+    fn set_script_source_resolves_pending_url_breakpoints_for_new_url() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        d.register_script_source(
+            7,
+            "let oldValue = 1;\n//# sourceURL=stator://old.js".to_string(),
+        );
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        let breakpoint = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://new.js","lineNumber":0,"columnNumber":0}}"#,
+        );
+        assert!(
+            breakpoint["result"]["locations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let messages = dispatch_all(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setScriptSource","params":{"scriptId":"7","scriptSource":"let newValue = 2;\n//# sourceURL=stator://new.js"}}"#,
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg["method"] == "Debugger.breakpointResolved")
+        );
+        assert!(messages.iter().any(|msg| msg["id"] == 3u64));
+        assert_eq!(dbg.borrow().breakpoints().count(), 1);
     }
 
     #[test]
