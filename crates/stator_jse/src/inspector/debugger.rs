@@ -60,6 +60,7 @@
 //! }
 //! ```
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -144,6 +145,21 @@ fn capture_context_slots(context: Option<&JsValue>) -> Vec<Vec<JsValue>> {
         next = borrowed.parent.as_ref().map(Rc::clone);
     }
     scopes
+}
+
+fn frame_context_at(
+    frame: &InterpreterFrame,
+    context_index: usize,
+) -> Option<Rc<RefCell<crate::objects::value::JsContext>>> {
+    let mut next = match frame.context.as_ref() {
+        Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+        _ => None,
+    };
+    for _ in 0..context_index {
+        let context = next?;
+        next = context.borrow().parent.as_ref().map(Rc::clone);
+    }
+    next
 }
 
 /// Cross-thread pause/resume bridge for a debugger attached to an interpreter.
@@ -378,6 +394,15 @@ fn synthetic_register_binding_index(
     None
 }
 
+fn synthetic_context_binding_index(name: &str) -> Option<(usize, usize)> {
+    let suffix = name.strip_prefix("$context")?;
+    let (context_index, slot_suffix) = suffix.split_once("_slot")?;
+    Some((
+        context_index.parse::<usize>().ok()?,
+        slot_suffix.parse::<usize>().ok()?,
+    ))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Debugger
 // ─────────────────────────────────────────────────────────────────────────────
@@ -435,6 +460,8 @@ pub struct Debugger {
     last_pause_frame: Option<PauseFrameSnapshot>,
     /// Mutations requested for the current paused frame, applied on resume.
     pending_frame_mutations: Vec<(String, JsValue)>,
+    /// Context-slot mutations requested for the current paused frame.
+    pending_context_mutations: Vec<(usize, usize, JsValue)>,
 }
 
 impl Default for Debugger {
@@ -464,6 +491,7 @@ impl Debugger {
             pause_requested: false,
             last_pause_frame: None,
             pending_frame_mutations: Vec::new(),
+            pending_context_mutations: Vec::new(),
         }
     }
 
@@ -669,13 +697,45 @@ impl Debugger {
         Ok(())
     }
 
+    /// Mutate a synthetic paused closure-context binding.
+    pub fn set_paused_context_binding(
+        &mut self,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), StatorError> {
+        let Some(snapshot) = self.last_pause_frame.as_mut() else {
+            return Err(StatorError::Internal(
+                "Debugger.setVariableValue: no paused frame snapshot is available".to_string(),
+            ));
+        };
+        let Some((context_index, slot_index)) = synthetic_context_binding_index(name) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown paused closure binding `{name}`"
+            )));
+        };
+        let Some(slots) = snapshot.context_slots.get_mut(context_index) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown context scope `{context_index}`"
+            )));
+        };
+        let Some(slot) = slots.get_mut(slot_index) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown context slot `{name}`"
+            )));
+        };
+        *slot = value.cheap_clone();
+        self.pending_context_mutations
+            .push((context_index, slot_index, value));
+        Ok(())
+    }
+
     /// Apply pending paused-frame mutations to the live interpreter frame.
     pub fn apply_pending_frame_mutations(
         &mut self,
         frame: &mut InterpreterFrame,
         accumulator: &mut JsValue,
     ) {
-        if self.pending_frame_mutations.is_empty() {
+        if self.pending_frame_mutations.is_empty() && self.pending_context_mutations.is_empty() {
             return;
         }
         let parameter_count = frame.bytecode_array.parameter_count() as usize;
@@ -688,6 +748,14 @@ impl Debugger {
                 synthetic_register_binding_index(&name, parameter_count, register_len)
             {
                 frame.registers[index] = value;
+            }
+        }
+        for (context_index, slot_index, value) in self.pending_context_mutations.drain(..) {
+            if let Some(context) = frame_context_at(frame, context_index) {
+                let mut context = context.borrow_mut();
+                if slot_index < context.slots.len() {
+                    context.slots[slot_index] = value;
+                }
             }
         }
     }
@@ -916,6 +984,7 @@ impl Debugger {
     /// step direction.
     fn record_pause(&mut self, reason: PauseReason, offset: u32) -> Option<DebugAction> {
         self.pending_frame_mutations.clear();
+        self.pending_context_mutations.clear();
         self.last_pause_reason = Some(reason);
         self.last_pause_offset = offset;
         self.step_mode = StepMode::None;
@@ -955,7 +1024,7 @@ mod tests {
     use crate::bytecode::feedback::FeedbackMetadata;
     use crate::error::StatorError;
     use crate::interpreter::{Interpreter, InterpreterFrame, attach_debugger, detach_debugger};
-    use crate::objects::value::JsValue;
+    use crate::objects::value::{JsContext, JsValue};
 
     use super::*;
 
@@ -1123,6 +1192,43 @@ mod tests {
         assert_eq!(frame.registers[0], JsValue::Smi(99));
         assert_eq!(accumulator, JsValue::Smi(7));
         assert_eq!(frame.accumulator, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_paused_context_binding_mutation_applies_on_resume() {
+        let ba = Rc::new(make_bytecodes_with_positions(vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]));
+        let parent_context = JsContext::new(1, None);
+        parent_context.borrow_mut().slots[0] = JsValue::Smi(11);
+        let inner_context = JsContext::new(1, Some(Rc::clone(&parent_context)));
+        inner_context.borrow_mut().slots[0] = JsValue::Smi(7);
+
+        let mut frame = InterpreterFrame::new(Rc::clone(&ba), vec![]);
+        frame.context = Some(JsValue::Context(Rc::clone(&inner_context)));
+        let mut accumulator = JsValue::Undefined;
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .check_pause_at_with_frame(0, || PauseFrameSnapshot::from_frame(&frame, &accumulator));
+
+        dbg.set_paused_context_binding("$context0_slot0", JsValue::Smi(70))
+            .unwrap();
+        dbg.set_paused_context_binding("$context1_slot0", JsValue::Smi(110))
+            .unwrap();
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().context_slots[0][0],
+            JsValue::Smi(70)
+        );
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().context_slots[1][0],
+            JsValue::Smi(110)
+        );
+
+        dbg.apply_pending_frame_mutations(&mut frame, &mut accumulator);
+        assert_eq!(inner_context.borrow().slots[0], JsValue::Smi(70));
+        assert_eq!(parent_context.borrow().slots[0], JsValue::Smi(110));
     }
 
     // ── Breakpoint management ─────────────────────────────────────────────────

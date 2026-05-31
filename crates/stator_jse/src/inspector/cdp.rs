@@ -562,6 +562,8 @@ pub struct CdpDispatcher {
     remote_objects: RemoteObjectRegistry,
     /// Remote object ID for the current paused local scope snapshot, if any.
     paused_local_scope_object_id: Option<String>,
+    /// Remote object IDs for current paused closure scope snapshots, inner first.
+    paused_context_scope_object_ids: Vec<String>,
     /// Remote object ID for the current paused global scope snapshot, if any.
     paused_global_scope_object_id: Option<String>,
     /// Monotonically increasing ID for `HeapProfiler.getHeapObjectId`.
@@ -690,6 +692,7 @@ impl CdpDispatcher {
             blackboxed_ranges: HashMap::new(),
             remote_objects: RemoteObjectRegistry::new(),
             paused_local_scope_object_id: None,
+            paused_context_scope_object_ids: Vec::new(),
             paused_global_scope_object_id: None,
             next_heap_object_id: 1,
             heap_objects: HashMap::new(),
@@ -1141,6 +1144,7 @@ impl CdpDispatcher {
         frame_snapshot: Option<&PauseFrameSnapshot>,
     ) -> Value {
         self.paused_local_scope_object_id = None;
+        self.paused_context_scope_object_ids.clear();
         self.paused_global_scope_object_id = None;
         let mut scopes = Vec::new();
         if let Some(snapshot) = frame_snapshot {
@@ -1174,6 +1178,10 @@ impl CdpDispatcher {
                     Some("debugger-closure-scope"),
                     false,
                 );
+                if let Some(object_id) = remote.get("objectId").and_then(Value::as_str) {
+                    self.paused_context_scope_object_ids
+                        .push(object_id.to_string());
+                }
                 scopes.push(json!({
                     "type": "closure",
                     "object": remote,
@@ -1220,6 +1228,7 @@ impl CdpDispatcher {
             return false;
         }
         self.paused_local_scope_object_id = None;
+        self.paused_context_scope_object_ids.clear();
         self.paused_global_scope_object_id = None;
         self.push_event("Debugger.resumed", json!({}));
         true
@@ -3322,10 +3331,23 @@ impl CdpDispatcher {
             return Ok(json!({}));
         }
         if has_local_scope && (1..global_scope_number).contains(&scope_number) {
-            return Err(unsupported_debugger_method(
-                "Debugger.setVariableValue",
-                "mutating captured closure context scopes is not implemented yet.",
-            ));
+            let context_index = (scope_number - 1) as usize;
+            let scope_value = value.cheap_clone();
+            debugger
+                .borrow_mut()
+                .set_paused_context_binding(variable_name, value)?;
+            if let Some(object_id) = self
+                .paused_context_scope_object_ids
+                .get(context_index)
+                .map(String::as_str)
+            {
+                self.remote_objects.set_plain_object_property(
+                    object_id,
+                    variable_name,
+                    scope_value,
+                );
+            }
+            return Ok(json!({}));
         }
         if scope_number != global_scope_number {
             return Err(crate::error::StatorError::Internal(format!(
@@ -8817,7 +8839,26 @@ mod tests {
             &mut d,
             r#"{"id":4,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"$context0_slot0","callFrameId":"stator-pause-frame-0","newValue":{"value":9}}}"#,
         );
-        assert!(mutation["error"].is_object());
+        assert!(mutation.get("error").is_none());
+        let updated_props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":5,"method":"Runtime.getProperties","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        let updated_value = updated_props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|prop| prop["name"] == "$context0_slot0")
+            .expect("updated context slot property");
+        assert_eq!(updated_value["value"]["value"], 9);
+
+        let updated_eval = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"$context0_slot0 + $context1_slot0"}}"#,
+        );
+        assert_eq!(updated_eval["result"]["result"]["value"], 20);
     }
 
     #[test]
