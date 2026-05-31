@@ -488,6 +488,14 @@ pub struct CdpDispatcher {
     debugger_enabled: bool,
     /// Whether `Target.setDiscoverTargets` is enabled.
     target_discovery_enabled: bool,
+    /// Whether `Target.setAutoAttach` is enabled.
+    target_auto_attach_enabled: bool,
+    /// Whether auto-attached targets should wait for debugger commands before running.
+    target_auto_attach_wait_for_debugger_on_start: bool,
+    /// Whether auto-attach should use flattened sessions.
+    target_auto_attach_flatten: bool,
+    /// Number of cached auto-attach filter entries.
+    target_auto_attach_filter_count: usize,
     /// Target IDs closed through `Target.closeTarget`.
     closed_target_ids: HashSet<String>,
     /// Monotonically increasing ID for attached Target sessions.
@@ -615,6 +623,10 @@ impl CdpDispatcher {
             service_worker_force_update_on_page_load: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
+            target_auto_attach_enabled: false,
+            target_auto_attach_wait_for_debugger_on_start: false,
+            target_auto_attach_flatten: false,
+            target_auto_attach_filter_count: 0,
             closed_target_ids: HashSet::new(),
             next_target_session_id: 1,
             target_session_id: None,
@@ -818,6 +830,26 @@ impl CdpDispatcher {
     /// Returns the cached force-update-on-page-load flag.
     pub fn service_worker_force_update_on_page_load(&self) -> bool {
         self.service_worker_force_update_on_page_load
+    }
+
+    /// Returns `true` if `Target.setAutoAttach` is currently enabled.
+    pub fn target_auto_attach_enabled(&self) -> bool {
+        self.target_auto_attach_enabled
+    }
+
+    /// Returns `true` if auto-attached targets should wait for debugger commands.
+    pub fn target_auto_attach_wait_for_debugger_on_start(&self) -> bool {
+        self.target_auto_attach_wait_for_debugger_on_start
+    }
+
+    /// Returns `true` if auto-attach should use flattened sessions.
+    pub fn target_auto_attach_flatten(&self) -> bool {
+        self.target_auto_attach_flatten
+    }
+
+    /// Returns the cached auto-attach filter entry count.
+    pub fn target_auto_attach_filter_count(&self) -> usize {
+        self.target_auto_attach_filter_count
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1150,6 +1182,49 @@ impl CdpDispatcher {
                 self.push_event("Target.targetCreated", json!({ "targetInfo": target_info }));
             }
         }
+        Ok(json!({}))
+    }
+
+    fn target_set_auto_attach(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(auto_attach) = params.get("autoAttach").and_then(Value::as_bool) else {
+            return Err(StatorError::TypeError(
+                "Target.setAutoAttach: required parameter 'autoAttach' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        let Some(wait_for_debugger_on_start) = params
+            .get("waitForDebuggerOnStart")
+            .and_then(Value::as_bool)
+        else {
+            return Err(StatorError::TypeError(
+                "Target.setAutoAttach: required parameter 'waitForDebuggerOnStart' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        let flatten = match params.get("flatten") {
+            Some(value) => value.as_bool().ok_or_else(|| {
+                StatorError::TypeError(
+                    "Target.setAutoAttach: optional parameter 'flatten' must be a boolean"
+                        .to_string(),
+                )
+            })?,
+            None => false,
+        };
+        let filter_count = match params.get("filter") {
+            Some(Value::Array(filters)) => filters.len(),
+            Some(_) => {
+                return Err(StatorError::TypeError(
+                    "Target.setAutoAttach: optional parameter 'filter' must be an array"
+                        .to_string(),
+                ));
+            }
+            None => 0,
+        };
+
+        self.target_auto_attach_enabled = auto_attach;
+        self.target_auto_attach_wait_for_debugger_on_start = wait_for_debugger_on_start;
+        self.target_auto_attach_flatten = flatten;
+        self.target_auto_attach_filter_count = filter_count;
         Ok(json!({}))
     }
 
@@ -1591,6 +1666,7 @@ impl CdpDispatcher {
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
+            "Target.setAutoAttach" => self.target_set_auto_attach(&req.params),
             "Target.attachToTarget" => self.target_attach_to_target(&req.params),
             "Target.detachFromTarget" => self.target_detach_from_target(&req.params),
             "Target.closeTarget" => self.target_close_target(&req.params),
@@ -4077,6 +4153,7 @@ fn schema_get_domains() -> Value {
             { "name": "Emulation", "version": "1.3" },
             { "name": "Overlay", "version": "1.3" },
             { "name": "ServiceWorker", "version": "1.3" },
+            { "name": "Target", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -6837,6 +6914,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
+        assert!(names.contains(&"Target"));
         assert!(names.contains(&"Schema"));
     }
 
@@ -6898,6 +6976,32 @@ mod tests {
             DEFAULT_TARGET_ID
         );
         assert_eq!(messages[1]["id"], 1);
+    }
+
+    #[test]
+    fn target_auto_attach_setup_stores_state_and_validates_input() {
+        let mut d = fresh_dispatcher();
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"page"}]}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert!(d.target_auto_attach_enabled());
+        assert!(d.target_auto_attach_wait_for_debugger_on_start());
+        assert!(d.target_auto_attach_flatten());
+        assert_eq!(d.target_auto_attach_filter_count(), 1);
+
+        let bad_required = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":true}}"#,
+        );
+        assert!(bad_required["error"].is_object());
+
+        let bad_filter = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Target.setAutoAttach","params":{"autoAttach":false,"waitForDebuggerOnStart":false,"filter":true}}"#,
+        );
+        assert!(bad_filter["error"].is_object());
     }
 
     #[test]
