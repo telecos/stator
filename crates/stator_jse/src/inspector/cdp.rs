@@ -70,6 +70,7 @@
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
 //! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
+//! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -478,6 +479,10 @@ pub struct CdpDispatcher {
     overlay_show_ad_highlights: bool,
     /// Cached inspect mode requested through `Overlay.setInspectMode`.
     overlay_inspect_mode: String,
+    /// Whether the ServiceWorker domain is currently enabled for this session.
+    service_worker_enabled: bool,
+    /// Cached `ServiceWorker.setForceUpdateOnPageLoad` value.
+    service_worker_force_update_on_page_load: bool,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -606,6 +611,8 @@ impl CdpDispatcher {
             overlay_show_layout_shift_regions: false,
             overlay_show_ad_highlights: false,
             overlay_inspect_mode: "none".to_string(),
+            service_worker_enabled: false,
+            service_worker_force_update_on_page_load: false,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -801,6 +808,16 @@ impl CdpDispatcher {
     /// Returns the cached inspect mode.
     pub fn overlay_inspect_mode(&self) -> &str {
         &self.overlay_inspect_mode
+    }
+
+    /// Returns `true` if the ServiceWorker domain is currently enabled.
+    pub fn service_worker_enabled(&self) -> bool {
+        self.service_worker_enabled
+    }
+
+    /// Returns the cached force-update-on-page-load flag.
+    pub fn service_worker_force_update_on_page_load(&self) -> bool {
+        self.service_worker_force_update_on_page_load
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1549,6 +1566,28 @@ impl CdpDispatcher {
             "Overlay.highlightNode" => Ok(json!({})),
             "Overlay.highlightRect" => Ok(json!({})),
 
+            // ── ServiceWorker ─────────────────────────────────────────────
+            "ServiceWorker.enable" => {
+                self.service_worker_enabled = true;
+                Ok(json!({}))
+            }
+            "ServiceWorker.disable" => {
+                self.service_worker_enabled = false;
+                Ok(json!({}))
+            }
+            "ServiceWorker.setForceUpdateOnPageLoad" => {
+                self.service_worker_set_force_update_on_page_load(&req.params)
+            }
+            "ServiceWorker.deliverPushMessage" => self.service_worker_known_noop(&req.params),
+            "ServiceWorker.dispatchSyncEvent" => self.service_worker_known_noop(&req.params),
+            "ServiceWorker.dispatchPeriodicSyncEvent" => {
+                self.service_worker_known_noop(&req.params)
+            }
+            "ServiceWorker.startWorker" => self.service_worker_known_noop(&req.params),
+            "ServiceWorker.stopWorker" => self.service_worker_known_noop(&req.params),
+            "ServiceWorker.skipWaiting" => self.service_worker_known_noop(&req.params),
+            "ServiceWorker.updateRegistration" => self.service_worker_known_noop(&req.params),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1795,6 +1834,42 @@ impl CdpDispatcher {
             ));
         };
         self.overlay_inspect_mode = mode.to_string();
+        Ok(json!({}))
+    }
+
+    fn service_worker_set_force_update_on_page_load(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let Some(force_update_on_page_load) =
+            params.get("forceUpdateOnPageLoad").and_then(Value::as_bool)
+        else {
+            return Err(crate::error::StatorError::TypeError(
+                "ServiceWorker.setForceUpdateOnPageLoad: required parameter 'forceUpdateOnPageLoad' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.service_worker_force_update_on_page_load = force_update_on_page_load;
+        Ok(json!({}))
+    }
+
+    fn service_worker_known_noop(&self, params: &Value) -> StatorResult<Value> {
+        if let Some(version_id) = params.get("versionId")
+            && !version_id.is_string()
+        {
+            return Err(crate::error::StatorError::TypeError(
+                "ServiceWorker request parameter 'versionId' must be a string when present"
+                    .to_string(),
+            ));
+        }
+        if let Some(registration_id) = params.get("registrationId")
+            && !registration_id.is_string()
+        {
+            return Err(crate::error::StatorError::TypeError(
+                "ServiceWorker request parameter 'registrationId' must be a string when present"
+                    .to_string(),
+            ));
+        }
         Ok(json!({}))
     }
 
@@ -4001,6 +4076,7 @@ fn schema_get_domains() -> Value {
             { "name": "Performance", "version": "1.3" },
             { "name": "Emulation", "version": "1.3" },
             { "name": "Overlay", "version": "1.3" },
+            { "name": "ServiceWorker", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -6247,6 +6323,49 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn service_worker_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"ServiceWorker.enable","params":{}}"#,
+        );
+        assert!(enable.get("error").is_none());
+        assert!(d.service_worker_enabled());
+
+        let force = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"ServiceWorker.setForceUpdateOnPageLoad","params":{"forceUpdateOnPageLoad":true}}"#,
+        );
+        assert!(force.get("error").is_none());
+        assert!(d.service_worker_force_update_on_page_load());
+
+        let bad_force = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"ServiceWorker.setForceUpdateOnPageLoad","params":{}}"#,
+        );
+        assert!(bad_force["error"].is_object());
+
+        let start = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"ServiceWorker.startWorker","params":{"versionId":"v1"}}"#,
+        );
+        assert!(start.get("error").is_none());
+
+        let bad_start = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"ServiceWorker.startWorker","params":{"versionId":1}}"#,
+        );
+        assert!(bad_start["error"].is_object());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"ServiceWorker.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.service_worker_enabled());
     }
 
     #[test]
