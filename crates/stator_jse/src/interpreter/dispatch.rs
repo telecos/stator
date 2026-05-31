@@ -32,8 +32,9 @@ use super::{
     number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup,
     proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
     resolve_jump, restore_closure_context, run_callee_pooled, set_function_name_if_missing,
-    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    set_pending_exception, settle_async_iterator_result, strict_eq,
+    sync_global_object_property_delete, sync_global_object_property_store, to_array_index,
+    to_bigint, to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
     try_inline_small_function, try_proto_lookup_rc, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
@@ -4288,7 +4289,8 @@ fn handle_sta_named_property(
                     && pm.is_writable_by_offset(cached_offset)
                 {
                     drop(pm);
-                    map.borrow_mut().set_by_offset(cached_offset, val);
+                    map.borrow_mut().set_by_offset(cached_offset, val.clone());
+                    sync_global_object_property_store(map, prop_name.as_ref(), val);
                     invalidate_plain_object_caches(ctx, map);
                     ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
@@ -4307,7 +4309,8 @@ fn handle_sta_named_property(
                 if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
                     if pm.is_writable_by_offset(offset) {
                         drop(pm);
-                        map.borrow_mut().set_by_offset(offset, val);
+                        map.borrow_mut().set_by_offset(offset, val.clone());
+                        sync_global_object_property_store(map, prop_name.as_ref(), val);
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
                         if let Some(cache) = &mut ctx.frame.mono_load_cache {
@@ -4414,9 +4417,11 @@ fn handle_sta_named_property(
                 }
             }
             set_function_name_if_missing(&val, &prop_name);
+            let global_sync_value = val.clone();
             let fill_result = map.borrow_mut().try_template_fill(&prop_name, val);
             match fill_result {
                 Ok(offset) => {
+                    sync_global_object_property_store(map, prop_name.as_ref(), global_sync_value);
                     if slot != u32::MAX && offset <= u16::MAX as usize {
                         let receiver_layout = map.borrow().layout_id();
                         ctx.frame.mega_store_ic_mut().update(MegamorphicIcEntry {
@@ -4452,7 +4457,10 @@ fn handle_sta_named_property(
                     }
                     return Ok(DispatchAction::Continue);
                 }
-                Err(val) => map.borrow_mut().insert_rc(Rc::clone(&prop_name), val),
+                Err(val) => {
+                    map.borrow_mut().insert_rc(Rc::clone(&prop_name), val);
+                    sync_global_object_property_store(map, prop_name.as_ref(), global_sync_value);
+                }
             }
             // Populate megamorphic store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -6610,6 +6618,7 @@ fn handle_delete_property_sloppy(
             } else {
                 drop(pm);
                 map.borrow_mut().remove(&key);
+                sync_global_object_property_delete(map, &key);
                 true
             }
         } else {
@@ -6666,6 +6675,8 @@ fn handle_delete_property_strict(
             for target in targets {
                 pm.remove(&target);
             }
+            drop(pm);
+            sync_global_object_property_delete(map, &key);
         } else if pm.contains_key(&key) && !pm.is_configurable(&key) {
             return Err(StatorError::TypeError(format!(
                 "Cannot delete property '{key}' of object"
@@ -6673,6 +6684,7 @@ fn handle_delete_property_strict(
         } else {
             drop(pm);
             map.borrow_mut().remove(&key);
+            sync_global_object_property_delete(map, &key);
         }
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {

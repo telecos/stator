@@ -11248,7 +11248,12 @@ impl Interpreter {
                                     {
                                         drop(pm);
                                         let val = acc.cheap_clone();
-                                        map_rc.borrow_mut().set_by_offset(offset, val);
+                                        map_rc.borrow_mut().set_by_offset(offset, val.clone());
+                                        sync_global_object_property_store(
+                                            &map_rc,
+                                            key_str.as_str(),
+                                            val,
+                                        );
                                         continue 'dispatch;
                                     }
                                 }
@@ -19201,6 +19206,48 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 ///   before reaching this helper).
 /// - **Non-writable properties**: the store is silently ignored.
 /// - **Non-extensible objects**: adding a new property is silently ignored.
+pub(super) fn sync_global_object_property_store(
+    map: &Rc<RefCell<PropertyMap>>,
+    prop_name: &str,
+    value: JsValue,
+) {
+    if prop_name == "globalThis" || prop_name == "this" {
+        return;
+    }
+
+    let Some(globals) = current_global_env() else {
+        return;
+    };
+    let is_active_global_object = {
+        let env = globals.borrow();
+        matches!(
+            env.get("globalThis"),
+            Some(JsValue::PlainObject(global_object)) if Rc::ptr_eq(global_object, map)
+        )
+    };
+    if is_active_global_object {
+        globals.borrow_mut().insert(prop_name.to_string(), value);
+    }
+}
+pub(super) fn sync_global_object_property_delete(map: &Rc<RefCell<PropertyMap>>, prop_name: &str) {
+    if prop_name == "globalThis" || prop_name == "this" {
+        return;
+    }
+
+    let Some(globals) = current_global_env() else {
+        return;
+    };
+    let is_active_global_object = {
+        let env = globals.borrow();
+        matches!(
+            env.get("globalThis"),
+            Some(JsValue::PlainObject(global_object)) if Rc::ptr_eq(global_object, map)
+        )
+    };
+    if is_active_global_object {
+        globals.borrow_mut().remove(prop_name);
+    }
+}
 pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()> {
     match obj {
         JsValue::Proxy(p) => {
@@ -19296,7 +19343,8 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                     return Ok(());
                 }
             }
-            map.borrow_mut().insert(prop_name, value);
+            map.borrow_mut().insert(prop_name.clone(), value.clone());
+            sync_global_object_property_store(map, &prop_name, value);
             // If this is an array-like PlainObject, update "length".
             if let Some(idx) = to_array_index(key) {
                 let new_len = (idx + 1) as i32;
