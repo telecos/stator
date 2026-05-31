@@ -61,6 +61,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::builtins::error::call_stack_depth;
@@ -111,6 +112,8 @@ pub struct PauseFrameSnapshot {
     pub frame_size: u32,
     /// Flat register snapshot: `[params..., locals...]`.
     pub registers: Vec<JsValue>,
+    /// Captured context-slot chains, inner scope first.
+    pub context_slots: Vec<Vec<JsValue>>,
     /// Accumulator value at the pause site.
     pub accumulator: JsValue,
 }
@@ -123,9 +126,24 @@ impl PauseFrameSnapshot {
             parameter_count: frame.bytecode_array.parameter_count(),
             frame_size: frame.bytecode_array.frame_size(),
             registers: frame.registers.iter().map(JsValue::cheap_clone).collect(),
+            context_slots: capture_context_slots(frame.context.as_ref()),
             accumulator: accumulator.cheap_clone(),
         }
     }
+}
+
+fn capture_context_slots(context: Option<&JsValue>) -> Vec<Vec<JsValue>> {
+    let mut scopes = Vec::new();
+    let mut next = match context {
+        Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+        _ => None,
+    };
+    while let Some(context) = next {
+        let borrowed = context.borrow();
+        scopes.push(borrowed.slots.iter().map(JsValue::cheap_clone).collect());
+        next = borrowed.parent.as_ref().map(Rc::clone);
+    }
+    scopes
 }
 
 /// Cross-thread pause/resume bridge for a debugger attached to an interpreter.
@@ -1040,6 +1058,7 @@ mod tests {
                 parameter_count: 0,
                 frame_size: 0,
                 registers: vec![],
+                context_slots: vec![],
                 accumulator: JsValue::Smi(1),
             })
             .is_some()

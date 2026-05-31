@@ -1163,6 +1163,23 @@ impl CdpDispatcher {
                 "object": remote,
                 "name": "Locals",
             }));
+            for (context_index, slots) in snapshot.context_slots.iter().enumerate() {
+                let mut context_map = PropertyMap::new();
+                for (name, value) in context_snapshot_bindings(context_index, slots) {
+                    context_map.insert(name, value);
+                }
+                let remote = js_value_to_remote_object(
+                    &JsValue::PlainObject(Rc::new(RefCell::new(context_map))),
+                    &mut self.remote_objects,
+                    Some("debugger-closure-scope"),
+                    false,
+                );
+                scopes.push(json!({
+                    "type": "closure",
+                    "object": remote,
+                    "name": format!("Closure {context_index}"),
+                }));
+            }
         }
         let globals: Vec<_> = self
             .globals
@@ -3215,10 +3232,11 @@ impl CdpDispatcher {
         let frame_snapshot = debugger_ref.last_pause_frame_snapshot().cloned();
         drop(debugger_ref);
         if let Some(snapshot) = frame_snapshot {
-            let _bindings = TemporaryGlobalBindings::new(
-                Rc::clone(&self.globals),
-                frame_snapshot_bindings(&snapshot),
-            );
+            let mut bindings = frame_snapshot_bindings(&snapshot);
+            for (context_index, slots) in snapshot.context_slots.iter().enumerate() {
+                bindings.extend(context_snapshot_bindings(context_index, slots));
+            }
+            let _bindings = TemporaryGlobalBindings::new(Rc::clone(&self.globals), bindings);
             return self.runtime_evaluate(params);
         }
         self.runtime_evaluate(params)
@@ -3269,16 +3287,26 @@ impl CdpDispatcher {
             )
         })?;
         let value = call_argument_to_js_value(new_value, &self.remote_objects)?;
-        let has_local_scope = {
+        let (has_local_scope, context_scope_count) = {
             let debugger_ref = debugger.borrow();
             ensure_active_call_frame_id(
                 "Debugger.setVariableValue",
                 requested_offset,
                 &debugger_ref,
             )?;
-            debugger_ref.last_pause_frame_snapshot().is_some()
+            let snapshot = debugger_ref.last_pause_frame_snapshot();
+            (
+                snapshot.is_some(),
+                snapshot
+                    .map(|snapshot| snapshot.context_slots.len() as u64)
+                    .unwrap_or(0),
+            )
         };
-        let global_scope_number = if has_local_scope { 1 } else { 0 };
+        let global_scope_number = if has_local_scope {
+            1 + context_scope_count
+        } else {
+            0
+        };
         if scope_number == 0 && has_local_scope {
             let scope_value = value.cheap_clone();
             debugger
@@ -3292,6 +3320,12 @@ impl CdpDispatcher {
                 );
             }
             return Ok(json!({}));
+        }
+        if has_local_scope && (1..global_scope_number).contains(&scope_number) {
+            return Err(unsupported_debugger_method(
+                "Debugger.setVariableValue",
+                "mutating captured closure context scopes is not implemented yet.",
+            ));
         }
         if scope_number != global_scope_number {
             return Err(crate::error::StatorError::Internal(format!(
@@ -4690,6 +4724,18 @@ fn frame_snapshot_bindings(snapshot: &PauseFrameSnapshot) -> Vec<(String, JsValu
         bindings.push((name, value.cheap_clone()));
     }
     bindings
+}
+
+fn context_snapshot_bindings(
+    context_index: usize,
+    slots: &[JsValue],
+) -> impl Iterator<Item = (String, JsValue)> + '_ {
+    slots.iter().enumerate().map(move |(slot_index, value)| {
+        (
+            format!("$context{context_index}_slot{slot_index}"),
+            value.cheap_clone(),
+        )
+    })
 }
 
 fn paused_event_params(
@@ -8403,6 +8449,17 @@ mod tests {
             parameter_count: 1,
             frame_size: 1,
             registers: vec![JsValue::Smi(3), JsValue::Smi(41)],
+            context_slots: vec![],
+            accumulator: JsValue::Smi(2),
+        }
+    }
+
+    fn sample_pause_frame_snapshot_with_context() -> PauseFrameSnapshot {
+        PauseFrameSnapshot {
+            parameter_count: 0,
+            frame_size: 0,
+            registers: vec![],
+            context_slots: vec![vec![JsValue::Smi(7)], vec![JsValue::Smi(11)]],
             accumulator: JsValue::Smi(2),
         }
     }
@@ -8712,6 +8769,55 @@ mod tests {
         assert!(names.contains("$accumulator"));
         assert!(names.contains("$param0"));
         assert!(names.contains("$local0"));
+    }
+
+    #[test]
+    fn notify_paused_includes_closure_scopes_when_context_snapshot_exists() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .borrow_mut()
+            .check_pause_at_with_frame(0, sample_pause_frame_snapshot_with_context);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+
+        assert!(d.notify_paused());
+        let paused = drain_all(&mut d);
+        let scope_chain = paused[0]["params"]["callFrames"][0]["scopeChain"]
+            .as_array()
+            .unwrap();
+        assert_eq!(scope_chain[0]["type"], "local");
+        assert_eq!(scope_chain[1]["type"], "closure");
+        assert_eq!(scope_chain[2]["type"], "closure");
+        assert_eq!(scope_chain[3]["type"], "global");
+
+        let object_id = scope_chain[1]["object"]["objectId"].as_str().unwrap();
+        let props = dispatch(
+            &mut d,
+            &format!(
+                r#"{{"id":2,"method":"Runtime.getProperties","params":{{"objectId":"{object_id}"}}}}"#
+            ),
+        );
+        let value = props["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|prop| prop["name"] == "$context0_slot0")
+            .expect("context slot property");
+        assert_eq!(value["value"]["value"], 7);
+
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"$context0_slot0 + $context1_slot0"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 18);
+
+        let mutation = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.setVariableValue","params":{"scopeNumber":1,"variableName":"$context0_slot0","callFrameId":"stator-pause-frame-0","newValue":{"value":9}}}"#,
+        );
+        assert!(mutation["error"].is_object());
     }
 
     #[test]
