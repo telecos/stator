@@ -3203,8 +3203,21 @@ impl CdpDispatcher {
                         .to_string(),
                 )
             })?;
+        let positions: Vec<Value> = positions
+            .iter()
+            .map(|position| {
+                let line_number =
+                    required_u32_param(position, "lineNumber", "Debugger.setBlackboxedRanges")?;
+                let column_number =
+                    required_u32_param(position, "columnNumber", "Debugger.setBlackboxedRanges")?;
+                Ok(json!({
+                    "lineNumber": line_number,
+                    "columnNumber": column_number,
+                }))
+            })
+            .collect::<StatorResult<_>>()?;
         self.blackboxed_ranges
-            .insert(script_id.to_string(), positions.clone());
+            .insert(script_id.to_string(), positions);
         Ok(json!({}))
     }
 
@@ -9189,6 +9202,18 @@ mod tests {
             r#"{"id":3,"method":"Debugger.setAsyncCallStackDepth","params":{}}"#,
         );
         assert!(bad["error"].is_object());
+
+        let bad_position = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.setBlackboxedRanges","params":{"scriptId":"7","positions":[{"lineNumber":0}]}}"#,
+        );
+        assert!(bad_position["error"].is_object());
+
+        let bad_number = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.setBlackboxedRanges","params":{"scriptId":"7","positions":[{"lineNumber":0,"columnNumber":-1}]}}"#,
+        );
+        assert!(bad_number["error"].is_object());
     }
 
     #[test]
