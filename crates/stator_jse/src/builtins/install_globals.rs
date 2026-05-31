@@ -16582,10 +16582,27 @@ fn make_array() -> JsValue {
             "fromAsync".into(),
             builtin_fn("fromAsync", 1, |args| {
                 use crate::builtins::promise::{
-                    active_microtask_queue, promise_reject, promise_resolve,
+                    PromiseState, active_microtask_queue, drain_active_microtask_queue,
+                    promise_reject, promise_resolve,
                 };
 
                 let queue = active_microtask_queue().unwrap_or_default();
+                fn await_from_async_value(value: JsValue) -> Result<JsValue, JsValue> {
+                    match value {
+                        JsValue::Promise(promise) => {
+                            drain_active_microtask_queue();
+                            match promise.state() {
+                                PromiseState::Fulfilled(value) => Ok(value),
+                                PromiseState::Rejected(reason) => Err(reason),
+                                PromiseState::Pending => Err(JsValue::String(
+                                    "Array.fromAsync: promise is still pending".into(),
+                                )),
+                            }
+                        }
+                        other => Ok(other),
+                    }
+                }
+
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
                 let map_fn = args.get(1).cloned();
                 // Validate mapFn.
@@ -16636,13 +16653,29 @@ fn make_array() -> JsValue {
                     }
                     _ => Vec::new(),
                 };
+                let mut awaited_items = Vec::with_capacity(items.len());
+                for item in items {
+                    match await_from_async_value(item) {
+                        Ok(value) => awaited_items.push(value),
+                        Err(reason) => {
+                            return Ok(JsValue::Promise(promise_reject(reason, &queue)));
+                        }
+                    }
+                }
                 // Apply mapFn if provided.
                 let mapped = if let Some(ref mf) = map_fn {
                     if !matches!(mf, JsValue::Undefined) {
-                        let mut mapped = Vec::with_capacity(items.len());
-                        for (i, v) in items.into_iter().enumerate() {
+                        let mut mapped = Vec::with_capacity(awaited_items.len());
+                        for (i, v) in awaited_items.into_iter().enumerate() {
                             match dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]) {
-                                Ok(value) => mapped.push(value),
+                                Ok(value) => match await_from_async_value(value) {
+                                    Ok(value) => mapped.push(value),
+                                    Err(reason) => {
+                                        return Ok(JsValue::Promise(promise_reject(
+                                            reason, &queue,
+                                        )));
+                                    }
+                                },
                                 Err(error) => {
                                     return Ok(JsValue::Promise(promise_reject(
                                         JsValue::String(error.to_string().into()),
@@ -16653,10 +16686,10 @@ fn make_array() -> JsValue {
                         }
                         mapped
                     } else {
-                        items
+                        awaited_items
                     }
                 } else {
-                    items
+                    awaited_items
                 };
                 let result_arr = JsValue::new_array(mapped);
                 Ok(JsValue::Promise(promise_resolve(result_arr, &queue)))
@@ -81802,6 +81835,22 @@ mod tests {
         );
     }
 
+    /// `Array.fromAsync` awaits fulfilled promise inputs and mapper results.
+    #[test]
+    fn e2e_array_from_async_awaits_promises() {
+        assert_microtask_transition(
+            r#"
+            var seen = 0;
+            Array.fromAsync([Promise.resolve(1), Promise.resolve(2)], function(x) {
+                return Promise.resolve(x * 3);
+            }).then(function(arr) { seen = arr[0] + arr[1]; });
+            "#,
+            "seen",
+            JsValue::Smi(0),
+            JsValue::Smi(9),
+        );
+    }
+
     /// `Array.fromAsync` with empty array.
     #[test]
     fn e2e_array_from_async_empty() {
@@ -81861,6 +81910,18 @@ mod tests {
                         .and_then(|reason| reason.to_js_string().ok())
                         .is_some_and(|reason| reason.contains("bad map"))
                 );
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
+    }
+
+    /// `Array.fromAsync` rejects if an input promise rejects.
+    #[test]
+    fn e2e_array_from_async_rejected_input_rejects() {
+        match eval_with_microtasks(r#"Array.fromAsync([Promise.reject("bad input")])"#) {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert_eq!(promise.reason(), Some(JsValue::String("bad input".into())));
             }
             other => panic!("expected rejected promise, got {other:?}"),
         }
