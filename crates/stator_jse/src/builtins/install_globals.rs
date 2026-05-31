@@ -2585,7 +2585,7 @@ fn make_error_constructor_object(
     proto.insert("message".into(), JsValue::String(String::new().into()));
     proto.insert(
         "toString".into(),
-        native(move |args| {
+        builtin_fn("toString", 0, |args| {
             let this = args.first().unwrap_or(&JsValue::Undefined);
             error_prototype_to_string(this)
         }),
@@ -2805,7 +2805,7 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         proto.insert("message".into(), JsValue::String(String::new().into()));
         proto.insert(
             "toString".into(),
-            native(|args| {
+            builtin_fn("toString", 0, |args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 error_prototype_to_string(this)
             }),
@@ -40276,7 +40276,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_error_to_string_builtin_name_and_length() {
         let result =
             global_eval("Error.prototype.toString.name + ':' + Error.prototype.toString.length")
