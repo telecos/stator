@@ -69,6 +69,7 @@
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
 //! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia` | Validated setup state |
+//! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -467,6 +468,16 @@ pub struct CdpDispatcher {
     emulation_media: String,
     /// Cached media feature count from `Emulation.setEmulatedMedia`.
     emulation_media_feature_count: usize,
+    /// Whether the Overlay domain is currently enabled for this session.
+    overlay_enabled: bool,
+    /// Cached Overlay visual-debugging toggles.
+    overlay_show_paint_rects: bool,
+    overlay_show_debug_borders: bool,
+    overlay_show_fps_counter: bool,
+    overlay_show_layout_shift_regions: bool,
+    overlay_show_ad_highlights: bool,
+    /// Cached inspect mode requested through `Overlay.setInspectMode`.
+    overlay_inspect_mode: String,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -588,6 +599,13 @@ impl CdpDispatcher {
             emulation_max_touch_points: 0,
             emulation_media: String::new(),
             emulation_media_feature_count: 0,
+            overlay_enabled: false,
+            overlay_show_paint_rects: false,
+            overlay_show_debug_borders: false,
+            overlay_show_fps_counter: false,
+            overlay_show_layout_shift_regions: false,
+            overlay_show_ad_highlights: false,
+            overlay_inspect_mode: "none".to_string(),
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -748,6 +766,41 @@ impl CdpDispatcher {
     /// Returns the cached emulated media feature count.
     pub fn emulation_media_feature_count(&self) -> usize {
         self.emulation_media_feature_count
+    }
+
+    /// Returns `true` if the Overlay domain is currently enabled.
+    pub fn overlay_enabled(&self) -> bool {
+        self.overlay_enabled
+    }
+
+    /// Returns the cached paint-rect overlay toggle.
+    pub fn overlay_show_paint_rects(&self) -> bool {
+        self.overlay_show_paint_rects
+    }
+
+    /// Returns the cached debug-border overlay toggle.
+    pub fn overlay_show_debug_borders(&self) -> bool {
+        self.overlay_show_debug_borders
+    }
+
+    /// Returns the cached FPS-counter overlay toggle.
+    pub fn overlay_show_fps_counter(&self) -> bool {
+        self.overlay_show_fps_counter
+    }
+
+    /// Returns the cached layout-shift overlay toggle.
+    pub fn overlay_show_layout_shift_regions(&self) -> bool {
+        self.overlay_show_layout_shift_regions
+    }
+
+    /// Returns the cached ad-highlight overlay toggle.
+    pub fn overlay_show_ad_highlights(&self) -> bool {
+        self.overlay_show_ad_highlights
+    }
+
+    /// Returns the cached inspect mode.
+    pub fn overlay_inspect_mode(&self) -> &str {
+        &self.overlay_inspect_mode
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1475,6 +1528,27 @@ impl CdpDispatcher {
             }
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
 
+            // ── Overlay ───────────────────────────────────────────────────
+            "Overlay.enable" => {
+                self.overlay_enabled = true;
+                Ok(json!({}))
+            }
+            "Overlay.disable" => {
+                self.overlay_enabled = false;
+                Ok(json!({}))
+            }
+            "Overlay.setShowPaintRects" => self.overlay_set_show_paint_rects(&req.params),
+            "Overlay.setShowDebugBorders" => self.overlay_set_show_debug_borders(&req.params),
+            "Overlay.setShowFPSCounter" => self.overlay_set_show_fps_counter(&req.params),
+            "Overlay.setShowLayoutShiftRegions" => {
+                self.overlay_set_show_layout_shift_regions(&req.params)
+            }
+            "Overlay.setShowAdHighlights" => self.overlay_set_show_ad_highlights(&req.params),
+            "Overlay.setInspectMode" => self.overlay_set_inspect_mode(&req.params),
+            "Overlay.hideHighlight" => Ok(json!({})),
+            "Overlay.highlightNode" => Ok(json!({})),
+            "Overlay.highlightRect" => Ok(json!({})),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1672,6 +1746,55 @@ impl CdpDispatcher {
         };
         self.emulation_media = media.to_string();
         self.emulation_media_feature_count = feature_count;
+        Ok(json!({}))
+    }
+
+    fn overlay_required_bool(params: &Value, method: &str, field: &str) -> StatorResult<bool> {
+        params.get(field).and_then(Value::as_bool).ok_or_else(|| {
+            crate::error::StatorError::TypeError(format!(
+                "{method}: required parameter '{field}' is missing or not a boolean"
+            ))
+        })
+    }
+
+    fn overlay_set_show_paint_rects(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_paint_rects =
+            Self::overlay_required_bool(params, "Overlay.setShowPaintRects", "result")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_debug_borders(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_debug_borders =
+            Self::overlay_required_bool(params, "Overlay.setShowDebugBorders", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_fps_counter(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_fps_counter =
+            Self::overlay_required_bool(params, "Overlay.setShowFPSCounter", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_layout_shift_regions(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_layout_shift_regions =
+            Self::overlay_required_bool(params, "Overlay.setShowLayoutShiftRegions", "result")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_ad_highlights(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_ad_highlights =
+            Self::overlay_required_bool(params, "Overlay.setShowAdHighlights", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_inspect_mode(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(mode) = params.get("mode").and_then(Value::as_str) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setInspectMode: required parameter 'mode' is missing or not a string"
+                    .to_string(),
+            ));
+        };
+        self.overlay_inspect_mode = mode.to_string();
         Ok(json!({}))
     }
 
@@ -3877,6 +4000,7 @@ fn schema_get_domains() -> Value {
             { "name": "Security", "version": "1.3" },
             { "name": "Performance", "version": "1.3" },
             { "name": "Emulation", "version": "1.3" },
+            { "name": "Overlay", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -6123,6 +6247,75 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn overlay_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Overlay.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.overlay_enabled());
+
+        let paint = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Overlay.setShowPaintRects","params":{"result":true}}"#,
+        );
+        assert!(paint.get("error").is_none());
+        assert!(d.overlay_show_paint_rects());
+
+        let borders = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Overlay.setShowDebugBorders","params":{"show":true}}"#,
+        );
+        assert!(borders.get("error").is_none());
+        assert!(d.overlay_show_debug_borders());
+
+        let fps = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Overlay.setShowFPSCounter","params":{"show":true}}"#,
+        );
+        assert!(fps.get("error").is_none());
+        assert!(d.overlay_show_fps_counter());
+
+        let layout = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Overlay.setShowLayoutShiftRegions","params":{"result":true}}"#,
+        );
+        assert!(layout.get("error").is_none());
+        assert!(d.overlay_show_layout_shift_regions());
+
+        let ad = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Overlay.setShowAdHighlights","params":{"show":true}}"#,
+        );
+        assert!(ad.get("error").is_none());
+        assert!(d.overlay_show_ad_highlights());
+
+        let inspect = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
+        );
+        assert!(inspect.get("error").is_none());
+        assert_eq!(d.overlay_inspect_mode(), "searchForNode");
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Overlay.setShowFPSCounter","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
+
+        let hide = dispatch(
+            &mut d,
+            r#"{"id":9,"method":"Overlay.hideHighlight","params":{}}"#,
+        );
+        assert!(hide.get("error").is_none());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":10,"method":"Overlay.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.overlay_enabled());
     }
 
     #[test]
