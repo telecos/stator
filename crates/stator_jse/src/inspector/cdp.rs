@@ -1191,6 +1191,8 @@ impl CdpDispatcher {
         if !self.debugger_enabled {
             return false;
         }
+        self.paused_local_scope_object_id = None;
+        self.paused_global_scope_object_id = None;
         self.push_event("Debugger.resumed", json!({}));
         true
     }
@@ -3091,6 +3093,7 @@ impl CdpDispatcher {
             let mut dbg = debugger.borrow_mut();
             if dbg.last_pause_reason().is_some() {
                 dbg.apply_action(DebugAction::Continue);
+                dbg.clear_last_pause();
                 emitted = true;
             }
         }
@@ -3167,6 +3170,7 @@ impl CdpDispatcher {
                 actual_location["columnNumber"].as_u64().unwrap_or(0) as u32 + 1,
             );
             debugger.apply_action(DebugAction::Continue);
+            debugger.clear_last_pause();
         }
         self.notify_resumed();
         Ok(json!({}))
@@ -3320,6 +3324,7 @@ impl CdpDispatcher {
                 ));
             }
             dbg.apply_action(action);
+            dbg.clear_last_pause();
         }
         self.notify_resumed();
         Ok(json!({}))
@@ -9017,6 +9022,32 @@ mod tests {
             r#"{"id":1,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"1"}}"#,
         );
         assert!(resp["error"].is_object());
+    }
+
+    #[test]
+    fn resume_clears_active_pause_for_call_frame_methods() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+        assert!(d.notify_paused());
+        let _ = drain_all(&mut d);
+
+        let resume = dispatch(&mut d, r#"{"id":2,"method":"Debugger.resume","params":{}}"#);
+        assert!(resume.get("error").is_none());
+
+        let eval = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"stator-pause-frame-0","expression":"1"}}"#,
+        );
+        assert!(eval["error"].is_object());
+
+        let set = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Debugger.setVariableValue","params":{"scopeNumber":0,"variableName":"x","callFrameId":"stator-pause-frame-0","newValue":{"value":1}}}"#,
+        );
+        assert!(set["error"].is_object());
     }
 
     #[test]

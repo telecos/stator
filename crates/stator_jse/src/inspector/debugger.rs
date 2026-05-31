@@ -605,6 +605,16 @@ impl Debugger {
         self.last_pause_frame.as_ref()
     }
 
+    /// Clear the currently active pause after execution is resumed.
+    ///
+    /// Pending frame mutations are intentionally kept: the interpreter applies
+    /// them on the next debug hook before executing resumed bytecode.
+    pub fn clear_last_pause(&mut self) {
+        self.last_pause_reason = None;
+        self.last_pause_frame = None;
+        self.pause_events.clear();
+    }
+
     /// Mutate a synthetic paused-frame local binding.
     ///
     /// The visible snapshot is updated immediately so follow-up
