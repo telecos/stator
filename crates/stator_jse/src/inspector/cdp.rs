@@ -1749,9 +1749,9 @@ impl CdpDispatcher {
             "Debugger.setBlackboxedRanges" => self.debugger_set_blackboxed_ranges(&req.params),
             "Debugger.resume" => self.debugger_resume(),
             "Debugger.continueToLocation" => self.debugger_continue_to_location(&req.params),
-            "Debugger.stepInto" => self.debugger_step(DebugAction::StepInto),
-            "Debugger.stepOver" => self.debugger_step(DebugAction::StepOver),
-            "Debugger.stepOut" => self.debugger_step(DebugAction::StepOut),
+            "Debugger.stepInto" => self.debugger_step(&req.params, DebugAction::StepInto),
+            "Debugger.stepOver" => self.debugger_step(&req.params, DebugAction::StepOver),
+            "Debugger.stepOut" => self.debugger_step(&req.params, DebugAction::StepOut),
             "Debugger.pause" => self.debugger_pause(),
             "Debugger.evaluateOnCallFrame" => self.debugger_evaluate_on_call_frame(&req.params),
             "Debugger.restartFrame" => Err(unsupported_debugger_method(
@@ -3462,7 +3462,8 @@ impl CdpDispatcher {
 
     // ── Debugger.stepInto / stepOver / stepOut ───────────────────────────────
 
-    fn debugger_step(&mut self, action: DebugAction) -> StatorResult<Value> {
+    fn debugger_step(&mut self, params: &Value, action: DebugAction) -> StatorResult<Value> {
+        validate_step_options(params, action)?;
         if let Some(bridge) = &self.pause_bridge
             && bridge.resume(action)
         {
@@ -5019,6 +5020,35 @@ fn debug_step_method_name(action: DebugAction) -> &'static str {
         DebugAction::StepOver => "Debugger.stepOver",
         DebugAction::StepOut => "Debugger.stepOut",
     }
+}
+
+fn validate_step_options(params: &Value, action: DebugAction) -> StatorResult<()> {
+    let method = debug_step_method_name(action);
+    if matches!(action, DebugAction::StepInto)
+        && params
+            .get("breakOnAsyncCall")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(unsupported_debugger_method(
+            method,
+            "breakOnAsyncCall is not implemented yet.",
+        ));
+    }
+    if let Some(skip_list) = params.get("skipList") {
+        let ranges = skip_list.as_array().ok_or_else(|| {
+            StatorError::TypeError(format!(
+                "{method}: optional parameter 'skipList' must be an array"
+            ))
+        })?;
+        if !ranges.is_empty() {
+            return Err(unsupported_debugger_method(
+                method,
+                "skipList stepping ranges are not implemented yet.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn paused_reason_str(reason: &PauseReason) -> &'static str {
@@ -9691,6 +9721,39 @@ mod tests {
         assert!(
             resp["error"].is_object(),
             "step without active pause must error"
+        );
+    }
+
+    #[test]
+    fn step_commands_reject_unsupported_step_options() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let async_step = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.stepInto","params":{"breakOnAsyncCall":true}}"#,
+        );
+        assert!(async_step["error"].is_object());
+        assert!(
+            async_step["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("breakOnAsyncCall")
+        );
+
+        let skip_step = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Debugger.stepOver","params":{"skipList":[{"scriptId":"7","start":{"lineNumber":0,"columnNumber":0},"end":{"lineNumber":1,"columnNumber":0}}]}}"#,
+        );
+        assert!(skip_step["error"].is_object());
+        assert!(
+            skip_step["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("skipList")
         );
     }
 
