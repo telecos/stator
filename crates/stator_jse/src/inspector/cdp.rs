@@ -3442,6 +3442,7 @@ impl CdpDispatcher {
     // ── Debugger.setBreakpointByUrl ──────────────────────────────────────────
 
     fn debugger_set_breakpoint(&mut self, params: &Value) -> StatorResult<Value> {
+        reject_unsupported_breakpoint_condition("Debugger.setBreakpoint", params)?;
         let location = params.get("location").ok_or_else(|| {
             crate::error::StatorError::TypeError(
                 "Debugger.setBreakpoint: required parameter 'location' is missing".to_string(),
@@ -3514,6 +3515,7 @@ impl CdpDispatcher {
     }
 
     fn debugger_set_breakpoint_by_url(&mut self, params: &Value) -> StatorResult<Value> {
+        reject_unsupported_breakpoint_condition("Debugger.setBreakpointByUrl", params)?;
         let line_number = params
             .get("lineNumber")
             .and_then(Value::as_u64)
@@ -4482,6 +4484,24 @@ fn url_breakpoint_matches(breakpoint: &CdpUrlBreakpoint, script_url: &str) -> St
             .is_some());
     }
     Ok(false)
+}
+
+fn reject_unsupported_breakpoint_condition(method: &str, params: &Value) -> StatorResult<()> {
+    let Some(condition) = params.get("condition") else {
+        return Ok(());
+    };
+    let condition = condition.as_str().ok_or_else(|| {
+        StatorError::TypeError(format!(
+            "{method}: optional parameter 'condition' must be a string"
+        ))
+    })?;
+    if condition.is_empty() {
+        return Ok(());
+    }
+    Err(unsupported_debugger_method(
+        method,
+        "conditional breakpoints are not implemented yet.",
+    ))
 }
 
 fn breakpoint_location_for_source(
@@ -6928,6 +6948,33 @@ mod tests {
     }
 
     #[test]
+    fn debugger_set_breakpoint_rejects_unsupported_conditions() {
+        let mut d = fresh_dispatcher();
+        d.register_script_source(
+            7,
+            "var a = 1;\nvar b = a + 2;\n//# sourceURL=stator://app.js".to_string(),
+        );
+
+        let conditional = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0},"condition":"a > 1"}}"#,
+        );
+        assert!(conditional["error"].is_object());
+        assert!(
+            conditional["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("conditional breakpoints")
+        );
+
+        let empty = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpoint","params":{"location":{"scriptId":"7","lineNumber":1,"columnNumber":0},"condition":""}}"#,
+        );
+        assert!(empty.get("error").is_none());
+    }
+
+    #[test]
     fn debugger_set_breakpoint_by_url_resolves_registered_script_url() {
         let mut d = fresh_dispatcher();
         d.register_script_source(
@@ -7002,6 +7049,28 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn debugger_set_breakpoint_by_url_rejects_unsupported_conditions() {
+        let mut d = fresh_dispatcher();
+        let conditional = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":0,"columnNumber":0,"condition":"a > 1"}}"#,
+        );
+        assert!(conditional["error"].is_object());
+        assert!(
+            conditional["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("conditional breakpoints")
+        );
+
+        let bad_type = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"stator://app.js","lineNumber":0,"columnNumber":0,"condition":true}}"#,
+        );
+        assert!(bad_type["error"].is_object());
     }
 
     #[test]
