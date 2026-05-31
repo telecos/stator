@@ -16581,8 +16581,11 @@ fn make_array() -> JsValue {
         props.insert(
             "fromAsync".into(),
             builtin_fn("fromAsync", 1, |args| {
-                use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+                use crate::builtins::promise::{
+                    active_microtask_queue, promise_reject, promise_resolve,
+                };
 
+                let queue = active_microtask_queue().unwrap_or_default();
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
                 let map_fn = args.get(1).cloned();
                 // Validate mapFn.
@@ -16590,9 +16593,12 @@ fn make_array() -> JsValue {
                     && !matches!(mf, JsValue::Undefined)
                     && !is_callable(mf)
                 {
-                    return Err(StatorError::TypeError(
-                        "Array.fromAsync: mapFn is not a function".into(),
-                    ));
+                    let error =
+                        StatorError::TypeError("Array.fromAsync: mapFn is not a function".into());
+                    return Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(error.to_string().into()),
+                        &queue,
+                    )));
                 }
                 // Collect items synchronously (covers sync iterables / array-like).
                 let items: Vec<JsValue> = match iterable {
@@ -16633,11 +16639,19 @@ fn make_array() -> JsValue {
                 // Apply mapFn if provided.
                 let mapped = if let Some(ref mf) = map_fn {
                     if !matches!(mf, JsValue::Undefined) {
-                        items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
-                            .collect::<Result<Vec<_>, _>>()?
+                        let mut mapped = Vec::with_capacity(items.len());
+                        for (i, v) in items.into_iter().enumerate() {
+                            match dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]) {
+                                Ok(value) => mapped.push(value),
+                                Err(error) => {
+                                    return Ok(JsValue::Promise(promise_reject(
+                                        JsValue::String(error.to_string().into()),
+                                        &queue,
+                                    )));
+                                }
+                            }
+                        }
+                        mapped
                     } else {
                         items
                     }
@@ -16645,8 +16659,6 @@ fn make_array() -> JsValue {
                     items
                 };
                 let result_arr = JsValue::new_array(mapped);
-                // Wrap in a resolved Promise.
-                let queue = MicrotaskQueue::new();
                 Ok(JsValue::Promise(promise_resolve(result_arr, &queue)))
             }),
         );
@@ -81759,47 +81771,49 @@ mod tests {
 
     /// `Array.fromAsync` with sync array resolves to array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_sync_array() {
-        let result = global_eval(
-            r#"
-            var p = Array.fromAsync([10, 20, 30]);
-            var arr = p.__value__;
-            arr.length
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        match eval_with_microtasks("Array.fromAsync([10, 20, 30])") {
+            JsValue::Promise(promise) => match promise.state() {
+                crate::builtins::promise::PromiseState::Fulfilled(JsValue::Array(items)) => {
+                    let items = items.borrow();
+                    assert_eq!(items.len(), 3);
+                    assert_eq!(items[0], JsValue::Smi(10));
+                    assert_eq!(items[1], JsValue::Smi(20));
+                    assert_eq!(items[2], JsValue::Smi(30));
+                }
+                other => panic!("expected fulfilled array promise, got {other:?}"),
+            },
+            other => panic!("expected promise, got {other:?}"),
+        }
     }
 
     /// `Array.fromAsync` with mapFn applies mapping.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_with_map_fn() {
-        let result = global_eval(
+        assert_microtask_transition(
             r#"
-            var p = Array.fromAsync([1, 2, 3], function(x) { return x * 2; });
-            var arr = p.__value__;
-            arr[0] + arr[1] + arr[2]
+            var seen = 0;
+            Array.fromAsync([1, 2, 3], function(x) { return x * 2; })
+                .then(function(arr) { seen = arr[0] + arr[1] + arr[2]; });
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(12));
+            "seen",
+            JsValue::Smi(0),
+            JsValue::Smi(12),
+        );
     }
 
     /// `Array.fromAsync` with empty array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_empty() {
-        let result = global_eval(
+        assert_microtask_transition(
             r#"
-            var p = Array.fromAsync([]);
-            var arr = p.__value__;
-            arr.length
+            var seen = -1;
+            Array.fromAsync([]).then(function(arr) { seen = arr.length; });
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(0));
+            "seen",
+            JsValue::Smi(-1),
+            JsValue::Smi(0),
+        );
     }
 
     /// `Array.fromAsync.length` is 1.
@@ -81819,8 +81833,37 @@ mod tests {
     /// `Array.fromAsync` rejects non-function mapFn.
     #[test]
     fn e2e_array_from_async_non_function_map_fn_throws() {
-        let result = global_eval("Array.fromAsync([1], 42)");
-        assert!(result.is_err());
+        match eval_with_microtasks("Array.fromAsync([1], 42)") {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert!(
+                    promise
+                        .reason()
+                        .and_then(|reason| reason.to_js_string().ok())
+                        .is_some_and(|reason| reason.contains("mapFn is not a function"))
+                );
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
+    }
+
+    /// `Array.fromAsync` rejects when mapFn throws.
+    #[test]
+    fn e2e_array_from_async_map_fn_throw_rejects() {
+        match eval_with_microtasks(
+            r#"Array.fromAsync([1], function() { throw new TypeError("bad map"); })"#,
+        ) {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert!(
+                    promise
+                        .reason()
+                        .and_then(|reason| reason.to_js_string().ok())
+                        .is_some_and(|reason| reason.contains("bad map"))
+                );
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
     }
 
     // ── Additional Object.groupBy e2e tests ─────────────────────────────

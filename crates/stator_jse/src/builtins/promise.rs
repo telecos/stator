@@ -143,6 +143,11 @@ pub fn enqueue_active_microtask(task: Box<dyn FnOnce()>) -> bool {
     })
 }
 
+/// Return the thread-local active microtask queue, if one is installed.
+pub fn active_microtask_queue() -> Option<MicrotaskQueue> {
+    ACTIVE_MTQ.with(|cell| cell.borrow().clone())
+}
+
 /// Return the async parent stack for the currently running microtask.
 pub fn current_async_stack_trace() -> Option<AsyncStackTrace> {
     ACTIVE_ASYNC_STACK.with(|cell| cell.borrow().clone())
