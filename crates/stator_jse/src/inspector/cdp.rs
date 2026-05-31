@@ -1745,6 +1745,7 @@ impl CdpDispatcher {
             "Debugger.setBlackboxPatterns" => self.debugger_set_blackbox_patterns(&req.params),
             "Debugger.setBlackboxedRanges" => self.debugger_set_blackboxed_ranges(&req.params),
             "Debugger.resume" => self.debugger_resume(),
+            "Debugger.terminateOnResume" => self.debugger_terminate_on_resume(),
             "Debugger.continueToLocation" => self.debugger_continue_to_location(&req.params),
             "Debugger.stepInto" => self.debugger_step(&req.params, DebugAction::StepInto),
             "Debugger.stepOver" => self.debugger_step(&req.params, DebugAction::StepOver),
@@ -3275,6 +3276,23 @@ impl CdpDispatcher {
         if emitted {
             self.notify_resumed();
         }
+        Ok(json!({}))
+    }
+
+    fn debugger_terminate_on_resume(&mut self) -> StatorResult<Value> {
+        let Some(debugger) = self.debugger.as_ref() else {
+            return Err(unsupported_debugger_method(
+                "Debugger.terminateOnResume",
+                "no same-thread interpreter Debugger is attached to this session.",
+            ));
+        };
+        if debugger.borrow().last_pause_reason().is_none() {
+            return Err(unsupported_debugger_method(
+                "Debugger.terminateOnResume",
+                "no active pause; terminateOnResume is only valid after a Debugger.paused event.",
+            ));
+        }
+        self.termination_requested.store(true, Ordering::SeqCst);
         Ok(json!({}))
     }
 
@@ -9766,6 +9784,51 @@ mod tests {
             remaining.iter().all(|m| m.get("method").is_none()),
             "no event expected when there is no active pause; got: {remaining:?}"
         );
+    }
+
+    #[test]
+    fn terminate_on_resume_interrupts_next_script_after_resume() {
+        let mut d = fresh_dispatcher();
+        let dbg = attach_test_debugger(&mut d);
+        let _ = dispatch(&mut d, r#"{"id":1,"method":"Debugger.enable","params":{}}"#);
+        let _ = drain_all(&mut d);
+        let _ = dbg.borrow_mut().on_debugger_statement(0);
+
+        let terminate = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Debugger.terminateOnResume","params":{}}"#,
+        );
+        assert!(terminate.get("error").is_none());
+        let resume = dispatch(&mut d, r#"{"id":3,"method":"Debugger.resume","params":{}}"#);
+        assert!(resume.get("error").is_none());
+
+        let interrupted = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Runtime.evaluate","params":{"expression":"1 + 2"}}"#,
+        );
+        assert!(
+            interrupted["result"]["exceptionDetails"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains(crate::interpreter::SCRIPT_TERMINATED_MESSAGE)
+        );
+
+        let after = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Runtime.evaluate","params":{"expression":"1 + 2"}}"#,
+        );
+        assert_eq!(after["result"]["result"]["value"], 3);
+    }
+
+    #[test]
+    fn terminate_on_resume_requires_active_pause() {
+        let mut d = fresh_dispatcher();
+        let _dbg = attach_test_debugger(&mut d);
+        let response = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Debugger.terminateOnResume","params":{}}"#,
+        );
+        assert!(response["error"].is_object());
     }
 
     #[test]
