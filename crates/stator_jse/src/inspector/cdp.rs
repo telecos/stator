@@ -68,6 +68,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia` | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
 //!
 //! # Example
@@ -456,6 +457,16 @@ pub struct CdpDispatcher {
     security_ignore_certificate_errors: bool,
     /// Whether the Performance domain is currently enabled for this session.
     performance_enabled: bool,
+    /// Cached `Emulation.setDeviceMetricsOverride` state.
+    emulation_device_metrics: Option<Value>,
+    /// Cached `Emulation.setTouchEmulationEnabled` state.
+    emulation_touch_enabled: bool,
+    /// Cached touch point count for touch emulation.
+    emulation_max_touch_points: u32,
+    /// Cached media type from `Emulation.setEmulatedMedia`.
+    emulation_media: String,
+    /// Cached media feature count from `Emulation.setEmulatedMedia`.
+    emulation_media_feature_count: usize,
     /// Whether the `Debugger` domain has been enabled by the client.  Used
     /// to gate fan-out of `Debugger.scriptParsed` events.
     debugger_enabled: bool,
@@ -572,6 +583,11 @@ impl CdpDispatcher {
             security_enabled: false,
             security_ignore_certificate_errors: false,
             performance_enabled: false,
+            emulation_device_metrics: None,
+            emulation_touch_enabled: false,
+            emulation_max_touch_points: 0,
+            emulation_media: String::new(),
+            emulation_media_feature_count: 0,
             debugger_enabled: false,
             target_discovery_enabled: false,
             closed_target_ids: HashSet::new(),
@@ -707,6 +723,31 @@ impl CdpDispatcher {
     /// Returns `true` if the Performance domain is currently enabled.
     pub fn performance_enabled(&self) -> bool {
         self.performance_enabled
+    }
+
+    /// Returns the cached device metrics override payload, if any.
+    pub fn emulation_device_metrics(&self) -> Option<&Value> {
+        self.emulation_device_metrics.as_ref()
+    }
+
+    /// Returns whether touch emulation is enabled.
+    pub fn emulation_touch_enabled(&self) -> bool {
+        self.emulation_touch_enabled
+    }
+
+    /// Returns the cached max touch-point count.
+    pub fn emulation_max_touch_points(&self) -> u32 {
+        self.emulation_max_touch_points
+    }
+
+    /// Returns the cached emulated media string.
+    pub fn emulation_media(&self) -> &str {
+        &self.emulation_media
+    }
+
+    /// Returns the cached emulated media feature count.
+    pub fn emulation_media_feature_count(&self) -> usize {
+        self.emulation_media_feature_count
     }
 
     /// Borrow the per-session remote-object registry.  Used by tests and
@@ -1422,6 +1463,18 @@ impl CdpDispatcher {
             }
             "Performance.getMetrics" => self.performance_get_metrics(),
 
+            // ── Emulation ─────────────────────────────────────────────────
+            "Emulation.setDeviceMetricsOverride" => {
+                self.emulation_set_device_metrics_override(&req.params)
+            }
+            "Emulation.clearDeviceMetricsOverride" => {
+                self.emulation_clear_device_metrics_override()
+            }
+            "Emulation.setTouchEmulationEnabled" => {
+                self.emulation_set_touch_emulation_enabled(&req.params)
+            }
+            "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
+
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
@@ -1560,6 +1613,66 @@ impl CdpDispatcher {
                 { "name": "TaskDuration", "value": 0.0 },
             ]
         }))
+    }
+
+    fn emulation_set_device_metrics_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let width = params.get("width").and_then(Value::as_u64);
+        let height = params.get("height").and_then(Value::as_u64);
+        let scale = params.get("deviceScaleFactor").and_then(Value::as_f64);
+        let mobile = params.get("mobile").and_then(Value::as_bool);
+        if width.is_none() || height.is_none() || scale.is_none() || mobile.is_none() {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setDeviceMetricsOverride: width, height, deviceScaleFactor, and mobile are required"
+                    .to_string(),
+            ));
+        }
+        if scale.is_some_and(|value| value < 0.0) {
+            return Err(crate::error::StatorError::RangeError(
+                "Emulation.setDeviceMetricsOverride: deviceScaleFactor must be non-negative"
+                    .to_string(),
+            ));
+        }
+        self.emulation_device_metrics = Some(params.clone());
+        Ok(json!({}))
+    }
+
+    fn emulation_clear_device_metrics_override(&mut self) -> StatorResult<Value> {
+        self.emulation_device_metrics = None;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_touch_emulation_enabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setTouchEmulationEnabled: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        let max_touch_points = params
+            .get("maxTouchPoints")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .min(u32::MAX as u64) as u32;
+        self.emulation_touch_enabled = enabled;
+        self.emulation_max_touch_points = max_touch_points;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_emulated_media(&mut self, params: &Value) -> StatorResult<Value> {
+        let media = params.get("media").and_then(Value::as_str).unwrap_or("");
+        let feature_count = match params.get("features") {
+            Some(Value::Array(features)) => features.len(),
+            Some(_) => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Emulation.setEmulatedMedia: optional parameter 'features' must be an array"
+                        .to_string(),
+                ));
+            }
+            None => 0,
+        };
+        self.emulation_media = media.to_string();
+        self.emulation_media_feature_count = feature_count;
+        Ok(json!({}))
     }
 
     // ── Runtime.enable ────────────────────────────────────────────────────────
@@ -3763,6 +3876,7 @@ fn schema_get_domains() -> Value {
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
             { "name": "Performance", "version": "1.3" },
+            { "name": "Emulation", "version": "1.3" },
             { "name": "Schema", "version": "1.3" }
         ]
     })
@@ -6009,6 +6123,52 @@ mod tests {
 
         assert_eq!(json["id"], 16u64);
         assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn emulation_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+        let metrics = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Emulation.setDeviceMetricsOverride","params":{"width":800,"height":600,"deviceScaleFactor":2,"mobile":false}}"#,
+        );
+        assert!(metrics.get("error").is_none());
+        assert!(d.emulation_device_metrics().is_some());
+
+        let bad_metrics = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Emulation.setDeviceMetricsOverride","params":{"width":800}}"#,
+        );
+        assert!(bad_metrics["error"].is_object());
+
+        let touch = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Emulation.setTouchEmulationEnabled","params":{"enabled":true,"maxTouchPoints":5}}"#,
+        );
+        assert!(touch.get("error").is_none());
+        assert!(d.emulation_touch_enabled());
+        assert_eq!(d.emulation_max_touch_points(), 5);
+
+        let media = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Emulation.setEmulatedMedia","params":{"media":"print","features":[{"name":"prefers-color-scheme","value":"dark"}]}}"#,
+        );
+        assert!(media.get("error").is_none());
+        assert_eq!(d.emulation_media(), "print");
+        assert_eq!(d.emulation_media_feature_count(), 1);
+
+        let media_bad = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Emulation.setEmulatedMedia","params":{"features":{}}}"#,
+        );
+        assert!(media_bad["error"].is_object());
+
+        let clear = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+        );
+        assert!(clear.get("error").is_none());
+        assert!(d.emulation_device_metrics().is_none());
     }
 
     #[test]
