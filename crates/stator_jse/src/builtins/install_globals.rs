@@ -53215,7 +53215,6 @@ mod tests {
 
     /// `reduce` on empty array with no initial value throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_empty_throws() {
         let result = global_eval("[].reduce(function(a, b) { return a + b })");
         assert!(
@@ -53242,7 +53241,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_skips_holes_and_passes_callback_arguments() {
         let result = global_eval(
             "var seen = []; \
@@ -53257,7 +53255,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_right_skips_holes_and_passes_callback_arguments() {
         let result = global_eval(
             "var seen = []; \
@@ -53371,7 +53368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_spreads_arrays_and_appends_scalars() {
         let result = global_eval("[1].concat([2], 3).join(',')").unwrap();
         assert_eq!(result, JsValue::String("1,2,3".into()));
@@ -53437,7 +53433,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_length_shrink_truncates_elements() {
         let result = global_eval(
             "var a = [1,2,3]; \
@@ -55760,7 +55755,6 @@ mod tests {
 
     /// `Array.prototype.at` works on generic array-like objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_at_array_like_negative() {
         let result =
             global_eval("Array.prototype.at.call({0: 'x', 1: 'y', length: 2}, -1)").unwrap();
