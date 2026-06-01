@@ -66949,7 +66949,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap_allows_strings_and_symbols() {
         let r = global_eval(
             r#"
@@ -67236,7 +67235,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_own_keys_allows_extra_keys_on_extensible_target() {
         assert_eval_true(
             r#"
@@ -67263,7 +67261,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_own_keys_allows_omitting_configurable_key_on_extensible_target() {
         assert_eval_true(
             r#"
