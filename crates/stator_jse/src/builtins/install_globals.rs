@@ -47476,10 +47476,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_numeric_separator_literals() {
         let result = global_eval("1_000_000 + 0xFF_FF + 0o7_7 + 0b10_10").unwrap();
-        assert_eq!(result, JsValue::Smi(1_065_622));
+        assert_eq!(result, JsValue::Smi(1_065_608));
     }
 
     #[test]
