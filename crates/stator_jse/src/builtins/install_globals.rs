@@ -52726,7 +52726,6 @@ mod tests {
 
     /// `Map` set/get round-trip.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_has_get() {
         let result = global_eval("var m = new Map(); m.set('key', 42); m.get('key')").unwrap();
         assert_eq!(result, JsValue::Smi(42));
@@ -52734,7 +52733,6 @@ mod tests {
 
     /// `Set.prototype.has` returns true for added values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_has() {
         let result = global_eval("var s = new Set(); s.add(42); s.has(42)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -52993,7 +52991,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_sort_handles_non_array_objects_with_length() {
         let result = global_eval(
             "var o = {0: 'b', 2: 'a', length: 3}; \
@@ -53141,7 +53138,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_includes_skips_sparse_holes() {
         let result = global_eval("var a = []; a.length = 1; a.includes(undefined)").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
