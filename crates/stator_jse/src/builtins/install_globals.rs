@@ -62640,7 +62640,6 @@ mod tests {
 
     /// `Object.getPrototypeOf({})` should return Object.prototype (not null).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_plain_object() {
         let result = global_eval("Object.getPrototypeOf({}) !== null").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -62905,7 +62904,6 @@ mod tests {
 
     /// `Object.create(proto)` sets prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_with_proto() {
         let result = global_eval("var p = { x: 42 }; var o = Object.create(p); o.x").unwrap();
         assert_eq!(result, JsValue::Smi(42));
@@ -63131,7 +63129,6 @@ mod tests {
     // ── Conformance: prototype chain edge cases ──────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_updates_prototype_chain() {
         let result = global_eval(
             "var proto = { x: 1 }; var obj = {}; obj.__proto__ = proto; \
@@ -63175,14 +63172,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_null_proto_object_has_no_tostring() {
         let result = global_eval("typeof Object.create(null).toString").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_null_proto_object_has_no_has_own_property_method() {
         let result = global_eval("typeof Object.create(null).hasOwnProperty").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -63204,7 +63199,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_respects_null_prototype() {
         let result = global_eval("var o = Object.create(null); 'toString' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
@@ -63222,7 +63216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_accessor_inherited_is_false() {
         let result = global_eval(
             "var p = {}; \
@@ -63255,7 +63248,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_uses_constructor_prototype_chain() {
         let result = global_eval(
             "function F() {} var o = new F(); \
@@ -63308,7 +63300,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_is_prototype_of_new_instance() {
         let result = global_eval("function F() {} F.prototype.isPrototypeOf(new F())").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -63321,7 +63312,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_after_proto_assignment() {
         let result =
             global_eval("var p = {}; var o = {}; o.__proto__ = p; Object.getPrototypeOf(o) === p")
