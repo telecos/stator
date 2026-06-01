@@ -47216,7 +47216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_bind_inherits_function_prototype_methods() {
         assert_eval_true(
             "function add(a, b) { return a + b; } var bound = add.bind(null, 1); bound.call(null, 2) === 3",
@@ -47229,7 +47228,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_call_ignores_bound_this_when_recalled() {
         assert_eval_true(
             "function f() { return this.value; } var g = f.bind({ value: 1 }); g.call({ value: 2 }) === 1",
