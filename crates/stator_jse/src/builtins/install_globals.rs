@@ -50020,7 +50020,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_static_method_constructs_instance() {
         let result = global_eval(
             "class Foo { static create() { return new Foo(); } } Foo.create() instanceof Foo",
@@ -50096,7 +50095,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_extends_dynamic_expression_uses_returned_base() {
         let result = global_eval(
             "class Base { value() { return 7; } } \
@@ -50232,7 +50230,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_new_target_flows_through_super_call() {
         let result = global_eval(
             "class Base { constructor() { this.nt = new.target; } } \
