@@ -58666,12 +58666,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_escapes_quotes_backslashes_and_controls() {
         let result = global_eval(r#"JSON.stringify({ s: "quote\"\slash\\line\n\t\b" })"#).unwrap();
         assert_eq!(
             result,
-            JsValue::String(r#"{"s":"quote\"\slash\\line\n\t\b"}"#.into())
+            JsValue::String(r#"{"s":"quote\"slash\\line\n\t\b"}"#.into())
         );
     }
 
@@ -58705,7 +58704,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_parse_reviver_array_undefined_stringifies_as_null() {
         let result = global_eval(
             r#"
