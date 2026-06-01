@@ -49841,7 +49841,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_inherits_prototype_methods() {
         let result = global_eval(
             "class MyError extends Error { marker() { return 7; } } \
