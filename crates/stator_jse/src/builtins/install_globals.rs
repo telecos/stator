@@ -53909,7 +53909,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_math_object_to_string_uses_math_tag() {
         let result = global_eval("Object.prototype.toString.call(Math)").unwrap();
         assert_eq!(result, JsValue::String("[object Math]".into()));
@@ -54059,7 +54058,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_string_wrapper_is_instance_of_string() {
         assert_eval_true("Object('hello') instanceof String");
     }
@@ -54110,7 +54108,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_number_wrapper_is_instance_of_number() {
         assert_eval_true("Object(42) instanceof Number");
     }
@@ -54151,7 +54148,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_boolean_wrapper_is_instance_of_boolean() {
         assert_eval_true("Object(true) instanceof Boolean");
     }
@@ -54162,7 +54158,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_primitive_to_string_autoboxes() {
         assert_eval_true("Symbol('s').toString() === 'Symbol(s)'");
     }
@@ -54178,7 +54173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_symbol_wrapper_is_instance_of_symbol() {
         assert_eval_true("var s = Symbol('s'); Object(s) instanceof Symbol");
     }
@@ -62096,7 +62090,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_object_to_string_uses_tag() {
         assert_eval_true("Object.prototype.toString.call(Atomics) === '[object Atomics]'");
     }
