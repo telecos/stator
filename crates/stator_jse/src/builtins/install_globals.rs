@@ -69057,7 +69057,6 @@ mod tests {
 
     /// for-of with custom Symbol.iterator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_custom_iterator() {
         let r = global_eval(
             r#"
@@ -69083,7 +69082,6 @@ mod tests {
 
     /// for-of break calls .return() on the iterator.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix iterator return protocol on break
     fn e2e_for_of_break_calls_return() {
         let r = global_eval(
             r#"
@@ -69126,7 +69124,6 @@ mod tests {
 
     /// Spread in array literal uses iteration protocol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_array_literal() {
         let r = global_eval("var a = [1, ...[2, 3], 4]; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4".into()));
@@ -69134,7 +69131,6 @@ mod tests {
 
     /// Spread string in array literal.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_string_in_array() {
         let r = global_eval("var a = [...'hi']; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("h,i".into()));
@@ -69185,7 +69181,6 @@ mod tests {
 
     /// Iterator protocol: missing done defaults to false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_missing_done_defaults_false() {
         let r = global_eval(
             r#"
@@ -69209,7 +69204,6 @@ mod tests {
 
     /// Iterator protocol: truthy string done stops iteration.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_truthy_done() {
         let r = global_eval(
             r#"
@@ -69344,7 +69338,6 @@ mod tests {
 
     /// for-of over generator with early return.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_generator_break() {
         let r = global_eval(
             r#"
@@ -69403,7 +69396,6 @@ mod tests {
 
     /// Spread multiple iterables in array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_multiple_in_array() {
         let r = global_eval("var a = [...[1, 2], ...[3, 4], 5]; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
@@ -69439,7 +69431,6 @@ mod tests {
 
     /// Spread empty array produces empty.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_empty_array() {
         let r = global_eval("[...[]].length").unwrap();
         assert_eq!(r, JsValue::Smi(0));
@@ -69489,7 +69480,6 @@ mod tests {
 
     /// Spread with custom Symbol.iterator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_custom_iterator() {
         let r = global_eval(
             r#"
