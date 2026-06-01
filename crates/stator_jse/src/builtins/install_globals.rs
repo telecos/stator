@@ -39103,7 +39103,6 @@ mod tests {
 
     /// Symbol as Map key.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_as_map_key() {
         let result = global_eval(
             r#"
@@ -39119,7 +39118,6 @@ mod tests {
 
     /// Different symbols as different Map keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_map_different_keys() {
         let result = global_eval(
             r#"
