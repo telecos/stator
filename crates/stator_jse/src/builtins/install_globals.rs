@@ -37405,7 +37405,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_key_distinct_from_string_key() {
         let result = global_eval(
             r#"
@@ -38012,7 +38011,6 @@ mod tests {
     );
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_custom_object() {
         let result = global_eval(
             r#"
@@ -38343,7 +38341,6 @@ mod tests {
 
     /// `Symbol.prototype` has `toString`, `valueOf`, `description` methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_symbol_prototype_methods() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
@@ -38361,10 +38358,7 @@ mod tests {
                     proto_map.get("valueOf"),
                     Some(JsValue::NativeFunction(_))
                 ));
-                assert!(matches!(
-                    proto_map.get("description"),
-                    Some(JsValue::NativeFunction(_))
-                ));
+                assert!(proto_map.is_accessor_property("description"));
             } else {
                 panic!("Symbol.prototype should be a PlainObject");
             }
@@ -38633,7 +38627,6 @@ mod tests {
 
     /// `Symbol.hasInstance` customises `instanceof`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_has_instance_usage() {
         let result = global_eval(
             r#"
@@ -38649,7 +38642,6 @@ mod tests {
 
     /// `Symbol.toStringTag` controls Object.prototype.toString output.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_usage() {
         let result = global_eval(
             r#"
@@ -43915,7 +43907,6 @@ mod tests {
 
     /// Setting Symbol.toStringTag changes Object.prototype.toString result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_custom_class() {
         assert_eval_true(
             r#"
@@ -43928,7 +43919,6 @@ mod tests {
 
     /// Symbol.toStringTag on null-prototype object works.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_null_proto() {
         assert_eval_true(
             r#"

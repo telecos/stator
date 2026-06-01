@@ -6118,25 +6118,17 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.cheap_clone();
 
-    // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
-    let rhs_callable = match &constructor {
-        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
-        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
-        JsValue::Proxy(p) => p.borrow().is_callable(),
-        _ => false,
-    };
-    if !rhs_callable {
+    if !is_js_receiver(&constructor) {
         return Err(StatorError::TypeError(
-            "Right-hand side of 'instanceof' is not callable".to_string(),
+            "Right-hand side of 'instanceof' is not an object".to_string(),
         ));
     }
 
-    // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
+    // §13.10.1 InstanceofOperator — consult @@hasInstance before checking
+    // ordinary RHS callability.
     let has_instance_fn = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
         JsValue::NativeFunction(_) | JsValue::Function(_) => {
-            // Look up @@hasInstance via the prototype chain (e.g.
-            // Function.prototype[@@hasInstance]).
             let v = proto_lookup(&constructor, "@@hasInstance");
             if matches!(v, JsValue::Undefined) {
                 None
@@ -6161,6 +6153,19 @@ fn handle_test_instance_of(
             }
             _ => {}
         }
+    }
+
+    // §7.3.21 OrdinaryHasInstance — without @@hasInstance, RHS must be callable.
+    let rhs_callable = match &constructor {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        JsValue::Proxy(p) => p.borrow().is_callable(),
+        _ => false,
+    };
+    if !rhs_callable {
+        return Err(StatorError::TypeError(
+            "Right-hand side of 'instanceof' is not callable".to_string(),
+        ));
     }
 
     // ── Built-in type checks via constructor identity ──────────────
