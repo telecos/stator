@@ -69812,7 +69812,6 @@ mod tests {
 
     /// Basic private instance field with initializer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_basic() {
         let r = global_eval(
             "class Foo { #x = 42; getX() { return this.#x; } } \
@@ -69824,7 +69823,6 @@ mod tests {
 
     /// Private field defaults to undefined when no initializer is given.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_default_undefined() {
         let r = global_eval(
             "class Foo { #x; getX() { return this.#x; } } \
@@ -69836,7 +69834,6 @@ mod tests {
 
     /// Private field can be mutated via a setter method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_setter() {
         let r = global_eval(
             "class Foo { #x = 0; setX(v) { this.#x = v; } getX() { return this.#x; } } \
@@ -69848,7 +69845,6 @@ mod tests {
 
     /// Multiple private fields on the same class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_multiple() {
         let r = global_eval(
             "class Point { #x = 1; #y = 2; sum() { return this.#x + this.#y; } } \
@@ -69860,7 +69856,6 @@ mod tests {
 
     /// Each instance gets its own private field value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_per_instance() {
         let r = global_eval(
             "class C { #v; constructor(v) { this.#v = v; } get() { return this.#v; } } \
@@ -69872,7 +69867,6 @@ mod tests {
 
     /// Private method returning a constant.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_basic() {
         let r = global_eval(
             "class Foo { #secret() { return 42; } reveal() { return this.#secret(); } } \
@@ -69884,7 +69878,6 @@ mod tests {
 
     /// Private method accessing a private field.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_accesses_field() {
         let r = global_eval(
             "class Foo { #x = 10; #double() { return this.#x * 2; } run() { return this.#double(); } } \
@@ -69946,7 +69939,6 @@ mod tests {
 
     /// Private field with expression initializer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_expr_initializer() {
         let r = global_eval(
             "class Foo { #x = 3 + 4; getX() { return this.#x; } } \
@@ -69991,7 +69983,6 @@ mod tests {
 
     /// `Array.from` with a Set produces the set's values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_set() {
         let r =
             global_eval("var s = new Set(); s.add(1); s.add(2); s.add(3); Array.from(s).join(',')")
@@ -70085,7 +70076,6 @@ mod tests {
 
     /// `Array.from` prefers the iterable protocol for custom iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_custom_iterable() {
         let r = global_eval(
             r#"
@@ -70108,7 +70098,6 @@ mod tests {
 
     /// `Array.from` supports `Map` iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_map_iterable() {
         let r = global_eval(
             "Array.from(new Map([['a', 1], ['b', 2]])).map(function(pair) { return pair[0] + pair[1]; }).join('|')",
@@ -70175,7 +70164,6 @@ mod tests {
 
     /// `flat` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_array_like_receiver() {
         let r = global_eval("Array.prototype.flat.call({ 0: [1, 2], 1: 3, length: 2 }).join(',')")
             .unwrap();
@@ -70196,7 +70184,6 @@ mod tests {
 
     /// `flatMap` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_array_like_receiver() {
         let r = global_eval(
             "Array.prototype.flatMap.call({ 0: 2, 1: 3, length: 2 }, function(v) { return [v, v + 1]; }).join(',')",
@@ -70233,7 +70220,6 @@ mod tests {
 
     /// `findLastIndex` works on array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_index_array_like() {
         let r = global_eval(
             "Array.prototype.findLastIndex.call({ 0: 1, 1: 4, 2: 6, length: 3 }, function(v) { return v % 2 === 0; })",
