@@ -50294,8 +50294,8 @@ mod tests {
         method: &str,
         args: Vec<JsValue>,
     ) -> StatorResult<JsValue> {
-        if let Some(JsValue::NativeFunction(f)) = proto.borrow().get(method).cloned() {
-            f(args)
+        if let Some(method_value) = proto.borrow().get(method).cloned() {
+            dispatch_call_value(&method_value, args)
         } else {
             panic!("String.prototype.{method} not found");
         }
@@ -50409,7 +50409,6 @@ mod tests {
 
     /// `trimLeft` is a legacy alias for `trimStart`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_trim_left_alias() {
         let proto = string_proto();
         let result = call_string_method(
@@ -50423,7 +50422,6 @@ mod tests {
 
     /// `trimRight` is a legacy alias for `trimEnd`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_trim_right_alias() {
         let proto = string_proto();
         let result = call_string_method(
@@ -52089,19 +52087,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_splits_two_astrals() {
         assert_eval_true(r#"[..."𝐀𝐁"].length === 2"#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_preserves_values() {
         assert_eval_true(r#"[..."𝐀𝐁"].join("|") === "𝐀|𝐁""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_from_surrogate_escapes() {
         assert_eval_true(r#"[..."\uD835\uDC00\uD835\uDC01"].length === 2"#);
     }
