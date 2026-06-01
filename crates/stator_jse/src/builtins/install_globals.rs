@@ -49319,7 +49319,6 @@ mod tests {
 
     /// `Object.create(proto)` sets up prototype chain for property lookup.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_prototype_chain() {
         let result = global_eval(
             r#"
@@ -49349,7 +49348,6 @@ mod tests {
 
     /// `Object.getPrototypeOf` returns the prototype set by Object.create.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_created_object() {
         let result = global_eval(
             r#"
@@ -49395,7 +49393,6 @@ mod tests {
 
     /// Multi-level prototype chain property resolution.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_multi_level_prototype_chain() {
         let result = global_eval(
             r#"
@@ -49798,7 +49795,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_instanceof_chain() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49810,7 +49806,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_prototype_chain() {
         let result = global_eval(
             "class MyError extends Error {} \
