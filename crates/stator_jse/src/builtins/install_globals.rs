@@ -49819,7 +49819,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_message() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49830,7 +49829,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_stack() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49851,7 +49849,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_cause() {
         let result = global_eval(
             "class MyError extends Error { constructor(msg, cause) { super(msg, { cause }); } } \
@@ -50126,7 +50123,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_default_derived_constructor_forwards_args() {
         let result = global_eval(
             "class Base { constructor(x) { this.x = x; } } \
@@ -50138,7 +50134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_default_derived_constructor_preserves_new_target() {
         let result = global_eval(
             "class Base { constructor() { this.isChild = new.target === Child; } } \

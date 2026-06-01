@@ -2209,8 +2209,7 @@ fn handle_call_any_receiver(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    ctx.frame.accumulator = f(args.into_vec())?;
-                    ctx.frame.global_cache_invalidate();
+                    ctx.frame.accumulator = call_plain_object_native_function(ctx, map, &f, args)?;
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -3031,13 +3030,19 @@ fn handle_call_with_spread(
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(args.into_vec())?;
-                ctx.frame.global_cache_invalidate();
-            } else {
-                return Err(StatorError::TypeError(
-                    "CallWithSpread: callee is not a function (got PlainObject)".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    ctx.frame.accumulator = call_plain_object_native_function(ctx, map, &f, args)?;
+                }
+                Some(JsValue::Function(ba)) => {
+                    call_plain_object_function(ctx, &ba, map, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CallWithSpread: callee is not a function (got PlainObject)".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -3055,6 +3060,45 @@ fn handle_call_with_spread(
 /// constructor is called (not `[[Construct]]`-ed).  The shared global
 /// environment already has `"this"` set by the enclosing `[[Construct]]`
 /// handler, so the parent body can see and mutate the same object.
+fn call_plain_object_native_function(
+    ctx: &mut DispatchContext,
+    map: &Rc<RefCell<PropertyMap>>,
+    f: &crate::objects::value::NativeFn,
+    args: CallArgs,
+) -> StatorResult<JsValue> {
+    let pending_super_this = {
+        let env = ctx.frame.global_env.borrow();
+        let is_super_callee = matches!(
+            env.get("super"),
+            Some(JsValue::PlainObject(super_map)) if Rc::ptr_eq(super_map, map)
+        );
+        if is_super_callee {
+            env.get(".class_pending_this").cloned()
+        } else {
+            None
+        }
+    };
+
+    if let Some(pending_this) = pending_super_this {
+        let current_this = ctx
+            .frame
+            .global_env
+            .borrow()
+            .get_this()
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        if current_this != JsValue::TheHole {
+            return Err(StatorError::ReferenceError(
+                "Super constructor may only be called once".into(),
+            ));
+        }
+        ctx.frame.global_env.borrow_mut().set_this(pending_this);
+    }
+
+    let result = f(args.into_vec())?;
+    ctx.frame.global_cache_invalidate();
+    Ok(result)
+}
 fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
