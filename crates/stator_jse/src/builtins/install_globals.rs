@@ -64118,7 +64118,6 @@ mod tests {
 
     /// Property access walks the prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_prototype_chain_access() {
         let result = global_eval(
             "var gp = { z: 100 }; \
@@ -64134,7 +64133,6 @@ mod tests {
 
     /// 'in' operator checks prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_prototype() {
         let result = global_eval("var p = { x: 1 }; var o = Object.create(p); 'x' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -64395,7 +64393,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_create_null_prototype_has_no_object_methods() {
         let result = global_eval("typeof Object.create(null).toString").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -67980,7 +67977,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_via_proxy_own_keys_trap() {
         let r = global_eval(
             r#"
