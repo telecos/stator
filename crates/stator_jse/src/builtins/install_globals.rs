@@ -46871,7 +46871,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_strict_mode_throws() {
         let result =
             global_eval("function outer() { 'use strict'; return arguments.callee; } outer()")
@@ -46880,7 +46879,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_strict_mode_computed_throws() {
         let result =
             global_eval("function outer() { 'use strict'; return arguments['callee']; } outer()")
@@ -47356,7 +47354,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_length_and_index_access() {
         assert_eval_true(
             "function f(a) { return arguments.length === 3 && arguments[0] === 1 && arguments[2] === 3; } f(1, 2, 3)",

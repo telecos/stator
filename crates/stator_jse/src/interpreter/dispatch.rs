@@ -6770,13 +6770,7 @@ fn handle_create_mapped_arguments(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let args: Vec<JsValue> = ctx
-        .frame
-        .call_args
-        .get(..param_count)
-        .unwrap_or(&[])
-        .to_vec();
+    let args: Vec<JsValue> = ctx.frame.call_args.to_vec();
     let mut map = PropertyMap::new();
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
@@ -6810,13 +6804,7 @@ fn handle_create_unmapped_arguments(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let args: Vec<JsValue> = ctx
-        .frame
-        .call_args
-        .get(..param_count)
-        .unwrap_or(&[])
-        .to_vec();
+    let args: Vec<JsValue> = ctx.frame.call_args.to_vec();
     let mut map = PropertyMap::new();
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
@@ -6826,14 +6814,14 @@ fn handle_create_unmapped_arguments(
         JsValue::Smi(args.len() as i32),
         PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
     );
-    map.insert(
-        "callee".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
-            Err(StatorError::TypeError(
-                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
-            ))
-        })),
-    );
+    let restricted_callee = JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
+        Err(StatorError::TypeError(
+            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+        ))
+    }));
+    map.insert("__get_callee__".to_string(), restricted_callee.clone());
+    map.insert("__set_callee__".to_string(), restricted_callee);
+    map.mark_accessor_property("callee");
     // @@iterator: array-like iteration support via NativeIterator
     let args_for_iter = args.clone();
     map.insert(
