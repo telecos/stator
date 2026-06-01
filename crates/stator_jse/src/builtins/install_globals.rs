@@ -43685,7 +43685,6 @@ mod tests {
 
     /// Module code strict: arguments.callee throws in strict mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_strict_arguments_callee_throws() {
         assert_eval_type_error(
             r#"
