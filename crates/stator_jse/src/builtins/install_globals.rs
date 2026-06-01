@@ -50129,7 +50129,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_method_call_uses_parent_method() {
         let result = global_eval(
             "class Base { value() { return 2; } } \
@@ -50141,7 +50140,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_method_call_preserves_receiver() {
         let result = global_eval(
             "class Base { read() { return this.value; } } \
@@ -50153,7 +50151,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_property_access_in_method() {
         let result = global_eval(
             "class Base { get answer() { return 4; } } \
@@ -50165,7 +50162,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_in_static_method_calls_parent_static() {
         let result = global_eval(
             "class Parent { static bar() { return 5; } } \
@@ -50177,7 +50173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_in_static_method_preserves_receiver() {
         let result = global_eval(
             "class Parent { static read() { return this.value; } } \

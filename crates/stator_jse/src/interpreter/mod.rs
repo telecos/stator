@@ -14307,11 +14307,14 @@ pub(super) fn restore_closure_context(
     let home_object = fn_props_get(ba, ".home_object");
     match home_object {
         JsValue::PlainObject(map) => {
-            let super_lookup_start = map
-                .borrow()
-                .get(INTERNAL_PROTO_PROPERTY_KEY)
-                .cloned()
-                .unwrap_or(JsValue::Undefined);
+            let super_lookup_start = {
+                let borrow = map.borrow();
+                borrow
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| borrow.get("__proto__"))
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+            };
             frame
                 .global_env
                 .borrow_mut()
