@@ -18091,14 +18091,20 @@ fn make_symbol() -> JsValue {
             }
         }
 
+        fn symbol_receiver_id(arg: Option<&JsValue>) -> Option<u64> {
+            if let Some(id) = arg.and_then(symbol_this_id) {
+                return Some(id);
+            }
+            current_this().as_ref().and_then(symbol_this_id)
+        }
+
         let mut proto = PropertyMap::new();
 
         // Symbol.prototype.description — getter returning the description.
         proto.insert(
             "__get_description__".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(desc.into())),
                         None => Ok(JsValue::Undefined),
@@ -18115,8 +18121,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "toString".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
                         None => Ok(JsValue::String("Symbol()".to_string().into())),
@@ -18133,8 +18138,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "valueOf".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
@@ -18149,8 +18153,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "@@toPrimitive".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
@@ -37237,7 +37240,6 @@ mod tests {
 
     /// `Object(Symbol("foo")).description` uses the wrapper receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_description_with_value() {
         let result = global_eval(r#"Object(Symbol("foo")).description"#).unwrap();
         assert_eq!(result, JsValue::String("foo".into()));
@@ -37254,7 +37256,6 @@ mod tests {
 
     /// `Symbol("foo").toString()` → "Symbol(foo)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_with_desc() {
         let result = global_eval(r#"Symbol("foo").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol(foo)".into()));
@@ -37262,7 +37263,6 @@ mod tests {
 
     /// `Symbol().toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_no_desc() {
         let result = global_eval("Symbol().toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -37270,7 +37270,6 @@ mod tests {
 
     /// `typeof Symbol("x").toString()` → "string"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_is_string() {
         let result = global_eval(r#"typeof Symbol("x").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("string".into()));
@@ -37280,7 +37279,6 @@ mod tests {
 
     /// `typeof Symbol("x").valueOf()` → "symbol"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_value_of_is_symbol() {
         let result = global_eval(r#"typeof Symbol("x").valueOf()"#).unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
@@ -37288,7 +37286,6 @@ mod tests {
 
     /// `Symbol.iterator.valueOf() === Symbol.iterator`
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_value_of_identity() {
         let result = global_eval("Symbol.iterator.valueOf() === Symbol.iterator").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -37296,7 +37293,6 @@ mod tests {
 
     /// `Object(Symbol("x"))` inherits from `Symbol.prototype`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_has_symbol_prototype() {
         assert_eval_true(r#"Object.getPrototypeOf(Object(Symbol("x"))) === Symbol.prototype"#);
     }
@@ -38543,7 +38539,6 @@ mod tests {
 
     /// `Symbol.iterator.toString()` returns "Symbol(Symbol.iterator)".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_iterator_to_string() {
         let result = global_eval("Symbol.iterator.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.iterator)".into()));
@@ -38551,7 +38546,6 @@ mod tests {
 
     /// `Symbol("").toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_empty_desc_to_string() {
         let result = global_eval(r#"Symbol("").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -38771,7 +38765,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("string")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_string_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38785,7 +38778,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("number")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_number_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38799,7 +38791,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("default")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_default_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38813,7 +38804,6 @@ mod tests {
 
     /// `typeof Symbol("x")[Symbol.toPrimitive]("string")` → "symbol".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_result_is_symbol() {
         let result = global_eval(r#"typeof Symbol("x")[Symbol.toPrimitive]("string")"#).unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
@@ -38821,7 +38811,6 @@ mod tests {
 
     /// Boxed symbols inherit `@@toPrimitive` from `Symbol.prototype`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_to_primitive_returns_symbol() {
         assert_eval_true(
             r#"
@@ -38844,7 +38833,6 @@ mod tests {
 
     /// Well-known symbol via @@toPrimitive preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_well_known_symbol_to_primitive_identity() {
         let result =
             global_eval("Symbol.iterator[Symbol.toPrimitive]('default') === Symbol.iterator")
@@ -38856,7 +38844,6 @@ mod tests {
 
     /// `Symbol.toPrimitive.toString()` → "Symbol(Symbol.toPrimitive)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_to_string() {
         let result = global_eval("Symbol.toPrimitive.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.toPrimitive)".into()));
@@ -38864,7 +38851,6 @@ mod tests {
 
     /// `Symbol.hasInstance.toString()` → "Symbol(Symbol.hasInstance)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_has_instance_to_string() {
         let result = global_eval("Symbol.hasInstance.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.hasInstance)".into()));
@@ -38872,7 +38858,6 @@ mod tests {
 
     /// `Symbol.toStringTag.toString()` → "Symbol(Symbol.toStringTag)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_to_string() {
         let result = global_eval("Symbol.toStringTag.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.toStringTag)".into()));
@@ -38880,7 +38865,6 @@ mod tests {
 
     /// `Symbol.species.toString()` → "Symbol(Symbol.species)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_species_to_string() {
         let result = global_eval("Symbol.species.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.species)".into()));
@@ -38888,7 +38872,6 @@ mod tests {
 
     /// `Symbol.isConcatSpreadable.toString()`
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_is_concat_spreadable_to_string() {
         let result = global_eval("Symbol.isConcatSpreadable.toString()").unwrap();
         assert_eq!(
@@ -38899,7 +38882,6 @@ mod tests {
 
     /// `Symbol.match.toString()` → "Symbol(Symbol.match)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_match_to_string() {
         let result = global_eval("Symbol.match.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.match)".into()));
@@ -38907,7 +38889,6 @@ mod tests {
 
     /// `Symbol.replace.toString()` → "Symbol(Symbol.replace)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_replace_to_string() {
         let result = global_eval("Symbol.replace.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.replace)".into()));
@@ -38915,7 +38896,6 @@ mod tests {
 
     /// `Symbol.search.toString()` → "Symbol(Symbol.search)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_search_to_string() {
         let result = global_eval("Symbol.search.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.search)".into()));
@@ -38923,7 +38903,6 @@ mod tests {
 
     /// `Symbol.split.toString()` → "Symbol(Symbol.split)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_split_to_string() {
         let result = global_eval("Symbol.split.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.split)".into()));
@@ -38931,7 +38910,6 @@ mod tests {
 
     /// `Symbol.unscopables.toString()` → "Symbol(Symbol.unscopables)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_unscopables_to_string() {
         let result = global_eval("Symbol.unscopables.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.unscopables)".into()));
@@ -38939,7 +38917,6 @@ mod tests {
 
     /// `Symbol.asyncIterator.toString()` → "Symbol(Symbol.asyncIterator)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_async_iterator_to_string() {
         let result = global_eval("Symbol.asyncIterator.toString()").unwrap();
         assert_eq!(
@@ -38950,7 +38927,6 @@ mod tests {
 
     /// `Symbol.matchAll.toString()` → "Symbol(Symbol.matchAll)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_match_all_to_string() {
         let result = global_eval("Symbol.matchAll.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.matchAll)".into()));
@@ -38960,7 +38936,6 @@ mod tests {
 
     /// User symbol valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_user_value_of_identity() {
         let result = global_eval(
             r#"
@@ -38974,7 +38949,6 @@ mod tests {
 
     /// Symbol.for symbol valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_value_of_identity() {
         let result = global_eval(r#"Symbol.for("vof").valueOf() === Symbol.for("vof")"#).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -38982,7 +38956,6 @@ mod tests {
 
     /// Well-known Symbol.toPrimitive valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_value_of_identity() {
         let result = global_eval("Symbol.toPrimitive.valueOf() === Symbol.toPrimitive").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -38992,7 +38965,6 @@ mod tests {
 
     /// `Symbol.for("x").toString()` → "Symbol(x)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_to_string() {
         let result = global_eval(r#"Symbol.for("x").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol(x)".into()));
@@ -39000,7 +38972,6 @@ mod tests {
 
     /// `Symbol.for("").toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_empty_to_string() {
         let result = global_eval(r#"Symbol.for("").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -39054,7 +39025,6 @@ mod tests {
 
     /// Symbol strict-not-equals to its toString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_not_equal_to_its_tostring() {
         let result = global_eval(
             r#"
@@ -39149,7 +39119,6 @@ mod tests {
 
     /// `Symbol.dispose.toString()` → "Symbol(Symbol.dispose)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_dispose_to_string() {
         let result = global_eval("Symbol.dispose.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.dispose)".into()));
@@ -39157,7 +39126,6 @@ mod tests {
 
     /// `Symbol.asyncDispose.toString()` → "Symbol(Symbol.asyncDispose)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_async_dispose_to_string() {
         let result = global_eval("Symbol.asyncDispose.toString()").unwrap();
         assert_eq!(
