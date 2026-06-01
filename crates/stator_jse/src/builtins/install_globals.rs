@@ -13876,14 +13876,16 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
 fn date_proto_delegate(name: &str) -> JsValue {
     let name = name.to_string();
     native(move |args| {
+        let env_this = current_global_env().and_then(|env| env.borrow().get_this().cloned());
         let (this, forwarded_args) = match args.first().cloned() {
-            Some(JsValue::Undefined) | None => {
-                let env_this = current_global_env()
-                    .and_then(|env| env.borrow().get_this().cloned())
-                    .unwrap_or(JsValue::Undefined);
-                (env_this, args.get(1..).unwrap_or(&[]).to_vec())
-            }
-            Some(value) => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+            Some(value) if value.is_object_like() => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+            _ => match env_this {
+                Some(value) if !matches!(value, JsValue::Undefined) => (value, args.to_vec()),
+                _ => match args.first().cloned() {
+                    Some(value) => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+                    None => (JsValue::Undefined, Vec::new()),
+                },
+            },
         };
 
         if name == "toJSON" {
@@ -57158,7 +57160,6 @@ mod tests {
 
     /// Invalid dates serialize to JSON as `null`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_invalid_date_to_json_returns_null() {
         let result = global_eval("new Date('invalid').toJSON()").unwrap();
         assert_eq!(result, JsValue::Null);
@@ -57465,7 +57466,6 @@ mod tests {
 
     /// `JSON.stringify` on a Date respects an overridden `toISOString`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_json_stringify_date_uses_overridden_to_iso_string() {
         let result = global_eval(
             r#"
@@ -58493,7 +58493,6 @@ mod tests {
 
     /// `JSON.stringify` handles a Date object via its `toJSON` method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_json_stringify_date_object() {
         let result = global_eval("JSON.stringify(new Date(0))").unwrap();
         assert_eq!(
