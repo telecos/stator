@@ -63368,7 +63368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_constructor_prototype_property_lookup_is_inherited() {
         let result =
             global_eval("function F() {} F.prototype.x = 1; var o = new F(); o.x").unwrap();
@@ -63376,7 +63375,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_constructor_prototype_is_prototype_of_instance() {
         let result =
             global_eval("function F() {} var o = new F(); F.prototype.isPrototypeOf(o)").unwrap();
@@ -63396,7 +63394,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_vs_in_inherited_property() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",
@@ -63425,7 +63422,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_same_prototype_is_noop() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); o.__proto__ = p; Object.getPrototypeOf(o) === p",
@@ -63444,7 +63440,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_to_null_removes_has_own_property_method() {
         let result =
             global_eval("var o = {}; o.__proto__ = null; typeof o.hasOwnProperty").unwrap();
@@ -65963,7 +65958,6 @@ mod tests {
 
     /// Proxy ownKeys trap intercepts Object.keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap() {
         let r = global_eval(
             r#"
@@ -66281,7 +66275,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_construct_uses_new_target_prototype() {
         let r = global_eval(
             r#"
@@ -66447,7 +66440,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_set_uses_receiver_for_inherited_data_property() {
         let r = global_eval(
             r#"
