@@ -19296,9 +19296,9 @@ fn make_weak_ref_builtin() -> JsValue {
         proto.insert(
             "deref".into(),
             native(|args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let (receiver, _) = resolve_branded_receiver(&args, "__is_weakref__");
                 let method = get_hidden_method(
-                    receiver,
+                    &receiver,
                     "__is_weakref__",
                     "__weakref_deref__",
                     "WeakRef.prototype.deref",
@@ -40955,7 +40955,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_weakmap_to_string_tag() {
         let r = global_eval(
             r#"
@@ -41018,7 +41017,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_weakset_to_string_tag() {
         let r = global_eval(
             r#"
@@ -41950,7 +41948,6 @@ mod tests {
     /// `WeakRef.prototype.deref()` returns the original object and `@@toStringTag`
     /// identifies the instance as `WeakRef`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weak_ref_deref_and_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42092,7 +42089,6 @@ mod tests {
 
     /// Multiple weak refs to the same target dereference independently.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_multiple_weak_refs_to_same_target() {
         assert_eval_true(
             r#"
@@ -42454,7 +42450,6 @@ mod tests {
 
     /// `WeakRef.deref()` returns `undefined` on an object-less receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_returns_object_or_undefined() {
         assert_eval_true(
             r#"
@@ -42468,7 +42463,6 @@ mod tests {
 
     /// WeakRef constructor accepts non-registered symbol targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_constructor_accepts_non_registered_symbol() {
         assert_eval_true(
             r#"
@@ -42496,7 +42490,6 @@ mod tests {
 
     /// WeakRef.deref returns the same identity object on repeated calls.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_identity_preserved() {
         assert_eval_true(
             r#"
@@ -42887,7 +42880,6 @@ mod tests {
 
     /// FinalizationRegistry `@@toStringTag` is correct.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42919,7 +42911,6 @@ mod tests {
 
     /// `WeakRef` `@@toStringTag` is correct.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_to_string_tag() {
         assert_eval_true(
             r#"
