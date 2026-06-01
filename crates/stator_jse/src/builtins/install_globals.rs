@@ -46864,7 +46864,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_sloppy_mode() {
         let result =
             global_eval("function outer() { return arguments.callee === outer; } outer()").unwrap();
@@ -75224,7 +75223,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_sloppy_mode_returns_function_name() {
         let result =
             global_eval("function outer() { return arguments.callee.name; } outer()").unwrap();
