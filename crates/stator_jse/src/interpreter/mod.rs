@@ -17947,13 +17947,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
             }
             "__proto__" => proto.clone().unwrap_or(JsValue::Null),
-            _ => {
-                if let Some(proto) = proto {
-                    proto_lookup_chain(&proto, key, obj)
-                } else {
-                    JsValue::Undefined
-                }
-            }
+            _ => crate::builtins::iterator::get_bound_iterator_method(obj, key).unwrap_or_else(
+                || {
+                    if let Some(proto) = proto {
+                        proto_lookup_chain(&proto, key, obj)
+                    } else {
+                        JsValue::Undefined
+                    }
+                },
+            ),
         };
     }
     // Handle JsValue::Iterator ΓÇö expose next/return/@@iterator so that
@@ -17989,7 +17991,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let iter = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(iter.clone())))
             }
-            _ => JsValue::Undefined,
+            _ => crate::builtins::iterator::get_bound_iterator_method(obj, key)
+                .unwrap_or(JsValue::Undefined),
         };
     }
     if let JsValue::Promise(_) = obj {
