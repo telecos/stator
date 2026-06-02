@@ -29803,6 +29803,26 @@ mod tests {
         ));
     }
 
+    fn call_builtin_function(value: &JsValue, args: Vec<JsValue>) -> JsValue {
+        let JsValue::PlainObject(fn_obj) = value else {
+            panic!("expected builtin function object, got {value:?}");
+        };
+        let call = fn_obj.borrow().get("__call__").cloned().unwrap();
+        let JsValue::NativeFunction(f) = call else {
+            panic!("__call__ should be a NativeFunction");
+        };
+        f(args).unwrap()
+    }
+
+    fn assert_builtin_metadata(value: &JsValue, name: &str, length: i32) {
+        let JsValue::PlainObject(fn_obj) = value else {
+            panic!("expected builtin function object, got {value:?}");
+        };
+        let borrow = fn_obj.borrow();
+        assert_eq!(borrow.get("name"), Some(&JsValue::String(name.into())));
+        assert_eq!(borrow.get("length"), Some(&JsValue::Smi(length)));
+    }
+
     fn assert_eval_fulfilled_promise_value(script: &str, expected: JsValue) {
         match eval_with_microtasks(script) {
             JsValue::Promise(promise) => {
@@ -36214,56 +36234,44 @@ mod tests {
         }
     }
 
-    /// Call parseInt via the native function wrapper.
+    /// Call parseInt via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_parse_int_native() {
+    fn test_parse_int_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let parse_int = globals.get("parseInt").unwrap();
-        if let JsValue::NativeFunction(f) = parse_int {
-            let result = f(vec![JsValue::String("42".into())]).unwrap();
-            assert_eq!(result, JsValue::Smi(42));
-        } else {
-            panic!("parseInt should be a NativeFunction");
-        }
+        let result = call_builtin_function(parse_int, vec![JsValue::String("42".into())]);
+        assert_eq!(result, JsValue::Smi(42));
+        assert_builtin_metadata(parse_int, "parseInt", 2);
     }
 
-    /// Call isNaN via the native function wrapper.
+    /// Call isNaN via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_is_nan_native() {
+    fn test_is_nan_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let is_nan = globals.get("isNaN").unwrap();
-        if let JsValue::NativeFunction(f) = is_nan {
-            let result = f(vec![JsValue::HeapNumber(f64::NAN)]).unwrap();
-            assert_eq!(result, JsValue::Boolean(true));
+        let result = call_builtin_function(is_nan, vec![JsValue::HeapNumber(f64::NAN)]);
+        assert_eq!(result, JsValue::Boolean(true));
 
-            let result = f(vec![JsValue::Smi(42)]).unwrap();
-            assert_eq!(result, JsValue::Boolean(false));
-        } else {
-            panic!("isNaN should be a NativeFunction");
-        }
+        let result = call_builtin_function(is_nan, vec![JsValue::Smi(42)]);
+        assert_eq!(result, JsValue::Boolean(false));
+        assert_builtin_metadata(is_nan, "isNaN", 1);
     }
 
-    /// Call console.log via the native function wrapper.
+    /// Call console.log via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_console_log_native() {
+    fn test_console_log_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let console = globals.get("console").unwrap();
-        if let JsValue::PlainObject(map) = console {
-            let log = map.borrow().get("log").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = log {
-                // Should return undefined without crashing.
-                let result = f(vec![JsValue::String("hello".into())]).unwrap();
-                assert_eq!(result, JsValue::Undefined);
-            } else {
-                panic!("log should be a NativeFunction");
-            }
-        }
+        let JsValue::PlainObject(map) = console else {
+            panic!("console should be a PlainObject");
+        };
+        let log = map.borrow().get("log").cloned().unwrap();
+        let result = call_builtin_function(&log, vec![JsValue::String("hello".into())]);
+        assert_eq!(result, JsValue::Undefined);
+        assert_builtin_metadata(&log, "log", 0);
     }
 
     // ── End-to-end tests: parse → compile → interpret ──────────────────────
