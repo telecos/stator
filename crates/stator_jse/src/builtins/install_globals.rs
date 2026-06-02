@@ -43040,11 +43040,11 @@ mod tests {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::interpreter::{Interpreter, InterpreterFrame};
         use crate::parser::{
-            ast::{ProgramItem, ReturnStmt, SourceType, Stmt},
-            parse,
+            ast::{ProgramItem, ReturnStmt, Stmt},
+            parse_module,
         };
 
-        let mut program = parse(src).unwrap();
+        let mut program = parse_module(src).unwrap();
         if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
             let return_stmt = ReturnStmt {
                 loc: expr_stmt.loc,
@@ -43052,8 +43052,6 @@ mod tests {
             };
             *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
         }
-        program.source_type = SourceType::Module;
-        program.is_strict = true;
 
         let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
         let mut ge = crate::interpreter::GlobalEnv::new();
@@ -43246,37 +43244,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_object_module() {
         assert_module_eval_true("typeof import.meta === 'object' && import.meta !== null");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_is_string_module() {
         assert_module_eval_true("typeof import.meta.url === 'string'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_is_placeholder_module() {
         assert_module_eval_true("import.meta.url === ''");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_frozen_module() {
         assert_module_eval_true("Object.isFrozen(import.meta)");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_not_extensible_module() {
         assert_module_eval_true("Object.isExtensible(import.meta) === false");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_has_resolve_function_module() {
         assert_module_eval_true("typeof import.meta.resolve === 'function'");
     }
@@ -43302,13 +43294,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_parses_in_array_literal_module() {
         assert_module_eval_true("var meta = [import.meta][0]; typeof meta.url === 'string'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_parses_in_object_literal_module() {
         assert_module_eval_true(
             "var meta = { value: import.meta }.value; typeof meta.resolve === 'function'",
@@ -43324,19 +43314,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_works_in_concatenation_module() {
         assert_module_eval_true("('prefix:' + import.meta.url) === 'prefix:'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_has_two_own_properties_module() {
         assert_module_eval_true("Object.getOwnPropertyNames(import.meta).length === 2");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_descriptor_is_non_writable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'url').writable === false",
@@ -43344,7 +43331,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_descriptor_is_non_writable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'resolve').writable === false",
@@ -43352,7 +43338,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_descriptor_is_non_configurable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'url').configurable === false",
@@ -43360,7 +43345,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_descriptor_is_non_configurable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'resolve').configurable === false",
@@ -43603,35 +43587,30 @@ mod tests {
 
     /// import.meta is an ordinary object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_typeof() {
         assert_module_eval_true("typeof import.meta === 'object'");
     }
 
     /// import.meta is not null.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_not_null() {
         assert_module_eval_true("import.meta !== null");
     }
 
     /// import.meta.url is a string.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_url_typeof() {
         assert_module_eval_true("typeof import.meta.url === 'string'");
     }
 
     /// import.meta is not extensible (frozen).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_not_extensible() {
         assert_module_eval_true("Object.isExtensible(import.meta) === false");
     }
 
     /// import.meta prototype is Object.prototype or null (implementation-defined).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_has_prototype() {
         // import.meta has either null or Object.prototype as its prototype
         assert_module_eval_true(
