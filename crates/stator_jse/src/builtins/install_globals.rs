@@ -19494,10 +19494,10 @@ fn make_finalization_registry_builtin() -> JsValue {
             proto.insert(
                 name.clone(),
                 native(move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    let (receiver, rest) =
+                        resolve_branded_receiver(&args, "__is_finalization_registry__");
                     let method = get_hidden_method(
-                        receiver,
+                        &receiver,
                         "__is_finalization_registry__",
                         &hidden,
                         &format!("FinalizationRegistry.prototype.{name}"),
@@ -42113,7 +42113,6 @@ mod tests {
     /// `register`/`unregister` track object tokens and `@@toStringTag` identifies
     /// the registry instance.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_register_unregister_and_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42220,7 +42219,6 @@ mod tests {
 
     /// `unregister` removes every registration sharing a token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_unregister_removes_all_matching_registrations() {
         assert_eval_true(
             r#"
@@ -42235,7 +42233,6 @@ mod tests {
 
     /// `unregister` does not remove registrations associated with other tokens.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_unregister_preserves_other_tokens() {
         assert_eval_true(
             r#"
@@ -42253,7 +42250,6 @@ mod tests {
 
     /// Extracted `register` methods use the call-site receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_extracted_register_uses_call_receiver() {
         assert_eval_true(
             r#"
@@ -42269,7 +42265,6 @@ mod tests {
 
     /// Extracted `unregister` methods use the call-site receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_extracted_unregister_uses_call_receiver() {
         assert_eval_true(
             r#"
@@ -42373,7 +42368,6 @@ mod tests {
 
     /// `register` works when invoked via `FinalizationRegistry.prototype.register.call`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_prototype_register_call_uses_receiver() {
         assert_eval_true(
             r#"
@@ -42387,7 +42381,6 @@ mod tests {
 
     /// `unregister` works when invoked via `FinalizationRegistry.prototype.unregister.call`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_prototype_unregister_call_uses_receiver() {
         assert_eval_true(
             r#"
