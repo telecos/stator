@@ -46198,7 +46198,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_direct_returns_undefined_for_non_expression_tail() {
         let result =
             global_eval("function outer() { return eval('var x = 1;'); } outer()").unwrap();

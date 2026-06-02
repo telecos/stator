@@ -547,8 +547,7 @@ pub(crate) fn global_eval_direct_with_scope_capture(
     Ok((outcome.result, outcome.global_env, outcome.is_strict))
 }
 
-/// If the last program item is an expression statement, rewrite it to a
-/// `return` so the interpreter propagates the completion value.
+/// Rewrite the eval completion value into an explicit return.
 fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
     use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
     if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
@@ -557,6 +556,16 @@ fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
             argument: Some(expr_stmt.expr.clone()),
         };
         *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
+    } else if matches!(
+        program.body.last(),
+        Some(ProgramItem::Stmt(Stmt::VarDecl(_)))
+    ) {
+        program
+            .body
+            .push(ProgramItem::Stmt(Stmt::Return(ReturnStmt {
+                loc: program.loc,
+                argument: None,
+            })));
     }
 }
 
