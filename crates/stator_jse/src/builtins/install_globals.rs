@@ -40273,67 +40273,31 @@ mod tests {
         assert!(matches!(globals.get("Map"), Some(JsValue::PlainObject(_))));
     }
 
-    /// Constructing a Map via `__call__` returns an object with prototype methods.
+    /// Constructing a Map exposes working prototype-backed methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_constructor_creates_instance() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
-            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let result = f(vec![]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("get"));
-                    assert!(inst.contains_key("set"));
-                    assert!(inst.contains_key("has"));
-                    assert!(inst.contains_key("delete"));
-                    assert!(inst.contains_key("clear"));
-                    assert!(inst.contains_key("forEach"));
-                    assert!(inst.contains_key("keys"));
-                    assert!(inst.contains_key("values"));
-                    assert!(inst.contains_key("entries"));
-                    assert!(inst.contains_key("size"));
-                } else {
-                    panic!("Map() should return a PlainObject");
-                }
-            } else {
-                panic!("Map.__call__ should be NativeFunction");
-            }
-        } else {
-            panic!("Map should be a PlainObject");
-        }
+        assert_eval_true(
+            r#"
+            var map = new Map();
+            map.set(1, "a");
+            map.get(1) === "a" &&
+            map.has(1) &&
+            map.size === 1 &&
+            map.delete(1) &&
+            map.size === 0
+            "#,
+        );
     }
 
     /// Map constructed with iterable argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_constructor_with_iterable() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
-            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let iterable = JsValue::new_array(vec![
-                    JsValue::new_array(vec![JsValue::Smi(1), JsValue::String("a".into())]),
-                    JsValue::new_array(vec![JsValue::Smi(2), JsValue::String("b".into())]),
-                ]);
-                let result = f(vec![iterable]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                    // Test get
-                    if let Some(JsValue::NativeFunction(get_fn)) = inst.get("get") {
-                        let val = get_fn(vec![JsValue::Smi(1)]).unwrap();
-                        assert_eq!(val, JsValue::String("a".into()));
-                    }
-                } else {
-                    panic!("Map() should return a PlainObject");
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var map = new Map([[1, "a"], [2, "b"]]);
+            map.size === 2 && map.get(1) === "a" && map.get(2) === "b"
+            "#,
+        );
     }
 
     // ── Set constructor tests ────────────────────────────────────────────────
@@ -40346,56 +40310,30 @@ mod tests {
         assert!(matches!(globals.get("Set"), Some(JsValue::PlainObject(_))));
     }
 
-    /// Constructing a Set via `__call__` returns an object with prototype methods.
+    /// Constructing a Set exposes working prototype-backed methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_constructor_creates_instance() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
-            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let result = f(vec![]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("add"));
-                    assert!(inst.contains_key("has"));
-                    assert!(inst.contains_key("delete"));
-                    assert!(inst.contains_key("clear"));
-                    assert!(inst.contains_key("forEach"));
-                    assert!(inst.contains_key("keys"));
-                    assert!(inst.contains_key("values"));
-                    assert!(inst.contains_key("entries"));
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                    assert_eq!(inst.get("keys"), inst.get("values"));
-                    assert_eq!(inst.get("@@iterator"), inst.get("values"));
-                } else {
-                    panic!("Set() should return a PlainObject");
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var set = new Set();
+            set.add(1);
+            set.has(1) &&
+            set.size === 1 &&
+            set.delete(1) &&
+            set.size === 0
+            "#,
+        );
     }
 
     /// Set constructed with iterable argument deduplicates.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_constructor_with_iterable() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
-            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let iterable =
-                    JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)]);
-                let result = f(vec![iterable]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var set = new Set([1, 2, 1]);
+            set.size === 2 && set.has(1) && set.has(2)
+            "#,
+        );
     }
 
     #[test]
