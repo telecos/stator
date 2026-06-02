@@ -55860,7 +55860,6 @@ mod tests {
 
     /// `Object.fromEntries` consumes Map iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_from_entries_map() {
         let result = global_eval(
             r#"
