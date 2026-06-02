@@ -4983,9 +4983,8 @@ pub fn parse_module(source: &str) -> StatorResult<Program> {
 /// Parse `source` as a classic script.
 ///
 /// Script mode does not allow top-level `await` (unless inside an `async`
-/// function) and `import.meta` is not available.  The source type is always
-/// [`SourceType::Script`] unless `import`/`export` declarations are
-/// encountered (which cause auto-promotion to module mode).
+/// function), `import.meta` is not available, and top-level static
+/// `import`/`export` declarations are rejected.
 ///
 /// # Errors
 ///
@@ -5004,6 +5003,11 @@ pub fn parse_script(source: &str) -> StatorResult<Program> {
     stacker::maybe_grow(32 * 1024, 512 * 1024, || {
         let mut parser = Parser::new(source)?;
         let program = parser.parse_program()?;
+        if program.source_type == SourceType::Module {
+            return Err(StatorError::SyntaxError(
+                "import/export declarations are only valid in module code".into(),
+            ));
+        }
         Ok(program)
     })
 }

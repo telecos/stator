@@ -43760,7 +43760,6 @@ mod tests {
 
     /// import/export is rejected in script mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_script_mode_rejects_import() {
         use crate::parser::parse_script;
         let result = parse_script("import { x } from 'mod';");
@@ -43769,7 +43768,6 @@ mod tests {
 
     /// export is rejected in script mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_script_mode_rejects_export() {
         use crate::parser::parse_script;
         let result = parse_script("export var x = 1;");
