@@ -14064,6 +14064,24 @@ pub(crate) fn make_fast_array_method(target: &JsValue, name: &str, length: i32) 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+fn make_bound_string_builtin(
+    receiver: Rc<str>,
+    name: &str,
+    length: i32,
+    f: impl Fn(&str, Vec<JsValue>) -> StatorResult<JsValue> + 'static,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let attrs = PropertyAttributes::CONFIGURABLE;
+    props.insert_with_attrs("name".into(), JsValue::String(name.into()), attrs);
+    props.insert_with_attrs("length".into(), JsValue::Smi(length), attrs);
+    props.insert(
+        "__call__".into(),
+        JsValue::NativeFunction(Rc::new(move |args| f(&receiver, args))),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 fn fast_array_method_name(callee: &JsValue) -> Option<Rc<str>> {
     let JsValue::PlainObject(map) = callee else {
         return None;
@@ -16061,9 +16079,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "trim" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trim", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim(s).into(),
+                    ))
+                });
             }
             "split" => {
                 let s = s.clone();
@@ -16350,15 +16370,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "trimStart" | "trimLeft" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_start().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trimStart", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim_start(s).into(),
+                    ))
+                });
             }
             "trimEnd" | "trimRight" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_end().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trimEnd", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim_end(s).into(),
+                    ))
+                });
             }
             "concat" => {
                 let s = s.clone();

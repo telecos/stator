@@ -60154,7 +60154,6 @@ mod tests {
 
     /// `trimLeft.name` is `"trimStart"` per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_left_name() {
         let result = global_eval("''.trimLeft.name").unwrap();
         assert_eq!(result, JsValue::String("trimStart".into()));
@@ -60162,7 +60161,6 @@ mod tests {
 
     /// `trimRight.name` is `"trimEnd"` per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_right_name() {
         let result = global_eval("''.trimRight.name").unwrap();
         assert_eq!(result, JsValue::String("trimEnd".into()));
@@ -65639,7 +65637,6 @@ mod tests {
 
     /// `trimStart` removes a leading BOM.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_start_bom() {
         let r = global_eval("'\\uFEFFhello'.trimStart()").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
@@ -65647,7 +65644,6 @@ mod tests {
 
     /// `trimEnd` removes a trailing BOM.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_end_bom() {
         let r = global_eval("'hello\\uFEFF'.trimEnd()").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
@@ -65669,7 +65665,6 @@ mod tests {
 
     /// `trimStart` trims only the leading ECMAScript whitespace.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_start_preserves_trailing_ecmascript_whitespace() {
         let r = global_eval("'\\uFEFFhello\\u00A0'.trimStart()").unwrap();
         assert_eq!(r, JsValue::String("hello\u{00A0}".into()));
@@ -65677,7 +65672,6 @@ mod tests {
 
     /// `trimEnd` trims only the trailing ECMAScript whitespace.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_end_preserves_leading_ecmascript_whitespace() {
         let r = global_eval("'\\u00A0hello\\uFEFF'.trimEnd()").unwrap();
         assert_eq!(r, JsValue::String("\u{00A0}hello".into()));
