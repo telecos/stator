@@ -42523,7 +42523,6 @@ mod tests {
 
     /// FinalizationRegistry callback receives the held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_callback_receives_held_value() {
         assert_eval_true(
             r#"
@@ -42540,7 +42539,6 @@ mod tests {
 
     /// FinalizationRegistry.register returns undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_returns_undefined() {
         assert_eval_true(
             r#"
@@ -42612,7 +42610,6 @@ mod tests {
 
     /// Register same target multiple times with different held values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_same_target_multiple_times() {
         assert_eval_true(
             r#"
@@ -42629,7 +42626,6 @@ mod tests {
 
     /// Unregister with non-registered token returns false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_unregister_non_registered_token() {
         assert_eval_true(
             r#"
@@ -42642,7 +42638,6 @@ mod tests {
 
     /// Symbol as unregister token — register and unregister.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_symbol_as_unregister_token() {
         assert_eval_true(
             r#"
@@ -42656,7 +42651,6 @@ mod tests {
 
     /// Symbol token: register multiple targets with the same symbol token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_symbol_token_multiple_registrations() {
         assert_eval_true(
             r#"
@@ -42671,7 +42665,6 @@ mod tests {
 
     /// Symbol token: different symbols are independent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_different_symbol_tokens_independent() {
         assert_eval_true(
             r#"
@@ -42689,7 +42682,6 @@ mod tests {
 
     /// Mixed object and symbol tokens in the same registry.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_mixed_object_and_symbol_tokens() {
         assert_eval_true(
             r#"
@@ -42708,7 +42700,6 @@ mod tests {
 
     /// Register with undefined token then unregister non-matching token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_no_token_unregister_different() {
         assert_eval_true(
             r#"
@@ -42738,7 +42729,6 @@ mod tests {
 
     /// Register target with string held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_string_held_value() {
         assert_eval_true(
             r#"
@@ -42752,7 +42742,6 @@ mod tests {
 
     /// Register target with number held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_number_held_value() {
         assert_eval_true(
             r#"
@@ -42766,7 +42755,6 @@ mod tests {
 
     /// Register target with undefined held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_undefined_held_value() {
         assert_eval_true(
             r#"
@@ -42951,7 +42939,6 @@ mod tests {
 
     /// FinalizationRegistry unregister removes all registrations sharing a symbol token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_unregister_removes_all_symbol_token_registrations() {
         assert_eval_true(
             r#"
