@@ -726,6 +726,11 @@ fn call_callback_with_this(
     this_arg: JsValue,
     args: Vec<JsValue>,
 ) -> StatorResult<JsValue> {
+    if let JsValue::NativeFunction(f) = cb
+        && current_global_env().is_none()
+    {
+        return f(args);
+    }
     dispatch_call_with_this(cb, this_arg, args)
 }
 
@@ -36830,7 +36835,6 @@ mod tests {
     // ── JSON Phase 2: apply_js_reviver ──────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_apply_js_reviver_doubles_numbers() {
         use crate::builtins::json::json_parse;
         use std::rc::Rc;
@@ -36862,7 +36866,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_apply_js_reviver_removes_undefined() {
         use crate::builtins::json::json_parse;
         use std::rc::Rc;
