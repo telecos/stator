@@ -46705,13 +46705,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_prototype_to_string() {
-        let result = global_eval("function foo() {} foo.toString()").unwrap();
-        assert_eq!(
-            result,
-            JsValue::String("function foo() { [native code] }".into())
-        );
+        let result =
+            global_eval("function foo() {} Function.prototype.toString.call(foo)").unwrap();
+        assert_eq!(result, JsValue::String("function foo() {}".into()));
     }
 
     #[test]
@@ -47182,17 +47179,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_named_function_uses_name() {
-        assert_eval_true(
-            "function named() {} named.toString() === 'function named() { [native code] }'",
-        );
+        assert_eval_true("function named() {} named.toString() === 'function named() {}'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_function_to_string_anonymous_function_uses_native_form() {
-        assert_eval_true("(function() {}).toString() === 'function () { [native code] }'");
+    fn e2e_function_to_string_anonymous_function_uses_source() {
+        assert_eval_true("(function() {}).toString() === 'function() {}'");
     }
 
     #[test]
