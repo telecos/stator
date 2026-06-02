@@ -49829,7 +49829,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_aggregate_error_errors_support_spread() {
         let result = global_eval(
             "let agg = new AggregateError([1, 2], 'boom'); \
