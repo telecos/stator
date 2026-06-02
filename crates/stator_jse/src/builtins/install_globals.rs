@@ -130,7 +130,8 @@ use crate::builtins::typed_array::{
 };
 use crate::builtins::wasm::make_webassembly_object;
 use crate::builtins::weak_ref::{
-    weak_ref_deref, weak_ref_new, weak_ref_new_plain, weak_ref_new_symbol,
+    weak_ref_deref, weak_ref_new, weak_ref_new_array, weak_ref_new_function, weak_ref_new_plain,
+    weak_ref_new_symbol,
 };
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEvent, ProfileEventKind, push_profile_event};
@@ -19261,6 +19262,8 @@ fn make_weak_ref_builtin() -> JsValue {
         let wr = match target {
             JsValue::Object(ptr) => weak_ref_new(*ptr)?,
             JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
+            JsValue::Array(rc) => weak_ref_new_array(rc),
+            JsValue::Function(rc) => weak_ref_new_function(rc),
             JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
             _ => {
                 return Err(StatorError::TypeError(
@@ -42455,7 +42458,6 @@ mod tests {
 
     /// WeakRef works with array targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_with_array_target() {
         assert_eval_true(
             r#"
@@ -42468,7 +42470,6 @@ mod tests {
 
     /// WeakRef works with function targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_with_function_target() {
         assert_eval_true(
             r#"
@@ -42773,7 +42774,6 @@ mod tests {
 
     /// WeakRef.deref() used in FinalizationRegistry cleanup callback context.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_in_cleanup_callback_context() {
         assert_eval_true(
             r#"
@@ -42791,7 +42791,6 @@ mod tests {
 
     /// WeakRef and FinalizationRegistry share the same target object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_and_fr_same_target() {
         assert_eval_true(
             r#"

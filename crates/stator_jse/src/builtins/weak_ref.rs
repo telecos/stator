@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::builtins::symbol::symbol_key_for;
+use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::heap_object::HeapObject;
 use crate::objects::property_map::PropertyMap;
@@ -41,6 +42,10 @@ pub(crate) enum WeakTarget {
     /// An Rc-managed `PlainObject`: uses `Weak<RefCell<PropertyMap>>` so that
     /// `deref()` returns `Undefined` once all strong references are dropped.
     Plain(Weak<RefCell<PropertyMap>>),
+    /// An Rc-managed array target.
+    Array(Weak<RefCell<Vec<JsValue>>>),
+    /// An Rc-managed bytecode function target.
+    Function(Weak<BytecodeArray>),
     /// A GC-managed `HeapObject`: raw pointer cleared by the GC sweep phase.
     Heap(Option<*mut HeapObject>),
     /// A non-registered symbol target. Registered symbols are rejected.
@@ -129,6 +134,20 @@ pub fn weak_ref_new_plain(rc: &Rc<RefCell<PropertyMap>>) -> JsWeakRef {
     }
 }
 
+/// ECMAScript §26.1.1.1 `new WeakRef(target)` for Rc-managed arrays.
+pub fn weak_ref_new_array(rc: &Rc<RefCell<Vec<JsValue>>>) -> JsWeakRef {
+    JsWeakRef {
+        target: WeakTarget::Array(Rc::downgrade(rc)),
+    }
+}
+
+/// ECMAScript §26.1.1.1 `new WeakRef(target)` for bytecode functions.
+pub fn weak_ref_new_function(rc: &Rc<BytecodeArray>) -> JsWeakRef {
+    JsWeakRef {
+        target: WeakTarget::Function(Rc::downgrade(rc)),
+    }
+}
+
 /// ECMAScript §26.1.1.1 `new WeakRef(target)` for non-registered symbols.
 ///
 /// Registered symbols created through `Symbol.for()` are rejected because they
@@ -184,6 +203,14 @@ pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
             Some(rc) => JsValue::PlainObject(rc),
             None => JsValue::Undefined,
         },
+        WeakTarget::Array(weak) => match weak.upgrade() {
+            Some(rc) => JsValue::Array(rc),
+            None => JsValue::Undefined,
+        },
+        WeakTarget::Function(weak) => match weak.upgrade() {
+            Some(rc) => JsValue::Function(rc),
+            None => JsValue::Undefined,
+        },
         WeakTarget::Heap(Some(ptr)) => JsValue::Object(*ptr),
         WeakTarget::Heap(None) => JsValue::Undefined,
         WeakTarget::Symbol(Some(symbol_id)) => JsValue::Symbol(*symbol_id),
@@ -221,6 +248,12 @@ pub fn weak_ref_clear(wr: &mut JsWeakRef) {
         WeakTarget::Heap(opt) => {
             *opt = None;
         }
+        WeakTarget::Array(_) => {
+            wr.target = WeakTarget::Array(Weak::new());
+        }
+        WeakTarget::Function(_) => {
+            wr.target = WeakTarget::Function(Weak::new());
+        }
         WeakTarget::Symbol(symbol_id) => {
             *symbol_id = None;
         }
@@ -246,6 +279,8 @@ pub fn weak_ref_clear(wr: &mut JsWeakRef) {
 pub fn weak_ref_has_target(wr: &JsWeakRef) -> bool {
     match &wr.target {
         WeakTarget::Plain(weak) => weak.strong_count() > 0,
+        WeakTarget::Array(weak) => weak.strong_count() > 0,
+        WeakTarget::Function(weak) => weak.strong_count() > 0,
         WeakTarget::Heap(opt) => opt.is_some(),
         WeakTarget::Symbol(symbol_id) => symbol_id.is_some(),
     }
