@@ -17040,6 +17040,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         let mut results = Vec::new();
@@ -17048,8 +17049,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17171,6 +17173,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17180,8 +17183,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 item.clone()
                             };
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17195,6 +17199,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17204,8 +17209,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 item.clone()
                             };
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![v, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17219,6 +17225,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17226,8 +17233,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if !val.to_boolean() {
@@ -17241,6 +17249,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17248,8 +17257,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17515,11 +17525,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, v) in items.iter().enumerate().rev() {
-                            let result = dispatch_call_value(
+                            let result = dispatch_call_with_this(
                                 &cb,
+                                this_arg.clone(),
                                 vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if to_boolean_val(&result) {
@@ -17533,6 +17545,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, v) in items.iter().enumerate().rev() {
@@ -17541,8 +17554,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 v.clone()
                             };
-                            let result = dispatch_call_value(
+                            let result = dispatch_call_with_this(
                                 &cb,
+                                this_arg.clone(),
                                 vec![elem, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if to_boolean_val(&result) {

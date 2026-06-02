@@ -53176,7 +53176,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_every_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [1,,2]; \
@@ -53193,7 +53192,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_some_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,1,3]; \
@@ -53210,7 +53208,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_filter_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [1,,3]; \
@@ -53225,7 +53222,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_find_visits_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,2]; \
@@ -53242,7 +53238,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_find_index_visits_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,2]; \
@@ -55695,7 +55690,6 @@ mod tests {
 
     /// `findLast` binds the supplied `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_find_last_this_arg() {
         let result = global_eval(
             r#"
@@ -55708,7 +55702,6 @@ mod tests {
 
     /// `findLastIndex` binds the supplied `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_find_last_index_this_arg() {
         let result = global_eval(
             r#"
