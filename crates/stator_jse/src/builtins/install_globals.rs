@@ -20012,7 +20012,10 @@ fn make_string() -> JsValue {
                     } else {
                         code_point.trunc()
                     };
-                    if !code_point.is_finite() || integer != code_point {
+                    if !code_point.is_finite()
+                        || integer != code_point
+                        || !(0.0..=0x10FFFF as f64).contains(&integer)
+                    {
                         return Err(StatorError::RangeError(format!(
                             "Invalid code point {code_point}"
                         )));
@@ -65450,7 +65453,6 @@ mod tests {
 
     /// Negative code points are rejected.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_from_code_point_rejects_negative() {
         assert!(global_eval("String.fromCodePoint(-1)").is_err());
     }
