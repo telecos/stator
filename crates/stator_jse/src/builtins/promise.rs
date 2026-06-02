@@ -32,7 +32,9 @@ use std::rc::Rc;
 
 use crate::builtins::error::{JsError, capture_call_stack};
 use crate::error::StatorError;
-use crate::interpreter::{dispatch_call_with_this, dispatch_get_property_value};
+use crate::interpreter::{
+    current_global_env, dispatch_call_with_this, dispatch_get_property_value,
+};
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
@@ -562,7 +564,7 @@ impl JsPromise {
                     Ok(JsValue::Undefined)
                 }));
 
-                match dispatch_call_with_this(
+                match call_thenable_method(
                     &then_fn,
                     then_value.clone(),
                     vec![resolve_fn, reject_fn],
@@ -729,6 +731,19 @@ fn get_thenable_method(value: &JsValue) -> Result<Option<JsValue>, JsValue> {
         Ok(_) => Ok(None),
         Err(error) => Err(rejection_reason_from_error(&error)),
     }
+}
+
+fn call_thenable_method(
+    then_fn: &JsValue,
+    this_value: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, StatorError> {
+    if let JsValue::NativeFunction(f) = then_fn
+        && current_global_env().is_none()
+    {
+        return f(args);
+    }
+    dispatch_call_with_this(then_fn, this_value, args)
 }
 
 fn rejection_reason_from_error(error: &StatorError) -> JsValue {

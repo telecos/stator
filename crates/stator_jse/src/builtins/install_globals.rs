@@ -45157,7 +45157,6 @@ mod tests {
 
     // -- 65. Thenable that rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_reject_via_api() {
         use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
         let q = MicrotaskQueue::new();
@@ -45183,7 +45182,6 @@ mod tests {
 
     // -- 66. Thenable idempotent: only first call to resolve/reject counts
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_idempotent_via_api() {
         use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
         let q = MicrotaskQueue::new();
