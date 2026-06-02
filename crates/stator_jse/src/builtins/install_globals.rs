@@ -60092,7 +60092,6 @@ mod tests {
 
     /// `substr.length` is 2 per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_substr_length_prop() {
         let result = global_eval("''.substr.length").unwrap();
         assert_eq!(result, JsValue::Smi(2));
@@ -60136,7 +60135,6 @@ mod tests {
 
     /// HTML method `.name` property is set correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_html_method_name() {
         let result = global_eval("''.bold.name").unwrap();
         assert_eq!(result, JsValue::String("bold".into()));
@@ -60144,7 +60142,6 @@ mod tests {
 
     /// HTML method `.length` property is set correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_html_method_length() {
         let result = global_eval("''.anchor.length").unwrap();
         assert_eq!(result, JsValue::Smi(1));

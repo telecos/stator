@@ -16645,7 +16645,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "substr" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "substr", 2, |s, args| {
                     let start = args
                         .first()
                         .map(|v| v.to_number().unwrap_or(f64::NAN) as i64)
@@ -16654,133 +16654,133 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         .get(1)
                         .map(|v| v.to_number().unwrap_or(f64::NAN) as i64);
                     Ok(JsValue::String(
-                        crate::builtins::string::string_substr(&s, start, length).into(),
+                        crate::builtins::string::string_substr(s, start, length).into(),
                     ))
-                }));
+                });
             }
             "anchor" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "anchor", 1, |s, args| {
                     let name = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_anchor(&s, &name).into(),
+                        crate::builtins::string::string_anchor(s, &name).into(),
                     ))
-                }));
+                });
             }
             "big" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "big", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_big(&s).into(),
+                        crate::builtins::string::string_big(s).into(),
                     ))
-                }));
+                });
             }
             "blink" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "blink", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_blink(&s).into(),
+                        crate::builtins::string::string_blink(s).into(),
                     ))
-                }));
+                });
             }
             "bold" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "bold", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_bold(&s).into(),
+                        crate::builtins::string::string_bold(s).into(),
                     ))
-                }));
+                });
             }
             "fixed" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "fixed", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fixed(&s).into(),
+                        crate::builtins::string::string_fixed(s).into(),
                     ))
-                }));
+                });
             }
             "fontcolor" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "fontcolor", 1, |s, args| {
                     let color = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fontcolor(&s, &color).into(),
+                        crate::builtins::string::string_fontcolor(s, &color).into(),
                     ))
-                }));
+                });
             }
             "fontsize" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "fontsize", 1, |s, args| {
                     let size = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fontsize(&s, &size).into(),
+                        crate::builtins::string::string_fontsize(s, &size).into(),
                     ))
-                }));
+                });
             }
             "italics" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "italics", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_italics(&s).into(),
+                        crate::builtins::string::string_italics(s).into(),
                     ))
-                }));
+                });
             }
             "link" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "link", 1, |s, args| {
                     let url = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_link(&s, &url).into(),
+                        crate::builtins::string::string_link(s, &url).into(),
                     ))
-                }));
+                });
             }
             "small" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "small", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_small(&s).into(),
+                        crate::builtins::string::string_small(s).into(),
                     ))
-                }));
+                });
             }
             "strike" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "strike", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_strike(&s).into(),
+                        crate::builtins::string::string_strike(s).into(),
                     ))
-                }));
+                });
             }
             "sub" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "sub", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_sub(&s).into(),
+                        crate::builtins::string::string_sub(s).into(),
                     ))
-                }));
+                });
             }
             "sup" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "sup", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_sup(&s).into(),
+                        crate::builtins::string::string_sup(s).into(),
                     ))
-                }));
+                });
             }
             "@@toPrimitive" => {
                 let s = s.clone();
