@@ -8320,6 +8320,11 @@ fn handle_define_keyed_getter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
+            fn_props_set(
+                ba,
+                "name".to_string(),
+                JsValue::String(format!("get {key_str}").into()),
+            );
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
@@ -8347,6 +8352,11 @@ fn handle_define_keyed_setter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
+            fn_props_set(
+                ba,
+                "name".to_string(),
+                JsValue::String(format!("set {key_str}").into()),
+            );
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;

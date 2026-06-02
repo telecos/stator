@@ -47254,7 +47254,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_name_getter_computed() {
         assert_eval_true(
             "let key = 'value'; Object.getOwnPropertyDescriptor({ get [key]() { return 1; } }, key).get.name === 'get value'",
@@ -47262,7 +47261,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_name_setter_computed() {
         assert_eval_true(
             "let key = 'value'; Object.getOwnPropertyDescriptor({ set [key](v) {} }, key).set.name === 'set value'",
