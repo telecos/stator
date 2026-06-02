@@ -53244,7 +53244,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_respects_symbol_is_concat_spreadable_on_object() {
         let result = global_eval(
             "var spread = {0: 'a', 1: 'b', length: 2}; \
@@ -53291,7 +53290,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_true_is_concat_spreadable_on_array() {
         let result = global_eval(
             "var arr = [1, 2]; \
@@ -81278,7 +81276,6 @@ mod tests {
     // ── @@isConcatSpreadable ────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_default_array() {
         assert_eval_true("[1,2].concat([3,4]).length === 4");
     }
@@ -81296,7 +81293,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_true_on_object() {
         assert_eval_true(
             r#"

@@ -14034,6 +14034,43 @@ fn is_array_like_plain_object(map: &PropertyMap) -> bool {
         .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
 }
 
+fn is_concat_spreadable_value(value: &JsValue) -> bool {
+    match value {
+        JsValue::Array(_) => true,
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            match borrow.get("@@isConcatSpreadable") {
+                Some(value) => value.to_boolean(),
+                None => is_array_like_plain_object(&borrow),
+            }
+        }
+        _ => false,
+    }
+}
+
+fn append_concat_value(result: &mut Vec<JsValue>, value: JsValue) {
+    if !is_concat_spreadable_value(&value) {
+        result.push(value);
+        return;
+    }
+    match value {
+        JsValue::Array(items) => result.extend_from_slice(&items.borrow()),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = array_like_length_from_property_map(&borrow);
+            for index in 0..len {
+                result.push(
+                    borrow
+                        .get(&index.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
+                );
+            }
+        }
+        other => result.push(other),
+    }
+}
+
 pub(crate) fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue {
     let bound_target = target.clone();
     let method_name: Rc<str> = name.into();
@@ -17005,10 +17042,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let mut result = a.borrow().clone();
                         for arg in args {
-                            match arg {
-                                JsValue::Array(other) => result.extend_from_slice(&other.borrow()),
-                                v => result.push(v),
-                            }
+                            append_concat_value(&mut result, arg);
                         }
                         Ok(JsValue::new_array(result))
                     }));
