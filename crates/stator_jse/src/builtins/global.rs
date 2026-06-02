@@ -522,7 +522,13 @@ fn eval_core(
             }
         }
     };
-    let result = Interpreter::run(&mut frame)?;
+    let preserve_current_globals =
+        matches!(mode, EvalMode::Direct) && current_global_env().is_some();
+    let result = if preserve_current_globals {
+        Interpreter::run_same_env(&mut frame)?
+    } else {
+        Interpreter::run(&mut frame)?
+    };
     Ok(EvalOutcome {
         result,
         global_env: Rc::clone(&frame.global_env),

@@ -4356,7 +4356,7 @@ impl Interpreter {
 
     /// Run a callee frame, skipping the `CURRENT_GLOBALS` TLS check when the
     /// caller guarantees the environment is already published.
-    pub(super) fn run_same_env(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+    pub(crate) fn run_same_env(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
         Self::run_inner(frame, true)
     }
 

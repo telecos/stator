@@ -46268,7 +46268,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_indirect_nested_inside_direct_uses_global_scope() {
         let result = global_eval(
             "var x = 20; function outer() { var x = 1; return eval(\"(0, eval)('x')\"); } outer()",
@@ -46579,7 +46578,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_nested_indirect_in_direct_uses_global() {
         assert_e2e_true(
             "var nv = 50; function f() { var nv = 1; return eval(\"(0, eval)('nv')\") === 50; } f()",
