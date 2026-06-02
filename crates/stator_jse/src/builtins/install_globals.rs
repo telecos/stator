@@ -19256,46 +19256,52 @@ fn make_weak_set_builtin() -> JsValue {
 fn make_weak_ref_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
+    let construct = native(|args| {
+        let target = args.first().unwrap_or(&JsValue::Undefined);
+        let wr = match target {
+            JsValue::Object(ptr) => weak_ref_new(*ptr)?,
+            JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
+            JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
+            _ => {
+                return Err(StatorError::TypeError(
+                    "WeakRef target must be an object or non-registered symbol".into(),
+                ));
+            }
+        };
+        let inner = Rc::new(RefCell::new(wr));
+        let mut obj = PropertyMap::new();
+        obj.insert_with_attrs(
+            "__is_weakref__".into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+
+        // Hidden per-instance deref implementation used by WeakRef.prototype.deref.
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "__weakref_deref__".into(),
+                native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
+            );
+        }
+
+        obj.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("WeakRef".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        obj.make_all_non_enumerable();
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+    });
     props.insert(
         "__call__".into(),
-        native(|args| {
-            let target = args.first().unwrap_or(&JsValue::Undefined);
-            let wr = match target {
-                JsValue::Object(ptr) => weak_ref_new(*ptr)?,
-                JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
-                JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
-                _ => {
-                    return Err(StatorError::TypeError(
-                        "WeakRef target must be an object or non-registered symbol".into(),
-                    ));
-                }
-            };
-            let inner = Rc::new(RefCell::new(wr));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_weakref__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
-
-            // Hidden per-instance deref implementation used by WeakRef.prototype.deref.
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "__weakref_deref__".into(),
-                    native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
-                );
-            }
-
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("WeakRef".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "WeakRef constructor must be called with new".into(),
+            ))
         }),
     );
+    props.insert("__construct__".into(), construct);
 
     // ── WeakRef.prototype ─────────────────────────────────────────────
     {
@@ -41746,7 +41752,7 @@ mod tests {
 
     // ── WeakRef constructor tests ────────────────────────────────────────────
 
-    /// `WeakRef` global is a PlainObject with a `__call__` constructor.
+    /// `WeakRef` global is a PlainObject constructor.
     #[test]
     fn test_weak_ref_global_exists() {
         let mut globals = HashMap::new();
@@ -41757,13 +41763,13 @@ mod tests {
         ));
     }
 
-    /// Constructing a WeakRef via `__call__` returns an object with hidden weak-ref state.
+    /// Constructing a WeakRef via `__construct__` returns an object with hidden weak-ref state.
     #[test]
     fn test_weak_ref_constructor_creates_instance() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let mut obj = crate::objects::heap_object::HeapObject::new_null();
                 let ptr = &raw mut obj;
@@ -41789,7 +41795,7 @@ mod tests {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let result = f(vec![JsValue::Smi(42)]);
                 assert!(result.is_err());
@@ -41803,7 +41809,7 @@ mod tests {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let mut obj = crate::objects::heap_object::HeapObject::new_null();
                 let ptr = &raw mut obj;
@@ -42507,7 +42513,6 @@ mod tests {
 
     /// WeakRef without `new` should throw.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_without_new_throws() {
         assert_eval_true(
             r#"
