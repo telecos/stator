@@ -50155,15 +50155,23 @@ mod tests {
         method: &str,
         args: Vec<JsValue>,
     ) -> StatorResult<JsValue> {
-        if let Some(method_value) = proto.borrow().get(method).cloned() {
-            dispatch_call_value(&method_value, args)
-        } else {
+        let Some(method_value) = proto.borrow().get(method).cloned() else {
             panic!("String.prototype.{method} not found");
+        };
+        if let JsValue::NativeFunction(f) = &method_value {
+            let globals = Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new()));
+            install_globals(&mut globals.borrow_mut().vars);
+            return crate::interpreter::invoke_native_with_this_in_global_env(
+                f,
+                globals,
+                JsValue::Undefined,
+                args,
+            );
         }
+        dispatch_call_value(&method_value, args)
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_match_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"(\d+)", "");
@@ -50183,7 +50191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_search_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\d+", "");
@@ -50194,7 +50201,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_replace_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\d+", "g");
@@ -50212,7 +50218,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_split_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\s+", "");
