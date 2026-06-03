@@ -16652,8 +16652,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                     "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
                                 ));
                             }
+                            let last_index = borrow
+                                .get("lastIndex")
+                                .and_then(|value| value.to_length().ok())
+                                .unwrap_or(0) as usize;
                             drop(borrow);
                             let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                            re.set_last_index(last_index);
                             let matches = re.try_symbol_match_all(&s)?;
                             let results: Vec<JsValue> = matches
                                 .into_iter()

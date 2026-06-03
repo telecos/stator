@@ -65057,7 +65057,6 @@ mod tests {
 
     /// `matchAll` starts from the regexp's current `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_uses_existing_last_index() {
         let r = global_eval(
             "var re = /a/g; re.lastIndex = 2; Array.from('baaa'.matchAll(re)).map(function(m) { return m.index; }).join(',')",
@@ -79833,7 +79832,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// RegExp `matchAll` preserves the original `lastIndex`.
         e2e_string_match_all_regexp_preserves_last_index,
         r#"var re = /a/g; re.lastIndex = 1; var out = Array.from("baaa".matchAll(re)); re.lastIndex === 1 && out.length === 3 && out[0].index === 1 && out[2].index === 3"#
