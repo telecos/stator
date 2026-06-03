@@ -79204,42 +79204,36 @@ mod tests {
     // ── String protocol dispatch e2e tests ─────────────────────────────────
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.match` delegates to custom `@@match`.
         e2e_string_match_custom_symbol_dispatch,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return "ok:" + s; } }); "abc".match(matcher) === "ok:abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@match` receives the source string.
         e2e_string_match_custom_symbol_receives_input,
         r#"var seen = ""; var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { seen = s; return null; } }); "abc".match(matcher) === null && seen === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@match` receives the matcher as `this`.
         e2e_string_match_custom_symbol_this_binding,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return this === matcher && s === "abc"; } }); "abc".match(matcher) === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@match` participates in `String.prototype.match`.
         e2e_string_match_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.match, { value: function(s) { return "proto:" + s; } }); var matcher = Object.create(proto); "abc".match(matcher) === "proto:abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@match` throws.
         e2e_string_match_custom_symbol_non_callable_throws,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: 123 }); try { "abc".match(matcher); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@match` falls back to string coercion.
         e2e_string_match_custom_symbol_undefined_falls_back,
         r#"var matcher = { toString: function() { return "b"; } }; Object.defineProperty(matcher, Symbol.match, { value: undefined }); var m = "abc".match(matcher); m[0] === "b" && m.index === 1"#

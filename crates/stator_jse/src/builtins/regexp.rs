@@ -327,24 +327,24 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_match = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_match__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_match);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = match re_match.try_symbol_match(&input)? {
-                    None => JsValue::Null,
-                    Some(SymbolMatchResult::Single(m)) => match_to_js(&m),
-                    Some(SymbolMatchResult::All(v)) => {
-                        let arr: Vec<JsValue> =
-                            v.into_iter().map(|s| JsValue::String(s.into())).collect();
-                        JsValue::new_array(arr)
-                    }
-                };
-                sync_last_index_to_props(&w, &re_match);
-                Ok(result)
-            })),
-        );
+        let match_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_match);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let result = match re_match.try_symbol_match(&input)? {
+                None => JsValue::Null,
+                Some(SymbolMatchResult::Single(m)) => match_to_js(&m),
+                Some(SymbolMatchResult::All(v)) => {
+                    let arr: Vec<JsValue> =
+                        v.into_iter().map(|s| JsValue::String(s.into())).collect();
+                    JsValue::new_array(arr)
+                }
+            };
+            sync_last_index_to_props(&w, &re_match);
+            Ok(result)
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_match__".into(), match_fn.clone());
+        props.insert("@@match".into(), match_fn);
     }
 
     // [Symbol.replace](string, replacement)

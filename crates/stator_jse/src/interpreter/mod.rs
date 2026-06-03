@@ -16571,60 +16571,87 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "match" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            match re.try_symbol_match(&s)? {
-                                Some(result) => {
-                                    use crate::objects::regexp::SymbolMatchResult;
-                                    match result {
-                                        SymbolMatchResult::Single(m) => {
-                                            let mut arr = vec![JsValue::String(m.matched.into())];
-                                            for c in &m.captures {
-                                                arr.push(match c {
-                                                    Some(s) => JsValue::String(s.clone().into()),
-                                                    None => JsValue::Undefined,
-                                                });
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let string_match_result = |pat: &str| {
+                        let index = crate::builtins::string::string_index_of(&s, pat, None);
+                        if index < 0 {
+                            JsValue::Null
+                        } else {
+                            let mut props = PropertyMap::new();
+                            props.insert("0".into(), JsValue::String(pat.into()));
+                            props.insert("index".into(), JsValue::Smi(index as i32));
+                            props.insert("input".into(), JsValue::String(s.clone()));
+                            props.insert("groups".into(), JsValue::Undefined);
+                            props.insert("length".into(), JsValue::Smi(1));
+                            props.insert("__is_array__".into(), JsValue::Boolean(true));
+                            JsValue::PlainObject(Rc::new(RefCell::new(props)))
+                        }
+                    };
+                    if let Some(matcher) = args.first()
+                        && !matches!(matcher, JsValue::Undefined)
+                    {
+                        let match_method = dispatch_get_property_value(
+                            matcher,
+                            JsValue::String("@@match".into()),
+                        )?;
+                        if !matches!(match_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&match_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.match @@match value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &match_method,
+                                matcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
+                        }
+                    }
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                match re.try_symbol_match(&s)? {
+                                    Some(result) => {
+                                        use crate::objects::regexp::SymbolMatchResult;
+                                        match result {
+                                            SymbolMatchResult::Single(m) => {
+                                                Ok(crate::builtins::regexp::match_to_js(&m))
                                             }
-                                            Ok(JsValue::new_array(arr))
-                                        }
-                                        SymbolMatchResult::All(matches) => {
-                                            let arr: Vec<JsValue> = matches
-                                                .into_iter()
-                                                .map(|m| JsValue::String(m.into()))
-                                                .collect();
-                                            Ok(JsValue::new_array(arr))
+                                            SymbolMatchResult::All(matches) => {
+                                                let arr: Vec<JsValue> = matches
+                                                    .into_iter()
+                                                    .map(|m| JsValue::String(m.into()))
+                                                    .collect();
+                                                Ok(JsValue::new_array(arr))
+                                            }
                                         }
                                     }
+                                    None => Ok(JsValue::Null),
                                 }
-                                None => Ok(JsValue::Null),
+                            } else {
+                                let pat = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(string_match_result(&pat))
                             }
-                        } else {
-                            Ok(JsValue::Null)
                         }
-                    }
-                    Some(JsValue::String(pat)) => {
-                        let pat = pat.to_string();
-                        match s.find(&pat) {
-                            Some(_idx) => {
-                                let arr = vec![JsValue::String(pat.into())];
-                                Ok(JsValue::new_array(arr))
-                            }
-                            None => Ok(JsValue::Null),
+                        Some(JsValue::String(pat)) => {
+                            let pat = pat.to_string();
+                            Ok(string_match_result(&pat))
                         }
+                        _ => Ok(JsValue::Null),
                     }
-                    _ => Ok(JsValue::Null),
                 }));
             }
             "search" => {
