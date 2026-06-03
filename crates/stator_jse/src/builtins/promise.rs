@@ -33,7 +33,7 @@ use std::rc::Rc;
 use crate::builtins::error::{JsError, capture_call_stack};
 use crate::error::StatorError;
 use crate::interpreter::{
-    current_global_env, dispatch_call_with_this, dispatch_get_property_value,
+    Interpreter, current_global_env, dispatch_call_with_this, dispatch_get_property_value,
 };
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
@@ -747,7 +747,8 @@ fn call_thenable_method(
 }
 
 fn rejection_reason_from_error(error: &StatorError) -> JsValue {
-    JsValue::String(error.to_string().into())
+    Interpreter::js_error_to_rejection_reason(error)
+        .unwrap_or_else(|| JsValue::String(error.to_string().into()))
 }
 
 // ── Constructor ────────────────────────────────────────────────────────────────

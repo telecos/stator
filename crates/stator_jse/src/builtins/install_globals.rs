@@ -2464,6 +2464,11 @@ fn promise_catch_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsV
     })
 }
 
+fn promise_rejection_reason(error: &StatorError) -> JsValue {
+    crate::interpreter::Interpreter::js_error_to_rejection_reason(error)
+        .unwrap_or_else(|| JsValue::String(error.to_string().into()))
+}
+
 fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
     let q = queue.clone();
     builtin_fn("finally", 1, move |args: Vec<JsValue>| {
@@ -2473,21 +2478,21 @@ fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> J
                 let f = Rc::clone(f);
                 Box::new(move || match f(vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
                 let callee = v.clone();
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             Some(JsValue::PlainObject(map)) if map.borrow().contains_key("__call__") => {
                 let callee = JsValue::PlainObject(Rc::clone(map));
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             _ => Box::new(|| Ok(JsValue::Undefined)),
@@ -22001,7 +22006,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             let f = Rc::clone(f);
             Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
                 Ok(result) => Ok(result),
-                Err(e) => Err(JsValue::String(e.to_string().into())),
+                Err(e) => Err(promise_rejection_reason(&e)),
             }))
         }
         JsValue::Function(_) | JsValue::Proxy(_) => {
@@ -22009,7 +22014,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             Some(Box::new(move |v: JsValue| {
                 match dispatch_call_value(&callee, vec![v.clone()]) {
                     Ok(result) => Ok(result),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 }
             }))
         }
@@ -22018,7 +22023,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             Some(Box::new(move |v: JsValue| {
                 match dispatch_call_value(&callee, vec![v.clone()]) {
                     Ok(result) => Ok(result),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 }
             }))
         }
@@ -45973,7 +45978,6 @@ mod tests {
         JsValue::String("cleanup|reason".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_throw_overrides_fulfillment,
         "var __promise_finally_3 = ''; \
          Promise.resolve('value') \
@@ -45984,7 +45988,6 @@ mod tests {
         JsValue::String("override".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_throw_overrides_rejection,
         "var __promise_finally_4 = ''; \
          Promise.reject('value') \
@@ -54780,32 +54783,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_thenable_getter_throw_rejects() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              var obj = {}; \
              Object.defineProperty(obj, 'then', { get: function() { throw 'getter'; } }); \
-             Promise.resolve(obj).catch(function(r) { out = r; }); \
-             out === 'getter'",
+             Promise.resolve(obj).catch(function(r) { out = r; });",
+            "out === 'getter'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_plain_object_passthrough() {
-        assert_eval_true(
-            "var obj = { x: 3 }; var out = 0; Promise.resolve(obj).then(function(v) { out = v.x; }); out === 3",
+        assert_eval_true_after_microtasks(
+            "var obj = { x: 3 }; var out = 0; Promise.resolve(obj).then(function(v) { out = v.x; });",
+            "out === 3",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_reject_keeps_promise_reason() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var inner = Promise.resolve(1); var same = false; \
-             Promise.reject(inner).catch(function(reason) { same = reason === inner; }); \
-             same",
+             Promise.reject(inner).catch(function(reason) { same = reason === inner; });",
+            "same",
         );
     }
 
