@@ -57712,10 +57712,9 @@ mod tests {
 
     /// ISO 8601 full form: `YYYY-MM-DDTHH:mm:ss.sssZ` parses correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_parse_iso_full_form() {
         let result = global_eval("Date.parse('2024-06-15T14:30:45.123Z')").unwrap();
-        assert_eq!(result, JsValue::HeapNumber(1718458245123.0));
+        assert_eq!(result, JsValue::HeapNumber(1718461845123.0));
     }
 
     /// ISO 8601 date-only `YYYY` defaults to Jan 1 UTC.
