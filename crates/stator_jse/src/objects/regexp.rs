@@ -724,12 +724,14 @@ impl JsRegExp {
 
     /// ECMAScript `RegExp.prototype[Symbol.search](string)`.
     ///
-    /// Returns the byte index of the first match, or `-1` if no match is
+    /// Returns the UTF-16 code-unit index of the first match, or `-1` if no match is
     /// found.  `lastIndex` is always reset to `0` before and after the search.
     pub fn symbol_search(&self, input: &str) -> i64 {
         let saved = self.last_index.get();
         self.last_index.set(0);
-        let result = self.exec(input).map_or(-1, |m| m.index as i64);
+        let result = self
+            .exec(input)
+            .map_or(-1, |m| input[..m.index].encode_utf16().count() as i64);
         self.last_index.set(saved);
         result
     }

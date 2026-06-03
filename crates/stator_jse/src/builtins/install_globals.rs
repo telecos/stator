@@ -65158,7 +65158,6 @@ mod tests {
 
     /// `search` with a regexp returns a UTF-16 code unit index.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_search_regexp_uses_utf16_index() {
         let r = global_eval("'😀a'.search(/a/)").unwrap();
         assert_eq!(r, JsValue::Smi(2));
@@ -79395,7 +79394,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// RegExp search reports UTF-16 indices.
         e2e_string_search_regexp_reports_utf16_index,
         r#""😀a".search(/a/) === 2"#
