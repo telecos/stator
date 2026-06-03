@@ -63023,14 +63023,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_sees_own_undefined_property() {
         let result = global_eval("var o = { x: undefined }; 'x' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_sees_inherited_undefined_property() {
         let result =
             global_eval("var p = { x: undefined }; var o = Object.create(p); 'x' in o").unwrap();
@@ -63242,7 +63240,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_vs_in_inherited_undefined_property() {
         let result = global_eval(
             "var p = { x: undefined }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",

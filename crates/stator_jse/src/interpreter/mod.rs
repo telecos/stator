@@ -766,7 +766,7 @@ pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
                     if plain_object_has_own_property(&borrow, key) {
                         return true;
                     }
-                    borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
+                    plain_object_proto_value(&borrow)
                 };
                 match next {
                     Some(JsValue::Null) | Some(JsValue::Undefined) => return false,
