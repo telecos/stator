@@ -392,28 +392,28 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_split = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_split__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_split);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let limit = match args.get(1) {
-                    Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(crate::builtins::util::clamped_f64_to_usize(v.to_number()?)),
-                };
-                let parts = re_split.try_symbol_split(&input, limit)?;
-                sync_last_index_to_props(&w, &re_split);
-                Ok(JsValue::new_array(
-                    parts
-                        .into_iter()
-                        .map(|s| match s {
-                            Some(s) => JsValue::String(s.into()),
-                            None => JsValue::Undefined,
-                        })
-                        .collect(),
-                ))
-            })),
-        );
+        let split_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_split);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let limit = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_uint32()? as usize),
+            };
+            let parts = re_split.try_symbol_split(&input, limit)?;
+            sync_last_index_to_props(&w, &re_split);
+            Ok(JsValue::new_array(
+                parts
+                    .into_iter()
+                    .map(|s| match s {
+                        Some(s) => JsValue::String(s.into()),
+                        None => JsValue::Undefined,
+                    })
+                    .collect(),
+            ))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_split__".into(), split_fn.clone());
+        props.insert("@@split".into(), split_fn);
     }
 
     // [Symbol.matchAll](string)

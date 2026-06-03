@@ -79400,42 +79400,36 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.split` delegates to custom `@@split`.
         e2e_string_split_custom_symbol_dispatch,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return ["x", String(limit), s]; } }); var out = "abc".split(splitter, 5); Array.isArray(out) && out.length === 3 && out[0] === "x" && out[1] === "5" && out[2] === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@split` receives the limit argument.
         e2e_string_split_custom_symbol_receives_limit,
         r#"var got = 0; var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { got = limit; return []; } }); "abc".split(splitter, 7).length === 0 && got === 7"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@split` receives the splitter as `this`.
         e2e_string_split_custom_symbol_this_binding,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return this === splitter && s === "abc" && limit === 3 ? ["ok"] : ["bad"]; } }); "abc".split(splitter, 3)[0] === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@split` participates in `String.prototype.split`.
         e2e_string_split_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.split, { value: function(s, limit) { return [s, String(limit)]; } }); var splitter = Object.create(proto); var out = "abc".split(splitter, 2); out.length === 2 && out[0] === "abc" && out[1] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@split` throws.
         e2e_string_split_custom_symbol_non_callable_throws,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: 123 }); try { "abc".split(splitter); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@split` falls back to string coercion.
         e2e_string_split_custom_symbol_undefined_falls_back,
         r#"var splitter = { toString: function() { return "b"; } }; Object.defineProperty(splitter, Symbol.split, { value: undefined }); var out = "abcb".split(splitter); out.length === 3 && out[0] === "a" && out[1] === "c" && out[2] === """#
@@ -79612,14 +79606,12 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` returns an array for basic matches.
         e2e_regexp_symbol_split_direct_basic_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c"); Array.isArray(out) && out.length === 3 && out[0] === "a" && out[2] === "c""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` honours the limit argument.
         e2e_regexp_symbol_split_direct_limit_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 2); out.length === 2 && out[0] === "a" && out[1] === "b""#

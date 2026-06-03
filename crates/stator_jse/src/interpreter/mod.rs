@@ -16132,7 +16132,46 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         _ => None,
                     };
-                    // A limit of 0 always returns an empty array.
+                    let split_with_string_separator = |sep: &str| {
+                        if sep.is_empty() {
+                            let chars: Vec<JsValue> = s
+                                .chars()
+                                .take(limit.unwrap_or(usize::MAX))
+                                .map(|c| JsValue::String(c.to_string().into()))
+                                .collect();
+                            JsValue::new_array(chars)
+                        } else {
+                            let parts: Vec<JsValue> = s
+                                .split(sep)
+                                .take(limit.unwrap_or(usize::MAX))
+                                .map(|p| JsValue::String(p.to_string().into()))
+                                .collect();
+                            JsValue::new_array(parts)
+                        }
+                    };
+                    if let Some(separator) = args.first()
+                        && !matches!(separator, JsValue::Undefined)
+                    {
+                        let split_method = dispatch_get_property_value(
+                            separator,
+                            JsValue::String("@@split".into()),
+                        )?;
+                        if !matches!(split_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&split_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.split @@split value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            let limit_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            return dispatch_call_with_this(
+                                &split_method,
+                                separator.clone(),
+                                vec![JsValue::String(s.clone()), limit_arg],
+                            );
+                        }
+                    }
+                    // A limit of 0 always returns an empty array after custom split dispatch.
                     if limit == Some(0) {
                         return Ok(JsValue::new_array(vec![]));
                     }
@@ -16160,27 +16199,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                     .collect();
                                 Ok(JsValue::new_array(items))
                             } else {
-                                Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
+                                let sep = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(split_with_string_separator(&sep))
                             }
                         }
                         Some(JsValue::String(sep)) => {
                             let sep = sep.to_string();
-                            if sep.is_empty() {
-                                // Empty separator: split into individual characters.
-                                let chars: Vec<JsValue> = s
-                                    .chars()
-                                    .take(limit.unwrap_or(usize::MAX))
-                                    .map(|c| JsValue::String(c.to_string().into()))
-                                    .collect();
-                                Ok(JsValue::new_array(chars))
-                            } else {
-                                let parts: Vec<JsValue> = s
-                                    .split(&sep)
-                                    .take(limit.unwrap_or(usize::MAX))
-                                    .map(|p| JsValue::String(p.to_string().into()))
-                                    .collect();
-                                Ok(JsValue::new_array(parts))
-                            }
+                            Ok(split_with_string_separator(&sep))
                         }
                         Some(JsValue::Undefined) | None => {
                             Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
