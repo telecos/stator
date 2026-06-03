@@ -79618,126 +79618,108 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` with limit `0` returns an empty array.
         e2e_regexp_symbol_split_direct_zero_limit_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 0); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` includes capture groups in the result.
         e2e_regexp_symbol_split_direct_captures_deep,
         r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c"); out.length === 5 && out[1] === "1" && out[3] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` includes undefined for non-participating captures.
         e2e_regexp_symbol_split_direct_undefined_capture_deep,
         r#"var re = /-(x)?/; var out = re[Symbol.split]("a-b"); out.length === 3 && out[0] === "a" && out[1] === undefined && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Zero-width direct `@@split` produces individual characters.
         e2e_regexp_symbol_split_direct_zero_width_characters_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split]("ab"); out.length === 2 && out[0] === "a" && out[1] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Zero-width direct `@@split` respects the limit argument.
         e2e_regexp_symbol_split_direct_zero_width_limit_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split]("ab", 1); out.length === 1 && out[0] === "a""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Empty input with an empty-match regexp splits to an empty array.
         e2e_regexp_symbol_split_direct_empty_input_empty_match_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// No-match direct `@@split` returns the original string.
         e2e_regexp_symbol_split_direct_no_match_deep,
         r#"var re = /\d+/; var out = re[Symbol.split]("abc"); out.length === 1 && out[0] === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Lookahead matches can split without consuming characters.
         e2e_regexp_symbol_split_direct_lookahead_deep,
         r#"var re = /(?=b)/; var out = re[Symbol.split]("abc"); out.length === 2 && out[0] === "a" && out[1] === "bc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Plain regexps are scanned sticky-style during split.
         e2e_regexp_symbol_split_direct_plain_scans_sticky_style_deep,
         r#"var re = /a/; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Sticky regexps produce the same split result.
         e2e_regexp_symbol_split_direct_sticky_flag_deep,
         r#"var re = /a/y; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` preserves the original `lastIndex`.
         e2e_regexp_symbol_split_direct_preserves_last_index_deep,
         r#"var re = /a/g; re.lastIndex = 2; re[Symbol.split]("baab"); re.lastIndex === 2"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Capture groups count toward the split limit.
         e2e_regexp_symbol_split_direct_capture_limit_deep,
         r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c", 4); out.length === 4 && out[0] === "a" && out[1] === "1" && out[2] === "b" && out[3] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Splitting at the end keeps a trailing empty string.
         e2e_regexp_symbol_split_direct_trailing_empty_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,"); out.length === 2 && out[0] === "a" && out[1] === """#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Splitting at the start keeps a leading empty string.
         e2e_regexp_symbol_split_direct_leading_empty_deep,
         r#"var re = /,/; var out = re[Symbol.split](",a"); out.length === 2 && out[0] === "" && out[1] === "a""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Adjacent matches keep empty strings between separators.
         e2e_regexp_symbol_split_direct_adjacent_matches_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,,b"); out.length === 3 && out[0] === "a" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global regexps split correctly and preserve empties.
         e2e_regexp_symbol_split_direct_global_flag_deep,
         r#"var re = /a/g; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Empty-input optional matches still return an empty array.
         e2e_regexp_symbol_split_direct_empty_input_optional_match_deep,
         r#"var re = /a?/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Lookaheads at the start do not create an extra leading empty string.
         e2e_regexp_symbol_split_direct_lookahead_at_start_deep,
         r#"var re = /(?=a)/; var out = re[Symbol.split]("ab"); out.length === 1 && out[0] === "ab""#
