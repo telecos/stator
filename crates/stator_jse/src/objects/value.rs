@@ -593,8 +593,8 @@ impl PartialEq for JsValue {
             // pointer; equality is pointer equality (same allocation).
             (Self::Object(a), Self::Object(b)) => std::ptr::eq(*a, *b),
             (Self::BigInt(a), Self::BigInt(b)) => a == b,
-            // Reference types: compare contents (matching the original derive behaviour).
-            (Self::Function(a), Self::Function(b)) => a == b,
+            // Reference types: compare object identity.
+            (Self::Function(a), Self::Function(b)) => Rc::ptr_eq(a, b),
             (Self::Array(a), Self::Array(b)) => Rc::ptr_eq(a, b),
             (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
             (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),

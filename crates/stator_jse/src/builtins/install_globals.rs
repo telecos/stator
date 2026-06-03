@@ -62327,7 +62327,6 @@ mod tests {
     /// Redefining a non-configurable accessor with a different setter must
     /// throw TypeError (§10.1.6.3 step 8b).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_define_property_non_configurable_accessor_redefine_setter() {
         let result = global_eval(
             "var o = {}; \
