@@ -76,8 +76,10 @@ fn day_from_year(y: f64) -> f64 {
 fn year_from_time(t: f64) -> f64 {
     // Binary search for the year.
     let d = day(t);
-    let mut lo = (d / 366.0 + 1970.0).floor() as i64 - 1;
-    let mut hi = (d / 365.0 + 1970.0).ceil() as i64 + 1;
+    let bound_a = d / 366.0 + 1970.0;
+    let bound_b = d / 365.0 + 1970.0;
+    let mut lo = bound_a.min(bound_b).floor() as i64 - 1;
+    let mut hi = bound_a.max(bound_b).ceil() as i64 + 1;
 
     while lo < hi {
         let mid = lo + (hi - lo) / 2;

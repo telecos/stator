@@ -57636,7 +57636,6 @@ mod tests {
 
     /// `toISOString()` formats extended negative years with a sign.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_to_iso_string_extended_negative_year() {
         let result = global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString()").unwrap();
         assert_eq!(
@@ -57890,7 +57889,6 @@ mod tests {
 
     /// `Date.UTC()` does NOT map year 100; 100 stays 100 CE.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_utc_year_100_no_mapping() {
         let result = global_eval("new Date(Date.UTC(100, 0, 1)).getUTCFullYear() === 100").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
