@@ -16300,11 +16300,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "replace" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        Some(v) => v.to_js_string()?,
-                        _ => "undefined".to_string(),
-                    };
+                    let replacement = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -16319,9 +16315,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(
-                                    re.try_symbol_replace(&s, &replacement)?.into(),
-                                ))
+                                let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                    let weak = std::rc::Weak::<RefCell<PropertyMap>>::new();
+                                    crate::builtins::regexp::regexp_replace_with_callback(
+                                        &re,
+                                        &s,
+                                        &replacement,
+                                        &weak,
+                                    )?
+                                } else {
+                                    re.try_symbol_replace(&s, &replacement.to_js_string()?)?
+                                };
+                                Ok(JsValue::String(result.into()))
                             } else {
                                 Ok(JsValue::String(s.clone()))
                             }
@@ -16329,8 +16334,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
                             Ok(JsValue::String(
-                                crate::builtins::string::string_replace(&s, &search, &replacement)
-                                    .into(),
+                                crate::builtins::string::string_replace(
+                                    &s,
+                                    &search,
+                                    &replacement.to_js_string()?,
+                                )
+                                .into(),
                             ))
                         }
                         _ => Ok(JsValue::String(s.clone())),
@@ -16356,11 +16365,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "replaceAll" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        Some(v) => v.to_js_string()?,
-                        _ => "undefined".to_string(),
-                    };
+                    let replacement = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -16380,9 +16385,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(
-                                    re.try_symbol_replace(&s, &replacement)?.into(),
-                                ))
+                                let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                    let weak = std::rc::Weak::<RefCell<PropertyMap>>::new();
+                                    crate::builtins::regexp::regexp_replace_with_callback(
+                                        &re,
+                                        &s,
+                                        &replacement,
+                                        &weak,
+                                    )?
+                                } else {
+                                    re.try_symbol_replace(&s, &replacement.to_js_string()?)?
+                                };
+                                Ok(JsValue::String(result.into()))
                             } else {
                                 Ok(JsValue::String(s.clone()))
                             }
@@ -16393,7 +16407,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 crate::builtins::string::string_replace_all(
                                     &s,
                                     &search,
-                                    &replacement,
+                                    &replacement.to_js_string()?,
                                 )
                                 .into(),
                             ))

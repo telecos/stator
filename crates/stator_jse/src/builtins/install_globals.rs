@@ -64391,7 +64391,6 @@ mod tests {
 
     /// Regex replacer receives (match, ...groups, offset, string).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_groups() {
         let r = global_eval(
             "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return y + ':' + mo + ':' + off + ':' + s; })",
@@ -64668,7 +64667,6 @@ mod tests {
 
     /// Regex function replacers receive undefined for nonparticipating groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_missing_group() {
         let r = global_eval(
             "'a'.replace(/(a)?(b)?/, function(m, a, b, off, s) { return String(a === 'a') + ':' + String(b === undefined) + ':' + off + ':' + s; })",
@@ -64679,7 +64677,6 @@ mod tests {
 
     /// Global regex function replacers receive captures, offsets, and the full string.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_global_offsets() {
         let r = global_eval(
             "'a1b2'.replace(/(\\d)/g, function(m, d, off, s) { return '[' + d + ',' + off + ',' + s.length + ']'; })",
@@ -65093,7 +65090,6 @@ mod tests {
 
     /// Regex function replacers receive UTF-16 offsets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_utf16_offsets() {
         let r = global_eval(
             "'😀1😀2'.replace(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
@@ -65104,7 +65100,6 @@ mod tests {
 
     /// Regex function replacers receive named groups as the final argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_named_groups_argument() {
         let r = global_eval(
             "'2024-07'.replace(/(?<y>\\d+)-(?<m>\\d+)/, function(m, y, mo, off, s, groups) { return groups.y + '/' + groups.m + '/' + off; })",
@@ -65115,7 +65110,6 @@ mod tests {
 
     /// Regex function replacers surface undefined named-group values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_named_group_undefined() {
         let r = global_eval(
             "'a'.replace(/(?<a>a)|(?<b>b)/, function(m, a, b, off, s, groups) { return String(groups.a === 'a') + ':' + String(groups.b === undefined); })",
@@ -65133,7 +65127,6 @@ mod tests {
 
     /// `replaceAll` with a global regexp callback uses UTF-16 offsets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_regex_function_replacer_utf16_offsets() {
         let r = global_eval(
             "'😀1😀2'.replaceAll(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
@@ -65144,7 +65137,6 @@ mod tests {
 
     /// `replaceAll` forwards named groups to callback replacers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_regex_function_replacer_named_groups_argument() {
         let r = global_eval(
             "'2024-07 2025-08'.replaceAll(/(?<y>\\d+)-(?<m>\\d+)/g, function(m, y, mo, off, s, groups) { return groups.m + '/' + groups.y + '@' + off; })",
@@ -65426,7 +65418,6 @@ mod tests {
 
     /// RegExp replacers are called for `replaceAll`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_replace_all_regexp_function_replacer() {
         let r = global_eval("'a1b2'.replaceAll(/\\d/g, function(m) { return '[' + m + ']'; })")
             .unwrap();

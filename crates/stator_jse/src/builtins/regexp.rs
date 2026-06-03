@@ -457,7 +457,7 @@ fn sync_last_index_to_props(weak: &Weak<RefCell<PropertyMap>>, re: &JsRegExp) {
     }
 }
 
-fn is_callable(value: &JsValue) -> bool {
+pub(crate) fn is_callable(value: &JsValue) -> bool {
     match value {
         JsValue::Function(_) | JsValue::NativeFunction(_) => true,
         JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
@@ -519,7 +519,7 @@ fn call_replace_callback(
     dispatch_call_value(callback, args)?.to_js_string()
 }
 
-fn regexp_replace_with_callback(
+pub(crate) fn regexp_replace_with_callback(
     re: &JsRegExp,
     input: &str,
     replacement: &JsValue,
