@@ -79346,42 +79346,36 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.search` delegates to custom `@@search`.
         e2e_string_search_custom_symbol_dispatch,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return 7; } }); "abc".search(searcher) === 7"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@search` receives the source string.
         e2e_string_search_custom_symbol_receives_input,
         r#"var seen = ""; var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { seen = s; return -1; } }); "abc".search(searcher) === -1 && seen === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@search` receives the searcher as `this`.
         e2e_string_search_custom_symbol_this_binding,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return this === searcher && s === "abc"; } }); "abc".search(searcher) === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@search` participates in `String.prototype.search`.
         e2e_string_search_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.search, { value: function(s) { return s.length; } }); var searcher = Object.create(proto); "abc".search(searcher) === 3"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@search` throws.
         e2e_string_search_custom_symbol_non_callable_throws,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: 123 }); try { "abc".search(searcher); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@search` falls back to string coercion.
         e2e_string_search_custom_symbol_undefined_falls_back,
         r#"var searcher = { toString: function() { return "b"; } }; Object.defineProperty(searcher, Symbol.search, { value: undefined }); "abc".search(searcher) === 1"#

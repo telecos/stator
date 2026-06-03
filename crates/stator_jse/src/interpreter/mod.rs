@@ -16629,32 +16629,59 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "search" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            Ok(JsValue::Smi(re.symbol_search(&s) as i32))
-                        } else {
-                            Ok(JsValue::Smi(-1))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    if let Some(searcher) = args.first()
+                        && !matches!(searcher, JsValue::Undefined)
+                    {
+                        let search_method = dispatch_get_property_value(
+                            searcher,
+                            JsValue::String("@@search".into()),
+                        )?;
+                        if !matches!(search_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&search_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.search @@search value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &search_method,
+                                searcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
                         }
                     }
-                    Some(JsValue::String(pat)) => {
-                        let pat = pat.to_string();
-                        Ok(JsValue::Smi(
-                            crate::builtins::string::string_index_of(&s, &pat, None) as i32,
-                        ))
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                Ok(JsValue::Smi(re.symbol_search(&s) as i32))
+                            } else {
+                                let pat = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(JsValue::Smi(crate::builtins::string::string_index_of(
+                                    &s, &pat, None,
+                                ) as i32))
+                            }
+                        }
+                        Some(JsValue::String(pat)) => {
+                            let pat = pat.to_string();
+                            Ok(JsValue::Smi(
+                                crate::builtins::string::string_index_of(&s, &pat, None) as i32,
+                            ))
+                        }
+                        _ => Ok(JsValue::Smi(-1)),
                     }
-                    _ => Ok(JsValue::Smi(-1)),
                 }));
             }
             "matchAll" => {
