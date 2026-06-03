@@ -459,7 +459,7 @@ fn sync_last_index_to_props(weak: &Weak<RefCell<PropertyMap>>, re: &JsRegExp) {
 
 pub(crate) fn is_callable(value: &JsValue) -> bool {
     match value {
-        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => true,
         JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
         _ => false,
     }

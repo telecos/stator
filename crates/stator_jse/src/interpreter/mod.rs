@@ -16333,14 +16333,30 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(
+                            let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                crate::builtins::string::string_replace_functional_fallible(
+                                    &s,
+                                    &search,
+                                    |matched, offset, input| {
+                                        dispatch_call_value(
+                                            &replacement,
+                                            vec![
+                                                JsValue::String(matched.into()),
+                                                JsValue::Smi(offset as i32),
+                                                JsValue::String(input.into()),
+                                            ],
+                                        )?
+                                        .to_js_string()
+                                    },
+                                )?
+                            } else {
                                 crate::builtins::string::string_replace(
                                     &s,
                                     &search,
                                     &replacement.to_js_string()?,
                                 )
-                                .into(),
-                            ))
+                            };
+                            Ok(JsValue::String(result.into()))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }
@@ -16403,14 +16419,30 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(
+                            let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                crate::builtins::string::string_replace_all_functional_fallible(
+                                    &s,
+                                    &search,
+                                    |matched, offset, input| {
+                                        dispatch_call_value(
+                                            &replacement,
+                                            vec![
+                                                JsValue::String(matched.into()),
+                                                JsValue::Smi(offset as i32),
+                                                JsValue::String(input.into()),
+                                            ],
+                                        )?
+                                        .to_js_string()
+                                    },
+                                )?
+                            } else {
                                 crate::builtins::string::string_replace_all(
                                     &s,
                                     &search,
                                     &replacement.to_js_string()?,
                                 )
-                                .into(),
-                            ))
+                            };
+                            Ok(JsValue::String(result.into()))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }

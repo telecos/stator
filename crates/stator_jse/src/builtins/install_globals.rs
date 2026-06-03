@@ -64381,7 +64381,6 @@ mod tests {
 
     /// Replace with function replacer — receives (match, offset, string).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_function_replacer() {
         let r =
             global_eval("'hello'.replace('ll', function(m, off, s) { return off.toString(); })")
@@ -64436,7 +64435,6 @@ mod tests {
 
     /// replaceAll with function replacer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_fn_replacer() {
         let r =
             global_eval("'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })")
