@@ -567,7 +567,7 @@ fn regexp_replace_with_callback(
 /// * `input` → original input string
 /// * `groups` → named groups object (or `undefined`)
 /// * `indices` → `{ 0: [s,e], 1: [s,e], …, groups: {…} }` when `/d` flag
-fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
+pub(crate) fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     let mut props = PropertyMap::new();
 
     // [0] = full match

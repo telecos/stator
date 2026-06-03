@@ -16328,7 +16328,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(s.replacen(&search, &replacement, 1).into()))
+                            Ok(JsValue::String(
+                                crate::builtins::string::string_replace(&s, &search, &replacement)
+                                    .into(),
+                            ))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }
@@ -16386,7 +16389,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(s.replace(&search, &replacement).into()))
+                            Ok(JsValue::String(
+                                crate::builtins::string::string_replace_all(
+                                    &s,
+                                    &search,
+                                    &replacement,
+                                )
+                                .into(),
+                            ))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }
@@ -16569,8 +16579,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     Some(JsValue::String(pat)) => {
                         let pat = pat.to_string();
-                        Ok(s.find(&pat)
-                            .map_or(JsValue::Smi(-1), |i| JsValue::Smi(i as i32)))
+                        Ok(JsValue::Smi(
+                            crate::builtins::string::string_index_of(&s, &pat, None) as i32,
+                        ))
                     }
                     _ => Ok(JsValue::Smi(-1)),
                 }));
@@ -16600,17 +16611,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             let matches = re.try_symbol_match_all(&s)?;
                             let results: Vec<JsValue> = matches
                                 .into_iter()
-                                .map(|m| {
-                                    let mut parts: Vec<JsValue> =
-                                        vec![JsValue::String(m.matched.clone().into())];
-                                    for g in &m.captures {
-                                        parts.push(match g {
-                                            Some(s) => JsValue::String(s.clone().into()),
-                                            None => JsValue::Undefined,
-                                        });
-                                    }
-                                    JsValue::new_array(parts)
-                                })
+                                .map(|m| crate::builtins::regexp::match_to_js(&m))
                                 .collect();
                             Ok(JsValue::Iterator(NativeIterator::from_items(results)))
                         } else {

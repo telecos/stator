@@ -64424,7 +64424,6 @@ mod tests {
 
     /// `$$` works in replaceAll.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_dollar_dollar() {
         let r = global_eval("'aba'.replaceAll('a', '$$')").unwrap();
         assert_eq!(r, JsValue::String("$b$".into()));
@@ -64432,7 +64431,6 @@ mod tests {
 
     /// `$&` works in replaceAll.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_dollar_ampersand() {
         let r = global_eval("'aba'.replaceAll('a', '[$&]')").unwrap();
         assert_eq!(r, JsValue::String("[a]b[a]".into()));
@@ -65055,7 +65053,6 @@ mod tests {
 
     /// `matchAll` reports indices in UTF-16 code units.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_utf16_indices() {
         let r = global_eval(
             "Array.from('😀a😀b'.matchAll(/[ab]/g)).map(function(m) { return m.index; }).join(',')",
@@ -65087,7 +65084,6 @@ mod tests {
 
     /// `matchAll` with named groups keeps the groups object on each match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_named_groups_object() {
         let r = global_eval(
             "Array.from('2024-07 2025-08'.matchAll(/(?<y>\\d{4})-(?<m>\\d{2})/g)).map(function(m) { return m.groups.y + '/' + m.groups.m; }).join(',')",
@@ -65404,6 +65400,12 @@ mod tests {
     fn e2e_string_search_string_fallback_no_match() {
         let r = global_eval("'banana'.search('xy')").unwrap();
         assert_eq!(r, JsValue::Smi(-1));
+    }
+    /// String search reports string-pattern indices in UTF-16 code units.
+    #[test]
+    fn e2e_string_search_string_fallback_uses_utf16_index() {
+        let r = global_eval("'😀a'.search('a')").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
     }
 
     /// `replaceAll` with a non-global regexp throws a `TypeError`.
