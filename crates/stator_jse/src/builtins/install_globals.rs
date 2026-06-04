@@ -79743,42 +79743,36 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.matchAll` delegates to custom `@@matchAll`.
         e2e_string_match_all_custom_symbol_dispatch,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s, s.toUpperCase()][Symbol.iterator](); } }); var out = Array.from("ab".matchAll(matcher)); out.length === 2 && out[0] === "ab" && out[1] === "AB""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@matchAll` receives the matcher as `this`.
         e2e_string_match_all_custom_symbol_this_binding,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [this === matcher && s === "ab"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@matchAll` participates in `String.prototype.matchAll`.
         e2e_string_match_all_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.matchAll, { value: function(s) { return [s.length][Symbol.iterator](); } }); var matcher = Object.create(proto); Array.from("abcd".matchAll(matcher))[0] === 4"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@matchAll` throws.
         e2e_string_match_all_custom_symbol_non_callable_throws,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: 123 }); try { Array.from("ab".matchAll(matcher)); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@matchAll` falls back to string coercion.
         e2e_string_match_all_custom_symbol_undefined_falls_back,
         r#"var matcher = { toString: function() { return "a"; } }; Object.defineProperty(matcher, Symbol.matchAll, { value: undefined }); Array.from("aba".matchAll(matcher)).length === 2"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@matchAll` does not require a global regexp.
         e2e_string_match_all_custom_symbol_no_global_requirement,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s + "!"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === "ab!""#

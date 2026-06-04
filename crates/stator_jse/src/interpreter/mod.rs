@@ -16741,61 +16741,111 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "matchAll" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            // ES ┬º22.1.3.12: matchAll requires the global flag.
-                            if !flags.contains('g') {
-                                return Err(StatorError::TypeError(
-                                    "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
-                                ));
-                            }
-                            let last_index = borrow
-                                .get("lastIndex")
-                                .and_then(|value| value.to_length().ok())
-                                .unwrap_or(0) as usize;
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            re.set_last_index(last_index);
-                            let matches = re.try_symbol_match_all(&s)?;
-                            let results: Vec<JsValue> = matches
-                                .into_iter()
-                                .map(|m| crate::builtins::regexp::match_to_js(&m))
-                                .collect();
-                            Ok(JsValue::Iterator(NativeIterator::from_items(results)))
-                        } else {
-                            Ok(JsValue::Iterator(NativeIterator::from_items(vec![])))
-                        }
-                    }
-                    Some(JsValue::String(pattern)) => {
-                        let pattern = pattern.to_string();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let string_match_all_results = |input: &Rc<str>, pattern: &str| {
                         if pattern.is_empty() {
-                            return Ok(JsValue::Iterator(NativeIterator::from_items(vec![])));
+                            return JsValue::Iterator(NativeIterator::from_items(vec![]));
                         }
                         let mut results = Vec::new();
                         let mut start = 0;
-                        while let Some(pos) = s[start..].find(pattern.as_str()) {
+                        while let Some(pos) = input[start..].find(pattern) {
                             let abs = start + pos;
                             let mut m = PropertyMap::new();
-                            m.insert("0".to_string(), JsValue::String(Rc::from(pattern.as_str())));
-                            m.insert("index".to_string(), JsValue::Smi(abs as i32));
-                            m.insert("input".to_string(), JsValue::String(s.clone()));
+                            m.insert("0".to_string(), JsValue::String(Rc::from(pattern)));
+                            m.insert(
+                                "index".to_string(),
+                                JsValue::Smi(input[..abs].encode_utf16().count() as i32),
+                            );
+                            m.insert("input".to_string(), JsValue::String(input.clone()));
+                            m.insert("groups".to_string(), JsValue::Undefined);
                             m.insert("length".to_string(), JsValue::Smi(1));
+                            m.insert("__is_array__".to_string(), JsValue::Boolean(true));
                             results.push(JsValue::PlainObject(Rc::new(RefCell::new(m))));
                             start = abs + pattern.len();
                         }
-                        Ok(JsValue::Iterator(NativeIterator::from_items(results)))
+                        JsValue::Iterator(NativeIterator::from_items(results))
+                    };
+
+                    if let Some(matcher) = args.first()
+                        && !matches!(matcher, JsValue::Undefined)
+                    {
+                        if let JsValue::PlainObject(map) = matcher {
+                            let borrow = map.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                if !flags.contains('g') {
+                                    return Err(StatorError::TypeError(
+                                        "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        let match_all_method = dispatch_get_property_value(
+                            matcher,
+                            JsValue::String("@@matchAll".into()),
+                        )?;
+                        if !matches!(match_all_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&match_all_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.matchAll @@matchAll value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &match_all_method,
+                                matcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
+                        }
                     }
-                    _ => Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                // ES §22.1.3.12: matchAll requires the global flag.
+                                if !flags.contains('g') {
+                                    return Err(StatorError::TypeError(
+                                        "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+                                    ));
+                                }
+                                let last_index = borrow
+                                    .get("lastIndex")
+                                    .and_then(|value| value.to_length().ok())
+                                    .unwrap_or(0)
+                                    as usize;
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                re.set_last_index(last_index);
+                                let matches = re.try_symbol_match_all(&s)?;
+                                let results: Vec<JsValue> = matches
+                                    .into_iter()
+                                    .map(|m| crate::builtins::regexp::match_to_js(&m))
+                                    .collect();
+                                Ok(JsValue::Iterator(NativeIterator::from_items(results)))
+                            } else {
+                                let pattern =
+                                    JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(string_match_all_results(&s, &pattern))
+                            }
+                        }
+                        Some(JsValue::String(pattern)) => {
+                            let pattern = pattern.to_string();
+                            Ok(string_match_all_results(&s, &pattern))
+                        }
+                        _ => Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
+                    }
                 }));
             }
             "@@iterator" | "Symbol(1)" => {

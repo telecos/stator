@@ -420,17 +420,17 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_match_all = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_match_all__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_match_all);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let matches = re_match_all.try_symbol_match_all(&input)?;
-                sync_last_index_to_props(&w, &re_match_all);
-                let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            })),
-        );
+        let match_all_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_match_all);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let matches = re_match_all.try_symbol_match_all(&input)?;
+            sync_last_index_to_props(&w, &re_match_all);
+            let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
+            Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_match_all__".into(), match_all_fn.clone());
+        props.insert("@@matchAll".into(), match_all_fn);
     }
 
     JsValue::PlainObject(props_rc)
