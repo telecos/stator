@@ -66551,7 +66551,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_null_handler_falls_through() {
         let r = global_eval(
             r#"
@@ -67696,7 +67695,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap_v2() {
         let r = global_eval(
             r#"
@@ -67834,7 +67832,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_no_trap_forwarding_all_ops() {
         let r = global_eval(
             r#"
