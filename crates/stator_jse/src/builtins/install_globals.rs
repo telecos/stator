@@ -80880,7 +80880,6 @@ mod tests {
 
     // 19. Inherited getter from prototype chain
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_inherited_getter_prototype() {
         assert_eval_true(
             "var parent = { get x() { return 'from parent'; } }; \
@@ -82690,7 +82689,6 @@ mod tests {
 
     /// Accessor on proto, reading through child.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_getter_read() {
         assert_eval_true(
             "var parent = {}; \
@@ -82735,7 +82733,6 @@ mod tests {
 
     /// Accessor setter on proto is invoked when writing to child.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_setter_this_binding() {
         assert_eval_true(
             "var parent = {}; \
@@ -82752,7 +82749,6 @@ mod tests {
 
     /// Accessor on proto does NOT show in hasOwnProperty.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_not_own() {
         assert_eval_true(
             "var parent = {}; \
@@ -82766,7 +82762,6 @@ mod tests {
 
     /// Multiple levels of prototype chain with accessors.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_chain_multi_level_accessor() {
         assert_eval_true(
             "var a = {}; \
@@ -82781,7 +82776,6 @@ mod tests {
 
     /// Own data property overrides accessor several levels up.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_chain_own_shadows_deep_accessor() {
         assert_eval_true(
             "var a = {}; \
