@@ -67867,7 +67867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_keys_es_ordering() {
         let r = global_eval(
             r#"
@@ -78091,7 +78090,6 @@ mod tests {
 
     /// Object.entries orders integer keys before string keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_entries_integer_ordering() {
         assert_eval_true(
             "var o = {}; o.b = 2; o['1'] = 'one'; o.a = 1; o['0'] = 'zero'; \
@@ -78210,7 +78208,6 @@ mod tests {
 
     /// Object.create inherits from proto.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_inherits_proto() {
         assert_eval_true(
             "var proto = {greet: function() { return 'hello' }}; \
@@ -78278,7 +78275,6 @@ mod tests {
 
     /// Object.keys orders integer indices before string keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_keys_integer_ordering() {
         assert_eval_true(
             "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
