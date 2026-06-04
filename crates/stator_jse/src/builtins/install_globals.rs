@@ -65822,7 +65822,6 @@ mod tests {
 
     /// Proxy.revocable: revoke makes proxy throw on access.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revocable_revoke() {
         let r = global_eval(
             r#"
@@ -66463,7 +66462,6 @@ mod tests {
 
     /// Multiple revoke calls are idempotent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revoke_idempotent() {
         let r = global_eval(
             r#"
@@ -67810,7 +67808,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revocable_basic_v2() {
         let r = global_eval(
             r#"
