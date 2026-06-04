@@ -952,6 +952,11 @@ impl BytecodeArray {
         *self.inner.construct_proto_cache.borrow_mut() = Some(proto);
     }
 
+    /// Clears the cached constructor `.prototype` value after mutation.
+    pub fn clear_construct_proto_cache(&self) {
+        *self.inner.construct_proto_cache.borrow_mut() = None;
+    }
+
     /// Returns a clone of the cached construct boilerplate, if populated.
     pub fn cached_construct_boilerplate(&self) -> Option<ConstructBoilerplate> {
         self.inner.construct_boilerplate.borrow().clone()

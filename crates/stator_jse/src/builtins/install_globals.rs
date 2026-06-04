@@ -63214,7 +63214,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replacing_constructor_prototype_affects_new_instances_only() {
         let result = global_eval(
             "function F() {} var old = new F(); var p = { y: 2 }; \

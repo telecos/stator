@@ -916,6 +916,9 @@ fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
 
 /// Store a named property on a `Function` value's side-table entry.
 pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+    if name == "prototype" {
+        ba.clear_construct_proto_cache();
+    }
     ba.mark_has_fn_props();
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
