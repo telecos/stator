@@ -79289,7 +79289,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional regexp replacement receives named groups.
         e2e_regexp_replace_function_receives_named_groups,
         r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, function(m, y, mo, idx, input, groups) { return groups.m + "/" + groups.y; }) === "07/2024""#
@@ -79326,7 +79325,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global functional regexp replacement visits each match.
         e2e_regexp_replace_global_functional_replacer,
         r#""a1 b2".replace(/\d/g, function(m) { return "[" + m + "]"; }) === "a[1] b[2]""#
@@ -79455,49 +79453,42 @@ mod tests {
     // ── RegExp replace/split/exec deep conformance ───────────────────────
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the whole match and captures.
         e2e_regexp_replace_function_receives_match_and_captures_deep,
         r#""12-34".replace(/(\d+)-(\d+)/, function(m, a, b) { return m + "|" + a + "|" + b; }) === "12-34|12|34""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the UTF-16 offset.
         e2e_regexp_replace_function_receives_utf16_offset_deep,
         r#""😀12".replace(/(\d+)/, function(m, a, off) { return a + ":" + off; }) === "😀12:2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the original input string.
         e2e_regexp_replace_function_receives_input_string_deep,
         r#""ab12cd".replace(/(\d+)/, function(m, a, off, input) { return input === "ab12cd" && off === 2 ? "[" + a + "]" : "bad"; }) === "ab[12]cd""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Named-group replacers receive a null-prototype groups object.
         e2e_regexp_replace_function_groups_null_proto_deep,
         r#""2024-07".replace(/(?<year>\d{4})-(?<month>\d{2})/, function(m, y, mo, off, input, groups) { return Object.getPrototypeOf(groups) === null && groups.year === y && groups.month === mo ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-participating named groups are undefined in replacers.
         e2e_regexp_replace_function_groups_undefined_entry_deep,
         r#""a".replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, input, groups) { return groups.x === "a" && groups.y === undefined ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Replacers without named groups do not receive a groups argument.
         e2e_regexp_replace_function_without_groups_argument_deep,
         r#""12".replace(/(\d+)/, function(m, a, off, input) { return arguments.length === 4 ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global functional replacement visits every match.
         e2e_regexp_replace_function_global_visits_all_matches_deep,
         r#""a1b2c3".replace(/(\d)/g, function(m, d, off) { return "[" + d + ":" + off + "]"; }) === "a[1:1]b[2:3]c[3:5]""#
@@ -79566,14 +79557,12 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@replace` supports global replacements.
         e2e_regexp_symbol_replace_direct_global_deep,
         r#"var re = /\d/g; re[Symbol.replace]("a1b2c3", "X") === "aXbXcX""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@replace` supports functional replacers with groups.
         e2e_regexp_symbol_replace_direct_function_named_groups_deep,
         r#"var re = /(?<year>\d{4})-(?<month>\d{2})/; re[Symbol.replace]("2024-07", function(m, y, mo, off, input, groups) { return groups.month + "/" + groups.year + "@" + off; }) === "07/2024@0""#
