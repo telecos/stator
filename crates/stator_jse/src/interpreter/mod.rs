@@ -19633,7 +19633,11 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             map.borrow_mut().insert(prop_name.clone(), value.clone());
             sync_global_object_property_store(map, &prop_name, value);
             // If this is an array-like PlainObject, update "length".
-            if let Some(idx) = to_array_index(key) {
+            let is_array = {
+                let pm = map.borrow();
+                matches!(pm.get("__is_array__"), Some(JsValue::Boolean(true)))
+            };
+            if is_array && let Some(idx) = to_array_index(key) {
                 let new_len = (idx + 1) as i32;
                 let cur_len = map
                     .borrow()

@@ -64230,7 +64230,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_assign_orders_numeric_keys_on_target() {
         let result = global_eval(
             "var target = {}; \
