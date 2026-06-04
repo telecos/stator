@@ -79531,7 +79531,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Invalid two-digit captures remain literal text.
         e2e_regexp_replace_substitution_invalid_two_digit_capture_deep,
         r#""abc123def".replace(/(\d)(\d)(\d)/, "$99") === "abc$99def""#
@@ -79544,10 +79543,9 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Missing named captures produce the empty string.
         e2e_regexp_replace_substitution_missing_named_capture_deep,
-        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<missing>") === ""#
+        r##""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<missing>") === """##
     );
 
     string_symbol_dispatch_test!(

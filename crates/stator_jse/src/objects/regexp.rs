@@ -1211,7 +1211,7 @@ fn apply_replacement(replacement: &str, m: &RegExpMatch, input: &str) -> String 
                             consumed = 3;
                         }
                     }
-                    if num > 0 {
+                    if num > 0 && num <= m.captures.len() {
                         if let Some(Some(cap)) = m.captures.get(num - 1) {
                             out.push_str(cap);
                         }
