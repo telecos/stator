@@ -79240,49 +79240,42 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.replace` delegates to custom `@@replace`.
         e2e_string_replace_custom_symbol_dispatch,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return "R:" + s + ":" + r; } }); "abc".replace(replacer, "X") === "R:abc:X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives a string replacement.
         e2e_string_replace_custom_symbol_receives_string_replacement,
         r#"var seen = ""; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { seen = r; return s; } }); "abc".replace(replacer, "X") === "abc" && seen === "X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives a functional replacer unchanged.
         e2e_string_replace_custom_symbol_receives_function_replacement,
         r#"var fn = function() {}; var ok = false; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { ok = r === fn && s === "abc"; return "done"; } }); "abc".replace(replacer, fn) === "done" && ok"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives the replacer as `this`.
         e2e_string_replace_custom_symbol_this_binding,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return this === replacer && s === "abc" && r === "X"; } }); "abc".replace(replacer, "X") === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@replace` participates in `String.prototype.replace`.
         e2e_string_replace_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.replace, { value: function(s, r) { return s + ":" + r; } }); var replacer = Object.create(proto); "abc".replace(replacer, "X") === "abc:X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@replace` throws.
         e2e_string_replace_custom_symbol_non_callable_throws,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: 123 }); try { "abc".replace(replacer, "X"); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@replace` falls back to string coercion.
         e2e_string_replace_custom_symbol_undefined_falls_back,
         r#"var replacer = { toString: function() { return "b"; } }; Object.defineProperty(replacer, Symbol.replace, { value: undefined }); "abca".replace(replacer, "X") === "aXca""#

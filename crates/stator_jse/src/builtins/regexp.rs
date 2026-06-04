@@ -351,21 +351,21 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_replace = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_replace__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_replace);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
-                let result = if is_callable(&replacement) {
-                    regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
-                } else {
-                    re_replace.try_symbol_replace(&input, &replacement.to_js_string()?)?
-                };
-                sync_last_index_to_props(&w, &re_replace);
-                Ok(JsValue::String(result.into()))
-            })),
-        );
+        let replace_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_replace);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+            let result = if is_callable(&replacement) {
+                regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
+            } else {
+                re_replace.try_symbol_replace(&input, &replacement.to_js_string()?)?
+            };
+            sync_last_index_to_props(&w, &re_replace);
+            Ok(JsValue::String(result.into()))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_replace__".into(), replace_fn.clone());
+        props.insert("@@replace".into(), replace_fn);
     }
 
     // [Symbol.search](string)

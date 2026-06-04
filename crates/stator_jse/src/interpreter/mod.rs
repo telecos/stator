@@ -16326,6 +16326,27 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let replacement = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(search_value) = args.first()
+                        && !matches!(search_value, JsValue::Undefined)
+                    {
+                        let replace_method = dispatch_get_property_value(
+                            search_value,
+                            JsValue::String("@@replace".into()),
+                        )?;
+                        if !matches!(replace_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&replace_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.replace @@replace value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &replace_method,
+                                search_value.clone(),
+                                vec![JsValue::String(s.clone()), replacement],
+                            );
+                        }
+                    }
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -16353,7 +16374,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 Ok(JsValue::String(result.into()))
                             } else {
-                                Ok(JsValue::String(s.clone()))
+                                let search =
+                                    JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                let result = crate::builtins::string::string_replace(
+                                    &s,
+                                    &search,
+                                    &replacement.to_js_string()?,
+                                );
+                                Ok(JsValue::String(result.into()))
                             }
                         }
                         Some(JsValue::String(search)) => {
