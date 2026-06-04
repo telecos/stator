@@ -39770,7 +39770,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_custom_iterator_like_to_array() {
         assert_eval_true(
             "var i = 0; var iter = Iterator.from({ next: function() { return i < 3 ? { value: i++, done: false } : { done: true }; } }); var out = iter.toArray(); out.length === 3 && out[0] === 0 && out[2] === 2",
@@ -39778,7 +39777,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_custom_iterable_to_array() {
         assert_eval_true(
             "var obj = {}; obj[Symbol.iterator] = function() { var i = 1; return { next: function() { return i <= 3 ? { value: i++ * 10, done: false } : { done: true }; } }; }; var out = Iterator.from(obj).toArray(); out.length === 3 && out[0] === 10 && out[2] === 30",
@@ -39989,7 +39987,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_next_only_object_supports_helpers() {
         assert_eval_true(
             "var i = 0; var iter = Iterator.from({ next: function() { return i < 4 ? { value: i++, done: false } : { done: true }; } }); var out = iter.map(function(v) { return v + 10; }).filter(function(v) { return v % 2 === 0; }).toArray(); out.length === 2 && out[0] === 10 && out[1] === 12",
@@ -39997,10 +39994,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_helper_chaining_map_filter_take_drop() {
         assert_eval_true(
-            "var out = Iterator.from([1, 2, 3, 4, 5, 6]).map(function(v) { return v * 2; }).filter(function(v) { return v % 3 !== 0; }).drop(1).take(2).toArray(); out.length === 2 && out[0] === 8 && out[1] === 10",
+            "var out = Iterator.from([1, 2, 3, 4, 5, 6]).map(function(v) { return v * 2; }).filter(function(v) { return v % 3 !== 0; }).drop(1).take(2).toArray(); out.length === 2 && out[0] === 4 && out[1] === 8",
         );
     }
 

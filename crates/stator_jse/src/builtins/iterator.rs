@@ -637,7 +637,10 @@ pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
         JsValue::Iterator(_) | JsValue::Generator(_) => Ok(iterable.clone()),
         JsValue::Array(arr) => Ok(make_array_iterator(arr.borrow().clone())),
         JsValue::String(s) => Ok(make_string_iterator(s)),
-        value if is_iterator_like(value) => Ok(value.clone()),
+        value if is_iterator_like(value) => {
+            let items = iterator_to_vec(value)?;
+            Ok(make_array_iterator(items))
+        }
         value => {
             for key in ["@@iterator", "Symbol(1)"] {
                 let method = dispatch_get_property_value(value, JsValue::String(key.into()));
@@ -655,7 +658,8 @@ pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
                             "Iterator.from: iterator method did not return an iterator".into(),
                         ));
                     }
-                    return Ok(iterator);
+                    let items = iterator_to_vec(&iterator)?;
+                    return Ok(make_array_iterator(items));
                 }
             }
             Err(StatorError::TypeError(format!(
