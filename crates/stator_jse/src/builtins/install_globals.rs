@@ -22901,7 +22901,7 @@ fn make_reflect() -> JsValue {
                             Some(result)
                         }
                     }
-                    _ => get_object_prototype(&target),
+                    _ => get_prototype_of_value(&target),
                 };
                 Ok(proto.unwrap_or(JsValue::Null))
             }),
