@@ -389,18 +389,33 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
         .collect()
 }
 
-fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
+fn enumerable_own_string_keys(value: &JsValue) -> StatorResult<Vec<String>> {
     match value {
-        JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
-        JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
-        JsValue::Array(items) => items
+        JsValue::PlainObject(map) => Ok(own_string_property_keys(&map.borrow(), true)),
+        JsValue::Error(error) => Ok(own_string_property_keys(&error.props.borrow(), true)),
+        JsValue::Proxy(proxy) => {
+            let keys = proxy_own_keys(&proxy.borrow())?;
+            let mut out = Vec::new();
+            for key in keys {
+                let JsValue::String(name) = key else {
+                    continue;
+                };
+                if let Some((_, attrs)) = proxy_get_own_property_descriptor(&proxy.borrow(), &name)?
+                    && attrs.contains(PropertyAttributes::ENUMERABLE)
+                {
+                    out.push(name.to_string());
+                }
+            }
+            Ok(out)
+        }
+        JsValue::Array(items) => Ok(items
             .borrow()
             .iter()
             .enumerate()
             .filter_map(|(index, value)| (!value.is_the_hole()).then_some(index.to_string()))
-            .collect(),
-        JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
-        _ => Vec::new(),
+            .collect()),
+        JsValue::String(s) => Ok((0..utf16_len(s)).map(|i| i.to_string()).collect()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -15078,7 +15093,7 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                let keys = enumerable_own_string_keys(val)
+                let keys = enumerable_own_string_keys(val)?
                     .into_iter()
                     .map(|key| JsValue::String(key.into()))
                     .collect();
@@ -15095,7 +15110,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut values = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     values.push(dispatch_get_property_value(
                         val,
                         JsValue::String(key.into()),
@@ -15114,7 +15129,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut entries = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     let value =
                         dispatch_get_property_value(val, JsValue::String(key.clone().into()))?;
                     entries.push(JsValue::new_array(vec![JsValue::String(key.into()), value]));
@@ -15778,7 +15793,7 @@ fn make_object() -> JsValue {
                         continue;
                     }
                     // Copy enumerable own string-keyed properties.
-                    for key in enumerable_own_string_keys(source) {
+                    for key in enumerable_own_string_keys(source)? {
                         let value = dispatch_get_property_value(
                             source,
                             JsValue::String(key.clone().into()),
