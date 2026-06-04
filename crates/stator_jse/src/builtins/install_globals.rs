@@ -110,8 +110,8 @@ use crate::builtins::symbol::{
     SYMBOL_ASYNC_DISPOSE, SYMBOL_ASYNC_ITERATOR, SYMBOL_DISPOSE, SYMBOL_HAS_INSTANCE,
     SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE,
     SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG,
-    SYMBOL_UNSCOPABLES, property_key_to_symbol, symbol_create, symbol_description, symbol_for,
-    symbol_key_for, symbol_to_property_key,
+    SYMBOL_UNSCOPABLES, is_symbol_property_key, property_key_to_symbol, symbol_create,
+    symbol_description, symbol_for, symbol_key_for, symbol_to_property_key,
 };
 use crate::builtins::typed_array::{
     JsArrayBuffer, TypedArrayKind, arraybuffer_detached, arraybuffer_max_byte_length,
@@ -15703,6 +15703,9 @@ fn make_object() -> JsValue {
                                 continue;
                             }
                             if k.starts_with("__") || k.starts_with('#') {
+                                continue;
+                            }
+                            if is_symbol_property_key(k) {
                                 continue;
                             }
                             if seen.insert(k.to_string()) {
