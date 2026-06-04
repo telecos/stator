@@ -40,7 +40,7 @@ use super::{
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
-    proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
+    proxy_apply, proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
 };
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
@@ -2203,6 +2203,12 @@ fn handle_call_any_receiver(
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             ctx.frame.accumulator = f(args.into_vec())?;
+            ctx.frame.global_cache_invalidate();
+        }
+        JsValue::Proxy(proxy) => {
+            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+            ctx.frame.accumulator =
+                proxy_apply(&mut proxy.borrow_mut(), JsValue::Undefined, args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {

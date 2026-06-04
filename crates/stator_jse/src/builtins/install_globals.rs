@@ -65780,7 +65780,6 @@ mod tests {
 
     /// Proxy apply trap intercepts function calls.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_trap() {
         let r = global_eval(
             r#"
@@ -66653,7 +66652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_null_handler_falls_through() {
         let r = global_eval(
             r#"
@@ -67706,7 +67704,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_trap_v2() {
         let r = global_eval(
             r#"
@@ -83197,7 +83194,6 @@ mod tests {
 
     /// Proxy: apply trap for function proxy.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_apply_trap() {
         assert_e2e_true(
             "var p = new Proxy(function(x) { return x * 2; }, { \
