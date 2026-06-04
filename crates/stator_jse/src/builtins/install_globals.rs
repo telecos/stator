@@ -63097,7 +63097,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_custom_symbol_hasinstance_receives_constructor_this() {
         let result = global_eval(
             "function F() {} \
@@ -63120,7 +63119,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_plain_object_rhs_uses_symbol_hasinstance() {
         let result = global_eval(
             "var C = { [Symbol.hasInstance]: function(v) { return this === C && v.ok === true; } }; \

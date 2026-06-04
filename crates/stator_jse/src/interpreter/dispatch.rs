@@ -6193,18 +6193,24 @@ fn handle_test_instance_of(
     };
     if let Some(ref hi) = has_instance_fn {
         match hi {
-            JsValue::NativeFunction(f) => {
-                let result = f(vec![ctx.frame.accumulator.cheap_clone()])?;
+            JsValue::NativeFunction(_)
+            | JsValue::Function(_)
+            | JsValue::PlainObject(_)
+            | JsValue::Proxy(_) => {
+                let result = dispatch_call_with_this(
+                    hi,
+                    constructor.clone(),
+                    vec![ctx.frame.accumulator.cheap_clone()],
+                )?;
                 ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
-            JsValue::Function(_) | JsValue::PlainObject(_) => {
-                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.cheap_clone()])?;
-                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
-                return Ok(DispatchAction::Continue);
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Symbol.hasInstance value is not callable".to_string(),
+                ));
             }
-            _ => {}
         }
     }
 
