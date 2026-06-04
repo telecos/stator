@@ -62975,7 +62975,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_ignores_primitive_value() {
         let result = global_eval(
             "var proto = { x: 1 }; var obj = Object.create(proto); \
@@ -62986,7 +62985,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_cycle_rejected() {
         let result = global_eval(
             "var a = {}; var b = {}; a.__proto__ = b; \
@@ -62997,7 +62995,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_non_extensible_rejected() {
         let result = global_eval(
             "var o = {}; Object.preventExtensions(o); \

@@ -29,7 +29,7 @@ use super::{
     find_handler, fn_props_get, fn_props_set, has_property_in_chain, has_prototype_in_chain,
     is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, make_construct_this,
     maybe_cache_construct_boilerplate, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue, ordinary_set_prototype_of,
     plain_object_to_array_items, populate_self_name, proto_lookup, proto_lookup_cached_resolution,
     proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
     run_callee_pooled, set_function_name_if_missing, set_pending_exception,
@@ -4319,6 +4319,14 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
+            if prop_name.as_ref() == "__proto__" {
+                if matches!(val, JsValue::Null) || val.is_object_like() {
+                    ordinary_set_prototype_of(&obj, val)?;
+                    invalidate_plain_object_caches(ctx, map);
+                    ctx.frame.global_cache_invalidate();
+                }
+                return Ok(DispatchAction::Continue);
+            }
             let ic_eligible = slot != u32::MAX;
             if ic_eligible {
                 ic_counters::record_probe(IcTier::Interpreter, IcOp::NamedStore);
