@@ -3428,7 +3428,9 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::This(_) => {
-                    if let Some(binding) = self.lookup_var("this") {
+                    if self.is_program && self.is_module {
+                        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    } else if let Some(binding) = self.lookup_var("this") {
                         self.emit_ldar(binding.reg);
                     } else {
                         let name_idx = self.add_string("this");

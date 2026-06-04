@@ -43510,14 +43510,12 @@ mod tests {
 
     /// Module code implicitly uses strict mode: this at top level is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_this_is_undefined() {
         assert_module_eval_true("typeof this === 'undefined'");
     }
 
     /// Module code implicitly uses strict mode: this === undefined directly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_this_strict_undefined() {
         assert_module_eval_true("this === undefined");
     }
