@@ -489,7 +489,7 @@ pub(super) fn default_async_generator_object_prototype() -> Option<JsValue> {
     })
 }
 
-fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
+pub(crate) fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
     state.borrow().prototype.clone().or_else(|| {
         if state.borrow().bytecode_array.is_async() {
             default_async_generator_object_prototype()

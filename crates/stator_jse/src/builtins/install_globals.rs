@@ -139,8 +139,8 @@ use crate::interpreter::{
     current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
     dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
     dispatch_setter, function_display_name, function_length_value, function_to_string_value,
-    get_object_prototype, has_prototype_in_chain, ordinary_set_prototype_of,
-    plain_object_has_own_property,
+    generator_object_prototype, get_object_prototype, has_prototype_in_chain,
+    ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -473,6 +473,7 @@ fn get_prototype_of_value(value: &JsValue) -> Option<JsValue> {
             get_object_prototype(value)
         }
         JsValue::Array(_) => constructor_prototype("Array"),
+        JsValue::Generator(state) => generator_object_prototype(state),
         JsValue::Function(_) | JsValue::NativeFunction(_) => constructor_prototype("Function"),
         JsValue::Boolean(_) => constructor_prototype("Boolean"),
         JsValue::Smi(_) | JsValue::HeapNumber(_) => constructor_prototype("Number"),
