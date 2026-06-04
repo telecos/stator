@@ -19028,6 +19028,9 @@ fn try_lookup_accessor_in_chain(
 /// where accessor errors must propagate instead of being coerced to
 /// `undefined`.
 pub(super) fn try_proto_lookup(obj: &JsValue, key: &str) -> StatorResult<JsValue> {
+    if let JsValue::Proxy(p) = obj {
+        return proxy_get_with_receiver(&p.borrow(), key, obj);
+    }
     if let Some(value) = try_lookup_accessor_in_chain(obj, key, obj)? {
         return Ok(value);
     }
@@ -19037,6 +19040,9 @@ pub(super) fn try_proto_lookup(obj: &JsValue, key: &str) -> StatorResult<JsValue
 /// Interned-key variant of [`try_proto_lookup`].
 pub(super) fn try_proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> StatorResult<JsValue> {
     let key_str = key.as_ref();
+    if let JsValue::Proxy(p) = obj {
+        return proxy_get_with_receiver(&p.borrow(), key_str, obj);
+    }
     if let Some(value) = try_lookup_accessor_in_chain(obj, key_str, obj)? {
         return Ok(value);
     }

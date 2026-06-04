@@ -66404,7 +66404,6 @@ mod tests {
 
     /// Proxy get invariant: non-configurable non-writable property must return correct value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_get_invariant() {
         let r = global_eval(
             r#"
@@ -66887,7 +66886,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_get_throws_for_mismatched_frozen_data_property() {
         assert_eval_true(
             r#"
@@ -83213,7 +83211,6 @@ mod tests {
 
     /// Revoked proxy: get throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_revoked_proxy_get_throws() {
         assert_e2e_true(
             "var r = Proxy.revocable({}, {}); r.revoke(); \
