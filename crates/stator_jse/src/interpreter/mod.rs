@@ -185,7 +185,9 @@ use crate::builtins::error::{
     call_stack_depth, pop_call_frame, push_call_frame, with_anon_call_frame,
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
-use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
+use crate::builtins::proxy::{
+    proxy_apply, proxy_get_with_receiver, proxy_has, proxy_set_with_receiver,
+};
 use crate::builtins::typed_array::{typed_array_get, typed_array_set};
 #[cfg(any(
     stator_maglev_jit_x86_64,
@@ -789,6 +791,7 @@ pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
                     }
                 }
             }
+            JsValue::Proxy(p) => return proxy_has(&p.borrow(), key).unwrap_or(false),
             JsValue::Null | JsValue::Undefined => return false,
             _ => return !matches!(proto_lookup(&current, key), JsValue::Undefined),
         }
@@ -18693,6 +18696,10 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
         if matches!(current, JsValue::Null | JsValue::Undefined) {
             return JsValue::Undefined;
         }
+        if let JsValue::Proxy(p) = &current {
+            return proxy_get_with_receiver(&p.borrow(), key, this_obj)
+                .unwrap_or(JsValue::Undefined);
+        }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
             // Check for getter accessor BEFORE data key (same rationale
@@ -18740,6 +18747,10 @@ fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -
     for _ in 0..256 {
         if matches!(current, JsValue::Null | JsValue::Undefined) {
             return JsValue::Undefined;
+        }
+        if let JsValue::Proxy(p) = &current {
+            return proxy_get_with_receiver(&p.borrow(), key_str, this_obj)
+                .unwrap_or(JsValue::Undefined);
         }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();

@@ -83166,7 +83166,6 @@ mod tests {
 
     /// Proxy as prototype: get trap intercepts property access.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_as_prototype_get() {
         assert_e2e_true(
             "var handler = { get: function(t, p) { return p === 'x' ? 42 : undefined; } }; \
@@ -83178,7 +83177,6 @@ mod tests {
 
     /// Proxy as prototype: has trap intercepts 'in' operator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_as_prototype_has() {
         assert_e2e_true(
             "var handler = { has: function(t, p) { return p === 'secret'; } }; \
