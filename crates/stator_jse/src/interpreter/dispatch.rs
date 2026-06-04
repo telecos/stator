@@ -12432,7 +12432,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_custom_has_instance() {
         let result = crate::builtins::global::global_eval(
             "var obj = { [Symbol.hasInstance](v) { return v === 42; } }; 42 instanceof obj",
@@ -12442,7 +12441,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_class_symbol_has_instance_true() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static [Symbol.hasInstance](x) { return x === 1; } } 1 instanceof Foo",
