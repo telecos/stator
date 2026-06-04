@@ -22435,6 +22435,9 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                 return Ok(result.to_boolean());
             }
             match &target {
+                JsValue::PlainObject(_) if matches!(receiver, JsValue::Proxy(_)) => {
+                    plain_set(&target, key, value, &target)
+                }
                 JsValue::PlainObject(_) => plain_set(&target, key, value, receiver),
                 _ => {
                     dispatch_set_property_value(
