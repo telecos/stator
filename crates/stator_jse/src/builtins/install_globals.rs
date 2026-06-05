@@ -63080,7 +63080,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_property_shadowing_undefined_masks_inherited_value() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); \
@@ -63835,7 +63834,6 @@ mod tests {
 
     /// for-in integer indices come first in ascending order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_in_integer_indices_first() {
         let result = global_eval(
             "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
@@ -64354,7 +64352,6 @@ mod tests {
 
     /// `$$` in replacement inserts a literal `$`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_dollar() {
         let r = global_eval("'abc'.replace('b', '$$')").unwrap();
         assert_eq!(r, JsValue::String("a$c".into()));
@@ -64362,7 +64359,6 @@ mod tests {
 
     /// `$&` in replacement inserts the matched substring.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_ampersand() {
         let r = global_eval("'abc'.replace('b', '[$&]')").unwrap();
         assert_eq!(r, JsValue::String("a[b]c".into()));
@@ -64370,7 +64366,6 @@ mod tests {
 
     /// `` $` `` in replacement inserts the portion before the match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_backtick() {
         let r = global_eval("'abc'.replace('b', '$`')").unwrap();
         assert_eq!(r, JsValue::String("aac".into()));
@@ -64378,7 +64373,6 @@ mod tests {
 
     /// `$'` in replacement inserts the portion after the match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_singlequote() {
         let r = global_eval("'abc'.replace('b', \"$'\")").unwrap();
         assert_eq!(r, JsValue::String("acc".into()));
