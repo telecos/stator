@@ -74307,10 +74307,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_matches_objects_by_identity() {
         let result = global_eval(
-            "var marker = {}; var other = {}; switch (marker) { case other: 0; case marker: 1; default: 2; }",
+            "var marker = {}; var other = {}; var result = 0; switch (marker) { case other: result = -1; break; case marker: result = 1; break; default: result = 2; } result",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(1));
