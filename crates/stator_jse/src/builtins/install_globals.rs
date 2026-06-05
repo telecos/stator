@@ -74149,7 +74149,6 @@ mod tests {
     // ── let/const TDZ ───────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_tdz_throws() {
         let result = global_eval(
             "function f() { try { return x; } catch(e) { return 'caught'; } let x = 1; } f()",
@@ -74159,7 +74158,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_tdz_throws() {
         let result = global_eval(
             "function f() { try { return x; } catch(e) { return 'caught'; } const x = 1; } f()",
@@ -74178,7 +74176,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_tdz_assignment_throws() {
         let result = global_eval(
             "function f() { try { x = 5; } catch(e) { return 'caught'; } let x; return x; } f()",
@@ -74718,7 +74715,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_tdz_typeof_let_throws_reference_error() {
         let result =
             global_eval("function f() { try { return typeof value; } catch (e) { return e.name; } let value = 1; } f()")
@@ -74727,7 +74723,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_tdz_typeof_const_throws_reference_error() {
         let result = global_eval(
             "function f() { try { return typeof value; } catch (e) { return e.name; } const value = 1; } f()",
@@ -75047,7 +75042,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_body_let_is_in_tdz_before_declaration() {
         let result = global_eval(
             "function outer() { try { return x; } catch (e) { return e.name; } let x = 22; } outer()",

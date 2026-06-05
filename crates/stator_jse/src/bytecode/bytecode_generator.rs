@@ -8650,6 +8650,10 @@ fn compile_function_inner(
     // blocks also create var-like bindings in the function scope.
     compiler.hoist_annex_b_fn_declarations(&body.body);
 
+    // Function-body lexical declarations are in TDZ from the start of the
+    // function body, not only once their declaration statement is reached.
+    compiler.hoist_lexical_decls(&body.body);
+
     // ── Closure capture analysis ──────────────────────────────────────────
     // Determine which local variables are captured by inner function/arrow
     // expressions.  Captured variables are stored in a JsContext instead of
