@@ -22215,6 +22215,7 @@ fn make_proxy() -> JsValue {
                         (obj, false)
                     }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
+                    JsValue::Proxy(proxy) => (JsObject::new(), proxy.borrow().is_callable()),
                     _ => {
                         return Err(StatorError::TypeError(
                             "Proxy: target must be an object".to_string(),
@@ -22262,6 +22263,7 @@ fn make_proxy() -> JsValue {
                         (obj, false)
                     }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
+                    JsValue::Proxy(proxy) => (JsObject::new(), proxy.borrow().is_callable()),
                     _ => {
                         return Err(StatorError::TypeError(
                             "Proxy.revocable: target must be an object".to_string(),
