@@ -82850,12 +82850,12 @@ mod tests {
         );
     }
 
-    /// Reflect.defineProperty mixed data+accessor → returns false.
+    /// Reflect.defineProperty mixed data+accessor descriptors throw during conversion.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_reflect_define_property_mixed_returns_false() {
+    fn e2e_reflect_define_property_mixed_descriptor_throws() {
         assert_eval_true(
-            "Reflect.defineProperty({}, 'x', { value: 1, get: function() {} }) === false",
+            "try { Reflect.defineProperty({}, 'x', { value: 1, get: function() {} }); false; } \
+             catch (e) { e instanceof TypeError; }",
         );
     }
 
