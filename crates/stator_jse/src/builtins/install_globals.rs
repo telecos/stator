@@ -58107,7 +58107,6 @@ mod tests {
 
     /// `toISOString()` formats negative years with `−` sign.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_iso_string_negative_year_format() {
         let result =
             global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString().startsWith('-000001')")
@@ -66433,7 +66432,6 @@ mod tests {
 
     /// Proxy set no-trap falls through and returns value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_no_trap_read_back() {
         let r = global_eval(
             r#"
@@ -67795,7 +67793,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_chained_two_levels() {
         let r = global_eval(
             r#"
@@ -68109,7 +68106,6 @@ mod tests {
 
     /// Reflect.has checks prototype chain for toString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_has_inherited_tostring() {
         let r = global_eval(r#"Reflect.has({}, "toString")"#).unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -68183,7 +68179,6 @@ mod tests {
 
     /// Reflect.getPrototypeOf on function returns Function.prototype.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_get_prototype_of_function() {
         let r =
             global_eval(r#"Reflect.getPrototypeOf(function(){}) === Function.prototype"#).unwrap();
