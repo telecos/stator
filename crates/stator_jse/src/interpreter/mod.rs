@@ -16566,25 +16566,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "normalize" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // ES ┬º22.1.3.13 String.prototype.normalize([form])
-                    // Determine the normalization form (default: "NFC").
                     let form = match args.first() {
-                        None | Some(JsValue::Undefined) => "NFC".to_string(),
-                        Some(v) => v.to_js_string()?,
+                        None | Some(JsValue::Undefined) => None,
+                        Some(v) => Some(v.to_js_string()?),
                     };
-                    match form.as_str() {
-                        "NFC" | "NFD" | "NFKC" | "NFKD" => {
-                            // ASCII-only strings are already in all normalization
-                            // forms, so we can return as-is.  For non-ASCII we
-                            // also return as-is (best-effort without the
-                            // unicode-normalization crate).
-                            Ok(JsValue::String(s.clone()))
-                        }
-                        _ => Err(StatorError::RangeError(
-                            "The normalization form should be one of NFC, NFD, NFKC, NFKD."
-                                .to_string(),
-                        )),
-                    }
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_normalize(&s, form.as_deref())?.into(),
+                    ))
                 }));
             }
             "localeCompare" => {

@@ -52088,25 +52088,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfc_composes_combining_mark() {
         assert_eval_true(r#""e\u0301".normalize("NFC") === "\u00E9""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfd_decomposes_precomposed_character() {
         assert_eval_true(r#""\u00E9".normalize("NFD") === "e\u0301""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfkc_compatibility_composes_ligature() {
         assert_eval_true(r#""\uFB03".normalize("NFKC") === "ffi""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfkd_compatibility_decomposes_ligature() {
         assert_eval_true(r#""\uFB03".normalize("NFKD") === "ffi""#);
     }
@@ -65641,7 +65637,6 @@ mod tests {
 
     /// `normalize()` with default (NFC) composes.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_normalize_default_nfc_edge() {
         let r = global_eval("'caf\\u0065\\u0301'.normalize()").unwrap();
         assert_eq!(r, JsValue::String("caf\u{e9}".into()));
@@ -65649,7 +65644,6 @@ mod tests {
 
     /// `normalize('NFD')` decomposes.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_normalize_nfd_edge() {
         let r = global_eval("'caf\\u00e9'.normalize('NFD').length").unwrap();
         // é decomposes to e + combining acute = 5 code units
