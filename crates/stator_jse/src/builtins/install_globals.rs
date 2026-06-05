@@ -67538,7 +67538,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_integer_ordering() {
         let r = global_eval(
             r#"
@@ -68101,7 +68100,6 @@ mod tests {
 
     /// Reflect.ownKeys returns integer keys in numeric order first.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_numeric_ordering() {
         let r = global_eval(
             r#"
@@ -81780,7 +81778,6 @@ mod tests {
 
     /// `concat` with Symbol.isConcatSpreadable true on object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_spreadable_object() {
         let r = global_eval(
             r#"
@@ -83269,7 +83266,6 @@ mod tests {
 
     /// arguments.length reflects actual argument count, not formal params.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_length_actual_count() {
         assert_e2e_true("function f(a) { return arguments.length; } f(1, 2, 3) === 3");
     }
