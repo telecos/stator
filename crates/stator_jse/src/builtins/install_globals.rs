@@ -51388,7 +51388,6 @@ mod tests {
 
     /// `matchAll` results include `index` per match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_index() {
         let r = global_eval(
             r#"
@@ -51402,7 +51401,6 @@ mod tests {
 
     /// `matchAll` results include named groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_named_groups() {
         let r = global_eval(
             r#"
@@ -51469,7 +51467,6 @@ mod tests {
 
     /// `RegExp.prototype[Symbol.matchAll]` is callable directly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_symbol_match_all_direct() {
         let r = global_eval(
             r#"
