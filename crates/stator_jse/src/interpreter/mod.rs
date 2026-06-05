@@ -10762,9 +10762,6 @@ impl Interpreter {
                                 }
                                 _ => {}
                             }
-                            let result = abstract_eq(&acc, rhs);
-                            acc = JsValue::Boolean(result);
-                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -10880,9 +10877,6 @@ impl Interpreter {
                                 }
                                 _ => {}
                             }
-                            let result = abstract_eq(&acc, rhs);
-                            acc = JsValue::Boolean(!result);
-                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -13551,8 +13545,8 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
 ///
 /// Delegates to [`JsValue::is_loosely_equal`] which implements the full spec
 /// algorithm including ToPrimitive coercion for objects.
-pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    lhs.is_loosely_equal(rhs).unwrap_or(false)
+pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
+    lhs.is_loosely_equal(rhs)
 }
 
 /// ECMAScript ┬º7.2.15 **Strict Equality Comparison** (`===`).

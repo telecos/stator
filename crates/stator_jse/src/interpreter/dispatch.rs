@@ -1412,7 +1412,7 @@ fn handle_test_equal(
         return Err(err_bad_operand("TestEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    let result = abstract_eq(&ctx.frame.accumulator, rhs);
+    let result = abstract_eq(&ctx.frame.accumulator, rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1425,7 +1425,7 @@ fn handle_test_not_equal(
         return Err(err_bad_operand("TestNotEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    let result = !abstract_eq(&ctx.frame.accumulator, rhs);
+    let result = !abstract_eq(&ctx.frame.accumulator, rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1573,7 +1573,7 @@ fn handle_test_equal_jump(
     };
 
     let rhs = ctx.frame.read_reg(v)?;
-    let comparison = abstract_eq(&ctx.frame.accumulator, rhs);
+    let comparison = abstract_eq(&ctx.frame.accumulator, rhs)?;
 
     ctx.frame.accumulator = JsValue::Boolean(comparison);
     let should_jump = if is_true_flag == 0 {
@@ -1606,7 +1606,7 @@ fn handle_test_not_equal_jump(
     };
 
     let rhs = ctx.frame.read_reg(v)?;
-    let comparison = !abstract_eq(&ctx.frame.accumulator, rhs);
+    let comparison = !abstract_eq(&ctx.frame.accumulator, rhs)?;
 
     ctx.frame.accumulator = JsValue::Boolean(comparison);
     let should_jump = if is_true_flag == 0 {

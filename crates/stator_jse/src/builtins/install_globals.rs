@@ -37753,12 +37753,10 @@ mod tests {
         "Number({ valueOf() { return {}; }, toString() { return '13'; } }) === 13"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_for_number,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 14 : 'bad'; } }; Number(Object.create(proto)) === 14"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_for_string,
         "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; String(Object.create(proto)) === 'string'"
     );
@@ -37855,12 +37853,10 @@ mod tests {
         "Number.isNaN(Number([1, 2]))"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_value_of_is_used,
         "var proto = { valueOf() { return 29; } }; Number(Object.create(proto)) === 29"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_to_string_is_used,
         "var proto = { valueOf() { return {}; }, toString() { return '30'; } }; Number(Object.create(proto)) === 30"
     );
@@ -37962,7 +37958,6 @@ mod tests {
         "String({ [Symbol.toPrimitive]() { return {}; } })"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_returning_object_throws_for_equality,
         "({ [Symbol.toPrimitive]() { return {}; } }) == 1"
     );
