@@ -74731,7 +74731,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_tdz_spans_entire_block_for_let() {
         let result = global_eval(
             "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: let x = 1; return x; default: return 'none'; } } f(0)",
@@ -74741,7 +74740,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_tdz_spans_entire_block_for_const() {
         let result = global_eval(
             "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: const x = 1; return x; default: return 'none'; } } f(0)",

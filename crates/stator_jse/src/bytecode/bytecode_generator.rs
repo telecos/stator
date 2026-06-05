@@ -3072,8 +3072,18 @@ impl FunctionCompiler {
 
         // Evaluate the discriminant once and save it.
         self.compile_expr(&s.discriminant)?;
-        let disc_reg = self.allocator.allocate_temporary();
+        let disc_reg = self.allocator.new_local();
         self.emit_star(disc_reg);
+
+        // Open the switch block scope before evaluating case tests. Lexical
+        // declarations in any case are in TDZ throughout the entire CaseBlock.
+        self.push_scope();
+        let switch_body_stmts: Vec<Stmt> = s
+            .cases
+            .iter()
+            .flat_map(|case| case.consequent.iter().cloned())
+            .collect();
+        self.hoist_lexical_decls(&switch_body_stmts);
 
         // Build a label for each case clause.
         let case_labels: Vec<usize> = s.cases.iter().map(|_| self.new_label()).collect();
@@ -3116,10 +3126,6 @@ impl FunctionCompiler {
 
         self.loop_stack.push((end_label, break_label));
 
-        // Open a block scope for the switch body so that `let`/`const`
-        // declarations in case clauses are properly scoped.
-        self.push_scope();
-
         // Emit case bodies.
         for (i, case) in s.cases.iter().enumerate() {
             self.bind_label(case_labels[i]);
@@ -3132,9 +3138,6 @@ impl FunctionCompiler {
         self.loop_stack.pop();
 
         self.bind_label(end_label);
-        self.allocator
-            .release_temporary(disc_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
