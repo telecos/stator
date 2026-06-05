@@ -23051,6 +23051,9 @@ fn make_reflect() -> JsValue {
                         arg_list,
                     );
                 }
+                if let JsValue::NativeFunction(f) = &target {
+                    return function_apply(f, &this_arg, &Some(arg_list));
+                }
                 dispatch_call_with_this(&target, this_arg, arg_list)
             }),
         );
@@ -67907,10 +67910,24 @@ mod tests {
 
     /// Reflect.apply passes `this` to arrow-like native functions.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_apply_string_concat() {
         let r = global_eval(r#"Reflect.apply(String.prototype.toUpperCase, "abc", [])"#).unwrap();
         assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_apply_string_concat_uses_receiver() {
+        let r = global_eval(r#"Reflect.apply(String.prototype.concat, "x", ["a", "b"])"#).unwrap();
+        assert_eq!(r, JsValue::String("xab".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_apply_string_null_receiver_throws() {
+        let r = global_eval(
+            r#"try { Reflect.apply(String.prototype.concat, null, ["a", "b"]); "no"; } catch (e) { e instanceof TypeError ? "ok" : "bad"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
     }
 
     /// Reflect.apply with empty args list returns function default.
