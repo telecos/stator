@@ -48993,10 +48993,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_delete_optional_nonoptional_tail_throws_type_error() {
         assert_eval_true(
             "try { delete ({ a: null })?.a.b; false; } catch (e) { e.name === 'TypeError'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_delete_nonoptional_null_property_throws_type_error() {
+        assert_eval_true(
+            "try { delete (null).prop; false; } catch (e) { e.name === 'TypeError'; }",
         );
     }
 

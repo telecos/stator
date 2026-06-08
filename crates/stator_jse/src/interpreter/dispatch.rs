@@ -6622,7 +6622,11 @@ fn handle_delete_property_sloppy(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
-    let removed = if let JsValue::Proxy(ref p) = obj {
+    let removed = if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot delete property '{key}' of null or undefined"
+        )));
+    } else if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key)?
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
@@ -6682,7 +6686,11 @@ fn handle_delete_property_strict(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
-    if let JsValue::Proxy(ref p) = obj {
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot delete property '{key}' of null or undefined"
+        )));
+    } else if let JsValue::Proxy(ref p) = obj {
         let deleted = proxy_delete_property(&mut p.borrow_mut(), &key)?;
         if !deleted {
             return Err(StatorError::TypeError(format!(
