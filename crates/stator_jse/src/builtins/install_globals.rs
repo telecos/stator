@@ -2532,24 +2532,27 @@ fn initialize_error_plain_object(
     cause: Option<JsValue>,
     errors: Option<Vec<JsValue>>,
 ) -> JsValue {
+    let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
     let stack_name = match kind {
         ErrorKind::AggregateError => "AggregateError",
         _ => kind.as_name(),
     };
     let mut borrow = target.borrow_mut();
-    borrow.insert(
+    borrow.insert_with_attrs(
         "message".into(),
         JsValue::String(message.to_string().into()),
+        attrs,
     );
-    borrow.insert(
+    borrow.insert_with_attrs(
         "stack".into(),
         JsValue::String(crate::builtins::error::capture_stack_trace(stack_name, message).into()),
+        attrs,
     );
     if let Some(cause) = cause {
-        borrow.insert("cause".into(), cause);
+        borrow.insert_with_attrs("cause".into(), cause, attrs);
     }
     if let Some(errors) = errors {
-        borrow.insert("errors".into(), JsValue::new_array(errors));
+        borrow.insert_with_attrs("errors".into(), JsValue::new_array(errors), attrs);
     }
     drop(borrow);
     JsValue::PlainObject(Rc::clone(target))
@@ -2577,10 +2580,11 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
             ));
         }
         let mut err = JsError::new(kind, message);
+        let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
         if let Some(ref cause_val) = cause {
             err.props
                 .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+                .insert_with_attrs("cause".to_string(), cause_val.clone(), attrs);
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -2613,8 +2617,10 @@ fn make_error_constructor_object(
     proto.insert(
         "toString".into(),
         builtin_fn("toString", 0, |args| {
-            let this = args.first().unwrap_or(&JsValue::Undefined);
-            error_prototype_to_string(this)
+            let this = current_this()
+                .or_else(|| args.first().cloned())
+                .unwrap_or(JsValue::Undefined);
+            error_prototype_to_string(&this)
         }),
     );
     proto.insert("__proto__".into(), error_proto.clone());
@@ -2692,13 +2698,16 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             ));
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
-        err.props
-            .borrow_mut()
-            .insert("errors".to_string(), JsValue::new_array(err.errors.clone()));
+        let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        err.props.borrow_mut().insert_with_attrs(
+            "errors".to_string(),
+            JsValue::new_array(err.errors.clone()),
+            attrs,
+        );
         if let Some(ref cause_val) = cause {
             err.props
                 .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+                .insert_with_attrs("cause".to_string(), cause_val.clone(), attrs);
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -2713,8 +2722,10 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
     proto.insert(
         "toString".into(),
         native(|args| {
-            let this = args.first().unwrap_or(&JsValue::Undefined);
-            error_prototype_to_string(this)
+            let this = current_this()
+                .or_else(|| args.first().cloned())
+                .unwrap_or(JsValue::Undefined);
+            error_prototype_to_string(&this)
         }),
     );
     proto.insert("__proto__".into(), error_proto.clone());
@@ -2833,8 +2844,10 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         proto.insert(
             "toString".into(),
             builtin_fn("toString", 0, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                error_prototype_to_string(this)
+                let this = current_this()
+                    .or_else(|| args.first().cloned())
+                    .unwrap_or(JsValue::Undefined);
+                error_prototype_to_string(&this)
             }),
         );
         proto.insert("@@toStringTag".into(), JsValue::String("Error".into()));
@@ -76484,7 +76497,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_aggregate_error_errors_own_descriptor() {
         assert_e2e_true(
             r#"let e = new AggregateError([1, 2], "boom");
@@ -76523,7 +76535,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_error_cause_own_descriptor() {
         assert_e2e_true(
             r#"let e = new SyntaxError("boom", { cause: 9 });
@@ -76556,7 +76567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_name_to_string_stack_and_cause() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {
