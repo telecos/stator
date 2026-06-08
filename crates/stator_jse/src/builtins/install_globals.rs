@@ -71381,7 +71381,6 @@ mod tests {
 
     /// Generator.prototype.return on already-completed generator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_on_completed() {
         let r = global_eval(
             r#"

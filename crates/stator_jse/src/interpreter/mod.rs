@@ -12872,7 +12872,7 @@ impl Interpreter {
                     }
                 }
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Completed => Ok(make_iterator_result(value, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
