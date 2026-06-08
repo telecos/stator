@@ -1453,9 +1453,11 @@ fn is_concat_spreadable(value: &JsValue) -> bool {
     match value {
         JsValue::PlainObject(map) => {
             let borrow = map.borrow();
+            let is_array = matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true)));
             match borrow.get("@@isConcatSpreadable").cloned() {
+                Some(JsValue::Undefined) => is_array,
                 Some(v) => v.to_boolean(),
-                None => matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))),
+                None => is_array,
             }
         }
         JsValue::Array(items) => {
@@ -81091,7 +81093,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_undefined_falls_back() {
         assert_eval_true(
             r#"

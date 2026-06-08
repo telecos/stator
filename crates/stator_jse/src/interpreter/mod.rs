@@ -14137,9 +14137,11 @@ fn is_concat_spreadable_value(value: &JsValue) -> bool {
         JsValue::Array(_) => true,
         JsValue::PlainObject(map) => {
             let borrow = map.borrow();
+            let is_array = is_array_like_plain_object(&borrow);
             match borrow.get("@@isConcatSpreadable") {
+                Some(JsValue::Undefined) => is_array,
                 Some(value) => value.to_boolean(),
-                None => is_array_like_plain_object(&borrow),
+                None => is_array,
             }
         }
         _ => false,
