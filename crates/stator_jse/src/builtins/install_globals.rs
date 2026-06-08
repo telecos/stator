@@ -72774,7 +72774,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_child_inherits_getter() {
         let result = global_eval(
             "class Parent { get x() { return this.y; } } \
@@ -72788,7 +72787,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_child_inherits_setter() {
         let result = global_eval(
             "class Parent { set x(v) { this.y = v; } } \
@@ -72802,7 +72800,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_inherited_accessor_round_trip() {
         let result = global_eval(
             "class Parent { \
@@ -72883,7 +72880,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_throwing_inherited_getter_propagates() {
         let result = global_eval(
             "var p = { get x() { throw 'boom'; } }; \
@@ -80933,7 +80929,6 @@ mod tests {
 
     // 35. Class with both instance and static getter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_instance_and_static_getter() {
         assert_eval_true(
             "class C { \
@@ -83169,7 +83164,6 @@ mod tests {
 
     /// Bound function: bind of bind preserves .name chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bind_of_bind_name() {
         assert_e2e_true(
             r#"function bar() {} var b1 = bar.bind(null); var b2 = b1.bind(null); b2.name === "bound bound bar""#,
