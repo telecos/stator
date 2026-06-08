@@ -671,6 +671,7 @@ pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
                     Some(proto)
                 }
             }),
+        JsValue::Array(_) => global_constructor_prototype("Array"),
         _ => None,
     }
 }

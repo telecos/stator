@@ -81086,7 +81086,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_array_instanceof() {
         assert_eval_true("[] instanceof Array");
     }
