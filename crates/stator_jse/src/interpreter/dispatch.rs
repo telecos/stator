@@ -36,7 +36,7 @@ use super::{
     settle_async_iterator_result, strict_eq, sync_global_object_property_delete,
     sync_global_object_property_store, to_array_index, to_bigint, to_property_key,
     try_execute_best_jit, try_fast_named_property_lookup, try_inline_small_function,
-    try_proto_lookup_rc, walk_context_chain,
+    try_proto_lookup_rc, walk_context_chain, with_function_constructor_global_env,
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -8043,12 +8043,16 @@ fn handle_call_direct_eval(
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.cheap_clone());
         }
         let eval_env = Rc::new(RefCell::new(GlobalEnv::with_vars(eval_bindings)));
+        let function_global_env = super::current_function_constructor_global_env()
+            .unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
         let (result, final_env, is_strict) =
-            crate::builtins::global::global_eval_direct_with_scope_capture(
-                &source,
-                Rc::clone(&eval_env),
-                ctx.frame.context.clone(),
-            )?;
+            with_function_constructor_global_env(function_global_env, || {
+                crate::builtins::global::global_eval_direct_with_scope_capture(
+                    &source,
+                    Rc::clone(&eval_env),
+                    ctx.frame.context.clone(),
+                )
+            })?;
         let final_bindings = final_env.borrow();
         for (name, reg) in &binding_registers {
             if let Some(value) = final_bindings.get(name) {

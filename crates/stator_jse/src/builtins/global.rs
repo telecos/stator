@@ -396,6 +396,13 @@ pub fn global_eval(source: &str) -> StatorResult<JsValue> {
     Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
 }
 
+pub(crate) fn global_eval_with_env(
+    source: &str,
+    global_env: Rc<RefCell<GlobalEnv>>,
+) -> StatorResult<JsValue> {
+    Ok(eval_core(source, EvalMode::Indirect, Some(global_env), None)?.result)
+}
+
 /// Direct eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = true`.
 ///
 /// The evaluated code shares the caller's `global_env` so that `var`
@@ -515,7 +522,7 @@ fn eval_core(
         }
         EvalMode::Indirect => {
             let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
-            if let Some(env) = current_global_env() {
+            if let Some(env) = caller_env.or_else(current_global_env) {
                 InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], env)
             } else {
                 InterpreterFrame::new(Rc::new(bytecode), vec![])

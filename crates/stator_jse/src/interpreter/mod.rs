@@ -379,6 +379,18 @@ thread_local! {
     /// on a specific receiver instance.
     static BUILTIN_METHODS: RefCell<HashMap<&'static str, JsValue>> =
         RefCell::new(HashMap::with_capacity(8));
+
+    /// Global environments captured by functions created with the `Function`
+    /// constructor. Unlike ordinary closures, these functions always resolve
+    /// free names against the realm global environment, even when they are
+    /// called from inside direct eval.
+    static FUNCTION_GLOBAL_ENVS: RefCell<HashMap<usize, Rc<RefCell<GlobalEnv>>>> =
+        RefCell::new(HashMap::new());
+
+    /// Root global environment for `Function` constructor calls made while a
+    /// direct eval frame is running.
+    static FUNCTION_CONSTRUCTOR_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
+        const { RefCell::new(None) };
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -423,6 +435,8 @@ pub fn interned_string_count() -> usize {
 /// be called by test harnesses (e.g. Test262) after each test completes.
 pub fn clear_interpreter_state() {
     FUNCTION_PROPS.with(|fp| fp.borrow_mut().clear());
+    FUNCTION_GLOBAL_ENVS.with(|envs| envs.borrow_mut().clear());
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|env| *env.borrow_mut() = None);
     STRING_TABLE.with(|table| {
         *table.borrow_mut() = crate::objects::js_string::StringTable::new();
     });
@@ -959,6 +973,40 @@ pub(crate) fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
             .and_then(|map| map.borrow().get(name).cloned())
             .unwrap_or(JsValue::Undefined)
     })
+}
+
+/// Capture the global environment a dynamically constructed function must use.
+pub(crate) fn fn_global_env_set(ba: &Rc<BytecodeArray>, env: Rc<RefCell<GlobalEnv>>) {
+    FUNCTION_GLOBAL_ENVS.with(|envs| {
+        envs.borrow_mut().insert(fn_props_key(ba), env);
+    });
+}
+
+fn fn_global_env_get(ba: &Rc<BytecodeArray>) -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_GLOBAL_ENVS.with(|envs| envs.borrow().get(&fn_props_key(ba)).cloned())
+}
+
+/// Return the global environment that `Function` constructor calls should
+/// capture in the current execution context.
+pub(crate) fn current_function_constructor_global_env() -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|env| env.borrow().clone())
+}
+
+/// Run `f` while `Function` constructor calls capture `env` as their global.
+pub(crate) fn with_function_constructor_global_env<R>(
+    env: Rc<RefCell<GlobalEnv>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|slot| {
+        let previous = slot.borrow().clone();
+        *slot.borrow_mut() = Some(env);
+        previous
+    });
+    let result = f();
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|slot| {
+        *slot.borrow_mut() = previous;
+    });
+    result
 }
 
 pub(crate) fn function_display_name(value: &JsValue) -> String {
@@ -3046,6 +3094,7 @@ pub(super) fn acquire_frame(
     args: impl IntoIterator<Item = JsValue>,
     global_env: Rc<RefCell<GlobalEnv>>,
 ) -> InterpreterFrame {
+    let global_env = fn_global_env_get(&bytecode_array).unwrap_or(global_env);
     let maybe_frame = FRAME_POOL.with(|pool| pool.borrow_mut().pop());
 
     if let Some(mut frame) = maybe_frame {
@@ -13776,11 +13825,21 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
 #[inline(always)]
 fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
     const STACK_GUARD_DEPTH: usize = 64;
+    let should_publish_globals =
+        Rc::as_ptr(&callee_frame.global_env) as usize != LAST_GLOBALS_PTR.with(Cell::get);
     if call_stack_depth() < STACK_GUARD_DEPTH {
-        Interpreter::run_same_env(callee_frame)
+        if should_publish_globals {
+            Interpreter::run(callee_frame)
+        } else {
+            Interpreter::run_same_env(callee_frame)
+        }
     } else {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            Interpreter::run_same_env(callee_frame)
+            if should_publish_globals {
+                Interpreter::run(callee_frame)
+            } else {
+                Interpreter::run_same_env(callee_frame)
+            }
         })
     }
 }
@@ -13871,15 +13930,7 @@ pub(super) fn dispatch_call(
                         );
                     }
                     let gen_before = frame.cache_generation;
-                    let result = with_anon_call_frame(|depth| {
-                        if depth < 64 {
-                            Interpreter::run_same_env(&mut callee_frame)
-                        } else {
-                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                                Interpreter::run_same_env(&mut callee_frame)
-                            })
-                        }
-                    });
+                    let result = with_anon_call_frame(|_| run_callee(&mut callee_frame));
                     release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
@@ -13976,15 +14027,7 @@ pub(super) fn dispatch_call_property(
                         callee_frame.global_env.borrow_mut().set_this(this_val);
                     }
                     let gen_before = frame.cache_generation;
-                    let result = with_anon_call_frame(|depth| {
-                        if depth < 64 {
-                            Interpreter::run_same_env(&mut callee_frame)
-                        } else {
-                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                                Interpreter::run_same_env(&mut callee_frame)
-                            })
-                        }
-                    });
+                    let result = with_anon_call_frame(|_| run_callee(&mut callee_frame));
                     release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
@@ -19301,7 +19344,9 @@ pub fn dispatch_call_value(
                 return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
-            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+            let mut frame = if let Some(globals) =
+                fn_global_env_get(ba).or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            {
                 acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
@@ -19352,7 +19397,9 @@ pub fn dispatch_call_with_this(
                 return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
-            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+            let mut frame = if let Some(globals) =
+                fn_global_env_get(ba).or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            {
                 acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)

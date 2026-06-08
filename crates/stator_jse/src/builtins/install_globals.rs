@@ -46333,10 +46333,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_constructor_nested_inside_eval_uses_global_scope() {
         let result = global_eval(
             "var x = 50; function outer() { var x = 2; return eval(\"new Function('return x')()\") } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(50));
+    }
+
+    #[test]
+    fn e2e_function_constructor_from_eval_keeps_global_scope_after_eval_returns() {
+        let result = global_eval(
+            "var x = 50; var f; function outer() { var x = 2; eval(\"f = new Function('return x')\"); } outer(); f()",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(50));
