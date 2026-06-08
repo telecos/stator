@@ -28574,7 +28574,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_strict_var_declaration_does_not_leak() {
         assert_script_result(
             "function f() { eval('\"use strict\"; var x = 1'); return typeof x; } f();",
@@ -28609,7 +28608,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_invalid_return_throws_syntax_error() {
         assert_script_syntax_error("eval('return 1;');");
     }
@@ -28628,7 +28626,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_this_is_undefined_in_strict_free_function() {
         assert_script_result(
             "function f() { 'use strict'; return eval('this') === undefined; } f();",

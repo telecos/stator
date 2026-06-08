@@ -473,6 +473,7 @@ pub fn global_eval_strict(
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
 
     let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
@@ -497,6 +498,7 @@ fn eval_core(
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
     let is_strict = program.is_strict;
 
@@ -580,6 +582,63 @@ fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
                 argument: None,
             })));
     }
+}
+
+fn reject_illegal_eval_returns(program: &crate::parser::ast::Program) -> StatorResult<()> {
+    use crate::parser::ast::{ProgramItem, Stmt};
+
+    fn stmt_contains_return(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return(_) => true,
+            Stmt::Block(block) => block.body.iter().any(stmt_contains_return),
+            Stmt::If(stmt) => {
+                stmt_contains_return(&stmt.consequent)
+                    || stmt.alternate.as_deref().is_some_and(stmt_contains_return)
+            }
+            Stmt::For(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::ForIn(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::ForOf(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::While(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::DoWhile(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::Switch(stmt) => stmt
+                .cases
+                .iter()
+                .any(|case| case.consequent.iter().any(stmt_contains_return)),
+            Stmt::Try(stmt) => {
+                stmt.block.body.iter().any(stmt_contains_return)
+                    || stmt
+                        .handler
+                        .as_ref()
+                        .is_some_and(|handler| handler.body.body.iter().any(stmt_contains_return))
+                    || stmt
+                        .finalizer
+                        .as_ref()
+                        .is_some_and(|block| block.body.iter().any(stmt_contains_return))
+            }
+            Stmt::Labeled(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::With(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::VarDecl(_)
+            | Stmt::FnDecl(_)
+            | Stmt::ClassDecl(_)
+            | Stmt::Expr(_)
+            | Stmt::Throw(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Debugger(_)
+            | Stmt::Empty(_) => false,
+        }
+    }
+
+    if program.body.iter().any(|item| {
+        matches!(
+            item,
+            ProgramItem::Stmt(stmt) if stmt_contains_return(stmt)
+        )
+    }) {
+        return Err(StatorError::SyntaxError("Illegal return statement".into()));
+    }
+
+    Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
