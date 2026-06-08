@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 26
+#define STATOR_FFI_ABI_VERSION_MINOR 27
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -350,6 +350,81 @@ typedef enum StatorParserMetadata {
    */
   StatorParserMetadataParserInserted = 1,
 } StatorParserMetadata;
+
+/**
+ * Stable status code returned by typed-accessor and Maybe-style FFI entry
+ * points so that C callers can distinguish a missing value, an invalid
+ * argument, an unsupported operation, and a JavaScript exception without
+ * reaching for out-of-band channels.
+ *
+ * Variants:
+ * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+ *   out-pointer was written.
+ * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+ *   a structural "no" answer (e.g. property missing, type mismatch on a
+ *   typed get).  Out-pointers are left untouched or zero-cleared, never
+ *   carrying a stale value.
+ * * [`StatorStatusException`][Self::StatorStatusException] — the operation
+ *   raised (or captured) a JavaScript exception.  When applicable, the
+ *   isolate's pending exception is populated and can be inspected through
+ *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
+ * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+ *   required argument was null or otherwise malformed; nothing was mutated.
+ * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+ *   operation is well-formed but not yet implemented for this kind of
+ *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
+ *   discriminants are stable; embedders should treat unknown values as
+ *   `StatorStatusUnsupported`.
+ *
+ * Backed by a C `int`-shaped enum so the discriminants are stable across
+ * the C ABI and can be compared by value from C/C++.
+ */
+typedef enum StatorStatus {
+  /**
+   * Operation succeeded.
+   */
+  StatorStatusOk = 0,
+  /**
+   * Operation succeeded with a structural "no" answer (missing property,
+   * type mismatch on a typed accessor).
+   */
+  StatorStatusFalse = 1,
+  /**
+   * A JavaScript exception was raised or captured.  The isolate's pending
+   * exception is set when this is returned by a Maybe-style API.
+   */
+  StatorStatusException = 2,
+  /**
+   * At least one argument was null or malformed.
+   */
+  StatorStatusInvalidArg = 3,
+  /**
+   * The operation is not supported for this value/object kind.
+   */
+  StatorStatusUnsupported = 4,
+} StatorStatus;
+
+/**
+ * Observable settlement state for a real FFI Promise handle.
+ */
+typedef enum StatorPromiseState {
+  /**
+   * The promise has not been fulfilled or rejected yet.
+   */
+  StatorPromiseStatePending = 0,
+  /**
+   * The promise was fulfilled and has a fulfillment result.
+   */
+  StatorPromiseStateFulfilled = 1,
+  /**
+   * The promise was rejected and has a rejection reason.
+   */
+  StatorPromiseStateRejected = 2,
+  /**
+   * The argument was null or was not a real Promise handle.
+   */
+  StatorPromiseStateInvalid = 3,
+} StatorPromiseState;
 
 /**
  * Status for classic-script code-cache operations.
@@ -729,59 +804,6 @@ typedef enum StatorModuleStatus {
    */
   StatorModuleStatusPendingAsyncEvaluation = 5,
 } StatorModuleStatus;
-
-/**
- * Stable status code returned by typed-accessor and Maybe-style FFI entry
- * points so that C callers can distinguish a missing value, an invalid
- * argument, an unsupported operation, and a JavaScript exception without
- * reaching for out-of-band channels.
- *
- * Variants:
- * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
- *   out-pointer was written.
- * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
- *   a structural "no" answer (e.g. property missing, type mismatch on a
- *   typed get).  Out-pointers are left untouched or zero-cleared, never
- *   carrying a stale value.
- * * [`StatorStatusException`][Self::StatorStatusException] — the operation
- *   raised (or captured) a JavaScript exception.  When applicable, the
- *   isolate's pending exception is populated and can be inspected through
- *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
- * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
- *   required argument was null or otherwise malformed; nothing was mutated.
- * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
- *   operation is well-formed but not yet implemented for this kind of
- *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
- *   discriminants are stable; embedders should treat unknown values as
- *   `StatorStatusUnsupported`.
- *
- * Backed by a C `int`-shaped enum so the discriminants are stable across
- * the C ABI and can be compared by value from C/C++.
- */
-typedef enum StatorStatus {
-  /**
-   * Operation succeeded.
-   */
-  StatorStatusOk = 0,
-  /**
-   * Operation succeeded with a structural "no" answer (missing property,
-   * type mismatch on a typed accessor).
-   */
-  StatorStatusFalse = 1,
-  /**
-   * A JavaScript exception was raised or captured.  The isolate's pending
-   * exception is set when this is returned by a Maybe-style API.
-   */
-  StatorStatusException = 2,
-  /**
-   * At least one argument was null or malformed.
-   */
-  StatorStatusInvalidArg = 3,
-  /**
-   * The operation is not supported for this value/object kind.
-   */
-  StatorStatusUnsupported = 4,
-} StatorStatus;
 
 /**
  * Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
@@ -4625,6 +4647,68 @@ struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
  * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
  */
 struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new pending JavaScript Promise backed by the real engine promise state.
+ *
+ * The returned value is a normal [`StatorValue`] whose type is `"object"` and
+ * for which [`stator_value_is_promise`] returns `true`.  It must be released
+ * with [`stator_value_destroy`] (or an active handle scope).  Returns null when
+ * `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_promise_new_pending(struct StatorIsolate *isolate);
+
+/**
+ * Resolve a real FFI Promise handle with `value`.
+ *
+ * A null `value` is treated as JavaScript `undefined`.  Settling an already
+ * settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+ *
+ * # Safety
+ * - `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorStatus stator_promise_resolve(struct StatorValue *promise,
+                                         const struct StatorValue *value);
+
+/**
+ * Reject a real FFI Promise handle with `reason`.
+ *
+ * A null `reason` is treated as JavaScript `undefined`.  Settling an already
+ * settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+ *
+ * # Safety
+ * - `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * - `reason` must be null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorStatus stator_promise_reject(struct StatorValue *promise,
+                                        const struct StatorValue *reason);
+
+/**
+ * Return the observable state of a real FFI Promise handle.
+ *
+ * Returns [`StatorPromiseState::StatorPromiseStateInvalid`] when `promise` is
+ * null, is not a promise, or is only a tag-only promise placeholder.
+ *
+ * # Safety
+ * `promise` must be null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorPromiseState stator_promise_state(const struct StatorValue *promise);
+
+/**
+ * Return the fulfillment value or rejection reason of a settled Promise handle.
+ *
+ * Returns null when `promise` is null, is not a real Promise handle, is still
+ * pending, or has no owning isolate.  The caller owns the returned value and
+ * must release it with [`stator_value_destroy`] (or an active handle scope).
+ *
+ * # Safety
+ * `promise` must be null or a valid, live [`StatorValue`] pointer.
+ */
+struct StatorValue *stator_promise_result(const struct StatorValue *promise);
 
 /**
  * Create a new `Map`-tagged value.
@@ -9005,6 +9089,32 @@ enum StatorStatus stator_dom_object_wrap_get_indexed_handler_flags(const struct 
  * the current thread.
  */
 size_t stator_drain_active_microtask_queue(void);
+
+/**
+ * Perform a microtask checkpoint for the active thread-local queue of `ctx`.
+ *
+ * The current FFI architecture stores Promise microtasks in the thread-local
+ * queue installed by the context's Promise globals.  This context-shaped entry
+ * point validates `ctx` and then drains that active queue, returning the number
+ * of microtasks run.  Returns 0 when `ctx` is null or no queue is active.
+ *
+ * # Safety
+ * `ctx` must be null or a valid, live [`StatorContext`] pointer.
+ */
+size_t stator_context_perform_microtask_checkpoint(struct StatorContext *ctx);
+
+/**
+ * Perform a microtask checkpoint for the active thread-local queue of `isolate`.
+ *
+ * This isolate-shaped entry point mirrors
+ * [`stator_context_perform_microtask_checkpoint`] for embedders that schedule
+ * checkpoints at isolate boundaries.  Returns 0 when `isolate` is null or no
+ * queue is active.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ */
+size_t stator_isolate_perform_microtask_checkpoint(struct StatorIsolate *isolate);
 
 /**
  * Drain active host-visible Promise rejection events.

@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use stator_jse::builtins::error::{ErrorKind, JsError};
-use stator_jse::builtins::promise::PromiseState;
+use stator_jse::builtins::promise::{
+    JsPromise, MicrotaskQueue, PromiseState, active_microtask_queue, install_active_microtask_queue,
+};
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
@@ -94,7 +96,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 26;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 27;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -2359,8 +2361,13 @@ enum StatorValueInner {
     Date,
     /// A JavaScript `RegExp` object.
     RegExp,
-    /// A JavaScript `Promise` object.
+    /// A tag-only JavaScript `Promise` object.
     Promise,
+    /// A JavaScript `Promise` backed by the engine's real shared-state handle.
+    PromiseHandle {
+        promise: JsPromise,
+        queue: MicrotaskQueue,
+    },
     /// A JavaScript `Map` object.
     Map,
     /// A JavaScript `Set` object.
@@ -2402,6 +2409,10 @@ fn clone_stator_value_inner(inner: &StatorValueInner) -> StatorValueInner {
         StatorValueInner::Date => StatorValueInner::Date,
         StatorValueInner::RegExp => StatorValueInner::RegExp,
         StatorValueInner::Promise => StatorValueInner::Promise,
+        StatorValueInner::PromiseHandle { promise, queue } => StatorValueInner::PromiseHandle {
+            promise: promise.clone(),
+            queue: queue.clone(),
+        },
         StatorValueInner::Map => StatorValueInner::Map,
         StatorValueInner::Set => StatorValueInner::Set,
     }
@@ -2846,6 +2857,172 @@ pub unsafe extern "C" fn stator_value_new_promise_tag(
     v
 }
 
+/// Observable settlement state for a real FFI Promise handle.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorPromiseState {
+    /// The promise has not been fulfilled or rejected yet.
+    StatorPromiseStatePending = 0,
+    /// The promise was fulfilled and has a fulfillment result.
+    StatorPromiseStateFulfilled = 1,
+    /// The promise was rejected and has a rejection reason.
+    StatorPromiseStateRejected = 2,
+    /// The argument was null or was not a real Promise handle.
+    StatorPromiseStateInvalid = 3,
+}
+
+fn active_or_new_microtask_queue() -> MicrotaskQueue {
+    active_microtask_queue().unwrap_or_else(|| {
+        let queue = MicrotaskQueue::new();
+        install_active_microtask_queue(&queue);
+        queue
+    })
+}
+
+/// Create a new pending JavaScript Promise backed by the real engine promise state.
+///
+/// The returned value is a normal [`StatorValue`] whose type is `"object"` and
+/// for which [`stator_value_is_promise`] returns `true`.  It must be released
+/// with [`stator_value_destroy`] (or an active handle scope).  Returns null when
+/// `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_new_pending(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let queue = active_or_new_microtask_queue();
+    let promise = stator_jse::builtins::promise::promise_pending();
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { allocate_stator_value(isolate, StatorValueInner::PromiseHandle { promise, queue }) }
+}
+
+/// Resolve a real FFI Promise handle with `value`.
+///
+/// A null `value` is treated as JavaScript `undefined`.  Settling an already
+/// settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+///
+/// # Safety
+/// - `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_resolve(
+    promise: *mut StatorValue,
+    value: *const StatorValue,
+) -> StatorStatus {
+    if promise.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let js_value = if value.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `value` is valid when non-null.
+        stator_value_inner_to_jsvalue(unsafe { &(*value).inner })
+    };
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, queue } => {
+            promise.resolve(js_value, queue);
+            StatorStatus::StatorStatusOk
+        }
+        StatorValueInner::Promise => StatorStatus::StatorStatusUnsupported,
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Reject a real FFI Promise handle with `reason`.
+///
+/// A null `reason` is treated as JavaScript `undefined`.  Settling an already
+/// settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+///
+/// # Safety
+/// - `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// - `reason` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_reject(
+    promise: *mut StatorValue,
+    reason: *const StatorValue,
+) -> StatorStatus {
+    if promise.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let js_reason = if reason.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `reason` is valid when non-null.
+        stator_value_inner_to_jsvalue(unsafe { &(*reason).inner })
+    };
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, queue } => {
+            promise.reject(js_reason, queue);
+            StatorStatus::StatorStatusOk
+        }
+        StatorValueInner::Promise => StatorStatus::StatorStatusUnsupported,
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Return the observable state of a real FFI Promise handle.
+///
+/// Returns [`StatorPromiseState::StatorPromiseStateInvalid`] when `promise` is
+/// null, is not a promise, or is only a tag-only promise placeholder.
+///
+/// # Safety
+/// `promise` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_state(promise: *const StatorValue) -> StatorPromiseState {
+    if promise.is_null() {
+        return StatorPromiseState::StatorPromiseStateInvalid;
+    }
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, .. } => match promise.state() {
+            PromiseState::Pending => StatorPromiseState::StatorPromiseStatePending,
+            PromiseState::Fulfilled(_) => StatorPromiseState::StatorPromiseStateFulfilled,
+            PromiseState::Rejected(_) => StatorPromiseState::StatorPromiseStateRejected,
+        },
+        _ => StatorPromiseState::StatorPromiseStateInvalid,
+    }
+}
+
+/// Return the fulfillment value or rejection reason of a settled Promise handle.
+///
+/// Returns null when `promise` is null, is not a real Promise handle, is still
+/// pending, or has no owning isolate.  The caller owns the returned value and
+/// must release it with [`stator_value_destroy`] (or an active handle scope).
+///
+/// # Safety
+/// `promise` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_result(promise: *const StatorValue) -> *mut StatorValue {
+    if promise.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `promise` is valid.
+    let (isolate, result) = unsafe {
+        let value = &*promise;
+        let result = match &value.inner {
+            StatorValueInner::PromiseHandle { promise, .. } => match promise.state() {
+                PromiseState::Pending => return std::ptr::null_mut(),
+                PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => value,
+            },
+            _ => return std::ptr::null_mut(),
+        };
+        (value.isolate, result)
+    };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = jsvalue_to_stator_value_inner(&result);
+    // SAFETY: `isolate` is the owning isolate recorded on the promise handle.
+    unsafe { allocate_stator_value(isolate, inner) }
+}
+
 /// Create a new `Map`-tagged value.
 ///
 /// Returns a null pointer if `isolate` is null.
@@ -3107,6 +3284,7 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
         | StatorValueInner::Set => c"object".as_ptr(),
     }
@@ -3143,6 +3321,7 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
         | StatorValueInner::Set => f64::NAN,
     }
@@ -3176,6 +3355,7 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
         | StatorValueInner::Set => c"".as_ptr(),
     }
@@ -3272,6 +3452,7 @@ pub unsafe extern "C" fn stator_value_is_object(val: *const StatorValue) -> bool
             | StatorValueInner::Date
             | StatorValueInner::RegExp
             | StatorValueInner::Promise
+            | StatorValueInner::PromiseHandle { .. }
             | StatorValueInner::Map
             | StatorValueInner::Set
     )
@@ -3382,7 +3563,10 @@ pub unsafe extern "C" fn stator_value_is_promise(val: *const StatorValue) -> boo
         return false;
     }
     // SAFETY: caller guarantees `val` is valid.
-    matches!(unsafe { &(*val).inner }, StatorValueInner::Promise)
+    matches!(
+        unsafe { &(*val).inner },
+        StatorValueInner::Promise | StatorValueInner::PromiseHandle { .. }
+    )
 }
 
 /// Returns `true` if `val` is a JavaScript `Map` object.
@@ -13133,6 +13317,7 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
         | StatorValueInner::Set => true,
     }
@@ -13191,6 +13376,10 @@ pub unsafe extern "C" fn stator_value_strict_equals(
             StatorValueInner::DomWrapHandle { plain: x, .. },
             StatorValueInner::DomWrapHandle { plain: y, .. },
         ) => Rc::ptr_eq(x, y),
+        (
+            StatorValueInner::PromiseHandle { promise: x, .. },
+            StatorValueInner::PromiseHandle { promise: y, .. },
+        ) => x == y,
         // Object-like tags carry no identity in FFI handles → never equal.
         _ => false,
     }
@@ -15254,6 +15443,7 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
         | StatorValueInner::Set => f64::NAN,
     }
@@ -15291,7 +15481,9 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
         StatorValueInner::Array => "".to_owned(),
         StatorValueInner::Date => "[object Date]".to_owned(),
         StatorValueInner::RegExp => "(?:)".to_owned(),
-        StatorValueInner::Promise => "[object Promise]".to_owned(),
+        StatorValueInner::Promise | StatorValueInner::PromiseHandle { .. } => {
+            "[object Promise]".to_owned()
+        }
         StatorValueInner::Map => "[object Map]".to_owned(),
         StatorValueInner::Set => "[object Set]".to_owned(),
     }
@@ -15325,6 +15517,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         | StatorValueInner::Promise
         | StatorValueInner::Map
         | StatorValueInner::Set => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
+        StatorValueInner::PromiseHandle { promise, .. } => JsValue::Promise(promise.clone()),
         StatorValueInner::ObjectHandle(_) => {
             // Identity-preserving bridge from `StatorValueInner::ObjectHandle`
             // into the interpreter heap is not yet implemented.  Round-trips
@@ -15374,11 +15567,13 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         JsValue::PlainObject(plain) => {
             dom_wrap_inner_for_plain_object(plain).unwrap_or(StatorValueInner::Object)
         }
-        JsValue::Object(_)
-        | JsValue::Generator(_)
-        | JsValue::Iterator(_)
-        | JsValue::Error(_)
-        | JsValue::Promise(_) => StatorValueInner::Object,
+        JsValue::Promise(promise) => StatorValueInner::PromiseHandle {
+            promise: promise.clone(),
+            queue: active_or_new_microtask_queue(),
+        },
+        JsValue::Object(_) | JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => {
+            StatorValueInner::Object
+        }
         JsValue::Symbol(_)
         | JsValue::BigInt(_)
         | JsValue::Context(_)
@@ -23598,8 +23793,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_indexed_handler_flags(
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
 
 use stator_jse::builtins::promise::{
-    MicrotaskQueue, PromiseRejectionEventKind, drain_active_microtask_queue,
-    drain_active_promise_rejection_events,
+    PromiseRejectionEventKind, drain_active_microtask_queue, drain_active_promise_rejection_events,
 };
 use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
 
@@ -23612,6 +23806,44 @@ use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, Tim
 /// the current thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_drain_active_microtask_queue() -> usize {
+    drain_active_microtask_queue()
+}
+
+/// Perform a microtask checkpoint for the active thread-local queue of `ctx`.
+///
+/// The current FFI architecture stores Promise microtasks in the thread-local
+/// queue installed by the context's Promise globals.  This context-shaped entry
+/// point validates `ctx` and then drains that active queue, returning the number
+/// of microtasks run.  Returns 0 when `ctx` is null or no queue is active.
+///
+/// # Safety
+/// `ctx` must be null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_perform_microtask_checkpoint(
+    ctx: *mut StatorContext,
+) -> usize {
+    if ctx.is_null() {
+        return 0;
+    }
+    drain_active_microtask_queue()
+}
+
+/// Perform a microtask checkpoint for the active thread-local queue of `isolate`.
+///
+/// This isolate-shaped entry point mirrors
+/// [`stator_context_perform_microtask_checkpoint`] for embedders that schedule
+/// checkpoints at isolate boundaries.  Returns 0 when `isolate` is null or no
+/// queue is active.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_perform_microtask_checkpoint(
+    isolate: *mut StatorIsolate,
+) -> usize {
+    if isolate.is_null() {
+        return 0;
+    }
     drain_active_microtask_queue()
 }
 
@@ -24425,6 +24657,10 @@ impl StatorValueInner {
             Self::Date => Self::Date,
             Self::RegExp => Self::RegExp,
             Self::Promise => Self::Promise,
+            Self::PromiseHandle { promise, queue } => Self::PromiseHandle {
+                promise: promise.clone(),
+                queue: queue.clone(),
+            },
             Self::Map => Self::Map,
             Self::Set => Self::Set,
         }
@@ -26235,6 +26471,154 @@ mod tests {
         // SAFETY: null isolate is documented to return null.
         let val = unsafe { stator_value_new_number(std::ptr::null_mut(), 1.0) };
         assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_promise_new_pending_resolve_result() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        assert!(!promise.is_null());
+        assert!(unsafe { stator_value_is_promise(promise) });
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStatePending
+        );
+        assert!(unsafe { stator_promise_result(promise) }.is_null());
+
+        // SAFETY: `iso` is valid.
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert_eq!(
+            unsafe { stator_promise_resolve(promise, value) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+        // SAFETY: `promise` is a live fulfilled promise handle.
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 42.0);
+
+        // A later reject is a no-op because promises settle only once.
+        assert_eq!(
+            unsafe { stator_promise_reject(promise, std::ptr::null()) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+
+        // SAFETY: values are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_value_destroy(value);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
+    fn test_promise_reject_and_invalid_arguments() {
+        let iso = IsolateGuard::new();
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        let reason = unsafe { stator_value_new_string(iso.as_ptr(), c"fail".as_ptr(), 4) };
+        assert_eq!(
+            unsafe { stator_promise_reject(promise, reason) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateRejected
+        );
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        let got = unsafe { CStr::from_ptr(stator_value_as_string(result)) }
+            .to_str()
+            .unwrap();
+        assert_eq!(got, "fail");
+
+        let number = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        assert_eq!(
+            unsafe { stator_promise_resolve(number, std::ptr::null()) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(
+            unsafe { stator_promise_resolve(std::ptr::null_mut(), std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(number) },
+            StatorPromiseState::StatorPromiseStateInvalid
+        );
+
+        let tag = unsafe { stator_value_new_promise_tag(iso.as_ptr()) };
+        assert!(unsafe { stator_value_is_promise(tag) });
+        assert_eq!(
+            unsafe { stator_promise_resolve(tag, std::ptr::null()) },
+            StatorStatus::StatorStatusUnsupported
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(tag) },
+            StatorPromiseState::StatorPromiseStateInvalid
+        );
+
+        unsafe {
+            stator_value_destroy(tag);
+            stator_value_destroy(number);
+            stator_value_destroy(result);
+            stator_value_destroy(reason);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
+    fn test_script_returned_promise_settles_on_context_microtask_checkpoint() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let source = b"Promise.resolve(1).then(function(v) { return v + 1; })";
+        let script =
+            unsafe { stator_script_compile(ctx, source.as_ptr() as *const c_char, source.len()) };
+        assert!(!script.is_null());
+        assert!(unsafe { stator_script_get_error(script) }.is_null());
+
+        let promise = unsafe { stator_script_run(script, ctx) };
+        assert!(!promise.is_null());
+        assert!(unsafe { stator_value_is_promise(promise) });
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStatePending
+        );
+
+        let drained = unsafe { stator_context_perform_microtask_checkpoint(ctx) };
+        assert!(drained >= 1);
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 2.0);
+        assert_eq!(
+            unsafe { stator_isolate_perform_microtask_checkpoint(iso.as_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { stator_context_perform_microtask_checkpoint(std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { stator_isolate_perform_microtask_checkpoint(std::ptr::null_mut()) },
+            0
+        );
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_value_destroy(promise);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
