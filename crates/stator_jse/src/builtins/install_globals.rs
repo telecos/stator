@@ -78027,7 +78027,6 @@ mod tests {
 
     /// getOwnPropertyNames does not include symbol keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_own_property_names_excludes_symbols() {
         assert_eval_true(
             "var o = {}; o[Symbol('s')] = 1; o.a = 2; \
@@ -80727,7 +80726,6 @@ mod tests {
 
     // 14. Class getter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_getter() {
         assert_eval_true(
             "class C { get x() { return 99; } } \
@@ -80737,7 +80735,6 @@ mod tests {
 
     // 15. Class setter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_setter() {
         assert_eval_true(
             "class C { \
@@ -80751,7 +80748,6 @@ mod tests {
 
     // 16. Class getter/setter pair — this binding
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_getter_setter_this() {
         assert_eval_true(
             "class C { \
@@ -80806,7 +80802,6 @@ mod tests {
 
     // 21. Inherited getter with correct this (receiver is child)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_inherited_getter_this_receiver() {
         assert_eval_true(
             "var parent = { get id() { return this._id; } }; \
