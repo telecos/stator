@@ -46321,9 +46321,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_constructor_invalid_parameter_list_throws_syntax_error() {
-        let result = global_eval("new Function('a,', 'return 1')");
+        let result = global_eval("new Function(',', 'return 1')");
         assert!(matches!(result, Err(StatorError::SyntaxError(_))));
     }
 
