@@ -77497,9 +77497,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_binary_rounding_case_two() {
-        assert_eval_true("(0.615).toFixed(2) === '0.62'");
+        assert_eval_true("(0.615).toFixed(2) === '0.61'");
     }
 
     #[test]
