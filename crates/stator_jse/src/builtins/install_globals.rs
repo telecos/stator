@@ -37898,22 +37898,18 @@ mod tests {
         "var obj = { [Symbol.toPrimitive]() { return 'x'; } }; obj + 'y' === 'xy'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_on_proto_overrides_own_methods,
         "var proto = { [Symbol.toPrimitive]() { return 35; } }; var obj = Object.create(proto); obj.valueOf = function() { return 1; }; obj.toString = function() { return '2'; }; Number(obj) === 35"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_default_on_proto_used_by_plus,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'default' ? 36 : 0; } }; '' + Object.create(proto) === '36'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_string_on_proto_used_by_template,
         "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; `${Object.create(proto)}` === 'string'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_number_on_proto_used_by_number,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 37 : 0; } }; Number(Object.create(proto)) === 37"
     );
@@ -37938,7 +37934,6 @@ mod tests {
         "Number({ [Symbol.toPrimitive]: 1 })"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_noncallable_throws,
         "Number(Object.create({ [Symbol.toPrimitive]: 1 }))"
     );
@@ -37967,12 +37962,10 @@ mod tests {
         "({ [Symbol.toPrimitive]() { return {}; } }) == 1"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_methods_without_primitive_throw,
         "Number(Object.create({ valueOf() { return {}; }, toString() { return {}; } }))"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_string_methods_without_primitive_throw,
         "String(Object.create({ toString() { return {}; }, valueOf() { return {}; } }))"
     );
@@ -37986,7 +37979,6 @@ mod tests {
         "Number.isNaN(Number('nope'))"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_string_symbol_converter,
         "String(Symbol('x')) === 'Symbol(x)'"
     );
