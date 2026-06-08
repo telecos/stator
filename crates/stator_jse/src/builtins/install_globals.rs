@@ -71170,7 +71170,6 @@ mod tests {
 
     /// Custom error subclass via class extends Error.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass() {
         let r = global_eval(
             r#"
@@ -71187,7 +71186,6 @@ mod tests {
 
     /// Custom error subclass ΓÇö instanceof checks.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_instanceof() {
         let r = global_eval(
             r#"
@@ -76538,7 +76536,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_instanceof_chain() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {}
@@ -76548,7 +76545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_constructor_and_prototype() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {}
@@ -76730,7 +76726,6 @@ mod tests {
 
     // 8. Custom error subclass via class extends Error
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21j_custom_error_subclass() {
         assert_e2e_true(
             r#"class MyError extends Error {
@@ -76846,7 +76841,6 @@ mod tests {
 
     // 19. All subclass prototypes inherit from Error.prototype
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21j_subclass_prototypes_inherit_error_prototype() {
         assert_e2e_true(
             r#"Object.getPrototypeOf(TypeError.prototype) === Error.prototype &&
@@ -82815,14 +82809,12 @@ mod tests {
 
     /// Arguments: arguments.length matches actual args count.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_length() {
         assert_e2e_true("function f() { return arguments.length; } f(1, 2, 3) === 3");
     }
 
     /// Arguments: callee in sloppy mode refers to function itself.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_callee_sloppy() {
         assert_e2e_true("function f() { return arguments.callee === f; } f()");
     }
@@ -83175,7 +83167,6 @@ mod tests {
 
     /// arguments: extra args beyond params accessible.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_extra_args() {
         assert_e2e_true(
             "function f(a) { return arguments[1] + arguments[2]; } f(1, 10, 20) === 30",
