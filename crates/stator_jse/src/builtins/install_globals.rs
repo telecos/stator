@@ -74221,7 +74221,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_in_switch_block_scoped() {
         let result = global_eval("switch(1) { case 1: let x = 42; break; } typeof x").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -74344,7 +74343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_in_switch_block_scoped() {
         let result = global_eval("switch (1) { case 1: const x = 42; break; } typeof x").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -74369,7 +74367,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_braces_give_each_case_its_own_let_scope() {
         let result = global_eval(
             "function f(value) { switch (value) { case 1: { let x = 1; return x; } case 2: { let x = 2; return x; } default: return 3; } } f(2)",
@@ -74379,7 +74376,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_braces_give_each_case_its_own_const_scope() {
         let result = global_eval(
             "function f(value) { switch (value) { case 1: { const x = 1; return x; } case 2: { const x = 2; return x; } default: return 3; } } f(1)",
@@ -74718,7 +74714,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_captures_outer_var_binding() {
         let result = global_eval(
             "function outer() { var x = 5; return function() { return x; }; } outer()()",
@@ -74728,7 +74723,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_captures_outer_let_binding() {
         let result = global_eval(
             "function outer() { let x = 6; return function() { return x; }; } outer()()",
@@ -74756,7 +74750,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_instances_keep_separate_var_state() {
         let result = global_eval(
             "function makeCounter() { var x = 0; return function() { x = x + 1; return x; }; } var a = makeCounter(); var b = makeCounter(); a() + ',' + a() + ',' + b()",
@@ -74766,7 +74759,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_var_closures_share_final_binding() {
         let result = global_eval(
             "function f() { var out = []; var fns = []; for (var i = 0; i < 3; i++) { fns.push(function() { return i; }); } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
