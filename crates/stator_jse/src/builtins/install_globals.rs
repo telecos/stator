@@ -70024,7 +70024,6 @@ mod tests {
 
     /// `findLast` honors `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_this_arg() {
         let r = global_eval(
             "var ctx = { cutoff: 3 }; \
@@ -70046,7 +70045,6 @@ mod tests {
 
     /// `toReversed` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_reversed_array_like() {
         let r = global_eval(
             "Array.prototype.toReversed.call({ 0: 'a', 1: 'b', 2: 'c', length: 3 }).join(',')",
@@ -70081,7 +70079,6 @@ mod tests {
 
     /// `with` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_with_array_like_receiver() {
         let r = global_eval(
             "Array.prototype.with.call({ 0: 'a', 1: 'b', length: 2 }, 1, 'z').join(',')",
@@ -70101,7 +70098,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_at_array_like_negative_index() {
         assert_eval_true("Array.prototype.at.call({ 0: 'a', 1: 'b', length: 2 }, -1) === 'b'");
     }
@@ -70122,7 +70118,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_at_array_like_missing_slot_returns_undefined() {
         assert_eval_true("Array.prototype.at.call({ length: 1 }, 0) === undefined");
     }
@@ -70135,7 +70130,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_array_like_visits_missing_indices() {
         assert_eval_true(
             "var seen = []; Array.prototype.findLast.call({ 2: 3, length: 3 }, function(v, i) { seen.push(i + ':' + String(v)); return false; }); seen.join('|') === '2:3|1:undefined|0:undefined'",
