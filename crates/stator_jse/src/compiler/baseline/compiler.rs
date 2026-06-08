@@ -3626,7 +3626,7 @@ pub(crate) mod jit_runtime {
                         store_slot = Some(*s as usize);
                     }
                 }
-                Opcode::LdaSmi => {
+                Opcode::LdaSmi | Opcode::LdaSmiStar => {
                     if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
                         pending_lda_smi = Some(*imm as i64);
                     }
@@ -3635,7 +3635,7 @@ pub(crate) mod jit_runtime {
                     has_return = true;
                 }
                 // Skip benign prefix/suffix instructions
-                Opcode::CreateMappedArguments | Opcode::Star => {}
+                Opcode::CreateMappedArguments | Opcode::Star | Opcode::Ldar => {}
                 // Any other opcode → not a simple increment pattern
                 _ => return None,
             }

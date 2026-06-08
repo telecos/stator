@@ -14808,8 +14808,59 @@ fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
         all_instrs
     };
 
+    // Match LdaCurrentContextSlot + Star + LdaSmiStar + Ldar + Add +
+    // StaCurrentContextSlot + [Reload +] Return (closure_counter pattern
+    // emitted by left-to-right binary evaluation). Returns same tag as AddSmi (0).
+    if instrs.len() >= 7
+        && is_inline_current_context_load(instrs[0].opcode)
+        && instrs[1].opcode == Opcode::Star
+        && instrs[2].opcode == Opcode::LdaSmiStar
+        && instrs[3].opcode == Opcode::Ldar
+        && instrs[4].opcode == Opcode::Add
+        && instrs[5].opcode == Opcode::StaCurrentContextSlot
+    {
+        let ok_tail = (instrs.len() == 7 && instrs[6].opcode == Opcode::Return)
+            || (instrs.len() == 8
+                && is_inline_current_context_load(instrs[6].opcode)
+                && instrs[7].opcode == Opcode::Return);
+        let lhs_reg = checked_operand_reg(&instrs[1], 0)?;
+        let reload_reg = checked_operand_reg(&instrs[3], 0)?;
+        let rhs_reg = checked_operand_reg(&instrs[2], 1)?;
+        let add_reg = checked_operand_reg(&instrs[4], 0)?;
+        let slot = checked_operand_constant_pool_idx(&instrs[0], 0)? as usize;
+        let store_slot = checked_operand_constant_pool_idx(&instrs[5], 0)? as usize;
+        if ok_tail && lhs_reg == reload_reg && rhs_reg == add_reg && slot == store_slot {
+            let imm = checked_operand_imm(&instrs[2], 0)?;
+            return Some((slot, imm, 0u8));
+        }
+    }
+    if instrs.len() >= 8
+        && is_inline_current_context_load(instrs[0].opcode)
+        && instrs[1].opcode == Opcode::Star
+        && instrs[2].opcode == Opcode::LdaSmi
+        && instrs[3].opcode == Opcode::Star
+        && instrs[4].opcode == Opcode::Ldar
+        && instrs[5].opcode == Opcode::Add
+        && instrs[6].opcode == Opcode::StaCurrentContextSlot
+    {
+        let ok_tail = (instrs.len() == 8 && instrs[7].opcode == Opcode::Return)
+            || (instrs.len() == 9
+                && is_inline_current_context_load(instrs[7].opcode)
+                && instrs[8].opcode == Opcode::Return);
+        let lhs_reg = checked_operand_reg(&instrs[1], 0)?;
+        let reload_reg = checked_operand_reg(&instrs[4], 0)?;
+        let rhs_reg = checked_operand_reg(&instrs[3], 0)?;
+        let add_reg = checked_operand_reg(&instrs[5], 0)?;
+        let slot = checked_operand_constant_pool_idx(&instrs[0], 0)? as usize;
+        let store_slot = checked_operand_constant_pool_idx(&instrs[6], 0)? as usize;
+        if ok_tail && lhs_reg == reload_reg && rhs_reg == add_reg && slot == store_slot {
+            let imm = checked_operand_imm(&instrs[2], 0)?;
+            return Some((slot, imm, 0u8));
+        }
+    }
+
     // Match LdaSmiStar + LdaCurrentContextSlot + Add + StaCurrentContextSlot + [Reload +] Return
-    // (closure_counter pattern).  Returns same tag as AddSmi (0).
+    // (legacy closure_counter pattern).  Returns same tag as AddSmi (0).
     if instrs.len() >= 5
         && instrs[0].opcode == Opcode::LdaSmiStar
         && is_inline_current_context_load(instrs[1].opcode)
@@ -15104,6 +15155,136 @@ pub(crate) fn try_inline_small_function(
             let opcode = inline_smi_binary_opcode(op.opcode)?;
             let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
             inline_binary_op(opcode, &lhs, &JsValue::Smi(checked_operand_imm(op, 0)?))
+        }
+        // Context-slot add with Smi constant emitted by left-to-right binary evaluation.
+        // LdaCurrentContextSlot(slot) + Star(lhs) + LdaSmiStar(imm,rhs) +
+        // Ldar(lhs) + Add(rhs) + StaCurrentContextSlot(slot) + Return
+        [load, star, lda_smi_star, ldar, add_instr, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && lda_smi_star.opcode == Opcode::LdaSmiStar
+                && ldar.opcode == Opcode::Ldar
+                && add_instr.opcode == Opcode::Add
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(lda_smi_star, 1)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if lhs_reg != reload_reg || rhs_reg != add_reg || load_slot != store_slot {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same pattern with a reload before return.
+        [
+            load,
+            star,
+            lda_smi_star,
+            ldar,
+            add_instr,
+            store,
+            reload,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star.opcode == Opcode::Star
+            && lda_smi_star.opcode == Opcode::LdaSmiStar
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && is_inline_current_context_load(reload.opcode)
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(lda_smi_star, 1)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if lhs_reg != reload_reg
+                || rhs_reg != add_reg
+                || load_slot != store_slot
+                || load_slot != reload_slot
+            {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same left-to-right context-slot add pattern when LdaSmi and Star were
+        // not fused by peephole.
+        [
+            load,
+            star_lhs,
+            lda_smi,
+            star_rhs,
+            ldar,
+            add_instr,
+            store,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star_lhs.opcode == Opcode::Star
+            && lda_smi.opcode == Opcode::LdaSmi
+            && star_rhs.opcode == Opcode::Star
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star_lhs, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(star_rhs, 0)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if lhs_reg != reload_reg || rhs_reg != add_reg || load_slot != store_slot {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same pattern with a reload before return.
+        [
+            load,
+            star_lhs,
+            lda_smi,
+            star_rhs,
+            ldar,
+            add_instr,
+            store,
+            reload,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star_lhs.opcode == Opcode::Star
+            && lda_smi.opcode == Opcode::LdaSmi
+            && star_rhs.opcode == Opcode::Star
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && is_inline_current_context_load(reload.opcode)
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star_lhs, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(star_rhs, 0)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if lhs_reg != reload_reg
+                || rhs_reg != add_reg
+                || load_slot != store_slot
+                || load_slot != reload_slot
+            {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
         }
         [rhs, star, lhs, op, ret]
             if rhs.opcode == Opcode::Ldar

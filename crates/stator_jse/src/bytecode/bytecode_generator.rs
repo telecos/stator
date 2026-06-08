@@ -3877,8 +3877,8 @@ impl FunctionCompiler {
 
     /// Compile a binary expression.
     ///
-    /// The pattern is: evaluate RHS → temporary, evaluate LHS → accumulator,
-    /// apply operator.  This works for all non-commutative ops.
+    /// The pattern is: evaluate LHS → temporary, evaluate RHS → temporary,
+    /// reload LHS → accumulator, apply operator.
     fn compile_binary(&mut self, b: &crate::parser::ast::BinaryExpr) -> StatorResult<()> {
         // `#x in obj` — private brand check.
         if b.op == BinaryOp::In
@@ -3908,13 +3908,17 @@ impl FunctionCompiler {
             return Ok(());
         }
 
-        // Evaluate RHS first, save to temporary.
+        // Evaluate operands left-to-right, then reload the LHS so existing
+        // binary opcodes still receive `accumulator op register`.
+        self.compile_expr(&b.left)?;
+        let lhs_reg = self.allocator.allocate_temporary();
+        self.emit_star(lhs_reg);
+
         self.compile_expr(&b.right)?;
         let rhs_reg = self.allocator.allocate_temporary();
         self.emit_star(rhs_reg);
 
-        // Evaluate LHS into accumulator.
-        self.compile_expr(&b.left)?;
+        self.emit_ldar(lhs_reg);
 
         let (op, slot_kind): (Opcode, FeedbackSlotKind) = match b.op {
             BinaryOp::Add => (Opcode::Add, FeedbackSlotKind::BinaryOp),
@@ -3942,6 +3946,9 @@ impl FunctionCompiler {
                 self.allocator
                     .release_temporary(rhs_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(lhs_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
                 self.emit(Instruction::new_unchecked(Opcode::LogicalNot, vec![]));
                 return Ok(());
             }
@@ -3959,6 +3966,9 @@ impl FunctionCompiler {
         ));
         self.allocator
             .release_temporary(rhs_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(lhs_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }

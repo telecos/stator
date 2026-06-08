@@ -64591,7 +64591,6 @@ mod tests {
 
     /// Global `test` advances `lastIndex` after a successful match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_global_updates_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'g'); String(re.test('ba')) + ':' + re.lastIndex",
@@ -64602,7 +64601,6 @@ mod tests {
 
     /// Sticky `test` respects `lastIndex` as the required start position.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_sticky_respects_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'y'); re.lastIndex = 1; String(re.test('ba')) + ':' + re.lastIndex",
@@ -64613,7 +64611,6 @@ mod tests {
 
     /// Sticky `test` resets `lastIndex` to zero after a failed anchored match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'y'); re.lastIndex = 2; String(re.test('ba')) + ':' + re.lastIndex",
