@@ -70172,7 +70172,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_non_callable_comparefn_throws_even_for_singleton() {
         assert_eval_true(
             "try { [1].toSorted(null); false; } catch (e) { e instanceof TypeError; }",
@@ -70212,7 +70211,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_undefined_delete_count_is_zero() {
         assert_eval_true("[1, 2, 3].toSpliced(1, undefined, 9).join(',') === '1,9,2,3'");
     }
@@ -70262,7 +70260,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_with_string_index_truncates() {
         assert_eval_true("[1, 2, 3].with('1.9', 9)[1] === 9");
     }

@@ -18006,9 +18006,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cmp_fn = args.first().cloned();
+                        if let Some(cb) = cmp_fn.as_ref()
+                            && !matches!(cb, JsValue::Undefined)
+                            && !crate::builtins::regexp::is_callable(cb)
+                        {
+                            return Err(StatorError::TypeError(
+                                "Array.prototype.toSorted compareFn must be callable".into(),
+                            ));
+                        }
                         let mut sorted = a.borrow().clone();
                         sorted.sort_by(|x, y| {
                             if let Some(ref cb) = cmp_fn
+                                && !matches!(cb, JsValue::Undefined)
                                 && let Ok(r) = dispatch_call_value(cb, vec![x.clone(), y.clone()])
                             {
                                 let n = match &r {
@@ -18028,15 +18037,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "with" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
-                        let idx = match args.first() {
-                            Some(JsValue::Smi(i)) => *i,
-                            Some(JsValue::HeapNumber(n)) => *n as i32,
-                            _ => 0,
-                        };
+                        let idx = args
+                            .first()
+                            .unwrap_or(&JsValue::Smi(0))
+                            .to_integer_or_infinity()?;
                         let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        let len = a.borrow().len() as i32;
-                        let actual = if idx < 0 { len + idx } else { idx };
-                        if actual < 0 || actual >= len {
+                        let len = a.borrow().len() as f64;
+                        let actual = if idx < 0.0 { len + idx } else { idx };
+                        if actual < 0.0 || actual >= len {
                             return Err(StatorError::RangeError("Invalid index".to_string()));
                         }
                         let mut new_arr = a.borrow().clone();
@@ -18060,6 +18068,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             start_raw.min(len)
                         } as usize;
                         let delete_count = match args.get(1) {
+                            Some(JsValue::Undefined) => 0,
                             Some(JsValue::Smi(i)) => (*i).max(0) as usize,
                             Some(JsValue::HeapNumber(n)) => (*n as i32).max(0) as usize,
                             _ => (len as usize).saturating_sub(start),
