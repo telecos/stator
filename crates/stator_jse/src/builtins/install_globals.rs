@@ -15718,7 +15718,10 @@ fn make_object() -> JsValue {
                                 }
                                 continue;
                             }
-                            if k.starts_with("__") || k.starts_with('#') {
+                            if k.as_ref() == INTERNAL_PROTO_PROPERTY_KEY
+                                || k.starts_with("__")
+                                || k.starts_with('#')
+                            {
                                 continue;
                             }
                             if is_symbol_property_key(k) {
@@ -82809,7 +82812,6 @@ mod tests {
 
     /// String exotic: ownKeys returns indices then "length".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_string_exotic_own_keys() {
         assert_e2e_true(
             r#"var s = new String("ab"); var k = Object.getOwnPropertyNames(s); k[0] === "0" && k[1] === "1" && k[k.length - 1] === "length""#,
@@ -82818,7 +82820,6 @@ mod tests {
 
     /// String exotic: indexed properties are not writable.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_string_exotic_index_not_writable() {
         assert_e2e_true(
             r#"var s = new String("abc"); var d = Object.getOwnPropertyDescriptor(s, "0"); d.writable === false && d.enumerable === true"#,

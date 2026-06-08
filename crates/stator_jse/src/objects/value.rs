@@ -1351,7 +1351,11 @@ impl JsValue {
                     let utf16: Vec<u16> = s.encode_utf16().collect();
                     for (index, unit) in utf16.iter().enumerate() {
                         let ch = String::from_utf16_lossy(std::slice::from_ref(unit));
-                        map.insert(index.to_string(), JsValue::String(ch.into()));
+                        map.insert_with_attrs(
+                            index.to_string(),
+                            JsValue::String(ch.into()),
+                            PropertyAttributes::ENUMERABLE,
+                        );
                     }
                 }
                 let ctor_name = match self {
