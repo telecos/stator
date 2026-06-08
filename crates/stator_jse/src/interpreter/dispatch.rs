@@ -10867,7 +10867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_super_calls_parent_static_method() {
         assert_eval_true(
             "class A { static value() { return 40; } } class B extends A { static result = 0; static { this.result = super.value() + 2; } } B.result === 42",
@@ -10875,7 +10874,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_super_uses_current_class_as_receiver() {
         assert_eval_true(
             "class A { static who() { return this.name; } } class B extends A { static result = ''; static { this.result = super.who(); } } B.result === 'B'",
@@ -11268,7 +11266,6 @@ mod tests {
 
     /// 17. `Reflect.construct` sets prototype from `newTarget`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_construct_prototype_from_new_target() {
         let r = crate::builtins::global::global_eval(
             "function A() {} \
@@ -11353,7 +11350,6 @@ mod tests {
 
     /// 24. `new.target` in a method is `undefined`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_in_method_undefined() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
@@ -11409,7 +11405,6 @@ mod tests {
 
     /// 29. `new.target` in arrow inside method → `undefined`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_arrow_in_method_undefined() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
@@ -11422,7 +11417,6 @@ mod tests {
 
     /// 30. Conditional based on `new.target` (abstract class pattern).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_abstract_class_pattern() {
         let r = crate::builtins::global::global_eval(
             "class Abstract { \
@@ -12232,7 +12226,6 @@ mod tests {
 
     /// for-in integer indices appear first in ascending order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_in_integer_order() {
         let result = crate::builtins::global::global_eval(
             "var o = {}; o.z = 1; o['10'] = 2; o['2'] = 3; o.a = 4; \
@@ -12523,7 +12516,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_error_subclass_prototype_chain() {
         // TypeError.prototype should inherit from Error.prototype.
         let result = crate::builtins::global::global_eval(
@@ -12758,7 +12750,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: bind + call this override regression
     fn e2e_bind_subsequent_call_doesnt_change_this() {
         // .bind() creates a bound function; subsequent .call() doesn't override.
         let result = crate::builtins::global::global_eval(

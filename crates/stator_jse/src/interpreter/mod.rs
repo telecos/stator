@@ -24331,7 +24331,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_inherited_property() {
         let parent = make_plain_object(vec![("inherited", JsValue::Smi(99))]);
         let child = make_plain_object(vec![("own", JsValue::Smi(1)), ("__proto__", parent)]);
@@ -24352,7 +24351,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_multi_level_chain() {
         let grandparent = make_plain_object(vec![("deep", JsValue::String("gp".into()))]);
         let parent = make_plain_object(vec![
@@ -24424,7 +24422,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: proto chain keyed load regression
     fn test_keyed_load_walks_proto_chain() {
         let parent = make_plain_object(vec![("greet", JsValue::String("hello".into()))]);
         let child = make_plain_object(vec![("__proto__", parent)]);
