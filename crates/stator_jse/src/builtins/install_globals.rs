@@ -69531,21 +69531,18 @@ mod tests {
 
     /// Destructuring can consume Set iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_basic() {
         assert_eval_true("let [a, b] = new Set([1, 2]); a === 1 && b === 2");
     }
 
     /// Destructuring defaults apply when Set iteration stops early.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_defaults_apply_to_missing_values() {
         assert_eval_true("let [a = 1, b = 2] = new Set([10]); a === 10 && b === 2");
     }
 
     /// Destructuring from Set supports rest elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_supports_rest_elements() {
         assert_eval_true(
             "let [a, ...rest] = new Set([1, 2, 3]); a === 1 && rest.length === 2 && rest[0] === 2 && rest[1] === 3",
@@ -69554,7 +69551,6 @@ mod tests {
 
     /// Destructuring supports nested mixed iterable inputs.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_nested_mixed_iterable_inputs() {
         assert_eval_true("let [{a}, [b]] = [{a: 1}, new Set([2])]; a === 1 && b === 2");
     }
@@ -69588,7 +69584,6 @@ mod tests {
 
     /// for-of over Set (if available), otherwise test with array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_set_iteration() {
         let r = global_eval(
             "var s = new Set([3, 1, 4, 1, 5]); \
@@ -69600,7 +69595,6 @@ mod tests {
 
     /// for-of over Map entries.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_map_iteration() {
         let r = global_eval(
             r#"

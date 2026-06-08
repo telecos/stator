@@ -4923,15 +4923,12 @@ fn handle_get_iterator(
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
         // PlainObject with @@iterator or Symbol.iterator → call it.
         JsValue::PlainObject(ref map) => {
-            let borrow = map.borrow();
-            // Check for both internal @@iterator and user-visible Symbol(SYMBOL_ITERATOR)
-            let iter_fn = borrow.get("@@iterator").cloned().or_else(|| {
-                let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
-                borrow.get(&sym_key).cloned()
-            });
-            drop(borrow);
+            let iter_fn = keyed_load(
+                &iterable,
+                &JsValue::Symbol(crate::builtins::symbol::SYMBOL_ITERATOR),
+            )?;
             match iter_fn {
-                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_)) => {
                     let result = dispatch_call_with_this(f, iterable.clone(), vec![])?;
                     // §7.4.1: result of @@iterator must be an object.
                     match &result {
@@ -4947,7 +4944,7 @@ fn handle_get_iterator(
                         }
                     }
                 }
-                Some(JsValue::PlainObject(ref call_obj))
+                JsValue::PlainObject(ref call_obj)
                     if call_obj.borrow().contains_key("__call__") =>
                 {
                     let result = dispatch_call_with_this(
@@ -4968,19 +4965,19 @@ fn handle_get_iterator(
                         }
                     }
                 }
-                Some(_) => {
-                    return Err(StatorError::TypeError(
-                        "GetIterator: @@iterator is not a function".into(),
-                    ));
-                }
-                None => {
-                    // Fallback: PlainObject with "length" → array-like
+                JsValue::Undefined => {
+                    // Fallback: PlainObject with "length" → array-like.
                     if map.borrow().contains_key("length") {
                         let items = plain_object_to_array_items(map);
                         JsValue::Iterator(NativeIterator::from_items(items))
                     } else {
                         return Err(StatorError::TypeError("object is not iterable".into()));
                     }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetIterator: @@iterator is not a function".into(),
+                    ));
                 }
             }
         }
