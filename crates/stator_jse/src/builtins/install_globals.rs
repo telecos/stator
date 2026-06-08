@@ -43298,19 +43298,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_returns_argument_module() {
         assert_module_eval_true("import.meta.resolve('module') === 'module'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_accepts_template_literal_module() {
         assert_module_eval_true("import.meta.resolve(`module`) === 'module'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_works_when_extracted_module() {
         assert_module_eval_true(
             "var resolve = import.meta.resolve; resolve('module') === 'module'",
@@ -43330,7 +43327,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_in_sequence_expression_module() {
         assert_module_eval_true(
             "var value = (0, import.meta.resolve('module')); value === 'module'",
