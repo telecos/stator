@@ -54985,19 +54985,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.allSettled([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.allSettled([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.allSettled([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
@@ -55059,19 +55056,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.any([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.any([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.any([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
@@ -55133,19 +55127,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.race([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.race([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.race([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
