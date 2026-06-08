@@ -80408,7 +80408,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_nested_closure_read() {
         assert_eval_true(
             "class C { #x = 3; make() { let self = this; return function() { return self.#x; }; } } \
@@ -80425,7 +80424,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_closure_survives_after_method_return() {
         assert_eval_true(
             "class C { #x = 11; make() { return () => this.#x; } } \
@@ -80435,7 +80433,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_brand_isolated_between_classes() {
         assert_eval_true(
             "class A { #x = 1; static has(o) { return #x in o; } get() { return this.#x; } } \
