@@ -58251,10 +58251,9 @@ mod tests {
 
     /// `new Date(number)` with a known timestamp round-trips through toISOString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_new_date_number_round_trip() {
         let result =
-            global_eval("new Date(1718458245123).toISOString() === '2024-06-15T14:30:45.123Z'")
+            global_eval("new Date(1718458245123).toISOString() === '2024-06-15T13:30:45.123Z'")
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
