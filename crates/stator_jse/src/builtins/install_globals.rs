@@ -77515,7 +77515,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_truncates_negative_fractional_digits_toward_zero() {
         assert_eval_true("(1.2).toFixed(-0.9) === '1'");
     }
@@ -77528,7 +77527,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_large_number_uses_to_string() {
         assert_eval_true("(1e21).toFixed(0) === '1e+21'");
     }

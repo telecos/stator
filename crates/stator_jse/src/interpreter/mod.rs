@@ -535,6 +535,21 @@ pub fn dispatch_get_property_value(obj: &JsValue, key: JsValue) -> StatorResult<
     keyed_load(obj, &key)
 }
 
+fn number_proto_to_fixed(n: f64, arg: Option<&JsValue>) -> StatorResult<JsValue> {
+    let digits = match arg {
+        None | Some(JsValue::Undefined) => 0.0,
+        Some(v) => v.to_integer_or_infinity()?,
+    };
+    if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
+        return Err(StatorError::RangeError(
+            "toFixed() digits argument must be between 0 and 100".into(),
+        ));
+    }
+    Ok(JsValue::String(
+        crate::builtins::number::number_to_fixed(n, digits as u32)?.into(),
+    ))
+}
+
 /// Shared implementation of `Number.prototype.toExponential(fractionDigits)`
 /// for the primitive-receiver fast path.  Performs the ES §21.1.3.2
 /// `ToIntegerOrInfinity` coercion on `arg`, rejects out-of-range or infinite
@@ -16077,17 +16092,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let frac = match args.first() {
-                        Some(v) => v.to_number()?,
-                        None => 0.0,
-                    };
-                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
-                        return Err(StatorError::RangeError(
-                            "toFixed() digits argument must be between 0 and 100".into(),
-                        ));
-                    }
-                    let digits = frac as usize;
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    number_proto_to_fixed(n, args.first())
                 }));
             }
             "toExponential" => {
@@ -16155,25 +16160,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let frac = match args.first() {
-                        Some(v) => v.to_number()?,
-                        None => 0.0,
-                    };
-                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
-                        return Err(StatorError::RangeError(
-                            "toFixed() digits argument must be between 0 and 100".into(),
-                        ));
-                    }
-                    let digits = frac as usize;
-                    if n.is_nan() {
-                        return Ok(JsValue::String("NaN".into()));
-                    }
-                    if n.is_infinite() {
-                        return Ok(JsValue::String(
-                            if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
-                        ));
-                    }
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    number_proto_to_fixed(n, args.first())
                 }));
             }
             "toExponential" => {
