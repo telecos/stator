@@ -1429,11 +1429,11 @@ typedef struct StatorModuleHandle StatorModuleHandle;
  * Named properties can be set and retrieved via [`stator_object_set`] and
  * [`stator_object_get`].
  *
- * The underlying [`JsObject`] storage is reference-counted, allowing the
- * same object identity to be exposed through multiple FFI handles via
- * [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
- * through one handle are observed through all other handles that share the
- * same backing storage.
+ * The underlying [`PropertyMap`] storage is reference-counted, allowing the
+ * same object identity to be exposed through multiple FFI handles and through
+ * [`JsValue::PlainObject`] without materialising a fresh script object.
+ * Mutations through one handle are observed through all other handles that
+ * share the same backing storage.
  */
 typedef struct StatorObject StatorObject;
 
@@ -6390,7 +6390,7 @@ enum StatorStatus stator_value_write_string_utf8(const struct StatorValue *val,
 
 /**
  * Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
- * shares the same underlying `JsObject` storage.
+ * shares the same underlying `PropertyMap` storage.
  *
  * The returned value's `typeof` is `"object"`; passing it to
  * [`stator_value_as_object`] yields a new [`StatorObject`] handle whose

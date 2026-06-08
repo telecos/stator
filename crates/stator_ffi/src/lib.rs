@@ -51,11 +51,10 @@ use stator_jse::host::{
 use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
-    decode_string_constant,
+    decode_string_constant, dispatch_get_property_value, dispatch_set_property_value,
 };
 use stator_jse::jit_mitigations::{self, JitMitigationsTier};
 use stator_jse::jit_unwind;
-use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
 use stator_jse::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use stator_jse::objects::value::{JsValue, ModuleBindingCell, NativeFn};
@@ -1894,7 +1893,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         _isolate: isolate,
         enter_count: 0,
         global: StatorObject {
-            inner: Rc::new(RefCell::new(JsObject::new())),
+            inner: Rc::new(RefCell::new(PropertyMap::new())),
             isolate,
         },
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
@@ -2335,13 +2334,13 @@ enum StatorValueInner {
     /// FFI round trips.  Use [`StatorValueInner::ObjectHandle`] (produced by
     /// [`stator_object_as_value`]) when identity must survive.
     Object,
-    /// A JavaScript object backed by a real, shared [`JsObject`] storage.
+    /// A JavaScript object backed by a shared [`PropertyMap`] storage.
     ///
     /// Produced by [`stator_object_as_value`].  Multiple [`StatorValue`] /
-    /// [`StatorObject`] handles that share the same `Rc<RefCell<JsObject>>`
+    /// [`StatorObject`] handles that share the same `Rc<RefCell<PropertyMap>>`
     /// observe one another's mutations and round-trip through
-    /// [`stator_value_as_object`] without identity loss.
-    ObjectHandle(Rc<RefCell<JsObject>>),
+    /// both the FFI value/object boundary and [`JsValue::PlainObject`] without identity loss.
+    ObjectHandle(Rc<RefCell<PropertyMap>>),
     /// A JavaScript object backed by a DOM wrapper materialized through the
     /// embedder FFI.
     DomWrapHandle {
@@ -3601,18 +3600,87 @@ pub unsafe extern "C" fn stator_value_is_set(val: *const StatorValue) -> bool {
 /// Named properties can be set and retrieved via [`stator_object_set`] and
 /// [`stator_object_get`].
 ///
-/// The underlying [`JsObject`] storage is reference-counted, allowing the
-/// same object identity to be exposed through multiple FFI handles via
-/// [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
-/// through one handle are observed through all other handles that share the
-/// same backing storage.
+/// The underlying [`PropertyMap`] storage is reference-counted, allowing the
+/// same object identity to be exposed through multiple FFI handles and through
+/// [`JsValue::PlainObject`] without materialising a fresh script object.
+/// Mutations through one handle are observed through all other handles that
+/// share the same backing storage.
 pub struct StatorObject {
-    inner: Rc<RefCell<JsObject>>,
+    inner: Rc<RefCell<PropertyMap>>,
     isolate: *mut StatorIsolate,
 }
 
 // SAFETY: `StatorObject` is single-threaded; see [`StatorValue`] rationale.
 unsafe impl Send for StatorObject {}
+
+fn plain_object_js_value(inner: &Rc<RefCell<PropertyMap>>) -> JsValue {
+    JsValue::PlainObject(Rc::clone(inner))
+}
+
+fn plain_object_property_key(key: &str) -> JsValue {
+    JsValue::String(key.to_owned().into())
+}
+
+fn plain_object_get_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> JsValue {
+    dispatch_get_property_value(
+        &plain_object_js_value(inner),
+        plain_object_property_key(key),
+    )
+    .unwrap_or(JsValue::Undefined)
+}
+
+fn plain_object_set_property(
+    inner: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    value: JsValue,
+) -> StatorResult<()> {
+    dispatch_set_property_value(
+        &plain_object_js_value(inner),
+        plain_object_property_key(key),
+        value,
+    )
+}
+
+fn plain_object_has_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
+    let mut current = Rc::clone(inner);
+    for _ in 0..256 {
+        let next = {
+            let borrowed = current.borrow();
+            if borrowed.contains_key(key) {
+                return true;
+            }
+            borrowed
+                .get(INTERNAL_PROTO_PROPERTY_KEY)
+                .cloned()
+                .or_else(|| borrowed.get("__proto__").cloned())
+        };
+        match next {
+            Some(JsValue::PlainObject(proto)) => current = proto,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn plain_object_delete_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
+    let mut borrowed = inner.borrow_mut();
+    if !borrowed.contains_key(key) {
+        return true;
+    }
+    if !borrowed.is_configurable(key) {
+        return false;
+    }
+    borrowed.remove(key).is_some()
+}
+
+fn plain_object_own_property_keys(inner: &Rc<RefCell<PropertyMap>>) -> Vec<String> {
+    inner
+        .borrow()
+        .keys()
+        .filter(|key| key.as_ref() != INTERNAL_PROTO_PROPERTY_KEY)
+        .map(|key| key.to_string())
+        .collect()
+}
 
 /// Create a new, empty JavaScript object.
 ///
@@ -3628,7 +3696,7 @@ pub unsafe extern "C" fn stator_object_new(isolate: *mut StatorIsolate) -> *mut 
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe { (*isolate).live_objects += 1 };
     Box::into_raw(Box::new(StatorObject {
-        inner: Rc::new(RefCell::new(JsObject::new())),
+        inner: Rc::new(RefCell::new(PropertyMap::new())),
         isolate,
     }))
 }
@@ -3676,7 +3744,8 @@ pub unsafe extern "C" fn stator_object_set(
     // SAFETY: caller guarantees `val` is valid.
     let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
     // SAFETY: caller guarantees `obj` is valid.
-    let _ = unsafe { (*obj).inner.borrow_mut().set_property(&key_str, js_val) };
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let _ = plain_object_set_property(&inner, key_str.as_ref(), js_val);
 }
 
 /// Get the named property `key` from `obj` as a new [`StatorValue`].
@@ -3699,31 +3768,14 @@ pub unsafe extern "C" fn stator_object_get(
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    let js_val = unsafe { (*obj).inner.borrow().get_property(&key_str) };
-    let inner = match js_val {
-        JsValue::HeapNumber(n) => StatorValueInner::Number(n),
-        JsValue::Smi(n) => StatorValueInner::Number(f64::from(n)),
-        JsValue::String(s) => {
-            // SAFETY: `s` contains no null bytes iff it came through our API;
-            // we truncate at the first null to be safe.
-            let valid_len = s.as_bytes().iter().position(|&b| b == 0).unwrap_or(s.len());
-            // SAFETY: `&s.as_bytes()[..valid_len]` has no null bytes.
-            unsafe {
-                StatorValueInner::Str(CString::from_vec_unchecked(
-                    s.as_bytes()[..valid_len].to_vec(),
-                ))
-            }
-        }
-        // Non-existent or non-primitive property → return null.
-        _ => return std::ptr::null_mut(),
-    };
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    if !plain_object_has_property(&inner, key_str.as_ref()) {
+        return std::ptr::null_mut();
+    }
+    let js_val = plain_object_get_property(&inner, key_str.as_ref());
     // SAFETY: caller guarantees `obj` is valid, so `isolate` is valid too.
     let isolate = unsafe { (*obj).isolate };
-    if !isolate.is_null() {
-        // SAFETY: `isolate` is valid for the lifetime of `obj`.
-        unsafe { (*isolate).live_objects += 1 };
-    }
-    Box::into_raw(Box::new(StatorValue { inner, isolate }))
+    js_value_to_owned_stator_value(isolate, &js_val)
 }
 
 /// Return `true` if `obj` has a property with the given `key` (own or
@@ -3742,7 +3794,8 @@ pub unsafe extern "C" fn stator_object_has(obj: *const StatorObject, key: *const
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    unsafe { (*obj).inner.borrow().has_property(&key_str) }
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    plain_object_has_property(&inner, key_str.as_ref())
 }
 
 /// Delete the named property `key` from `obj`.
@@ -3763,16 +3816,8 @@ pub unsafe extern "C" fn stator_object_delete(obj: *mut StatorObject, key: *cons
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    // `delete_own_property` returns `Ok(false)` when the property is
-    // non-configurable and `Err(_)` on internal engine errors; both cases
-    // map to `false` here, consistent with ECMAScript's [[Delete]] semantics.
-    unsafe {
-        (*obj)
-            .inner
-            .borrow_mut()
-            .delete_own_property(&key_str)
-            .unwrap_or(false)
-    }
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    plain_object_delete_property(&inner, key_str.as_ref())
 }
 
 /// An opaque snapshot of the own property names of a JavaScript object.
@@ -3801,7 +3846,7 @@ pub unsafe extern "C" fn stator_object_get_property_names(
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `obj` is valid.
-    let keys = unsafe { (*obj).inner.borrow().own_property_keys() };
+    let keys = plain_object_own_property_keys(&unsafe { &*obj }.inner);
     let names = keys
         .into_iter()
         .map(|k| {
@@ -13370,7 +13415,7 @@ pub unsafe extern "C" fn stator_value_strict_equals(
         }
         (StatorValueInner::Str(x), StatorValueInner::Str(y)) => x == y,
         // Two shared-storage object handles compare equal iff they point at
-        // the same underlying `Rc<RefCell<JsObject>>` (pointer identity).
+        // the same underlying `Rc<RefCell<PropertyMap>>` (pointer identity).
         (StatorValueInner::ObjectHandle(x), StatorValueInner::ObjectHandle(y)) => Rc::ptr_eq(x, y),
         (
             StatorValueInner::DomWrapHandle { plain: x, .. },
@@ -13660,13 +13705,13 @@ pub unsafe extern "C" fn stator_value_write_string_utf8(
 // ── Object / value identity bridge ───────────────────────────────────────────
 
 /// Borrow the shared backing storage of an [`StatorObject`] handle so that
-/// the same `Rc<RefCell<JsObject>>` can be reused by both [`StatorObject`]
+/// the same `Rc<RefCell<PropertyMap>>` can be reused by both [`StatorObject`]
 /// and [`StatorValue`] handles created from it.  Returns `None` if the
 /// object's pointer is null.
 ///
 /// # Safety
 /// `obj` must be either null or a valid, live [`StatorObject`] pointer.
-unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCell<JsObject>>> {
+unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCell<PropertyMap>>> {
     if obj.is_null() {
         return None;
     }
@@ -13675,7 +13720,7 @@ unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCe
 }
 
 /// Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
-/// shares the same underlying `JsObject` storage.
+/// shares the same underlying `PropertyMap` storage.
 ///
 /// The returned value's `typeof` is `"object"`; passing it to
 /// [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
@@ -13778,7 +13823,7 @@ unsafe fn decode_property_key<'a>(key: *const c_char, key_len: usize) -> Option<
 }
 
 /// Build a fresh owned [`StatorValue`] from a [`JsValue`] returned by an
-/// underlying [`JsObject`] property read.
+/// underlying [`PropertyMap`] property read.
 ///
 /// The new value is registered with the isolate's live-object counter and
 /// (if open) the innermost handle scope.  Returns a null pointer when
@@ -13851,18 +13896,10 @@ pub unsafe extern "C" fn stator_object_get_property(
     if isolate.is_null() {
         return StatorStatus::StatorStatusInvalidArg;
     }
-    let (present, js_val) = {
-        let borrowed = inner_rc.borrow();
-        let present = borrowed.has_property(key_str);
-        if present {
-            (true, borrowed.get_property(key_str))
-        } else {
-            (false, JsValue::Undefined)
-        }
-    };
-    if !present {
+    if !plain_object_has_property(&inner_rc, key_str) {
         return StatorStatus::StatorStatusFalse;
     }
+    let js_val = plain_object_get_property(&inner_rc, key_str);
     let val = js_value_to_owned_stator_value(isolate, &js_val);
     if val.is_null() {
         return StatorStatus::StatorStatusInvalidArg;
@@ -13909,7 +13946,7 @@ pub unsafe extern "C" fn stator_object_set_property(
     let inner_rc = Rc::clone(&unsafe { &*obj }.inner);
     // SAFETY: caller guarantees `val` is valid.
     let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
-    let result = inner_rc.borrow_mut().set_property(key_str, js_val);
+    let result = plain_object_set_property(&inner_rc, key_str, js_val);
     match result {
         Ok(()) => StatorStatus::StatorStatusOk,
         Err(err) => {
@@ -13974,7 +14011,8 @@ pub unsafe extern "C" fn stator_object_has_property(
         None => return StatorStatus::StatorStatusInvalidArg,
     };
     // SAFETY: caller guarantees `obj` is valid.
-    let present = unsafe { &*obj }.inner.borrow().has_property(key_str);
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let present = plain_object_has_property(&inner, key_str);
     // SAFETY: caller guarantees `out` is valid.
     unsafe { *out = present };
     StatorStatus::StatorStatusOk
@@ -14011,11 +14049,8 @@ pub unsafe extern "C" fn stator_object_delete_property(
         None => return StatorStatus::StatorStatusInvalidArg,
     };
     // SAFETY: caller guarantees `obj` is valid.
-    let deleted = unsafe { &*obj }
-        .inner
-        .borrow_mut()
-        .delete_own_property(key_str)
-        .unwrap_or(false);
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let deleted = plain_object_delete_property(&inner, key_str);
     // SAFETY: caller guarantees `out` is valid.
     unsafe { *out = deleted };
     StatorStatus::StatorStatusOk
@@ -15518,16 +15553,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         | StatorValueInner::Map
         | StatorValueInner::Set => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
         StatorValueInner::PromiseHandle { promise, .. } => JsValue::Promise(promise.clone()),
-        StatorValueInner::ObjectHandle(_) => {
-            // Identity-preserving bridge from `StatorValueInner::ObjectHandle`
-            // into the interpreter heap is not yet implemented.  Round-trips
-            // through this conversion (e.g. when an object handle is passed
-            // through a script-visible global) lose identity: a fresh empty
-            // `PlainObject` is materialised here.  FFI-level property reads
-            // and writes via `stator_object_*` APIs still observe shared
-            // state because they operate directly on the `Rc<RefCell<JsObject>>`.
-            JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
-        }
+        StatorValueInner::ObjectHandle(rc) => JsValue::PlainObject(Rc::clone(rc)),
         StatorValueInner::DomWrapHandle { plain, .. } => JsValue::PlainObject(Rc::clone(plain)),
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
@@ -15564,9 +15590,8 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         }
         JsValue::Function(_) | JsValue::NativeFunction(_) => StatorValueInner::Function,
         JsValue::Array(_) => StatorValueInner::Array,
-        JsValue::PlainObject(plain) => {
-            dom_wrap_inner_for_plain_object(plain).unwrap_or(StatorValueInner::Object)
-        }
+        JsValue::PlainObject(plain) => dom_wrap_inner_for_plain_object(plain)
+            .unwrap_or_else(|| StatorValueInner::ObjectHandle(Rc::clone(plain))),
         JsValue::Promise(promise) => StatorValueInner::PromiseHandle {
             promise: promise.clone(),
             queue: active_or_new_microtask_queue(),
@@ -17034,21 +17059,6 @@ pub unsafe extern "C" fn stator_object_template_prototype_template(
         .as_mut() as *mut StatorObjectTemplate
 }
 
-fn object_template_to_js_object(tmpl: &StatorObjectTemplate) -> JsObject {
-    let prototype = tmpl
-        .prototype_template
-        .as_ref()
-        .map(|prototype| Rc::new(RefCell::new(object_template_to_js_object(prototype))));
-    let mut obj = match prototype {
-        Some(prototype) => JsObject::with_prototype(prototype),
-        None => JsObject::new(),
-    };
-    for (key, val_inner) in &tmpl.properties {
-        let _ = obj.set_property(key, stator_value_inner_to_jsvalue(val_inner));
-    }
-    obj
-}
-
 fn install_object_template_on_property_map(map: &mut PropertyMap, tmpl: &StatorObjectTemplate) {
     let default_attrs = PropertyAttributes::from_bits_truncate(
         PropertyAttributes::WRITABLE.bits()
@@ -17102,13 +17112,10 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
         return std::ptr::null_mut();
     }
     // SAFETY: `tmpl` is valid.
-    let obj = object_template_to_js_object(unsafe { &*tmpl });
+    let inner = object_template_to_property_map(unsafe { &*tmpl });
     // SAFETY: isolate is valid.
     unsafe { (*isolate).live_objects += 1 };
-    Box::into_raw(Box::new(StatorObject {
-        inner: Rc::new(RefCell::new(obj)),
-        isolate,
-    }))
+    Box::into_raw(Box::new(StatorObject { inner, isolate }))
 }
 
 // ── Structured messages ──────────────────────────────────────────────────────
@@ -24986,7 +24993,7 @@ struct StatorWeakSlot {
 /// cannot keep the referent alive.
 enum WeakRef {
     /// Weak handle to an [`StatorValueInner::ObjectHandle`].
-    Object(std::rc::Weak<RefCell<JsObject>>),
+    Object(std::rc::Weak<RefCell<PropertyMap>>),
     /// Weak handle to an [`StatorValueInner::DomWrapHandle`].  The `wrap`
     /// pointer is **not** owned by the weak slot; it is only used by
     /// [`stator_weak_upgrade`] to reconstitute the original handle if the
@@ -45147,6 +45154,89 @@ mod tests {
     }
 
     #[test]
+    fn test_object_handle_jsvalue_bridge_reuses_plain_object() {
+        let iso = IsolateGuard::new();
+        let obj = make_object_with_key_42(iso.as_ptr());
+        let val = unsafe { stator_object_as_value(obj) };
+
+        let first = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
+        let second = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
+        assert!(first.is_strictly_equal(&second));
+        assert_eq!(
+            dispatch_get_property_value(&first, JsValue::String("key".into())).unwrap(),
+            JsValue::Smi(42)
+        );
+
+        dispatch_set_property_value(&first, JsValue::String("from_js".into()), JsValue::Smi(7))
+            .unwrap();
+        let got = unsafe { stator_object_get(obj, c"from_js".as_ptr()) };
+        assert!(!got.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got) }, 7.0);
+
+        let round_trip =
+            unsafe { allocate_stator_value(iso.as_ptr(), jsvalue_to_stator_value_inner(&first)) };
+        let obj2 = unsafe { stator_value_as_object(round_trip) };
+        assert!(!obj2.is_null());
+        let val2 = unsafe { stator_object_as_value(obj2) };
+        assert!(unsafe { stator_value_strict_equals(val, val2) });
+
+        unsafe {
+            stator_value_destroy(got);
+            stator_value_destroy(round_trip);
+            stator_value_destroy(val2);
+            stator_object_destroy(obj2);
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_context_global_set_object_handle_preserves_script_identity() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let obj = make_object_with_key_42(iso.as_ptr());
+        let val = unsafe { stator_object_as_value(obj) };
+        unsafe { stator_context_global_set(ctx, c"host".as_ptr(), val) };
+
+        let src = b"host.fromScript = 7; host === host;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert!(unsafe { stator_value_to_boolean(result) });
+
+        let got = unsafe { stator_object_get(obj, c"fromScript".as_ptr()) };
+        assert!(!got.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got) }, 7.0);
+
+        let return_src = b"host;";
+        let return_script = unsafe {
+            stator_script_compile(ctx, return_src.as_ptr() as *const c_char, return_src.len())
+        };
+        assert!(!return_script.is_null());
+        let returned = unsafe { stator_script_run(return_script, ctx) };
+        assert!(!returned.is_null());
+        let returned_obj = unsafe { stator_value_as_object(returned) };
+        assert!(!returned_obj.is_null());
+        let returned_val = unsafe { stator_object_as_value(returned_obj) };
+        assert!(unsafe { stator_value_strict_equals(val, returned_val) });
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_value_destroy(got);
+            stator_value_destroy(returned_val);
+            stator_object_destroy(returned_obj);
+            stator_value_destroy(returned);
+            stator_script_free(return_script);
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_value_as_object_returns_null_for_tag_only() {
         let iso = IsolateGuard::new();
         let val = unsafe { stator_value_new_object(iso.as_ptr()) };
@@ -45994,7 +46084,7 @@ mod tests {
         assert!(!persistent.is_null());
         assert!(!unsafe { stator_persistent_is_empty(persistent) });
         // Destroy the originating object handle now; the persistent should
-        // still keep the underlying JsObject alive.
+        // still keep the underlying plain object alive.
         unsafe { stator_object_destroy(obj) };
         unsafe { stator_handle_scope_close(scope) };
 
