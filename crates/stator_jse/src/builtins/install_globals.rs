@@ -70421,7 +70421,6 @@ mod tests {
 
     /// `Array.prototype[Symbol.iterator]` aliases `values`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_symbol_iterator_aliases_values() {
         let r = global_eval("Array.prototype[Symbol.iterator] === Array.prototype.values").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -70821,7 +70820,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_delete_hole_map_preserves_hole() {
         assert_eval_true(
             "var a = [1, 2, 3]; delete a[1]; var r = a.map(function(x) { return x * 2; }); r.length === 3 && r[0] === 2 && r[2] === 6 && !Object.hasOwn(r, '1')",
@@ -80584,7 +80582,6 @@ mod tests {
 
     /// Private field with default value of zero is not nullish.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_default_zero() {
         assert_eval_true(
             "class C { #x = 0; get() { return this.#x; } } \
@@ -81011,7 +81008,6 @@ mod tests {
     // ── @@hasInstance ────────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_basic_function() {
         assert_eval_true(
             "function Foo() {} \
@@ -81034,7 +81030,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_class_override() {
         assert_eval_true(
             r#"
