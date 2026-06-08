@@ -38015,17 +38015,14 @@ mod tests {
         "String(Object(Symbol('x'))) === 'Symbol(x)'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_number_primitive,
         "typeof Object(1) === 'object' && Object(1).valueOf() === 1 && Object.prototype.toString.call(Object(1)) === '[object Number]'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_string_primitive,
         "typeof Object('hi') === 'object' && Object('hi').toString() === 'hi' && Object.prototype.toString.call(Object('hi')) === '[object String]'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_symbol_primitive,
         "typeof Object(Symbol('x')) === 'object' && String(Object(Symbol('x')).valueOf()) === 'Symbol(x)' && Object.prototype.toString.call(Object(Symbol('x'))) === '[object Symbol]'"
     );
@@ -43386,7 +43383,6 @@ mod tests {
 
     /// Object.prototype.toString on a namespace-like object uses the tag.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_module_ns_object_to_string_uses_tag() {
         assert_eval_true(
             r#"
