@@ -71721,7 +71721,6 @@ mod tests {
 
     /// Infinite generator consumed via for-of with break.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_infinite_generator_for_of_break() {
         let r = global_eval(
             r#"
@@ -72224,7 +72223,6 @@ mod tests {
 
     /// Async generator return() resolves to an iterator result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_resolves_iterator_result() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72888,7 +72886,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_throwing_getter_propagates_string() {
         let result = global_eval(
             "var o = { get x() { throw 'boom'; } }; \
@@ -74752,7 +74749,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_observes_var_updates() {
         let result = global_eval(
             "function outer() { var x = 1; var read = function() { return x; }; x = 9; return read(); } outer()",
@@ -74762,7 +74758,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_observes_let_updates() {
         let result = global_eval(
             "function outer() { let x = 2; var read = function() { return x; }; x = 8; return read(); } outer()",
