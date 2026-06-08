@@ -1696,7 +1696,7 @@ impl FunctionCompiler {
                     }
                     self.compile_ident_store(&ident.name)?;
                     Ok(None)
-                } else if self.is_program && is_var && !self.is_module {
+                } else if self.is_program && is_var && !self.is_module && !self.is_strict {
                     // Program-level `var`: store exclusively via StaGlobal
                     // so that nested callbacks (which also use StaGlobal /
                     // LdaGlobal) share the same storage.  Without this,
@@ -1799,7 +1799,7 @@ impl FunctionCompiler {
             &decl.body,
             decl.is_generator,
             decl.is_async,
-            decl.is_strict,
+            decl.is_strict || self.is_strict,
             false,
             FunctionCompileOptions {
                 self_name: None,
@@ -1833,7 +1833,7 @@ impl FunctionCompiler {
             self.emit_star(reg);
             // Top-level script function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
-            if self.is_program && !self.is_module {
+            if self.is_program && !self.is_module && !self.is_strict {
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
                 // Re-load the value from the local register first so the
@@ -8910,7 +8910,7 @@ impl BytecodeGenerator {
 
         // Hoist `var` declarations. Scripts use the global env; modules keep
         // top-level `var` module-scoped so exports can write through cells.
-        if is_module {
+        if is_module || compiler.is_strict {
             compiler.hoist_var_declarations(&stmts_owned);
         } else {
             compiler.hoist_var_declarations_global(&stmts_owned);

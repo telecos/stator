@@ -21,22 +21,23 @@ use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, rec
 use super::{
     ACTIVE_DEBUGGER, CallArgs, FAST_ARRAY_METHOD_KEY, GlobalEnv, INLINE_BYTECODE_THRESHOLD,
     Interpreter, InterpreterFrame, MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc,
-    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, acquire_frame, bigint_pow, clone_shared_global_env,
-    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
-    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
-    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, fast_array_method_name, fast_array_method_target,
-    find_handler, fn_props_get, fn_props_set, has_property_in_chain, has_prototype_in_chain,
-    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, make_construct_this,
-    maybe_cache_construct_boilerplate, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue, ordinary_set_prototype_of,
-    plain_object_to_array_items, populate_self_name, proto_lookup, proto_lookup_cached_resolution,
-    proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
-    run_callee_pooled, set_function_name_if_missing, set_pending_exception,
-    settle_async_iterator_result, strict_eq, sync_global_object_property_delete,
-    sync_global_object_property_store, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, try_fast_named_property_lookup, try_inline_small_function,
-    try_proto_lookup_rc, walk_context_chain, with_function_constructor_global_env,
+    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, acquire_frame, bigint_pow, bind_no_receiver_this,
+    clone_shared_global_env, collect_args, concat_rc_strs, constant_pool_jump_delta,
+    constant_to_value, construct_builtin_result, decode_string_constant, dispatch_call_property,
+    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, fast_array_method_name,
+    fast_array_method_target, find_handler, fn_props_get, fn_props_set, has_property_in_chain,
+    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name, proto_lookup,
+    proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
+    resolve_jump, restore_closure_context, restore_no_receiver_this, run_callee_pooled,
+    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
+    sync_global_object_property_delete, sync_global_object_property_store, to_array_index,
+    to_bigint, to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    try_inline_small_function, try_proto_lookup_rc, walk_context_chain,
+    with_function_constructor_global_env,
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2156,6 +2157,8 @@ fn handle_call_any_receiver(
             } else {
                 // ── Inline small functions (zero-arg fast path) ──
                 if arg_count == 0
+                    && !ba.is_strict()
+                    && !ctx.frame.bytecode_array.is_strict()
                     && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                     && !ba.has_exception_handler()
                     && let Some(result) =
@@ -2183,6 +2186,11 @@ fn handle_call_any_receiver(
                     }
                 }
                 let callee_val = JsValue::Function(Rc::clone(&ba));
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
+                } else {
+                    None
+                };
                 let mut callee_frame =
                     acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                 restore_closure_context(&mut callee_frame, &ba);
@@ -2196,6 +2204,9 @@ fn handle_call_any_receiver(
                 pop_call_frame();
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
+                }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                 }
                 ctx.frame.accumulator = result?;
             }
@@ -2327,11 +2338,8 @@ fn handle_tail_call(
                 } else {
                     JsValue::Undefined
                 };
-                if !ba.is_arrow() && ba.is_strict() {
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
+                if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict());
                 }
                 restore_closure_context(ctx.frame, &ba);
                 if ba.self_name_register().is_some() {
@@ -2392,7 +2400,9 @@ fn handle_call_undefined_receiver0(
                     return Ok(DispatchAction::Continue);
                 }
             }
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+            if !ba.is_strict()
+                && !ctx.frame.bytecode_array.is_strict()
+                && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
@@ -2440,13 +2450,8 @@ fn handle_call_undefined_receiver0(
                 }
                 // Arrow functions use lexical `this` — skip override.
                 // Strict mode: `this` is undefined for free function calls.
-                let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                    let old = ctx.frame.global_env.borrow().get_this().cloned();
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
-                    old
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                 } else {
                     None
                 };
@@ -2477,15 +2482,8 @@ fn handle_call_undefined_receiver0(
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
                 }
-                if !ba.is_arrow() && ba.is_strict() {
-                    match saved_this {
-                        Some(v) => {
-                            ctx.frame.global_env.borrow_mut().set_this(v);
-                        }
-                        None => {
-                            ctx.frame.global_env.borrow_mut().remove_this();
-                        }
-                    }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                 }
                 ctx.frame.accumulator = result?;
             }
@@ -2536,7 +2534,9 @@ fn handle_call_undefined_receiver1(
     }
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+            if !ba.is_strict()
+                && !ctx.frame.bytecode_array.is_strict()
+                && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
@@ -2587,13 +2587,8 @@ fn handle_call_undefined_receiver1(
                     }
                 }
                 // Arrow functions use lexical `this` — skip override.
-                let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                    let old = ctx.frame.global_env.borrow().get_this().cloned();
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
-                    old
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                 } else {
                     None
                 };
@@ -2617,15 +2612,8 @@ fn handle_call_undefined_receiver1(
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
                 }
-                if !ba.is_arrow() && ba.is_strict() {
-                    match saved_this {
-                        Some(v) => {
-                            ctx.frame.global_env.borrow_mut().set_this(v);
-                        }
-                        None => {
-                            ctx.frame.global_env.borrow_mut().remove_this();
-                        }
-                    }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                 }
                 ctx.frame.accumulator = result?;
             }
@@ -2674,21 +2662,6 @@ fn handle_call_undefined_receiver2(
     let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
-                && !ba.has_exception_handler()
-                && !ba.is_generator()
-                && !ba.is_async()
-            {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
-                let inline_args = [arg1, arg2];
-                if let Some(result) =
-                    try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
-                {
-                    ctx.frame.accumulator = result;
-                    return Ok(DispatchAction::Continue);
-                }
-            }
             if ba.is_generator() {
                 #[cold]
                 fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
@@ -2728,13 +2701,8 @@ fn handle_call_undefined_receiver2(
                 }
                 if !tried_jit {
                     // Arrow functions use lexical `this` — skip override.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get_this().cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .set_this(JsValue::Undefined);
-                        old
+                    let saved_this = if !ba.is_arrow() {
+                        bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                     } else {
                         None
                     };
@@ -2758,15 +2726,8 @@ fn handle_call_undefined_receiver2(
                     if gen_before != ctx.frame.global_env.borrow().generation() {
                         ctx.frame.global_cache_invalidate();
                     }
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame.global_env.borrow_mut().set_this(v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove_this();
-                            }
-                        }
+                    if !ba.is_arrow() {
+                        restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                     }
                     ctx.frame.accumulator = result?;
                 }

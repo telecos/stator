@@ -43837,13 +43837,28 @@ mod tests {
 
     /// In strict mode, this in a plain function call is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_strict_this_undefined_in_function() {
         assert_eval_true(
             r#"
             "use strict";
             function f() { return this; }
             f() === undefined
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_script_var_is_lexical_binding() {
+        assert_eval_true(r#""use strict"; var strictTopLevel = 7; strictTopLevel === 7"#);
+    }
+
+    #[test]
+    fn e2e_sloppy_function_called_from_strict_uses_global_this() {
+        assert_eval_true(
+            r#"
+            function g() { return this === globalThis; }
+            function s() { "use strict"; return g(); }
+            s()
             "#,
         );
     }

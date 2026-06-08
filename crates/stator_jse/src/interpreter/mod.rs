@@ -3761,6 +3761,34 @@ fn fxhash(s: &str) -> u64 {
     h
 }
 
+pub(super) fn bind_no_receiver_this(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    is_strict: bool,
+) -> Option<JsValue> {
+    let old = global_env.borrow().get_this().cloned();
+    let this_value = if is_strict {
+        JsValue::Undefined
+    } else {
+        global_env
+            .borrow()
+            .get("globalThis")
+            .cloned()
+            .unwrap_or(JsValue::Undefined)
+    };
+    global_env.borrow_mut().set_this(this_value);
+    old
+}
+
+pub(super) fn restore_no_receiver_this(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    saved_this: Option<JsValue>,
+) {
+    match saved_this {
+        Some(value) => global_env.borrow_mut().set_this(value),
+        None => global_env.borrow_mut().remove_this(),
+    }
+}
+
 impl InterpreterFrame {
     /// Create a new frame for the given [`BytecodeArray`], pre-loading `args`
     /// into the parameter registers.
@@ -6988,6 +7016,8 @@ impl Interpreter {
 
                                     // Try inline BEFORE any Rc clones.
                                     if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !func_ba.is_strict()
+                                        && !frame.bytecode_array.is_strict()
                                         && !func_ba.has_exception_handler()
                                         && let Some(result) = try_inline_small_function(
                                             func_ba,
@@ -7033,10 +7063,8 @@ impl Interpreter {
                                     let ba = Rc::clone(func_rc);
                                     frame.pc = pc;
 
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7085,15 +7113,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -7166,11 +7187,14 @@ impl Interpreter {
                                         let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }
                                             .cheap_clone();
                                         let inline_args = [arg1];
-                                        if let Some(result) = try_inline_small_function(
-                                            ba,
-                                            &inline_args,
-                                            &frame.global_env,
-                                        ) {
+                                        if !ba.is_strict()
+                                            && !frame.bytecode_array.is_strict()
+                                            && let Some(result) = try_inline_small_function(
+                                                ba,
+                                                &inline_args,
+                                                &frame.global_env,
+                                            )
+                                        {
                                             match result {
                                                 JsValue::Smi(v) => {
                                                     sa = v;
@@ -7197,10 +7221,8 @@ impl Interpreter {
                                     // Only sync the PC for error traces.
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1];
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7241,15 +7263,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -7306,10 +7321,8 @@ impl Interpreter {
                                         unsafe { frame.read_reg_unchecked(arg2_reg) }.cheap_clone();
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1, arg2];
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7345,15 +7358,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -8896,11 +8902,14 @@ impl Interpreter {
                                                 }
                                             }
                                             // Fall back to full pattern match.
-                                            if let Some(result) = try_inline_small_function(
-                                                func_ba,
-                                                &[],
-                                                &frame.global_env,
-                                            ) {
+                                            if !func_ba.is_strict()
+                                                && !frame.bytecode_array.is_strict()
+                                                && let Some(result) = try_inline_small_function(
+                                                    func_ba,
+                                                    &[],
+                                                    &frame.global_env,
+                                                )
+                                            {
                                                 match result {
                                                     JsValue::Smi(v) => {
                                                         sa = v;
@@ -11604,6 +11613,7 @@ impl Interpreter {
                             // refcount bump when the function is small enough
                             // to be inlined.
                             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !is_strict
                                 && !ba.has_exception_handler()
                                 && let Some(result) =
                                     try_inline_small_function(ba, &[], &frame.global_env)
@@ -11615,10 +11625,8 @@ impl Interpreter {
                             let ba = Rc::clone(ba);
                             frame.pc = pc;
 
-                            let saved_this = if !is_arrow && is_strict {
-                                let old = frame.global_env.borrow().get_this().cloned();
-                                frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                old
+                            let saved_this = if !is_arrow {
+                                bind_no_receiver_this(&frame.global_env, is_strict)
                             } else {
                                 None
                             };
@@ -11664,15 +11672,8 @@ impl Interpreter {
                             {
                                 frame.global_cache_invalidate();
                             }
-                            if !is_arrow && is_strict {
-                                match saved_this {
-                                    Some(v) => {
-                                        frame.global_env.borrow_mut().set_this(v);
-                                    }
-                                    None => {
-                                        frame.global_env.borrow_mut().remove_this();
-                                    }
-                                }
+                            if !is_arrow {
+                                restore_no_receiver_this(&frame.global_env, saved_this);
                             }
                             match result {
                                 Ok(v) => {
@@ -11767,6 +11768,7 @@ impl Interpreter {
                             let arg_ptr =
                                 unsafe { frame.read_reg_unchecked(arg_reg) } as *const JsValue;
                             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !is_strict
                                 && !ba.has_exception_handler()
                                 && let Some(result) = try_inline_small_function(
                                     ba,
@@ -11781,10 +11783,8 @@ impl Interpreter {
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             frame.pc = pc;
-                            let saved_this = if !is_arrow && is_strict {
-                                let old = frame.global_env.borrow().get_this().cloned();
-                                frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                old
+                            let saved_this = if !is_arrow {
+                                bind_no_receiver_this(&frame.global_env, is_strict)
                             } else {
                                 None
                             };
@@ -11819,15 +11819,8 @@ impl Interpreter {
                             {
                                 frame.global_cache_invalidate();
                             }
-                            if !is_arrow && is_strict {
-                                match saved_this {
-                                    Some(v) => {
-                                        frame.global_env.borrow_mut().set_this(v);
-                                    }
-                                    None => {
-                                        frame.global_env.borrow_mut().remove_this();
-                                    }
-                                }
+                            if !is_arrow {
+                                restore_no_receiver_this(&frame.global_env, saved_this);
                             }
                             match result {
                                 Ok(v) => {
@@ -12047,6 +12040,8 @@ impl Interpreter {
                             if let JsValue::Function(func_rc) = callee {
                                 let func_ba = func_rc.as_ref();
                                 if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                    && !func_ba.is_strict()
+                                    && !frame.bytecode_array.is_strict()
                                     && !func_ba.has_exception_handler()
                                 {
                                     if let Some(result) =
