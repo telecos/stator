@@ -80160,7 +80160,6 @@ mod tests {
 
     /// Private field access inside class method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_access() {
         assert_eval_true(
             "class C { #x = 42; get() { return this.#x; } } \
@@ -80230,7 +80229,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_reachable_from_nested_closure() {
         assert_eval_true(
             "class C { #x = 4; #m() { return this.#x; } make() { return () => this.#m(); } } \
@@ -80280,7 +80278,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_getter_behavior() {
         assert_eval_true(
             "class C { #value = 21; get #x() { return this.#value * 2; } read() { return this.#x; } } \
@@ -80289,7 +80286,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_setter_behavior() {
         assert_eval_true(
             "class C { #value = 0; set #x(v) { this.#value = v + 1; } run() { this.#x = 9; return this.#value; } } \
@@ -80298,7 +80294,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_getter_setter_pair() {
         assert_eval_true(
             "class C { #value = 1; get #x() { return this.#value; } set #x(v) { this.#value = v; } run() { this.#x = 7; return this.#x; } } \
