@@ -14029,6 +14029,45 @@ fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
     }
 }
 
+fn array_join_element_string(value: &JsValue) -> StatorResult<String> {
+    match value {
+        JsValue::Null | JsValue::Undefined | JsValue::TheHole => Ok(String::new()),
+        JsValue::Array(_) => array_join_string(value, ","),
+        JsValue::PlainObject(map) => {
+            if is_array_like_plain_object(&map.borrow()) {
+                array_join_string(value, ",")
+            } else {
+                value.to_js_string()
+            }
+        }
+        other => other.to_js_string(),
+    }
+}
+
+fn array_join_string(value: &JsValue, separator: &str) -> StatorResult<String> {
+    let elements = match value {
+        JsValue::Array(items) => items.borrow().clone(),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = array_like_length_from_property_map(&borrow);
+            (0..len)
+                .map(|index| {
+                    borrow
+                        .get(&index.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    elements
+        .iter()
+        .map(array_join_element_string)
+        .collect::<StatorResult<Vec<_>>>()
+        .map(|parts| parts.join(separator))
+}
+
 fn is_array_like_plain_object(map: &PropertyMap) -> bool {
     map.get("__is_array__")
         .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
@@ -17142,37 +17181,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(JsValue::String(s)) => s.to_string(),
                             _ => ",".to_string(),
                         };
-                        let parts: Vec<String> = a
-                            .borrow()
-                            .iter()
-                            .map(|v| match v {
-                                JsValue::String(s) => s.to_string(),
-                                JsValue::Smi(n) => n.to_string(),
-                                JsValue::HeapNumber(n) => format!("{n}"),
-                                JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null | JsValue::Undefined => String::new(),
-                                _ => String::new(),
-                            })
-                            .collect();
-                        Ok(JsValue::String(parts.join(&sep).into()))
+                        array_join_string(&JsValue::Array(Rc::clone(&a)), &sep)
+                            .map(|joined| JsValue::String(joined.into()))
                     }));
                 }
                 "toString" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let parts: Vec<String> = a
-                            .borrow()
-                            .iter()
-                            .map(|v| match v {
-                                JsValue::String(s) => s.to_string(),
-                                JsValue::Smi(n) => n.to_string(),
-                                JsValue::HeapNumber(n) => format!("{n}"),
-                                JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null | JsValue::Undefined => String::new(),
-                                _ => String::new(),
-                            })
-                            .collect();
-                        Ok(JsValue::String(parts.join(",").into()))
+                        array_join_string(&JsValue::Array(Rc::clone(&a)), ",")
+                            .map(|joined| JsValue::String(joined.into()))
                     }));
                 }
                 "indexOf" => return make_fast_array_method(obj, "indexOf", 1),
@@ -17567,12 +17584,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         let mut result = Vec::new();
                         for (i, item) in items.iter().enumerate() {
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             match &val {

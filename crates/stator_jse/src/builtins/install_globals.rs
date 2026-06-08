@@ -69828,7 +69828,6 @@ mod tests {
 
     /// `Array.prototype.flat` with default depth (1).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_depth_one() {
         let r = global_eval("[1, [2, [3]]].flat().join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3".into()));
@@ -69843,7 +69842,6 @@ mod tests {
 
     /// `Array.prototype.flat` with depth 2.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_depth_two() {
         let r = global_eval("[1, [2, [3, [4]]]].flat(2).join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4".into()));
@@ -69980,7 +69978,6 @@ mod tests {
 
     /// `flatMap` honors `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_this_arg() {
         let r = global_eval(
             "var ctx = { mult: 4 }; \
