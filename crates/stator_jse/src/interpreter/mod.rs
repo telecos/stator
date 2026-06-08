@@ -17757,6 +17757,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let items = a.borrow().clone();
                         let mut result = Vec::new();
                         for (i, item) in items.iter().enumerate() {
+                            if item.is_the_hole() {
+                                continue;
+                            }
                             let val = dispatch_call_with_this(
                                 &callback,
                                 this_arg.clone(),
@@ -17764,7 +17767,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             )?;
                             match &val {
                                 JsValue::Array(inner) => {
-                                    result.extend_from_slice(&inner.borrow());
+                                    result.extend(inner.borrow().iter().filter_map(|value| {
+                                        if value.is_the_hole() {
+                                            None
+                                        } else {
+                                            Some(value.clone())
+                                        }
+                                    }));
                                 }
                                 JsValue::PlainObject(map) => {
                                     let borrow = map.borrow();
@@ -17777,12 +17786,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                             _ => 0,
                                         };
                                         for idx in 0..len {
-                                            result.push(
-                                                borrow
-                                                    .get(&idx.to_string())
-                                                    .cloned()
-                                                    .unwrap_or(JsValue::Undefined),
-                                            );
+                                            if let Some(value) = borrow.get(&idx.to_string()) {
+                                                result.push(value.clone());
+                                            }
                                         }
                                     } else {
                                         result.push(val.clone());
@@ -17843,7 +17849,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "values" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let items = a.borrow().clone();
+                        let items = a
+                            .borrow()
+                            .iter()
+                            .map(|value| {
+                                if value.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                            .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }
@@ -17855,7 +17871,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             .iter()
                             .enumerate()
                             .map(|(i, v)| {
-                                JsValue::new_array(vec![JsValue::Smi(i as i32), v.clone()])
+                                let value = if v.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    v.clone()
+                                };
+                                JsValue::new_array(vec![JsValue::Smi(i as i32), value])
                             })
                             .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(entries)))
@@ -17864,7 +17885,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "@@iterator" | "Symbol(1)" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let items = a.borrow().clone();
+                        let items = a
+                            .borrow()
+                            .iter()
+                            .map(|value| {
+                                if value.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                            .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }

@@ -70306,7 +70306,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_skips_holes_in_source() {
         assert_eval_true(
             "var r = [, 1].flatMap(function(v) { return [v]; }); r.length === 1 && r[0] === 1",
@@ -70314,7 +70313,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_skips_holes_in_returned_arrays() {
         assert_eval_true(
             "var r = [1].flatMap(function() { return [, 2]; }); r.length === 1 && r[0] === 2",
@@ -70771,9 +70769,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_constructor_iterator_materializes_undefined() {
-        assert_eval_true("Array.from(Array(3)).join('|') === 'undefined|undefined|undefined'");
+        assert_eval_true(
+            "Array.from(Array(3)).map(String).join('|') === 'undefined|undefined|undefined'",
+        );
     }
 
     #[test]
