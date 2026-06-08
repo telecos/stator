@@ -77259,7 +77259,6 @@ mod tests {
 
     /// toExponential(2) formats in scientific notation.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_basic() {
         let result = global_eval("(123456).toExponential(2)").unwrap();
         assert_eq!(result, JsValue::String("1.23e+5".into()));
@@ -77267,7 +77266,6 @@ mod tests {
 
     /// toExponential on zero.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_zero() {
         let result = global_eval("(0).toExponential(2)").unwrap();
         assert_eq!(result, JsValue::String("0.00e+0".into()));
@@ -77275,7 +77273,6 @@ mod tests {
 
     /// toExponential with no args uses minimal digits.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_no_args() {
         let result = global_eval("(100).toExponential()").unwrap();
         assert_eq!(result, JsValue::String("1e+2".into()));
@@ -77290,7 +77287,6 @@ mod tests {
 
     /// toPrecision(5) formats with significant digits.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_basic() {
         let result = global_eval("(123.456).toPrecision(5)").unwrap();
         assert_eq!(result, JsValue::String("123.46".into()));
@@ -77427,7 +77423,6 @@ mod tests {
 
     /// toFixed(-0) returns "0".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_negative_zero() {
         let result = global_eval("(-0).toFixed(1)").unwrap();
         assert_eq!(result, JsValue::String("0.0".into()));
@@ -77486,13 +77481,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_rounds_exact_half_up() {
         assert_eval_true("(1.25).toFixed(1) === '1.3'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_rounds_negative_exact_half_up() {
         assert_eval_true("(-1.25).toFixed(1) === '-1.3'");
     }
