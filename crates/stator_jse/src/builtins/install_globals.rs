@@ -70191,7 +70191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ 0: 2, 1: 1, length: 2 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSorted.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70233,7 +70232,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ 0: 1, length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSpliced.call(p, 0, 0, 9); false; } catch (e) { e.message === 'boom'; }",
@@ -70301,7 +70299,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flat.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70332,7 +70329,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flatMap.call(p, function(v) { return [v]; }); false; } catch (e) { e.message === 'boom'; }",
@@ -70824,7 +70820,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_sparse_array_materializes_undefined() {
         assert_eval_true("var a = [...[1, , 3]]; a.length === 3 && a[1] === undefined");
     }
