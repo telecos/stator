@@ -79037,7 +79037,6 @@ mod tests {
 
     /// Symbol.match: non-global returns exec-like result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_symbol_match_nonglobal() {
         assert_eval_true(
             r#"var m = "foo 42 bar".match(/\d+/);
@@ -79855,7 +79854,6 @@ mod tests {
 
     /// matchAll: returns iterator of match objects with groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_matchall_named_groups() {
         assert_eval_true(
             r#"var results = [];
@@ -80471,7 +80469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_nested_arrow_update() {
         assert_eval_true(
             "class C { #x = 1; run() { let bump = () => { this.#x = this.#x + 1; return this.#x; }; return bump() === 2 && this.#x === 2; } } \
@@ -80513,7 +80510,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_initializer_with_sibling_private_access() {
         assert_eval_true(
             "class C { #x = 6; #y = this.#x + 1; sum() { return this.#x + this.#y; } } \
@@ -81685,7 +81681,6 @@ mod tests {
 
     /// `concat` flattens one level of arrays.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_basic() {
         let r = global_eval("[1,2].concat([3,4],[5]).join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
@@ -81707,7 +81702,6 @@ mod tests {
 
     /// `concat` with empty arrays.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_empty() {
         let r = global_eval("[].concat([],[]).length").unwrap();
         assert_eq!(r, JsValue::Smi(0));
@@ -81879,7 +81873,6 @@ mod tests {
 
     /// `reduce` on empty array without initial throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_reduce_empty_no_initial_throws() {
         let r = global_eval(
             "try { [].reduce(function(a, b) { return a + b; }); false; } \
@@ -82874,7 +82867,6 @@ mod tests {
 
     /// Arguments: Symbol.iterator makes arguments iterable.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_symbol_iterator() {
         assert_e2e_true(
             "function f() { var sum = 0; for (var x of arguments) sum += x; return sum; } f(1, 2, 3) === 6",
@@ -83078,7 +83070,6 @@ mod tests {
 
     /// Array: setting .length truncates elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_array_length_truncates() {
         assert_e2e_true(
             "var a = [1, 2, 3, 4, 5]; a.length = 2; a.length === 2 && a[2] === undefined",
@@ -83093,7 +83084,6 @@ mod tests {
 
     /// Array: setting .length to 0 clears array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_array_length_zero_clears() {
         assert_e2e_true("var a = [1, 2, 3]; a.length = 0; a.length === 0 && a[0] === undefined");
     }
@@ -83192,7 +83182,6 @@ mod tests {
 
     /// Revoked proxy: ownKeys throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_revoked_proxy_ownkeys_throws() {
         assert_e2e_true(
             "var r = Proxy.revocable({}, {}); r.revoke(); \
