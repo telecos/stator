@@ -43038,13 +43038,30 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
+        use crate::builtins::error::{ErrorKind, JsError};
         use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::host::{HostDynamicImportRequest, HostModuleLoader, HostScope};
         use crate::interpreter::{Interpreter, InterpreterFrame};
         use crate::parser::{
             ast::{ProgramItem, ReturnStmt, Stmt},
             parse_module,
         };
+
+        struct IdentityResolveLoader;
+        impl HostModuleLoader for IdentityResolveLoader {
+            fn dynamic_import(&self, request: HostDynamicImportRequest) -> Result<(), JsError> {
+                request.reject(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("Cannot resolve module '{}'", request.specifier()),
+                ));
+                Ok(())
+            }
+
+            fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {
+                Ok(specifier.to_string())
+            }
+        }
 
         let mut program = parse_module(src).unwrap();
         if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
@@ -43063,6 +43080,8 @@ mod tests {
             vec![],
             Rc::new(RefCell::new(ge)),
         );
+        let loader: Rc<dyn HostModuleLoader> = Rc::new(IdentityResolveLoader);
+        let _host_scope = HostScope::install(Some(loader), None);
         let result = Interpreter::run(&mut frame).unwrap();
         drain_active_microtask_queue();
         match result {
