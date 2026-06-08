@@ -64725,7 +64725,6 @@ mod tests {
 
     /// Global `match` collects all matches and resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_resets_last_index() {
         let r = global_eval(
             "var re = /a/g; re.lastIndex = 2; var out = 'baab'.match(re); out.join(',') + ':' + re.lastIndex",
@@ -64736,7 +64735,6 @@ mod tests {
 
     /// Global `match` with no matches returns `null` and resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_no_match_resets_last_index() {
         let r = global_eval(
             "var re = /z/g; re.lastIndex = 3; var out = 'abc'.match(re); String(out === null) + ':' + re.lastIndex",
@@ -64747,7 +64745,6 @@ mod tests {
 
     /// Sticky-only `match` behaves like `exec`, not global collection.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_sticky_returns_exec_shape() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 1; var out = 'ba'.match(re); out[0] + ':' + out.index + ':' + re.lastIndex",
@@ -64758,7 +64755,6 @@ mod tests {
 
     /// Sticky-only `match` failure resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 1; var out = 'bb'.match(re); String(out === null) + ':' + re.lastIndex",
@@ -64854,7 +64850,6 @@ mod tests {
 
     /// Global replace resets `lastIndex` after completion.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_global_resets_last_index() {
         let r =
             global_eval("var re = /a/g; re.lastIndex = 1; 'baab'.replace(re, 'x'); re.lastIndex")
@@ -64872,7 +64867,6 @@ mod tests {
 
     /// Sticky replace failure resets `lastIndex` via exec semantics.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 3; 'baab'.replace(re, 'x') + ':' + re.lastIndex",
@@ -70392,7 +70386,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_set_preserves_iteration_order() {
         assert_eval_true("Array.from(new Set([3, 1, 3])).join(',') === '3,1'");
     }
@@ -70464,7 +70457,6 @@ mod tests {
 
     /// `keys()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_keys_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.keys.call({ 0: 'a', 2: 'c', length: 3 })).join(',')",
@@ -70475,7 +70467,6 @@ mod tests {
 
     /// `values()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_values_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.values.call({ 0: 'a', 2: 'c', length: 3 })).join(',')",
@@ -70486,7 +70477,6 @@ mod tests {
 
     /// `entries()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_entries_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.entries.call({ 0: 'a', 2: 'c', length: 3 }))\
@@ -71615,7 +71605,6 @@ mod tests {
 
     /// Spread generator into array literal.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_spread_into_array() {
         let r = global_eval(
             r#"
