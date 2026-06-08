@@ -71351,7 +71351,6 @@ mod tests {
 
     /// Generator.prototype.return(value) ΓÇö early termination.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_method() {
         let r = global_eval(
             r#"
@@ -71478,7 +71477,6 @@ mod tests {
 
     /// Generator expression ΓÇö `var gen = function*() { ... }`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_expression() {
         let r = global_eval(
             r#"
@@ -71493,7 +71491,6 @@ mod tests {
 
     /// Infinite generator ΓÇö partial consumption with break.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_infinite_generator() {
         let r = global_eval(
             r#"
@@ -71646,7 +71643,6 @@ mod tests {
 
     /// Generator with try/finally ΓÇö finally runs on .return() call.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_try_finally_return() {
         let r = global_eval(
             r#"
@@ -71737,7 +71733,6 @@ mod tests {
 
     /// Generator with computed yield values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_computed_yields() {
         let r = global_eval(
             r#"
@@ -71797,7 +71792,6 @@ mod tests {
 
     /// Uncaught throw() during yield* propagates to the caller.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_yield_star_throw_propagates_uncaught() {
         let r = global_eval(
             r#"
@@ -71860,7 +71854,6 @@ mod tests {
 
     /// yield* return() runs the delegate's finally block.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_yield_star_return_runs_inner_finally() {
         assert_eval_true(
             r#"
@@ -71899,7 +71892,6 @@ mod tests {
 
     /// After return(), next() remains done forever.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_then_next_stays_done() {
         assert_eval_true(
             r#"
@@ -72046,7 +72038,6 @@ mod tests {
 
     /// Generator instances inherit from the function's own .prototype object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_instance_prototype_is_function_prototype_property() {
         assert_eval_true(
             r#"
@@ -72081,7 +72072,6 @@ mod tests {
 
     /// Object literal generator methods yield values in order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_object_method_yields_values() {
         assert_eval_true(
             r#"
@@ -72094,7 +72084,6 @@ mod tests {
 
     /// Class generator methods yield values in order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_class_method_yields_values() {
         assert_eval_true(
             r#"
@@ -72113,14 +72102,12 @@ mod tests {
 
     /// Class generator methods keep the inferred method name.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_class_method_name_is_preserved() {
         assert_eval_true("class C { *method() {} } new C().method.name === 'method'");
     }
 
     /// Generator expressions still create instances linked to their .prototype.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_expression_instances_use_generator_prototype_chain() {
         assert_eval_true(
             r#"
@@ -72238,7 +72225,6 @@ mod tests {
 
     /// Async generator return() triggers finally blocks.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_runs_finally() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72260,7 +72246,6 @@ mod tests {
 
     /// After async return(), next() stays done.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_after_done_keeps_next_done() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72337,7 +72322,6 @@ mod tests {
 
     /// next() after async return() always stays done.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_next_after_return_stays_done() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72388,7 +72372,6 @@ mod tests {
 
     /// Breaking from for await...of closes the async generator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_for_await_break_runs_finally() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72425,7 +72408,6 @@ mod tests {
 
     /// Async generator object methods are supported.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_object_method_yields_values() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72443,7 +72425,6 @@ mod tests {
 
     /// Async generator class methods are supported.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_class_method_yields_values() {
         assert_eval_fulfilled_promise_true(
             r#"
