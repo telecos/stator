@@ -32068,6 +32068,18 @@ mod tests {
         0x01, 0x67, 0x03, 0x6f, 0x00,
     ];
 
+    const WASM_IMPORT_MEMORY64_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem64" (memory i64 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory (i64) 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory64 1 2)))"#,
+    ];
+
+    const WASM_IMPORT_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem" (memory (page_size_log2 12) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory (pagesize 4096) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory 1 2 (page_size_log2 12))))"#,
+    ];
+
     const WASM_IMPORT_ADD_RUN: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f,
         0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x61,
@@ -32457,6 +32469,49 @@ mod tests {
                 assert!(err.contains(term), "missing '{term}' in: {err}");
             }
             stator_module_free(module);
+        }
+    }
+
+    fn assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+        candidates: &[&str],
+        expected_terms: &[&str],
+    ) {
+        for wat in candidates {
+            let Ok(bytes) = wat::parse_str(wat) else {
+                continue;
+            };
+            let module =
+                compile_typed_module_bytes(&bytes, StatorModuleType::StatorModuleTypeWebAssembly);
+            // SAFETY: `module` is non-null and live.
+            unsafe {
+                let status = stator_module_get_status(module);
+                let error_ptr = stator_module_get_error(module);
+                if status != StatorModuleStatus::StatorModuleStatusErrored {
+                    stator_module_free(module);
+                    panic!("unsupported Wasm import unexpectedly compiled: {wat}");
+                }
+                if error_ptr.is_null() {
+                    stator_module_free(module);
+                    panic!("unsupported Wasm import failed without a diagnostic: {wat}");
+                }
+                let err = CStr::from_ptr(error_ptr).to_str().unwrap();
+                let looks_like_stator_import_diagnostic = err.contains("runtime/FFI primitive")
+                    || expected_terms.iter().all(|term| err.contains(term));
+                if !looks_like_stator_import_diagnostic {
+                    stator_module_free(module);
+                    continue;
+                }
+                assert!(err.contains("unsupported"), "missing unsupported: {err}");
+                assert!(
+                    err.contains("runtime/FFI primitive"),
+                    "missing primitive blocker: {err}"
+                );
+                for term in expected_terms {
+                    assert!(err.contains(term), "missing '{term}' in: {err}");
+                }
+                stator_module_free(module);
+                return;
+            }
         }
     }
 
@@ -32879,7 +32934,31 @@ mod tests {
     fn test_module_wasm_unsupported_memory_import_fails_compilation() {
         assert_wasm_unsupported_import_kind_fails_compilation(
             WASM_IMPORT_MEMORY,
-            &["env.mem", "memory", "min=1", "max=none", "memory64=false"],
+            &[
+                "env.mem",
+                "memory",
+                "min=1",
+                "max=none",
+                "memory64=false",
+                "shared=false",
+                "page_size_log2=16",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_memory64_import_fails_compilation_if_supported() {
+        assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+            WASM_IMPORT_MEMORY64_WAT_CANDIDATES,
+            &["env.mem64", "memory", "memory64=true"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_custom_page_memory_import_fails_compilation_if_supported() {
+        assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+            WASM_IMPORT_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES,
+            &["env.mem", "memory", "page_size_log2=12"],
         );
     }
 

@@ -293,6 +293,46 @@ fn extract_bytes_from_module(module_obj: &JsValue) -> StatorResult<Vec<u8>> {
     }
 }
 
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn format_wasm_val_types(types: impl Iterator<Item = wasmtime::ValType>) -> String {
+    let types: Vec<String> = types.map(|ty| ty.to_string()).collect();
+    format!("[{}]", types.join(", "))
+}
+
+fn describe_unsupported_wasm_import_kind(kind: wasmtime::ExternType) -> String {
+    match kind {
+        wasmtime::ExternType::Func(func) => format!(
+            "function import (params={}, results={})",
+            format_wasm_val_types(func.params()),
+            format_wasm_val_types(func.results())
+        ),
+        wasmtime::ExternType::Memory(memory) => format!(
+            "memory import (min={}, max={}, memory64={}, shared={}, page_size_log2={})",
+            memory.minimum(),
+            format_optional_u64(memory.maximum()),
+            memory.is_64(),
+            memory.is_shared(),
+            memory.page_size_log2()
+        ),
+        wasmtime::ExternType::Table(table) => format!(
+            "table import (element={}, min={}, max={}, table64={})",
+            table.element(),
+            table.minimum(),
+            format_optional_u64(table.maximum()),
+            table.is_64()
+        ),
+        wasmtime::ExternType::Global(global) => format!(
+            "global import (value_type={}, mutable={})",
+            global.content(),
+            global.mutability().is_var()
+        ),
+        _ => "extern import kind not represented by Stator".to_string(),
+    }
+}
+
 /// Instantiate a compiled [`WasmModule`] and wrap the live instance in a
 /// `WebAssembly.Instance` [`JsValue::PlainObject`].
 ///
@@ -311,7 +351,8 @@ fn extract_bytes_from_module(module_obj: &JsValue) -> StatorResult<Vec<u8>> {
 fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResult<JsValue> {
     if let Some(import) = module.inner().imports().next() {
         return Err(StatorError::TypeError(format!(
-            "WebAssembly.Instance: imports are not implemented (missing {}.{})",
+            "WebAssembly.Instance: unsupported {} '{}.{}'; imports are not implemented",
+            describe_unsupported_wasm_import_kind(import.ty()),
             import.module(),
             import.name()
         )));
@@ -717,6 +758,53 @@ mod tests {
                 call $f))
     "#;
 
+    const IMPORTED_TABLE_WAT: &str = r#"
+        (module
+            (import "env" "tab" (table 1 3 funcref)))
+    "#;
+
+    const IMPORTED_NON_SHARED_MEMORY_WAT: &str = r#"
+        (module
+            (import "env" "mem" (memory 1 2)))
+    "#;
+
+    const IMPORTED_SHARED_MEMORY_WAT: &str = r#"
+        (module
+            (import "env" "mem" (memory 1 1 shared)))
+    "#;
+
+    const IMPORTED_MUTABLE_GLOBAL_WAT: &str = r#"
+        (module
+            (import "env" "g" (global (mut i32))))
+    "#;
+
+    const IMPORTED_V128_GLOBAL_WAT: &str = r#"
+        (module
+            (import "env" "g" (global v128)))
+    "#;
+
+    const IMPORTED_MUTABLE_V128_GLOBAL_WAT: &str = r#"
+        (module
+            (import "env" "g" (global (mut v128))))
+    "#;
+
+    const IMPORTED_EXTERNREF_GLOBAL_WAT: &str = r#"
+        (module
+            (import "env" "g" (global externref)))
+    "#;
+
+    const IMPORTED_MEMORY64_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem64" (memory i64 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory (i64) 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory64 1 2)))"#,
+    ];
+
+    const IMPORTED_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem" (memory (page_size_log2 12) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory (pagesize 4096) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory 1 2 (page_size_log2 12))))"#,
+    ];
+
     const EXPORTED_MEMORY_WAT: &str = r#"
         (module
             (memory (export "memory") 1))
@@ -743,6 +831,37 @@ mod tests {
             map.borrow_mut().insert(k.to_string(), v.clone());
         }
         JsValue::PlainObject(map)
+    }
+
+    fn assert_type_error_contains(err: StatorError, expected_terms: &[&str]) {
+        match err {
+            StatorError::TypeError(msg) => {
+                for term in expected_terms {
+                    assert!(msg.contains(term), "missing '{term}' in: {msg}");
+                }
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+    }
+
+    fn assert_instance_import_wat_fails_closed(wat: &str, expected_terms: &[&str]) {
+        let module = wasm_module_ctor(vec![wat_val(wat)]).unwrap();
+        let err = wasm_instance_ctor(vec![module, descriptor(&[])]).unwrap_err();
+        assert_type_error_contains(err, expected_terms);
+    }
+
+    fn assert_optional_instance_import_wat_fails_closed(
+        candidates: &[&str],
+        expected_terms: &[&str],
+    ) {
+        for wat in candidates {
+            let Ok(module) = wasm_module_ctor(vec![wat_val(wat)]) else {
+                continue;
+            };
+            let err = wasm_instance_ctor(vec![module, descriptor(&[])]).unwrap_err();
+            assert_type_error_contains(err, expected_terms);
+            return;
+        }
     }
 
     // ── bytes_from_js_value ───────────────────────────────────────────────────
@@ -1254,6 +1373,94 @@ mod tests {
             }
             other => panic!("expected TypeError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_table_import() {
+        assert_instance_import_wat_fails_closed(
+            IMPORTED_TABLE_WAT,
+            &[
+                "env.tab",
+                "table import",
+                "element",
+                "min=1",
+                "table64=false",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_non_shared_memory_import() {
+        assert_instance_import_wat_fails_closed(
+            IMPORTED_NON_SHARED_MEMORY_WAT,
+            &[
+                "env.mem",
+                "memory import",
+                "min=1",
+                "max=2",
+                "memory64=false",
+                "shared=false",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_shared_memory_import() {
+        assert_instance_import_wat_fails_closed(
+            IMPORTED_SHARED_MEMORY_WAT,
+            &[
+                "env.mem",
+                "memory import",
+                "min=1",
+                "max=1",
+                "memory64=false",
+                "shared=true",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_reference_global_import() {
+        assert_instance_import_wat_fails_closed(
+            IMPORTED_EXTERNREF_GLOBAL_WAT,
+            &["env.g", "global import", "extern", "mutable=false"],
+        );
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_mutable_and_v128_global_imports() {
+        for (wat, terms) in [
+            (
+                IMPORTED_MUTABLE_GLOBAL_WAT,
+                &["env.g", "global import", "i32", "mutable=true"][..],
+            ),
+            (
+                IMPORTED_V128_GLOBAL_WAT,
+                &["env.g", "global import", "v128", "mutable=false"][..],
+            ),
+            (
+                IMPORTED_MUTABLE_V128_GLOBAL_WAT,
+                &["env.g", "global import", "v128", "mutable=true"][..],
+            ),
+        ] {
+            assert_instance_import_wat_fails_closed(wat, terms);
+        }
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_memory64_import_if_supported() {
+        assert_optional_instance_import_wat_fails_closed(
+            IMPORTED_MEMORY64_WAT_CANDIDATES,
+            &["env.mem64", "memory import", "memory64=true"],
+        );
+    }
+
+    #[test]
+    fn test_instance_ctor_fails_closed_for_custom_page_memory_import_if_supported() {
+        assert_optional_instance_import_wat_fails_closed(
+            IMPORTED_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES,
+            &["env.mem", "memory import", "page_size_log2=12"],
+        );
     }
 
     #[test]
