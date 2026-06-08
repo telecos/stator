@@ -64799,7 +64799,6 @@ mod tests {
 
     /// Function replacers receive named groups as the final parameter.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups() {
         let r = global_eval(
             "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year; })",
@@ -64810,7 +64809,6 @@ mod tests {
 
     /// Named-group replacers receive six arguments including `groups`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_argument_count() {
         let r = global_eval(
             "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return String(arguments.length) + ':' + groups.year; })",
@@ -64821,7 +64819,6 @@ mod tests {
 
     /// Replacers without named groups do not receive a `groups` argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_without_named_groups_argument_count() {
         let r = global_eval(
             "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return String(arguments.length) + ':' + off; })",
@@ -64832,7 +64829,6 @@ mod tests {
 
     /// Missing named captures are surfaced as `undefined` in the groups object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_undefined_entry() {
         let r = global_eval(
             "'a'.replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, s, groups) { return groups.x === 'a' && groups.y === undefined ? 'ok' : 'bad'; })",
@@ -64843,7 +64839,6 @@ mod tests {
 
     /// Global function replacers receive named groups for each match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_global() {
         let r = global_eval(
             "'2024-07 2025-01'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/g, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year + '@' + off; })",
@@ -64863,7 +64858,6 @@ mod tests {
 
     /// Sticky non-global replace starts from the current `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_sticky_uses_current_last_index() {
         let r = global_eval("var re = /a/y; re.lastIndex = 1; 'baab'.replace(re, 'x')").unwrap();
         assert_eq!(r, JsValue::String("bxab".into()));
@@ -64984,7 +64978,6 @@ mod tests {
 
     /// Combined global+sticky `match` resets `lastIndex` after collecting matches.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_sticky_resets_last_index() {
         let r =
             global_eval("var re = /a/gy; re.lastIndex = 2; var out = 'aaab'.match(re); out.join(',') + ':' + re.lastIndex")
@@ -70160,7 +70153,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_reversed_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toReversed.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70208,7 +70200,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_array_like_receiver() {
         assert_eval_true(
             "Array.prototype.toSorted.call({ 0: 'b', 1: 'a', length: 2 }).join(',') === 'a,b'",
@@ -70252,7 +70243,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_array_like_receiver() {
         assert_eval_true(
             "Array.prototype.toSpliced.call({ 0: 'a', 1: 'b', length: 2 }, 1, 0, 'x').join(',') === 'a,x,b'",
@@ -70297,7 +70287,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_skips_holes_in_source_and_nested_arrays() {
         assert_eval_true(
             "Array.prototype.flat.call({ 0: [1, , 2], 2: 3, length: 3 }).join(',') === '1,2,3'",
@@ -70339,7 +70328,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_array_like_receiver_skips_missing_slots() {
         assert_eval_true(
             "var r = Array.prototype.flatMap.call({ 1: 2, length: 2 }, function(v) { return [v]; }); r.length === 1 && r[0] === 2",
