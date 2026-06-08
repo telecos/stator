@@ -17717,15 +17717,13 @@ fn make_array() -> JsValue {
         );
 
         // values()
-        proto.insert(
-            "values".into(),
-            builtin_fn("values", 0, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let values = try_to_array_like_elements(arr)?.0;
-                Ok(JsValue::Iterator(NativeIterator::from_items(values)))
-            }),
-        );
+        let array_values_fn = builtin_fn("values", 0, |args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            require_object_coercible(arr)?;
+            let values = try_to_array_like_elements(arr)?.0;
+            Ok(JsValue::Iterator(NativeIterator::from_items(values)))
+        });
+        proto.insert("values".into(), array_values_fn.clone());
 
         // entries()
         proto.insert(
@@ -17746,16 +17744,8 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // [Symbol.iterator]() — same as values() per §23.1.3.34
-        proto.insert(
-            "@@iterator".into(),
-            builtin_fn("values", 0, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let values = try_to_array_like_elements(arr)?.0;
-                Ok(JsValue::Iterator(NativeIterator::from_items(values)))
-            }),
-        );
+        // [Symbol.iterator]() — same function object as values() per §23.1.3.34
+        proto.insert("@@iterator".into(), array_values_fn);
 
         // toReversed()
         proto.insert(
