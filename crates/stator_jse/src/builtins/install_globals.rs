@@ -46453,7 +46453,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_scope_indirect_cannot_see_local() {
         assert_e2e_true(
             "function f() { var local = 5; try { (0, eval)('local'); return false; } catch(e) { return true; } } f()",
@@ -46469,7 +46468,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_ctor_scope_no_closure_over_local() {
         assert_e2e_true(
             "function f() { var secret = 999; var fn = new Function('try { return secret; } catch(e) { return -1; }'); return fn() === -1; } f()",
@@ -77050,7 +77048,6 @@ mod tests {
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_reference_error_undeclared_variable_access,
         r#"try { missingBinding; false; } catch (e) { e instanceof ReferenceError && e.message === "missingBinding is not defined" }"#
     );

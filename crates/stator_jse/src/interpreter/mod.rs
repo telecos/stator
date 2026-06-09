@@ -4287,7 +4287,15 @@ impl InterpreterFrame {
 
         // Cache miss — single borrow to read value + generation together.
         let env = self.global_env.borrow();
-        let value = env.get(name).cloned().unwrap_or(JsValue::Undefined);
+        let value = match env.get(name).cloned() {
+            Some(value) => value,
+            None if name == "this" => JsValue::Undefined,
+            None => {
+                return Err(StatorError::ReferenceError(format!(
+                    "{name} is not defined"
+                )));
+            }
+        };
         let current_gen = env.generation();
         drop(env);
         self.cache_generation = current_gen;
@@ -28472,6 +28480,14 @@ mod tests {
         assert!(matches!(err, StatorError::SyntaxError(_)), "{src}: {err:?}");
     }
 
+    fn assert_script_reference_error(src: &str) {
+        let err = compile_source_and_run(src).unwrap_err();
+        assert!(
+            matches!(err, StatorError::ReferenceError(_)),
+            "{src}: {err:?}"
+        );
+    }
+
     #[test]
     fn test_eval_direct_reads_function_scope_var() {
         assert_script_result(
@@ -28562,9 +28578,8 @@ mod tests {
 
     #[test]
     fn test_eval_indirect_cannot_read_local_binding() {
-        assert_script_result(
-            "function f() { var x = 1; var e = eval; return typeof e('x'); } f();",
-            JsValue::String("undefined".into()),
+        assert_script_reference_error(
+            "function f() { var x = 1; var e = eval; return e('x'); } f();",
         );
     }
 
