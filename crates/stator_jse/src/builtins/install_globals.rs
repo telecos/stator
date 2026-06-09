@@ -80939,7 +80939,6 @@ mod tests {
 
     // 33. Accessor property in for...in
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_accessor_property_in_for_in() {
         assert_eval_true(
             "var o = { get x() { return 1; }, y: 2 }; \

@@ -6515,6 +6515,17 @@ fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
             for _ in 0..256 {
                 let Some(m) = current_map.take() else { break };
                 let borrow = m.borrow();
+                if borrow.is_accessor_property(key) {
+                    let getter_key = format!("__get_{key}__");
+                    if let Some((_value, attrs)) = borrow.get_with_attrs(&getter_key) {
+                        return attrs.contains(PropertyAttributes::ENUMERABLE);
+                    }
+                    let setter_key = format!("__set_{key}__");
+                    if let Some((_value, attrs)) = borrow.get_with_attrs(&setter_key) {
+                        return attrs.contains(PropertyAttributes::ENUMERABLE);
+                    }
+                    return false;
+                }
                 if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
                     return attrs.contains(PropertyAttributes::ENUMERABLE);
                 }
