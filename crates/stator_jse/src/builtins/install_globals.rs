@@ -46474,7 +46474,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_function_does_not_leak() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('function gStrict() {}'); return typeof gStrict === 'undefined'; } f()",
@@ -74930,7 +74929,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_direct_strict_eval_declared_function_is_not_visible_after_eval() {
         let result = global_eval(
             "function outer() { eval(\"'use strict'; function inner() { return 17; }\"); return typeof inner; } outer()",
