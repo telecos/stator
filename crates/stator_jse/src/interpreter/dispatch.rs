@@ -10679,7 +10679,6 @@ mod tests {
 
     /// Static methods should be accessible on the class constructor.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static bar() { return 99; } } Foo.bar()",

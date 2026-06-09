@@ -30582,7 +30582,6 @@ mod tests {
     /// Static methods: `class Foo { static bar() { return 1; } }`
     /// ΓÇö `Foo.bar()` should work.
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_static_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static bar() { return 99; } } \
