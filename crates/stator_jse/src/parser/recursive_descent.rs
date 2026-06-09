@@ -2960,7 +2960,57 @@ impl<'src> Parser<'src> {
                 self.scanner = saved_scanner.clone();
                 self.current = saved_current.clone();
             } else {
-                // Not `()`, restore for the general path below.
+                if self.peek_kind() == TokenKind::DotDotDot {
+                    let rest_start = self.current_span();
+                    self.bump()?; // consume `...`
+                    let arg = self.parse_binding_pat()?;
+                    let rest_end = arg.loc();
+                    let params = vec![Param {
+                        loc: Self::merge_spans(rest_start, rest_end),
+                        pat: Pat::Rest(Box::new(RestElement {
+                            loc: Self::merge_spans(rest_start, rest_end),
+                            argument: Box::new(arg),
+                        })),
+                        default: None,
+                    }];
+                    self.expect(TokenKind::RightParen)?;
+                    if self.peek_kind() == TokenKind::Arrow {
+                        self.bump()?; // consume `=>`
+                        let body = self.parse_arrow_body(false)?;
+                        let end = self.arrow_body_loc(&body);
+                        return Ok(Expr::Arrow(Box::new(ArrowExpr {
+                            loc: Self::merge_spans(start, end),
+                            is_async: false,
+                            params,
+                            body,
+                            is_strict: self.strict_mode,
+                        })));
+                    }
+                }
+                // Try parsing a full formal parameter list. This handles
+                // parameter forms that are not valid expressions in the cover
+                // grammar, such as rest-only arrows: `(...args) => args`.
+                let params_result = self.parse_formal_params();
+                if let Ok(params) = params_result
+                    && self.peek_kind() == TokenKind::RightParen
+                {
+                    self.bump()?; // consume `)`
+                    if self.peek_kind() == TokenKind::Arrow {
+                        self.bump()?; // consume `=>`
+                        self.check_unique_params(&params)?;
+                        let body = self.parse_arrow_body(false)?;
+                        let end = self.arrow_body_loc(&body);
+                        return Ok(Expr::Arrow(Box::new(ArrowExpr {
+                            loc: Self::merge_spans(start, end),
+                            is_async: false,
+                            params,
+                            body,
+                            is_strict: self.strict_mode,
+                        })));
+                    }
+                }
+                // Not a parenthesized formal-parameter arrow; restore for the
+                // expression cover grammar below.
                 self.scanner = saved_scanner.clone();
                 self.current = saved_current.clone();
             }
@@ -9712,7 +9762,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // NOTE: rest-only arrow params not yet supported
     fn test_arrow_rest_param() {
         parse("(...args) => args").unwrap();
     }
