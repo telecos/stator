@@ -9199,7 +9199,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_user_constructor_instanceof() {
         let result = crate::builtins::global::global_eval(
             "function Foo() {} var x = new Foo(); x instanceof Foo",
@@ -9252,7 +9251,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { #bar() { return 42; } test() { return this.#bar(); } } \
@@ -9263,7 +9261,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field() {
         let result = crate::builtins::global::global_eval(
             "class C { #x = 10; get() { return this.#x; } } new C().get()",
@@ -9273,7 +9270,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_write() {
         let result = crate::builtins::global::global_eval(
             "class C { #x = 0; set(v) { this.#x = v; } get() { return this.#x; } } \
@@ -10401,7 +10397,6 @@ mod tests {
 
     /// Class basic
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_basic_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { bar() { return 42; } } new Foo().bar()",
@@ -10696,7 +10691,6 @@ mod tests {
 
     /// Class expression (not just declaration).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_expression() {
         let result = crate::builtins::global::global_eval(
             "var Foo = class { greet() { return 7; } }; new Foo().greet()",
@@ -10707,7 +10701,6 @@ mod tests {
 
     /// Class with computed property name in method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_property_name() {
         let result = crate::builtins::global::global_eval(
             "var name = 'greet'; \
@@ -10748,7 +10741,6 @@ mod tests {
 
     /// super.method() in a derived class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_super_method_call() {
         let result = crate::builtins::global::global_eval(
             "class Base { value() { return 10; } } \
@@ -10761,7 +10753,6 @@ mod tests {
 
     /// Class inheritance — instanceof works for subclass.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_inheritance_instanceof() {
         let result = crate::builtins::global::global_eval(
             "class Base {} class Child extends Base {} \
