@@ -17990,6 +17990,17 @@ fn make_array() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
+                fn array_constructor_length(n: f64) -> StatorResult<usize> {
+                    if n.fract() != 0.0 || n.is_nan() || n.is_infinite() || n < 0.0 {
+                        return Err(crate::error::StatorError::RangeError(
+                            "Invalid array length".to_string(),
+                        ));
+                    }
+                    crate::builtins::util::checked_f64_to_length(n).map_err(|_| {
+                        crate::error::StatorError::RangeError("Invalid array length".to_string())
+                    })
+                }
+
                 if args.is_empty() {
                     return Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))));
                 }
@@ -17999,18 +18010,12 @@ fn make_array() -> JsValue {
                     // (negative, fractional, NaN, ±Infinity).
                     match &args[0] {
                         JsValue::Smi(n) => {
-                            let len = crate::builtins::util::checked_f64_to_length(*n as f64)?;
+                            let len = array_constructor_length(*n as f64)?;
                             let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
                         JsValue::HeapNumber(n) => {
-                            // Fractional, NaN, or ±Infinity → invalid array length.
-                            if n.fract() != 0.0 {
-                                return Err(crate::error::StatorError::RangeError(
-                                    "Invalid array length".to_string(),
-                                ));
-                            }
-                            let len = crate::builtins::util::checked_f64_to_length(*n)?;
+                            let len = array_constructor_length(*n)?;
                             let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
@@ -77014,7 +77019,6 @@ mod tests {
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_range_error_invalid_array_length_constructor,
         r#"try { new Array(-1); false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
     );
