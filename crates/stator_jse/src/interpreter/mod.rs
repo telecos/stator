@@ -30530,7 +30530,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_sloppy_small() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
