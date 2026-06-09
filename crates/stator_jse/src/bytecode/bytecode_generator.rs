@@ -11101,7 +11101,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_expression() {
         // `var C = class {};`
         let prog = make_program(vec![var_decl_stmt(
