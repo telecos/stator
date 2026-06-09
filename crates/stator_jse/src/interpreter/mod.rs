@@ -29036,7 +29036,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_custom_async_iterable() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -29093,7 +29092,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_method() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; } async function f() { var it = g(); await it.next(); var r = await it.return(5); return r.value + (r.done ? 1 : 0); } f()",
@@ -29222,7 +29220,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -29248,7 +29245,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_iterator_fallback() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -29274,7 +29270,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_async_iterator_awaits_value_promises() {
         let result = compile_source_and_run(
             r#"async function f() {
