@@ -29164,7 +29164,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_after_completion_keeps_done_true() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(7); return r.value + (r.done ? 1 : 0); } f()",
@@ -29174,7 +29173,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_awaits_return_argument() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.return(Promise.resolve(6)); return r.value + (r.done ? 1 : 0); } f()",
@@ -29547,7 +29545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_promise_value_is_awaited() {
         // .return(Promise.resolve(X)) should await the promise.
         let result = compile_source_and_run(
@@ -29625,7 +29622,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_on_completed_gen() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(55); return r.value + (r.done ? 1 : 0); } f()",
@@ -29665,7 +29661,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_closure_captures() {
         let result = compile_source_and_run(
             r#"function makeGen(start) {
