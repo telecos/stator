@@ -82827,7 +82827,6 @@ mod tests {
 
     /// Strict mode: arguments.callee throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_callee_throws() {
         assert_e2e_true(
             r#""use strict"; function f() { try { arguments.callee; return false; } catch(e) { return e instanceof TypeError; } } f()"#,
@@ -82836,7 +82835,6 @@ mod tests {
 
     /// Strict mode: arguments is not mapped to parameters.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_no_mapping() {
         assert_e2e_true(
             r#""use strict"; function f(a) { a = 99; return arguments[0] !== 99; } f(1)"#,
@@ -82845,7 +82843,6 @@ mod tests {
 
     /// Strict mode: arguments reverse mapping also absent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_no_reverse_mapping() {
         assert_e2e_true(
             r#""use strict"; function f(a) { arguments[0] = 42; return a !== 42; } f(1)"#,

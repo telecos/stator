@@ -12072,7 +12072,6 @@ mod tests {
 
     /// Spread string into array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_string_into_array() {
         let result =
             crate::builtins::global::global_eval("var a = [...'abc']; a.join('-')").unwrap();
@@ -12112,7 +12111,6 @@ mod tests {
 
     /// Spread generator into array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_generator_into_array() {
         let result = crate::builtins::global::global_eval(
             "function* gen() { yield 1; yield 2; yield 3; } var a = [...gen()]; a.join(',')",
@@ -12181,7 +12179,6 @@ mod tests {
 
     /// arguments object is iterable with for-of.
     #[test]
-    #[ignore] // TODO: arguments @@iterator not fully supported
     fn e2e_for_of_arguments() {
         let result = crate::builtins::global::global_eval(
             "function f() { var r = 0; for (var x of arguments) r += x; return r; } f(1,2,3)",
@@ -12192,7 +12189,6 @@ mod tests {
 
     /// Spread arguments object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_arguments() {
         let result = crate::builtins::global::global_eval(
             "function f() { return [...arguments].join('-'); } f('a','b','c')",
@@ -12827,7 +12823,6 @@ mod tests {
     // ── arguments object ────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: arguments object regression
     fn e2e_arguments_length() {
         let result = crate::builtins::global::global_eval(
             "function f() { return arguments.length; } f(1,2,3)",
@@ -12837,7 +12832,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arguments object regression
     fn e2e_arguments_indexed_access() {
         let result = crate::builtins::global::global_eval(
             "function f() { return arguments[0] + arguments[1]; } f(10, 20)",
@@ -12856,7 +12850,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arguments @@iterator not fully supported
     fn e2e_arguments_iterable() {
         let result = crate::builtins::global::global_eval(
             "function f() { var r = ''; for (var x of arguments) r += x + ','; return r; } \
