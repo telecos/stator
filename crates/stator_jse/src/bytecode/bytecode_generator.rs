@@ -13335,7 +13335,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_switch_block_scoping_let() {
         let result = crate::builtins::global::global_eval(
             "var r; switch(1) { case 1: let v = 42; r = v; break; } r",
