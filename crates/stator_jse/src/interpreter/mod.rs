@@ -28711,7 +28711,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_function_constructor_body_reads_global_this() {
         assert_script_result(
             "var marker = 8; var f = new Function('return this.marker'); f();",
@@ -30626,7 +30625,6 @@ mod tests {
     /// `Foo.prototype.__proto__ === Bar.prototype` and
     /// `Foo.__proto__ === Bar` (static inheritance).
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_extends_prototype_chain() {
         // Verify that an instance of Child can access Parent prototype methods.
         let result = crate::builtins::global::global_eval(
@@ -32280,7 +32278,6 @@ mod tests {
     // ΓöÇΓöÇ instanceof operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
-    #[ignore] // TODO: instanceof Array regression
     fn test_instanceof_array() {
         let r = eval(r#"return [] instanceof Array;"#).unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -32293,7 +32290,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: instanceof custom class regression
     fn test_instanceof_custom_class() {
         let r = eval(
             r#"
