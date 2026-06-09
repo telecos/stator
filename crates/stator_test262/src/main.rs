@@ -439,6 +439,11 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
+    "annexB/built-ins/unescape/empty-string.js",
+    "annexB/built-ins/unescape/two.js",
+    "annexB/built-ins/unescape/four.js",
+    "annexB/built-ins/unescape/two-ignore-non-hex.js",
+    "annexB/built-ins/unescape/four-ignore-bad-u.js",
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
@@ -1861,7 +1866,18 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
-        assert!(is_skipped_path("annexB/built-ins/unescape/empty-string.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/empty-string.js"
+        ));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/two.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/four.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/two-ignore-non-hex.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/four-ignore-bad-u.js"
+        ));
+        assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
 
     #[test]
@@ -1890,10 +1906,13 @@ mod tests {
             "annexB/built-ins/escape/"
         ));
         assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/unescape/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AggregateError/"
         ));
         assert!(!skipped_path_has_allowlisted_descendant(
-            "annexB/built-ins/unescape/"
+            "annexB/built-ins/Date/"
         ));
     }
 
@@ -2047,6 +2066,19 @@ mod tests {
         std::fs::write(escape_dir.join("unmodified.js"), "escape('@')").unwrap();
         std::fs::write(escape_dir.join("escape-below.js"), "escape('\\0')").unwrap();
         std::fs::write(unescape_dir.join("empty-string.js"), "unescape('')").unwrap();
+        std::fs::write(unescape_dir.join("two.js"), "unescape('%20')").unwrap();
+        std::fs::write(unescape_dir.join("four.js"), "unescape('%u0020')").unwrap();
+        std::fs::write(
+            unescape_dir.join("two-ignore-non-hex.js"),
+            "unescape('%xz')",
+        )
+        .unwrap();
+        std::fs::write(
+            unescape_dir.join("four-ignore-bad-u.js"),
+            "unescape('%uxxxx')",
+        )
+        .unwrap();
+        std::fs::write(unescape_dir.join("other.js"), "unescape('%2f')").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
         collect_tests(&tmp, &tmp, &mut out).unwrap();
@@ -2066,6 +2098,11 @@ mod tests {
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
                 "annexB/built-ins/escape/unmodified.js",
+                "annexB/built-ins/unescape/empty-string.js",
+                "annexB/built-ins/unescape/four-ignore-bad-u.js",
+                "annexB/built-ins/unescape/four.js",
+                "annexB/built-ins/unescape/two-ignore-non-hex.js",
+                "annexB/built-ins/unescape/two.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
