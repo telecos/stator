@@ -29429,7 +29429,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_yield_star_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function* outer() {
@@ -29512,7 +29511,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_break_early() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s = s + x; if (x === 2) break; } return s; } f()",
