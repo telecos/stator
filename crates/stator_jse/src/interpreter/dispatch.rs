@@ -2114,7 +2114,11 @@ fn handle_create_closure(
     if !is_arrow && func_rc.is_generator() {
         let func_val = JsValue::Function(Rc::clone(&func_rc));
         let mut proto = PropertyMap::new();
-        proto.insert("constructor".to_string(), func_val);
+        proto.insert_with_attrs(
+            "constructor".to_string(),
+            func_val,
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
         if let Some(generator_proto) = super::default_generator_object_prototype() {
             proto.insert("__proto__".to_string(), generator_proto);
         }
@@ -10587,7 +10591,6 @@ mod tests {
     /// prototype chain.
     // NOTE: for-in prototype chain enumeration not yet fully implemented
     #[test]
-    #[ignore]
     fn test_for_in_prototype_chain() {
         let result = crate::builtins::global::global_eval(
             "function Base() {} \

@@ -18526,7 +18526,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if key == "prototype" && !ba.is_arrow() && !ba.is_generator() {
             let func_val = JsValue::Function(Rc::clone(ba));
             let mut proto_map = PropertyMap::new();
-            proto_map.insert("constructor".to_string(), func_val);
+            proto_map.insert_with_attrs(
+                "constructor".to_string(),
+                func_val,
+                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+            );
             let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
             fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
             return proto_obj;
@@ -19622,7 +19626,11 @@ pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) ->
     if matches!(proto, JsValue::Undefined) && !ba.is_arrow() {
         let func_val = JsValue::Function(Rc::clone(ba));
         let mut proto_map = PropertyMap::new();
-        proto_map.insert("constructor".to_string(), func_val);
+        proto_map.insert_with_attrs(
+            "constructor".to_string(),
+            func_val,
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
         let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
         fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
         ba.set_construct_proto_cache(proto_obj.clone());
