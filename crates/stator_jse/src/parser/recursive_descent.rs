@@ -6090,7 +6090,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_method() {
         let prog = parse("class Foo { [Symbol.iterator]() {} }").unwrap();
         assert_eq!(prog.body.len(), 1);
