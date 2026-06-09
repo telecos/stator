@@ -444,6 +444,9 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/four.js",
     "annexB/built-ins/unescape/two-ignore-non-hex.js",
     "annexB/built-ins/unescape/four-ignore-bad-u.js",
+    "annexB/built-ins/String/prototype/substr/B.2.3.js",
+    "annexB/built-ins/String/prototype/substr/length.js",
+    "annexB/built-ins/String/prototype/substr/name.js",
     "built-ins/AsyncGeneratorFunction/instance-length.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
@@ -1873,6 +1876,18 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/B.2.3.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/name.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/unescape/empty-string.js"
         ));
         assert!(!is_skipped_path("annexB/built-ins/unescape/two.js"));
@@ -1945,6 +1960,9 @@ mod tests {
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/unescape/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/String/prototype/substr/"
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AggregateError/"
@@ -2103,12 +2121,27 @@ mod tests {
     fn test_collect_tests_keeps_annex_b_escape_allowlist() {
         let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_escape_collect_test");
         let escape_dir = tmp.join("annexB").join("built-ins").join("escape");
+        let substr_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("String")
+            .join("prototype")
+            .join("substr");
         let unescape_dir = tmp.join("annexB").join("built-ins").join("unescape");
         let _ = std::fs::create_dir_all(&escape_dir);
+        let _ = std::fs::create_dir_all(&substr_dir);
         let _ = std::fs::create_dir_all(&unescape_dir);
         std::fs::write(escape_dir.join("empty-string.js"), "escape('')").unwrap();
         std::fs::write(escape_dir.join("unmodified.js"), "escape('@')").unwrap();
         std::fs::write(escape_dir.join("escape-below.js"), "escape('\\0')").unwrap();
+        std::fs::write(substr_dir.join("B.2.3.js"), "''.substr(0)").unwrap();
+        std::fs::write(
+            substr_dir.join("length.js"),
+            "String.prototype.substr.length",
+        )
+        .unwrap();
+        std::fs::write(substr_dir.join("name.js"), "String.prototype.substr.name").unwrap();
+        std::fs::write(substr_dir.join("not-a-constructor.js"), "isConstructor").unwrap();
         std::fs::write(unescape_dir.join("empty-string.js"), "unescape('')").unwrap();
         std::fs::write(unescape_dir.join("two.js"), "unescape('%20')").unwrap();
         std::fs::write(unescape_dir.join("four.js"), "unescape('%u0020')").unwrap();
@@ -2139,6 +2172,9 @@ mod tests {
         assert_eq!(
             rel,
             vec![
+                "annexB/built-ins/String/prototype/substr/B.2.3.js",
+                "annexB/built-ins/String/prototype/substr/length.js",
+                "annexB/built-ins/String/prototype/substr/name.js",
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
                 "annexB/built-ins/escape/unmodified.js",
