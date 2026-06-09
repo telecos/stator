@@ -43052,6 +43052,35 @@ mod tests {
     /// Helper: run JS, drain microtasks, return the result.
     fn eval_with_microtasks(src: &str) -> JsValue {
         use crate::builtins::promise::drain_active_microtask_queue;
+        use crate::host::{HostDynamicImportRequest, HostModuleLoader, HostScope};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct IdentityDynamicImportLoader;
+        impl HostModuleLoader for IdentityDynamicImportLoader {
+            fn dynamic_import(
+                &self,
+                request: HostDynamicImportRequest,
+            ) -> Result<(), crate::builtins::error::JsError> {
+                let mut namespace = PropertyMap::new();
+                namespace.insert(
+                    "default".to_string(),
+                    JsValue::String(request.specifier().to_string().into()),
+                );
+                request.resolve(JsValue::PlainObject(Rc::new(RefCell::new(namespace))));
+                Ok(())
+            }
+
+            fn resolve(
+                &self,
+                specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<String, crate::builtins::error::JsError> {
+                Ok(specifier.to_string())
+            }
+        }
+
+        let _host_scope = HostScope::install(Some(Rc::new(IdentityDynamicImportLoader)), None);
         let result = global_eval(src).unwrap();
         drain_active_microtask_queue();
         result
@@ -43243,7 +43272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_dynamic_import_then_resolves_default_specifier_script() {
         let _ = eval_with_microtasks(
             r#"
@@ -43258,7 +43286,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_dynamic_import_then_resolves_template_literal_specifier_script() {
         let _ = eval_with_microtasks(
             r#"
