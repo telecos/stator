@@ -12803,7 +12803,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_survives_after_return() {
         let result = crate::builtins::global::global_eval(
             "function counter() { var n = 0; return function() { n = n + 1; return n; }; } \

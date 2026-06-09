@@ -74958,7 +74958,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_can_read_function_body_let_binding() {
         let result = global_eval(
             "function outer() { let x = 22; return function() { return x; }; } outer()()",
