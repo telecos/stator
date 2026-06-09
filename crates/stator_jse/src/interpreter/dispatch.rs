@@ -10273,7 +10273,6 @@ mod tests {
 
     /// Spread in array literal
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_spread_in_array_literal() {
         let result =
             crate::builtins::global::global_eval("var a = [1,2,3]; [...a].length").unwrap();
