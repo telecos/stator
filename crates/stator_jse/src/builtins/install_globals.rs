@@ -77019,7 +77019,6 @@ mod tests {
         r#"try { new Array(-1); false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_range_error_invalid_array_length_assignment,
         r#"try { let a = []; a.length = -1; false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
     );
@@ -77074,12 +77073,10 @@ mod tests {
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_custom_error_subclass_name_override_in_to_string,
         r#"class MyError extends Error { constructor(message) { super(message); this.name = "MyError"; } } new MyError("boom").toString() === "MyError: boom""#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_custom_type_error_subclass_prototype_name_override_in_to_string,
         r#"class FancyTypeError extends TypeError {} FancyTypeError.prototype.name = "FancyTypeError"; new FancyTypeError("boom").toString() === "FancyTypeError: boom""#
     );
