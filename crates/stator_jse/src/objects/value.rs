@@ -2011,6 +2011,10 @@ fn ordinary_to_primitive(value: &JsValue, hint: ToPrimitiveHint) -> StatorResult
         }
     }
 
+    if matches!(value, JsValue::Object(_)) {
+        return Ok(JsValue::String(value.obj_to_string_tag().into()));
+    }
+
     Err(StatorError::TypeError(
         "Cannot convert object to primitive value".into(),
     ))
@@ -2832,7 +2836,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_number_object_via_to_primitive() {
         // Object goes through ToPrimitive → "[object Object]" → NaN.
         let mut obj = HeapObject::new_null();
@@ -2981,7 +2984,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_js_string_object_via_to_primitive() {
         // Object goes through ToPrimitive → "[object Object]".
         let mut obj = HeapObject::new_null();
