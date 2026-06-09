@@ -444,6 +444,9 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/four.js",
     "annexB/built-ins/unescape/two-ignore-non-hex.js",
     "annexB/built-ins/unescape/four-ignore-bad-u.js",
+    "built-ins/AsyncFunction/instance-length.js",
+    "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
+    "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
@@ -1900,6 +1903,22 @@ mod tests {
     }
 
     #[test]
+    fn test_async_function_allowlist_not_skipped() {
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/instance-length.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunction-is-extensible.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunction-name.js"
+        ));
+    }
+
+    #[test]
     fn test_skipped_path_descendant_allowlist() {
         assert!(skipped_path_has_allowlisted_descendant("annexB/"));
         assert!(skipped_path_has_allowlisted_descendant(
@@ -1910,6 +1929,9 @@ mod tests {
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AggregateError/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/AsyncFunction/"
         ));
         assert!(!skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/Date/"
@@ -2154,6 +2176,47 @@ mod tests {
                 "built-ins/AggregateError/message-method-prop-cast.js",
                 "built-ins/AggregateError/message-method-prop.js",
                 "built-ins/AggregateError/message-undefined-no-prop.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_async_function_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_async_function_collect_test");
+        let async_dir = tmp.join("built-ins").join("AsyncFunction");
+        let _ = std::fs::create_dir_all(&async_dir);
+        std::fs::write(async_dir.join("instance-length.js"), "AsyncFunction").unwrap();
+        std::fs::write(
+            async_dir.join("AsyncFunction-is-extensible.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_dir.join("AsyncFunctionPrototype-is-extensible.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
+        std::fs::write(async_dir.join("AsyncFunction-name.js"), "AsyncFunction").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
+                "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+                "built-ins/AsyncFunction/instance-length.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
