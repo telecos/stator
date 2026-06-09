@@ -439,6 +439,10 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
+    "built-ins/AggregateError/cause-property.js",
+    "built-ins/AggregateError/message-method-prop.js",
+    "built-ins/AggregateError/message-method-prop-cast.js",
+    "built-ins/AggregateError/message-undefined-no-prop.js",
 ];
 
 /// Individual test files (relative to the `test/` directory, forward-slash
@@ -1203,6 +1207,14 @@ fn collect_tests(dir: &Path, test_root: &Path, out: &mut Vec<PathBuf>) -> io::Re
             }
             collect_tests(&path, test_root, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            let rel = path
+                .strip_prefix(test_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_skipped_path(&rel) {
+                continue;
+            }
             // Skip _FIXTURE.js files — they are included by other tests via
             // the harness mechanism and are not runnable on their own.
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
@@ -1853,10 +1865,32 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_error_allowlist_not_skipped() {
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/cause-property.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-method-prop.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-method-prop-cast.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-undefined-no-prop.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AggregateError/errors-iterabletolist.js"
+        ));
+    }
+
+    #[test]
     fn test_skipped_path_descendant_allowlist() {
         assert!(skipped_path_has_allowlisted_descendant("annexB/"));
         assert!(skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/escape/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/AggregateError/"
         ));
         assert!(!skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/unescape/"
@@ -2032,6 +2066,57 @@ mod tests {
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
                 "annexB/built-ins/escape/unmodified.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_aggregate_error_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_aggregate_error_collect_test");
+        let aggregate_dir = tmp.join("built-ins").join("AggregateError");
+        let _ = std::fs::create_dir_all(&aggregate_dir);
+        std::fs::write(aggregate_dir.join("cause-property.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-method-prop.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-method-prop-cast.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-undefined-no-prop.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("errors-iterabletolist.js"),
+            "AggregateError",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/AggregateError/cause-property.js",
+                "built-ins/AggregateError/message-method-prop-cast.js",
+                "built-ins/AggregateError/message-method-prop.js",
+                "built-ins/AggregateError/message-undefined-no-prop.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
