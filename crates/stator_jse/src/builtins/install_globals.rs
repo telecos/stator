@@ -74365,7 +74365,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_duplicate_let_across_cases_is_syntax_error() {
         let result =
             global_eval("switch (1) { case 1: let x = 1; break; case 2: let x = 2; break; }")
@@ -74374,7 +74373,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_duplicate_const_across_cases_is_syntax_error() {
         let result =
             global_eval("switch (1) { case 1: const x = 1; break; case 2: const x = 2; break; }")

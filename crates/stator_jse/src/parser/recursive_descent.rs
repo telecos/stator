@@ -41,6 +41,7 @@ use crate::parser::ast::{
     WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue, cook_template_raw};
+use std::collections::HashSet;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Parser
@@ -1113,6 +1114,7 @@ impl<'src> Parser<'src> {
         self.breakable_depth += 1;
         let mut cases = Vec::new();
         let mut seen_default = false;
+        let mut lexical_names = HashSet::new();
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
                 return Err(self.error("unexpected end of input in switch statement"));
@@ -1141,6 +1143,9 @@ impl<'src> Parser<'src> {
                 }
                 consequent.push(self.parse_stmt()?);
             }
+            for stmt in &consequent {
+                self.check_switch_lexical_names(stmt, &mut lexical_names)?;
+            }
 
             let case_end = if let Some(last) = consequent.last() {
                 last.loc()
@@ -1162,6 +1167,73 @@ impl<'src> Parser<'src> {
             discriminant: Box::new(discriminant),
             cases,
         }))
+    }
+
+    fn check_switch_lexical_names(
+        &self,
+        stmt: &Stmt,
+        seen: &mut HashSet<String>,
+    ) -> StatorResult<()> {
+        match stmt {
+            Stmt::VarDecl(decl) if matches!(decl.kind, VarKind::Let | VarKind::Const) => {
+                for declarator in &decl.declarators {
+                    let mut names = Vec::new();
+                    Self::collect_bound_names_from_pat(&declarator.id, &mut names);
+                    for name in names {
+                        if !seen.insert(name.clone()) {
+                            return Err(Self::error_at(
+                                declarator.id.loc(),
+                                &format!(
+                                    "duplicate lexical declaration '{name}' in switch statement"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            Stmt::ClassDecl(class_decl) => {
+                if let Some(id) = &class_decl.id
+                    && !seen.insert(id.name.clone())
+                {
+                    return Err(Self::error_at(
+                        id.loc,
+                        &format!(
+                            "duplicate lexical declaration '{}' in switch statement",
+                            id.name
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn collect_bound_names_from_pat(pat: &Pat, names: &mut Vec<String>) {
+        match pat {
+            Pat::Ident(ident) => names.push(ident.name.clone()),
+            Pat::Array(array) => {
+                for element in array.elements.iter().flatten() {
+                    Self::collect_bound_names_from_pat(element, names);
+                }
+            }
+            Pat::Object(object) => {
+                for prop in &object.properties {
+                    match prop {
+                        ObjectPatProp::KeyValue(prop) => {
+                            Self::collect_bound_names_from_pat(&prop.value, names);
+                        }
+                        ObjectPatProp::Assign(prop) => names.push(prop.key.name.clone()),
+                        ObjectPatProp::Rest(rest) => {
+                            Self::collect_bound_names_from_pat(&rest.argument, names);
+                        }
+                    }
+                }
+            }
+            Pat::Rest(rest) => Self::collect_bound_names_from_pat(&rest.argument, names),
+            Pat::Assign(assign) => Self::collect_bound_names_from_pat(&assign.left, names),
+            Pat::Expr(_) => {}
+        }
     }
 
     fn parse_fn_decl(&mut self, fn_span: Span, is_async: bool) -> StatorResult<Stmt> {
