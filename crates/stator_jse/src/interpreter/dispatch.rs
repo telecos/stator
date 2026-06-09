@@ -10890,7 +10890,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_field_super_calls_parent_static_method() {
         assert_eval_true(
             "class A { static value() { return 5; } } class B extends A { static x = super.value() + 1; } B.x === 6",
@@ -10898,7 +10897,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_field_super_uses_current_class_as_receiver() {
         assert_eval_true(
             "class A { static who() { return this.name; } } class B extends A { static value = super.who(); } B.value === 'B'",
