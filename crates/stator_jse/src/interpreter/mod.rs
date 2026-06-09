@@ -30334,7 +30334,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_strict() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
@@ -30379,7 +30378,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_arrow_function_strict() {
         test_tail_call_assert_smi(
             "function run(n) { \
