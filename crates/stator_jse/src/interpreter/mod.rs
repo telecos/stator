@@ -29863,7 +29863,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_return_method() {
         // Generator .return(val) should complete the generator.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -29900,7 +29899,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: generator return on completed regression
     fn test_generator_return_on_completed() {
         // .return(val) on a completed generator returns { value: val, done: true }
         // per ┬º27.5.3.4 GeneratorResumeAbrupt step 2a.
@@ -29946,7 +29944,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_not_resumable_after_return() {
         // After .return(), .next() should return { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();

@@ -71458,7 +71458,6 @@ mod tests {
 
     /// yield* delegation to another generator.
     #[test]
-    #[ignore] // TODO: hangs in CI – yield* delegation infinite loop
     fn e2e_yield_star_generator() {
         let r = global_eval(
             r#"
