@@ -13221,7 +13221,6 @@ mod tests {
     // ── Block scoping ────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_let_block_scoped() {
         // After the block, x should not be visible → ReferenceError.
         let result = crate::builtins::global::global_eval("{ let x = 1; } x");
@@ -13229,14 +13228,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_const_block_scoped() {
         let result = crate::builtins::global::global_eval("{ const x = 1; } x");
         assert!(result.is_err(), "const should be block scoped");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_let_in_for_block_scoped() {
         let result = crate::builtins::global::global_eval("for (let i = 0; i < 3; i++) {} i");
         assert!(result.is_err(), "let in for-loop should be block scoped");
