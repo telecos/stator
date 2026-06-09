@@ -83346,7 +83346,6 @@ mod tests {
 
     /// try/finally: finally does NOT override the completion value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_finally_completion_value() {
         let result = global_eval("try { 1 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -83354,7 +83353,6 @@ mod tests {
 
     /// try/catch/finally: finally does NOT override completion value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_catch_finally_completion() {
         let result = global_eval("try { 1 } catch(e) { 2 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -83362,7 +83360,6 @@ mod tests {
 
     /// try/catch/finally with thrown error: catch value is kept, finally doesn't override.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_catch_finally_thrown() {
         let result = global_eval("try { throw 'err'; } catch(e) { 2 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(2));

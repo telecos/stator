@@ -3255,7 +3255,13 @@ impl FunctionCompiler {
             // covers the catch block so that finally executes even if the catch
             // body throws.
             if let Some(finalizer) = &s.finalizer {
+                let save_reg = self.allocator.allocate_temporary();
+                self.emit_star(save_reg);
                 self.compile_block(finalizer)?;
+                self.emit_ldar(save_reg);
+                self.allocator
+                    .release_temporary(save_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
 
                 // Exception-path handler for exceptions thrown inside catch.
                 let after_ex_handler_label = self.new_label();
@@ -3288,7 +3294,13 @@ impl FunctionCompiler {
             // run finally, then re-throw.
 
             // Normal path: inline finally.
+            let save_reg = self.allocator.allocate_temporary();
+            self.emit_star(save_reg);
             self.compile_block(finalizer)?;
+            self.emit_ldar(save_reg);
+            self.allocator
+                .release_temporary(save_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
 
             // Jump past exception-path handler.
             let after_ex_handler_label = self.new_label();
