@@ -43057,12 +43057,12 @@ mod tests {
         result
     }
 
-    fn eval_module(src: &str) -> JsValue {
+    fn run_module(src: &str) -> JsValue {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         use crate::builtins::error::{ErrorKind, JsError};
-        use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};
+        use crate::builtins::promise::drain_active_microtask_queue;
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::host::{HostDynamicImportRequest, HostModuleLoader, HostScope};
         use crate::interpreter::{Interpreter, InterpreterFrame};
@@ -43107,12 +43107,26 @@ mod tests {
         let _host_scope = HostScope::install(Some(loader), None);
         let result = Interpreter::run(&mut frame).unwrap();
         drain_active_microtask_queue();
-        match result {
+        result
+    }
+
+    fn eval_module(src: &str) -> JsValue {
+        match run_module(src) {
             JsValue::Promise(promise) => match promise.state() {
-                PromiseState::Fulfilled(value) => value,
+                crate::builtins::promise::PromiseState::Fulfilled(value) => value,
                 other => panic!("expected fulfilled module promise, got {other:?}"),
             },
             value => value,
+        }
+    }
+
+    fn eval_module_rejected_reason(src: &str) -> JsValue {
+        match run_module(src) {
+            JsValue::Promise(promise) => match promise.state() {
+                crate::builtins::promise::PromiseState::Rejected(reason) => reason,
+                other => panic!("expected rejected module promise, got {other:?}"),
+            },
+            value => panic!("expected module promise, got {value:?}"),
         }
     }
 
@@ -43555,12 +43569,11 @@ mod tests {
 
     /// Module code strict: assigning to undeclared variable throws.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_strict_undeclared_var_throws() {
-        let result = eval_module("undeclaredVar789 = 1; true");
-        // In strict mode this should throw, but if it doesn't the module
-        // still enforces strict semantics in other ways — accept both.
-        let _ = result;
+        let reason = eval_module_rejected_reason("undeclaredVar789 = 1; true");
+        assert!(
+            matches!(reason, JsValue::String(message) if message.contains("undeclaredVar789 is not defined"))
+        );
     }
 
     /// Module code strict: delete on unqualified identifier is SyntaxError.
