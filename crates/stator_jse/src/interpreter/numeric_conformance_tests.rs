@@ -432,7 +432,6 @@ mod tests {
     );
     coercion_e2e_test!(e2e_to_string_true_literal, "String(true) === 'true'");
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_string_symbol_via_constructor_function,
         "String(Symbol('x')) === 'Symbol(x)'"
     );
