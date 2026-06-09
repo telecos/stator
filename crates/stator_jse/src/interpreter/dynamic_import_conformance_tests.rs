@@ -209,7 +209,10 @@ mod tests {
         // import.foo should be a SyntaxError (only .meta is valid).
         let err = parse_module("import.foo").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("import.meta"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("expected 'meta' after 'import.'"),
+            "unexpected error: {msg}"
+        );
     }
 
     // ── 6. import.meta is an ordinary, extensible object ─────────────────────

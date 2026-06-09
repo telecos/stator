@@ -4235,9 +4235,7 @@ impl<'src> Parser<'src> {
                     if prop_name != "meta" {
                         return Err(Self::error_at(
                             prop_tok.span,
-                            &format!(
-                                "the only valid meta property for import is 'import.meta', got 'import.{prop_name}'"
-                            ),
+                            &format!("expected 'meta' after 'import.', got '{prop_name}'"),
                         ));
                     }
                     if !self.is_module {
@@ -8457,7 +8455,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_parse_import_dot_non_meta_is_error() {
         // `import.foo` is a SyntaxError — only `import.meta` is valid.
         let err = parse_module("import.foo").unwrap_err();
