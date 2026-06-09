@@ -43441,7 +43441,6 @@ mod tests {
 
     /// Adding a property to a frozen namespace-like object throws in strict mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_module_ns_frozen_no_add_strict() {
         assert_eval_type_error(
             r#"
