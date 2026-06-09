@@ -434,6 +434,13 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
     "built-ins/AggregateError/",
 ];
 
+/// Individual tests under otherwise-skipped path prefixes that are supported.
+const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
+    "annexB/built-ins/escape/empty-string.js",
+    "annexB/built-ins/escape/unmodified.js",
+    "annexB/built-ins/escape/escape-below.js",
+];
+
 /// Individual test files (relative to the `test/` directory, forward-slash
 /// separated) that are known to hang due to catastrophic backtracking or
 /// other pathological behaviour.
@@ -451,10 +458,17 @@ const SKIPPED_TEST_FILES: &[&str] = &[
 /// Returns `true` when `rel_path` starts with any of the [`SKIPPED_PATH_PREFIXES`]
 /// or exactly matches a [`SKIPPED_TEST_FILES`] entry.
 fn is_skipped_path(rel_path: &str) -> bool {
-    SKIPPED_PATH_PREFIXES
+    !SKIPPED_PATH_ALLOWLIST.contains(&rel_path)
+        && (SKIPPED_PATH_PREFIXES
+            .iter()
+            .any(|prefix| rel_path.starts_with(prefix))
+            || SKIPPED_TEST_FILES.contains(&rel_path))
+}
+
+fn skipped_path_has_allowlisted_descendant(rel_path_with_slash: &str) -> bool {
+    SKIPPED_PATH_ALLOWLIST
         .iter()
-        .any(|prefix| rel_path.starts_with(prefix))
-        || SKIPPED_TEST_FILES.contains(&rel_path)
+        .any(|path| path.starts_with(rel_path_with_slash))
 }
 
 // ─── Test execution ──────────────────────────────────────────────────────────
@@ -1183,6 +1197,7 @@ fn collect_tests(dir: &Path, test_root: &Path, out: &mut Vec<PathBuf>) -> io::Re
             if SKIPPED_PATH_PREFIXES
                 .iter()
                 .any(|prefix| rel_with_slash.starts_with(prefix))
+                && !skipped_path_has_allowlisted_descendant(&rel_with_slash)
             {
                 continue;
             }
@@ -1829,6 +1844,25 @@ mod tests {
         assert!(!has_unsupported_feature(&[]));
     }
 
+    #[test]
+    fn test_annex_b_escape_allowlist_not_skipped() {
+        assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
+        assert!(is_skipped_path("annexB/built-ins/unescape/empty-string.js"));
+    }
+
+    #[test]
+    fn test_skipped_path_descendant_allowlist() {
+        assert!(skipped_path_has_allowlisted_descendant("annexB/"));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/escape/"
+        ));
+        assert!(!skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/unescape/"
+        ));
+    }
+
     // ── Error type matching ───────────────────────────────────────────────────
 
     #[test]
@@ -1965,6 +1999,41 @@ mod tests {
         collect_tests(&tmp, &tmp, &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("a.js"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_escape_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_escape_collect_test");
+        let escape_dir = tmp.join("annexB").join("built-ins").join("escape");
+        let unescape_dir = tmp.join("annexB").join("built-ins").join("unescape");
+        let _ = std::fs::create_dir_all(&escape_dir);
+        let _ = std::fs::create_dir_all(&unescape_dir);
+        std::fs::write(escape_dir.join("empty-string.js"), "escape('')").unwrap();
+        std::fs::write(escape_dir.join("unmodified.js"), "escape('@')").unwrap();
+        std::fs::write(escape_dir.join("escape-below.js"), "escape('\\0')").unwrap();
+        std::fs::write(unescape_dir.join("empty-string.js"), "unescape('')").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/escape/empty-string.js",
+                "annexB/built-ins/escape/escape-below.js",
+                "annexB/built-ins/escape/unmodified.js",
+            ]
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
