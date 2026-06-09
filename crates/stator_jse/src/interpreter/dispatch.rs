@@ -3522,6 +3522,26 @@ fn handle_pop_context(
     Ok(DispatchAction::Continue)
 }
 
+fn handle_set_literal_prototype(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
+        return Err(err_bad_operand("SetLiteralPrototype", 0));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let proto = ctx.frame.accumulator.cheap_clone();
+    if matches!(proto, JsValue::Null) || proto.is_object_like() {
+        ordinary_set_prototype_of(&obj, proto)?;
+        if let JsValue::PlainObject(ref map) = obj {
+            invalidate_plain_object_caches(ctx, map);
+        }
+        ctx.frame.global_cache_invalidate();
+    }
+    ctx.frame.accumulator = obj;
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_lda_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -8968,6 +8988,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::StaKeyedProperty as usize] = handle_sta_keyed_property;
     table[Opcode::DefineNamedOwnProperty as usize] = handle_define_named_own_property;
     table[Opcode::DefineKeyedOwnProperty as usize] = handle_define_keyed_own_property;
+    table[Opcode::SetLiteralPrototype as usize] = handle_set_literal_prototype;
     table[Opcode::StaInArrayLiteral as usize] = handle_sta_in_array_literal;
     table[Opcode::DefineKeyedOwnPropertyInLiteral as usize] =
         handle_define_keyed_own_property_in_literal;
@@ -13011,7 +13032,6 @@ mod tests {
     // ── Object literal __proto__ ────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_in_literal() {
         let result = crate::builtins::global::global_eval(
             "var base = {greet() { return 'hello'; }};\
@@ -13023,7 +13043,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_inherited_property() {
         let result = crate::builtins::global::global_eval(
             "var parent = {x: 100};\
