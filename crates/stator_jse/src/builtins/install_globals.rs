@@ -79165,7 +79165,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional regexp replacement receives capture, index, and input.
         e2e_regexp_replace_function_receives_capture_index_input,
         r#""abc123".replace(/(\d+)/, function(m, d, idx, input) { return d + ":" + idx + ":" + input; }) === "abc123:3:abc123""#
@@ -79450,7 +79449,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.replace` with a string search passes the match, offset, and input.
         e2e_string_replace_function_string_search_signature_deep,
         r#""zabz".replace("ab", function(m, off, input) { return m + ":" + off + ":" + input; }) === "zab:1:zabzz""#
