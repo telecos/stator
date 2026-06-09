@@ -66542,7 +66542,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_trap_false_strict_assignment_throws() {
         let r = global_eval(
             r#"
@@ -66619,7 +66618,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_delete_property_false_strict_delete_throws() {
         let r = global_eval(
             r#"
