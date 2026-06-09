@@ -46468,7 +46468,6 @@ mod tests {
 
     // 4. eval in strict mode has its own variable scope
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_var_does_not_leak() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('var strictLocal = 1'); return typeof strictLocal === 'undefined'; } f()",
@@ -46514,7 +46513,6 @@ mod tests {
 
     // 6. eval with var in strict mode doesn't affect caller scope
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_var_no_caller_effect() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('var sv = 123'); return typeof sv === 'undefined'; } f()",
@@ -74917,7 +74915,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_direct_strict_eval_does_not_leak_var_declaration() {
         let result = global_eval(
             "function outer() { eval(\"'use strict'; var hidden = 5\"); return typeof hidden; } outer()",

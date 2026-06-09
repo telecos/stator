@@ -393,14 +393,14 @@ type DirectEvalCapture = (JsValue, Rc<RefCell<GlobalEnv>>, bool);
 /// assert_eq!(result, JsValue::Boolean(true));
 /// ```
 pub fn global_eval(source: &str) -> StatorResult<JsValue> {
-    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
+    Ok(eval_core(source, EvalMode::Indirect, None, None, false)?.result)
 }
 
 pub(crate) fn global_eval_with_env(
     source: &str,
     global_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
-    Ok(eval_core(source, EvalMode::Indirect, Some(global_env), None)?.result)
+    Ok(eval_core(source, EvalMode::Indirect, Some(global_env), None, false)?.result)
 }
 
 /// Direct eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = true`.
@@ -443,7 +443,7 @@ pub fn global_eval_direct(
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
 pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
-    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
+    Ok(eval_core(source, EvalMode::Indirect, None, None, false)?.result)
 }
 
 /// Strict-mode eval — the evaluated code receives its own variable
@@ -473,6 +473,7 @@ pub fn global_eval_strict(
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    program.is_strict = true;
     reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
 
@@ -492,12 +493,16 @@ fn eval_core(
     mode: EvalMode,
     caller_env: Option<Rc<RefCell<GlobalEnv>>>,
     caller_context: Option<JsValue>,
+    caller_is_strict: bool,
 ) -> StatorResult<EvalOutcome> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame, current_global_env};
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    if matches!(mode, EvalMode::Direct) && caller_is_strict {
+        program.is_strict = true;
+    }
     reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
     let is_strict = program.is_strict;
@@ -550,15 +555,22 @@ pub(crate) fn global_eval_direct_with_scope(
     caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<JsValue> {
-    Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context)?.0)
+    Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context, false)?.0)
 }
 
 pub(crate) fn global_eval_direct_with_scope_capture(
     source: &str,
     caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
+    caller_is_strict: bool,
 ) -> StatorResult<DirectEvalCapture> {
-    let outcome = eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)?;
+    let outcome = eval_core(
+        source,
+        EvalMode::Direct,
+        Some(caller_env),
+        caller_context,
+        caller_is_strict,
+    )?;
     Ok((outcome.result, outcome.global_env, outcome.is_strict))
 }
 

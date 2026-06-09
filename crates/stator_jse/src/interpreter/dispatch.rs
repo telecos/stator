@@ -8020,6 +8020,7 @@ fn handle_call_direct_eval(
                     &source,
                     Rc::clone(&eval_env),
                     ctx.frame.context.clone(),
+                    ctx.frame.bytecode_array.is_strict(),
                 )
             })?;
         let final_bindings = final_env.borrow();
