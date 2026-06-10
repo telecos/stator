@@ -1110,7 +1110,10 @@ typedef enum StatorNativeCodeCacheDiagnostic {
    */
   StatorNativeCodeCacheDiagnosticRejectedEngineVersion = 4,
   /**
-   * Native artifact/header format version did not match.
+   * Native artifact format version did not match.
+   *
+   * Unsupported fixed-header versions are treated as corrupt payloads because
+   * the decoder only accepts `STATOR_NATIVE_CODE_CACHE_HEADER_VERSION`.
    */
   StatorNativeCodeCacheDiagnosticRejectedFormatVersion = 5,
   /**
