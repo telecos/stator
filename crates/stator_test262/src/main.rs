@@ -439,11 +439,17 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
+    "annexB/built-ins/escape/length.js",
+    "annexB/built-ins/escape/name.js",
+    "annexB/built-ins/escape/prop-desc.js",
     "annexB/built-ins/unescape/empty-string.js",
     "annexB/built-ins/unescape/two.js",
     "annexB/built-ins/unescape/four.js",
     "annexB/built-ins/unescape/two-ignore-non-hex.js",
     "annexB/built-ins/unescape/four-ignore-bad-u.js",
+    "annexB/built-ins/unescape/length.js",
+    "annexB/built-ins/unescape/name.js",
+    "annexB/built-ins/unescape/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/name.js",
@@ -1881,6 +1887,9 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/length.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/name.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/prop-desc.js"));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/B.2.3.js"
         ));
@@ -1904,6 +1913,9 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/unescape/four-ignore-bad-u.js"
         ));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/length.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/name.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
         assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
 
@@ -2162,6 +2174,9 @@ mod tests {
         std::fs::write(escape_dir.join("empty-string.js"), "escape('')").unwrap();
         std::fs::write(escape_dir.join("unmodified.js"), "escape('@')").unwrap();
         std::fs::write(escape_dir.join("escape-below.js"), "escape('\\0')").unwrap();
+        std::fs::write(escape_dir.join("length.js"), "escape.length").unwrap();
+        std::fs::write(escape_dir.join("name.js"), "escape.name").unwrap();
+        std::fs::write(escape_dir.join("prop-desc.js"), "escape").unwrap();
         std::fs::write(substr_dir.join("B.2.3.js"), "''.substr(0)").unwrap();
         std::fs::write(
             substr_dir.join("length.js"),
@@ -2183,6 +2198,9 @@ mod tests {
             "unescape('%uxxxx')",
         )
         .unwrap();
+        std::fs::write(unescape_dir.join("length.js"), "unescape.length").unwrap();
+        std::fs::write(unescape_dir.join("name.js"), "unescape.name").unwrap();
+        std::fs::write(unescape_dir.join("prop-desc.js"), "unescape").unwrap();
         std::fs::write(unescape_dir.join("other.js"), "unescape('%2f')").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
@@ -2205,10 +2223,16 @@ mod tests {
                 "annexB/built-ins/String/prototype/substr/name.js",
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
+                "annexB/built-ins/escape/length.js",
+                "annexB/built-ins/escape/name.js",
+                "annexB/built-ins/escape/prop-desc.js",
                 "annexB/built-ins/escape/unmodified.js",
                 "annexB/built-ins/unescape/empty-string.js",
                 "annexB/built-ins/unescape/four-ignore-bad-u.js",
                 "annexB/built-ins/unescape/four.js",
+                "annexB/built-ins/unescape/length.js",
+                "annexB/built-ins/unescape/name.js",
+                "annexB/built-ins/unescape/prop-desc.js",
                 "annexB/built-ins/unescape/two-ignore-non-hex.js",
                 "annexB/built-ins/unescape/two.js",
             ]
