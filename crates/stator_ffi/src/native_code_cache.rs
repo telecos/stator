@@ -67,7 +67,10 @@ pub enum StatorNativeCodeCacheDiagnostic {
     StatorNativeCodeCacheDiagnosticRejectedArtifactType = 3,
     /// Engine crate or FFI ABI identity did not match.
     StatorNativeCodeCacheDiagnosticRejectedEngineVersion = 4,
-    /// Native artifact/header format version did not match.
+    /// Native artifact format version did not match.
+    ///
+    /// Unsupported fixed-header versions are treated as corrupt payloads because
+    /// the decoder only accepts `STATOR_NATIVE_CODE_CACHE_HEADER_VERSION`.
     StatorNativeCodeCacheDiagnosticRejectedFormatVersion = 5,
     /// Source key digest did not match the requested source artifact key.
     StatorNativeCodeCacheDiagnosticRejectedSourceIdentity = 6,
@@ -647,6 +650,28 @@ mod tests {
             StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
         );
         assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_validate_treats_header_version_mismatch_as_corrupt_payload() {
+        let expected = compatibility();
+        let mut artifact = artifact(b"payload");
+        artifact[8..12]
+            .copy_from_slice(&(STATOR_NATIVE_CODE_CACHE_HEADER_VERSION + 1).to_le_bytes());
+
+        // SAFETY: artifact and expected pointers are valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                &expected,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
     }
 
     #[test]
