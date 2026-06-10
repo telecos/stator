@@ -550,6 +550,24 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_accepts_null_out_info() {
+        let artifact = artifact(b"payload");
+        // SAFETY: artifact bytes are valid for the duration of the call; null
+        // out_info is documented as accepted.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticAccepted
+        );
+    }
+
+    #[test]
     fn test_validate_rejects_null_expected() {
         let payload = b"payload";
         let artifact = artifact(payload);
