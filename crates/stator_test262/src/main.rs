@@ -455,6 +455,9 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/Array/fromAsync/length.js",
     "built-ins/Array/fromAsync/name.js",
+    "built-ins/AggregateError/prototype/name.js",
+    "built-ins/AggregateError/prototype/message.js",
+    "built-ins/AggregateError/prototype/constructor.js",
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
@@ -1917,6 +1920,15 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/name.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/message.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/constructor.js"
+        ));
         assert!(is_skipped_path(
             "built-ins/AggregateError/errors-iterabletolist.js"
         ));
@@ -2228,6 +2240,12 @@ mod tests {
             "AggregateError",
         )
         .unwrap();
+        let prototype_dir = aggregate_dir.join("prototype");
+        let _ = std::fs::create_dir_all(&prototype_dir);
+        std::fs::write(prototype_dir.join("name.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("message.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("constructor.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("not-a-constructor.js"), "AggregateError").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
         collect_tests(&tmp, &tmp, &mut out).unwrap();
@@ -2248,6 +2266,9 @@ mod tests {
                 "built-ins/AggregateError/message-method-prop-cast.js",
                 "built-ins/AggregateError/message-method-prop.js",
                 "built-ins/AggregateError/message-undefined-no-prop.js",
+                "built-ins/AggregateError/prototype/constructor.js",
+                "built-ins/AggregateError/prototype/message.js",
+                "built-ins/AggregateError/prototype/name.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
