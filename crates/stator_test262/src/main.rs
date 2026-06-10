@@ -517,6 +517,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
+    "annexB/built-ins/String/prototype/substr/length-positive.js",
     "annexB/built-ins/String/prototype/substr/name.js",
     "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
     "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
@@ -1973,6 +1974,9 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-positive.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/name.js"
