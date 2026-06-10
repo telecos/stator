@@ -466,10 +466,38 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/fixed/length.js",
     "annexB/built-ins/String/prototype/fixed/name.js",
     "annexB/built-ins/String/prototype/fixed/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
+    "annexB/built-ins/String/prototype/fontcolor/length.js",
+    "annexB/built-ins/String/prototype/fontcolor/name.js",
+    "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
+    "annexB/built-ins/String/prototype/fontsize/length.js",
+    "annexB/built-ins/String/prototype/fontsize/name.js",
+    "annexB/built-ins/String/prototype/fontsize/prop-desc.js",
     "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
     "annexB/built-ins/String/prototype/italics/length.js",
     "annexB/built-ins/String/prototype/italics/name.js",
     "annexB/built-ins/String/prototype/italics/prop-desc.js",
+    "annexB/built-ins/String/prototype/link/B.2.3.10.js",
+    "annexB/built-ins/String/prototype/link/length.js",
+    "annexB/built-ins/String/prototype/link/name.js",
+    "annexB/built-ins/String/prototype/link/prop-desc.js",
+    "annexB/built-ins/String/prototype/small/B.2.3.11.js",
+    "annexB/built-ins/String/prototype/small/length.js",
+    "annexB/built-ins/String/prototype/small/name.js",
+    "annexB/built-ins/String/prototype/small/prop-desc.js",
+    "annexB/built-ins/String/prototype/strike/B.2.3.12.js",
+    "annexB/built-ins/String/prototype/strike/length.js",
+    "annexB/built-ins/String/prototype/strike/name.js",
+    "annexB/built-ins/String/prototype/strike/prop-desc.js",
+    "annexB/built-ins/String/prototype/sub/B.2.3.13.js",
+    "annexB/built-ins/String/prototype/sub/length.js",
+    "annexB/built-ins/String/prototype/sub/name.js",
+    "annexB/built-ins/String/prototype/sub/prop-desc.js",
+    "annexB/built-ins/String/prototype/sup/B.2.3.14.js",
+    "annexB/built-ins/String/prototype/sup/length.js",
+    "annexB/built-ins/String/prototype/sup/name.js",
+    "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/name.js",
@@ -1949,7 +1977,19 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/big/prop-desc.js"
         ));
-        for method in ["blink", "bold", "fixed", "italics"] {
+        for method in [
+            "blink",
+            "bold",
+            "fixed",
+            "fontcolor",
+            "fontsize",
+            "italics",
+            "link",
+            "small",
+            "strike",
+            "sub",
+            "sup",
+        ] {
             assert!(!is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/length.js"
             )));
@@ -1970,7 +2010,28 @@ mod tests {
             "annexB/built-ins/String/prototype/fixed/B.2.3.6.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/link/B.2.3.10.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/small/B.2.3.11.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/strike/B.2.3.12.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sub/B.2.3.13.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sup/B.2.3.14.js"
         ));
         assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
