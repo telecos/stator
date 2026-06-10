@@ -453,54 +453,67 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/big/B.2.3.3.js",
     "annexB/built-ins/String/prototype/big/length.js",
     "annexB/built-ins/String/prototype/big/name.js",
+    "annexB/built-ins/String/prototype/big/not-a-constructor.js",
     "annexB/built-ins/String/prototype/big/prop-desc.js",
     "annexB/built-ins/String/prototype/blink/B.2.3.4.js",
     "annexB/built-ins/String/prototype/blink/length.js",
     "annexB/built-ins/String/prototype/blink/name.js",
+    "annexB/built-ins/String/prototype/blink/not-a-constructor.js",
     "annexB/built-ins/String/prototype/blink/prop-desc.js",
     "annexB/built-ins/String/prototype/bold/B.2.3.5.js",
     "annexB/built-ins/String/prototype/bold/length.js",
     "annexB/built-ins/String/prototype/bold/name.js",
+    "annexB/built-ins/String/prototype/bold/not-a-constructor.js",
     "annexB/built-ins/String/prototype/bold/prop-desc.js",
     "annexB/built-ins/String/prototype/fixed/B.2.3.6.js",
     "annexB/built-ins/String/prototype/fixed/length.js",
     "annexB/built-ins/String/prototype/fixed/name.js",
+    "annexB/built-ins/String/prototype/fixed/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fixed/prop-desc.js",
     "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
     "annexB/built-ins/String/prototype/fontcolor/length.js",
     "annexB/built-ins/String/prototype/fontcolor/name.js",
+    "annexB/built-ins/String/prototype/fontcolor/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
     "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
     "annexB/built-ins/String/prototype/fontsize/length.js",
     "annexB/built-ins/String/prototype/fontsize/name.js",
+    "annexB/built-ins/String/prototype/fontsize/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fontsize/prop-desc.js",
     "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
     "annexB/built-ins/String/prototype/italics/length.js",
     "annexB/built-ins/String/prototype/italics/name.js",
+    "annexB/built-ins/String/prototype/italics/not-a-constructor.js",
     "annexB/built-ins/String/prototype/italics/prop-desc.js",
     "annexB/built-ins/String/prototype/link/B.2.3.10.js",
     "annexB/built-ins/String/prototype/link/length.js",
     "annexB/built-ins/String/prototype/link/name.js",
+    "annexB/built-ins/String/prototype/link/not-a-constructor.js",
     "annexB/built-ins/String/prototype/link/prop-desc.js",
     "annexB/built-ins/String/prototype/small/B.2.3.11.js",
     "annexB/built-ins/String/prototype/small/length.js",
     "annexB/built-ins/String/prototype/small/name.js",
+    "annexB/built-ins/String/prototype/small/not-a-constructor.js",
     "annexB/built-ins/String/prototype/small/prop-desc.js",
     "annexB/built-ins/String/prototype/strike/B.2.3.12.js",
     "annexB/built-ins/String/prototype/strike/length.js",
     "annexB/built-ins/String/prototype/strike/name.js",
+    "annexB/built-ins/String/prototype/strike/not-a-constructor.js",
     "annexB/built-ins/String/prototype/strike/prop-desc.js",
     "annexB/built-ins/String/prototype/sub/B.2.3.13.js",
     "annexB/built-ins/String/prototype/sub/length.js",
     "annexB/built-ins/String/prototype/sub/name.js",
+    "annexB/built-ins/String/prototype/sub/not-a-constructor.js",
     "annexB/built-ins/String/prototype/sub/prop-desc.js",
     "annexB/built-ins/String/prototype/sup/B.2.3.14.js",
     "annexB/built-ins/String/prototype/sup/length.js",
     "annexB/built-ins/String/prototype/sup/name.js",
+    "annexB/built-ins/String/prototype/sup/not-a-constructor.js",
     "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/name.js",
+    "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
     "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
     "built-ins/AsyncGeneratorFunction/instance-length.js",
     "built-ins/AsyncGeneratorFunction/extensibility.js",
@@ -512,6 +525,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/Array/fromAsync/length.js",
     "built-ins/Array/fromAsync/name.js",
+    "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/prototype/name.js",
     "built-ins/AggregateError/prototype/message.js",
     "built-ins/AggregateError/prototype/constructor.js",
@@ -1952,7 +1966,7 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
         ));
         assert!(!is_skipped_path(
@@ -2003,6 +2017,9 @@ mod tests {
             assert!(!is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/prop-desc.js"
             )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/not-a-constructor.js"
+            )));
         }
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/blink/B.2.3.4.js"
@@ -2037,6 +2054,9 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/sup/B.2.3.14.js"
         ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
+        ));
         assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
 
@@ -2054,6 +2074,7 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
+        assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/name.js"
         ));
@@ -2350,6 +2371,7 @@ mod tests {
                 "annexB/built-ins/String/prototype/substr/B.2.3.js",
                 "annexB/built-ins/String/prototype/substr/length.js",
                 "annexB/built-ins/String/prototype/substr/name.js",
+                "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
                 "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
@@ -2391,6 +2413,7 @@ mod tests {
             "AggregateError",
         )
         .unwrap();
+        std::fs::write(aggregate_dir.join("name.js"), "AggregateError").unwrap();
         std::fs::write(
             aggregate_dir.join("errors-iterabletolist.js"),
             "AggregateError",
@@ -2422,6 +2445,7 @@ mod tests {
                 "built-ins/AggregateError/message-method-prop-cast.js",
                 "built-ins/AggregateError/message-method-prop.js",
                 "built-ins/AggregateError/message-undefined-no-prop.js",
+                "built-ins/AggregateError/name.js",
                 "built-ins/AggregateError/prototype/constructor.js",
                 "built-ins/AggregateError/prototype/message.js",
                 "built-ins/AggregateError/prototype/name.js",
