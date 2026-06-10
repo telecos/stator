@@ -454,6 +454,22 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/big/length.js",
     "annexB/built-ins/String/prototype/big/name.js",
     "annexB/built-ins/String/prototype/big/prop-desc.js",
+    "annexB/built-ins/String/prototype/blink/B.2.3.4.js",
+    "annexB/built-ins/String/prototype/blink/length.js",
+    "annexB/built-ins/String/prototype/blink/name.js",
+    "annexB/built-ins/String/prototype/blink/prop-desc.js",
+    "annexB/built-ins/String/prototype/bold/B.2.3.5.js",
+    "annexB/built-ins/String/prototype/bold/length.js",
+    "annexB/built-ins/String/prototype/bold/name.js",
+    "annexB/built-ins/String/prototype/bold/prop-desc.js",
+    "annexB/built-ins/String/prototype/fixed/B.2.3.6.js",
+    "annexB/built-ins/String/prototype/fixed/length.js",
+    "annexB/built-ins/String/prototype/fixed/name.js",
+    "annexB/built-ins/String/prototype/fixed/prop-desc.js",
+    "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
+    "annexB/built-ins/String/prototype/italics/length.js",
+    "annexB/built-ins/String/prototype/italics/name.js",
+    "annexB/built-ins/String/prototype/italics/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/name.js",
@@ -1932,6 +1948,29 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/big/prop-desc.js"
+        ));
+        for method in ["blink", "bold", "fixed", "italics"] {
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/length.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/name.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/prop-desc.js"
+            )));
+        }
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/blink/B.2.3.4.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/bold/B.2.3.5.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fixed/B.2.3.6.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
         ));
         assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
