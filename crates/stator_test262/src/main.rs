@@ -478,6 +478,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/fixed/name.js",
     "annexB/built-ins/String/prototype/fixed/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fixed/prop-desc.js",
+    "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
     "annexB/built-ins/String/prototype/fontcolor/length.js",
     "annexB/built-ins/String/prototype/fontcolor/name.js",
@@ -2096,6 +2097,9 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/fixed/B.2.3.6.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js"
