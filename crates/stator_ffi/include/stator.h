@@ -9815,6 +9815,10 @@ size_t stator_native_code_cache_header_size(void);
 
 /**
  * Return a stable low-cardinality telemetry code string for a diagnostic.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
  */
 const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);
 
