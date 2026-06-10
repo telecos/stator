@@ -742,6 +742,10 @@ mod tests {
         ];
         for (diagnostic, expected) in cases {
             let ptr = stator_native_code_cache_diagnostic_name(diagnostic);
+            assert!(
+                !ptr.is_null(),
+                "diagnostic name pointer must be non-null for {diagnostic:?}"
+            );
             // SAFETY: The function returns static NUL-terminated strings.
             let actual = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
             assert_eq!(actual, expected);
