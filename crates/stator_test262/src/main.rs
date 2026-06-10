@@ -450,6 +450,11 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/length.js",
     "annexB/built-ins/unescape/name.js",
     "annexB/built-ins/unescape/prop-desc.js",
+    "annexB/built-ins/String/prototype/anchor/B.2.3.2.js",
+    "annexB/built-ins/String/prototype/anchor/length.js",
+    "annexB/built-ins/String/prototype/anchor/name.js",
+    "annexB/built-ins/String/prototype/anchor/not-a-constructor.js",
+    "annexB/built-ins/String/prototype/anchor/prop-desc.js",
     "annexB/built-ins/String/prototype/big/B.2.3.3.js",
     "annexB/built-ins/String/prototype/big/length.js",
     "annexB/built-ins/String/prototype/big/name.js",
@@ -515,6 +520,14 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/substr/name.js",
     "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
     "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
+    "annexB/built-ins/String/prototype/trimLeft/length.js",
+    "annexB/built-ins/String/prototype/trimLeft/name.js",
+    "annexB/built-ins/String/prototype/trimLeft/prop-desc.js",
+    "annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js",
+    "annexB/built-ins/String/prototype/trimRight/length.js",
+    "annexB/built-ins/String/prototype/trimRight/name.js",
+    "annexB/built-ins/String/prototype/trimRight/prop-desc.js",
+    "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js",
     "built-ins/AsyncGeneratorFunction/instance-length.js",
     "built-ins/AsyncGeneratorFunction/extensibility.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
@@ -1983,6 +1996,29 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/unescape/length.js"));
         assert!(!is_skipped_path("annexB/built-ins/unescape/name.js"));
         assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/B.2.3.2.js"
+        ));
+        for method in ["anchor", "trimLeft", "trimRight"] {
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/length.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/name.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/prop-desc.js"
+            )));
+        }
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/not-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js"
+        ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/big/B.2.3.3.js"
         ));
