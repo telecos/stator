@@ -517,6 +517,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
+    "annexB/built-ins/String/prototype/substr/length-falsey.js",
     "annexB/built-ins/String/prototype/substr/length-negative.js",
     "annexB/built-ins/String/prototype/substr/length-positive.js",
     "annexB/built-ins/String/prototype/substr/name.js",
@@ -536,6 +537,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/instance-length.js",
+    "built-ins/AsyncFunction/instance-has-name.js",
+    "built-ins/AsyncFunction/instance-prototype-property.js",
     "built-ins/AsyncFunction/AsyncFunction.js",
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
@@ -1977,6 +1980,9 @@ mod tests {
             "annexB/built-ins/String/prototype/substr/length.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-falsey.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/length-negative.js"
         ));
         assert!(!is_skipped_path(
@@ -2141,6 +2147,12 @@ mod tests {
     fn test_async_function_allowlist_not_skipped() {
         assert!(!is_skipped_path(
             "built-ins/AsyncFunction/instance-length.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/instance-has-name.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/instance-prototype-property.js"
         ));
         assert!(!is_skipped_path("built-ins/AsyncFunction/AsyncFunction.js"));
         assert!(!is_skipped_path(
@@ -2376,6 +2388,7 @@ mod tests {
             "String.prototype.substr.length",
         )
         .unwrap();
+        std::fs::write(substr_dir.join("length-falsey.js"), "''.substr(0, false)").unwrap();
         std::fs::write(substr_dir.join("length-negative.js"), "''.substr(0, -1)").unwrap();
         std::fs::write(substr_dir.join("length-positive.js"), "'abc'.substr(0, 2)").unwrap();
         std::fs::write(substr_dir.join("name.js"), "String.prototype.substr.name").unwrap();
@@ -2420,6 +2433,7 @@ mod tests {
             rel,
             vec![
                 "annexB/built-ins/String/prototype/substr/B.2.3.js",
+                "annexB/built-ins/String/prototype/substr/length-falsey.js",
                 "annexB/built-ins/String/prototype/substr/length-negative.js",
                 "annexB/built-ins/String/prototype/substr/length-positive.js",
                 "annexB/built-ins/String/prototype/substr/length.js",
@@ -2514,6 +2528,12 @@ mod tests {
         let async_dir = tmp.join("built-ins").join("AsyncFunction");
         let _ = std::fs::create_dir_all(&async_dir);
         std::fs::write(async_dir.join("instance-length.js"), "AsyncFunction").unwrap();
+        std::fs::write(async_dir.join("instance-has-name.js"), "AsyncFunction").unwrap();
+        std::fs::write(
+            async_dir.join("instance-prototype-property.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
         std::fs::write(async_dir.join("AsyncFunction.js"), "AsyncFunction").unwrap();
         std::fs::write(
             async_dir.join("AsyncFunction-is-extensible.js"),
@@ -2545,7 +2565,9 @@ mod tests {
                 "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
                 "built-ins/AsyncFunction/AsyncFunction.js",
                 "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+                "built-ins/AsyncFunction/instance-has-name.js",
                 "built-ins/AsyncFunction/instance-length.js",
+                "built-ins/AsyncFunction/instance-prototype-property.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
