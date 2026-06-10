@@ -3880,9 +3880,10 @@ struct StatorIsolate *stator_isolate_new(void);
  * After this call the pointer is invalid and must not be used.
  *
  * # Safety
- * - `isolate` must be a non-null pointer returned by `stator_isolate_create`.
- * - `isolate` must not be used again after this call.
- * - This function must not be called more than once for the same pointer.
+ * - `isolate` must be null or a pointer returned by `stator_isolate_create`.
+ * - If non-null, `isolate` must not be used again after this call.
+ * - If non-null, this function must not be called more than once for the same pointer.
+ * - Passing null is a no-op.
  */
 void stator_isolate_destroy(struct StatorIsolate *isolate);
 
@@ -3893,9 +3894,10 @@ void stator_isolate_destroy(struct StatorIsolate *isolate);
  * Equivalent to [`stator_isolate_destroy`].
  *
  * # Safety
- * - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
- * - `isolate` must not be used again after this call.
- * - This function must not be called more than once for the same pointer.
+ * - `isolate` must be null or a pointer returned by `stator_isolate_new`.
+ * - If non-null, `isolate` must not be used again after this call.
+ * - If non-null, this function must not be called more than once for the same pointer.
+ * - Passing null is a no-op.
  */
 void stator_isolate_dispose(struct StatorIsolate *isolate);
 

@@ -312,9 +312,10 @@ pub extern "C" fn stator_isolate_new() -> *mut StatorIsolate {
 /// After this call the pointer is invalid and must not be used.
 ///
 /// # Safety
-/// - `isolate` must be a non-null pointer returned by `stator_isolate_create`.
-/// - `isolate` must not be used again after this call.
-/// - This function must not be called more than once for the same pointer.
+/// - `isolate` must be null or a pointer returned by `stator_isolate_create`.
+/// - If non-null, `isolate` must not be used again after this call.
+/// - If non-null, this function must not be called more than once for the same pointer.
+/// - Passing null is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_destroy(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -329,9 +330,10 @@ pub unsafe extern "C" fn stator_isolate_destroy(isolate: *mut StatorIsolate) {
 /// Equivalent to [`stator_isolate_destroy`].
 ///
 /// # Safety
-/// - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
-/// - `isolate` must not be used again after this call.
-/// - This function must not be called more than once for the same pointer.
+/// - `isolate` must be null or a pointer returned by `stator_isolate_new`.
+/// - If non-null, `isolate` must not be used again after this call.
+/// - If non-null, this function must not be called more than once for the same pointer.
+/// - Passing null is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
     // SAFETY: same requirements as `stator_isolate_destroy`.
