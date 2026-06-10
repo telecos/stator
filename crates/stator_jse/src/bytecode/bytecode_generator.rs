@@ -10863,7 +10863,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_async_generator_expr_compiles() {
         // `var f = async function*() { yield 1; };`
         use crate::parser::ast::FnExpr;
@@ -10882,12 +10881,15 @@ mod tests {
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let pool = arr.constant_pool();
-        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
-            assert!(ba.is_generator(), "must be marked as generator");
-            assert!(ba.is_async(), "must be marked as async");
-        } else {
-            panic!("constant pool[0] should be a Function");
-        }
+        let ba = pool
+            .iter()
+            .find_map(|entry| match entry {
+                crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("expected a Function entry in the constant pool");
+        assert!(ba.is_generator(), "must be marked as generator");
+        assert!(ba.is_async(), "must be marked as async");
     }
 
     #[test]
