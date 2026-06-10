@@ -450,10 +450,15 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/length.js",
     "annexB/built-ins/unescape/name.js",
     "annexB/built-ins/unescape/prop-desc.js",
+    "annexB/built-ins/String/prototype/big/B.2.3.3.js",
+    "annexB/built-ins/String/prototype/big/length.js",
+    "annexB/built-ins/String/prototype/big/name.js",
+    "annexB/built-ins/String/prototype/big/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/name.js",
     "built-ins/AsyncGeneratorFunction/instance-length.js",
+    "built-ins/AsyncGeneratorFunction/extensibility.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/instance-length.js",
@@ -1916,6 +1921,18 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/unescape/length.js"));
         assert!(!is_skipped_path("annexB/built-ins/unescape/name.js"));
         assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/B.2.3.3.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/name.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/prop-desc.js"
+        ));
         assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
     }
 
@@ -1968,6 +1985,9 @@ mod tests {
     fn test_async_generator_function_allowlist_not_skipped() {
         assert!(!is_skipped_path(
             "built-ins/AsyncGeneratorFunction/instance-length.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/extensibility.js"
         ));
         assert!(!is_skipped_path(
             "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js"
@@ -2355,6 +2375,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            async_gen_dir.join("extensibility.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
             async_gen_dir.join("AsyncGeneratorFunction-is-extensible.js"),
             "AsyncGeneratorFunction",
         )
@@ -2387,6 +2412,7 @@ mod tests {
             vec![
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
+                "built-ins/AsyncGeneratorFunction/extensibility.js",
                 "built-ins/AsyncGeneratorFunction/instance-length.js",
             ]
         );
