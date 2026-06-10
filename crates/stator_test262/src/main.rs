@@ -546,6 +546,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/Array/fromAsync/length.js",
     "built-ins/Array/fromAsync/name.js",
     "built-ins/AggregateError/name.js",
+    "built-ins/AggregateError/prop-desc.js",
+    "built-ins/AggregateError/proto.js",
     "built-ins/AggregateError/prototype/name.js",
     "built-ins/AggregateError/prototype/message.js",
     "built-ins/AggregateError/prototype/constructor.js",
@@ -2133,6 +2135,8 @@ mod tests {
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/name.js"
         ));
@@ -2486,6 +2490,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(aggregate_dir.join("name.js"), "AggregateError").unwrap();
+        std::fs::write(aggregate_dir.join("prop-desc.js"), "AggregateError").unwrap();
+        std::fs::write(aggregate_dir.join("proto.js"), "AggregateError").unwrap();
         std::fs::write(
             aggregate_dir.join("errors-iterabletolist.js"),
             "AggregateError",
@@ -2518,6 +2524,8 @@ mod tests {
                 "built-ins/AggregateError/message-method-prop.js",
                 "built-ins/AggregateError/message-undefined-no-prop.js",
                 "built-ins/AggregateError/name.js",
+                "built-ins/AggregateError/prop-desc.js",
+                "built-ins/AggregateError/proto.js",
                 "built-ins/AggregateError/prototype/constructor.js",
                 "built-ins/AggregateError/prototype/message.js",
                 "built-ins/AggregateError/prototype/name.js",
