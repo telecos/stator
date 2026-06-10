@@ -6255,8 +6255,10 @@ bool stator_value_to_boolean(const struct StatorValue *val);
  * - Numbers: `NaN !== NaN`; `+0 === -0`.
  * - Strings: byte-for-byte equality.
  * - Booleans: value equality.
- * - Object / function / array / … : `false` (no shared identity in FFI
- *   handles; two distinct handles are never the same object).
+ * - Tag-only object / function / array / promise placeholders: `false`
+ *   because they carry no shared identity in FFI handles.
+ * - Shared-storage object, DOM wrapper, and Promise handles: identity equality
+ *   based on the underlying shared engine handle.
  *
  * Both null pointers are treated as `undefined`.
  *

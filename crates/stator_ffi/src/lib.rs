@@ -13377,8 +13377,10 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
 /// - Numbers: `NaN !== NaN`; `+0 === -0`.
 /// - Strings: byte-for-byte equality.
 /// - Booleans: value equality.
-/// - Object / function / array / … : `false` (no shared identity in FFI
-///   handles; two distinct handles are never the same object).
+/// - Tag-only object / function / array / promise placeholders: `false`
+///   because they carry no shared identity in FFI handles.
+/// - Shared-storage object, DOM wrapper, and Promise handles: identity equality
+///   based on the underlying shared engine handle.
 ///
 /// Both null pointers are treated as `undefined`.
 ///
@@ -38556,6 +38558,67 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_equals_object_handles_compare_by_identity() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        // SAFETY: `obj` is non-null and live.
+        let value = unsafe { stator_object_as_value(obj) };
+        // SAFETY: `value` is a live ObjectHandle value.
+        let same_obj = unsafe { stator_value_as_object(value) };
+        // SAFETY: `iso` is valid.
+        let other_obj = unsafe { stator_object_new(iso.as_ptr()) };
+        assert!(!same_obj.is_null());
+        // SAFETY: `same_obj` and `other_obj` are non-null and live.
+        let same_value = unsafe { stator_object_as_value(same_obj) };
+        let other_value = unsafe { stator_object_as_value(other_obj) };
+
+        // SAFETY: all values are non-null and live.
+        assert!(unsafe { stator_value_strict_equals(value, same_value) });
+        assert!(!unsafe { stator_value_strict_equals(value, other_value) });
+
+        // SAFETY: all handles are non-null and live.
+        unsafe {
+            stator_value_destroy(value);
+            stator_value_destroy(same_value);
+            stator_value_destroy(other_value);
+            stator_object_destroy(obj);
+            stator_object_destroy(same_obj);
+            stator_object_destroy(other_obj);
+        }
+    }
+
+    #[test]
+    fn test_strict_equals_promise_handles_compare_by_identity() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        assert!(!promise.is_null());
+        // SAFETY: `promise` is non-null and live; cloning preserves the shared
+        // PromiseHandle identity for this internal FFI test.
+        let same_promise = unsafe {
+            allocate_stator_value(iso.as_ptr(), clone_stator_value_inner(&(*promise).inner))
+        };
+        // SAFETY: `iso` is valid.
+        let other_promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        let tag_only_promise = unsafe { stator_value_new_promise_tag(iso.as_ptr()) };
+
+        // SAFETY: all values are non-null and live.
+        assert!(unsafe { stator_value_strict_equals(promise, same_promise) });
+        assert!(!unsafe { stator_value_strict_equals(promise, other_promise) });
+        assert!(!unsafe { stator_value_strict_equals(promise, tag_only_promise) });
+
+        // SAFETY: all values are non-null and live.
+        unsafe {
+            stator_value_destroy(tag_only_promise);
+            stator_value_destroy(other_promise);
+            stator_value_destroy(same_promise);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
     fn test_strict_equals_null_ptr_treated_as_undefined() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -42335,10 +42398,15 @@ mod tests {
 
         let first = unsafe { stator_dom_object_wrap_as_value(wrap) };
         let second = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let second_wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let third = unsafe { stator_dom_object_wrap_as_value(second_wrap) };
         assert!(!first.is_null());
         assert!(!second.is_null());
+        assert!(!second_wrap.is_null());
+        assert!(!third.is_null());
         assert!(unsafe { stator_value_is_object(first) });
         assert!(unsafe { stator_value_strict_equals(first, second) });
+        assert!(!unsafe { stator_value_strict_equals(first, third) });
         assert_eq!(unsafe { stator_value_as_dom_object_wrap(first) }, wrap);
 
         let plain = unsafe { stator_value_new_object(iso.as_ptr()) };
@@ -42351,6 +42419,8 @@ mod tests {
             stator_value_destroy(plain);
             stator_value_destroy(first);
             stator_value_destroy(second);
+            stator_value_destroy(third);
+            stator_dom_object_wrap_destroy(second_wrap);
             stator_dom_object_wrap_destroy(wrap);
         }
     }
