@@ -457,6 +457,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/anchor/name.js",
     "annexB/built-ins/String/prototype/anchor/not-a-constructor.js",
     "annexB/built-ins/String/prototype/anchor/prop-desc.js",
+    "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/big/B.2.3.3.js",
     "annexB/built-ins/String/prototype/big/length.js",
     "annexB/built-ins/String/prototype/big/name.js",
@@ -2023,6 +2024,9 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js"
         ));
         for method in ["anchor", "trimLeft", "trimRight"] {
             assert!(!is_skipped_path(&format!(
