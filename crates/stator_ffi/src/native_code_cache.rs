@@ -590,6 +590,33 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_null_and_empty_input() {
+        let expected = compatibility();
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: null bytes are explicitly rejected before dereference; pointers are otherwise valid.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(std::ptr::null(), 1, &expected, &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+
+        let bytes = b"";
+        // SAFETY: zero length is explicitly rejected before dereference; pointers are otherwise valid.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(bytes.as_ptr(), 0, &expected, &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
     fn test_validate_rejects_payload_digest_and_length_mismatch() {
         let payload = b"payload";
         let expected = compatibility();
