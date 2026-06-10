@@ -80947,15 +80947,14 @@ mod tests {
         );
     }
 
-    // 34. Overriding inherited getter with own property
+    // 34. Inherited getter without setter rejects sloppy assignment shadowing
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_override_inherited_getter() {
         assert_eval_true(
             "var parent = { get x() { return 'parent'; } }; \
              var child = Object.create(parent); \
              child.x = 'child'; \
-             child.x === 'child'",
+             child.x === 'parent' && Object.getOwnPropertyNames(child).length === 0",
         );
     }
 

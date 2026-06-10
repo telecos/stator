@@ -453,6 +453,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/instance-length.js",
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+    "built-ins/Array/fromAsync/length.js",
+    "built-ins/Array/fromAsync/name.js",
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
@@ -1953,6 +1955,15 @@ mod tests {
     }
 
     #[test]
+    fn test_array_from_async_allowlist_not_skipped() {
+        assert!(!is_skipped_path("built-ins/Array/fromAsync/length.js"));
+        assert!(!is_skipped_path("built-ins/Array/fromAsync/name.js"));
+        assert!(is_skipped_path(
+            "built-ins/Array/fromAsync/async-iterable.js"
+        ));
+    }
+
+    #[test]
     fn test_skipped_path_descendant_allowlist() {
         assert!(skipped_path_has_allowlisted_descendant("annexB/"));
         assert!(skipped_path_has_allowlisted_descendant(
@@ -1972,6 +1983,9 @@ mod tests {
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AsyncGeneratorFunction/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/Array/fromAsync/"
         ));
         assert!(!skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/Date/"
@@ -2325,6 +2339,41 @@ mod tests {
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/instance-length.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_array_from_async_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_array_from_async_collect_test");
+        let from_async_dir = tmp.join("built-ins").join("Array").join("fromAsync");
+        let _ = std::fs::create_dir_all(&from_async_dir);
+        std::fs::write(from_async_dir.join("length.js"), "Array.fromAsync.length").unwrap();
+        std::fs::write(from_async_dir.join("name.js"), "Array.fromAsync.name").unwrap();
+        std::fs::write(
+            from_async_dir.join("async-iterable.js"),
+            "Array.fromAsync(async function*(){}())",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/Array/fromAsync/length.js",
+                "built-ins/Array/fromAsync/name.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
