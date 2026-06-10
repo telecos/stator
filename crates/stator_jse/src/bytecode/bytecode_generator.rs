@@ -11019,7 +11019,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_method_emits_define_named_own() {
         // `class Foo { bar() {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -11032,13 +11031,12 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty),
-            "expected DefineNamedOwnProperty for method"
+                .any(|i| i.opcode == Opcode::DefineClassNamedOwnProperty),
+            "expected DefineClassNamedOwnProperty for method"
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_method() {
         // `class Foo { static bar() {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -11051,12 +11049,11 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty)
+                .any(|i| i.opcode == Opcode::DefineClassNamedOwnProperty)
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_getter_setter() {
         // `class Foo { get x() {} set x(v) {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -11072,12 +11069,12 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineGetterProperty)
+                .any(|i| i.opcode == Opcode::DefineClassGetterProperty)
         );
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineSetterProperty)
+                .any(|i| i.opcode == Opcode::DefineClassSetterProperty)
         );
     }
 
@@ -12845,9 +12842,8 @@ mod tests {
     // ── 6. Computed property names in classes ────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_computed_class_method_bytecode() {
-        // `class C { [k]() {} }` should emit DefineKeyedOwnProperty.
+        // `class C { [k]() {} }` should emit DefineClassKeyedOwnProperty.
         let prog = make_program(vec![
             var_decl_stmt(VarKind::Let, "k", Some(str_expr("myMethod"))),
             class_decl_stmt(
@@ -12868,8 +12864,8 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
-            "computed class method must emit DefineKeyedOwnProperty"
+                .any(|i| i.opcode == Opcode::DefineClassKeyedOwnProperty),
+            "computed class method must emit DefineClassKeyedOwnProperty"
         );
     }
 
