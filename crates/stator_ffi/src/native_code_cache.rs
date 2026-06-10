@@ -663,6 +663,14 @@ mod tests {
         let artifact = artifact(payload);
         let cases: &[(fn(&mut StatorNativeCodeCacheCompatibility), StatorNativeCodeCacheDiagnostic)] = &[
             (
+                |c| c.tier = StatorNativeCodeCacheTier::StatorNativeCodeCacheTierMaglev,
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType,
+            ),
+            (
+                |c| c.native_format_version += 1,
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion,
+            ),
+            (
                 |c| c.ffi_abi_version += 1,
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion,
             ),
