@@ -682,12 +682,40 @@ mod tests {
                 "accepted",
             ),
             (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument,
+                "invalid_argument",
+            ),
+            (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload,
                 "corrupt_payload",
             ),
             (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType,
+                "rejected_artifact_type",
+            ),
+            (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion,
                 "rejected_engine_version",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion,
+                "rejected_format_version",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedSourceIdentity,
+                "rejected_source_identity",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedPlatform,
+                "rejected_platform",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedBuildFeatures,
+                "rejected_build_features",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedCompilerFlags,
+                "rejected_compiler_flags",
             ),
             (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticUnsupportedNativeCode,
