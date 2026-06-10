@@ -74866,7 +74866,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_reassignment_in_function_reports_type_error_name() {
         let result = global_eval(
             "function f() { const x = 1; try { x = 2; } catch (e) { return e.name; } } f()",
@@ -74876,11 +74875,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_reassignment_in_block_reports_type_error_name() {
-        let result =
-            global_eval("{ const x = 1; try { x = 2; } catch (e) { x; return e.name; } }").unwrap();
+        let result = global_eval(
+            "function f() { { const x = 1; try { x = 2; } catch (e) { x; return e.name; } } } f()",
+        )
+        .unwrap();
         assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_const_reassignment_in_function_uncaught_type_error() {
+        let err = global_eval("function f() { const x = 1; x = 2; } f()").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Assignment to constant variable 'x'")
+        );
     }
 
     #[test]

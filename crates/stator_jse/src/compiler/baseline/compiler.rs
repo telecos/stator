@@ -2540,7 +2540,7 @@ pub(crate) mod jit_runtime {
                 }
             }
 
-            // ── ThrowReferenceErrorIfHole ────────────────────────────────
+            // ── Runtime-catchable throw checks ────────────────────────────
             Opcode::ThrowReferenceErrorIfHole => {
                 let val = jit_i64_to_jsvalue(acc);
                 if matches!(val, JsValue::TheHole) {
@@ -2550,6 +2550,7 @@ pub(crate) mod jit_runtime {
                     Some(acc)
                 }
             }
+            Opcode::ThrowConstAssignmentTypeError => None,
 
             // ── LdaTheHole ──────────────────────────────────────────────
             Opcode::LdaTheHole => Some(jsvalue_to_jit_i64(JsValue::TheHole)),
@@ -13547,6 +13548,7 @@ impl<'a> BaselineCompiler<'a> {
                 | Opcode::TestInstanceOf
                 | Opcode::TestIn
                 | Opcode::ThrowReferenceErrorIfHole
+                | Opcode::ThrowConstAssignmentTypeError
                 | Opcode::ToNumber
                 | Opcode::ToNumeric
                 | Opcode::CreateClosure
@@ -15915,17 +15917,12 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_runtime_stub(Opcode::TestIn, obj_flat, 0, bytecode_offset);
             }
 
-            // ── ThrowReferenceErrorIfHole runtime stub ──────────────────────
-            Opcode::ThrowReferenceErrorIfHole => {
+            // ── Runtime throw stubs ─────────────────────────────────────────
+            Opcode::ThrowReferenceErrorIfHole | Opcode::ThrowConstAssignmentTypeError => {
                 let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
-                    return Err(bad_operand("ThrowReferenceErrorIfHole", 0));
+                    return Err(bad_operand("runtime throw", 0));
                 };
-                self.emit_runtime_stub(
-                    Opcode::ThrowReferenceErrorIfHole,
-                    i64::from(name_idx),
-                    0,
-                    bytecode_offset,
-                );
+                self.emit_runtime_stub(instr.opcode, i64::from(name_idx), 0, bytecode_offset);
             }
 
             // ── LdaTheHole runtime stub ─────────────────────────────────────

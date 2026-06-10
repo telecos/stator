@@ -6878,6 +6878,23 @@ fn handle_throw_reference_error_if_hole(
 }
 
 #[cold]
+fn handle_throw_const_assignment_type_error(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
+        return Err(err_bad_operand("ThrowConstAssignmentTypeError", 0));
+    };
+    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => "<unknown>".to_string(),
+    };
+    Err(StatorError::TypeError(format!(
+        "Assignment to constant variable '{name}'"
+    )))
+}
+
+#[cold]
 fn handle_throw_super_not_called_if_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -9137,6 +9154,8 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::JumpIfJSReceiverConstant as usize] = handle_jump_if_js_receiver_constant;
     table[Opcode::Return as usize] = handle_return;
     table[Opcode::ThrowReferenceErrorIfHole as usize] = handle_throw_reference_error_if_hole;
+    table[Opcode::ThrowConstAssignmentTypeError as usize] =
+        handle_throw_const_assignment_type_error;
     table[Opcode::ThrowSuperNotCalledIfHole as usize] = handle_throw_super_not_called_if_hole;
     table[Opcode::ThrowSuperAlreadyCalledIfNotHole as usize] =
         handle_throw_super_already_called_if_not_hole;

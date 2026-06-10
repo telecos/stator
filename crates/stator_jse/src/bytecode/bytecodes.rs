@@ -718,6 +718,8 @@ pub enum Opcode {
     Return,
     /// Throw a `ReferenceError` if the accumulator is the hole. `[name_idx]`
     ThrowReferenceErrorIfHole,
+    /// Throw a `TypeError` for assignment to a const binding. `[name_idx]`
+    ThrowConstAssignmentTypeError,
     /// Throw if `super()` has not yet been called.
     ThrowSuperNotCalledIfHole,
     /// Throw if `super()` has already been called.
@@ -1103,6 +1105,7 @@ impl Opcode {
             // Return / Throw
             Opcode::Return => &[],
             Opcode::ThrowReferenceErrorIfHole => &[ConstantPoolIdx],
+            Opcode::ThrowConstAssignmentTypeError => &[ConstantPoolIdx],
             Opcode::ThrowSuperNotCalledIfHole => &[],
             Opcode::ThrowSuperAlreadyCalledIfNotHole => &[],
             Opcode::ThrowIfNullOrUndefined => &[],

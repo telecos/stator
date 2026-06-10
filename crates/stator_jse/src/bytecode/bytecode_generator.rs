@@ -206,6 +206,9 @@ struct FunctionCompileOptions {
     module_variables: HashMap<String, (u32, i32)>,
     /// Local imported binding name → `(source, imported_name)`.
     imported_module_bindings: HashMap<String, (String, String)>,
+    /// Namespace-import local binding names. These are read from local slots but
+    /// remain immutable imported bindings for assignment validation.
+    imported_namespace_bindings: HashSet<String>,
     exported_module_bindings: HashSet<String>,
     /// Local-name → exported-alias map propagated to inner function bodies so
     /// stores into a captured module-exported binding write through to every
@@ -299,6 +302,8 @@ struct FunctionCompiler {
     module_variables: HashMap<String, (u32, i32)>,
     /// Local imported binding name → `(source, imported_name)` for live reads.
     imported_module_bindings: HashMap<String, (String, String)>,
+    /// Namespace-import local binding names.
+    imported_namespace_bindings: HashSet<String>,
     /// Local binding names directly exported by this module.
     ///
     /// Assignments to these names write through to the corresponding module
@@ -391,6 +396,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -1810,6 +1816,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -2558,6 +2565,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -3672,9 +3680,10 @@ impl FunctionCompiler {
 
     /// Store the accumulator to the variable named `name`.
     ///
-    /// Returns an error if the variable is a `const` binding.
-    /// If the binding is still in the TDZ, emits a runtime
-    /// `ThrowReferenceErrorIfHole` check before the store.
+    /// If the variable is a `const` binding, emits a runtime TypeError so
+    /// enclosing JavaScript `try`/`catch` blocks can observe it. If the binding
+    /// is still in the TDZ, emits a runtime `ThrowReferenceErrorIfHole` check
+    /// before the store.
     fn compile_ident_store(&mut self, name: &str) -> StatorResult<()> {
         // Closure captures: inner function writing to an outer variable.
         if let Some(&slot) = self.closure_captures.get(name) {
@@ -3694,11 +3703,24 @@ impl FunctionCompiler {
             self.emit_exported_module_write_through(name);
             return Ok(());
         }
+        if self.imported_module_bindings.contains_key(name) {
+            return Err(StatorError::TypeError(format!(
+                "Assignment to constant variable '{name}'"
+            )));
+        }
+        if self.imported_namespace_bindings.contains(name) {
+            return Err(StatorError::TypeError(format!(
+                "Assignment to constant variable '{name}'"
+            )));
+        }
         if let Some(binding) = self.lookup_var(name) {
             if binding.is_const {
-                return Err(StatorError::TypeError(format!(
-                    "Assignment to constant variable '{name}'"
-                )));
+                let name_idx = self.add_string(name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowConstAssignmentTypeError,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+                return Ok(());
             }
             if binding.needs_tdz_check {
                 // Save the value being assigned, check TDZ, then store.
@@ -5253,6 +5275,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5302,6 +5325,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5356,6 +5380,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5442,6 +5467,7 @@ impl FunctionCompiler {
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -7007,6 +7033,8 @@ impl FunctionCompiler {
                     self.emit_star(reg);
                 }
                 ImportSpecifier::Namespace(ns) => {
+                    self.imported_namespace_bindings
+                        .insert(ns.local.name.clone());
                     let req_idx = self.add_string(source);
                     self.emit(Instruction::new_unchecked(
                         Opcode::GetModuleNamespace,
@@ -7386,6 +7414,7 @@ fn compile_function_with_private_names(
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
         },
@@ -8611,6 +8640,7 @@ fn compile_function_inner(
         is_module,
         module_variables,
         imported_module_bindings,
+        imported_namespace_bindings,
         exported_module_bindings,
         local_export_aliases,
     } = options;
@@ -8621,6 +8651,7 @@ fn compile_function_inner(
     let _ = module_variables;
     compiler.module_variables = HashMap::new();
     compiler.imported_module_bindings = imported_module_bindings;
+    compiler.imported_namespace_bindings = imported_namespace_bindings;
     compiler.exported_module_bindings = exported_module_bindings;
     compiler.local_export_aliases = local_export_aliases;
 
