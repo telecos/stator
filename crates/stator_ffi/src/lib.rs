@@ -4157,8 +4157,10 @@ pub unsafe extern "C" fn stator_string_new(data: *const c_char, len: usize) -> *
 
 /// Return a pointer to the UTF-8 bytes held by `string`.
 ///
-/// The returned pointer is valid until `string` is freed and is **not**
-/// guaranteed to be null-terminated. Returns null when `string` is null.
+/// The returned pointer is valid for `stator_string_len(string)` bytes or until
+/// `string` is freed, and is **not** guaranteed to be null-terminated. When the
+/// length is zero, the pointer is only a zero-length buffer and must not be
+/// dereferenced. Returns null when `string` is null.
 ///
 /// # Safety
 /// - `string` must be either null or a valid pointer to a live
