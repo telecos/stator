@@ -554,6 +554,35 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_rejects_short_and_bad_magic_header() {
+        let mut info = sentinel_info();
+        let original = info;
+
+        let short = [0u8; STATOR_NATIVE_CODE_CACHE_HEADER_SIZE - 1];
+        // SAFETY: short buffer pointer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(short.as_ptr(), short.len(), &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+
+        let mut bad_magic = artifact(b"payload");
+        bad_magic[0] ^= 0xFF;
+        // SAFETY: artifact buffer pointer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(bad_magic.as_ptr(), bad_magic.len(), &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
     fn test_classify_accepts_null_out_info() {
         let artifact = artifact(b"payload");
         // SAFETY: artifact bytes are valid for the duration of the call; null
