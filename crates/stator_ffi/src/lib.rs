@@ -1879,7 +1879,7 @@ unsafe impl Send for StatorContext {}
 /// [`stator_context_destroy`] clears the current-context slot when it matches.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut StatorContext {
     if isolate.is_null() {

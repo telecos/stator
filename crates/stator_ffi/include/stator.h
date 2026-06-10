@@ -4305,7 +4305,7 @@ bool stator_isolate_jit_disabled(const struct StatorIsolate *isolate);
  * [`stator_context_destroy`] clears the current-context slot when it matches.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
  */
 struct StatorContext *stator_context_new(struct StatorIsolate *isolate);
 
