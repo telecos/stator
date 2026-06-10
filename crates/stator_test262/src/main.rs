@@ -463,6 +463,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/big/name.js",
     "annexB/built-ins/String/prototype/big/not-a-constructor.js",
     "annexB/built-ins/String/prototype/big/prop-desc.js",
+    "annexB/built-ins/String/prototype/big/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/blink/B.2.3.4.js",
     "annexB/built-ins/String/prototype/blink/length.js",
     "annexB/built-ins/String/prototype/blink/name.js",
@@ -2062,6 +2063,9 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/big/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/this-val-tostring-err.js"
         ));
         for method in [
             "blink",
