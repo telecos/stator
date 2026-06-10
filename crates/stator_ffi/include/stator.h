@@ -2448,11 +2448,11 @@ typedef struct StatorScriptCompileOptions {
    */
   size_t resource_name_len;
   /**
-   * 1-based line offset within the resource.
+   * Zero-based line offset within the resource.
    */
   int32_t line_offset;
   /**
-   * 1-based column offset within the resource.
+   * Zero-based column offset within the resource.
    */
   int32_t column_offset;
   /**
@@ -2543,11 +2543,11 @@ typedef struct StatorModuleCompileOptions {
    */
   size_t resource_name_len;
   /**
-   * 1-based line offset within the resource.
+   * Zero-based line offset within the resource.
    */
   int32_t line_offset;
   /**
-   * 1-based column offset within the resource.
+   * Zero-based column offset within the resource.
    */
   int32_t column_offset;
   /**

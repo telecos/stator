@@ -4014,10 +4014,10 @@ pub struct StatorScript {
     /// via [`stator_script_set_origin`].  Mirrors `v8::ScriptOrigin::ResourceName`.
     /// Used by browser embedders to attribute stack frames to source files.
     resource_name: Option<CString>,
-    /// 1-based line offset of the script within `resource_name`.  Defaults to 0.
+    /// Zero-based line offset of the script within `resource_name`. Defaults to 0.
     /// Mirrors `v8::ScriptOrigin::ResourceLineOffset`.
     resource_line_offset: i32,
-    /// 1-based column offset of the script within `resource_name`.  Defaults
+    /// Zero-based column offset of the script within `resource_name`. Defaults
     /// to 0.  Mirrors `v8::ScriptOrigin::ResourceColumnOffset`.
     resource_column_offset: i32,
 }
@@ -4036,9 +4036,9 @@ pub struct StatorScriptCompileOptions {
     pub resource_name: *const c_char,
     /// Number of bytes in `resource_name`.
     pub resource_name_len: usize,
-    /// 1-based line offset within the resource.
+    /// Zero-based line offset within the resource.
     pub line_offset: i32,
-    /// 1-based column offset within the resource.
+    /// Zero-based column offset within the resource.
     pub column_offset: i32,
     /// Optional source URL / sourceURL directive bytes.
     pub source_url: *const c_char,
@@ -4270,9 +4270,9 @@ pub struct StatorModule {
     error_kind: StatorMessageKind,
     /// Resource name (typically a URL) supplied by the embedder.
     resource_name: Option<CString>,
-    /// 1-based line offset of the module within `resource_name`. Defaults to 0.
+    /// Zero-based line offset of the module within `resource_name`. Defaults to 0.
     resource_line_offset: i32,
-    /// 1-based column offset of the module within `resource_name`. Defaults to 0.
+    /// Zero-based column offset of the module within `resource_name`. Defaults to 0.
     resource_column_offset: i32,
     /// Owned copy of the embedder-supplied base URL bytes, if any.
     base_url: Option<Vec<u8>>,
@@ -4584,9 +4584,9 @@ pub struct StatorModuleCompileOptions {
     pub resource_name: *const c_char,
     /// Number of bytes in `resource_name`.
     pub resource_name_len: usize,
-    /// 1-based line offset within the resource.
+    /// Zero-based line offset within the resource.
     pub line_offset: i32,
-    /// 1-based column offset within the resource.
+    /// Zero-based column offset within the resource.
     pub column_offset: i32,
     /// Pointer to `base_url_len` bytes of browser base URL metadata.
     pub base_url: *const c_char,
