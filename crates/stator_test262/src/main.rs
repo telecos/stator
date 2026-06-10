@@ -545,6 +545,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunction.js",
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+    "built-ins/AsyncFunction/is-not-a-global.js",
     "built-ins/Array/fromAsync/length.js",
     "built-ins/Array/fromAsync/name.js",
     "built-ins/Array/fromAsync/prop-desc.js",
@@ -2178,6 +2179,9 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js"
         ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/is-not-a-global.js"
+        ));
         assert!(is_skipped_path(
             "built-ins/AsyncFunction/AsyncFunction-name.js"
         ));
@@ -2567,6 +2571,7 @@ mod tests {
             "AsyncFunction",
         )
         .unwrap();
+        std::fs::write(async_dir.join("is-not-a-global.js"), "AsyncFunction").unwrap();
         std::fs::write(async_dir.join("AsyncFunction-name.js"), "AsyncFunction").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
@@ -2590,6 +2595,7 @@ mod tests {
                 "built-ins/AsyncFunction/instance-has-name.js",
                 "built-ins/AsyncFunction/instance-length.js",
                 "built-ins/AsyncFunction/instance-prototype-property.js",
+                "built-ins/AsyncFunction/is-not-a-global.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
