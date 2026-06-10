@@ -26997,7 +26997,7 @@ mod tests {
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(1)]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::Array(arr) = result {
-            assert!(arr.borrow().len() >= 0);
+            assert_eq!(arr.borrow().len(), 0);
         } else {
             panic!("expected Array, got {result:?}");
         }
