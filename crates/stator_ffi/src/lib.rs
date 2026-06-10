@@ -106,13 +106,9 @@ pub const STATOR_FFI_ABI_VERSION_PATCH: u32 = 0;
 /// Packed Stator FFI ABI version: `(major << 16) | (minor << 8) | patch`.
 ///
 /// Embedders may compare this constant to the value returned by
-/// [`stator_ffi_abi_version`] to detect a header/library skew at runtime:
-///
-/// ```c
-/// if (stator_ffi_abi_version() != STATOR_FFI_ABI_VERSION) {
-///     /* header and shared library disagree — refuse to proceed. */
-/// }
-/// ```
+/// `stator_ffi_abi_version()` to detect a header/library skew at runtime. For
+/// example, if the returned value differs from `STATOR_FFI_ABI_VERSION`, the
+/// header and shared library disagree and the embedder should refuse to proceed.
 pub const STATOR_FFI_ABI_VERSION: u32 = (STATOR_FFI_ABI_VERSION_MAJOR << 16)
     | (STATOR_FFI_ABI_VERSION_MINOR << 8)
     | STATOR_FFI_ABI_VERSION_PATCH;
