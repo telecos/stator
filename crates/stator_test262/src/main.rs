@@ -517,6 +517,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/substr/B.2.3.js",
     "annexB/built-ins/String/prototype/substr/length.js",
+    "annexB/built-ins/String/prototype/substr/length-negative.js",
     "annexB/built-ins/String/prototype/substr/length-positive.js",
     "annexB/built-ins/String/prototype/substr/name.js",
     "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
@@ -1976,6 +1977,9 @@ mod tests {
             "annexB/built-ins/String/prototype/substr/length.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-negative.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/length-positive.js"
         ));
         assert!(!is_skipped_path(
@@ -2372,12 +2376,15 @@ mod tests {
             "String.prototype.substr.length",
         )
         .unwrap();
+        std::fs::write(substr_dir.join("length-negative.js"), "''.substr(0, -1)").unwrap();
+        std::fs::write(substr_dir.join("length-positive.js"), "'abc'.substr(0, 2)").unwrap();
         std::fs::write(substr_dir.join("name.js"), "String.prototype.substr.name").unwrap();
         std::fs::write(
             substr_dir.join("this-non-obj-coerce.js"),
             "String.prototype.substr.call(null)",
         )
         .unwrap();
+        std::fs::write(substr_dir.join("start-negative.js"), "'abc'.substr(-1)").unwrap();
         std::fs::write(substr_dir.join("not-a-constructor.js"), "isConstructor").unwrap();
         std::fs::write(unescape_dir.join("empty-string.js"), "unescape('')").unwrap();
         std::fs::write(unescape_dir.join("two.js"), "unescape('%20')").unwrap();
@@ -2413,9 +2420,12 @@ mod tests {
             rel,
             vec![
                 "annexB/built-ins/String/prototype/substr/B.2.3.js",
+                "annexB/built-ins/String/prototype/substr/length-negative.js",
+                "annexB/built-ins/String/prototype/substr/length-positive.js",
                 "annexB/built-ins/String/prototype/substr/length.js",
                 "annexB/built-ins/String/prototype/substr/name.js",
                 "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
+                "annexB/built-ins/String/prototype/substr/start-negative.js",
                 "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
