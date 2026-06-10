@@ -11166,7 +11166,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_method() {
         // `class Foo { [k]() {} }` (k declared beforehand)
         let prog = make_program(vec![
@@ -11189,8 +11188,8 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
-            "expected DefineKeyedOwnProperty for computed method"
+                .any(|i| i.opcode == Opcode::DefineClassKeyedOwnProperty),
+            "expected DefineClassKeyedOwnProperty for computed method"
         );
     }
 
