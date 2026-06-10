@@ -451,6 +451,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/instance-length.js",
+    "built-ins/AsyncFunction/AsyncFunction.js",
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/Array/fromAsync/length.js",
@@ -1939,6 +1940,7 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AsyncFunction/instance-length.js"
         ));
+        assert!(!is_skipped_path("built-ins/AsyncFunction/AsyncFunction.js"));
         assert!(!is_skipped_path(
             "built-ins/AsyncFunction/AsyncFunction-is-extensible.js"
         ));
@@ -2280,6 +2282,7 @@ mod tests {
         let async_dir = tmp.join("built-ins").join("AsyncFunction");
         let _ = std::fs::create_dir_all(&async_dir);
         std::fs::write(async_dir.join("instance-length.js"), "AsyncFunction").unwrap();
+        std::fs::write(async_dir.join("AsyncFunction.js"), "AsyncFunction").unwrap();
         std::fs::write(
             async_dir.join("AsyncFunction-is-extensible.js"),
             "AsyncFunction",
@@ -2308,6 +2311,7 @@ mod tests {
             rel,
             vec![
                 "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
+                "built-ins/AsyncFunction/AsyncFunction.js",
                 "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
                 "built-ins/AsyncFunction/instance-length.js",
             ]
