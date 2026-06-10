@@ -3906,7 +3906,7 @@ void stator_isolate_dispose(struct StatorIsolate *isolate);
  * call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
  */
 void stator_isolate_enter(struct StatorIsolate *isolate);
 
@@ -3917,7 +3917,7 @@ void stator_isolate_enter(struct StatorIsolate *isolate);
  * Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
  */
 void stator_isolate_exit(struct StatorIsolate *isolate);
 

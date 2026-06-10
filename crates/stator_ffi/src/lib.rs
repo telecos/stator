@@ -344,7 +344,7 @@ pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
 /// call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
 /// Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
