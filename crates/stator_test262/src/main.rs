@@ -547,6 +547,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/Array/fromAsync/length.js",
     "built-ins/Array/fromAsync/name.js",
+    "built-ins/Array/fromAsync/prop-desc.js",
     "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
@@ -2205,6 +2206,7 @@ mod tests {
     fn test_array_from_async_allowlist_not_skipped() {
         assert!(!is_skipped_path("built-ins/Array/fromAsync/length.js"));
         assert!(!is_skipped_path("built-ins/Array/fromAsync/name.js"));
+        assert!(!is_skipped_path("built-ins/Array/fromAsync/prop-desc.js"));
         assert!(is_skipped_path(
             "built-ins/Array/fromAsync/async-iterable.js"
         ));
@@ -2656,6 +2658,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&from_async_dir);
         std::fs::write(from_async_dir.join("length.js"), "Array.fromAsync.length").unwrap();
         std::fs::write(from_async_dir.join("name.js"), "Array.fromAsync.name").unwrap();
+        std::fs::write(from_async_dir.join("prop-desc.js"), "Array.fromAsync").unwrap();
         std::fs::write(
             from_async_dir.join("async-iterable.js"),
             "Array.fromAsync(async function*(){}())",
@@ -2679,6 +2682,7 @@ mod tests {
             vec![
                 "built-ins/Array/fromAsync/length.js",
                 "built-ins/Array/fromAsync/name.js",
+                "built-ins/Array/fromAsync/prop-desc.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
