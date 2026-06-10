@@ -33750,6 +33750,15 @@ mod tests {
     }
 
     #[test]
+    fn test_stator_string_accessors_accept_null() {
+        // SAFETY: null string handles are documented inputs for both accessors.
+        unsafe {
+            assert!(stator_string_data(std::ptr::null()).is_null());
+            assert_eq!(stator_string_len(std::ptr::null()), 0);
+        }
+    }
+
+    #[test]
     fn test_stator_string_free_accepts_null() {
         // SAFETY: passing null is a documented no-op.
         unsafe { stator_string_free(std::ptr::null_mut()) };
