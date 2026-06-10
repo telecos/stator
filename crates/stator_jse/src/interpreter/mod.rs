@@ -13602,7 +13602,7 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
         return Ok(a < b);
     }
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
-        return Ok(a < b);
+        return Ok(a.encode_utf16().cmp(b.encode_utf16()).is_lt());
     }
     // Full spec: ┬º7.2.14 IsLessThan(x, y, true)
     // Returns None for undefined (NaN cases) ΓåÆ map to false

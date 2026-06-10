@@ -513,7 +513,6 @@ mod tests {
         "!(10 < '9') && '5' < 10"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_relational_utf16_string_ordering,
         "'\\uD855\\uDE51' < '\\uFF3A'"
     );
