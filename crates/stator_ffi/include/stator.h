@@ -1094,7 +1094,7 @@ typedef enum StatorNativeCodeCacheDiagnostic {
    */
   StatorNativeCodeCacheDiagnosticAccepted = 0,
   /**
-   * A required pointer/length pair or output pointer was invalid.
+   * A required input pointer/length pair or compatibility pointer was invalid.
    */
   StatorNativeCodeCacheDiagnosticInvalidArgument = 1,
   /**

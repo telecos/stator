@@ -59,7 +59,7 @@ impl StatorNativeCodeCacheTier {
 pub enum StatorNativeCodeCacheDiagnostic {
     /// Header classification accepted the fixed header shape.
     StatorNativeCodeCacheDiagnosticAccepted = 0,
-    /// A required pointer/length pair or output pointer was invalid.
+    /// A required input pointer/length pair or compatibility pointer was invalid.
     StatorNativeCodeCacheDiagnosticInvalidArgument = 1,
     /// Header structure, payload length, or payload digest was invalid.
     StatorNativeCodeCacheDiagnosticCorruptPayload = 2,
