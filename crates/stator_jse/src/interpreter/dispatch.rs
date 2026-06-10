@@ -10815,14 +10815,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_inheritance_prototype_chain() {
         let result = crate::builtins::global::global_eval(
             "class Foo {} \
              class Bar extends Foo {} \
              (Bar.__proto__ === Foo) && \
              (Bar.prototype.__proto__ === Foo.prototype) && \
-             !(Bar.prototype instanceof Foo) && \
+             (Bar.prototype instanceof Foo) && \
              (new Bar() instanceof Foo)",
         )
         .unwrap();
