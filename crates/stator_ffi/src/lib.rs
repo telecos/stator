@@ -376,7 +376,7 @@ pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
 /// equivalent to clearing it.  Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_set_data(
     isolate: *mut StatorIsolate,
@@ -513,7 +513,7 @@ pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
 /// raw pointer and does not free it.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
 /// - `exception` must be either null or a valid, live [`StatorValue`] pointer
 ///   that outlives the pending-exception window.
 #[unsafe(no_mangle)]
@@ -3234,9 +3234,11 @@ pub unsafe extern "C" fn stator_null_new(isolate: *mut StatorIsolate) -> *mut St
 
 /// Destroy a value and decrement the isolate's live-object counter.
 ///
+/// Passing null is a no-op.
+///
 /// # Safety
-/// `val` must be a non-null pointer returned by any `stator_value_new_*`
-/// function and must not be used again after this call.
+/// `val` must be null or a pointer returned by any `stator_value_new_*`
+/// function. If non-null, it must not be used again after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_destroy(val: *mut StatorValue) {
     if !val.is_null() {
@@ -26406,6 +26408,12 @@ mod tests {
         assert!((n - 3.14).abs() < f64::EPSILON);
         // SAFETY: `val` is non-null and live.
         unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_destroy_null_is_safe() {
+        // SAFETY: passing null is documented as a no-op.
+        unsafe { stator_value_destroy(std::ptr::null_mut()) };
     }
 
     #[test]

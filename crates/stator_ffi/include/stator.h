@@ -3933,7 +3933,7 @@ void stator_isolate_exit(struct StatorIsolate *isolate);
  * equivalent to clearing it.  Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
  */
 void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void *data);
 
@@ -4018,7 +4018,7 @@ bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate
  * raw pointer and does not free it.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
  * - `exception` must be either null or a valid, live [`StatorValue`] pointer
  *   that outlives the pending-exception window.
  */
@@ -4833,9 +4833,11 @@ struct StatorValue *stator_null_new(struct StatorIsolate *isolate);
 /**
  * Destroy a value and decrement the isolate's live-object counter.
  *
+ * Passing null is a no-op.
+ *
  * # Safety
- * `val` must be a non-null pointer returned by any `stator_value_new_*`
- * function and must not be used again after this call.
+ * `val` must be null or a pointer returned by any `stator_value_new_*`
+ * function. If non-null, it must not be used again after this call.
  */
 void stator_value_destroy(struct StatorValue *val);
 
