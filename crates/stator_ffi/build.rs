@@ -1,8 +1,9 @@
 //! build.rs — cbindgen pipeline for `stator_jse_ffi`.
 //!
 //! Generates `include/stator.h` from the `extern "C"` surface in
-//! `src/lib.rs`.  The header is written to the crate root (not `$OUT_DIR`)
-//! so it can be committed and used by embedders without a Rust toolchain.
+//! `src/lib.rs`.  The header is written to the crate's `include/` directory
+//! (not `$OUT_DIR`) so it can be committed and used by embedders without a Rust
+//! toolchain.
 //!
 //! Also re-emits the `stator_maglev_jit_x86_64` cfg so that the FFI crate's
 //! `cfg(stator_maglev_jit_x86_64)` branches are recognised on the same set of
