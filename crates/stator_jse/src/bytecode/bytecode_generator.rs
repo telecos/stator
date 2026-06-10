@@ -1689,7 +1689,7 @@ impl FunctionCompiler {
     ) -> StatorResult<Option<Register>> {
         match &declarator.id {
             Pat::Ident(ident) => {
-                if self.is_eval_scope {
+                if self.is_eval_scope && is_var {
                     // Eval scope: var declarations are hoisted into the
                     // caller's global environment via StaGlobal so they
                     // survive after the eval frame completes.

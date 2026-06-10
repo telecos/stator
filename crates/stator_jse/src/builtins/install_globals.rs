@@ -46525,7 +46525,6 @@ mod tests {
 
     // 5. eval with let/const — block scoped to eval, not caller
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_let_scoped_to_eval_not_caller() {
         assert_e2e_true(
             "function f() { eval('let ev_let = 10'); return typeof ev_let === 'undefined'; } f()",
@@ -46533,7 +46532,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_const_scoped_to_eval_not_caller() {
         assert_e2e_true(
             "function f() { eval('const ev_const = 10'); return typeof ev_const === 'undefined'; } f()",
@@ -46541,15 +46539,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_let_visible_inside_eval() {
         assert_e2e_true("function f() { return eval('let x = 42; x'); } f() === 42");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_const_visible_inside_eval() {
         assert_e2e_true("function f() { return eval('const y = 99; y'); } f() === 99");
+    }
+
+    #[test]
+    fn e2e_eval_var_remains_visible_to_caller() {
+        assert_e2e_true("function f() { eval('var ev_var = 10'); return ev_var; } f() === 10");
     }
 
     // 6. eval with var in strict mode doesn't affect caller scope
