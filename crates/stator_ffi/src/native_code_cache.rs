@@ -156,8 +156,11 @@ pub extern "C" fn stator_native_code_cache_diagnostic_name(
 ///
 /// # Safety
 ///
-/// `bytes` must point to `len` readable bytes for the duration of the call.
-/// When `out_info` is non-null, it must be valid for one write.
+/// When `bytes` is non-null and `len > 0`, it must point to `len` readable
+/// bytes for the duration of the call. Null `bytes` or zero `len` returns
+/// [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+/// without dereferencing `bytes`. When `out_info` is non-null, it must be valid
+/// for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_native_code_cache_classify_header(
     bytes: *const u8,
@@ -185,9 +188,13 @@ pub unsafe extern "C" fn stator_native_code_cache_classify_header(
 ///
 /// # Safety
 ///
-/// `bytes` must point to `len` readable bytes for the duration of the call,
-/// `expected` must point to a valid compatibility struct, and `out_info` must be
-/// valid for one write when it is non-null.
+/// When `bytes` is non-null and `len > 0`, it must point to `len` readable
+/// bytes for the duration of the call. `expected` must either be null or point
+/// to a valid compatibility struct. Null `bytes`, zero `len`, or null
+/// `expected` returns
+/// [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+/// without dereferencing invalid inputs. When `out_info` is non-null, it must be
+/// valid for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_native_code_cache_validate_header(
     bytes: *const u8,
@@ -457,6 +464,23 @@ mod tests {
         artifact
     }
 
+    fn sentinel_info() -> StatorNativeCodeCacheHeaderInfo {
+        StatorNativeCodeCacheHeaderInfo {
+            header_version: u32::MAX,
+            tier: StatorNativeCodeCacheTier::StatorNativeCodeCacheTierUnknown,
+            native_format_version: u32::MAX,
+            ffi_abi_version: u32::MAX,
+            engine_version_digest: [0xAA; DIGEST_LEN],
+            compiler_version_digest: [0xBB; DIGEST_LEN],
+            target_triple_digest: [0xCC; DIGEST_LEN],
+            cpu_feature_set_digest: [0xDD; DIGEST_LEN],
+            jit_flags_digest: [0xEE; DIGEST_LEN],
+            source_key_digest: [0x11; DIGEST_LEN],
+            payload_digest: [0x22; DIGEST_LEN],
+            payload_length_bytes: u64::MAX,
+        }
+    }
+
     #[test]
     fn test_classify_header_decodes_canonical_fields() {
         let payload = b"native payload bytes are never executed";
@@ -499,6 +523,52 @@ mod tests {
         assert_eq!(info.source_key_digest, expected.source_key_digest);
         assert_eq!(info.payload_digest, native_sha256_digest(payload));
         assert_eq!(info.payload_length_bytes, payload.len() as u64);
+    }
+
+    #[test]
+    fn test_classify_rejects_null_and_empty_input() {
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: null bytes are explicitly rejected before dereference; out pointer is valid.
+        let diagnostic =
+            unsafe { stator_native_code_cache_classify_header(std::ptr::null(), 1, &mut info) };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+
+        let bytes = b"";
+        // SAFETY: zero length is rejected before dereference; out pointer is valid.
+        let diagnostic =
+            unsafe { stator_native_code_cache_classify_header(bytes.as_ptr(), 0, &mut info) };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_validate_rejects_null_expected() {
+        let payload = b"payload";
+        let artifact = artifact(payload);
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: artifact bytes are valid; null expected is explicitly rejected before dereference.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                std::ptr::null(),
+                &mut info,
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
     }
 
     #[test]

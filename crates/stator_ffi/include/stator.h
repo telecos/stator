@@ -9828,8 +9828,11 @@ const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheD
  *
  * # Safety
  *
- * `bytes` must point to `len` readable bytes for the duration of the call.
- * When `out_info` is non-null, it must be valid for one write.
+ * When `bytes` is non-null and `len > 0`, it must point to `len` readable
+ * bytes for the duration of the call. Null `bytes` or zero `len` returns
+ * [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+ * without dereferencing `bytes`. When `out_info` is non-null, it must be valid
+ * for one write; null `out_info` is accepted.
  */
 enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(const uint8_t *bytes,
                                                                               size_t len,
@@ -9845,9 +9848,13 @@ enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(co
  *
  * # Safety
  *
- * `bytes` must point to `len` readable bytes for the duration of the call,
- * `expected` must point to a valid compatibility struct, and `out_info` must be
- * valid for one write when it is non-null.
+ * When `bytes` is non-null and `len > 0`, it must point to `len` readable
+ * bytes for the duration of the call. `expected` must either be null or point
+ * to a valid compatibility struct. Null `bytes`, zero `len`, or null
+ * `expected` returns
+ * [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+ * without dereferencing invalid inputs. When `out_info` is non-null, it must be
+ * valid for one write; null `out_info` is accepted.
  */
 enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_validate_header(const uint8_t *bytes,
                                                                               size_t len,
