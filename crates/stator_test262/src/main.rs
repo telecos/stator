@@ -452,6 +452,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/name.js",
     "annexB/built-ins/unescape/prop-desc.js",
     "annexB/built-ins/String/prototype/anchor/B.2.3.2.js",
+    "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/anchor/length.js",
     "annexB/built-ins/String/prototype/anchor/name.js",
     "annexB/built-ins/String/prototype/anchor/not-a-constructor.js",
@@ -2019,6 +2020,9 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/anchor/B.2.3.2.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js"
         ));
         for method in ["anchor", "trimLeft", "trimRight"] {
             assert!(!is_skipped_path(&format!(
