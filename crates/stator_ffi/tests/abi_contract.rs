@@ -478,6 +478,8 @@ fn test_header_dom_callable_callback_typedefs_and_docs_match_abi() {
     for signature in [
         "typedef enum StatorStatus (*StatorDomCallAsFunctionCb)(const struct StatorValue *receiver,\n                                                       const struct StatorValue *const *args,\n                                                       size_t arg_count,\n                                                       void *data,\n                                                       struct StatorValue **out);",
         "typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_target,\n                                                  const struct StatorValue *const *args,\n                                                  size_t arg_count,\n                                                  void *data,\n                                                  struct StatorValue **out);",
+        "enum StatorStatus (*call)(const struct StatorValue *receiver,\n                            const struct StatorValue *const *args,\n                            size_t arg_count,\n                            void *data,\n                            struct StatorValue **out);",
+        "enum StatorStatus (*construct)(const struct StatorValue *new_target,\n                                 const struct StatorValue *const *args,\n                                 size_t arg_count,\n                                 void *data,\n                                 struct StatorValue **out);",
     ] {
         assert!(
             header.contains(signature),
@@ -502,6 +504,40 @@ fn test_header_dom_callable_callback_typedefs_and_docs_match_abi() {
         assert!(
             !docs.contains(marker),
             "generated stator.h DOM callable callback docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
+fn test_header_dom_definer_descriptor_handler_fields_are_c_function_pointers() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for marker in [
+        "Option_StatorDomCallAsFunctionCb",
+        "Option_StatorDomConstructCb",
+        "Option_StatorDomIndexedDefinerCb",
+        "Option_StatorDomIndexedDescriptorCb",
+        "Option_StatorDomNamedDefinerCb",
+        "Option_StatorDomNamedDescriptorCb",
+        "Option_StatorDomNamedSymbolDefinerCb",
+        "Option_StatorDomNamedSymbolDescriptorCb",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should expose nullable DOM callback fields as C function pointers, not opaque `{marker}`"
+        );
+    }
+
+    for signature in [
+        "enum StatorStatus (*definer)(const char *name_utf8,\n                               size_t name_len,\n                               const struct StatorDomPropertyDescriptor *descriptor,\n                               void *data);",
+        "enum StatorStatus (*descriptor)(const char *name_utf8,\n                                  size_t name_len,\n                                  void *data,\n                                  struct StatorDomPropertyDescriptor *out_descriptor);",
+        "enum StatorStatus (*symbol_definer)(const struct StatorDomSymbolKey *key,\n                                      const struct StatorDomPropertyDescriptor *descriptor,\n                                      void *data);",
+        "enum StatorStatus (*symbol_descriptor)(const struct StatorDomSymbolKey *key,\n                                         void *data,\n                                         struct StatorDomPropertyDescriptor *out_descriptor);",
+        "enum StatorStatus (*definer)(uint32_t index,\n                               const struct StatorDomPropertyDescriptor *descriptor,\n                               void *data);",
+        "enum StatorStatus (*descriptor)(uint32_t index,\n                                  void *data,\n                                  struct StatorDomPropertyDescriptor *out_descriptor);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM definer/descriptor callback field drifted:\n{signature}"
         );
     }
 }

@@ -1159,22 +1159,6 @@ typedef enum StatorNativeCodeCacheTier {
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
 
-typedef struct Option_StatorDomCallAsFunctionCb Option_StatorDomCallAsFunctionCb;
-
-typedef struct Option_StatorDomConstructCb Option_StatorDomConstructCb;
-
-typedef struct Option_StatorDomIndexedDefinerCb Option_StatorDomIndexedDefinerCb;
-
-typedef struct Option_StatorDomIndexedDescriptorCb Option_StatorDomIndexedDescriptorCb;
-
-typedef struct Option_StatorDomNamedDefinerCb Option_StatorDomNamedDefinerCb;
-
-typedef struct Option_StatorDomNamedDescriptorCb Option_StatorDomNamedDescriptorCb;
-
-typedef struct Option_StatorDomNamedSymbolDefinerCb Option_StatorDomNamedSymbolDefinerCb;
-
-typedef struct Option_StatorDomNamedSymbolDescriptorCb Option_StatorDomNamedSymbolDescriptorCb;
-
 typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
 
 typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTemplateCallback;
@@ -3130,11 +3114,19 @@ typedef struct StatorDomCallableHandler {
   /**
    * Call-as-function callback, or null to leave ordinary calls unsupported.
    */
-  struct Option_StatorDomCallAsFunctionCb call;
+  enum StatorStatus (*call)(const struct StatorValue *receiver,
+                            const struct StatorValue *const *args,
+                            size_t arg_count,
+                            void *data,
+                            struct StatorValue **out);
   /**
    * Construct callback, or null to leave `new wrapper(...)` unsupported.
    */
-  struct Option_StatorDomConstructCb construct;
+  enum StatorStatus (*construct)(const struct StatorValue *new_target,
+                                 const struct StatorValue *const *args,
+                                 size_t arg_count,
+                                 void *data,
+                                 struct StatorValue **out);
   /**
    * Opaque embedder data passed to both callbacks.
    */
@@ -3222,19 +3214,29 @@ typedef struct StatorDomNamedDefinerDescriptorHandler {
   /**
    * String-keyed definer, or null.
    */
-  struct Option_StatorDomNamedDefinerCb definer;
+  enum StatorStatus (*definer)(const char *name_utf8,
+                               size_t name_len,
+                               const struct StatorDomPropertyDescriptor *descriptor,
+                               void *data);
   /**
    * String-keyed descriptor callback, or null.
    */
-  struct Option_StatorDomNamedDescriptorCb descriptor;
+  enum StatorStatus (*descriptor)(const char *name_utf8,
+                                  size_t name_len,
+                                  void *data,
+                                  struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Symbol-keyed definer, or null.
    */
-  struct Option_StatorDomNamedSymbolDefinerCb symbol_definer;
+  enum StatorStatus (*symbol_definer)(const struct StatorDomSymbolKey *key,
+                                      const struct StatorDomPropertyDescriptor *descriptor,
+                                      void *data);
   /**
    * Symbol-keyed descriptor callback, or null.
    */
-  struct Option_StatorDomNamedSymbolDescriptorCb symbol_descriptor;
+  enum StatorStatus (*symbol_descriptor)(const struct StatorDomSymbolKey *key,
+                                         void *data,
+                                         struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Opaque embedder data passed to every callback.
    */
@@ -3248,11 +3250,15 @@ typedef struct StatorDomIndexedDefinerDescriptorHandler {
   /**
    * Indexed definer, or null.
    */
-  struct Option_StatorDomIndexedDefinerCb definer;
+  enum StatorStatus (*definer)(uint32_t index,
+                               const struct StatorDomPropertyDescriptor *descriptor,
+                               void *data);
   /**
    * Indexed descriptor callback, or null.
    */
-  struct Option_StatorDomIndexedDescriptorCb descriptor;
+  enum StatorStatus (*descriptor)(uint32_t index,
+                                  void *data,
+                                  struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Opaque embedder data passed to every callback.
    */

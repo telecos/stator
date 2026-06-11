@@ -21602,9 +21602,25 @@ pub type StatorDomConstructCb = unsafe extern "C" fn(
 #[derive(Copy, Clone)]
 pub struct StatorDomCallableHandler {
     /// Call-as-function callback, or null to leave ordinary calls unsupported.
-    pub call: Option<StatorDomCallAsFunctionCb>,
+    pub call: Option<
+        unsafe extern "C" fn(
+            receiver: *const StatorValue,
+            args: *const *const StatorValue,
+            arg_count: usize,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
     /// Construct callback, or null to leave `new wrapper(...)` unsupported.
-    pub construct: Option<StatorDomConstructCb>,
+    pub construct: Option<
+        unsafe extern "C" fn(
+            new_target: *const StatorValue,
+            args: *const *const StatorValue,
+            arg_count: usize,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to both callbacks.
     pub data: *mut c_void,
 }
@@ -21726,13 +21742,39 @@ pub type StatorDomIndexedDescriptorCb = unsafe extern "C" fn(
 #[derive(Copy, Clone)]
 pub struct StatorDomNamedDefinerDescriptorHandler {
     /// String-keyed definer, or null.
-    pub definer: Option<StatorDomNamedDefinerCb>,
+    pub definer: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// String-keyed descriptor callback, or null.
-    pub descriptor: Option<StatorDomNamedDescriptorCb>,
+    pub descriptor: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Symbol-keyed definer, or null.
-    pub symbol_definer: Option<StatorDomNamedSymbolDefinerCb>,
+    pub symbol_definer: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Symbol-keyed descriptor callback, or null.
-    pub symbol_descriptor: Option<StatorDomNamedSymbolDescriptorCb>,
+    pub symbol_descriptor: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }
@@ -21742,9 +21784,21 @@ pub struct StatorDomNamedDefinerDescriptorHandler {
 #[derive(Copy, Clone)]
 pub struct StatorDomIndexedDefinerDescriptorHandler {
     /// Indexed definer, or null.
-    pub definer: Option<StatorDomIndexedDefinerCb>,
+    pub definer: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Indexed descriptor callback, or null.
-    pub descriptor: Option<StatorDomIndexedDescriptorCb>,
+    pub descriptor: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }
