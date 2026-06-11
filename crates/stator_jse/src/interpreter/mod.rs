@@ -27640,9 +27640,7 @@ mod tests {
 
     // ΓöÇΓöÇ LdaNamedPropertyFromSuper ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-    // NOTE: LdaNamedPropertyFromSuper bytecode-level test ΓÇö super property lookup not fully wired
     #[test]
-    #[ignore]
     fn test_lda_named_property_from_super() {
         let ba = make_bytecode_with_pool(
             vec![
@@ -27658,7 +27656,9 @@ mod tests {
                         Operand::FeedbackSlot(0),
                     ],
                 ),
-                // LdaNamedPropertyFromSuper reads from reg 0
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                // LdaNamedPropertyFromSuper starts lookup from the accumulator;
+                // operand 0 is the receiver that accessors would observe.
                 Instruction::new_unchecked(
                     Opcode::LdaNamedPropertyFromSuper,
                     vec![
