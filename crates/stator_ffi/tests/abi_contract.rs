@@ -308,6 +308,27 @@ fn test_header_status_discriminants_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_module_cache_status_discriminants_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorModuleCacheStatusProducedMetadata", 0),
+        ("StatorModuleCacheStatusAcceptedValidatedRecompiled", 1),
+        ("StatorModuleCacheStatusInvalidArgument", 2),
+        ("StatorModuleCacheStatusCompileError", 3),
+        ("StatorModuleCacheStatusRejected", 4),
+        ("StatorModuleCacheStatusUnsupported", 5),
+        ("StatorModuleCacheStatusAcceptedBytecodeRestored", 6),
+        ("StatorModuleCacheStatusCorruptPayload", 7),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable module cache status discriminant `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_native_code_cache_function_signatures_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [

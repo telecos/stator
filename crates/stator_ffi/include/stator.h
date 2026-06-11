@@ -523,9 +523,9 @@ typedef enum StatorModuleType {
    * Currently fail-closed unsupported. Stator has no CSS parser and no
    * `CSSStyleSheet` object representation, so CSS module bodies cannot be
    * parsed, evaluated, or restored from a code cache. Compilation always
-   * returns an errored [`StatorModule`] tagged with this `source_type`,
+   * returns an errored `StatorModule` tagged with this `source_type`,
    * `stator_module_create_code_cache` reports
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`], and
+   * `StatorModuleCacheStatusUnsupported`, and
    * `stator_module_compile_cached` rejects CSS source with the same
    * status. Resolving a request that carries `with { type: "css" }` to a
    * non-CSS module is a type mismatch like every other typed import.
@@ -549,7 +549,7 @@ typedef enum StatorModuleCacheStatus {
    * payloads store validated source bytes plus parsed import/export metadata;
    * until a safe compiled-artifact deserializer is available they are
    * accepted with
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
+   * `StatorModuleCacheStatusAcceptedValidatedRecompiled`.
    */
   StatorModuleCacheStatusProducedMetadata = 0,
   /**
@@ -587,7 +587,7 @@ typedef enum StatorModuleCacheStatus {
    * checksum failed to verify. The bytes after the format-version field
    * are corrupt, truncated, or were tampered with after production. The
    * blob is fail-closed rejected. This status is distinct from
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`], which
+   * `StatorModuleCacheStatusRejected`, which
    * covers source/options/metadata mismatches; embedders can use the
    * distinction to decide whether to evict the blob from disk versus
    * recompile under the new options.
