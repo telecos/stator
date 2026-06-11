@@ -1008,6 +1008,15 @@ fn test_header_script_cache_discriminants_match_abi() {
             "generated stator.h is missing stable script cache discriminant `{marker}`"
         );
     }
+    for signature in [
+        "const char *stator_script_cache_status_name_u32(uint32_t status);",
+        "const char *stator_script_cache_diagnostic_name_u32(uint32_t diagnostic);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h script cache telemetry name signature drifted:\n{signature}"
+        );
+    }
 }
 
 #[test]

@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 28
+#define STATOR_FFI_ABI_VERSION_MINOR 29
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5165,6 +5165,30 @@ size_t stator_heap_used(const struct StatorIsolate *isolate);
  * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_heap_capacity(const struct StatorIsolate *isolate);
+
+/**
+ * Return a stable telemetry code string for a raw classic-script cache status.
+ *
+ * Unknown or future status values return `"unknown_status"` rather than
+ * requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_script_cache_status_name_u32(uint32_t status);
+
+/**
+ * Return a stable telemetry code string for a raw classic-script cache diagnostic.
+ *
+ * Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+ * than requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_script_cache_diagnostic_name_u32(uint32_t diagnostic);
 
 /**
  * Allocate a new owned [`StatorString`] from `len` UTF-8 bytes at `data`.

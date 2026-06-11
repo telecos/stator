@@ -95,7 +95,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 28;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 29;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -4097,6 +4097,62 @@ pub enum StatorScriptCacheDiagnostic {
     StatorScriptCacheDiagnosticCompileError = 6,
     /// Operation is unsupported for this build or input shape.
     StatorScriptCacheDiagnosticUnsupported = 7,
+}
+
+fn script_cache_status_name_bytes_u32(status: u32) -> &'static [u8] {
+    match status {
+        0 => b"produced_metadata\0",
+        1 => b"accepted_bytecode_restored\0",
+        2 => b"accepted_validated_recompiled\0",
+        3 => b"invalid_argument\0",
+        4 => b"compile_error\0",
+        5 => b"rejected\0",
+        6 => b"unsupported\0",
+        7 => b"corrupt_payload\0",
+        _ => b"unknown_status\0",
+    }
+}
+
+fn script_cache_diagnostic_name_bytes_u32(diagnostic: u32) -> &'static [u8] {
+    match diagnostic {
+        0 => b"none\0",
+        1 => b"magic_mismatch\0",
+        2 => b"version_mismatch\0",
+        3 => b"source_mismatch\0",
+        4 => b"options_mismatch\0",
+        5 => b"corrupt_payload\0",
+        6 => b"compile_error\0",
+        7 => b"unsupported\0",
+        _ => b"unknown_diagnostic\0",
+    }
+}
+
+/// Return a stable telemetry code string for a raw classic-script cache status.
+///
+/// Unknown or future status values return `"unknown_status"` rather than
+/// requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_script_cache_status_name_u32(status: u32) -> *const c_char {
+    script_cache_status_name_bytes_u32(status).as_ptr().cast()
+}
+
+/// Return a stable telemetry code string for a raw classic-script cache diagnostic.
+///
+/// Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+/// than requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_script_cache_diagnostic_name_u32(diagnostic: u32) -> *const c_char {
+    script_cache_diagnostic_name_bytes_u32(diagnostic)
+        .as_ptr()
+        .cast()
 }
 
 /// Telemetry returned by classic-script code-cache APIs.
@@ -26052,6 +26108,115 @@ mod tests {
         assert_eq!(
             StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported as u32,
             7
+        );
+    }
+
+    #[test]
+    fn test_script_code_cache_stable_status_and_diagnostic_name_mapping() {
+        let statuses = [
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata as u32,
+                "produced_metadata",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored as u32,
+                "accepted_bytecode_restored",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedValidatedRecompiled as u32,
+                "accepted_validated_recompiled",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument as u32,
+                "invalid_argument",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusRejected as u32,
+                "rejected",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported as u32,
+                "unsupported",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+        ];
+        for (status, expected) in statuses {
+            let ptr = stator_script_cache_status_name_u32(status);
+            assert!(
+                !ptr.is_null(),
+                "status name pointer must be non-null for {status}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown_status = stator_script_cache_status_name_u32(999);
+        assert!(!unknown_status.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown_status) }.to_str().unwrap(),
+            "unknown_status"
+        );
+
+        let diagnostics = [
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone as u32,
+                "none",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticMagicMismatch as u32,
+                "magic_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticVersionMismatch as u32,
+                "version_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch as u32,
+                "source_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticOptionsMismatch as u32,
+                "options_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported as u32,
+                "unsupported",
+            ),
+        ];
+        for (diagnostic, expected) in diagnostics {
+            let ptr = stator_script_cache_diagnostic_name_u32(diagnostic);
+            assert!(
+                !ptr.is_null(),
+                "diagnostic name pointer must be non-null for {diagnostic}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown_diagnostic = stator_script_cache_diagnostic_name_u32(999);
+        assert!(!unknown_diagnostic.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown_diagnostic) }
+                .to_str()
+                .unwrap(),
+            "unknown_diagnostic"
         );
     }
 
