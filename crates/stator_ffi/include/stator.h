@@ -3677,22 +3677,22 @@ typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_
  * `(name_utf8, name_len)` — it is **not** required to be null-terminated.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] — the interceptor handled the read and
- *   wrote a non-null [`StatorValue`] pointer into `*out`.  Ownership of the
+ * * `StatorStatusOk` — the interceptor handled the read and
+ *   wrote a non-null `StatorValue` pointer into `*out`.  Ownership of the
  *   value transfers to Stator, which will destroy it once consumed.
- * * [`StatorStatus::StatorStatusFalse`] — the interceptor did not handle the
+ * * `StatorStatusFalse` — the interceptor did not handle the
  *   read; the engine falls through to the wrapper's own properties.  `*out`
  *   is ignored.
- * * [`StatorStatus::StatorStatusException`] — the embedder raised an
+ * * `StatorStatusException` — the embedder raised an
  *   exception.  If the callback did not populate the isolate's pending
- *   exception via [`stator_isolate_throw_exception`], the FFI bridge records a
+ *   exception via `stator_isolate_throw_exception`, the FFI bridge records a
  *   generic DOM-interceptor exception before the wrapper-backed global
  *   accessor thunk fails script execution.
  * * Any other status is treated as fall-through.
  *
  * # Safety
  * - `name_utf8` must be valid for `name_len` bytes.
- * - `out` must be a writable `*mut StatorValue` slot if [`StatorStatus::StatorStatusOk`]
+ * - `out` must be a writable `StatorValue**` slot if `StatorStatusOk`
  *   is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedGetterCbV2)(const char *name_utf8,
@@ -3703,15 +3703,15 @@ typedef enum StatorStatus (*StatorDomNamedGetterCbV2)(const char *name_utf8,
 /**
  * V2 named-property **setter** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
+ * Returns `StatorStatusOk` to indicate the write was handled
  * (engine will not fall through to the wrapper's own properties),
- * [`StatorStatus::StatorStatusFalse`] for fall-through, or
- * [`StatorStatus::StatorStatusException`] to fail wrapper-backed global
+ * `StatorStatusFalse` for fall-through, or
+ * `StatorStatusException` to fail wrapper-backed global
  * access with a pending exception.
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `value` must be either
- * null or a valid, live [`StatorValue`] pointer borrowed for the call.
+ * null or a valid, live `StatorValue` pointer borrowed for the call.
  */
 typedef enum StatorStatus (*StatorDomNamedSetterCbV2)(const char *name_utf8,
                                                       size_t name_len,
@@ -3721,14 +3721,14 @@ typedef enum StatorStatus (*StatorDomNamedSetterCbV2)(const char *name_utf8,
 /**
  * V2 named-property **query** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] when the property exists (writing
+ * Returns `StatorStatusOk` when the property exists (writing
  * `v8::PropertyAttribute` flags into `*out_attrs`; `0` = `None`),
- * [`StatorStatus::StatorStatusFalse`] when it does not exist, or
- * [`StatorStatus::StatorStatusException`] (treated as missing).
+ * `StatorStatusFalse` when it does not exist, or
+ * `StatorStatusException` (treated as missing).
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `out_attrs` must be a
- * writable `*mut u32` slot if [`StatorStatus::StatorStatusOk`] is returned.
+ * writable `uint32_t *` slot if `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedQueryCb)(const char *name_utf8,
                                                    size_t name_len,
@@ -3738,16 +3738,16 @@ typedef enum StatorStatus (*StatorDomNamedQueryCb)(const char *name_utf8,
 /**
  * V2 named-property **deleter** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] to indicate the interceptor
+ * Returns `StatorStatusOk` to indicate the interceptor
  * handled the delete and wrote the JS-visible "deleted" result into
  * `*out_deleted` (`true` for successful delete, `false` for non-configurable
- * / refused).  [`StatorStatus::StatorStatusFalse`] falls through to the
- * wrapper's own properties.  [`StatorStatus::StatorStatusException`] is
+ * / refused).  `StatorStatusFalse` falls through to the
+ * wrapper's own properties.  `StatorStatusException` is
  * treated as fall-through.
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `out_deleted` must be a
- * writable `*mut bool` slot if [`StatorStatus::StatorStatusOk`] is returned.
+ * writable `bool *` slot if `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedDeleterCb)(const char *name_utf8,
                                                      size_t name_len,
@@ -3758,7 +3758,7 @@ typedef enum StatorStatus (*StatorDomNamedDeleterCb)(const char *name_utf8,
  * V2 named-property **enumerator** callback.
  *
  * The callback should push each materializable own string name into `buf` via
- * [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
+ * `stator_dom_name_buffer_push` and return `StatorStatusOk`
  * on success.  Query or descriptor callbacks provide attributes that determine
  * which returned names are enumerable.  Any other status is treated as
  * "no names produced".
@@ -3772,12 +3772,12 @@ typedef enum StatorStatus (*StatorDomNamedEnumeratorCb)(struct StatorDomNameBuff
 /**
  * V2 indexed-property **getter** callback.
  *
- * Semantics mirror [`StatorDomNamedGetterCbV2`] but the property key is a
+ * Semantics mirror `StatorDomNamedGetterCbV2` but the property key is a
  * numeric `u32` index.
  *
  * # Safety
- * `out` must be a writable `*mut StatorValue` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out` must be a writable `StatorValue**` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedGetterCbV2)(uint32_t index,
                                                         void *data,
@@ -3786,10 +3786,10 @@ typedef enum StatorStatus (*StatorDomIndexedGetterCbV2)(uint32_t index,
 /**
  * V2 indexed-property **setter** callback.
  *
- * Semantics mirror [`StatorDomNamedSetterCbV2`] for indexed access.
+ * Semantics mirror `StatorDomNamedSetterCbV2` for indexed access.
  *
  * # Safety
- * `value` must be either null or a valid, live [`StatorValue`] pointer
+ * `value` must be either null or a valid, live `StatorValue` pointer
  * borrowed for the call.
  */
 typedef enum StatorStatus (*StatorDomIndexedSetterCbV2)(uint32_t index,
@@ -3799,25 +3799,25 @@ typedef enum StatorStatus (*StatorDomIndexedSetterCbV2)(uint32_t index,
 /**
  * V2 indexed-property **query** callback.
  *
- * Semantics mirror [`StatorDomNamedQueryCb`] for indexed access.
+ * Semantics mirror `StatorDomNamedQueryCb` for indexed access.
  *
  * # Safety
- * `out_attrs` must be a writable `*mut u32` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out_attrs` must be a writable `uint32_t *` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedQueryCb)(uint32_t index, void *data, uint32_t *out_attrs);
 
 /**
  * V2 indexed-collection **length** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] with the collection length
+ * Returns `StatorStatusOk` with the collection length
  * written into `*out_len`.  Any other status is treated as "length unknown"
  * and the engine observes `0` — embedders should therefore reserve other
  * statuses for genuine error conditions, never for ordinary length queries.
  *
  * # Safety
- * `out_len` must be a writable `*mut u32` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out_len` must be a writable `uint32_t *` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedLengthCb)(void *data, uint32_t *out_len);
 

@@ -507,6 +507,36 @@ fn test_header_dom_callable_callback_typedefs_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_dom_v2_callback_docs_use_c_friendly_names() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    let start = header
+        .find("V2 named-property **getter** callback.")
+        .expect("generated stator.h should document DOM V2 callbacks");
+    let end = start
+        + header[start..]
+            .find("Return the packed Stator FFI ABI version compiled into this library.")
+            .expect("generated stator.h should document ABI version APIs after callback typedefs");
+    let docs = &header[start..end];
+    for marker in [
+        "StatorStatus::",
+        "[`StatorValue`]",
+        "[`stator_isolate_throw_exception`]",
+        "[`stator_dom_name_buffer_push`]",
+        "[`stator_dom_index_buffer_push`]",
+        "[`StatorDomNamedGetterCbV2`]",
+        "[`StatorDomNamedSetterCbV2`]",
+        "[`StatorDomNamedQueryCb`]",
+        "stator_jse::dom::IndexedDeleterResult",
+        "*mut ",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h DOM V2 callback docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
