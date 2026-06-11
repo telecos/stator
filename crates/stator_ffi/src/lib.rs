@@ -346,7 +346,7 @@ pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
 /// call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -361,7 +361,7 @@ pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
 /// Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -376,7 +376,7 @@ pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
 /// equivalent to clearing it.  Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_set_data(
     isolate: *mut StatorIsolate,
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn stator_isolate_set_data(
 /// Returns a null pointer when `isolate` is null or `slot` has not been set.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_get_data(
     isolate: *const StatorIsolate,
@@ -450,7 +450,7 @@ pub unsafe extern "C" fn stator_isolate_get_data(
 /// Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut StatorIsolate) {
     if isolate.is_null() {
@@ -476,7 +476,7 @@ pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut Stator
 /// Safe to call from any thread.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut StatorIsolate) {
     if isolate.is_null() {
@@ -492,7 +492,7 @@ pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut
 /// Returns `false` when `isolate` is null.  Safe to call from any thread.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
     isolate: *const StatorIsolate,
@@ -513,7 +513,7 @@ pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
 /// raw pointer and does not free it.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 /// - `exception` must be either null or a valid, live [`StatorValue`] pointer
 ///   that outlives the pending-exception window.
 #[unsafe(no_mangle)]
@@ -532,7 +532,7 @@ pub unsafe extern "C" fn stator_isolate_throw_exception(
 /// most recent one was destroyed).
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_get_current_context(
     isolate: *const StatorIsolate,
@@ -549,7 +549,7 @@ pub unsafe extern "C" fn stator_isolate_get_current_context(
 /// Returns `false` when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_has_pending_exception(
     isolate: *const StatorIsolate,
@@ -568,7 +568,7 @@ pub unsafe extern "C" fn stator_isolate_has_pending_exception(
 /// [`stator_value_destroy`].
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_clear_pending_exception(
     isolate: *mut StatorIsolate,
@@ -1878,7 +1878,7 @@ unsafe impl Send for StatorContext {}
 /// [`stator_context_destroy`] clears the current-context slot when it matches.
 ///
 /// # Safety
-/// `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut StatorContext {
     if isolate.is_null() {
@@ -2524,7 +2524,7 @@ unsafe fn allocate_stator_value(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_number(
     isolate: *mut StatorIsolate,
@@ -2558,7 +2558,7 @@ pub unsafe extern "C" fn stator_value_new_number(
 /// pointer if `isolate` or `data` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `data` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_string(
@@ -2598,7 +2598,7 @@ pub unsafe extern "C" fn stator_value_new_string(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_boolean(
     isolate: *mut StatorIsolate,
@@ -2630,7 +2630,7 @@ pub unsafe extern "C" fn stator_value_new_boolean(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_undefined(
     isolate: *mut StatorIsolate,
@@ -2661,7 +2661,7 @@ pub unsafe extern "C" fn stator_value_new_undefined(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_null(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2690,7 +2690,7 @@ pub unsafe extern "C" fn stator_value_new_null(isolate: *mut StatorIsolate) -> *
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_object(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2716,7 +2716,7 @@ pub unsafe extern "C" fn stator_value_new_object(isolate: *mut StatorIsolate) ->
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_function_tag(
     isolate: *mut StatorIsolate,
@@ -2744,7 +2744,7 @@ pub unsafe extern "C" fn stator_value_new_function_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_array_tag(
     isolate: *mut StatorIsolate,
@@ -2772,7 +2772,7 @@ pub unsafe extern "C" fn stator_value_new_array_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_date_tag(
     isolate: *mut StatorIsolate,
@@ -2800,7 +2800,7 @@ pub unsafe extern "C" fn stator_value_new_date_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_regexp_tag(
     isolate: *mut StatorIsolate,
@@ -2828,7 +2828,7 @@ pub unsafe extern "C" fn stator_value_new_regexp_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_promise_tag(
     isolate: *mut StatorIsolate,
@@ -2881,7 +2881,7 @@ fn active_or_new_microtask_queue() -> MicrotaskQueue {
 /// `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_promise_new_pending(
     isolate: *mut StatorIsolate,
@@ -3022,7 +3022,7 @@ pub unsafe extern "C" fn stator_promise_result(promise: *const StatorValue) -> *
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_map_tag(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -3048,7 +3048,7 @@ pub unsafe extern "C" fn stator_value_new_map_tag(isolate: *mut StatorIsolate) -
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_set_tag(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -3079,7 +3079,7 @@ pub unsafe extern "C" fn stator_value_new_set_tag(isolate: *mut StatorIsolate) -
 /// pointer if `isolate` or `data` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `data` must be valid for reads of `len` bytes and must point to valid
 ///   UTF-8 data.
 #[unsafe(no_mangle)]
@@ -3163,7 +3163,7 @@ pub unsafe extern "C" fn stator_string_write_utf8(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_number_new(
     isolate: *mut StatorIsolate,
@@ -3180,7 +3180,7 @@ pub unsafe extern "C" fn stator_number_new(
 /// null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_integer_new(
     isolate: *mut StatorIsolate,
@@ -3195,7 +3195,7 @@ pub unsafe extern "C" fn stator_integer_new(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_boolean_new(
     isolate: *mut StatorIsolate,
@@ -3210,7 +3210,7 @@ pub unsafe extern "C" fn stator_boolean_new(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_undefined_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
     // SAFETY: delegated to `stator_value_new_undefined`.
@@ -3222,7 +3222,7 @@ pub unsafe extern "C" fn stator_undefined_new(isolate: *mut StatorIsolate) -> *m
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_null_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
     // SAFETY: delegated to `stator_value_new_null`.
@@ -3684,7 +3684,7 @@ fn plain_object_own_property_keys(inner: &Rc<RefCell<PropertyMap>>) -> Vec<Strin
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_new(isolate: *mut StatorIsolate) -> *mut StatorObject {
     if isolate.is_null() {
@@ -3923,7 +3923,7 @@ pub unsafe extern "C" fn stator_property_names_destroy(names: *mut StatorPropert
 /// model; it is equivalent to [`stator_isolate_gc`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -3947,7 +3947,7 @@ pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_live_object_count(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -3963,7 +3963,7 @@ pub unsafe extern "C" fn stator_live_object_count(isolate: *const StatorIsolate)
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_heap_used(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -3979,7 +3979,7 @@ pub unsafe extern "C" fn stator_heap_used(isolate: *const StatorIsolate) -> usiz
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_heap_capacity(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -13253,7 +13253,7 @@ pub unsafe extern "C" fn stator_value_to_number(val: *const StatorValue) -> f64 
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `val` must be either null or a valid, live [`StatorValue`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_to_string(
@@ -14455,7 +14455,7 @@ unsafe impl Send for StatorFunctionTemplate {}
 /// pass the returned pointer to [`stator_function_template_destroy`].
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `callback` must remain valid for the lifetime of the template.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_function_template_new(
@@ -16618,7 +16618,7 @@ unsafe impl Send for StatorHandleScope {}
 /// pass the returned pointer to [`stator_handle_scope_close`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_handle_scope_new(
     isolate: *mut StatorIsolate,
@@ -16699,7 +16699,7 @@ unsafe impl Send for StatorEscapableHandleScope {}
 /// pass the returned pointer to [`stator_escapable_handle_scope_close`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_escapable_handle_scope_new(
     isolate: *mut StatorIsolate,
@@ -16875,7 +16875,7 @@ unsafe impl Send for StatorObjectTemplate {}
 /// pass the returned pointer to [`stator_object_template_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_template_new(
     isolate: *mut StatorIsolate,
@@ -17413,7 +17413,7 @@ pub unsafe extern "C" fn stator_message_destroy(msg: *mut StatorMessage) {
 ///
 /// # Safety
 /// `isolate` must be either null or a valid pointer to a live
-/// [`StatorIsolate`].
+/// `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_peek_pending_message(
     isolate: *const StatorIsolate,
@@ -17441,7 +17441,7 @@ pub unsafe extern "C" fn stator_isolate_peek_pending_message(
 ///
 /// # Safety
 /// `isolate` must be either null or a valid pointer to a live
-/// [`StatorIsolate`].
+/// `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_take_pending_message(
     isolate: *mut StatorIsolate,
@@ -17513,7 +17513,7 @@ unsafe impl Send for StatorTryCatch {}
 /// pass the returned pointer to [`stator_try_catch_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_try_catch_new(isolate: *mut StatorIsolate) -> *mut StatorTryCatch {
     if isolate.is_null() {
@@ -18571,7 +18571,7 @@ pub unsafe extern "C" fn stator_wasm_streaming_destroy(
 /// [`stator_wasm_module_destroy`] to free all associated resources.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `bytes` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_wasm_compile(
@@ -19181,7 +19181,7 @@ pub unsafe extern "C" fn stator_wasm_exports_destroy(exports: *mut *mut c_char) 
 /// # Safety
 /// - `instance` must be a non-null, valid pointer to a live
 ///   [`StatorWasmInstance`].
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `name` must be a valid, null-terminated C string.
 /// - `args` must be valid for reads of `args_len` pointers; each non-null
 ///   element must be a valid, live [`StatorValue`] pointer.
@@ -19715,7 +19715,7 @@ unsafe impl Send for StatorDomObjectWrap {}
 /// the returned pointer to [`stator_dom_object_wrap_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_new(
     isolate: *mut StatorIsolate,
@@ -20059,7 +20059,7 @@ unsafe impl Send for StatorDomWeakRef {}
 /// `clear`, `destroy`) are therefore safe.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn dispatch_dom_weak_callbacks(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
@@ -20476,7 +20476,7 @@ fn dom_class_registry_matches(
 /// [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `name` must point to `name_len` bytes when `name_len > 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_register(
@@ -20523,7 +20523,7 @@ pub unsafe extern "C" fn stator_dom_class_id_register(
 /// registered child, and `InvalidArg` for null isolate or class id 0.
 ///
 /// # Safety
-/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_unregister(
     isolate: *mut StatorIsolate,
@@ -20545,7 +20545,7 @@ pub unsafe extern "C" fn stator_dom_class_id_unregister(
 /// output is zero-cleared so callers cannot observe stale pointers.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `out_info` must be null or valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_query(
@@ -20612,7 +20612,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_is_class(
 /// values whose wrapper has already been destroyed.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `value` must be null or a valid, live [`StatorValue`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_is_dom_object_wrap_class(
@@ -23841,7 +23841,7 @@ pub unsafe extern "C" fn stator_context_perform_microtask_checkpoint(
 /// queue is active.
 ///
 /// # Safety
-/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_perform_microtask_checkpoint(
     isolate: *mut StatorIsolate,
@@ -25059,7 +25059,7 @@ impl WeakRef {
 /// receives as a `*mut StatorWeak`.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn install_weak_slot(
     isolate: *mut StatorIsolate,
@@ -25106,7 +25106,7 @@ unsafe fn install_weak_slot(
 /// skipped — guaranteeing the one-shot contract from `docs/handles.md` §2.3.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn dispatch_weak_callbacks(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
@@ -25782,7 +25782,7 @@ pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
 /// Null-tolerant: passing null `isolate` is a no-op.
 ///
 /// # Safety
-/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// The supplied `userdata` is passed verbatim to the callback; its
 /// lifetime is entirely the embedder's responsibility and must outlive
 /// the registration.
@@ -25862,7 +25862,7 @@ pub unsafe extern "C" fn stator_traced_visitor_visit(
 /// call and must not reset or dispose it.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `host` must be null or a valid, live [`StatorValue`] pointer.
 /// - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
 ///   embedder's responsibility.
@@ -25926,7 +25926,7 @@ pub unsafe extern "C" fn stator_traced_visit_outgoing(
 /// `Rc` strong count is already zero are skipped.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by
 /// the current thread.
 unsafe fn dispatch_traced_visitor(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned here.

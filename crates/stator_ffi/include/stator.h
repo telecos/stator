@@ -3906,7 +3906,7 @@ void stator_isolate_dispose(struct StatorIsolate *isolate);
  * call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_enter(struct StatorIsolate *isolate);
 
@@ -3917,7 +3917,7 @@ void stator_isolate_enter(struct StatorIsolate *isolate);
  * Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_exit(struct StatorIsolate *isolate);
 
@@ -3928,7 +3928,7 @@ void stator_isolate_exit(struct StatorIsolate *isolate);
  * equivalent to clearing it.  Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void *data);
 
@@ -3938,7 +3938,7 @@ void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void 
  * Returns a null pointer when `isolate` is null or `slot` has not been set.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot);
 
@@ -3974,7 +3974,7 @@ void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot
  * Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
 
@@ -3988,7 +3988,7 @@ void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
  * Safe to call from any thread.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
 
@@ -3999,7 +3999,7 @@ void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
  * Returns `false` when `isolate` is null.  Safe to call from any thread.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate);
 
@@ -4013,7 +4013,7 @@ bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate
  * raw pointer and does not free it.
  *
  * # Safety
- * - `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  * - `exception` must be either null or a valid, live [`StatorValue`] pointer
  *   that outlives the pending-exception window.
  */
@@ -4027,7 +4027,7 @@ void stator_isolate_throw_exception(struct StatorIsolate *isolate, struct Stator
  * most recent one was destroyed).
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 struct StatorContext *stator_isolate_get_current_context(const struct StatorIsolate *isolate);
 
@@ -4037,7 +4037,7 @@ struct StatorContext *stator_isolate_get_current_context(const struct StatorIsol
  * Returns `false` when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 bool stator_isolate_has_pending_exception(const struct StatorIsolate *isolate);
 
@@ -4049,7 +4049,7 @@ bool stator_isolate_has_pending_exception(const struct StatorIsolate *isolate);
  * [`stator_value_destroy`].
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 struct StatorValue *stator_isolate_clear_pending_exception(struct StatorIsolate *isolate);
 
@@ -4305,7 +4305,7 @@ bool stator_isolate_jit_disabled(const struct StatorIsolate *isolate);
  * [`stator_context_destroy`] clears the current-context slot when it matches.
  *
  * # Safety
- * `isolate` must be null or a valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 struct StatorContext *stator_context_new(struct StatorIsolate *isolate);
 
@@ -4535,7 +4535,7 @@ bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_number(struct StatorIsolate *isolate, double val);
 
@@ -4547,7 +4547,7 @@ struct StatorValue *stator_value_new_number(struct StatorIsolate *isolate, doubl
  * pointer if `isolate` or `data` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `data` must be valid for reads of `len` bytes.
  */
 struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
@@ -4560,7 +4560,7 @@ struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool val);
 
@@ -4570,7 +4570,7 @@ struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
 
@@ -4580,7 +4580,7 @@ struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
 
@@ -4590,7 +4590,7 @@ struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_object(struct StatorIsolate *isolate);
 
@@ -4600,7 +4600,7 @@ struct StatorValue *stator_value_new_object(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_function_tag(struct StatorIsolate *isolate);
 
@@ -4610,7 +4610,7 @@ struct StatorValue *stator_value_new_function_tag(struct StatorIsolate *isolate)
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_array_tag(struct StatorIsolate *isolate);
 
@@ -4620,7 +4620,7 @@ struct StatorValue *stator_value_new_array_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_date_tag(struct StatorIsolate *isolate);
 
@@ -4630,7 +4630,7 @@ struct StatorValue *stator_value_new_date_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
 
@@ -4640,7 +4640,7 @@ struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
 
@@ -4653,7 +4653,7 @@ struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
  * `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_promise_new_pending(struct StatorIsolate *isolate);
 
@@ -4712,7 +4712,7 @@ struct StatorValue *stator_promise_result(const struct StatorValue *promise);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
 
@@ -4722,7 +4722,7 @@ struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
 
@@ -4735,7 +4735,7 @@ struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
  * pointer if `isolate` or `data` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `data` must be valid for reads of `len` bytes and must point to valid
  *   UTF-8 data.
  */
@@ -4779,7 +4779,7 @@ size_t stator_string_write_utf8(const struct StatorValue *val,
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_number_new(struct StatorIsolate *isolate, double val);
 
@@ -4791,7 +4791,7 @@ struct StatorValue *stator_number_new(struct StatorIsolate *isolate, double val)
  * null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_integer_new(struct StatorIsolate *isolate, int64_t val);
 
@@ -4801,7 +4801,7 @@ struct StatorValue *stator_integer_new(struct StatorIsolate *isolate, int64_t va
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_boolean_new(struct StatorIsolate *isolate, bool val);
 
@@ -4811,7 +4811,7 @@ struct StatorValue *stator_boolean_new(struct StatorIsolate *isolate, bool val);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_undefined_new(struct StatorIsolate *isolate);
 
@@ -4821,7 +4821,7 @@ struct StatorValue *stator_undefined_new(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_null_new(struct StatorIsolate *isolate);
 
@@ -5005,7 +5005,7 @@ bool stator_value_is_set(const struct StatorValue *val);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorObject *stator_object_new(struct StatorIsolate *isolate);
 
@@ -5126,7 +5126,7 @@ void stator_property_names_destroy(struct StatorPropertyNames *names);
  * model; it is equivalent to [`stator_isolate_gc`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 void stator_gc_collect(struct StatorIsolate *isolate);
 
@@ -5140,7 +5140,7 @@ void stator_gc_collect(struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_live_object_count(const struct StatorIsolate *isolate);
 
@@ -5151,7 +5151,7 @@ size_t stator_live_object_count(const struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_heap_used(const struct StatorIsolate *isolate);
 
@@ -5162,7 +5162,7 @@ size_t stator_heap_used(const struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_heap_capacity(const struct StatorIsolate *isolate);
 
@@ -6199,7 +6199,7 @@ double stator_value_to_number(const struct StatorValue *val);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 struct StatorValue *stator_value_to_string(struct StatorIsolate *isolate,
@@ -6647,7 +6647,7 @@ struct StatorIsolate *stator_function_callback_info_get_isolate(const struct Sta
  * pass the returned pointer to [`stator_function_template_destroy`].
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `callback` must remain valid for the lifetime of the template.
  */
 struct StatorFunctionTemplate *stator_function_template_new(struct StatorIsolate *isolate,
@@ -7104,7 +7104,7 @@ size_t stator_snapshot_report_applied_global_count(const struct StatorSnapshotRe
  * pass the returned pointer to [`stator_handle_scope_close`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorHandleScope *stator_handle_scope_new(struct StatorIsolate *isolate);
 
@@ -7132,7 +7132,7 @@ void stator_handle_scope_close(struct StatorHandleScope *scope);
  * pass the returned pointer to [`stator_escapable_handle_scope_close`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorEscapableHandleScope *stator_escapable_handle_scope_new(struct StatorIsolate *isolate);
 
@@ -7178,7 +7178,7 @@ void stator_escapable_handle_scope_close(struct StatorEscapableHandleScope *scop
  * pass the returned pointer to [`stator_object_template_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorObjectTemplate *stator_object_template_new(struct StatorIsolate *isolate);
 
@@ -7382,7 +7382,7 @@ void stator_message_destroy(struct StatorMessage *msg);
  *
  * # Safety
  * `isolate` must be either null or a valid pointer to a live
- * [`StatorIsolate`].
+ * `StatorIsolate`.
  */
 const struct StatorMessage *stator_isolate_peek_pending_message(const struct StatorIsolate *isolate);
 
@@ -7400,7 +7400,7 @@ const struct StatorMessage *stator_isolate_peek_pending_message(const struct Sta
  *
  * # Safety
  * `isolate` must be either null or a valid pointer to a live
- * [`StatorIsolate`].
+ * `StatorIsolate`.
  */
 struct StatorMessage *stator_isolate_take_pending_message(struct StatorIsolate *isolate);
 
@@ -7426,7 +7426,7 @@ enum StatorMessageKind stator_script_error_kind(const struct StatorScript *scrip
  * pass the returned pointer to [`stator_try_catch_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorTryCatch *stator_try_catch_new(struct StatorIsolate *isolate);
 
@@ -7740,7 +7740,7 @@ void stator_wasm_streaming_destroy(struct StatorWasmStreamingOperation *operatio
  * [`stator_wasm_module_destroy`] to free all associated resources.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `bytes` must be valid for reads of `len` bytes.
  */
 struct StatorWasmModule *stator_wasm_compile(struct StatorIsolate *isolate,
@@ -7866,7 +7866,7 @@ void stator_wasm_exports_destroy(char **exports);
  * # Safety
  * - `instance` must be a non-null, valid pointer to a live
  *   [`StatorWasmInstance`].
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `name` must be a valid, null-terminated C string.
  * - `args` must be valid for reads of `args_len` pointers; each non-null
  *   element must be a valid, live [`StatorValue`] pointer.
@@ -8058,7 +8058,7 @@ void stator_debug_session_destroy(struct StatorDebugSession *session);
  * the returned pointer to [`stator_dom_object_wrap_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorDomObjectWrap *stator_dom_object_wrap_new(struct StatorIsolate *isolate,
                                                        uint32_t field_count);
@@ -8282,7 +8282,7 @@ uint32_t stator_dom_object_wrap_get_class_id(const struct StatorDomObjectWrap *w
  * [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `name` must point to `name_len` bytes when `name_len > 0`.
  */
 enum StatorStatus stator_dom_class_id_register(struct StatorIsolate *isolate,
@@ -8299,7 +8299,7 @@ enum StatorStatus stator_dom_class_id_register(struct StatorIsolate *isolate,
  * registered child, and `InvalidArg` for null isolate or class id 0.
  *
  * # Safety
- * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 enum StatorStatus stator_dom_class_id_unregister(struct StatorIsolate *isolate, uint32_t class_id);
 
@@ -8310,7 +8310,7 @@ enum StatorStatus stator_dom_class_id_unregister(struct StatorIsolate *isolate, 
  * output is zero-cleared so callers cannot observe stale pointers.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `out_info` must be null or valid for writes.
  */
 enum StatorStatus stator_dom_class_id_query(const struct StatorIsolate *isolate,
@@ -8338,7 +8338,7 @@ bool stator_dom_object_wrap_is_class(const struct StatorDomObjectWrap *wrap,
  * values whose wrapper has already been destroyed.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `value` must be null or a valid, live [`StatorValue`] pointer.
  */
 bool stator_value_is_dom_object_wrap_class(const struct StatorIsolate *isolate,
@@ -9112,7 +9112,7 @@ size_t stator_context_perform_microtask_checkpoint(struct StatorContext *ctx);
  * queue is active.
  *
  * # Safety
- * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_isolate_perform_microtask_checkpoint(struct StatorIsolate *isolate);
 
@@ -9754,7 +9754,7 @@ void stator_traced_dispose(struct StatorTraced *traced);
  * Null-tolerant: passing null `isolate` is a no-op.
  *
  * # Safety
- * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * The supplied `userdata` is passed verbatim to the callback; its
  * lifetime is entirely the embedder's responsibility and must outlive
  * the registration.
@@ -9798,7 +9798,7 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
  * call and must not reset or dispose it.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `host` must be null or a valid, live [`StatorValue`] pointer.
  * - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
  *   embedder's responsibility.

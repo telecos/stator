@@ -864,6 +864,15 @@ fn test_header_context_cdp_debug_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_isolate_safety_docs_use_c_friendly_names() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    assert!(
+        !header.contains("[`StatorIsolate`]"),
+        "generated stator.h should not expose Rust intra-doc links to StatorIsolate"
+    );
+}
+
+#[test]
 fn test_header_module_host_callback_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [
