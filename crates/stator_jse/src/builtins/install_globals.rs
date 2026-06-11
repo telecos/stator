@@ -21795,10 +21795,10 @@ fn make_regexp() -> JsValue {
             // overwrite the properties on `this`.
             proto.insert(
                 "compile".into(),
-                native(|args| {
-                    let this = args.first().unwrap_or(&JsValue::Undefined);
-                    let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                    let flags_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+                builtin_fn("compile", 2, |args| {
+                    let (this, user_args) = resolve_branded_receiver(&args, "__is_regexp__");
+                    let pattern_arg = user_args.first().unwrap_or(&JsValue::Undefined);
+                    let flags_arg = user_args.get(1).unwrap_or(&JsValue::Undefined);
 
                     let pattern = match pattern_arg {
                         JsValue::Undefined => String::new(),
@@ -21815,7 +21815,7 @@ fn make_regexp() -> JsValue {
                     ])?;
 
                     if let (JsValue::PlainObject(target), JsValue::PlainObject(source)) =
-                        (this, &new_re)
+                        (&this, &new_re)
                     {
                         let src = source.borrow();
                         let mut tgt = target.borrow_mut();
@@ -21834,6 +21834,8 @@ fn make_regexp() -> JsValue {
                             "lastIndex",
                             "test",
                             "exec",
+                            "__regexp_test__",
+                            "__regexp_exec__",
                             "toString",
                             "__symbol_match__",
                             "__symbol_replace__",
@@ -64730,6 +64732,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("a:1:2".into()));
+    }
+
+    /// Annex B `RegExp.prototype.compile` exposes built-in function metadata.
+    #[test]
+    fn e2e_regexp_prototype_compile_metadata() {
+        let r = global_eval(
+            "var lengthDesc = Object.getOwnPropertyDescriptor(RegExp.prototype.compile, 'length'); \
+             var nameDesc = Object.getOwnPropertyDescriptor(RegExp.prototype.compile, 'name'); \
+             RegExp.prototype.compile.length + ':' + RegExp.prototype.compile.name + ':' + \
+             lengthDesc.writable + ':' + lengthDesc.enumerable + ':' + lengthDesc.configurable + ':' + \
+             nameDesc.writable + ':' + nameDesc.enumerable + ':' + nameDesc.configurable",
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String("2:compile:false:false:true:false:false:true".into())
+        );
     }
 
     /// Sticky `test` respects `lastIndex` as the required start position.

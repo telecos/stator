@@ -437,6 +437,8 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
 /// Individual tests under otherwise-skipped path prefixes that are supported.
 const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
+    "annexB/built-ins/RegExp/prototype/compile/length.js",
+    "annexB/built-ins/RegExp/prototype/compile/name.js",
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
@@ -1992,6 +1994,12 @@ mod tests {
     fn test_annex_b_escape_allowlist_not_skipped() {
         assert!(!is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/name.js"
         ));
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
