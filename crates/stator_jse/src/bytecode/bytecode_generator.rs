@@ -195,6 +195,7 @@ struct PrivateNameBinding {
 #[derive(Default)]
 struct FunctionCompileOptions {
     self_name: Option<String>,
+    class_static_name: Option<String>,
     private_names: HashMap<String, PrivateNameBinding>,
     source_text: Option<Rc<str>>,
     source_span: Option<SourceLocation>,
@@ -1809,6 +1810,7 @@ impl FunctionCompiler {
             false,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(decl.loc),
@@ -1949,6 +1951,7 @@ impl FunctionCompiler {
                 false,
                 false,
                 ctor.value.is_strict,
+                None,
                 self.private_names.clone(),
             )?
         } else if super_class.is_some() {
@@ -2031,7 +2034,7 @@ impl FunctionCompiler {
                     self.compile_class_static_property(class_reg, p)?;
                 }
                 ClassMember::StaticBlock(sb) => {
-                    self.compile_class_static_block(class_reg, sb)?;
+                    self.compile_class_static_block(id.map(|id| id.name.as_str()), class_reg, sb)?;
                 }
                 ClassMember::Property(p) => {
                     let computed_key_name = match &p.key {
@@ -2413,6 +2416,7 @@ impl FunctionCompiler {
 
     fn compile_class_static_block(
         &mut self,
+        class_name: Option<&str>,
         class_reg: Register,
         block: &crate::parser::ast::StaticBlock,
     ) -> StatorResult<()> {
@@ -2426,6 +2430,7 @@ impl FunctionCompiler {
             false,
             false,
             true,
+            class_name,
             self.private_names.clone(),
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(block_array)));
@@ -2483,6 +2488,7 @@ impl FunctionCompiler {
             false,
             false,
             true,
+            None,
             self.private_names.clone(),
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(value_array)));
@@ -5268,6 +5274,7 @@ impl FunctionCompiler {
             false,
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
@@ -5318,6 +5325,7 @@ impl FunctionCompiler {
             false,
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
@@ -5373,6 +5381,7 @@ impl FunctionCompiler {
             true,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
@@ -5460,6 +5469,7 @@ impl FunctionCompiler {
             true,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
@@ -7396,6 +7406,7 @@ fn compile_function_with_private_names(
     is_generator: bool,
     is_async: bool,
     is_strict: bool,
+    class_static_name: Option<&str>,
     private_names: HashMap<String, PrivateNameBinding>,
 ) -> StatorResult<BytecodeArray> {
     compile_function_inner(
@@ -7407,6 +7418,7 @@ fn compile_function_with_private_names(
         false,
         FunctionCompileOptions {
             self_name: None,
+            class_static_name: class_static_name.map(str::to_owned),
             private_names,
             source_text: None,
             source_span: None,
@@ -8633,6 +8645,7 @@ fn compile_function_inner(
     compiler.is_strict = is_strict;
     let FunctionCompileOptions {
         self_name,
+        class_static_name,
         private_names,
         source_text,
         source_span,
@@ -8709,6 +8722,19 @@ fn compile_function_inner(
     // Function-body lexical declarations are in TDZ from the start of the
     // function body, not only once their declaration statement is reached.
     compiler.hoist_lexical_decls(&body.body);
+
+    if let Some(name) = class_static_name.as_deref()
+        && compiler.lookup_var(name).is_none()
+    {
+        let reg = compiler.define_const_local(name);
+        let name_idx = compiler.add_string("this");
+        let slot = compiler.alloc_slot(FeedbackSlotKind::LoadGlobal);
+        compiler.emit(Instruction::new_unchecked(
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(name_idx), slot],
+        ));
+        compiler.emit_star(reg);
+    }
 
     // ── Closure capture analysis ──────────────────────────────────────────
     // Determine which local variables are captured by inner function/arrow

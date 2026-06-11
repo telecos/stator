@@ -10853,7 +10853,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_this_identity_matches_class() {
         assert_eval_true("class C { static ok = false; static { this.ok = this === C; } } C.ok");
     }
@@ -10972,7 +10971,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_sees_class_expression_name() {
         assert_eval_true(
             "var value = class C { static { this.ok = C === this; } }; value.ok === true",
