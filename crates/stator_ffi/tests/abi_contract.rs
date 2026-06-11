@@ -864,6 +864,42 @@ fn test_header_context_cdp_debug_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_module_host_callback_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "bool stator_context_set_module_url_resolver(struct StatorContext *ctx,\n                                            enum StatorResolveStatus (*callback)(struct StatorContext *ctx,\n                                                                                 void *user_data,\n                                                                                 const struct StatorModule *referrer,\n                                                                                 const struct StatorModuleOrigin *origin,\n                                                                                 const char *specifier,\n                                                                                 size_t specifier_len,\n                                                                                 const struct StatorImportAttribute *attributes,\n                                                                                 size_t attributes_len,\n                                                                                 struct StatorString **out_resolved_url,\n                                                                                 struct StatorString **out_error),\n                                            void *user_data,\n                                            void (*free_user_data)(void *user_data));",
+        "bool stator_context_set_import_meta_populator(struct StatorContext *ctx,\n                                              enum StatorResolveStatus (*callback)(struct StatorContext *ctx,\n                                                                                   void *user_data,\n                                                                                   const struct StatorModule *referrer,\n                                                                                   const struct StatorModuleOrigin *origin,\n                                                                                   struct StatorImportMetaProperties *out_meta,\n                                                                                   struct StatorString **out_error),\n                                              void *user_data,\n                                              void (*free_user_data)(void *user_data));",
+        "bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,\n                                                struct Option_StatorDynamicImportCallback callback,\n                                                void *user_data,\n                                                void (*free_user_data)(void *user_data));",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h module host-callback signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Register, replace, or clear the module URL resolver callback for `ctx`.")
+        .expect("generated stator.h should document module URL resolver registration");
+    let end = header
+        .find("Create a new number value.")
+        .expect("generated stator.h should document value constructors after module callbacks");
+    let docs = &header[start..end];
+    for marker in [
+        "[`StatorResolveStatus`]",
+        "[`StatorDynamicImportRequest`]",
+        "StatorResolveStatus::",
+        "[`stator_context_set_module_resolver`]",
+        "[`stator_dynamic_import_request_resolve_module`]",
+        "[`stator_dynamic_import_request_reject`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h module host-callback docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

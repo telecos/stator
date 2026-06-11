@@ -2149,7 +2149,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 ///
 /// When installed, the callback is invoked before static module resolution,
 /// dynamic `import()`, and `import.meta.resolve`. It must return a canonical
-/// resolved URL or a structured [`StatorResolveStatus`] failure. Failures are
+/// resolved URL or a structured `StatorResolveStatus` failure. Failures are
 /// propagated without falling back to the raw specifier or invoking the module
 /// resolver.
 ///
@@ -2158,7 +2158,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_module_url_resolver(
     ctx: *mut StatorContext,
@@ -2208,14 +2208,14 @@ pub unsafe extern "C" fn stator_context_set_module_url_resolver(
 /// When installed, the callback runs before module evaluation exposes
 /// `import.meta`. Returning a non-`Ok` status fails evaluation closed and
 /// prevents default metadata fallback. Lifetime and cleanup rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 ///
 /// Returns `true` on successful registration or clear, and `false` for a null
 /// context or malformed clear request.
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_import_meta_populator(
     ctx: *mut StatorContext,
@@ -2260,12 +2260,12 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
 ///
 /// When installed, module-evaluation dynamic `import()` calls invoke this
 /// callback after the URL resolver has canonicalised the specifier. The callback
-/// receives a [`StatorDynamicImportRequest`] handle and must return
-/// [`StatorResolveStatus::StatorResolveStatusOk`] or
-/// [`StatorResolveStatus::StatorResolveStatusPending`] after it has accepted
+/// receives a `StatorDynamicImportRequest` handle and must return
+/// `StatorResolveStatusOk` or
+/// `StatorResolveStatusPending` after it has accepted
 /// ownership of the request. It must later call either
-/// [`stator_dynamic_import_request_resolve_module`] or
-/// [`stator_dynamic_import_request_reject`]. Non-success statuses reject the
+/// `stator_dynamic_import_request_resolve_module` or
+/// `stator_dynamic_import_request_reject`. Non-success statuses reject the
 /// JavaScript promise immediately and Stator consumes the request.
 ///
 /// Returns `true` on successful registration or clear, and `false` for a null
@@ -2273,7 +2273,7 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`]. The callback must not settle or free
+/// `stator_context_set_module_resolver`. The callback must not settle or free
 /// the request before returning; request settlement is a later host action on
 /// the same serialized context/module thread.
 #[unsafe(no_mangle)]
