@@ -436,6 +436,7 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
 
 /// Individual tests under otherwise-skipped path prefixes that are supported.
 const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
+    "annexB/built-ins/Date/prototype/toGMTString/prop-desc.js",
     "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
     "annexB/built-ins/RegExp/prototype/compile/length.js",
     "annexB/built-ins/RegExp/prototype/compile/name.js",
@@ -2384,7 +2385,7 @@ mod tests {
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/Array/fromAsync/"
         ));
-        assert!(!skipped_path_has_allowlisted_descendant(
+        assert!(skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/Date/"
         ));
     }
@@ -2622,6 +2623,38 @@ mod tests {
                 "annexB/built-ins/unescape/two-ignore-non-hex.js",
                 "annexB/built-ins/unescape/two.js",
             ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_date_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_date_collect_test");
+        let date_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("Date")
+            .join("prototype")
+            .join("toGMTString");
+        let _ = std::fs::create_dir_all(&date_dir);
+        std::fs::write(date_dir.join("prop-desc.js"), "Date.prototype.toGMTString").unwrap();
+        std::fs::write(date_dir.join("value.js"), "Date.prototype.toGMTString").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec!["annexB/built-ins/Date/prototype/toGMTString/prop-desc.js"]
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
