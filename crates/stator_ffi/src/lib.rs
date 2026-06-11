@@ -797,10 +797,10 @@ pub unsafe extern "C" fn stator_isolate_reset_tiering_stats(_isolate: *mut Stato
     stator_jse::interpreter::reset_tiering_stats();
 }
 
-/// Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+/// Number of JIT tiers carried by `StatorDeoptHistogramStats`.
 pub const STATOR_DEOPT_TIER_COUNT: usize = 3;
 
-/// Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+/// Number of stable deopt reasons carried by `StatorDeoptReasonCounts`.
 pub const STATOR_DEOPT_REASON_COUNT: usize = 7;
 
 /// Per-reason deopt counters for one JIT tier.
@@ -918,13 +918,13 @@ pub unsafe extern "C" fn stator_isolate_reset_deopt_histogram_stats(_isolate: *m
     deopt_counters::reset();
 }
 
-/// Number of execution tiers carried by [`StatorIcCountersStats`].
+/// Number of execution tiers carried by `StatorIcCountersStats`.
 pub const STATOR_IC_TIER_COUNT: usize = 4;
 
-/// Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+/// Number of inline-cache operation kinds carried by `StatorIcTierCounters`.
 pub const STATOR_IC_OP_COUNT: usize = 5;
 
-/// Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+/// Number of inline-cache event kinds carried by `StatorIcOpCounters`.
 pub const STATOR_IC_EVENT_COUNT: usize = 4;
 
 /// Per-event inline-cache counters for one (tier, op) cell.

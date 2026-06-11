@@ -208,6 +208,45 @@ fn test_header_native_code_cache_constants_and_diagnostics_match_abi() {
 }
 
 #[test]
+fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, value) in [
+        (
+            "STATOR_DEOPT_TIER_COUNT",
+            stator_jse_ffi::STATOR_DEOPT_TIER_COUNT,
+        ),
+        (
+            "STATOR_DEOPT_REASON_COUNT",
+            stator_jse_ffi::STATOR_DEOPT_REASON_COUNT,
+        ),
+        ("STATOR_IC_TIER_COUNT", stator_jse_ffi::STATOR_IC_TIER_COUNT),
+        ("STATOR_IC_OP_COUNT", stator_jse_ffi::STATOR_IC_OP_COUNT),
+        (
+            "STATOR_IC_EVENT_COUNT",
+            stator_jse_ffi::STATOR_IC_EVENT_COUNT,
+        ),
+    ] {
+        assert_eq!(
+            parse_define_u32(&header, name),
+            Some(value as u32),
+            "generated stator.h `{name}` drifted from Rust ABI constant"
+        );
+    }
+    for marker in [
+        "[`StatorDeoptHistogramStats`]",
+        "[`StatorDeoptReasonCounts`]",
+        "[`StatorIcCountersStats`]",
+        "[`StatorIcTierCounters`]",
+        "[`StatorIcOpCounters`]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_native_code_cache_function_signatures_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [

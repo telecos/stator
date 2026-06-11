@@ -48,27 +48,27 @@
 #define STATOR_FFI_ABI_VERSION (((STATOR_FFI_ABI_VERSION_MAJOR << 16) | (STATOR_FFI_ABI_VERSION_MINOR << 8)) | STATOR_FFI_ABI_VERSION_PATCH)
 
 /**
- * Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+ * Number of JIT tiers carried by `StatorDeoptHistogramStats`.
  */
 #define STATOR_DEOPT_TIER_COUNT 3
 
 /**
- * Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+ * Number of stable deopt reasons carried by `StatorDeoptReasonCounts`.
  */
 #define STATOR_DEOPT_REASON_COUNT 7
 
 /**
- * Number of execution tiers carried by [`StatorIcCountersStats`].
+ * Number of execution tiers carried by `StatorIcCountersStats`.
  */
 #define STATOR_IC_TIER_COUNT 4
 
 /**
- * Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+ * Number of inline-cache operation kinds carried by `StatorIcTierCounters`.
  */
 #define STATOR_IC_OP_COUNT 5
 
 /**
- * Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+ * Number of inline-cache event kinds carried by `StatorIcOpCounters`.
  */
 #define STATOR_IC_EVENT_COUNT 4
 
