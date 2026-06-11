@@ -10464,10 +10464,9 @@ mod tests {
     // ── yield delegation (yield*) ─────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_yield_star_compiles() {
         // `function* outer() { yield* inner; }` — verify compilation emits
-        // GetIterator + IteratorNext + SuspendGenerator in the inner bytecode.
+        // GetIterator + next() call + SuspendGenerator in the inner bytecode.
         use crate::parser::ast::{FnDecl, YieldExpr};
         let decl = FnDecl {
             loc: span(),
@@ -10506,8 +10505,8 @@ mod tests {
             assert!(
                 inner_instrs
                     .iter()
-                    .any(|i| i.opcode == Opcode::IteratorNext),
-                "yield* must emit IteratorNext"
+                    .any(|i| i.opcode == Opcode::CallProperty1),
+                "yield* must call the delegated iterator's next method"
             );
             assert!(
                 inner_instrs
