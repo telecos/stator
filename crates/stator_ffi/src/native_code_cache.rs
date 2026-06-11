@@ -675,6 +675,26 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_rejects_unknown_tier_as_corrupt_payload() {
+        let mut artifact = artifact(b"payload");
+        artifact[12..16].copy_from_slice(&99u32.to_le_bytes());
+
+        let mut info = sentinel_info();
+        let original = info;
+
+        // SAFETY: artifact buffer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(artifact.as_ptr(), artifact.len(), &mut info)
+        };
+
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
     fn test_validate_rejects_payload_digest_and_length_mismatch() {
         let payload = b"payload";
         let expected = compatibility();
