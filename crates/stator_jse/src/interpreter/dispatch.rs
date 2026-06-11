@@ -3081,7 +3081,26 @@ fn call_plain_object_function(
         map.borrow().get(".class_constructor"),
         Some(JsValue::Boolean(true))
     );
+    let is_derived_constructor = is_class_constructor
+        && matches!(
+            map.borrow().get(".class_derived"),
+            Some(JsValue::Boolean(true))
+        );
+    let is_super_callee = if is_class_constructor {
+        let env = ctx.frame.global_env.borrow();
+        matches!(
+            env.get("super"),
+            Some(JsValue::PlainObject(super_map)) if Rc::ptr_eq(super_map, map)
+        )
+    } else {
+        false
+    };
     if is_class_constructor {
+        if !is_super_callee {
+            return Err(StatorError::TypeError(
+                "Class constructor cannot be invoked without 'new'".into(),
+            ));
+        }
         let pending_this = ctx
             .frame
             .global_env
@@ -3102,9 +3121,25 @@ fn call_plain_object_function(
                         "Super constructor may only be called once".into(),
                     ));
                 }
-                ctx.frame.global_env.borrow_mut().set_this(pending_this);
+                if !is_derived_constructor {
+                    let mut env = ctx.frame.global_env.borrow_mut();
+                    env.set_this(pending_this);
+                    env.remove(".class_pending_this");
+                }
             }
             None => {
+                let current_this = ctx
+                    .frame
+                    .global_env
+                    .borrow()
+                    .get_this()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                if is_super_callee && current_this != JsValue::TheHole {
+                    return Err(StatorError::ReferenceError(
+                        "Super constructor may only be called once".into(),
+                    ));
+                }
                 return Err(StatorError::TypeError(
                     "Class constructor cannot be invoked without 'new'".into(),
                 ));
@@ -3114,9 +3149,36 @@ fn call_plain_object_function(
     let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = ctx.frame.new_target.clone();
+    let saved_super = if is_derived_constructor {
+        let parent = map.borrow().get("__proto__").cloned();
+        let mut env = ctx.frame.global_env.borrow_mut();
+        let saved = env.get("super").cloned();
+        match parent {
+            Some(parent) if !matches!(parent, JsValue::Undefined | JsValue::Null) => {
+                env.insert("super".to_string(), parent);
+            }
+            _ => {
+                env.remove("super");
+            }
+        }
+        Some(saved)
+    } else {
+        None
+    };
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
+    if let Some(saved_super) = saved_super {
+        let mut env = ctx.frame.global_env.borrow_mut();
+        match saved_super {
+            Some(value) => {
+                env.insert("super".to_string(), value);
+            }
+            None => {
+                env.remove("super");
+            }
+        }
+    }
     ctx.frame.global_cache_invalidate();
     ctx.frame.accumulator = result?;
     Ok(())
@@ -11181,7 +11243,6 @@ mod tests {
 
     /// 6. `new.target` preserved through multiple inheritance levels.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_three_level_inheritance() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
