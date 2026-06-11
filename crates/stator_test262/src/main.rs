@@ -567,6 +567,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncGeneratorFunction/extensibility.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
+    "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
     "built-ins/AsyncFunction/instance-length.js",
     "built-ins/AsyncFunction/instance-has-name.js",
     "built-ins/AsyncFunction/instance-prototype-property.js",
@@ -2346,8 +2347,14 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
         ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
+        ));
         assert!(is_skipped_path(
             "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-name.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/prototype/constructor.js"
         ));
     }
 
@@ -2783,7 +2790,9 @@ mod tests {
         let tmp =
             std::env::temp_dir().join("stator_jse_test262_async_generator_function_collect_test");
         let async_gen_dir = tmp.join("built-ins").join("AsyncGeneratorFunction");
+        let async_gen_proto_dir = async_gen_dir.join("prototype");
         let _ = std::fs::create_dir_all(&async_gen_dir);
+        let _ = std::fs::create_dir_all(&async_gen_proto_dir);
         std::fs::write(
             async_gen_dir.join("instance-length.js"),
             "AsyncGeneratorFunction",
@@ -2805,8 +2814,18 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            async_gen_proto_dir.join("extensibility.js"),
+            "AsyncGeneratorFunction.prototype",
+        )
+        .unwrap();
+        std::fs::write(
             async_gen_dir.join("AsyncGeneratorFunction-name.js"),
             "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_proto_dir.join("constructor.js"),
+            "AsyncGeneratorFunction.prototype.constructor",
         )
         .unwrap();
 
@@ -2829,6 +2848,7 @@ mod tests {
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/extensibility.js",
                 "built-ins/AsyncGeneratorFunction/instance-length.js",
+                "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
