@@ -403,6 +403,66 @@ fn test_header_dom_symbol_buffer_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_dom_index_and_name_buffer_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorDomIndexBuffer *stator_dom_index_buffer_new(void);",
+        "void stator_dom_index_buffer_destroy(struct StatorDomIndexBuffer *buf);",
+        "size_t stator_dom_index_buffer_len(const struct StatorDomIndexBuffer *buf);",
+        "enum StatorStatus stator_dom_index_buffer_get(const struct StatorDomIndexBuffer *buf,\n                                              size_t index,\n                                              uint32_t *out_index);",
+        "enum StatorStatus stator_dom_index_buffer_push(struct StatorDomIndexBuffer *buf, uint32_t index);",
+        "enum StatorStatus stator_dom_name_buffer_push(struct StatorDomNameBuffer *buf,\n                                              const char *name_utf8,\n                                              size_t name_len);",
+        "enum StatorStatus stator_dom_object_wrap_invoke_indexed_enumerate_into(struct StatorDomObjectWrap *wrap,\n                                                                       struct StatorDomIndexBuffer *buf);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM index/name buffer signature drifted:\n{signature}"
+        );
+    }
+
+    let typedef_start = header
+        .find("Opaque index buffer passed to a `StatorDomIndexedEnumeratorCb`")
+        .expect("generated stator.h should document StatorDomIndexBuffer");
+    let typedef_end = header
+        .find("An opaque handle to a DOM object wrapper.")
+        .expect("generated stator.h should document DOM wrappers after buffers");
+    let typedef_docs = &header[typedef_start..typedef_end];
+    let api_start = header
+        .find("Allocate a fresh, empty `StatorDomIndexBuffer`")
+        .expect("generated stator.h should document index-buffer allocation");
+    let api_end = header
+        .find("Install an aggregated set of named-property interceptors on `wrap`.")
+        .expect("generated stator.h should document named handler APIs after name buffers");
+    let api_docs = &header[api_start..api_end];
+    let invoke_start = header
+        .find("Collect the indices reported by the wrapper's indexed-property")
+        .expect("generated stator.h should document indexed enumerate invocation");
+    let invoke_end = header
+        .find("Allocate a fresh, empty `StatorDomSymbolBuffer`")
+        .expect("generated stator.h should document symbol buffers after indexed invocation");
+    let invoke_docs = &header[invoke_start..invoke_end];
+
+    for marker in [
+        "[`StatorDomIndexBuffer`]",
+        "[`StatorDomNameBuffer`]",
+        "[`stator_dom_index_buffer_push`]",
+        "[`stator_dom_index_buffer_new`]",
+        "[`stator_dom_index_buffer_destroy`]",
+        "[`stator_dom_index_buffer_get`]",
+        "[`stator_dom_name_buffer_push`]",
+        "StatorStatus::StatorStatus",
+        "*mut u32",
+    ] {
+        assert!(
+            !typedef_docs.contains(marker)
+                && !api_docs.contains(marker)
+                && !invoke_docs.contains(marker),
+            "generated stator.h DOM index/name buffer docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

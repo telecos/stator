@@ -21747,18 +21747,17 @@ pub unsafe extern "C" fn stator_dom_property_descriptor_clear(
     }
     *d = StatorDomPropertyDescriptor::default();
 }
-/// Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
+/// Opaque index buffer passed to a `StatorDomIndexedEnumeratorCb`
 /// callback.  The callback fills it by repeatedly calling
-/// [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
-/// bridge for the duration of the callback and must not outlive it.
+/// `stator_dom_index_buffer_push`.  The buffer is owned by the FFI bridge for
+/// the duration of the callback and must not outlive it.
 ///
 /// Embedders that want to drive the indexed enumerator directly from C
 /// (rather than through an installed handler) can allocate a buffer with
-/// [`stator_dom_index_buffer_new`], pass it to
-/// [`stator_dom_object_wrap_invoke_indexed_enumerate_into`], inspect the
-/// contents via [`stator_dom_index_buffer_len`] /
-/// [`stator_dom_index_buffer_get`], and release it with
-/// [`stator_dom_index_buffer_destroy`].
+/// `stator_dom_index_buffer_new`, pass it to
+/// `stator_dom_object_wrap_invoke_indexed_enumerate_into`, inspect the
+/// contents via `stator_dom_index_buffer_len` / `stator_dom_index_buffer_get`,
+/// and release it with `stator_dom_index_buffer_destroy`.
 pub struct StatorDomIndexBuffer {
     indices: Vec<u32>,
 }
@@ -21767,12 +21766,12 @@ pub struct StatorDomIndexBuffer {
 // on the owning thread during a single callback invocation.
 unsafe impl Send for StatorDomIndexBuffer {}
 
-/// Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
-/// [`stator_dom_index_buffer_destroy`].
+/// Allocate a fresh, empty `StatorDomIndexBuffer`.  Free with
+/// `stator_dom_index_buffer_destroy`.
 ///
 /// # Safety
 /// The returned pointer must be released exactly once via
-/// [`stator_dom_index_buffer_destroy`].
+/// `stator_dom_index_buffer_destroy`.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_dom_index_buffer_new() -> *mut StatorDomIndexBuffer {
     Box::into_raw(Box::new(StatorDomIndexBuffer {
@@ -21780,11 +21779,11 @@ pub extern "C" fn stator_dom_index_buffer_new() -> *mut StatorDomIndexBuffer {
     }))
 }
 
-/// Free a [`StatorDomIndexBuffer`].  Does nothing when `buf` is null.
+/// Free a `StatorDomIndexBuffer`.  Does nothing when `buf` is null.
 ///
 /// # Safety
 /// `buf` must be either null or a pointer returned by
-/// [`stator_dom_index_buffer_new`], not previously destroyed.
+/// `stator_dom_index_buffer_new`, not previously destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_destroy(buf: *mut StatorDomIndexBuffer) {
     if !buf.is_null() {
@@ -21810,13 +21809,13 @@ pub unsafe extern "C" fn stator_dom_index_buffer_len(buf: *const StatorDomIndexB
 /// Read the entry at `index` from `buf` into `*out_index`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` or `out_index`
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` or `out_index`
 ///   is null, or when `index` is out of range.
 ///
 /// # Safety
 /// - `buf` must be either null or a valid buffer pointer.
-/// - `out_index` must be either null or a writable `*mut u32`.
+/// - `out_index` must be either null or a writable `uint32_t *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_get(
     buf: *const StatorDomIndexBuffer,
@@ -21836,17 +21835,17 @@ pub unsafe extern "C" fn stator_dom_index_buffer_get(
     StatorStatus::StatorStatusOk
 }
 
-/// Append an index to a [`StatorDomIndexBuffer`].
+/// Append an index to a `StatorDomIndexBuffer`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null.
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` is null.
 ///
 /// # Safety
 /// `buf` must be either null or a valid pointer to a
-/// [`StatorDomIndexBuffer`] currently borrowed by an enumerator callback
+/// `StatorDomIndexBuffer` currently borrowed by an enumerator callback
 /// (or owned by the caller between
-/// [`stator_dom_index_buffer_new`]/[`stator_dom_index_buffer_destroy`]).
+/// `stator_dom_index_buffer_new` / `stator_dom_index_buffer_destroy`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_push(
     buf: *mut StatorDomIndexBuffer,
@@ -21860,10 +21859,10 @@ pub unsafe extern "C" fn stator_dom_index_buffer_push(
     StatorStatus::StatorStatusOk
 }
 
-/// Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
+/// Opaque name buffer passed to a `StatorDomNamedEnumeratorCb` callback.
 ///
 /// The callback fills the buffer by repeatedly calling
-/// [`stator_dom_name_buffer_push`].  The buffer is owned by the FFI bridge
+/// `stator_dom_name_buffer_push`.  The buffer is owned by the FFI bridge
 /// and must not outlive the callback invocation.
 pub struct StatorDomNameBuffer {
     names: Vec<String>,
@@ -21873,16 +21872,16 @@ pub struct StatorDomNameBuffer {
 // accessed on the owning thread during a single callback invocation.
 unsafe impl Send for StatorDomNameBuffer {}
 
-/// Append a UTF-8 name to a [`StatorDomNameBuffer`].
+/// Append a UTF-8 name to a `StatorDomNameBuffer`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` is null, when
 ///   `name_utf8` is null while `name_len` is non-zero, or when the byte
 ///   range is not valid UTF-8.
 ///
 /// # Safety
-/// - `buf` must be either null or a valid pointer to a [`StatorDomNameBuffer`]
+/// - `buf` must be either null or a valid pointer to a `StatorDomNameBuffer`
 ///   that is currently borrowed by an enumerator callback.
 /// - `name_utf8` must point to at least `name_len` valid bytes when
 ///   `name_len > 0`.
@@ -22996,8 +22995,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
 
 /// Collect the indices reported by the wrapper's indexed-property
 /// enumerator into `buf`.  The buffer is owned by the caller, created
-/// with [`stator_dom_index_buffer_new`] and released with
-/// [`stator_dom_index_buffer_destroy`].
+/// with `stator_dom_index_buffer_new` and released with
+/// `stator_dom_index_buffer_destroy`.
 ///
 /// The enumerator is invoked with the wrapper's `IndexedEnumerate`
 /// access-check gate; on denial (or when the wrapper has been
@@ -23006,15 +23005,15 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
 /// Stator does not reorder or de-duplicate them.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success (including the empty
+/// * `StatorStatusOk` on success (including the empty
 ///   no-handler / denied / invalidated cases).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `buf` is
+/// * `StatorStatusInvalidArg` when `wrap` or `buf` is
 ///   null.
 ///
 /// # Safety
-/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+/// - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
 /// - `buf` must be either null or a valid buffer pointer returned by
-///   [`stator_dom_index_buffer_new`] that has not been destroyed.
+///   `stator_dom_index_buffer_new` that has not been destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_enumerate_into(
     wrap: *mut StatorDomObjectWrap,
