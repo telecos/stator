@@ -186,7 +186,7 @@
 /**
  * Bitmask of every named-handler flag recognised by this Stator build.
  * Any bit outside this mask is rejected by
- * [`stator_dom_object_wrap_set_named_handler_flags`].
+ * `stator_dom_object_wrap_set_named_handler_flags`.
  */
 #define STATOR_DOM_NAMED_HANDLER_FLAG_ALL ((((STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ | STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING) | STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS) | STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS) | STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT)
 
@@ -2740,7 +2740,7 @@ typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct Stato
 
 /**
  * POD bundle of named-property interceptors, installed in one call by
- * [`stator_dom_object_wrap_install_named_handler`].
+ * `stator_dom_object_wrap_install_named_handler`.
  *
  * Each callback field is optional: pass `NULL` from C (or `None` from Rust)
  * to leave a particular interceptor uninstalled.  At least one callback
@@ -8694,7 +8694,7 @@ enum StatorStatus stator_dom_symbol_buffer_push(struct StatorDomSymbolBuffer *bu
  * named handler is installed yet, an empty one is created so the
  * symbol callbacks have a home.  The installation **does not** set the
  * `INTERCEPT_SYMBOLS` flag automatically — the embedder must call
- * [`stator_dom_object_wrap_set_named_handler_flags`] to opt in.
+ * `stator_dom_object_wrap_set_named_handler_flags` to opt in.
  * Without that flag the symbol callbacks remain dormant (fail-closed),
  * matching V8/Blink semantics and preventing accidental stringification.
  *
@@ -9009,78 +9009,78 @@ enum StatorStatus stator_dom_object_wrap_invoke_indexed_descriptor(struct Stator
                                                                    struct StatorDomPropertyDescriptor *out_descriptor);
 
 /**
- * Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+ * Replace the `StatorDomNamedHandler` flag bitmask on `wrap`.
  *
  * The flag set is validated against
- * [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`] and rejected if any unknown bit
+ * `STATOR_DOM_NAMED_HANDLER_FLAG_ALL` and rejected if any unknown bit
  * is set — this is the fail-closed behaviour that prevents an embedder
  * from silently activating semantics this Stator build does not
  * understand.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the flags were stored.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+ * * `StatorStatusOk` when the flags were stored.
+ * * `StatorStatusInvalidArg` when `wrap` is null, when
  *   no named handler is currently installed (install one with
- *   [`stator_dom_object_wrap_install_named_handler`] first), or when
- *   `flags` contains a bit outside [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`].
+ *   `stator_dom_object_wrap_install_named_handler` first), or when
+ *   `flags` contains a bit outside `STATOR_DOM_NAMED_HANDLER_FLAG_ALL`.
  *
  * # Safety
- * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  */
 enum StatorStatus stator_dom_object_wrap_set_named_handler_flags(struct StatorDomObjectWrap *wrap,
                                                                  uint32_t flags);
 
 /**
- * Read the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+ * Read the `StatorDomNamedHandler` flag bitmask on `wrap`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+ * * `StatorStatusOk` with `*out_flags` set to the
  *   currently-installed flag bitmask (always `0` when no named handler
  *   is installed).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+ * * `StatorStatusInvalidArg` when `wrap` or `out_flags`
  *   is null.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  * - `out_flags` must be a writable `*mut u32` slot on
- *   [`StatorStatus::StatorStatusOk`] return.
+ *   `StatorStatusOk` return.
  */
 enum StatorStatus stator_dom_object_wrap_get_named_handler_flags(const struct StatorDomObjectWrap *wrap,
                                                                  uint32_t *out_flags);
 
 /**
- * Replace the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+ * Replace the `StatorDomIndexedHandler` flag bitmask on `wrap`.
  *
  * The flag set is validated against
- * [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`] and rejected if any unknown
+ * `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL` and rejected if any unknown
  * bit is set.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the flags were stored.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+ * * `StatorStatusOk` when the flags were stored.
+ * * `StatorStatusInvalidArg` when `wrap` is null, when
  *   no indexed handler is currently installed, or when `flags` contains
- *   a bit outside [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`].
+ *   a bit outside `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`.
  *
  * # Safety
- * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  */
 enum StatorStatus stator_dom_object_wrap_set_indexed_handler_flags(struct StatorDomObjectWrap *wrap,
                                                                    uint32_t flags);
 
 /**
- * Read the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+ * Read the `StatorDomIndexedHandler` flag bitmask on `wrap`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+ * * `StatorStatusOk` with `*out_flags` set to the
  *   currently-installed flag bitmask (always `0` when no indexed
  *   handler is installed).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+ * * `StatorStatusInvalidArg` when `wrap` or `out_flags`
  *   is null.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  * - `out_flags` must be a writable `*mut u32` slot on
- *   [`StatorStatus::StatorStatusOk`] return.
+ *   `StatorStatusOk` return.
  */
 enum StatorStatus stator_dom_object_wrap_get_indexed_handler_flags(const struct StatorDomObjectWrap *wrap,
                                                                    uint32_t *out_flags);

@@ -278,6 +278,50 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
 }
 
 #[test]
+fn test_header_dom_handler_flags_match_abi_and_use_c_friendly_docs() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for define in [
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_NONE 0",
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ (1 << 0)",
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING (1 << 1)",
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS (1 << 2)",
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS (1 << 3)",
+        "#define STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT (1 << 4)",
+        "#define STATOR_DOM_INDEXED_HANDLER_FLAG_NONE 0",
+        "#define STATOR_DOM_INDEXED_HANDLER_FLAG_ALL_CAN_READ (1 << 0)",
+        "#define STATOR_DOM_INDEXED_HANDLER_FLAG_NON_MASKING (1 << 1)",
+        "#define STATOR_DOM_INDEXED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT (1 << 4)",
+    ] {
+        assert!(
+            header.contains(define),
+            "generated stator.h is missing DOM handler flag define `{define}`"
+        );
+    }
+    for signature in [
+        "enum StatorStatus stator_dom_object_wrap_set_named_handler_flags(struct StatorDomObjectWrap *wrap,\n                                                                 uint32_t flags);",
+        "enum StatorStatus stator_dom_object_wrap_get_named_handler_flags(const struct StatorDomObjectWrap *wrap,\n                                                                 uint32_t *out_flags);",
+        "enum StatorStatus stator_dom_object_wrap_set_indexed_handler_flags(struct StatorDomObjectWrap *wrap,\n                                                                   uint32_t flags);",
+        "enum StatorStatus stator_dom_object_wrap_get_indexed_handler_flags(const struct StatorDomObjectWrap *wrap,\n                                                                   uint32_t *out_flags);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM handler flag signature drifted:\n{signature}"
+        );
+    }
+    for marker in [
+        "[`stator_dom_object_wrap_set_named_handler_flags`]",
+        "[`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`]",
+        "[`stator_dom_object_wrap_install_named_handler`]",
+        "[`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
