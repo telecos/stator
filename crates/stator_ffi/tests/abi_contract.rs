@@ -412,6 +412,7 @@ fn test_header_dom_index_and_name_buffer_signatures_and_docs_match_abi() {
         "enum StatorStatus stator_dom_index_buffer_get(const struct StatorDomIndexBuffer *buf,\n                                              size_t index,\n                                              uint32_t *out_index);",
         "enum StatorStatus stator_dom_index_buffer_push(struct StatorDomIndexBuffer *buf, uint32_t index);",
         "enum StatorStatus stator_dom_name_buffer_push(struct StatorDomNameBuffer *buf,\n                                              const char *name_utf8,\n                                              size_t name_len);",
+        "enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDomObjectWrap *wrap,\n                                                                uint32_t index,\n                                                                bool *out_deleted);",
         "enum StatorStatus stator_dom_object_wrap_invoke_indexed_enumerate_into(struct StatorDomObjectWrap *wrap,\n                                                                       struct StatorDomIndexBuffer *buf);",
     ] {
         assert!(
@@ -435,12 +436,17 @@ fn test_header_dom_index_and_name_buffer_signatures_and_docs_match_abi() {
         .expect("generated stator.h should document named handler APIs after name buffers");
     let api_docs = &header[api_start..api_end];
     let invoke_start = header
+        .find("Invoke the wrapper's indexed-property **deleter** path.")
+        .expect("generated stator.h should document indexed deleter invocation");
+    let invoke_end = header
         .find("Collect the indices reported by the wrapper's indexed-property")
         .expect("generated stator.h should document indexed enumerate invocation");
+    let deleter_docs = &header[invoke_start..invoke_end];
+    let enumerate_start = invoke_end;
     let invoke_end = header
         .find("Allocate a fresh, empty `StatorDomSymbolBuffer`")
         .expect("generated stator.h should document symbol buffers after indexed invocation");
-    let invoke_docs = &header[invoke_start..invoke_end];
+    let invoke_docs = &header[enumerate_start..invoke_end];
 
     for marker in [
         "[`StatorDomIndexBuffer`]",
@@ -452,10 +458,14 @@ fn test_header_dom_index_and_name_buffer_signatures_and_docs_match_abi() {
         "[`stator_dom_name_buffer_push`]",
         "StatorStatus::StatorStatus",
         "*mut u32",
+        "*mut bool",
+        "stator_jse::dom::IndexedDeleterResult",
+        "[`StatorDomObjectWrap`]",
     ] {
         assert!(
             !typedef_docs.contains(marker)
                 && !api_docs.contains(marker)
+                && !deleter_docs.contains(marker)
                 && !invoke_docs.contains(marker),
             "generated stator.h DOM index/name buffer docs should not expose Rust-specific marker `{marker}`"
         );

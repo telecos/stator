@@ -8808,8 +8808,8 @@ enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct Sta
  * Invoke the wrapper's indexed-property **deleter** path.
  *
  * Mirrors `delete nodeList[index]`.  The result is encoded through
- * [`StatorStatus`] / `*out_deleted` to expose the three-way
- * [`stator_jse::dom::IndexedDeleterResult`] outcome to embedders:
+ * `StatorStatus` / `*out_deleted` to expose the three-way indexed-delete
+ * outcome to embedders:
  *
  * | Wrapper outcome                                         | Status                | `*out_deleted` |
  * |---------------------------------------------------------|-----------------------|----------------|
@@ -8820,14 +8820,14 @@ enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct Sta
  * | Access-check denied / wrapper invalidated (fail-closed) | `StatorStatusOk`      | `false`        |
  *
  * `*out_deleted` is always written when this function returns
- * [`StatorStatus::StatorStatusOk`].  This function only reports a
+ * `StatorStatusOk`.  This function only reports a
  * non-`Ok` status when its FFI arguments are themselves invalid (null
  * `wrap`/`out_deleted`, or a stale wrapper pointer), in which case
  * `*out_deleted` is left untouched.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
- * - `out_deleted` must be either null or a writable `*mut bool`.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
+ * - `out_deleted` must be either null or a writable `bool *`.
  */
 enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDomObjectWrap *wrap,
                                                                 uint32_t index,
