@@ -156,6 +156,19 @@ pub extern "C" fn stator_native_code_cache_diagnostic_name(
     diagnostic_name_bytes(diagnostic).as_ptr().cast()
 }
 
+/// Return a stable telemetry code string for a raw diagnostic value.
+///
+/// Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+/// than requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_native_code_cache_diagnostic_name_u32(diagnostic: u32) -> *const c_char {
+    diagnostic_name_bytes_u32(diagnostic).as_ptr().cast()
+}
+
 /// Decode a native-tier artifact header without checking runtime compatibility.
 ///
 /// This helper accepts only the fixed header shape. It never validates or loads
@@ -410,40 +423,25 @@ fn sha256_digest(bytes: &[u8]) -> [u8; DIGEST_LEN] {
     Sha256::digest(bytes).into()
 }
 
-fn diagnostic_name_bytes(diagnostic: StatorNativeCodeCacheDiagnostic) -> &'static [u8] {
+fn diagnostic_name_bytes_u32(diagnostic: u32) -> &'static [u8] {
     match diagnostic {
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticAccepted => b"accepted\0",
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument => {
-            b"invalid_argument\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload => {
-            b"corrupt_payload\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType => {
-            b"rejected_artifact_type\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion => {
-            b"rejected_engine_version\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion => {
-            b"rejected_format_version\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedSourceIdentity => {
-            b"rejected_source_identity\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedPlatform => {
-            b"rejected_platform\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedBuildFeatures => {
-            b"rejected_build_features\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedCompilerFlags => {
-            b"rejected_compiler_flags\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticUnsupportedNativeCode => {
-            b"unsupported_native_code\0"
-        }
+        0 => b"accepted\0",
+        1 => b"invalid_argument\0",
+        2 => b"corrupt_payload\0",
+        3 => b"rejected_artifact_type\0",
+        4 => b"rejected_engine_version\0",
+        5 => b"rejected_format_version\0",
+        6 => b"rejected_source_identity\0",
+        7 => b"rejected_platform\0",
+        8 => b"rejected_build_features\0",
+        9 => b"rejected_compiler_flags\0",
+        10 => b"unsupported_native_code\0",
+        _ => b"unknown_diagnostic\0",
     }
+}
+
+fn diagnostic_name_bytes(diagnostic: StatorNativeCodeCacheDiagnostic) -> &'static [u8] {
+    diagnostic_name_bytes_u32(diagnostic as u32)
 }
 
 #[cfg(test)]
@@ -873,6 +871,25 @@ mod tests {
             // SAFETY: The function returns static NUL-terminated strings.
             let actual = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
             assert_eq!(actual, expected);
+
+            let raw_ptr = stator_native_code_cache_diagnostic_name_u32(diagnostic as u32);
+            assert!(
+                !raw_ptr.is_null(),
+                "raw diagnostic name pointer must be non-null for {diagnostic:?}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let raw_actual = unsafe { std::ffi::CStr::from_ptr(raw_ptr) }
+                .to_str()
+                .unwrap();
+            assert_eq!(raw_actual, expected);
         }
+
+        let unknown_ptr = stator_native_code_cache_diagnostic_name_u32(999);
+        assert!(!unknown_ptr.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        let unknown = unsafe { std::ffi::CStr::from_ptr(unknown_ptr) }
+            .to_str()
+            .unwrap();
+        assert_eq!(unknown, "unknown_diagnostic");
     }
 }

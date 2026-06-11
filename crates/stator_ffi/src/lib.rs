@@ -95,7 +95,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 27;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 28;
 
 /// Patch version of the Stator FFI C ABI.
 ///

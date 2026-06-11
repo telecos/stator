@@ -1094,6 +1094,7 @@ fn test_header_native_code_cache_function_signatures_match_abi() {
     for signature in [
         "size_t stator_native_code_cache_header_size(void);",
         "const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);",
+        "const char *stator_native_code_cache_diagnostic_name_u32(uint32_t diagnostic);",
         "enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(const uint8_t *bytes,\n                                                                              size_t len,\n                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);",
         "enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_validate_header(const uint8_t *bytes,\n                                                                              size_t len,\n                                                                              const struct StatorNativeCodeCacheCompatibility *expected,\n                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);",
     ] {

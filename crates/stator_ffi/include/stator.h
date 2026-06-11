@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 27
+#define STATOR_FFI_ABI_VERSION_MINOR 28
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -9821,6 +9821,18 @@ size_t stator_native_code_cache_header_size(void);
  * lifetime of the process.
  */
 const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);
+
+/**
+ * Return a stable telemetry code string for a raw diagnostic value.
+ *
+ * Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+ * than requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_native_code_cache_diagnostic_name_u32(uint32_t diagnostic);
 
 /**
  * Decode a native-tier artifact header without checking runtime compatibility.
