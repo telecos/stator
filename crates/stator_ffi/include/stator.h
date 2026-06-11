@@ -1182,8 +1182,8 @@ typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTempla
 /**
  * An opaque handle to a CDP WebSocket server.
  *
- * Created with [`stator_cdp_server_create`] and freed with
- * [`stator_cdp_server_destroy`].
+ * Created with `stator_cdp_server_create` and freed with
+ * `stator_cdp_server_destroy`.
  */
 typedef struct StatorCdpServer StatorCdpServer;
 
@@ -1191,27 +1191,27 @@ typedef struct StatorCdpServer StatorCdpServer;
  * An opaque context handle.
  *
  * A context represents an execution environment associated with an
- * [`StatorIsolate`].  The caller must pass the returned pointer to
- * [`stator_context_destroy`] when the context is no longer needed.
+ * `StatorIsolate`.  The caller must pass the returned pointer to
+ * `stator_context_destroy` when the context is no longer needed.
  */
 typedef struct StatorContext StatorContext;
 
 /**
  * An opaque handle to an interactive debugging session.
  *
- * A debug session owns both the compiled [`InterpreterFrame`] and an attached
- * [`Debugger`], allowing the host to:
+ * A debug session owns both the compiled interpreter frame and an attached
+ * debugger, allowing the host to:
  *
  * 1. Set breakpoints before execution starts.
- * 2. Start execution with [`stator_debug_session_run`] — the call returns
+ * 2. Start execution with `stator_debug_session_run` — the call returns
  *    `true` when a breakpoint is hit, leaving the session in a paused state.
- * 3. Inspect global variables with [`stator_debug_session_get_global_string`].
- * 4. Resume with [`stator_debug_session_resume`].
+ * 3. Inspect global variables with `stator_debug_session_get_global_string`.
+ * 4. Resume with `stator_debug_session_resume`.
  * 5. Repeat until `run` / `resume` return `false` (execution completed).
- * 6. Retrieve the final result with [`stator_debug_session_result`].
+ * 6. Retrieve the final result with `stator_debug_session_result`.
  *
- * Created with [`stator_debug_session_create`] and freed with
- * [`stator_debug_session_destroy`].
+ * Created with `stator_debug_session_create` and freed with
+ * `stator_debug_session_destroy`.
  */
 typedef struct StatorDebugSession StatorDebugSession;
 

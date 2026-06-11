@@ -466,6 +466,44 @@ fn test_header_wasm_value_kind_discriminants_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_context_cdp_debug_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorContext *stator_context_new(struct StatorIsolate *isolate);",
+        "void stator_context_destroy(struct StatorContext *ctx);",
+        "struct StatorCdpServer *stator_cdp_server_create(uint16_t port);",
+        "void stator_cdp_server_destroy(struct StatorCdpServer *server);",
+        "struct StatorDebugSession *stator_debug_session_create(const struct StatorScript *script,\n                                                       struct StatorContext *ctx);",
+        "bool stator_debug_session_run(struct StatorDebugSession *session);",
+        "int32_t stator_debug_session_get_global_string(const struct StatorDebugSession *session,\n                                               const char *name,\n                                               char *buf,\n                                               size_t buf_len);",
+        "bool stator_debug_session_resume(struct StatorDebugSession *session);",
+        "struct StatorValue *stator_debug_session_result(const struct StatorDebugSession *session);",
+        "void stator_debug_session_destroy(struct StatorDebugSession *session);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h context/CDP/debug signature drifted:\n{signature}"
+        );
+    }
+
+    for typedef in [
+        "typedef struct StatorContext StatorContext;",
+        "typedef struct StatorCdpServer StatorCdpServer;",
+        "typedef struct StatorDebugSession StatorDebugSession;",
+    ] {
+        let end = header
+            .find(typedef)
+            .unwrap_or_else(|| panic!("generated stator.h missing `{typedef}`"));
+        let start = end.saturating_sub(700);
+        let doc_window = &header[start..end];
+        assert!(
+            !doc_window.contains("[`"),
+            "generated stator.h opaque-handle docs should not expose Rust intra-doc links near `{typedef}`:\n{doc_window}"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
