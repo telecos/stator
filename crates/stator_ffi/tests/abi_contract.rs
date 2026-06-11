@@ -177,12 +177,18 @@ fn test_exported_symbol_surface_matches_baseline() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     let current = parse_exported_functions(&header);
 
-    // Defensive sanity check: parsing must at least find the ABI version
-    // accessor.  If it doesn't, the parser regressed rather than the ABI.
-    assert!(
-        current.contains("stator_ffi_abi_version"),
-        "header parser failed to find stator_ffi_abi_version — parser regressed"
-    );
+    // Defensive sanity check: parsing must at least find representative
+    // scalar-return and pointer-return accessors. If it doesn't, the parser
+    // regressed rather than the ABI.
+    for required in [
+        "stator_ffi_abi_version",
+        "stator_native_code_cache_diagnostic_name",
+    ] {
+        assert!(
+            current.contains(required),
+            "header parser failed to find {required} — parser regressed"
+        );
+    }
 
     if std::env::var_os("STATOR_FFI_ABI_UPDATE_BASELINE").is_some() {
         let mut body = String::new();
