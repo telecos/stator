@@ -7441,10 +7441,14 @@ fn collect_function_scope_names(
     params: &[Param],
     stmts: &[Stmt],
     self_name: Option<&str>,
+    include_implicit_arguments: bool,
 ) -> HashSet<String> {
     let mut names = HashSet::new();
     if let Some(name) = self_name {
         names.insert(name.to_string());
+    }
+    if include_implicit_arguments {
+        names.insert("arguments".to_string());
     }
     for p in params {
         collect_pat_binding_names(&p.pat, &mut names);
@@ -7610,7 +7614,7 @@ fn collect_function_free_refs(
     stmts: &[Stmt],
     self_name: Option<&str>,
 ) -> HashSet<String> {
-    let function_scope = collect_function_scope_names(params, stmts, self_name);
+    let function_scope = collect_function_scope_names(params, stmts, self_name, true);
     let mut scopes = vec![function_scope];
     let mut free_refs = HashSet::new();
     collect_free_refs_in_params(params, &scopes, &mut free_refs);
@@ -7619,7 +7623,12 @@ fn collect_function_free_refs(
 }
 
 fn collect_arrow_free_refs(arrow: &ArrowExpr) -> HashSet<String> {
-    let mut scopes = vec![collect_function_scope_names(&arrow.params, &[], None)];
+    let mut scopes = vec![collect_function_scope_names(
+        &arrow.params,
+        &[],
+        None,
+        false,
+    )];
     let mut free_refs = HashSet::new();
     collect_free_refs_in_params(&arrow.params, &scopes, &mut free_refs);
     match &arrow.body {
@@ -8279,8 +8288,13 @@ fn walk_expr_for_inner_refs(expr: &Expr, out: &mut HashSet<String>) {
 }
 
 /// Find all captured variables: locals referenced by nested functions.
-fn find_captured_vars(outer_params: &[Param], body: &BlockStmt) -> HashSet<String> {
-    let function_scope = collect_function_scope_names(outer_params, &body.body, None);
+fn find_captured_vars(
+    outer_params: &[Param],
+    body: &BlockStmt,
+    include_implicit_arguments: bool,
+) -> HashSet<String> {
+    let function_scope =
+        collect_function_scope_names(outer_params, &body.body, None, include_implicit_arguments);
     let mut scopes = vec![function_scope];
     let mut captured = HashSet::new();
     find_captures_in_params(outer_params, &mut scopes, &mut captured);
@@ -8753,7 +8767,7 @@ fn compile_function_inner(
     // itself reference the variable would silently fail to propagate it
     // (the inner function would see `undefined`), and any sibling inherited
     // binding could be mis-resolved to a freshly allocated slot.
-    let captured = find_captured_vars(params, body);
+    let captured = find_captured_vars(params, body, !is_arrow);
     let inner_free_refs = collect_inner_function_free_refs_in_block(body);
     let needs_forward = compiler
         .closure_captures

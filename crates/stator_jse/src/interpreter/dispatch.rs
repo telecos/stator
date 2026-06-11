@@ -12721,7 +12721,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arrow arguments object regression
     fn e2e_arrow_no_own_arguments() {
         // Arrow functions do NOT have their own `arguments` object.
         let result = crate::builtins::global::global_eval(
@@ -12732,7 +12731,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arrow arguments object regression
     fn e2e_arrow_inherits_outer_arguments() {
         // Arrow should read enclosing function's arguments.
         let result = crate::builtins::global::global_eval(
