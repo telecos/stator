@@ -439,6 +439,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
     "annexB/built-ins/RegExp/prototype/compile/length.js",
     "annexB/built-ins/RegExp/prototype/compile/name.js",
+    "annexB/built-ins/escape/argument_types.js",
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
@@ -447,7 +448,9 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/escape/prop-desc.js",
     "annexB/built-ins/escape/to-primitive-observe.js",
     "annexB/built-ins/escape/to-string-err.js",
+    "annexB/built-ins/escape/to-string-err-symbol.js",
     "annexB/built-ins/escape/to-string-observe.js",
+    "annexB/built-ins/unescape/argument_types.js",
     "annexB/built-ins/unescape/empty-string.js",
     "annexB/built-ins/unescape/two.js",
     "annexB/built-ins/unescape/four.js",
@@ -2017,6 +2020,9 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/name.js"
         ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/argument_types.js"
+        ));
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
@@ -2027,6 +2033,9 @@ mod tests {
             "annexB/built-ins/escape/to-primitive-observe.js"
         ));
         assert!(!is_skipped_path("annexB/built-ins/escape/to-string-err.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/to-string-err-symbol.js"
+        ));
         assert!(!is_skipped_path(
             "annexB/built-ins/escape/to-string-observe.js"
         ));
@@ -2059,6 +2068,9 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/unescape/empty-string.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/argument_types.js"
         ));
         assert!(!is_skipped_path("annexB/built-ins/unescape/two.js"));
         assert!(!is_skipped_path("annexB/built-ins/unescape/four.js"));
