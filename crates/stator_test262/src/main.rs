@@ -488,18 +488,21 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/fontcolor/name.js",
     "annexB/built-ins/String/prototype/fontcolor/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
     "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/fontsize/length.js",
     "annexB/built-ins/String/prototype/fontsize/name.js",
     "annexB/built-ins/String/prototype/fontsize/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fontsize/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
     "annexB/built-ins/String/prototype/italics/length.js",
     "annexB/built-ins/String/prototype/italics/name.js",
     "annexB/built-ins/String/prototype/italics/not-a-constructor.js",
     "annexB/built-ins/String/prototype/italics/prop-desc.js",
     "annexB/built-ins/String/prototype/link/B.2.3.10.js",
+    "annexB/built-ins/String/prototype/link/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/link/length.js",
     "annexB/built-ins/String/prototype/link/name.js",
     "annexB/built-ins/String/prototype/link/not-a-constructor.js",
@@ -2126,16 +2129,25 @@ mod tests {
             "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/link/B.2.3.10.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/link/attr-tostring-err.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/small/B.2.3.11.js"
