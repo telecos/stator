@@ -437,6 +437,48 @@ fn test_header_module_cache_status_discriminants_match_abi() {
 }
 
 #[test]
+fn test_header_jit_tier_discriminants_and_signatures_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [("Baseline", 1), ("Maglev", 2), ("Turbofan", 3)] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable JIT tier discriminant `{marker}`"
+        );
+    }
+    for (name, discriminant) in [
+        ("AlreadyReady", 0),
+        ("Compiled", 1),
+        ("Pending", 2),
+        ("UnsupportedTier", 3),
+        ("JitDisabled", 4),
+        ("DeoptBlocked", 5),
+        ("GraphBuildFailed", 6),
+        ("DegenerateGraph", 7),
+        ("CompileFailed", 8),
+        ("ExecutableAllocationFailed", 9),
+        ("TimedOut", 10),
+        ("InvalidScript", 11),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable tier-request status discriminant `{marker}`"
+        );
+    }
+    for signature in [
+        "bool stator_script_force_tier(struct StatorScript *script,\n                              enum StatorJitTier tier,\n                              struct StatorTierRequestResult *result);",
+        "bool stator_script_observe_tier(const struct StatorScript *script,\n                                enum StatorJitTier tier,\n                                struct StatorTierRequestResult *result);",
+        "bool stator_script_wait_for_tier(const struct StatorScript *script,\n                                 enum StatorJitTier tier,\n                                 uint64_t timeout_ms,\n                                 struct StatorTierRequestResult *result);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h deterministic tier signature drifted:\n{signature}"
+        );
+    }
+}
+
+#[test]
 fn test_header_message_kind_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
