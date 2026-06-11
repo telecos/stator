@@ -568,8 +568,11 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/Array/fromAsync/name.js",
     "built-ins/Array/fromAsync/prop-desc.js",
     "built-ins/AggregateError/name.js",
+    "built-ins/AggregateError/length.js",
+    "built-ins/AggregateError/newtarget-is-undefined.js",
     "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
+    "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
     "built-ins/AggregateError/prototype/name.js",
     "built-ins/AggregateError/prototype/message.js",
     "built-ins/AggregateError/prototype/constructor.js",
@@ -2217,8 +2220,15 @@ mod tests {
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/length.js"));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-is-undefined.js"
+        ));
         assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
         assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/errors-absent-on-prototype.js"
+        ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/name.js"
         ));

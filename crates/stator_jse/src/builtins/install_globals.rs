@@ -2741,6 +2741,11 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         "name".into(),
         JsValue::String("AggregateError".to_string().into()),
     );
+    props.insert_with_attrs(
+        "length".into(),
+        JsValue::Smi(2),
+        PropertyAttributes::CONFIGURABLE,
+    );
     props.insert("@@hasInstance".into(), {
         let proto_for_instanceof = proto_val.clone();
         native(move |args| {
