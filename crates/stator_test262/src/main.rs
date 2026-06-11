@@ -582,6 +582,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
+    "built-ins/AggregateError/message-tostring-abrupt.js",
+    "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
     "built-ins/AggregateError/message-undefined-no-prop.js",
 ];
 
@@ -2218,6 +2220,12 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-method-prop-cast.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-tostring-abrupt.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-tostring-abrupt-symbol.js"
         ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
