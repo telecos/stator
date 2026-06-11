@@ -1063,7 +1063,7 @@ typedef enum StatorPromiseRejectionEventKind {
 } StatorPromiseRejectionEventKind;
 
 /**
- * Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+ * Selects what the embedder receives in the `StatorWeakCallbackInfo` when
  * the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
  * `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
  * can recover embedder fields without re-dereferencing the dead object.
@@ -1071,12 +1071,12 @@ typedef enum StatorPromiseRejectionEventKind {
 typedef enum StatorWeakParameterKind {
   /**
    * The callback only needs the opaque `parameter` pointer captured at
-   * [`stator_weak_new`] time.  `internal_fields` are zeroed.
+   * `stator_weak_new` time.  `internal_fields` are zeroed.
    */
   Opaque = 0,
   /**
    * The callback expects the first two internal fields of the referent
-   * to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+   * to be snapshotted into `StatorWeakCallbackInfo::internal_fields` at
    * slot-creation time.  This is the kind Blink uses to break C++ side
    * pointers from inside the weak callback without touching the (dead)
    * JS wrapper.
@@ -3348,8 +3348,8 @@ typedef struct StatorWeakCallbackInfo {
   /**
    * First two internal-field pointers snapshotted at slot creation when
    * the weak slot was registered with
-   * [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
-   * [`StatorWeakParameterKind::Opaque`] slots.
+   * `StatorWeakParameterKind::InternalFields`.  Always zeroed for
+   * `StatorWeakParameterKind::Opaque` slots.
    */
   void *internal_fields[2];
   /**

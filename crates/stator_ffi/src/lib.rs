@@ -24911,7 +24911,7 @@ pub struct StatorWeak {
     _opaque: [u8; 0],
 }
 
-/// Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+/// Selects what the embedder receives in the `StatorWeakCallbackInfo` when
 /// the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
 /// `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
 /// can recover embedder fields without re-dereferencing the dead object.
@@ -24919,10 +24919,10 @@ pub struct StatorWeak {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatorWeakParameterKind {
     /// The callback only needs the opaque `parameter` pointer captured at
-    /// [`stator_weak_new`] time.  `internal_fields` are zeroed.
+    /// `stator_weak_new` time.  `internal_fields` are zeroed.
     Opaque = 0,
     /// The callback expects the first two internal fields of the referent
-    /// to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+    /// to be snapshotted into `StatorWeakCallbackInfo::internal_fields` at
     /// slot-creation time.  This is the kind Blink uses to break C++ side
     /// pointers from inside the weak callback without touching the (dead)
     /// JS wrapper.
@@ -24940,8 +24940,8 @@ pub struct StatorWeakCallbackInfo {
     pub parameter: *mut c_void,
     /// First two internal-field pointers snapshotted at slot creation when
     /// the weak slot was registered with
-    /// [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
-    /// [`StatorWeakParameterKind::Opaque`] slots.
+    /// `StatorWeakParameterKind::InternalFields`.  Always zeroed for
+    /// `StatorWeakParameterKind::Opaque` slots.
     pub internal_fields: [*mut c_void; 2],
     /// The isolate that owns the slot — typically used to schedule
     /// follow-up embedder work.  The callback must **not** call back into

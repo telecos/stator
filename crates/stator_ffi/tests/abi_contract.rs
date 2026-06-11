@@ -384,6 +384,38 @@ fn test_header_promise_state_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_weak_parameter_kind_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [("Opaque", 0), ("InternalFields", 1)] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable weak parameter-kind discriminant `{marker}`"
+        );
+    }
+    for signature in [
+        "struct StatorWeak *stator_weak_new(struct StatorContext *ctx,\n                                   struct StatorValue *value,\n                                   void *parameter,\n                                   void *internal_field0,\n                                   void *internal_field1,\n                                   StatorWeakCallback cb,\n                                   enum StatorWeakParameterKind parameter_kind);",
+        "struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persistent,\n                                               void *parameter,\n                                               void *internal_field0,\n                                               void *internal_field1,\n                                               StatorWeakCallback cb,\n                                               enum StatorWeakParameterKind parameter_kind);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h weak-handle signature drifted:\n{signature}"
+        );
+    }
+    for marker in [
+        "[`StatorWeakCallbackInfo`]",
+        "[`StatorWeakCallbackInfo::internal_fields`]",
+        "[`StatorWeakParameterKind::InternalFields`]",
+        "[`StatorWeakParameterKind::Opaque`]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
