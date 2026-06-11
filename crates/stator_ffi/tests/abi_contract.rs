@@ -346,6 +346,61 @@ fn test_header_dom_handler_flags_match_abi_and_use_c_friendly_docs() {
 }
 
 #[test]
+fn test_header_dom_symbol_buffer_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorDomSymbolBuffer *stator_dom_symbol_buffer_new(void);",
+        "void stator_dom_symbol_buffer_destroy(struct StatorDomSymbolBuffer *buf);",
+        "size_t stator_dom_symbol_buffer_len(const struct StatorDomSymbolBuffer *buf);",
+        "enum StatorStatus stator_dom_symbol_buffer_push(struct StatorDomSymbolBuffer *buf,\n                                                uint64_t symbol_id,\n                                                const char *description_utf8,\n                                                size_t description_len);",
+        "enum StatorStatus stator_dom_symbol_buffer_get(const struct StatorDomSymbolBuffer *buf,\n                                               size_t index,\n                                               struct StatorDomSymbolKey *out_key);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM symbol-buffer signature drifted:\n{signature}"
+        );
+    }
+
+    let key_start = header
+        .find("POD descriptor for a symbol property key")
+        .expect("generated stator.h should document StatorDomSymbolKey");
+    let key_end = header
+        .find("POD bundle of symbol-keyed named-property interceptors")
+        .expect("generated stator.h should document symbol handler APIs");
+    let symbol_key_docs = &header[key_start..key_end];
+    for marker in [
+        "[`SymbolKey`][stator_jse::dom::SymbolKey]",
+        "stator_jse::dom::SymbolKey",
+    ] {
+        assert!(
+            !symbol_key_docs.contains(marker),
+            "generated stator.h DOM symbol-key docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+
+    let push_start = header
+        .find("Append a symbol identity to a `StatorDomSymbolBuffer`")
+        .expect("generated stator.h should document symbol-buffer push");
+    let push_end = header
+        .find("Install an aggregated set of symbol-keyed named-property interceptors")
+        .expect("generated stator.h should document symbol handler install APIs");
+    let push_docs = &header[push_start..push_end];
+    let buffer_start = header
+        .find("Allocate a fresh, empty `StatorDomSymbolBuffer`")
+        .expect("generated stator.h should document StatorDomSymbolBuffer allocation");
+    let buffer_end = header
+        .find("Install additive named/symbol definer")
+        .expect("generated stator.h should document symbol definer APIs");
+    let buffer_docs = &header[buffer_start..buffer_end];
+    for marker in ["StatorStatus::StatorStatus"] {
+        assert!(
+            !push_docs.contains(marker) && !buffer_docs.contains(marker),
+            "generated stator.h DOM symbol-buffer docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

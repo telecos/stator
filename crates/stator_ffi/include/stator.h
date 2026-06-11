@@ -3144,10 +3144,10 @@ typedef struct StatorDomCallableHandler {
 
 /**
  * POD descriptor for a symbol property key passed across the FFI
- * boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
- * without ever coercing the symbol to a string: `symbol_id` carries the
- * engine-assigned identity verbatim, and `description_utf8`/`description_len`
- * carry the optional description for diagnostics only.
+ * boundary.  Mirrors the engine's internal symbol-key representation without
+ * ever coercing the symbol to a string: `symbol_id` carries the engine-assigned
+ * identity verbatim, and `description_utf8`/`description_len` carry the
+ * optional description for diagnostics only.
  *
  * `description_utf8` may be `NULL` (with `description_len == 0`) when the
  * symbol has no description.  The pointer is borrowed for the duration of
@@ -8664,16 +8664,16 @@ enum StatorStatus stator_dom_object_wrap_invoke_construct(struct StatorDomObject
                                                           struct StatorValue **out);
 
 /**
- * Append a symbol identity to a [`StatorDomSymbolBuffer`].
+ * Append a symbol identity to a `StatorDomSymbolBuffer`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+ * * `StatorStatusOk` on success.
+ * * `StatorStatusInvalidArg` when `buf` is null, when
  *   `description_utf8` is null while `description_len` is non-zero, or
  *   when the description byte range is not valid UTF-8.
  *
  * # Safety
- * - `buf` must be a valid pointer to a [`StatorDomSymbolBuffer`] currently
+ * - `buf` must be a valid pointer to a `StatorDomSymbolBuffer` currently
  *   borrowed by an enumerator callback.
  * - `description_utf8` must point to at least `description_len` valid
  *   bytes when `description_len > 0`.
@@ -8861,21 +8861,21 @@ enum StatorStatus stator_dom_object_wrap_invoke_indexed_enumerate_into(struct St
                                                                        struct StatorDomIndexBuffer *buf);
 
 /**
- * Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with
- * [`stator_dom_symbol_buffer_destroy`].
+ * Allocate a fresh, empty `StatorDomSymbolBuffer`.  Free with
+ * `stator_dom_symbol_buffer_destroy`.
  *
  * # Safety
  * The returned pointer must be released exactly once via
- * [`stator_dom_symbol_buffer_destroy`].
+ * `stator_dom_symbol_buffer_destroy`.
  */
 struct StatorDomSymbolBuffer *stator_dom_symbol_buffer_new(void);
 
 /**
- * Free a [`StatorDomSymbolBuffer`].  Does nothing when `buf` is null.
+ * Free a `StatorDomSymbolBuffer`.  Does nothing when `buf` is null.
  *
  * # Safety
  * `buf` must be either null or a pointer returned by
- * [`stator_dom_symbol_buffer_new`], not previously destroyed.
+ * `stator_dom_symbol_buffer_new`, not previously destroyed.
  */
 void stator_dom_symbol_buffer_destroy(struct StatorDomSymbolBuffer *buf);
 
@@ -8894,9 +8894,9 @@ size_t stator_dom_symbol_buffer_len(const struct StatorDomSymbolBuffer *buf);
  * The borrowed `description_utf8` pointer remains valid until `buf` is
  * mutated (pushed to, cleared, or destroyed).
  *
- * Returns [`StatorStatus::StatorStatusInvalidArg`] when `buf` or
+ * Returns `StatorStatusInvalidArg` when `buf` or
  * `out_key` is null or `index` is out of range; otherwise
- * [`StatorStatus::StatorStatusOk`].
+ * `StatorStatusOk`.
  *
  * # Safety
  * `buf` and `out_key` must be valid pointers; see lifetime note above.
