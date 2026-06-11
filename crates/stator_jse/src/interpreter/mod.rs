@@ -28991,11 +28991,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_promise_resolve_thenable_unwraps() {
+        use crate::builtins::promise::drain_active_microtask_queue;
+
         let result =
             compile_source_and_run(r#"Promise.resolve({ then(resolve) { resolve(14); } })"#)
                 .unwrap();
+        drain_active_microtask_queue();
         assert_fulfilled_promise_value(result, JsValue::Smi(14));
     }
 
