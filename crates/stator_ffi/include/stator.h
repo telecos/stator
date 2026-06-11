@@ -106,22 +106,22 @@
 #define STATOR_JIT_MITIGATIONS_TIER_COUNT 4
 
 /**
- * `MitigationStatus::UnsupportedPlatform` u32 encoding for the FFI snapshot.
+ * `UnsupportedPlatform` u32 encoding for the FFI mitigation snapshot.
  */
 #define STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM 0
 
 /**
- * `MitigationStatus::Disabled` u32 encoding for the FFI snapshot.
+ * `Disabled` u32 encoding for the FFI mitigation snapshot.
  */
 #define STATOR_MITIGATION_STATUS_DISABLED 1
 
 /**
- * `MitigationStatus::Enabled` u32 encoding for the FFI snapshot.
+ * `Enabled` u32 encoding for the FFI mitigation snapshot.
  */
 #define STATOR_MITIGATION_STATUS_ENABLED 2
 
 /**
- * `MitigationStatus::Unknown` u32 encoding for the FFI snapshot.
+ * `Unknown` u32 encoding for the FFI mitigation snapshot.
  */
 #define STATOR_MITIGATION_STATUS_UNKNOWN 3
 

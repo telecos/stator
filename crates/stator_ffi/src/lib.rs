@@ -1195,13 +1195,13 @@ pub const STATOR_JIT_MEMORY_TIER_COUNT: usize = 4;
 /// Number of JIT tier rows carried by `StatorJitMitigationsStats`.
 pub const STATOR_JIT_MITIGATIONS_TIER_COUNT: usize = 4;
 
-/// `MitigationStatus::UnsupportedPlatform` u32 encoding for the FFI snapshot.
+/// `UnsupportedPlatform` u32 encoding for the FFI mitigation snapshot.
 pub const STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM: u32 = 0;
-/// `MitigationStatus::Disabled` u32 encoding for the FFI snapshot.
+/// `Disabled` u32 encoding for the FFI mitigation snapshot.
 pub const STATOR_MITIGATION_STATUS_DISABLED: u32 = 1;
-/// `MitigationStatus::Enabled` u32 encoding for the FFI snapshot.
+/// `Enabled` u32 encoding for the FFI mitigation snapshot.
 pub const STATOR_MITIGATION_STATUS_ENABLED: u32 = 2;
-/// `MitigationStatus::Unknown` u32 encoding for the FFI snapshot.
+/// `Unknown` u32 encoding for the FFI mitigation snapshot.
 pub const STATOR_MITIGATION_STATUS_UNKNOWN: u32 = 3;
 
 /// Per-tier release-safe JIT code memory counters.

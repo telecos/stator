@@ -213,41 +213,63 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
     for (name, value) in [
         (
             "STATOR_DEOPT_TIER_COUNT",
-            stator_jse_ffi::STATOR_DEOPT_TIER_COUNT,
+            stator_jse_ffi::STATOR_DEOPT_TIER_COUNT as u32,
         ),
         (
             "STATOR_DEOPT_REASON_COUNT",
-            stator_jse_ffi::STATOR_DEOPT_REASON_COUNT,
+            stator_jse_ffi::STATOR_DEOPT_REASON_COUNT as u32,
         ),
-        ("STATOR_IC_TIER_COUNT", stator_jse_ffi::STATOR_IC_TIER_COUNT),
-        ("STATOR_IC_OP_COUNT", stator_jse_ffi::STATOR_IC_OP_COUNT),
+        (
+            "STATOR_IC_TIER_COUNT",
+            stator_jse_ffi::STATOR_IC_TIER_COUNT as u32,
+        ),
+        (
+            "STATOR_IC_OP_COUNT",
+            stator_jse_ffi::STATOR_IC_OP_COUNT as u32,
+        ),
         (
             "STATOR_IC_EVENT_COUNT",
-            stator_jse_ffi::STATOR_IC_EVENT_COUNT,
+            stator_jse_ffi::STATOR_IC_EVENT_COUNT as u32,
         ),
         (
             "STATOR_TIER_LATENCY_BUCKET_COUNT",
-            stator_jse_ffi::STATOR_TIER_LATENCY_BUCKET_COUNT,
+            stator_jse_ffi::STATOR_TIER_LATENCY_BUCKET_COUNT as u32,
         ),
         (
             "STATOR_OSR_TIER_COUNT",
-            stator_jse_ffi::STATOR_OSR_TIER_COUNT,
+            stator_jse_ffi::STATOR_OSR_TIER_COUNT as u32,
         ),
         (
             "STATOR_OSR_EXIT_REASON_COUNT",
-            stator_jse_ffi::STATOR_OSR_EXIT_REASON_COUNT,
+            stator_jse_ffi::STATOR_OSR_EXIT_REASON_COUNT as u32,
         ),
         (
             "STATOR_JIT_UNWIND_TIER_COUNT",
-            stator_jse_ffi::STATOR_JIT_UNWIND_TIER_COUNT,
+            stator_jse_ffi::STATOR_JIT_UNWIND_TIER_COUNT as u32,
         ),
         (
             "STATOR_JIT_MEMORY_TIER_COUNT",
-            stator_jse_ffi::STATOR_JIT_MEMORY_TIER_COUNT,
+            stator_jse_ffi::STATOR_JIT_MEMORY_TIER_COUNT as u32,
         ),
         (
             "STATOR_JIT_MITIGATIONS_TIER_COUNT",
-            stator_jse_ffi::STATOR_JIT_MITIGATIONS_TIER_COUNT,
+            stator_jse_ffi::STATOR_JIT_MITIGATIONS_TIER_COUNT as u32,
+        ),
+        (
+            "STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM",
+            stator_jse_ffi::STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM,
+        ),
+        (
+            "STATOR_MITIGATION_STATUS_DISABLED",
+            stator_jse_ffi::STATOR_MITIGATION_STATUS_DISABLED,
+        ),
+        (
+            "STATOR_MITIGATION_STATUS_ENABLED",
+            stator_jse_ffi::STATOR_MITIGATION_STATUS_ENABLED,
+        ),
+        (
+            "STATOR_MITIGATION_STATUS_UNKNOWN",
+            stator_jse_ffi::STATOR_MITIGATION_STATUS_UNKNOWN,
         ),
     ] {
         assert_eq!(
@@ -269,6 +291,7 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
         "[`StatorJitUnwindStats`]",
         "[`StatorJitMemoryStats`]",
         "[`StatorJitMitigationsStats`]",
+        "MitigationStatus::",
     ] {
         assert!(
             !header.contains(marker),
