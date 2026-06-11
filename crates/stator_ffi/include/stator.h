@@ -801,7 +801,7 @@ typedef enum StatorModuleStatus {
 } StatorModuleStatus;
 
 /**
- * Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+ * Hash fields in `StatorSnapshotBuildBinding` that embedders can override.
  */
 typedef enum StatorSnapshotBuildHashField {
   /**

@@ -467,6 +467,28 @@ fn test_header_module_status_discriminants_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_snapshot_build_hash_discriminants_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorSnapshotBuildHashBuildId", 0),
+        ("StatorSnapshotBuildHashBuildFeatures", 1),
+        ("StatorSnapshotBuildHashJitTiering", 2),
+        ("StatorSnapshotBuildHashCpuFeatures", 3),
+        ("StatorSnapshotBuildHashEdgeRelease", 4),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable snapshot build hash discriminant `{marker}`"
+        );
+    }
+    assert!(
+        !header.contains("[`StatorSnapshotBuildBinding`]"),
+        "generated stator.h should not expose Rust intra-doc links for snapshot build binding"
+    );
+}
+
+#[test]
 fn test_header_script_cache_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

@@ -15677,7 +15677,7 @@ pub struct StatorSnapshotBuildBinding {
     inner: StwcBuildBinding,
 }
 
-/// Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+/// Hash fields in `StatorSnapshotBuildBinding` that embedders can override.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatorSnapshotBuildHashField {
