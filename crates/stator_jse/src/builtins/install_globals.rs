@@ -80211,7 +80211,6 @@ mod tests {
 
     /// Private field is not accessible outside class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_not_external() {
         let result = global_eval("class C { #x = 1; } new C().#x");
         assert!(

@@ -3231,6 +3231,12 @@ impl<'src> Parser<'src> {
         // `#x in obj` — private brand check.
         if self.peek_kind() == TokenKind::PrivateIdentifier && !self.no_in {
             let tok = self.bump()?;
+            if self.class_depth == 0 {
+                return Err(Self::error_at(
+                    tok.span,
+                    "private names can only be used inside a class",
+                ));
+            }
             let name = match tok.value {
                 TokenValue::Str(s) => s,
                 _ => return Err(Self::error_at(tok.span, "invalid private name token")),
@@ -3486,6 +3492,12 @@ impl<'src> Parser<'src> {
                     if self.peek_kind() == TokenKind::PrivateIdentifier {
                         // Private access: `obj.#field`
                         let prop_tok = self.bump()?;
+                        if self.class_depth == 0 {
+                            return Err(Self::error_at(
+                                prop_tok.span,
+                                "private names can only be used inside a class",
+                            ));
+                        }
                         let name = match prop_tok.value {
                             TokenValue::Str(s) => s,
                             _ => {
@@ -3582,6 +3594,12 @@ impl<'src> Parser<'src> {
                         TokenKind::PrivateIdentifier => {
                             // `object?.#field`
                             let prop_tok = self.bump()?;
+                            if self.class_depth == 0 {
+                                return Err(Self::error_at(
+                                    prop_tok.span,
+                                    "private names can only be used inside a class",
+                                ));
+                            }
                             let name = match prop_tok.value {
                                 TokenValue::Str(s) => s,
                                 _ => {
@@ -4249,6 +4267,12 @@ impl<'src> Parser<'src> {
                             self.bump()?;
                             if self.peek_kind() == TokenKind::PrivateIdentifier {
                                 let prop_tok = self.bump()?;
+                                if self.class_depth == 0 {
+                                    return Err(Self::error_at(
+                                        prop_tok.span,
+                                        "private names can only be used inside a class",
+                                    ));
+                                }
                                 let name = match prop_tok.value {
                                     TokenValue::Str(s) => s,
                                     _ => {
@@ -8011,6 +8035,18 @@ mod tests {
         } else {
             panic!("expected ClassDecl");
         }
+    }
+
+    #[test]
+    fn test_private_member_access_outside_class_is_syntax_error() {
+        assert!(parse("obj.#x").is_err());
+        assert!(parse("obj?.#x").is_err());
+        assert!(parse("new obj.#x()").is_err());
+    }
+
+    #[test]
+    fn test_private_brand_check_outside_class_is_syntax_error() {
+        assert!(parse("#x in obj").is_err());
     }
 
     #[test]
