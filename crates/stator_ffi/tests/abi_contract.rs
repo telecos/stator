@@ -348,6 +348,41 @@ fn test_header_dom_handler_flags_match_abi_and_use_c_friendly_docs() {
 }
 
 #[test]
+fn test_header_dom_traced_edge_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "bool stator_dom_object_wrap_add_traced_edge(struct StatorDomObjectWrap *wrap,\n                                            struct StatorTraced *traced);",
+        "bool stator_dom_object_wrap_remove_traced_edge(struct StatorDomObjectWrap *wrap,\n                                               struct StatorTraced *traced);",
+        "size_t stator_dom_object_wrap_clear_traced_edges(struct StatorDomObjectWrap *wrap);",
+        "size_t stator_dom_object_wrap_traced_edge_count(const struct StatorDomObjectWrap *wrap);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM traced-edge signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Register an outgoing traced edge on a DOM wrapper.")
+        .expect("generated stator.h should document DOM traced-edge APIs");
+    let end = header
+        .find("Install a fail-closed access-check callback on `wrap`.")
+        .expect("generated stator.h should document access checks after traced-edge APIs");
+    let docs = &header[start..end];
+    for marker in [
+        "[`StatorDomObjectWrap`]",
+        "[`StatorTraced`]",
+        "[`stator_traced_dispose`]",
+        "[`stator_traced_visit_outgoing`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h DOM traced-edge docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_dom_symbol_buffer_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [

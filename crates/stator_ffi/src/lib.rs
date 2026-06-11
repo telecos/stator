@@ -20887,9 +20887,9 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_native_ptr(
 /// invalidated, or the traced slot belongs to a different isolate.
 ///
 /// # Safety
-/// - `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
-/// - `traced` must be null or a valid, live [`StatorTraced`] pointer that has
-///   not yet been passed to [`stator_traced_dispose`].
+/// - `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
+/// - `traced` must be null or a valid, live `StatorTraced` pointer that has
+///   not yet been passed to `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_add_traced_edge(
     wrap: *mut StatorDomObjectWrap,
@@ -20921,7 +20921,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_add_traced_edge(
 /// or when the edge was not registered on `wrap`.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_remove_traced_edge(
     wrap: *mut StatorDomObjectWrap,
@@ -20945,7 +20945,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_remove_traced_edge(
 /// Returns the number of edges removed. Passing null removes nothing.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_clear_traced_edges(
     wrap: *mut StatorDomObjectWrap,
@@ -20964,11 +20964,11 @@ pub unsafe extern "C" fn stator_dom_object_wrap_clear_traced_edges(
 /// Return the number of outgoing traced edges currently registered on `wrap`.
 ///
 /// Empty traced slots may still be present until the embedder removes or clears
-/// them; [`stator_traced_visit_outgoing`] filters empty slots at visitation time.
+/// them; `stator_traced_visit_outgoing` filters empty slots at visitation time.
 /// Passing null returns zero.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_traced_edge_count(
     wrap: *const StatorDomObjectWrap,
