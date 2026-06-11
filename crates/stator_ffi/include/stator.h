@@ -6527,27 +6527,26 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
                                                 bool *out);
 
 /**
- * Invoke a callable [`StatorValue`] with `argc` arguments and, on success,
+ * Invoke a callable `StatorValue` with `argc` arguments and, on success,
  * write the returned value to `*out_val`.
  *
  * This first slice only supports native functions installed via
- * [`stator_function_template_get_function`] or returned through the FFI by
- * a native callback — i.e. values whose internal representation is a
- * reference-counted [`NativeFn`].  Bytecode-backed function values
- * ([`StatorValueInner::Function`]) cannot yet be invoked through this API
+ * `stator_function_template_get_function` or returned through the FFI by
+ * a native callback.  Bytecode-backed function values cannot yet be invoked
+ * through this API
  * because the FFI does not yet model `new.target` or bytecode-function call
  * frames for direct embedder calls; calling such a value returns
- * [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
+ * `StatorStatusUnsupported`.  Construct semantics are
  * likewise deferred.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the native function ran to
+ * * `StatorStatusOk` when the native function ran to
  *   completion; `*out_val` holds the (caller-owned) result.
- * * [`StatorStatus::StatorStatusException`] when the native callback
+ * * `StatorStatusException` when the native callback
  *   returned an `Err`.  The isolate's pending exception is populated.
- * * [`StatorStatus::StatorStatusUnsupported`] when `callable` is not a
+ * * `StatorStatusUnsupported` when `callable` is not a
  *   native function (e.g. bytecode function, plain object, primitive).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `callable`, or
+ * * `StatorStatusInvalidArg` when `ctx`, `callable`, or
  *   `out_val` is null, when `argc` is negative, or when `args` is null
  *   while `argc > 0`.
  *
@@ -6555,13 +6554,13 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
  * treated as JavaScript `undefined`.
  *
  * # Safety
- * * `ctx` must be a valid, live [`StatorContext`] pointer.
- * * `callable` must be either null or a valid, live [`StatorValue`] pointer.
- * * `recv` must be either null or a valid, live [`StatorValue`] pointer.
- * * `args` must be valid for `argc` `*const StatorValue` reads when `argc > 0`
+ * * `ctx` must be a valid, live `StatorContext` pointer.
+ * * `callable` must be either null or a valid, live `StatorValue` pointer.
+ * * `recv` must be either null or a valid, live `StatorValue` pointer.
+ * * `args` must be valid for `argc` `StatorValue const*` reads when `argc > 0`
  *   (or null when `argc == 0`).  Each non-null element must point at a
- *   valid, live [`StatorValue`].
- * * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+ *   valid, live `StatorValue`.
+ * * `out_val` must be either null or a valid output slot for a `StatorValue*`.
  */
 enum StatorStatus stator_value_call(struct StatorContext *ctx,
                                     const struct StatorValue *callable,

@@ -508,24 +508,46 @@ fn test_header_object_property_signatures_and_docs_match_abi() {
     for signature in [
         "enum StatorStatus stator_object_has_property(const struct StatorObject *obj,\n                                             const char *key,\n                                             size_t key_len,\n                                             bool *out);",
         "enum StatorStatus stator_object_delete_property(struct StatorObject *obj,\n                                                const char *key,\n                                                size_t key_len,\n                                                bool *out);",
+        "enum StatorStatus stator_value_call(struct StatorContext *ctx,\n                                    const struct StatorValue *callable,\n                                    const struct StatorValue *recv,\n                                    int32_t argc,\n                                    const struct StatorValue *const *args,\n                                    struct StatorValue **out_val);",
     ] {
         assert!(
             header.contains(signature),
-            "generated stator.h object property signature drifted:\n{signature}"
+            "generated stator.h object property/value call signature drifted:\n{signature}"
         );
     }
 
     let start = header
         .find("Test whether `obj` has a property named `(key, key_len)`")
         .expect("generated stator.h should document object property lookup");
-    let end = header
-        .find("Invoke a callable [`StatorValue`] with `argc` arguments")
+    let call_start = header
+        .find("Invoke a callable `StatorValue` with `argc` arguments")
         .expect("generated stator.h should document value calls after object property APIs");
-    let docs = &header[start..end];
+    let property_docs = &header[start..call_start];
     for marker in ["StatorStatus::StatorStatus", "[`StatorObject`]"] {
         assert!(
-            !docs.contains(marker),
+            !property_docs.contains(marker),
             "generated stator.h object property docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+
+    let call_end = call_start
+        + header[call_start..]
+            .find("Register a native function named `name` on `ctx`.")
+            .unwrap_or_else(|| {
+                panic!("generated stator.h should document native registration after value call")
+            });
+    let call_docs = &header[call_start..call_end];
+    for marker in [
+        "[`StatorValue`]",
+        "[`NativeFn`]",
+        "StatorValueInner::",
+        "StatorStatus::StatorStatus",
+        "*const StatorValue",
+        "*mut StatorValue",
+    ] {
+        assert!(
+            !call_docs.contains(marker),
+            "generated stator.h value call docs should not expose Rust-specific marker `{marker}`"
         );
     }
 }
