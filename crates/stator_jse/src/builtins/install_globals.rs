@@ -2758,7 +2758,7 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         })
     });
     props.insert("__proto__".into(), error_ctor.clone());
-    props.insert("prototype".into(), proto_val);
+    props.insert_with_attrs("prototype".into(), proto_val, PropertyAttributes::empty());
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
 

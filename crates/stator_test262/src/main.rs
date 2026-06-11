@@ -569,6 +569,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/Array/fromAsync/prop-desc.js",
     "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/length.js",
+    "built-ins/AggregateError/is-a-constructor.js",
     "built-ins/AggregateError/newtarget-is-undefined.js",
     "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
@@ -576,6 +577,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AggregateError/prototype/name.js",
     "built-ins/AggregateError/prototype/message.js",
     "built-ins/AggregateError/prototype/constructor.js",
+    "built-ins/AggregateError/prototype/prop-desc.js",
+    "built-ins/AggregateError/prototype/proto.js",
     "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
@@ -2222,6 +2225,9 @@ mod tests {
         assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
         assert!(!is_skipped_path("built-ins/AggregateError/length.js"));
         assert!(!is_skipped_path(
+            "built-ins/AggregateError/is-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/newtarget-is-undefined.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
@@ -2237,6 +2243,12 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/proto.js"
         ));
         assert!(is_skipped_path(
             "built-ins/AggregateError/errors-iterabletolist.js"
