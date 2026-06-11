@@ -8717,8 +8717,6 @@ fn compile_function_inner(
     // writes the actual function value at call time.
     let self_name_reg = if let Some(name) = self_name.as_deref() {
         let reg = compiler.define_local(name);
-        compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-        compiler.emit_star(reg);
         Some(reg)
     } else {
         None
@@ -9601,6 +9599,38 @@ mod tests {
         let instrs = inner.instructions().unwrap();
         assert!(instrs.iter().any(|i| i.opcode == Opcode::Add));
         assert_eq!(instrs.last().unwrap().opcode, Opcode::Return);
+    }
+
+    #[test]
+    fn test_named_function_expression_records_self_name_register() {
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("f")))],
+        };
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Fn(Box::new(FnExpr {
+                loc: span(),
+                id: Some(ident("f")),
+                is_async: false,
+                is_generator: false,
+                params: vec![],
+                body,
+                is_strict: false,
+            }))),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let nested = arr
+            .get_constant(0)
+            .and_then(|entry| match entry {
+                ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("function expression should compile into a function constant");
+        assert!(
+            nested.self_name_register().is_some(),
+            "named function expressions must record their self-reference register"
+        );
     }
 
     #[test]

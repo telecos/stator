@@ -2165,6 +2165,7 @@ fn handle_call_any_receiver(
                     && !ctx.frame.bytecode_array.is_strict()
                     && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                     && !ba.has_exception_handler()
+                    && ba.self_name_register().is_none()
                     && let Some(result) =
                         try_inline_small_function(ba.as_ref(), &[], &ctx.frame.global_env)
                 {
@@ -2410,6 +2411,7 @@ fn handle_call_undefined_receiver0(
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
+                && ba.self_name_register().is_none()
             {
                 let no_args: &[JsValue] = &[];
                 if let Some(result) =
@@ -2544,6 +2546,7 @@ fn handle_call_undefined_receiver1(
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
+                && ba.self_name_register().is_none()
             {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
@@ -3148,6 +3151,9 @@ fn call_plain_object_function(
     }
     let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
+    if ba.self_name_register().is_some() {
+        populate_self_name(&mut callee_frame, ba, &JsValue::PlainObject(Rc::clone(map)));
+    }
     callee_frame.new_target = ctx.frame.new_target.clone();
     let saved_super = if is_derived_constructor {
         let parent = map.borrow().get("__proto__").cloned();

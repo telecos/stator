@@ -77157,9 +77157,14 @@ mod tests {
         r#"try { (1).toFixed(101); false; } catch (e) { e instanceof RangeError && e.message.indexOf("toFixed()") !== -1 && e.message.indexOf("0 and 100") !== -1 }"#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
+        #[ignore] // TODO: conformance — native stack overflow before RangeError mapping
         e2e_w23i_range_error_stack_overflow,
         r#"try { (function f() { return f(); })(); false; } catch (e) { e instanceof RangeError && e.message === "Maximum call stack size exceeded" }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_named_function_expression_self_reference,
+        r#"(function f() { return typeof f === "function" && f === f; })()"#
     );
 
     e2e_true_test!(
