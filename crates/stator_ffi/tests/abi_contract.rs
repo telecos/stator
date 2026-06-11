@@ -587,6 +587,39 @@ fn test_header_value_numeric_getter_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_value_string_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "enum StatorStatus stator_value_get_string_utf8_length(const struct StatorValue *val, size_t *out);",
+        "enum StatorStatus stator_value_write_string_utf8(const struct StatorValue *val,\n                                                 char *buf,\n                                                 size_t buf_size,\n                                                 size_t *written);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h value string signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Read the UTF-8 byte length of the string stored in `val` into `*out`.")
+        .expect("generated stator.h should document string length getter");
+    let end = header
+        .find("Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle")
+        .expect("generated stator.h should document object/value bridge after string APIs");
+    let docs = &header[start..end];
+    for marker in [
+        "StatorStatus::StatorStatus",
+        "[`StatorValue`]",
+        "[`stator_value_write_string_utf8`]",
+        "[`stator_value_get_string_utf8_length`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h value string docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_promise_state_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

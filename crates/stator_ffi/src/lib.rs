@@ -13613,17 +13613,17 @@ pub unsafe extern "C" fn stator_value_get_uint32(
 ///
 /// The returned length does **not** include a terminating null byte and is
 /// the count of raw UTF-8 bytes — sufficient for sizing a buffer passed to
-/// [`stator_value_write_string_utf8`].
+/// `stator_value_write_string_utf8`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a string; `*out` is the
+/// * `StatorStatusOk` when `val` is a string; `*out` is the
 ///   byte length.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   string.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `usize`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_string_utf8_length(
@@ -13653,7 +13653,7 @@ pub unsafe extern "C" fn stator_value_get_string_utf8_length(
 ///
 /// At most `buf_size` bytes are written.  If `buf_size` is smaller than the
 /// string's byte length the output is truncated; callers can size their
-/// buffer with [`stator_value_get_string_utf8_length`] and inspect
+/// buffer with `stator_value_get_string_utf8_length` and inspect
 /// `*written` to detect truncation.
 ///
 /// On success, `*written` (if non-null) is set to the number of bytes
@@ -13661,15 +13661,15 @@ pub unsafe extern "C" fn stator_value_get_string_utf8_length(
 /// callers never see stale length information.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on a (possibly truncated) successful
+/// * `StatorStatusOk` on a (possibly truncated) successful
 ///   write.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   string.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `buf` is null.
+/// * `StatorStatusInvalidArg` when `val` or `buf` is null.
 ///   A null `written` pointer is allowed (and simply discards the length).
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `buf` must be valid for writes of `buf_size` bytes (unless null).
 /// * `written` must be either null or a valid pointer to a `usize`.
 #[unsafe(no_mangle)]
