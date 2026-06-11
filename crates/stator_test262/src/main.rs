@@ -475,6 +475,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/bold/name.js",
     "annexB/built-ins/String/prototype/bold/not-a-constructor.js",
     "annexB/built-ins/String/prototype/bold/prop-desc.js",
+    "annexB/built-ins/String/prototype/bold/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fixed/B.2.3.6.js",
     "annexB/built-ins/String/prototype/fixed/length.js",
     "annexB/built-ins/String/prototype/fixed/name.js",
@@ -482,11 +483,13 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/fixed/prop-desc.js",
     "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
+    "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/fontcolor/length.js",
     "annexB/built-ins/String/prototype/fontcolor/name.js",
     "annexB/built-ins/String/prototype/fontcolor/not-a-constructor.js",
     "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
     "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
+    "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/fontsize/length.js",
     "annexB/built-ins/String/prototype/fontsize/name.js",
     "annexB/built-ins/String/prototype/fontsize/not-a-constructor.js",
@@ -2075,6 +2078,9 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/blink/this-val-tostring-err.js"
         ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/bold/this-val-tostring-err.js"
+        ));
         for method in [
             "blink",
             "bold",
@@ -2117,7 +2123,13 @@ mod tests {
             "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
