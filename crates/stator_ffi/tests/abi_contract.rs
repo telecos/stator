@@ -473,6 +473,40 @@ fn test_header_dom_index_and_name_buffer_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_dom_callable_callback_typedefs_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "typedef enum StatorStatus (*StatorDomCallAsFunctionCb)(const struct StatorValue *receiver,\n                                                       const struct StatorValue *const *args,\n                                                       size_t arg_count,\n                                                       void *data,\n                                                       struct StatorValue **out);",
+        "typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_target,\n                                                  const struct StatorValue *const *args,\n                                                  size_t arg_count,\n                                                  void *data,\n                                                  struct StatorValue **out);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h DOM callable callback typedef drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("DOM wrapper call-as-function callback.")
+        .expect("generated stator.h should document DOM callable callback");
+    let end = header
+        .find("V2 named-property **getter** callback.")
+        .expect(
+            "generated stator.h should document named getter callback after callable callbacks",
+        );
+    let docs = &header[start..end];
+    for marker in [
+        "[`StatorValue`]",
+        "StatorStatus::StatorStatus",
+        "[`StatorDomCallAsFunctionCb`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h DOM callable callback docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

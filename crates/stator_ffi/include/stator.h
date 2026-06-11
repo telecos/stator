@@ -3646,8 +3646,8 @@ typedef bool (*StatorWasmHostFuncCallback)(struct StatorContext *ctx,
  *
  * `receiver` is the JS receiver for ordinary calls (or null when invoked
  * directly through FFI without one). `args` is a borrowed array of
- * `arg_count` borrowed [`StatorValue`] pointers and may be null when
- * `arg_count == 0`. Returning [`StatorStatus::StatorStatusOk`] transfers
+ * `arg_count` borrowed `StatorValue` pointers and may be null when
+ * `arg_count == 0`. Returning `StatorStatusOk` transfers
  * ownership of `*out` to Stator when it is non-null; a null `*out` means the
  * JavaScript result is `undefined`.
  */
@@ -3662,7 +3662,7 @@ typedef enum StatorStatus (*StatorDomCallAsFunctionCb)(const struct StatorValue 
  *
  * `new_target` is the constructor value for script `new wrapper(...)` calls
  * (or null for direct FFI invocations that do not supply one). Argument and
- * result ownership semantics match [`StatorDomCallAsFunctionCb`].
+ * result ownership semantics match `StatorDomCallAsFunctionCb`.
  */
 typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_target,
                                                   const struct StatorValue *const *args,
