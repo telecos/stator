@@ -17148,8 +17148,8 @@ pub enum StatorMessageKind {
     StatorMessageKindURI = 5,
     /// WebAssembly compilation, instantiation, or execution failure.
     StatorMessageKindWasm = 6,
-    /// An internal engine error (`stator_jse::error::StatorError::Internal`)
-    /// or a programmer-induced FFI misuse (e.g. null source pointer).
+    /// An internal engine error or a programmer-induced FFI misuse
+    /// (e.g. null source pointer).
     StatorMessageKindInternal = 7,
     /// Script execution was interrupted by an explicit termination request
     /// (`stator_isolate_terminate_execution` or equivalent).
@@ -17193,7 +17193,7 @@ pub enum StatorMessageKind {
 ///   populated by the engine; getters return `false` so callers can detect
 ///   the missing data rather than treat a zero as truthful.
 /// - **terminated** — `true` when the message was raised because execution
-///   was being terminated (see [`StatorMessageKind::StatorMessageKindTermination`]).
+///   was being terminated (see `StatorMessageKindTermination`).
 ///
 /// Created internally by the engine and exposed via:
 /// - [`stator_isolate_take_pending_message`] (ownership transfer)

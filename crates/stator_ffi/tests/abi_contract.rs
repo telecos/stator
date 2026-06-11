@@ -822,7 +822,11 @@ fn test_header_message_kind_discriminants_and_docs_match_abi() {
             "generated stator.h is missing stable message-kind discriminant `{marker}`"
         );
     }
-    for marker in ["[`StatorMessageKind::StatorMessageKindUnknown`]"] {
+    for marker in [
+        "[`StatorMessageKind::StatorMessageKindUnknown`]",
+        "[`StatorMessageKind::StatorMessageKindTermination`]",
+        "stator_jse::error::StatorError::",
+    ] {
         assert!(
             !header.contains(marker),
             "generated stator.h should not expose Rust intra-doc link `{marker}`"
