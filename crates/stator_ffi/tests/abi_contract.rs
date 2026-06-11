@@ -352,6 +352,38 @@ fn test_header_status_discriminants_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_promise_state_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorPromiseStatePending", 0),
+        ("StatorPromiseStateFulfilled", 1),
+        ("StatorPromiseStateRejected", 2),
+        ("StatorPromiseStateInvalid", 3),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable Promise state discriminant `{marker}`"
+        );
+    }
+    for signature in [
+        "enum StatorPromiseState stator_promise_state(const struct StatorValue *promise);",
+        "struct StatorValue *stator_promise_result(const struct StatorValue *promise);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h Promise signature drifted:\n{signature}"
+        );
+    }
+    for marker in ["[`StatorPromiseState::StatorPromiseStateInvalid`]"] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

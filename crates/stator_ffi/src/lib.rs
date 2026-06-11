@@ -2965,11 +2965,11 @@ pub unsafe extern "C" fn stator_promise_reject(
 
 /// Return the observable state of a real FFI Promise handle.
 ///
-/// Returns [`StatorPromiseState::StatorPromiseStateInvalid`] when `promise` is
+/// Returns `StatorPromiseStateInvalid` when `promise` is
 /// null, is not a promise, or is only a tag-only promise placeholder.
 ///
 /// # Safety
-/// `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// `promise` must be null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_promise_state(promise: *const StatorValue) -> StatorPromiseState {
     if promise.is_null() {
@@ -2990,10 +2990,10 @@ pub unsafe extern "C" fn stator_promise_state(promise: *const StatorValue) -> St
 ///
 /// Returns null when `promise` is null, is not a real Promise handle, is still
 /// pending, or has no owning isolate.  The caller owns the returned value and
-/// must release it with [`stator_value_destroy`] (or an active handle scope).
+/// must release it with `stator_value_destroy` (or an active handle scope).
 ///
 /// # Safety
-/// `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// `promise` must be null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_promise_result(promise: *const StatorValue) -> *mut StatorValue {
     if promise.is_null() {

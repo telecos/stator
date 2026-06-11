@@ -4690,11 +4690,11 @@ enum StatorStatus stator_promise_reject(struct StatorValue *promise,
 /**
  * Return the observable state of a real FFI Promise handle.
  *
- * Returns [`StatorPromiseState::StatorPromiseStateInvalid`] when `promise` is
+ * Returns `StatorPromiseStateInvalid` when `promise` is
  * null, is not a promise, or is only a tag-only promise placeholder.
  *
  * # Safety
- * `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * `promise` must be null or a valid, live `StatorValue` pointer.
  */
 enum StatorPromiseState stator_promise_state(const struct StatorValue *promise);
 
@@ -4703,10 +4703,10 @@ enum StatorPromiseState stator_promise_state(const struct StatorValue *promise);
  *
  * Returns null when `promise` is null, is not a real Promise handle, is still
  * pending, or has no owning isolate.  The caller owns the returned value and
- * must release it with [`stator_value_destroy`] (or an active handle scope).
+ * must release it with `stator_value_destroy` (or an active handle scope).
  *
  * # Safety
- * `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * `promise` must be null or a valid, live `StatorValue` pointer.
  */
 struct StatorValue *stator_promise_result(const struct StatorValue *promise);
 
