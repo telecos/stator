@@ -21422,9 +21422,12 @@ fn make_regexp() -> JsValue {
                 "exec".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("exec").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("exec").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21437,9 +21440,12 @@ fn make_regexp() -> JsValue {
                 "test".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("test").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("test").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21695,10 +21701,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_match__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_match__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_match__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21711,10 +21719,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_replace__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_replace__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_replace__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let repl = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input, repl]);
@@ -21728,10 +21738,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_search__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_search__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_search__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21744,10 +21756,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_split__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_split__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_split__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let limit = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input, limit]);
@@ -21761,10 +21775,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_match_all__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_match_all__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_match_all__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -64674,6 +64690,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// `RegExp.prototype.test.call(...)` delegates without keeping the receiver borrowed.
+    #[test]
+    fn e2e_regexp_prototype_test_call_updates_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 1; String(RegExp.prototype.test.call(re, 'ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// `RegExp.prototype.exec.call(...)` delegates without keeping the receiver borrowed.
+    #[test]
+    fn e2e_regexp_prototype_exec_call_updates_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 1; var m = RegExp.prototype.exec.call(re, 'ba'); m[0] + ':' + m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:1:2".into()));
     }
 
     /// Sticky `test` respects `lastIndex` as the required start position.
