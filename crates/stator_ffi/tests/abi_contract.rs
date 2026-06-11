@@ -416,6 +416,29 @@ fn test_header_weak_parameter_kind_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_wasm_value_kind_discriminants_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorWasmValueKindI32", 0),
+        ("StatorWasmValueKindI64", 1),
+        ("StatorWasmValueKindF32", 2),
+        ("StatorWasmValueKindF64", 3),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable Wasm value-kind discriminant `{marker}`"
+        );
+    }
+    for marker in ["[`StatorWasmValue`]", "[`StatorWasmValue::kind`]"] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

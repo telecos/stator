@@ -2866,9 +2866,9 @@ typedef struct StatorPlatformVTable {
 } StatorPlatformVTable;
 
 /**
- * C-ABI union payload of a [`StatorWasmValue`].
+ * C-ABI union payload of a `StatorWasmValue`.
  *
- * Only the variant indicated by the containing [`StatorWasmValue::kind`] is
+ * Only the variant indicated by the containing `StatorWasmValue.kind` is
  * well-defined; reading any other variant is undefined behavior.
  */
 typedef union StatorWasmValuePayload {
@@ -3624,17 +3624,17 @@ typedef enum StatorResolveStatus (*StatorImportMetaPopulateCallback)(struct Stat
  *
  * Invoked synchronously on the thread running the Wasm caller.  Returns
  * `true` after writing exactly `results_len` typed results into `results`.
- * Result kinds must match the declaration in [`StatorWasmHostFunc::results`].
+ * Result kinds must match the declaration in `StatorWasmHostFunc.results`.
  * Returning `false` or a mismatched result kind traps the running Wasm call:
  * the enclosing
- * [`stator_wasm_instance_call`] then returns null.
+ * `stator_wasm_instance_call` then returns null.
  *
  * # Safety
  * - `args` is a valid pointer for reads of `args_len` consecutive
- *   [`StatorWasmValue`]s.
+ *   `StatorWasmValue`s.
  * - `results` is a valid pointer for writes of `results_len` consecutive
- *   [`StatorWasmValue`]s.  Each slot must be initialised by the callback
- *   with the kind declared in [`StatorWasmHostFunc::results`].
+ *   `StatorWasmValue`s.  Each slot must be initialised by the callback
+ *   with the kind declared in `StatorWasmHostFunc.results`.
  * - `ctx` and `user_data` are the values supplied at instantiate time and
  *   must remain live for the duration of the call.
  */
