@@ -165,7 +165,7 @@ pub extern "C" fn stator_native_code_cache_diagnostic_name(
 ///
 /// When `bytes` is non-null and `len > 0`, it must point to `len` readable
 /// bytes for the duration of the call. Null `bytes` or zero `len` returns
-/// [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+/// `StatorNativeCodeCacheDiagnosticInvalidArgument`
 /// without dereferencing `bytes`. When `out_info` is non-null, it must be valid
 /// for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]
@@ -199,7 +199,7 @@ pub unsafe extern "C" fn stator_native_code_cache_classify_header(
 /// bytes for the duration of the call. `expected` must either be null or point
 /// to a valid compatibility struct. Null `bytes`, zero `len`, or null
 /// `expected` returns
-/// [`StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument`]
+/// `StatorNativeCodeCacheDiagnosticInvalidArgument`
 /// without dereferencing invalid inputs. When `out_info` is non-null, it must be
 /// valid for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]

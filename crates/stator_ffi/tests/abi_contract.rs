@@ -208,6 +208,22 @@ fn test_header_native_code_cache_constants_and_diagnostics_match_abi() {
 }
 
 #[test]
+fn test_header_native_code_cache_function_signatures_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "size_t stator_native_code_cache_header_size(void);",
+        "const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);",
+        "enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(const uint8_t *bytes,\n                                                                              size_t len,\n                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);",
+        "enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_validate_header(const uint8_t *bytes,\n                                                                              size_t len,\n                                                                              const struct StatorNativeCodeCacheCompatibility *expected,\n                                                                              struct StatorNativeCodeCacheHeaderInfo *out_info);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h native code-cache signature drifted:\n{signature}"
+        );
+    }
+}
+
+#[test]
 fn test_header_contains_abi_version_markers() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for marker in [
