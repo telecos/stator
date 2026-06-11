@@ -286,6 +286,7 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
         "[`StatorIcOpCounters`]",
         "[`StatorTierLatencyTier`]",
         "[`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`]",
+        "stator_jse::compiler::tier_latency::",
         "[`StatorOsrCountersStats`]",
         "[`StatorOsrExitReasonCounts`]",
         "[`StatorJitUnwindStats`]",

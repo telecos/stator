@@ -75,8 +75,8 @@
 /**
  * Number of histogram buckets carried by `StatorTierLatencyTier`.
  *
- * This must match `stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS` and is
- * part of the C ABI contract.  Bumping this value is a breaking change.
+ * This mirrors the engine's fixed promotion-latency histogram bucket count and
+ * is part of the C ABI contract.  Bumping this value is a breaking change.
  */
 #define STATOR_TIER_LATENCY_BUCKET_COUNT 9
 
@@ -1819,10 +1819,8 @@ typedef struct StatorIcCountersStats {
  * Per-tier portion of [`StatorTierLatencyStats`].
  *
  * All durations are expressed in **nanoseconds**.  Histogram bucket
- * boundaries follow
- * [`stator_jse::compiler::tier_latency::HISTOGRAM_BUCKETS_US`] (in
- * microseconds), with the final bucket counting overflows above the
- * last named upper bound.
+ * boundaries follow the engine's fixed microsecond promotion-latency buckets,
+ * with the final bucket counting overflows above the last named upper bound.
  */
 typedef struct StatorTierLatencyTier {
   /**
