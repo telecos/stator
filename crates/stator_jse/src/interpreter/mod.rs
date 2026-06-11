@@ -22845,7 +22845,6 @@ mod tests {
     /// JIT.  The test captures a snapshot before and after triggering
     /// compilation and asserts that the counters increase on x86-64 Unix.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô JIT stats polling
     fn test_jit_stats_updated_after_compilation() {
         use super::jit_stats;
         use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
