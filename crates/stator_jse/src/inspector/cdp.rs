@@ -527,6 +527,9 @@ pub struct CdpDispatcher {
     overlay_show_fps_counter: bool,
     overlay_show_layout_shift_regions: bool,
     overlay_show_ad_highlights: bool,
+    overlay_show_viewport_size_on_resize: bool,
+    overlay_show_scroll_bottleneck_rects: bool,
+    overlay_show_hit_test_borders: bool,
     /// Cached inspect mode requested through `Overlay.setInspectMode`.
     overlay_inspect_mode: String,
     /// Whether the ServiceWorker domain is currently enabled for this session.
@@ -687,6 +690,9 @@ impl CdpDispatcher {
             overlay_show_fps_counter: false,
             overlay_show_layout_shift_regions: false,
             overlay_show_ad_highlights: false,
+            overlay_show_viewport_size_on_resize: false,
+            overlay_show_scroll_bottleneck_rects: false,
+            overlay_show_hit_test_borders: false,
             overlay_inspect_mode: "none".to_string(),
             service_worker_enabled: false,
             service_worker_force_update_on_page_load: false,
@@ -964,6 +970,21 @@ impl CdpDispatcher {
     /// Returns the cached ad-highlight overlay toggle.
     pub fn overlay_show_ad_highlights(&self) -> bool {
         self.overlay_show_ad_highlights
+    }
+
+    /// Returns the cached viewport-size overlay toggle.
+    pub fn overlay_show_viewport_size_on_resize(&self) -> bool {
+        self.overlay_show_viewport_size_on_resize
+    }
+
+    /// Returns the cached scroll-bottleneck overlay toggle.
+    pub fn overlay_show_scroll_bottleneck_rects(&self) -> bool {
+        self.overlay_show_scroll_bottleneck_rects
+    }
+
+    /// Returns the cached hit-test-border overlay toggle.
+    pub fn overlay_show_hit_test_borders(&self) -> bool {
+        self.overlay_show_hit_test_borders
     }
 
     /// Returns the cached inspect mode.
@@ -1903,6 +1924,13 @@ impl CdpDispatcher {
                 self.overlay_set_show_layout_shift_regions(&req.params)
             }
             "Overlay.setShowAdHighlights" => self.overlay_set_show_ad_highlights(&req.params),
+            "Overlay.setShowViewportSizeOnResize" => {
+                self.overlay_set_show_viewport_size_on_resize(&req.params)
+            }
+            "Overlay.setShowScrollBottleneckRects" => {
+                self.overlay_set_show_scroll_bottleneck_rects(&req.params)
+            }
+            "Overlay.setShowHitTestBorders" => self.overlay_set_show_hit_test_borders(&req.params),
             "Overlay.setInspectMode" => self.overlay_set_inspect_mode(&req.params),
             "Overlay.hideHighlight" => Ok(json!({})),
             "Overlay.highlightNode" => Ok(json!({})),
@@ -2166,6 +2194,24 @@ impl CdpDispatcher {
     fn overlay_set_show_ad_highlights(&mut self, params: &Value) -> StatorResult<Value> {
         self.overlay_show_ad_highlights =
             Self::overlay_required_bool(params, "Overlay.setShowAdHighlights", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_viewport_size_on_resize(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_viewport_size_on_resize =
+            Self::overlay_required_bool(params, "Overlay.setShowViewportSizeOnResize", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_scroll_bottleneck_rects(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_scroll_bottleneck_rects =
+            Self::overlay_required_bool(params, "Overlay.setShowScrollBottleneckRects", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_hit_test_borders(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_hit_test_borders =
+            Self::overlay_required_bool(params, "Overlay.setShowHitTestBorders", "show")?;
         Ok(json!({}))
     }
 
@@ -7734,28 +7780,49 @@ mod tests {
         assert!(ad.get("error").is_none());
         assert!(d.overlay_show_ad_highlights());
 
+        let viewport = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Overlay.setShowViewportSizeOnResize","params":{"show":true}}"#,
+        );
+        assert!(viewport.get("error").is_none());
+        assert!(d.overlay_show_viewport_size_on_resize());
+
+        let scroll = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Overlay.setShowScrollBottleneckRects","params":{"show":true}}"#,
+        );
+        assert!(scroll.get("error").is_none());
+        assert!(d.overlay_show_scroll_bottleneck_rects());
+
+        let hit = dispatch(
+            &mut d,
+            r#"{"id":9,"method":"Overlay.setShowHitTestBorders","params":{"show":true}}"#,
+        );
+        assert!(hit.get("error").is_none());
+        assert!(d.overlay_show_hit_test_borders());
+
         let inspect = dispatch(
             &mut d,
-            r#"{"id":7,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
+            r#"{"id":10,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
         );
         assert!(inspect.get("error").is_none());
         assert_eq!(d.overlay_inspect_mode(), "searchForNode");
 
         let bad = dispatch(
             &mut d,
-            r#"{"id":8,"method":"Overlay.setShowFPSCounter","params":{}}"#,
+            r#"{"id":11,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
         );
         assert!(bad["error"].is_object());
 
         let hide = dispatch(
             &mut d,
-            r#"{"id":9,"method":"Overlay.hideHighlight","params":{}}"#,
+            r#"{"id":12,"method":"Overlay.hideHighlight","params":{}}"#,
         );
         assert!(hide.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":10,"method":"Overlay.disable","params":{}}"#,
+            r#"{"id":13,"method":"Overlay.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.overlay_enabled());
