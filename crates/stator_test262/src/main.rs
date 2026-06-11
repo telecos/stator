@@ -577,6 +577,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AggregateError/length.js",
     "built-ins/AggregateError/is-a-constructor.js",
     "built-ins/AggregateError/newtarget-is-undefined.js",
+    "built-ins/AggregateError/newtarget-proto-custom.js",
+    "built-ins/AggregateError/newtarget-proto.js",
     "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
     "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
@@ -2259,6 +2261,12 @@ mod tests {
         ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/newtarget-is-undefined.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto-custom.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
         assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
