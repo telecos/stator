@@ -241,6 +241,17 @@ fn test_header_contains_abi_version_markers() {
             "generated stator.h is missing ABI marker `{marker}`; cbindgen export list may have regressed"
         );
     }
+    for signature in [
+        "uint32_t stator_ffi_abi_version(void);",
+        "uint32_t stator_ffi_abi_version_major(void);",
+        "uint32_t stator_ffi_abi_version_minor(void);",
+        "uint32_t stator_ffi_abi_version_patch(void);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h ABI version signature drifted:\n{signature}"
+        );
+    }
 }
 
 #[test]

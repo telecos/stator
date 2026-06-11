@@ -237,7 +237,7 @@ The header format is exactly 256 bytes:
 | 216 | `payload_digest` | SHA-256 of the native payload bytes after the header | `corrupt_payload` |
 | 248 | `payload_length_bytes` | u64 little-endian exact payload length | `corrupt_payload` |
 
-The public FFI helpers `stator_native_code_cache_classify_header`, `stator_native_code_cache_validate_header`, `stator_native_code_cache_header_size`, and `stator_native_code_cache_diagnostic_name` expose this contract to embedders. Classification only decodes the fixed header. Validation compares target tier, engine/ABI/compiler identity, target triple and CPU features, JIT flags, source key digest, payload digest, and payload length. A fully compatible artifact returns `unsupported_native_code` until Stator has a safe native compiled-artifact serialization and loader.
+The public FFI helpers `stator_native_code_cache_classify_header`, `stator_native_code_cache_validate_header`, `stator_native_code_cache_header_size`, and `stator_native_code_cache_diagnostic_name` expose this contract to embedders. Classification only decodes the fixed header. Validation compares target tier, engine/ABI/compiler identity, target triple and CPU features, JIT flags, source key digest, payload digest, and payload length. A fully compatible artifact returns `unsupported_native_code` until Stator has a safe native compiled-artifact serialization and loader. Classification and validation return `invalid_argument` for null `bytes` or zero `len`, validation also returns `invalid_argument` for null `expected`, `out_info` may be null, and diagnostic-name pointers are process-static strings that embedders must not free.
 
 ### Module source metadata v2 plumbing
 
