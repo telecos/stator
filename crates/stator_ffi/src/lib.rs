@@ -95,7 +95,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 29;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 30;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -4746,6 +4746,33 @@ pub enum StatorModuleCacheStatus {
     /// authenticity should wrap the cache blob in their own signed or
     /// HMAC'd envelope.
     StatorModuleCacheStatusCorruptPayload = 7,
+}
+
+fn module_cache_status_name_bytes_u32(status: u32) -> &'static [u8] {
+    match status {
+        0 => b"produced_metadata\0",
+        1 => b"accepted_validated_recompiled\0",
+        2 => b"invalid_argument\0",
+        3 => b"compile_error\0",
+        4 => b"rejected\0",
+        5 => b"unsupported\0",
+        6 => b"accepted_bytecode_restored\0",
+        7 => b"corrupt_payload\0",
+        _ => b"unknown_status\0",
+    }
+}
+
+/// Return a stable telemetry code string for a raw module code-cache status.
+///
+/// Unknown or future status values return `"unknown_status"` rather than
+/// requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_module_cache_status_name_u32(status: u32) -> *const c_char {
+    module_cache_status_name_bytes_u32(status).as_ptr().cast()
 }
 
 /// Read-only view of the browser policy/origin metadata associated with a
@@ -26214,6 +26241,61 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "unknown_diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_module_code_cache_stable_status_name_mapping() {
+        let statuses = [
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata as u32,
+                "produced_metadata",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled as u32,
+                "accepted_validated_recompiled",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument as u32,
+                "invalid_argument",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusRejected as u32,
+                "rejected",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported as u32,
+                "unsupported",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored as u32,
+                "accepted_bytecode_restored",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+        ];
+        for (status, expected) in statuses {
+            let ptr = stator_module_cache_status_name_u32(status);
+            assert!(
+                !ptr.is_null(),
+                "module status name pointer must be non-null for {status}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown = stator_module_cache_status_name_u32(999);
+        assert!(!unknown.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown) }.to_str().unwrap(),
+            "unknown_status"
         );
     }
 

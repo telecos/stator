@@ -204,6 +204,7 @@ stator_message_resource_name
 stator_message_terminated
 stator_message_text
 stator_module_bytecode_count
+stator_module_cache_status_name_u32
 stator_module_compile
 stator_module_compile_cached
 stator_module_compile_typed

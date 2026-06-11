@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 29
+#define STATOR_FFI_ABI_VERSION_MINOR 30
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5240,6 +5240,18 @@ size_t stator_string_len(const struct StatorString *string);
  *   [`stator_string_new`] that has not already been freed.
  */
 void stator_string_free(struct StatorString *string);
+
+/**
+ * Return a stable telemetry code string for a raw module code-cache status.
+ *
+ * Unknown or future status values return `"unknown_status"` rather than
+ * requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_module_cache_status_name_u32(uint32_t status);
 
 /**
  * Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.

@@ -957,6 +957,11 @@ fn test_header_module_cache_status_discriminants_match_abi() {
             "generated stator.h is missing stable module cache status discriminant `{marker}`"
         );
     }
+    let signature = "const char *stator_module_cache_status_name_u32(uint32_t status);";
+    assert!(
+        header.contains(signature),
+        "generated stator.h module cache status name signature drifted:\n{signature}"
+    );
 }
 
 #[test]
