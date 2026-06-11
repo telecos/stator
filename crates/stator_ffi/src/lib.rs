@@ -13987,13 +13987,13 @@ pub unsafe extern "C" fn stator_object_set_property(
 /// inherited).  The result is written to `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success; `*out` is `true` iff the
+/// * `StatorStatusOk` on success; `*out` is `true` iff the
 ///   property exists.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
 ///   null, or when the key bytes are not valid UTF-8.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]
@@ -14023,15 +14023,15 @@ pub unsafe extern "C" fn stator_object_has_property(
 /// outcome of the underlying `[[Delete]]` is written to `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.  `*out` is `true` when
+/// * `StatorStatusOk` on success.  `*out` is `true` when
 ///   the property no longer exists (either it was successfully deleted or
 ///   was already absent) and `false` when deletion was rejected (e.g. a
 ///   non-configurable own property).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
 ///   null, or when the key bytes are not valid UTF-8.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]

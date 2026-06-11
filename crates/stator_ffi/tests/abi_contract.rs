@@ -503,6 +503,34 @@ fn test_header_status_discriminants_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_object_property_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "enum StatorStatus stator_object_has_property(const struct StatorObject *obj,\n                                             const char *key,\n                                             size_t key_len,\n                                             bool *out);",
+        "enum StatorStatus stator_object_delete_property(struct StatorObject *obj,\n                                                const char *key,\n                                                size_t key_len,\n                                                bool *out);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h object property signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Test whether `obj` has a property named `(key, key_len)`")
+        .expect("generated stator.h should document object property lookup");
+    let end = header
+        .find("Invoke a callable [`StatorValue`] with `argc` arguments")
+        .expect("generated stator.h should document value calls after object property APIs");
+    let docs = &header[start..end];
+    for marker in ["StatorStatus::StatorStatus", "[`StatorObject`]"] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h object property docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_promise_state_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
