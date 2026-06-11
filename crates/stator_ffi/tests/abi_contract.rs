@@ -613,6 +613,8 @@ fn test_header_weak_parameter_kind_signatures_and_docs_match_abi() {
         "[`StatorWeakCallbackInfo::internal_fields`]",
         "[`StatorWeakParameterKind::InternalFields`]",
         "[`StatorWeakParameterKind::Opaque`]",
+        "StatorWeakParameterKind::InternalFields",
+        "StatorWeakParameterKind::Opaque",
     ] {
         assert!(
             !header.contains(marker),

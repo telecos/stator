@@ -24936,9 +24936,8 @@ pub struct StatorWeakCallbackInfo {
     /// The opaque pointer registered with [`stator_weak_new`].
     pub parameter: *mut c_void,
     /// First two internal-field pointers snapshotted at slot creation when
-    /// the weak slot was registered with
-    /// `StatorWeakParameterKind::InternalFields`.  Always zeroed for
-    /// `StatorWeakParameterKind::Opaque` slots.
+    /// the weak slot was registered with `InternalFields` parameter mode.
+    /// Always zeroed for `Opaque` parameter-mode slots.
     pub internal_fields: [*mut c_void; 2],
     /// The isolate that owns the slot — typically used to schedule
     /// follow-up embedder work.  The callback must **not** call back into

@@ -3344,9 +3344,8 @@ typedef struct StatorWeakCallbackInfo {
   void *parameter;
   /**
    * First two internal-field pointers snapshotted at slot creation when
-   * the weak slot was registered with
-   * `StatorWeakParameterKind::InternalFields`.  Always zeroed for
-   * `StatorWeakParameterKind::Opaque` slots.
+   * the weak slot was registered with `InternalFields` parameter mode.
+   * Always zeroed for `Opaque` parameter-mode slots.
    */
   void *internal_fields[2];
   /**
