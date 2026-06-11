@@ -501,6 +501,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/italics/name.js",
     "annexB/built-ins/String/prototype/italics/not-a-constructor.js",
     "annexB/built-ins/String/prototype/italics/prop-desc.js",
+    "annexB/built-ins/String/prototype/italics/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/link/B.2.3.10.js",
     "annexB/built-ins/String/prototype/link/attr-tostring-err.js",
     "annexB/built-ins/String/prototype/link/length.js",
@@ -512,11 +513,13 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/small/name.js",
     "annexB/built-ins/String/prototype/small/not-a-constructor.js",
     "annexB/built-ins/String/prototype/small/prop-desc.js",
+    "annexB/built-ins/String/prototype/small/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/strike/B.2.3.12.js",
     "annexB/built-ins/String/prototype/strike/length.js",
     "annexB/built-ins/String/prototype/strike/name.js",
     "annexB/built-ins/String/prototype/strike/not-a-constructor.js",
     "annexB/built-ins/String/prototype/strike/prop-desc.js",
+    "annexB/built-ins/String/prototype/strike/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/sub/B.2.3.13.js",
     "annexB/built-ins/String/prototype/sub/length.js",
     "annexB/built-ins/String/prototype/sub/name.js",
@@ -2144,6 +2147,9 @@ mod tests {
             "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/italics/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/link/B.2.3.10.js"
         ));
         assert!(!is_skipped_path(
@@ -2153,7 +2159,13 @@ mod tests {
             "annexB/built-ins/String/prototype/small/B.2.3.11.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/small/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/strike/B.2.3.12.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/strike/this-val-tostring-err.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/sub/B.2.3.13.js"
