@@ -4005,9 +4005,9 @@ pub struct StatorScript {
     /// Human-readable error message, or `None` on success.
     error: Option<CString>,
     /// Structured classification of the compile error, or
-    /// [`StatorMessageKind::StatorMessageKindUnknown`] when the script compiled successfully
+    /// `StatorMessageKindUnknown` when the script compiled successfully
     /// or the error was not classified.  Parse/compile failures are
-    /// classified as [`StatorMessageKind::StatorMessageKindSyntax`].
+    /// classified as `StatorMessageKindSyntax`.
     error_kind: StatorMessageKind,
     /// Resource name (typically a filename or URL) supplied by the embedder
     /// via [`stator_script_set_origin`].  Mirrors `v8::ScriptOrigin::ResourceName`.
@@ -9010,9 +9010,9 @@ pub unsafe extern "C" fn stator_module_get_error(module: *const StatorModule) ->
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `module`'s compile error.
+/// Return the structured `StatorMessageKind` of `module`'s compile error.
 ///
-/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+/// Returns `StatorMessageKindUnknown` when `module`
 /// compiled successfully or is null.
 ///
 /// # Safety
@@ -17131,7 +17131,7 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
 /// the C ABI and can be compared by value from C/C++.
 ///
 /// New variants may be appended in future versions; embedders should treat
-/// unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+/// unknown values as `StatorMessageKindUnknown`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatorMessageKind {
@@ -17163,19 +17163,19 @@ pub enum StatorMessageKind {
     StatorMessageKindOutOfMemory = 10,
     /// A sandbox bounds-check violation.
     StatorMessageKindSandboxViolation = 11,
-    /// The module's [`StatorModuleType`] is recognised but not executable by
+    /// The module's `StatorModuleType` is recognised but not executable by
     /// Stator itself and requires host integration before it can be compiled,
     /// evaluated, or restored from a code cache.
     ///
     /// Currently emitted for CSS module bodies (see
-    /// [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+    /// `StatorModuleTypeCss`): Stator has no CSS parser
     /// and no `CSSStyleSheet` representation, so the engine fails closed and
     /// tags the error with this stable kind so embedders like the Edge host
     /// can detect "unsupported module type, route through host integration"
     /// purely by enum value without text-matching the diagnostic.
     ///
-    /// Always paired with an errored [`StatorModule`] whose
-    /// [`stator_module_get_error`] message names the missing host primitive,
+    /// Always paired with an errored `StatorModule` whose
+    /// `stator_module_get_error` message names the missing host primitive,
     /// and — when a typed import resolves to such a module — propagates to
     /// the importer's link-time error so the same enum value surfaces on the
     /// graph root.
@@ -17262,9 +17262,9 @@ fn message_kind_for_error(
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `msg`.
+/// Return the structured `StatorMessageKind` of `msg`.
 ///
-/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+/// Returns `StatorMessageKindUnknown` when `msg` is null.
 ///
 /// # Safety
 /// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
@@ -17460,12 +17460,12 @@ pub unsafe extern "C" fn stator_isolate_take_pending_message(
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `script`'s compile error,
-/// or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+/// Return the structured `StatorMessageKind` of `script`'s compile error,
+/// or `StatorMessageKindUnknown` when `script` compiled successfully or
 /// is null.
 ///
 /// Parse and bytecode-generator failures are classified as
-/// [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+/// `StatorMessageKindSyntax`; FFI misuse such as a null source pointer
 /// is classified as [`StatorMessageKind::StatorMessageKindInternal`].
 ///
 /// # Safety

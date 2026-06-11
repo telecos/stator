@@ -329,6 +329,38 @@ fn test_header_module_cache_status_discriminants_match_abi() {
 }
 
 #[test]
+fn test_header_message_kind_discriminants_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorMessageKindUnknown", 0),
+        ("StatorMessageKindSyntax", 1),
+        ("StatorMessageKindType", 2),
+        ("StatorMessageKindRange", 3),
+        ("StatorMessageKindReference", 4),
+        ("StatorMessageKindURI", 5),
+        ("StatorMessageKindWasm", 6),
+        ("StatorMessageKindInternal", 7),
+        ("StatorMessageKindTermination", 8),
+        ("StatorMessageKindJsException", 9),
+        ("StatorMessageKindOutOfMemory", 10),
+        ("StatorMessageKindSandboxViolation", 11),
+        ("StatorMessageKindUnsupportedModuleType", 12),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable message-kind discriminant `{marker}`"
+        );
+    }
+    for marker in ["[`StatorMessageKind::StatorMessageKindUnknown`]"] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_native_code_cache_function_signatures_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [

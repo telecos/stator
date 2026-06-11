@@ -682,7 +682,7 @@ typedef enum StatorTierRequestStatus {
  * the C ABI and can be compared by value from C/C++.
  *
  * New variants may be appended in future versions; embedders should treat
- * unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+ * unknown values as `StatorMessageKindUnknown`.
  */
 typedef enum StatorMessageKind {
   /**
@@ -738,19 +738,19 @@ typedef enum StatorMessageKind {
    */
   StatorMessageKindSandboxViolation = 11,
   /**
-   * The module's [`StatorModuleType`] is recognised but not executable by
+   * The module's `StatorModuleType` is recognised but not executable by
    * Stator itself and requires host integration before it can be compiled,
    * evaluated, or restored from a code cache.
    *
    * Currently emitted for CSS module bodies (see
-   * [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+   * `StatorModuleTypeCss`): Stator has no CSS parser
    * and no `CSSStyleSheet` representation, so the engine fails closed and
    * tags the error with this stable kind so embedders like the Edge host
    * can detect "unsupported module type, route through host integration"
    * purely by enum value without text-matching the diagnostic.
    *
-   * Always paired with an errored [`StatorModule`] whose
-   * [`stator_module_get_error`] message names the missing host primitive,
+   * Always paired with an errored `StatorModule` whose
+   * `stator_module_get_error` message names the missing host primitive,
    * and — when a typed import resolves to such a module — propagates to
    * the importer's link-time error so the same enum value surfaces on the
    * graph root.
@@ -5594,9 +5594,9 @@ void stator_script_free(struct StatorScript *script);
 const char *stator_module_get_error(const struct StatorModule *module);
 
 /**
- * Return the structured [`StatorMessageKind`] of `module`'s compile error.
+ * Return the structured `StatorMessageKind` of `module`'s compile error.
  *
- * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+ * Returns `StatorMessageKindUnknown` when `module`
  * compiled successfully or is null.
  *
  * # Safety
@@ -7290,9 +7290,9 @@ struct StatorObjectTemplate *stator_object_template_prototype_template(struct St
 struct StatorObject *stator_object_template_new_instance(const struct StatorObjectTemplate *tmpl);
 
 /**
- * Return the structured [`StatorMessageKind`] of `msg`.
+ * Return the structured `StatorMessageKind` of `msg`.
  *
- * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+ * Returns `StatorMessageKindUnknown` when `msg` is null.
  *
  * # Safety
  * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
@@ -7411,12 +7411,12 @@ const struct StatorMessage *stator_isolate_peek_pending_message(const struct Sta
 struct StatorMessage *stator_isolate_take_pending_message(struct StatorIsolate *isolate);
 
 /**
- * Return the structured [`StatorMessageKind`] of `script`'s compile error,
- * or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+ * Return the structured `StatorMessageKind` of `script`'s compile error,
+ * or `StatorMessageKindUnknown` when `script` compiled successfully or
  * is null.
  *
  * Parse and bytecode-generator failures are classified as
- * [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+ * `StatorMessageKindSyntax`; FFI misuse such as a null source pointer
  * is classified as [`StatorMessageKind::StatorMessageKindInternal`].
  *
  * # Safety
