@@ -603,7 +603,7 @@ fn test_header_value_string_signatures_and_docs_match_abi() {
         .find("Read the UTF-8 byte length of the string stored in `val` into `*out`.")
         .expect("generated stator.h should document string length getter");
     let end = header
-        .find("Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle")
+        .find("Wrap a `StatorObject` handle as a fresh `StatorValue` handle")
         .expect("generated stator.h should document object/value bridge after string APIs");
     let docs = &header[start..end];
     for marker in [
@@ -615,6 +615,41 @@ fn test_header_value_string_signatures_and_docs_match_abi() {
         assert!(
             !docs.contains(marker),
             "generated stator.h value string docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
+fn test_header_object_value_bridge_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorValue *stator_object_as_value(const struct StatorObject *obj);",
+        "struct StatorObject *stator_value_as_object(const struct StatorValue *val);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h object/value bridge signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Wrap a `StatorObject` handle as a fresh `StatorValue` handle")
+        .expect("generated stator.h should document object/value bridge");
+    let end = header
+        .find("Read the property named `(key, key_len)` from `obj`")
+        .expect("generated stator.h should document object property reads after bridge APIs");
+    let docs = &header[start..end];
+    for marker in [
+        "[`StatorObject`]",
+        "[`StatorValue`]",
+        "[`stator_object_as_value`]",
+        "[`stator_value_as_object`]",
+        "[`stator_value_destroy`]",
+        "[`stator_object_destroy`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h object/value bridge docs should not expose Rust-specific marker `{marker}`"
         );
     }
 }

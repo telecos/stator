@@ -6391,43 +6391,43 @@ enum StatorStatus stator_value_write_string_utf8(const struct StatorValue *val,
                                                  size_t *written);
 
 /**
- * Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
+ * Wrap a `StatorObject` handle as a fresh `StatorValue` handle that
  * shares the same underlying `PropertyMap` storage.
  *
  * The returned value's `typeof` is `"object"`; passing it to
- * [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
+ * `stator_value_as_object` yields a new `StatorObject` handle whose
  * property mutations are observed through `obj` and vice versa.  This is
  * the FFI mechanism for round-tripping object identity across the
  * value/object boundary.
  *
  * Returns a null pointer when `obj` is null.  The caller owns the returned
- * value pointer and must release it with [`stator_value_destroy`] (or rely
+ * value pointer and must release it with `stator_value_destroy` (or rely
  * on the active handle scope).
  *
  * # Safety
- * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * `obj` must be either null or a valid, live `StatorObject` pointer.
  */
 struct StatorValue *stator_object_as_value(const struct StatorObject *obj);
 
 /**
- * Wrap a [`StatorValue`] holding an object-as-value handle as a fresh
- * [`StatorObject`] handle that shares the same underlying `JsObject`
+ * Wrap a `StatorValue` holding an object-as-value handle as a fresh
+ * `StatorObject` handle that shares the same underlying `JsObject`
  * storage.
  *
  * Identity is only preserved for values produced by
- * [`stator_object_as_value`] (or by future FFI APIs that allocate the
+ * `stator_object_as_value` (or by future FFI APIs that allocate the
  * shared-storage representation).  Tag-only object values created via
- * [`stator_value_new_object`], `stator_value_new_array_tag`, and the other
+ * `stator_value_new_object`, `stator_value_new_array_tag`, and the other
  * tag constructors carry no per-instance storage; passing such a value
  * here returns a null pointer to make the limitation explicit at the call
  * site rather than silently materialising a divergent empty object.
  *
  * Returns a null pointer when `val` is null, is not an object-like value,
  * or is a tag-only object value.  The caller owns the returned object
- * pointer and must release it with [`stator_object_destroy`].
+ * pointer and must release it with `stator_object_destroy`.
  *
  * # Safety
- * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * `val` must be either null or a valid, live `StatorValue` pointer.
  */
 struct StatorObject *stator_value_as_object(const struct StatorValue *val);
 
