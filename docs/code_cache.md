@@ -224,7 +224,7 @@ The header format is exactly 256 bytes:
 | Offset | Field | Type | Compatibility diagnostic |
 |---:|---|---|---|
 | 0 | `magic` | 8 ASCII bytes `STNCACH1` | `corrupt_payload` |
-| 8 | `native_header_format_version` | u32 little-endian, currently `1` | `rejected_format_version` |
+| 8 | `native_header_format_version` | u32 little-endian, currently `1` | `corrupt_payload` |
 | 12 | `target_tier` | u32 (`1` baseline, `2` maglev, `3` turbofan) | `rejected_artifact_type` |
 | 16 | `native_format_version` | u32 baseline/JIT artifact format | `rejected_format_version` |
 | 20 | `target_ffi_abi_version` | packed u32 `STATOR_FFI_ABI_VERSION` | `rejected_engine_version` |

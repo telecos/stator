@@ -72,6 +72,25 @@ fn parse_exported_functions(header: &str) -> BTreeSet<String> {
 }
 
 #[test]
+fn test_parse_exported_functions_handles_pointer_returns_and_noise() {
+    let header = r#"
+        uint32_t stator_ffi_abi_version(void);
+        const char *stator_native_code_cache_diagnostic_name(StatorNativeCodeCacheDiagnostic diagnostic);
+        // void stator_commented_out(void);
+        #define stator_not_a_function 1
+        typedef void (*StatorCallback)(void);
+    "#;
+    let parsed = parse_exported_functions(header);
+    assert_eq!(
+        parsed,
+        BTreeSet::from([
+            "stator_ffi_abi_version".to_string(),
+            "stator_native_code_cache_diagnostic_name".to_string(),
+        ])
+    );
+}
+
+#[test]
 fn test_abi_version_function_matches_constant() {
     let runtime = stator_jse_ffi::stator_ffi_abi_version();
     assert_eq!(
