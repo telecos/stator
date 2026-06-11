@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 30
+#define STATOR_FFI_ABI_VERSION_MINOR 31
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -2576,70 +2576,6 @@ typedef struct StatorModuleCompileOptions {
 } StatorModuleCompileOptions;
 
 /**
- * Per-script tiering state visible to embedders.
- */
-typedef struct StatorScriptTierStatus {
-  /**
-   * Number of bytecode instructions in the script.
-   */
-  size_t bytecode_count;
-  /**
-   * Number of times the script/function has been invoked.
-   */
-  uint32_t invocation_count;
-  /**
-   * Whether baseline JIT code is cached.
-   */
-  bool baseline_jit_compiled;
-  /**
-   * Whether Maglev JIT code is cached.
-   */
-  bool maglev_jit_compiled;
-  /**
-   * Whether an executable Maglev entry is cached.
-   */
-  bool maglev_executable_cached;
-  /**
-   * Whether Maglev compilation has been attempted.
-   */
-  bool maglev_compile_attempted;
-  /**
-   * Number of Maglev deopts recorded for this script.
-   */
-  uint32_t maglev_deopt_count;
-  /**
-   * Invocation count at which Maglev may be retried.
-   */
-  uint32_t maglev_next_try_at;
-  /**
-   * Whether Turbofan JIT code is cached.
-   */
-  bool turbofan_jit_compiled;
-  /**
-   * Whether this script is blocked from JIT tier execution.
-   */
-  bool jit_disabled;
-} StatorScriptTierStatus;
-
-/**
- * Result record filled by deterministic force/wait tier APIs.
- */
-typedef struct StatorTierRequestResult {
-  /**
-   * Tier requested by the caller.
-   */
-  enum StatorJitTier requested_tier;
-  /**
-   * Final status of the request/observation.
-   */
-  enum StatorTierRequestStatus status;
-  /**
-   * Whether the requested tier is observable as ready now.
-   */
-  bool ready;
-} StatorTierRequestResult;
-
-/**
  * Stable browser-facing source metadata v2 for compiled modules.
  *
  * All pointer/length pairs are optional when length is zero. Non-empty fields
@@ -2709,6 +2645,70 @@ typedef struct StatorModuleSourceMetadataV2 {
    */
   size_t edge_cache_metadata_len;
 } StatorModuleSourceMetadataV2;
+
+/**
+ * Per-script tiering state visible to embedders.
+ */
+typedef struct StatorScriptTierStatus {
+  /**
+   * Number of bytecode instructions in the script.
+   */
+  size_t bytecode_count;
+  /**
+   * Number of times the script/function has been invoked.
+   */
+  uint32_t invocation_count;
+  /**
+   * Whether baseline JIT code is cached.
+   */
+  bool baseline_jit_compiled;
+  /**
+   * Whether Maglev JIT code is cached.
+   */
+  bool maglev_jit_compiled;
+  /**
+   * Whether an executable Maglev entry is cached.
+   */
+  bool maglev_executable_cached;
+  /**
+   * Whether Maglev compilation has been attempted.
+   */
+  bool maglev_compile_attempted;
+  /**
+   * Number of Maglev deopts recorded for this script.
+   */
+  uint32_t maglev_deopt_count;
+  /**
+   * Invocation count at which Maglev may be retried.
+   */
+  uint32_t maglev_next_try_at;
+  /**
+   * Whether Turbofan JIT code is cached.
+   */
+  bool turbofan_jit_compiled;
+  /**
+   * Whether this script is blocked from JIT tier execution.
+   */
+  bool jit_disabled;
+} StatorScriptTierStatus;
+
+/**
+ * Result record filled by deterministic force/wait tier APIs.
+ */
+typedef struct StatorTierRequestResult {
+  /**
+   * Tier requested by the caller.
+   */
+  enum StatorJitTier requested_tier;
+  /**
+   * Final status of the request/observation.
+   */
+  enum StatorTierRequestStatus status;
+  /**
+   * Whether the requested tier is observable as ready now.
+   */
+  bool ready;
+} StatorTierRequestResult;
 
 /**
  * C-callable native-function signature.
@@ -5431,6 +5431,30 @@ struct StatorModule *stator_module_compile_cached(struct StatorContext *_ctx,
                                                   size_t cache_len,
                                                   const struct StatorModuleCompileOptions *options,
                                                   enum StatorModuleCacheStatus *out_status);
+
+/**
+ * Compile a module from `source` using a cache blob and source metadata v2.
+ *
+ * This is an opt-in variant of `stator_module_compile_cached` for embedders
+ * that produced a cache after calling `stator_module_set_source_metadata_v2`.
+ * The supplied metadata participates in cache identity and is restored onto
+ * the returned module on a cache hit. Null metadata keeps the legacy empty-v2
+ * behavior.
+ *
+ * # Safety
+ * - Pointers follow `stator_module_compile_cached`.
+ * - `metadata_v2`, when non-null, must point to a readable
+ *   `StatorModuleSourceMetadataV2` whose pointer/length fields are readable
+ *   when their lengths are non-zero.
+ */
+struct StatorModule *stator_module_compile_cached_with_source_metadata_v2(struct StatorContext *_ctx,
+                                                                          const char *source,
+                                                                          size_t source_len,
+                                                                          const char *cache_data,
+                                                                          size_t cache_len,
+                                                                          const struct StatorModuleCompileOptions *options,
+                                                                          const struct StatorModuleSourceMetadataV2 *metadata_v2,
+                                                                          enum StatorModuleCacheStatus *out_status);
 
 /**
  * Return a null-terminated error message if `script` compiled with an error.

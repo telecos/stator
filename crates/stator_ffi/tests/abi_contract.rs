@@ -962,6 +962,11 @@ fn test_header_module_cache_status_discriminants_match_abi() {
         header.contains(signature),
         "generated stator.h module cache status name signature drifted:\n{signature}"
     );
+    let signature = "struct StatorModule *stator_module_compile_cached_with_source_metadata_v2(struct StatorContext *_ctx,\n                                                                          const char *source,\n                                                                          size_t source_len,\n                                                                          const char *cache_data,\n                                                                          size_t cache_len,\n                                                                          const struct StatorModuleCompileOptions *options,\n                                                                          const struct StatorModuleSourceMetadataV2 *metadata_v2,\n                                                                          enum StatorModuleCacheStatus *out_status);";
+    assert!(
+        header.contains(signature),
+        "generated stator.h module cache v2 restore signature drifted:\n{signature}"
+    );
 }
 
 #[test]
