@@ -21423,7 +21423,7 @@ fn make_regexp() -> JsValue {
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
                     let method = if let JsValue::PlainObject(map) = this {
-                        map.borrow().get("exec").cloned()
+                        map.borrow().get("__regexp_exec__").cloned()
                     } else {
                         None
                     };
@@ -21441,7 +21441,7 @@ fn make_regexp() -> JsValue {
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
                     let method = if let JsValue::PlainObject(map) = this {
-                        map.borrow().get("test").cloned()
+                        map.borrow().get("__regexp_test__").cloned()
                     } else {
                         None
                     };
@@ -64707,6 +64707,26 @@ mod tests {
     fn e2e_regexp_prototype_exec_call_updates_last_index() {
         let r = global_eval(
             "var re = /a/g; re.lastIndex = 1; var m = RegExp.prototype.exec.call(re, 'ba'); m[0] + ':' + m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:1:2".into()));
+    }
+
+    /// Prototype `test` uses the built-in RegExp algorithm even if the own property is shadowed.
+    #[test]
+    fn e2e_regexp_prototype_test_call_ignores_shadowed_test() {
+        let r = global_eval(
+            "var re = /a/g; re.test = function(){ return false; }; re.lastIndex = 1; String(RegExp.prototype.test.call(re, 'ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// Prototype `exec` uses the built-in RegExp algorithm even if the own property is shadowed.
+    #[test]
+    fn e2e_regexp_prototype_exec_call_ignores_shadowed_exec() {
+        let r = global_eval(
+            "var re = /a/g; re.exec = function(){ return null; }; re.lastIndex = 1; var m = RegExp.prototype.exec.call(re, 'ba'); m[0] + ':' + m.index + ':' + re.lastIndex",
         )
         .unwrap();
         assert_eq!(r, JsValue::String("a:1:2".into()));
