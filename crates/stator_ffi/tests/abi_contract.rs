@@ -869,6 +869,56 @@ fn test_header_weak_parameter_kind_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_traced_root_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "typedef void (*StatorTracedRootVisitor)(void *userdata, struct StatorTracedVisitor *visitor);",
+        "typedef void (*StatorTracedEdgeCallback)(void *userdata, struct StatorTraced *edge);",
+        "struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorValue *value);",
+        "void stator_traced_reset(struct StatorTraced *traced);",
+        "bool stator_traced_is_empty(const struct StatorTraced *traced);",
+        "struct StatorValue *stator_traced_get(const struct StatorTraced *traced);",
+        "void stator_traced_dispose(struct StatorTraced *traced);",
+        "void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,\n                                            StatorTracedRootVisitor visitor,\n                                            void *userdata);",
+        "void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct StatorTraced *traced);",
+        "void stator_traced_visit_outgoing(struct StatorIsolate *isolate,\n                                  struct StatorValue *host,\n                                  StatorTracedEdgeCallback callback,\n                                  void *userdata);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h traced-root signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Allocate a fresh traced root slot.")
+        .expect("generated stator.h should document traced-root APIs");
+    let end = header
+        .find("Return the fixed byte length of native-tier artifact headers.")
+        .expect("generated stator.h should document native cache APIs after traced APIs");
+    let docs = &header[start..end];
+    for marker in [
+        "[`stator_traced_new`]",
+        "[`stator_traced_dispose`]",
+        "[`stator_traced_get`]",
+        "[`stator_traced_visitor_visit`]",
+        "[`stator_isolate_gc`]",
+        "[`stator_gc_collect`]",
+        "[`stator_dom_object_wrap_as_value`]",
+        "[`stator_dom_object_wrap_add_traced_edge`]",
+        "[`StatorValue`]",
+        "[`StatorContext`]",
+        "[`StatorTracedRootVisitor`]",
+        "Passing a `None` callback",
+        "non-`None`",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h traced-root docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_wasm_value_kind_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

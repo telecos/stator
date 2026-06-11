@@ -3053,9 +3053,9 @@ typedef struct StatorDomClassInfo {
 /**
  * Opaque traced-handle slot exposed to the embedder.
  *
- * The pointer returned by [`stator_traced_new`] is the address of a
+ * The pointer returned by `stator_traced_new` is the address of a
  * stable, isolate-owned slot.  Its address does not change until the slot
- * is freed by [`stator_traced_dispose`].  The bytes pointed at are
+ * is freed by `stator_traced_dispose`.  The bytes pointed at are
  * implementation-defined and must not be inspected or mutated by the
  * embedder.
  */
@@ -3377,8 +3377,8 @@ typedef void (*StatorWeakCallback)(const struct StatorWeakCallbackInfo *info);
  * Opaque traced-root visitor token passed to the embedder root visitor.
  *
  * The pointer is only valid for the duration of a single
- * [`StatorTracedRootVisitor`] invocation; storing it across calls or
- * passing it to [`stator_traced_visitor_visit`] from another thread is
+ * `StatorTracedRootVisitor` invocation; storing it across calls or
+ * passing it to `stator_traced_visitor_visit` from another thread is
  * undefined behaviour.  All `stator_traced_visitor_*` functions check
  * for a null token and fail closed.
  */
@@ -3402,7 +3402,7 @@ typedef void (*StatorTracedRootVisitor)(void *userdata, struct StatorTracedVisit
 
 /**
  * Embedder edge callback: invoked once per outgoing `TracedReference`
- * edge during a call to [`stator_traced_visit_outgoing`].  The `edge`
+ * edge during a call to `stator_traced_visit_outgoing`.  The `edge`
  * pointer is borrowed for the duration of the call; the embedder must
  * not dispose or reset it (those operations belong to the slot's
  * owner).
@@ -9734,27 +9734,27 @@ struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persiste
  * - `value`'s payload is not a reference-counted (object/wrapper/native
  *   function) variant — primitives carry no GC identity, so a traced
  *   handle would be meaningless.  This rejection is the same as
- *   [`stator_weak_new`].
+ *   `stator_weak_new`.
  *
  * The newly created slot is allocated in the **stale** state: it does
  * not count as a live root until the embedder reports it via
- * [`stator_traced_visitor_visit`] during a GC cycle.  Between cycles it
+ * `stator_traced_visitor_visit` during a GC cycle.  Between cycles it
  * transparently keeps the referent alive via its strong clone, so
  * embedders that need rooting *before* the first GC can simply call
- * [`stator_traced_get`] to materialise the value as needed.
+ * `stator_traced_get` to materialise the value as needed.
  *
  * # Safety
- * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
- * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ * - `ctx` must be null or a valid, live `StatorContext` pointer.
+ * - `value` must be null or a valid, live `StatorValue` pointer.
  */
 struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorValue *value);
 
 /**
  * Clear the referent stored in `traced` without freeing the slot.
  *
- * After `reset()`, [`stator_traced_is_empty`] returns `true` and
- * [`stator_traced_get`] returns null.  The slot pointer itself remains
- * valid; the slot is only freed by [`stator_traced_dispose`].  A
+ * After `reset()`, `stator_traced_is_empty` returns `true` and
+ * `stator_traced_get` returns null.  The slot pointer itself remains
+ * valid; the slot is only freed by `stator_traced_dispose`.  A
  * subsequent embedder visitor call that visits this slot still marks it
  * as visited, but no strong reference is restored because the weak
  * handle has been cleared.
@@ -9763,8 +9763,8 @@ struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorV
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 void stator_traced_reset(struct StatorTraced *traced);
 
@@ -9774,13 +9774,13 @@ void stator_traced_reset(struct StatorTraced *traced);
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 bool stator_traced_is_empty(const struct StatorTraced *traced);
 
 /**
- * Materialise a fresh [`StatorValue`] from the value stored in `traced`.
+ * Materialise a fresh `StatorValue` from the value stored in `traced`.
  *
  * Returns null when the slot is null, has been reset, or its referent
  * has been collected.  When a strong clone is currently held the value
@@ -9789,8 +9789,8 @@ bool stator_traced_is_empty(const struct StatorTraced *traced);
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 struct StatorValue *stator_traced_get(const struct StatorTraced *traced);
 
@@ -9803,7 +9803,7 @@ struct StatorValue *stator_traced_get(const struct StatorTraced *traced);
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`].  After this call returns the embedder must
+ * `stator_traced_new`.  After this call returns the embedder must
  * treat the pointer as invalid.
  */
 void stator_traced_dispose(struct StatorTraced *traced);
@@ -9811,11 +9811,11 @@ void stator_traced_dispose(struct StatorTraced *traced);
 /**
  * Register the embedder traced-root visitor on `isolate`.
  *
- * Passing a `None` callback clears any previously registered visitor;
+ * Passing a null callback clears any previously registered visitor;
  * subsequent GC cycles will treat every traced slot as unvisited and
  * therefore unreachable from the embedder.  The callback runs on the
  * owning thread at the start of every GC cycle driven by
- * [`stator_isolate_gc`] / [`stator_gc_collect`].
+ * `stator_isolate_gc` / `stator_gc_collect`.
  *
  * Null-tolerant: passing null `isolate` is a no-op.
  *
@@ -9832,7 +9832,7 @@ void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,
 /**
  * Mark `traced` as visited in the current GC cycle.
  *
- * Only valid to call from inside a [`StatorTracedRootVisitor`]
+ * Only valid to call from inside a `StatorTracedRootVisitor`
  * invocation; the `visitor` token is the one supplied to the visitor
  * callback by the engine.  Fails closed (no-op) when `visitor` or
  * `traced` is null, when the visitor has an out-of-date epoch (callers
@@ -9844,8 +9844,8 @@ void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,
  * - `visitor` must be null or the live token supplied to the current
  *   visitor callback invocation on `traced`'s isolate.
  * - `traced` must be null or a slot pointer returned by
- *   [`stator_traced_new`] that has not yet been passed to
- *   [`stator_traced_dispose`].
+ *   `stator_traced_new` that has not yet been passed to
+ *   `stator_traced_dispose`.
  */
 void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct StatorTraced *traced);
 
@@ -9855,8 +9855,8 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
  * This is the JS→C++ direction of the cross-heap tracing protocol: it lets an
  * embedder (typically Oilpan) discover every live traced edge a JS host object
  * holds without poking at engine internals. DOM wrapper values created by
- * [`stator_dom_object_wrap_as_value`] expose the borrowed edges registered via
- * [`stator_dom_object_wrap_add_traced_edge`]. Ordinary JS values, invalidated
+ * `stator_dom_object_wrap_as_value` expose the borrowed edges registered via
+ * `stator_dom_object_wrap_add_traced_edge`. Ordinary JS values, invalidated
  * wrappers, cross-isolate values, null arguments, and empty traced slots fail
  * closed by reporting zero edges.
  *
@@ -9865,8 +9865,8 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
  *
  * # Safety
  * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
- * - `host` must be null or a valid, live [`StatorValue`] pointer.
- * - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
+ * - `host` must be null or a valid, live `StatorValue` pointer.
+ * - `callback` (if non-null) and `userdata` lifetimes are entirely the
  *   embedder's responsibility.
  */
 void stator_traced_visit_outgoing(struct StatorIsolate *isolate,
