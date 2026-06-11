@@ -471,6 +471,17 @@ mod tests {
         artifact
     }
 
+    #[test]
+    fn test_header_size_accessor_matches_builder() {
+        let payload = b"native bytes";
+        let header = build_native_code_cache_header(&compatibility(), payload);
+        assert_eq!(
+            stator_native_code_cache_header_size(),
+            STATOR_NATIVE_CODE_CACHE_HEADER_SIZE
+        );
+        assert_eq!(header.len(), stator_native_code_cache_header_size());
+    }
+
     fn sentinel_info() -> StatorNativeCodeCacheHeaderInfo {
         StatorNativeCodeCacheHeaderInfo {
             header_version: u32::MAX,

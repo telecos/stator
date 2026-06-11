@@ -172,6 +172,42 @@ fn test_header_abi_version_macros_match_rust_constants() {
 }
 
 #[test]
+fn test_header_native_code_cache_constants_and_diagnostics_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+
+    assert_eq!(
+        parse_define_u32(&header, "STATOR_NATIVE_CODE_CACHE_DIGEST_LEN"),
+        Some(stator_jse_ffi::native_code_cache::STATOR_NATIVE_CODE_CACHE_DIGEST_LEN as u32),
+        "generated stator.h native code-cache digest length drifted from Rust constant"
+    );
+    assert_eq!(
+        parse_define_u32(&header, "STATOR_NATIVE_CODE_CACHE_HEADER_SIZE"),
+        Some(stator_jse_ffi::native_code_cache::STATOR_NATIVE_CODE_CACHE_HEADER_SIZE as u32),
+        "generated stator.h native code-cache header size drifted from Rust constant"
+    );
+
+    for (name, discriminant) in [
+        ("StatorNativeCodeCacheDiagnosticAccepted", 0),
+        ("StatorNativeCodeCacheDiagnosticInvalidArgument", 1),
+        ("StatorNativeCodeCacheDiagnosticCorruptPayload", 2),
+        ("StatorNativeCodeCacheDiagnosticRejectedArtifactType", 3),
+        ("StatorNativeCodeCacheDiagnosticRejectedEngineVersion", 4),
+        ("StatorNativeCodeCacheDiagnosticRejectedFormatVersion", 5),
+        ("StatorNativeCodeCacheDiagnosticRejectedSourceIdentity", 6),
+        ("StatorNativeCodeCacheDiagnosticRejectedPlatform", 7),
+        ("StatorNativeCodeCacheDiagnosticRejectedBuildFeatures", 8),
+        ("StatorNativeCodeCacheDiagnosticRejectedCompilerFlags", 9),
+        ("StatorNativeCodeCacheDiagnosticUnsupportedNativeCode", 10),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable native code-cache diagnostic `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_contains_abi_version_markers() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for marker in [
