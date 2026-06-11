@@ -28546,7 +28546,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_returns_undefined_for_statement_only_program() {
         assert_script_result(
             "typeof eval('var x = 1; if (x) { }');",

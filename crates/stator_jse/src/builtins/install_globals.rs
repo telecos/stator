@@ -83582,7 +83582,6 @@ mod tests {
 
     /// if without else: completion is undefined when false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_if_no_else_false() {
         let result = global_eval("if (false) { 1 }").unwrap();
         assert_eq!(result, JsValue::Undefined);
@@ -83590,7 +83589,6 @@ mod tests {
 
     /// Empty statement: completion is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_empty_statement_completion() {
         let result = global_eval("if (true) ;").unwrap();
         assert_eq!(result, JsValue::Undefined);

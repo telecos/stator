@@ -576,13 +576,26 @@ pub(crate) fn global_eval_direct_with_scope_capture(
 
 /// Rewrite the eval completion value into an explicit return.
 fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
-    use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
+    use crate::parser::ast::{
+        BlockStmt, Expr, ExprStmt, NumLit, ProgramItem, ReturnStmt, Stmt, UnaryExpr, UnaryOp,
+    };
     if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
         let return_stmt = ReturnStmt {
             loc: expr_stmt.loc,
             argument: Some(expr_stmt.expr.clone()),
         };
         *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
+    } else if let Some(ProgramItem::Stmt(Stmt::If(if_stmt))) = program.body.last_mut() {
+        if stmt_has_static_empty_completion(&if_stmt.consequent) {
+            append_undefined_completion(&mut if_stmt.consequent);
+        }
+        if let Some(alternate) = &mut if_stmt.alternate {
+            if stmt_has_static_empty_completion(alternate) {
+                append_undefined_completion(alternate);
+            }
+        } else {
+            if_stmt.alternate = Some(Box::new(undefined_completion_stmt(if_stmt.loc)));
+        }
     } else if matches!(
         program.body.last(),
         Some(ProgramItem::Stmt(Stmt::VarDecl(_)))
@@ -593,6 +606,49 @@ fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
                 loc: program.loc,
                 argument: None,
             })));
+    }
+
+    fn stmt_has_static_empty_completion(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Empty(_)
+            | Stmt::VarDecl(_)
+            | Stmt::FnDecl(_)
+            | Stmt::ClassDecl(_)
+            | Stmt::Debugger(_) => true,
+            Stmt::Block(block) => block.body.iter().all(stmt_has_static_empty_completion),
+            _ => false,
+        }
+    }
+
+    fn append_undefined_completion(stmt: &mut Box<Stmt>) {
+        let loc = stmt.loc();
+        match stmt.as_mut() {
+            Stmt::Block(block) => {
+                block.body.push(undefined_completion_stmt(block.loc));
+            }
+            _ => {
+                let original = (**stmt).clone();
+                **stmt = Stmt::Block(BlockStmt {
+                    loc,
+                    body: vec![original, undefined_completion_stmt(loc)],
+                });
+            }
+        }
+    }
+
+    fn undefined_completion_stmt(loc: crate::parser::ast::SourceLocation) -> Stmt {
+        Stmt::Expr(ExprStmt {
+            loc,
+            expr: Box::new(Expr::Unary(Box::new(UnaryExpr {
+                loc,
+                op: UnaryOp::Void,
+                argument: Box::new(Expr::Num(NumLit {
+                    loc,
+                    value: 0.0,
+                    raw: "0".to_string(),
+                })),
+            }))),
+        })
     }
 }
 
