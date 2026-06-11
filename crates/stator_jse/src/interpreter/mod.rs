@@ -944,7 +944,11 @@ pub fn with_debugger<R, F: FnOnce(&mut Debugger) -> R>(f: F) -> Option<R> {
 /// Uses the raw pointer of the inner `Rc<BytecodeArray>` allocation so that
 /// all clones of the same `Rc` share a single property bag.
 fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
-    Rc::as_ptr(ba) as usize
+    fn_props_key_from_ptr(Rc::as_ptr(ba))
+}
+
+fn fn_props_key_from_ptr(ba: *const BytecodeArray) -> usize {
+    ba as usize
 }
 
 /// Store a named property on a `Function` value's side-table entry.
@@ -984,6 +988,14 @@ pub(crate) fn fn_global_env_set(ba: &Rc<BytecodeArray>, env: Rc<RefCell<GlobalEn
 
 fn fn_global_env_get(ba: &Rc<BytecodeArray>) -> Option<Rc<RefCell<GlobalEnv>>> {
     FUNCTION_GLOBAL_ENVS.with(|envs| envs.borrow().get(&fn_props_key(ba)).cloned())
+}
+
+fn fn_global_env_get_ref(ba: &BytecodeArray) -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_GLOBAL_ENVS.with(|envs| {
+        envs.borrow()
+            .get(&fn_props_key_from_ptr(ba as *const BytecodeArray))
+            .cloned()
+    })
 }
 
 /// Return the global environment that `Function` constructor calls should
@@ -15016,6 +15028,8 @@ pub(crate) fn try_inline_small_function(
 
     let decoded = ba.shared_decoded_instructions().ok()?;
     let all_instrs = decoded.0.as_slice();
+    let captured_global_env = fn_global_env_get_ref(ba);
+    let global_env = captured_global_env.as_ref().unwrap_or(global_env);
 
     // Strip leading CreateMappedArguments/CreateUnmappedArguments + Star pair.
     // Sloppy-mode functions always emit these, but when the arguments object
