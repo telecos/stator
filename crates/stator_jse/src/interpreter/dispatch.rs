@@ -12741,6 +12741,25 @@ mod tests {
     }
 
     #[test]
+    fn e2e_arrow_arguments_ignore_call_time_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function outer(){ var f = () => arguments[0] + ':' + arguments.length; return f; } \
+             outer('outer', 'x')('inner')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("outer:2".into()));
+    }
+
+    #[test]
+    fn e2e_nested_arrow_inherits_outer_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function wrap(a){ return (() => (() => arguments[0])); } wrap(41)()()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(41));
+    }
+
+    #[test]
     fn e2e_arrow_lexical_this_in_method() {
         // Arrow inherits `this` from enclosing scope (the method's `this`).
         let result = crate::builtins::global::global_eval(
