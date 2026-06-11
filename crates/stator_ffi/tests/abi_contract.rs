@@ -290,8 +290,10 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
         "[`StatorOsrCountersStats`]",
         "[`StatorOsrExitReasonCounts`]",
         "[`StatorJitUnwindStats`]",
+        "stator_jse::jit_unwind::",
         "[`StatorJitMemoryStats`]",
         "[`StatorJitMitigationsStats`]",
+        "stator_jse::jit_mitigations::",
         "MitigationStatus::",
     ] {
         assert!(

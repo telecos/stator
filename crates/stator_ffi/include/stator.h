@@ -2081,8 +2081,8 @@ typedef struct StatorOsrCountersStats {
 } StatorOsrCountersStats;
 
 /**
- * Per-tier release-safe JIT unwind counters, mirroring
- * [`stator_jse::jit_unwind::JitUnwindTierSnapshot`].
+ * Per-tier release-safe JIT unwind counters, mirroring the engine's internal
+ * unwind diagnostics snapshot.
  *
  * `unwind_supported` is `false` for every tier in this build; see
  * `docs/edge_diagnostics.md` for the rationale and the conditions under
@@ -2140,8 +2140,8 @@ typedef struct StatorJitUnwindStats {
 } StatorJitUnwindStats;
 
 /**
- * Per-tier release-safe CFG/CET counters, mirroring
- * [`stator_jse::jit_mitigations::JitMitigationsTierSnapshot`].
+ * Per-tier release-safe CFG/CET counters, mirroring the engine's internal
+ * mitigation diagnostics snapshot.
  *
  * `cfg_supported` / `cet_compatible` are `false` for every tier in this
  * build; see `docs/edge_diagnostics.md` for the support matrix and the
