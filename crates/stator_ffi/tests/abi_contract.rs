@@ -437,6 +437,65 @@ fn test_header_module_cache_status_discriminants_match_abi() {
 }
 
 #[test]
+fn test_header_module_status_discriminants_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorModuleStatusErrored", -1),
+        ("StatorModuleStatusUnlinked", 0),
+        ("StatorModuleStatusLinking", 1),
+        ("StatorModuleStatusLinked", 2),
+        ("StatorModuleStatusEvaluating", 3),
+        ("StatorModuleStatusEvaluated", 4),
+        ("StatorModuleStatusPendingAsyncEvaluation", 5),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable module status discriminant `{marker}`"
+        );
+    }
+    for marker in [
+        "[`stator_module_resume_evaluation`]",
+        "[`stator_module_pending_evaluation_fulfill`]",
+        "[`stator_module_pending_evaluation_reject`]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
+fn test_header_script_cache_discriminants_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorScriptCacheStatusProducedMetadata", 0),
+        ("StatorScriptCacheStatusAcceptedBytecodeRestored", 1),
+        ("StatorScriptCacheStatusAcceptedValidatedRecompiled", 2),
+        ("StatorScriptCacheStatusInvalidArgument", 3),
+        ("StatorScriptCacheStatusCompileError", 4),
+        ("StatorScriptCacheStatusRejected", 5),
+        ("StatorScriptCacheStatusUnsupported", 6),
+        ("StatorScriptCacheStatusCorruptPayload", 7),
+        ("StatorScriptCacheDiagnosticNone", 0),
+        ("StatorScriptCacheDiagnosticMagicMismatch", 1),
+        ("StatorScriptCacheDiagnosticVersionMismatch", 2),
+        ("StatorScriptCacheDiagnosticSourceMismatch", 3),
+        ("StatorScriptCacheDiagnosticOptionsMismatch", 4),
+        ("StatorScriptCacheDiagnosticCorruptPayload", 5),
+        ("StatorScriptCacheDiagnosticCompileError", 6),
+        ("StatorScriptCacheDiagnosticUnsupported", 7),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable script cache discriminant `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_jit_tier_discriminants_and_signatures_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [("Baseline", 1), ("Maglev", 2), ("Turbofan", 3)] {

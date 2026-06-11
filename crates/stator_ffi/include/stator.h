@@ -759,7 +759,7 @@ typedef enum StatorMessageKind {
 } StatorMessageKind;
 
 /**
- * Link/evaluation state for a [`StatorModule`].
+ * Link/evaluation state for a `StatorModule`.
  */
 typedef enum StatorModuleStatus {
   /**
@@ -791,10 +791,10 @@ typedef enum StatorModuleStatus {
    * promise has not yet settled after draining the local microtask
    * queue. Exports are intentionally *not* published in this state; the
    * embedder must drive evaluation forward by calling
-   * [`stator_module_resume_evaluation`] (after settling the awaited
+   * `stator_module_resume_evaluation` (after settling the awaited
    * promise via host primitives or
-   * [`stator_module_pending_evaluation_fulfill`] /
-   * [`stator_module_pending_evaluation_reject`]) before the module's
+   * `stator_module_pending_evaluation_fulfill` /
+   * `stator_module_pending_evaluation_reject`) before the module's
    * bindings become observable.
    */
   StatorModuleStatusPendingAsyncEvaluation = 5,
@@ -6091,7 +6091,7 @@ struct StatorValue *stator_module_resume_evaluation(struct StatorModule *module,
  * copied into the engine; ownership of `value` is retained by the caller.
  *
  * Return value and status transitions mirror
- * [`stator_module_resume_evaluation`].
+ * `stator_module_resume_evaluation`.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by
@@ -6115,7 +6115,7 @@ struct StatorValue *stator_module_pending_evaluation_fulfill(struct StatorModule
  * copied into the engine; ownership of `reason` is retained by the caller.
  *
  * Return value and status transitions mirror
- * [`stator_module_resume_evaluation`].
+ * `stator_module_resume_evaluation`.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by
