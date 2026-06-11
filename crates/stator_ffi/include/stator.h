@@ -353,19 +353,19 @@ typedef enum StatorParserMetadata {
  * reaching for out-of-band channels.
  *
  * Variants:
- * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+ * * `StatorStatusOk` — the call succeeded; any
  *   out-pointer was written.
- * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+ * * `StatorStatusFalse` — the call succeeded with
  *   a structural "no" answer (e.g. property missing, type mismatch on a
  *   typed get).  Out-pointers are left untouched or zero-cleared, never
  *   carrying a stale value.
- * * [`StatorStatusException`][Self::StatorStatusException] — the operation
+ * * `StatorStatusException` — the operation
  *   raised (or captured) a JavaScript exception.  When applicable, the
  *   isolate's pending exception is populated and can be inspected through
- *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
- * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+ *   `stator_isolate_peek_pending_message` / `stator_try_catch_*`.
+ * * `StatorStatusInvalidArg` — at least one
  *   required argument was null or otherwise malformed; nothing was mutated.
- * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+ * * `StatorStatusUnsupported` — the
  *   operation is well-formed but not yet implemented for this kind of
  *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
  *   discriminants are stable; embedders should treat unknown values as

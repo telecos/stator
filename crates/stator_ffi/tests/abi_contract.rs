@@ -278,6 +278,36 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
 }
 
 #[test]
+fn test_header_status_discriminants_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for (name, discriminant) in [
+        ("StatorStatusOk", 0),
+        ("StatorStatusFalse", 1),
+        ("StatorStatusException", 2),
+        ("StatorStatusInvalidArg", 3),
+        ("StatorStatusUnsupported", 4),
+    ] {
+        let marker = format!("{name} = {discriminant}");
+        assert!(
+            header.contains(&marker),
+            "generated stator.h is missing stable status discriminant `{marker}`"
+        );
+    }
+    for marker in [
+        "[`StatorStatusOk`][Self::StatorStatusOk]",
+        "[`StatorStatusFalse`][Self::StatorStatusFalse]",
+        "[`StatorStatusException`][Self::StatorStatusException]",
+        "[`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg]",
+        "[`StatorStatusUnsupported`][Self::StatorStatusUnsupported]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_native_code_cache_function_signatures_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for signature in [
