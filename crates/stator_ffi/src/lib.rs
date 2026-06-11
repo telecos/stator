@@ -1069,10 +1069,9 @@ pub unsafe extern "C" fn stator_isolate_reset_ic_counters_stats(_isolate: *mut S
     ic_counters::reset();
 }
 
-/// Number of histogram buckets carried by [`StatorTierLatencyTier`].
+/// Number of histogram buckets carried by `StatorTierLatencyTier`.
 ///
-/// This must match
-/// [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
+/// This must match `stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS` and is
 /// part of the C ABI contract.  Bumping this value is a breaking change.
 pub const STATOR_TIER_LATENCY_BUCKET_COUNT: usize = 9;
 
@@ -1181,19 +1180,19 @@ pub unsafe extern "C" fn stator_isolate_reset_tier_latency_stats(_isolate: *mut 
     stator_jse::compiler::tier_latency::reset();
 }
 
-/// Number of execution tiers carried by [`StatorOsrCountersStats`].
+/// Number of execution tiers carried by `StatorOsrCountersStats`.
 pub const STATOR_OSR_TIER_COUNT: usize = 4;
 
-/// Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+/// Number of OSR exit reasons carried by `StatorOsrExitReasonCounts`.
 pub const STATOR_OSR_EXIT_REASON_COUNT: usize = 4;
 
-/// Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+/// Number of JIT tier rows carried by `StatorJitUnwindStats`.
 pub const STATOR_JIT_UNWIND_TIER_COUNT: usize = 4;
 
-/// Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+/// Number of JIT memory tier rows carried by `StatorJitMemoryStats`.
 pub const STATOR_JIT_MEMORY_TIER_COUNT: usize = 4;
 
-/// Number of JIT tier rows carried by [`StatorJitMitigationsStats`].
+/// Number of JIT tier rows carried by `StatorJitMitigationsStats`.
 pub const STATOR_JIT_MITIGATIONS_TIER_COUNT: usize = 4;
 
 /// `MitigationStatus::UnsupportedPlatform` u32 encoding for the FFI snapshot.

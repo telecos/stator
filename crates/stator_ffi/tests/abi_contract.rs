@@ -225,6 +225,30 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
             "STATOR_IC_EVENT_COUNT",
             stator_jse_ffi::STATOR_IC_EVENT_COUNT,
         ),
+        (
+            "STATOR_TIER_LATENCY_BUCKET_COUNT",
+            stator_jse_ffi::STATOR_TIER_LATENCY_BUCKET_COUNT,
+        ),
+        (
+            "STATOR_OSR_TIER_COUNT",
+            stator_jse_ffi::STATOR_OSR_TIER_COUNT,
+        ),
+        (
+            "STATOR_OSR_EXIT_REASON_COUNT",
+            stator_jse_ffi::STATOR_OSR_EXIT_REASON_COUNT,
+        ),
+        (
+            "STATOR_JIT_UNWIND_TIER_COUNT",
+            stator_jse_ffi::STATOR_JIT_UNWIND_TIER_COUNT,
+        ),
+        (
+            "STATOR_JIT_MEMORY_TIER_COUNT",
+            stator_jse_ffi::STATOR_JIT_MEMORY_TIER_COUNT,
+        ),
+        (
+            "STATOR_JIT_MITIGATIONS_TIER_COUNT",
+            stator_jse_ffi::STATOR_JIT_MITIGATIONS_TIER_COUNT,
+        ),
     ] {
         assert_eq!(
             parse_define_u32(&header, name),
@@ -238,6 +262,13 @@ fn test_header_stats_constants_match_abi_and_use_c_friendly_docs() {
         "[`StatorIcCountersStats`]",
         "[`StatorIcTierCounters`]",
         "[`StatorIcOpCounters`]",
+        "[`StatorTierLatencyTier`]",
+        "[`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`]",
+        "[`StatorOsrCountersStats`]",
+        "[`StatorOsrExitReasonCounts`]",
+        "[`StatorJitUnwindStats`]",
+        "[`StatorJitMemoryStats`]",
+        "[`StatorJitMitigationsStats`]",
     ] {
         assert!(
             !header.contains(marker),

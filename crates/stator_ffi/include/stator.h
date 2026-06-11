@@ -73,36 +73,35 @@
 #define STATOR_IC_EVENT_COUNT 4
 
 /**
- * Number of histogram buckets carried by [`StatorTierLatencyTier`].
+ * Number of histogram buckets carried by `StatorTierLatencyTier`.
  *
- * This must match
- * [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
+ * This must match `stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS` and is
  * part of the C ABI contract.  Bumping this value is a breaking change.
  */
 #define STATOR_TIER_LATENCY_BUCKET_COUNT 9
 
 /**
- * Number of execution tiers carried by [`StatorOsrCountersStats`].
+ * Number of execution tiers carried by `StatorOsrCountersStats`.
  */
 #define STATOR_OSR_TIER_COUNT 4
 
 /**
- * Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+ * Number of OSR exit reasons carried by `StatorOsrExitReasonCounts`.
  */
 #define STATOR_OSR_EXIT_REASON_COUNT 4
 
 /**
- * Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+ * Number of JIT tier rows carried by `StatorJitUnwindStats`.
  */
 #define STATOR_JIT_UNWIND_TIER_COUNT 4
 
 /**
- * Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+ * Number of JIT memory tier rows carried by `StatorJitMemoryStats`.
  */
 #define STATOR_JIT_MEMORY_TIER_COUNT 4
 
 /**
- * Number of JIT tier rows carried by [`StatorJitMitigationsStats`].
+ * Number of JIT tier rows carried by `StatorJitMitigationsStats`.
  */
 #define STATOR_JIT_MITIGATIONS_TIER_COUNT 4
 
