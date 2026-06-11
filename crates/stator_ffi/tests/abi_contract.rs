@@ -384,6 +384,33 @@ fn test_header_promise_state_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_persistent_handle_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorPersistent *stator_persistent_new(struct StatorContext *ctx,\n                                               struct StatorValue *value);",
+        "void stator_persistent_reset(struct StatorPersistent *persistent);",
+        "bool stator_persistent_is_empty(const struct StatorPersistent *persistent);",
+        "struct StatorValue *stator_persistent_get(const struct StatorPersistent *persistent);",
+        "void stator_persistent_dispose(struct StatorPersistent *persistent);",
+        "struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persistent,\n                                               void *parameter,\n                                               void *internal_field0,\n                                               void *internal_field1,\n                                               StatorWeakCallback cb,\n                                               enum StatorWeakParameterKind parameter_kind);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h persistent-handle signature drifted:\n{signature}"
+        );
+    }
+    for marker in [
+        "[`StatorPersistentSlot`]",
+        "[`stator_jse::gc::handle::PersistentRoots`]",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust intra-doc link `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_weak_parameter_kind_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [("Opaque", 0), ("InternalFields", 1)] {
