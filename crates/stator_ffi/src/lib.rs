@@ -13479,13 +13479,13 @@ pub enum StatorStatus {
 /// Read the boolean value of `val` into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript boolean.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusOk` when `val` holds a JavaScript boolean.
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   boolean.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_boolean(
@@ -13509,13 +13509,13 @@ pub unsafe extern "C" fn stator_value_get_boolean(
 /// Read the numeric value of `val` into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript number.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusOk` when `val` holds a JavaScript number.
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   number.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to an `f64`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_number(
@@ -13539,19 +13539,19 @@ pub unsafe extern "C" fn stator_value_get_number(
 /// Read `val` as a signed 32-bit integer into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+/// * `StatorStatusOk` when `val` is a finite integer in the
 ///   range `[−2³¹, 2³¹−1]`; `*out` is set to the exact value.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+/// * `StatorStatusFalse` when `val` is non-null but is not
 ///   exactly representable as an `i32` (non-number, fractional, ±Infinity,
 ///   `NaN`, or out of range).  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// Mirrors the semantics of `v8::Value::Int32Value` for the success case but
 /// without the implicit `ToNumber` coercion — embedders that want the lossy
-/// truncating conversion should call [`stator_value_to_int32`] instead.
+/// truncating conversion should call `stator_value_to_int32` instead.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to an `i32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_int32(
@@ -13578,14 +13578,14 @@ pub unsafe extern "C" fn stator_value_get_int32(
 /// Read `val` as an unsigned 32-bit integer into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+/// * `StatorStatusOk` when `val` is a finite integer in the
 ///   range `[0, 2³²−1]`; `*out` is set to the exact value.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+/// * `StatorStatusFalse` when `val` is non-null but is not
 ///   exactly representable as a `u32`.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `u32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_uint32(

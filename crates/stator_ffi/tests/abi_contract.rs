@@ -531,6 +531,40 @@ fn test_header_object_property_signatures_and_docs_match_abi() {
 }
 
 #[test]
+fn test_header_value_numeric_getter_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "enum StatorStatus stator_value_get_boolean(const struct StatorValue *val, bool *out);",
+        "enum StatorStatus stator_value_get_number(const struct StatorValue *val, double *out);",
+        "enum StatorStatus stator_value_get_int32(const struct StatorValue *val, int32_t *out);",
+        "enum StatorStatus stator_value_get_uint32(const struct StatorValue *val, uint32_t *out);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h value getter signature drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Read the boolean value of `val` into `*out`.")
+        .expect("generated stator.h should document value boolean getter");
+    let end = header
+        .find("Read the UTF-8 byte length of the string stored in `val` into `*out`.")
+        .expect("generated stator.h should document string getter after numeric getters");
+    let docs = &header[start..end];
+    for marker in [
+        "StatorStatus::StatorStatus",
+        "[`StatorValue`]",
+        "[`stator_value_to_int32`]",
+    ] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h value getter docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_promise_state_signatures_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
