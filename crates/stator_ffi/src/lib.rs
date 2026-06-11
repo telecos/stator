@@ -13851,26 +13851,26 @@ fn js_value_to_owned_stator_value(
 }
 
 /// Read the property named `(key, key_len)` from `obj` and, on success, write
-/// a freshly-allocated [`StatorValue`] handle to `*out_val`.
+/// a freshly-allocated `StatorValue` handle to `*out_val`.
 ///
 /// Maybe-style semantics:
-/// * [`StatorStatus::StatorStatusOk`] when the property exists.  The
+/// * `StatorStatusOk` when the property exists.  The
 ///   returned value mirrors the property value, including an explicit
 ///   `undefined` if that is what is stored.
-/// * [`StatorStatus::StatorStatusFalse`] when the property is missing from
+/// * `StatorStatusFalse` when the property is missing from
 ///   `obj` and its prototype chain.  `*out_val` is set to null.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or
 ///   `out_val` is null, when the key bytes are not valid UTF-8, or when the
 ///   object has no associated isolate.
 ///
-/// The caller owns the [`StatorValue`] handed back through `*out_val` and
-/// must release it with [`stator_value_destroy`] (or rely on the active
+/// The caller owns the `StatorValue` handed back through `*out_val` and
+/// must release it with `stator_value_destroy` (or rely on the active
 /// handle scope).
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
-/// * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+/// * `out_val` must be either null or a valid output slot for a `StatorValue*`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_get_property(
     obj: *const StatorObject,
@@ -13913,21 +13913,20 @@ pub unsafe extern "C" fn stator_object_get_property(
 /// Write `val` to the property named `(key, key_len)` on `obj`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when the property was created or
+/// * `StatorStatusOk` when the property was created or
 ///   updated.
-/// * [`StatorStatus::StatorStatusException`] when the underlying `[[Set]]`
+/// * `StatorStatusException` when the underlying `[[Set]]`
 ///   raised an error (e.g. assigning to a read-only property).  The
 ///   isolate's pending exception is populated with a stringified error and
-///   a structured [`StatorMessage`] classified as
-///   [`StatorMessageKind::StatorMessageKindType`].
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `val` is
+///   a structured `StatorMessage` classified as `StatorMessageKindType`.
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `val` is
 ///   null, when the key bytes are not valid UTF-8, or when the object has
 ///   no associated isolate.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_set_property(
     obj: *mut StatorObject,
