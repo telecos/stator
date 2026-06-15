@@ -16202,7 +16202,7 @@ pub unsafe extern "C" fn stator_snapshot_manifest_register_native_function(
     ctx: *mut StatorContext,
     id: *const c_char,
     id_len: usize,
-    callback: Option<StatorFunctionTemplateCallback>,
+    callback: Option<unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue>,
 ) -> StatorStatus {
     if manifest.is_null() || id.is_null() || id_len == 0 {
         return StatorStatus::StatorStatusInvalidArg;
@@ -26260,6 +26260,15 @@ mod traced_internal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static FFI_OSR_COUNTERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_ffi_osr_counters() -> std::sync::MutexGuard<'static, ()> {
+        match FFI_OSR_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
 
     /// Helper: create an isolate and automatically destroy it after the test.
     struct IsolateGuard(*mut StatorIsolate);
@@ -37265,6 +37274,7 @@ mod tests {
 
     #[test]
     fn test_osr_counters_stats_null_safety() {
+        let _g = lock_ffi_osr_counters();
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -37290,12 +37300,7 @@ mod tests {
 
     #[test]
     fn test_osr_counters_snapshot_roundtrip_via_ffi() {
-        use std::sync::Mutex;
-        static FFI_OSR_COUNTERS_LOCK: Mutex<()> = Mutex::new(());
-        let _g = match FFI_OSR_COUNTERS_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _g = lock_ffi_osr_counters();
 
         // SAFETY: null isolate is accepted; we reset before recording.
         unsafe { stator_isolate_reset_osr_counters_stats(std::ptr::null_mut()) };

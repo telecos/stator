@@ -1060,12 +1060,23 @@ fn test_header_module_host_callback_signatures_and_docs_match_abi() {
 }
 
 #[test]
-fn test_header_module_host_callbacks_are_c_function_pointers() {
+fn test_header_nullable_callbacks_are_c_function_pointers() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
-    for marker in ["Option_StatorDynamicImportCallback"] {
+    for marker in [
+        "Option_StatorDynamicImportCallback",
+        "Option_StatorFunctionTemplateCallback",
+    ] {
         assert!(
             !header.contains(marker),
-            "generated stator.h should expose nullable module host callbacks as C function pointers, not opaque `{marker}`"
+            "generated stator.h should expose nullable callbacks as C function pointers, not opaque `{marker}`"
+        );
+    }
+    for signature in [
+        "enum StatorStatus stator_snapshot_manifest_register_native_function(struct StatorSnapshotManifest *manifest,\n                                                                    struct StatorContext *ctx,\n                                                                    const char *id,\n                                                                    size_t id_len,\n                                                                    struct StatorValue *(*callback)(const struct StatorFunctionCallbackInfo*));",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h nullable callback signature drifted:\n{signature}"
         );
     }
 }

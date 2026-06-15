@@ -1159,8 +1159,6 @@ typedef enum StatorNativeCodeCacheTier {
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
 
-typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTemplateCallback;
-
 /**
  * An opaque handle to a CDP WebSocket server.
  *
@@ -6982,7 +6980,7 @@ enum StatorStatus stator_snapshot_manifest_register_native_function(struct Stato
                                                                     struct StatorContext *ctx,
                                                                     const char *id,
                                                                     size_t id_len,
-                                                                    struct Option_StatorFunctionTemplateCallback callback);
+                                                                    struct StatorValue *(*callback)(const struct StatorFunctionCallbackInfo*));
 
 /**
  * Return the number of ids registered in `manifest`.
