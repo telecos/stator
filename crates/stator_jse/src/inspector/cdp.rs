@@ -538,6 +538,8 @@ pub struct CdpDispatcher {
     overlay_scroll_snap_overlay_count: usize,
     /// Cached container-query overlay setup count from `Overlay.setShowContainerQueryOverlays`.
     overlay_container_query_overlay_count: usize,
+    /// Cached isolated-elements setup count from `Overlay.setShowIsolatedElements`.
+    overlay_isolated_element_count: usize,
     /// Cached inspect mode requested through `Overlay.setInspectMode`.
     overlay_inspect_mode: String,
     /// Whether the ServiceWorker domain is currently enabled for this session.
@@ -705,6 +707,7 @@ impl CdpDispatcher {
             overlay_flex_overlay_count: 0,
             overlay_scroll_snap_overlay_count: 0,
             overlay_container_query_overlay_count: 0,
+            overlay_isolated_element_count: 0,
             overlay_inspect_mode: "none".to_string(),
             service_worker_enabled: false,
             service_worker_force_update_on_page_load: false,
@@ -1017,6 +1020,11 @@ impl CdpDispatcher {
     /// Returns the cached container-query overlay setup count.
     pub fn overlay_container_query_overlay_count(&self) -> usize {
         self.overlay_container_query_overlay_count
+    }
+
+    /// Returns the cached isolated-elements setup count.
+    pub fn overlay_isolated_element_count(&self) -> usize {
+        self.overlay_isolated_element_count
     }
 
     /// Returns the cached inspect mode.
@@ -1971,6 +1979,9 @@ impl CdpDispatcher {
             "Overlay.setShowContainerQueryOverlays" => {
                 self.overlay_set_show_container_query_overlays(&req.params)
             }
+            "Overlay.setShowIsolatedElements" => {
+                self.overlay_set_show_isolated_elements(&req.params)
+            }
             "Overlay.setInspectMode" => self.overlay_set_inspect_mode(&req.params),
             "Overlay.hideHighlight" => Ok(json!({})),
             "Overlay.highlightNode" => Ok(json!({})),
@@ -2352,6 +2363,31 @@ impl CdpDispatcher {
             }
         }
         self.overlay_container_query_overlay_count = configs.len();
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_isolated_elements(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(configs) = params.get("isolatedElementHighlightConfigs") else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowIsolatedElements: required parameter 'isolatedElementHighlightConfigs' is missing"
+                    .to_string(),
+            ));
+        };
+        let Value::Array(configs) = configs else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowIsolatedElements: required parameter 'isolatedElementHighlightConfigs' must be an array"
+                    .to_string(),
+            ));
+        };
+        for config in configs {
+            if !config.is_object() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Overlay.setShowIsolatedElements: every isolated-elements config must be an object"
+                        .to_string(),
+                ));
+            }
+        }
+        self.overlay_isolated_element_count = configs.len();
         Ok(json!({}))
     }
 
@@ -7969,52 +8005,65 @@ mod tests {
         assert!(container_query.get("error").is_none());
         assert_eq!(d.overlay_container_query_overlay_count(), 1);
 
+        let isolated = dispatch(
+            &mut d,
+            r#"{"id":14,"method":"Overlay.setShowIsolatedElements","params":{"isolatedElementHighlightConfigs":[{"nodeId":6,"highlightConfig":{}}]}}"#,
+        );
+        assert!(isolated.get("error").is_none());
+        assert_eq!(d.overlay_isolated_element_count(), 1);
+
         let inspect = dispatch(
             &mut d,
-            r#"{"id":14,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
+            r#"{"id":15,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
         );
         assert!(inspect.get("error").is_none());
         assert_eq!(d.overlay_inspect_mode(), "searchForNode");
 
         let bad = dispatch(
             &mut d,
-            r#"{"id":15,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
+            r#"{"id":16,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
         );
         assert!(bad["error"].is_object());
 
         let bad_grid = dispatch(
             &mut d,
-            r#"{"id":16,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[1]}}"#,
+            r#"{"id":17,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[1]}}"#,
         );
         assert!(bad_grid["error"].is_object());
 
         let bad_flex = dispatch(
             &mut d,
-            r#"{"id":17,"method":"Overlay.setShowFlexOverlays","params":{"flexNodeHighlightConfigs":[42]}}"#,
+            r#"{"id":18,"method":"Overlay.setShowFlexOverlays","params":{"flexNodeHighlightConfigs":[42]}}"#,
         );
         assert!(bad_flex["error"].is_object());
 
         let bad_scroll_snap = dispatch(
             &mut d,
-            r#"{"id":18,"method":"Overlay.setShowScrollSnapOverlays","params":{"scrollSnapHighlightConfigs":[false]}}"#,
+            r#"{"id":19,"method":"Overlay.setShowScrollSnapOverlays","params":{"scrollSnapHighlightConfigs":[false]}}"#,
         );
         assert!(bad_scroll_snap["error"].is_object());
 
         let bad_container_query = dispatch(
             &mut d,
-            r#"{"id":19,"method":"Overlay.setShowContainerQueryOverlays","params":{"containerQueryHighlightConfigs":[null]}}"#,
+            r#"{"id":20,"method":"Overlay.setShowContainerQueryOverlays","params":{"containerQueryHighlightConfigs":[null]}}"#,
         );
         assert!(bad_container_query["error"].is_object());
 
+        let bad_isolated = dispatch(
+            &mut d,
+            r#"{"id":21,"method":"Overlay.setShowIsolatedElements","params":{"isolatedElementHighlightConfigs":["node"]}}"#,
+        );
+        assert!(bad_isolated["error"].is_object());
+
         let hide = dispatch(
             &mut d,
-            r#"{"id":20,"method":"Overlay.hideHighlight","params":{}}"#,
+            r#"{"id":22,"method":"Overlay.hideHighlight","params":{}}"#,
         );
         assert!(hide.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":21,"method":"Overlay.disable","params":{}}"#,
+            r#"{"id":23,"method":"Overlay.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.overlay_enabled());
