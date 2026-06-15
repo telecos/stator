@@ -30390,7 +30390,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_named_function_expression_strict() {
         test_tail_call_assert_smi(
             "var sum = function inner(n, acc) { \
