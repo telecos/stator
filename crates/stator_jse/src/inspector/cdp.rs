@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setScriptExecutionDisabled` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -523,6 +523,8 @@ pub struct CdpDispatcher {
     emulation_cpu_throttling_rate: f64,
     /// Cached `Emulation.setTimezoneOverride` timezone id.
     emulation_timezone_id: String,
+    /// Cached `Emulation.setScriptExecutionDisabled` state.
+    emulation_script_execution_disabled: bool,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -700,6 +702,7 @@ impl CdpDispatcher {
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
             emulation_timezone_id: String::new(),
+            emulation_script_execution_disabled: false,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -971,6 +974,11 @@ impl CdpDispatcher {
     /// Returns the cached timezone override id.
     pub fn emulation_timezone_id(&self) -> &str {
         &self.emulation_timezone_id
+    }
+
+    /// Returns the cached script execution disabled state.
+    pub fn emulation_script_execution_disabled(&self) -> bool {
+        self.emulation_script_execution_disabled
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -1965,6 +1973,9 @@ impl CdpDispatcher {
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
             "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
             "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
+            "Emulation.setScriptExecutionDisabled" => {
+                self.emulation_set_script_execution_disabled(&req.params)
+            }
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2253,6 +2264,17 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_timezone_id = timezone_id.to_string();
+        Ok(json!({}))
+    }
+
+    fn emulation_set_script_execution_disabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(value) = params.get("value").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setScriptExecutionDisabled: required parameter 'value' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.emulation_script_execution_disabled = value;
         Ok(json!({}))
     }
 
@@ -8192,9 +8214,29 @@ mod tests {
         );
         assert!(timezone_bad["error"].is_object());
 
+        let script_disabled = dispatch(
+            &mut d,
+            r#"{"id":12,"method":"Emulation.setScriptExecutionDisabled","params":{"value":true}}"#,
+        );
+        assert!(script_disabled.get("error").is_none());
+        assert!(d.emulation_script_execution_disabled());
+
+        let script_enabled = dispatch(
+            &mut d,
+            r#"{"id":13,"method":"Emulation.setScriptExecutionDisabled","params":{"value":false}}"#,
+        );
+        assert!(script_enabled.get("error").is_none());
+        assert!(!d.emulation_script_execution_disabled());
+
+        let script_bad = dispatch(
+            &mut d,
+            r#"{"id":14,"method":"Emulation.setScriptExecutionDisabled","params":{}}"#,
+        );
+        assert!(script_bad["error"].is_object());
+
         let clear = dispatch(
             &mut d,
-            r#"{"id":12,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":15,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
