@@ -1119,6 +1119,36 @@ fn test_header_has_cpp_include_guard_and_extern_c_block() {
 }
 
 #[test]
+fn test_header_contains_no_rust_internal_wrappers() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for marker in [
+        "MaybeUninit",
+        "PhantomData",
+        "ManuallyDrop",
+        "NonNull_",
+        "Cell_",
+        "RefCell_",
+        "UnsafeCell_",
+        "Pin_",
+        "Rc_",
+        "Arc_",
+        "Mutex_",
+        "RwLock_",
+        "HashMap_",
+        "HashSet_",
+        "BTreeMap_",
+        "BTreeSet_",
+        "Cow_",
+        "Range_",
+    ] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should not expose Rust-internal wrapper type marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
