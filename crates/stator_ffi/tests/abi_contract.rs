@@ -608,6 +608,31 @@ fn test_header_dom_v2_callback_docs_use_c_friendly_names() {
 }
 
 #[test]
+fn test_header_opaque_runtime_typedef_docs_use_c_friendly_names() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for typedef in [
+        "typedef struct StatorDomObjectWrap StatorDomObjectWrap;",
+        "typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;",
+        "typedef struct StatorDomWeakRef StatorDomWeakRef;",
+        "typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;",
+        "typedef struct StatorFunctionTemplate StatorFunctionTemplate;",
+        "typedef struct StatorHandleScope StatorHandleScope;",
+    ] {
+        let end = header
+            .find(typedef)
+            .unwrap_or_else(|| panic!("generated stator.h missing `{typedef}`"));
+        let start = end.saturating_sub(900);
+        let doc_window = &header[start..end];
+        for marker in ["[`", "StatorStatus::", "*mut "] {
+            assert!(
+                !doc_window.contains(marker),
+                "generated stator.h opaque runtime typedef docs should not expose Rust-specific marker `{marker}` near `{typedef}`:\n{doc_window}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

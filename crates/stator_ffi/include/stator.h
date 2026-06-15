@@ -1222,8 +1222,8 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
 /**
  * An opaque handle to a DOM object wrapper.
  *
- * Created by [`stator_dom_object_wrap_new`] and freed by
- * [`stator_dom_object_wrap_destroy`].  Stores opaque embedder pointers in
+ * Created by `stator_dom_object_wrap_new` and freed by
+ * `stator_dom_object_wrap_destroy`.  Stores opaque embedder pointers in
  * *internal fields* and routes property access through optional interceptors.
  *
  * In addition to the engine-level wrapper state, the FFI layer tracks two
@@ -1236,9 +1236,9 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
 typedef struct StatorDomObjectWrap StatorDomObjectWrap;
 
 /**
- * Opaque buffer passed to a [`StatorDomNamedSymbolEnumeratorCb`] callback.
+ * Opaque buffer passed to a `StatorDomNamedSymbolEnumeratorCb` callback.
  * The callback pushes symbol identities by repeatedly invoking
- * [`stator_dom_symbol_buffer_push`].  The buffer is owned by the FFI
+ * `stator_dom_symbol_buffer_push`.  The buffer is owned by the FFI
  * bridge and must not outlive the callback invocation.
  */
 typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
@@ -1246,16 +1246,16 @@ typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
 /**
  * An opaque handle to a DOM wrapper weak reference.
  *
- * Created by [`stator_dom_weak_ref_new`] and freed by
- * [`stator_dom_weak_ref_destroy`].  The reference does **not** keep the
+ * Created by `stator_dom_weak_ref_new` and freed by
+ * `stator_dom_weak_ref_destroy`.  The reference does **not** keep the
  * associated DOM wrapper (or its materialized JS value) alive; the embedder
  * callback registered at creation time fires exactly once when the engine
  * proves the wrapper unreachable from JS, when the wrapper is invalidated,
  * or when the wrapper is destroyed.
  *
- * Dispatch is driven by the GC: every call to [`stator_isolate_gc`] (or
- * [`stator_gc_collect`]) walks the isolate's DOM weak table and fires every
- * eligible slot exactly once.  The legacy [`stator_dom_weak_ref_invoke`]
+ * Dispatch is driven by the GC: every call to `stator_isolate_gc` (or
+ * `stator_gc_collect`) walks the isolate's DOM weak table and fires every
+ * eligible slot exactly once.  The legacy `stator_dom_weak_ref_invoke`
  * helper still works for embedders that want to drive the callback
  * directly, but the GC-driven path is now authoritative.
  *
@@ -1277,13 +1277,13 @@ typedef struct StatorDynamicImportRequest StatorDynamicImportRequest;
 /**
  * An opaque escapable handle scope.
  *
- * Works like [`StatorHandleScope`] but allows a single value to be
+ * Works like `StatorHandleScope` but allows a single value to be
  * *escaped* — promoted into the enclosing scope (or left as an embedder-owned
  * handle if there is no enclosing scope) — via
- * [`stator_escapable_handle_scope_escape`].
+ * `stator_escapable_handle_scope_escape`.
  *
- * Created by [`stator_escapable_handle_scope_new`] and closed (and its
- * remaining values destroyed) by [`stator_escapable_handle_scope_close`].
+ * Created by `stator_escapable_handle_scope_new` and closed (and its
+ * remaining values destroyed) by `stator_escapable_handle_scope_close`.
  */
 typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
 
@@ -1305,20 +1305,20 @@ typedef struct StatorFunctionCallbackInfo StatorFunctionCallbackInfo;
  * An opaque function template handle.
  *
  * A function template associates a C callback with an isolate so that
- * [`stator_function_template_get_function`] can produce a [`StatorValue`]
+ * `stator_function_template_get_function` can produce a `StatorValue`
  * representing the function, which can then be installed into a context's
- * global environment via [`stator_context_global_set`].
+ * global environment via `stator_context_global_set`.
  */
 typedef struct StatorFunctionTemplate StatorFunctionTemplate;
 
 /**
- * An opaque handle scope that manages the lifetime of [`StatorValue`] handles
+ * An opaque handle scope that manages the lifetime of `StatorValue` handles
  * created while the scope is open.
  *
  * When a handle scope is open on an isolate, any value created via
- * [`stator_value_new_number`] or [`stator_value_new_string`] is automatically
+ * `stator_value_new_number` or `stator_value_new_string` is automatically
  * registered with the innermost open scope.  Calling
- * [`stator_handle_scope_close`] destroys all registered values and restores
+ * `stator_handle_scope_close` destroys all registered values and restores
  * the previous scope.
  *
  * Handle scopes nest: opening a second scope while one is already open is
@@ -1326,7 +1326,7 @@ typedef struct StatorFunctionTemplate StatorFunctionTemplate;
  *
  * # Ownership
  * Values registered with a scope are **owned by the scope**.  The embedder
- * must **not** call [`stator_value_destroy`] on those values; doing so would
+ * must **not** call `stator_value_destroy` on those values; doing so would
  * result in a double-free.
  */
 typedef struct StatorHandleScope StatorHandleScope;
