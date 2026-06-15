@@ -36991,6 +36991,8 @@ mod tests {
 
     #[test]
     fn test_tiering_stats_null_safety() {
+        let _g = lock_ffi_tiering_stats();
+
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -44629,6 +44631,14 @@ mod tests {
         stats
     }
 
+    fn lock_ffi_tiering_stats() -> std::sync::MutexGuard<'static, ()> {
+        static FFI_TIERING_STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        match FFI_TIERING_STATS_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Run an Edge-proof shaped workload (compile once, warmup + measured)
     /// against `source` and return `(final_number_result, stats)`.
     ///
@@ -44639,6 +44649,7 @@ mod tests {
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     fn run_edge_proof_compiled(source: &[u8]) -> (f64, StatorTieringStats) {
+        let _g = lock_ffi_tiering_stats();
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
@@ -44762,6 +44773,7 @@ mod tests {
         source: &[u8],
         measured: usize,
     ) -> (u128, u128, u128, u128, f64, StatorTieringStats) {
+        let _g = lock_ffi_tiering_stats();
         let iso = IsolateGuard::new();
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
         unsafe { stator_isolate_reset_tiering_stats(iso.as_ptr()) };
@@ -44810,17 +44822,13 @@ mod tests {
         (median, mean, min, max, last, stats)
     }
 
-    /// Print release-mode timings for the three Edge perf-proof scripts
-    /// using exactly the FFI pattern Edge times.  Ignored by default so it
-    /// does not slow down `cargo test`; run with:
-    ///   `cargo test -p stator_jse_ffi --release \
-    ///        edge_pattern_timing_release -- --ignored --nocapture`
+    /// Print timings for the three Edge perf-proof scripts using exactly the
+    /// FFI pattern Edge times.
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     #[test]
-    #[ignore]
     fn edge_pattern_timing_release() {
         let scripts: &[(&str, &[u8], f64)] = &[
             (
