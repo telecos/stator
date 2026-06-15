@@ -12932,7 +12932,7 @@ impl Interpreter {
                     }
                 }
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Completed => Err(async_iterator_reason_to_error(value)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -30054,7 +30054,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: generator throw on completed regression
     fn test_generator_throw_on_completed_generator() {
         // .throw(err) on a completed generator throws the error.
         let ba = gen_bytecode_yield_1_yield_2();

@@ -49,13 +49,9 @@ fn update_regexp_statics(m: &RegExpMatch) {
         let mut s = cell.borrow_mut();
         s.input.clone_from(&m.input);
         s.last_match.clone_from(&m.matched);
-        s.left_context = m.input[..m.index].to_string();
+        s.left_context = m.input.get(..m.index).unwrap_or("").to_string();
         let end = m.index + m.matched.len();
-        s.right_context = if end <= m.input.len() {
-            m.input[end..].to_string()
-        } else {
-            String::new()
-        };
+        s.right_context = m.input.get(end..).unwrap_or("").to_string();
         // last paren = last non-empty capture
         s.last_paren = m
             .captures

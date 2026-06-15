@@ -52250,7 +52250,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_regexp_non_unicode_dot_matches_single_code_unit() {
         assert_eval_true(r#"/./.exec("𝐀")[0].length === 1"#);
     }
