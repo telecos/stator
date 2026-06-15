@@ -1102,6 +1102,23 @@ fn test_header_contains_no_cbindgen_generic_wrappers() {
 }
 
 #[test]
+fn test_header_has_cpp_include_guard_and_extern_c_block() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for marker in ["#ifndef STATOR_H", "#define STATOR_H", "#endif"] {
+        assert!(
+            header.contains(marker),
+            "generated stator.h is missing include-guard marker `{marker}`"
+        );
+    }
+    for marker in ["#ifdef __cplusplus", "extern \"C\" {", "}  // extern \"C\""] {
+        assert!(
+            header.contains(marker),
+            "generated stator.h is missing C++ compatibility marker `{marker}`"
+        );
+    }
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
