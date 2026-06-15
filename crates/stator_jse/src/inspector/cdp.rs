@@ -519,6 +519,8 @@ pub struct CdpDispatcher {
     emulation_media: String,
     /// Cached media feature count from `Emulation.setEmulatedMedia`.
     emulation_media_feature_count: usize,
+    /// Cached `Emulation.setCPUThrottlingRate` value (1.0 means no throttling).
+    emulation_cpu_throttling_rate: f64,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -694,6 +696,7 @@ impl CdpDispatcher {
             emulation_max_touch_points: 0,
             emulation_media: String::new(),
             emulation_media_feature_count: 0,
+            emulation_cpu_throttling_rate: 1.0,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -955,6 +958,11 @@ impl CdpDispatcher {
     /// Returns the cached emulated media feature count.
     pub fn emulation_media_feature_count(&self) -> usize {
         self.emulation_media_feature_count
+    }
+
+    /// Returns the cached CPU throttling rate.
+    pub fn emulation_cpu_throttling_rate(&self) -> f64 {
+        self.emulation_cpu_throttling_rate
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -1947,6 +1955,7 @@ impl CdpDispatcher {
                 self.emulation_set_touch_emulation_enabled(&req.params)
             }
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
+            "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2207,6 +2216,23 @@ impl CdpDispatcher {
         };
         self.emulation_media = media.to_string();
         self.emulation_media_feature_count = feature_count;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_cpu_throttling_rate(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(rate) = params.get("rate").and_then(Value::as_f64) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setCPUThrottlingRate: required parameter 'rate' is missing or not a number"
+                    .to_string(),
+            ));
+        };
+        if !rate.is_finite() || rate < 0.0 {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setCPUThrottlingRate: 'rate' must be a finite, non-negative number"
+                    .to_string(),
+            ));
+        }
+        self.emulation_cpu_throttling_rate = rate;
         Ok(json!({}))
     }
 
@@ -8107,9 +8133,28 @@ mod tests {
         );
         assert!(media_bad["error"].is_object());
 
+        let cpu = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Emulation.setCPUThrottlingRate","params":{"rate":4}}"#,
+        );
+        assert!(cpu.get("error").is_none());
+        assert_eq!(d.emulation_cpu_throttling_rate(), 4.0);
+
+        let cpu_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Emulation.setCPUThrottlingRate","params":{}}"#,
+        );
+        assert!(cpu_bad_missing["error"].is_object());
+
+        let cpu_bad_negative = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Emulation.setCPUThrottlingRate","params":{"rate":-1}}"#,
+        );
+        assert!(cpu_bad_negative["error"].is_object());
+
         let clear = dispatch(
             &mut d,
-            r#"{"id":6,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":9,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
