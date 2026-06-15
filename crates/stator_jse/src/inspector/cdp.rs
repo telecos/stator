@@ -534,6 +534,8 @@ pub struct CdpDispatcher {
     overlay_grid_overlay_count: usize,
     /// Cached flex overlay setup count from `Overlay.setShowFlexOverlays`.
     overlay_flex_overlay_count: usize,
+    /// Cached scroll-snap overlay setup count from `Overlay.setShowScrollSnapOverlays`.
+    overlay_scroll_snap_overlay_count: usize,
     /// Cached inspect mode requested through `Overlay.setInspectMode`.
     overlay_inspect_mode: String,
     /// Whether the ServiceWorker domain is currently enabled for this session.
@@ -699,6 +701,7 @@ impl CdpDispatcher {
             overlay_show_hit_test_borders: false,
             overlay_grid_overlay_count: 0,
             overlay_flex_overlay_count: 0,
+            overlay_scroll_snap_overlay_count: 0,
             overlay_inspect_mode: "none".to_string(),
             service_worker_enabled: false,
             service_worker_force_update_on_page_load: false,
@@ -1001,6 +1004,11 @@ impl CdpDispatcher {
     /// Returns the cached flex overlay setup count.
     pub fn overlay_flex_overlay_count(&self) -> usize {
         self.overlay_flex_overlay_count
+    }
+
+    /// Returns the cached scroll-snap overlay setup count.
+    pub fn overlay_scroll_snap_overlay_count(&self) -> usize {
+        self.overlay_scroll_snap_overlay_count
     }
 
     /// Returns the cached inspect mode.
@@ -1949,6 +1957,9 @@ impl CdpDispatcher {
             "Overlay.setShowHitTestBorders" => self.overlay_set_show_hit_test_borders(&req.params),
             "Overlay.setShowGridOverlays" => self.overlay_set_show_grid_overlays(&req.params),
             "Overlay.setShowFlexOverlays" => self.overlay_set_show_flex_overlays(&req.params),
+            "Overlay.setShowScrollSnapOverlays" => {
+                self.overlay_set_show_scroll_snap_overlays(&req.params)
+            }
             "Overlay.setInspectMode" => self.overlay_set_inspect_mode(&req.params),
             "Overlay.hideHighlight" => Ok(json!({})),
             "Overlay.highlightNode" => Ok(json!({})),
@@ -2280,6 +2291,31 @@ impl CdpDispatcher {
             }
         }
         self.overlay_flex_overlay_count = configs.len();
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_scroll_snap_overlays(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(configs) = params.get("scrollSnapHighlightConfigs") else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowScrollSnapOverlays: required parameter 'scrollSnapHighlightConfigs' is missing"
+                    .to_string(),
+            ));
+        };
+        let Value::Array(configs) = configs else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowScrollSnapOverlays: required parameter 'scrollSnapHighlightConfigs' must be an array"
+                    .to_string(),
+            ));
+        };
+        for config in configs {
+            if !config.is_object() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Overlay.setShowScrollSnapOverlays: every scroll-snap overlay config must be an object"
+                        .to_string(),
+                ));
+            }
+        }
+        self.overlay_scroll_snap_overlay_count = configs.len();
         Ok(json!({}))
     }
 
@@ -7883,40 +7919,53 @@ mod tests {
         assert!(flex.get("error").is_none());
         assert_eq!(d.overlay_flex_overlay_count(), 1);
 
+        let scroll_snap = dispatch(
+            &mut d,
+            r#"{"id":12,"method":"Overlay.setShowScrollSnapOverlays","params":{"scrollSnapHighlightConfigs":[{"nodeId":4,"scrollSnapContainerHighlightConfig":{}}]}}"#,
+        );
+        assert!(scroll_snap.get("error").is_none());
+        assert_eq!(d.overlay_scroll_snap_overlay_count(), 1);
+
         let inspect = dispatch(
             &mut d,
-            r#"{"id":12,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
+            r#"{"id":13,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
         );
         assert!(inspect.get("error").is_none());
         assert_eq!(d.overlay_inspect_mode(), "searchForNode");
 
         let bad = dispatch(
             &mut d,
-            r#"{"id":13,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
+            r#"{"id":14,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
         );
         assert!(bad["error"].is_object());
 
         let bad_grid = dispatch(
             &mut d,
-            r#"{"id":14,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[1]}}"#,
+            r#"{"id":15,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[1]}}"#,
         );
         assert!(bad_grid["error"].is_object());
 
         let bad_flex = dispatch(
             &mut d,
-            r#"{"id":15,"method":"Overlay.setShowFlexOverlays","params":{"flexNodeHighlightConfigs":[42]}}"#,
+            r#"{"id":16,"method":"Overlay.setShowFlexOverlays","params":{"flexNodeHighlightConfigs":[42]}}"#,
         );
         assert!(bad_flex["error"].is_object());
 
+        let bad_scroll_snap = dispatch(
+            &mut d,
+            r#"{"id":17,"method":"Overlay.setShowScrollSnapOverlays","params":{"scrollSnapHighlightConfigs":[false]}}"#,
+        );
+        assert!(bad_scroll_snap["error"].is_object());
+
         let hide = dispatch(
             &mut d,
-            r#"{"id":16,"method":"Overlay.hideHighlight","params":{}}"#,
+            r#"{"id":18,"method":"Overlay.hideHighlight","params":{}}"#,
         );
         assert!(hide.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":17,"method":"Overlay.disable","params":{}}"#,
+            r#"{"id":19,"method":"Overlay.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.overlay_enabled());
