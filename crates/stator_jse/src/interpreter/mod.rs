@@ -23296,7 +23296,6 @@ mod tests {
     /// The test calls `add(1, 2)` well above the Maglev threshold and then
     /// polls for the Maglev cache to be populated, asserting the correct result.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô Maglev tiering polling
     fn test_maglev_compiled_after_threshold() {
         use super::maglev_stats;
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
