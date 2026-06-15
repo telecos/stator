@@ -29664,7 +29664,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_throw_on_completed_gen_rejects() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); return await it.throw('late'); } f()",
