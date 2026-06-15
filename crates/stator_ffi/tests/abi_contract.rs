@@ -1029,7 +1029,7 @@ fn test_header_module_host_callback_signatures_and_docs_match_abi() {
     for signature in [
         "bool stator_context_set_module_url_resolver(struct StatorContext *ctx,\n                                            enum StatorResolveStatus (*callback)(struct StatorContext *ctx,\n                                                                                 void *user_data,\n                                                                                 const struct StatorModule *referrer,\n                                                                                 const struct StatorModuleOrigin *origin,\n                                                                                 const char *specifier,\n                                                                                 size_t specifier_len,\n                                                                                 const struct StatorImportAttribute *attributes,\n                                                                                 size_t attributes_len,\n                                                                                 struct StatorString **out_resolved_url,\n                                                                                 struct StatorString **out_error),\n                                            void *user_data,\n                                            void (*free_user_data)(void *user_data));",
         "bool stator_context_set_import_meta_populator(struct StatorContext *ctx,\n                                              enum StatorResolveStatus (*callback)(struct StatorContext *ctx,\n                                                                                   void *user_data,\n                                                                                   const struct StatorModule *referrer,\n                                                                                   const struct StatorModuleOrigin *origin,\n                                                                                   struct StatorImportMetaProperties *out_meta,\n                                                                                   struct StatorString **out_error),\n                                              void *user_data,\n                                              void (*free_user_data)(void *user_data));",
-        "bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,\n                                                struct Option_StatorDynamicImportCallback callback,\n                                                void *user_data,\n                                                void (*free_user_data)(void *user_data));",
+        "bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,\n                                                enum StatorResolveStatus (*callback)(struct StatorContext *ctx,\n                                                                                     void *user_data,\n                                                                                     struct StatorDynamicImportRequest *request,\n                                                                                     const struct StatorModule *referrer,\n                                                                                     const struct StatorModuleOrigin *origin,\n                                                                                     const char *specifier,\n                                                                                     size_t specifier_len,\n                                                                                     const struct StatorImportAttribute *attributes,\n                                                                                     size_t attributes_len,\n                                                                                     struct StatorString **out_error),\n                                                void *user_data,\n                                                void (*free_user_data)(void *user_data));",
     ] {
         assert!(
             header.contains(signature),
@@ -1055,6 +1055,17 @@ fn test_header_module_host_callback_signatures_and_docs_match_abi() {
         assert!(
             !docs.contains(marker),
             "generated stator.h module host-callback docs should not expose Rust-specific marker `{marker}`"
+        );
+    }
+}
+
+#[test]
+fn test_header_module_host_callbacks_are_c_function_pointers() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for marker in ["Option_StatorDynamicImportCallback"] {
+        assert!(
+            !header.contains(marker),
+            "generated stator.h should expose nullable module host callbacks as C function pointers, not opaque `{marker}`"
         );
     }
 }

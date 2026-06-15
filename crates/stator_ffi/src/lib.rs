@@ -2279,7 +2279,20 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_dynamic_import_resolver(
     ctx: *mut StatorContext,
-    callback: Option<StatorDynamicImportCallback>,
+    callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            request: *mut StatorDynamicImportRequest,
+            referrer: *const StatorModule,
+            origin: *const StatorModuleOrigin,
+            specifier: *const c_char,
+            specifier_len: usize,
+            attributes: *const StatorImportAttribute,
+            attributes_len: usize,
+            out_error: *mut *mut StatorString,
+        ) -> StatorResolveStatus,
+    >,
     user_data: *mut c_void,
     free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> bool {

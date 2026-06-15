@@ -1159,8 +1159,6 @@ typedef enum StatorNativeCodeCacheTier {
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
 
-typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
-
 typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTemplateCallback;
 
 /**
@@ -4531,7 +4529,16 @@ bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
  * the same serialized context/module thread.
  */
 bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,
-                                                struct Option_StatorDynamicImportCallback callback,
+                                                enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
+                                                                                     void *user_data,
+                                                                                     struct StatorDynamicImportRequest *request,
+                                                                                     const struct StatorModule *referrer,
+                                                                                     const struct StatorModuleOrigin *origin,
+                                                                                     const char *specifier,
+                                                                                     size_t specifier_len,
+                                                                                     const struct StatorImportAttribute *attributes,
+                                                                                     size_t attributes_len,
+                                                                                     struct StatorString **out_error),
                                                 void *user_data,
                                                 void (*free_user_data)(void *user_data));
 
