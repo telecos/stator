@@ -23386,7 +23386,6 @@ mod tests {
     /// After the Maglev tier is installed the function must continue to return
     /// the correct result for all argument combinations.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô Maglev tier-up polling
     fn test_maglev_correct_result_after_tier_up() {
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
 
