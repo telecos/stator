@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setScriptExecutionDisabled` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -523,8 +523,12 @@ pub struct CdpDispatcher {
     emulation_cpu_throttling_rate: f64,
     /// Cached `Emulation.setTimezoneOverride` timezone id.
     emulation_timezone_id: String,
+    /// Cached `Emulation.setLocaleOverride` locale id.
+    emulation_locale: String,
     /// Cached `Emulation.setScriptExecutionDisabled` state.
     emulation_script_execution_disabled: bool,
+    /// Cached `Emulation.setFocusEmulationEnabled` state.
+    emulation_focus_emulation_enabled: bool,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -702,7 +706,9 @@ impl CdpDispatcher {
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
             emulation_timezone_id: String::new(),
+            emulation_locale: String::new(),
             emulation_script_execution_disabled: false,
+            emulation_focus_emulation_enabled: false,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -976,9 +982,19 @@ impl CdpDispatcher {
         &self.emulation_timezone_id
     }
 
+    /// Returns the cached locale override id.
+    pub fn emulation_locale(&self) -> &str {
+        &self.emulation_locale
+    }
+
     /// Returns the cached script execution disabled state.
     pub fn emulation_script_execution_disabled(&self) -> bool {
         self.emulation_script_execution_disabled
+    }
+
+    /// Returns the cached focus emulation enabled state.
+    pub fn emulation_focus_emulation_enabled(&self) -> bool {
+        self.emulation_focus_emulation_enabled
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -1973,8 +1989,12 @@ impl CdpDispatcher {
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
             "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
             "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
+            "Emulation.setLocaleOverride" => self.emulation_set_locale_override(&req.params),
             "Emulation.setScriptExecutionDisabled" => {
                 self.emulation_set_script_execution_disabled(&req.params)
+            }
+            "Emulation.setFocusEmulationEnabled" => {
+                self.emulation_set_focus_emulation_enabled(&req.params)
             }
 
             // ── Overlay ───────────────────────────────────────────────────
@@ -2267,6 +2287,17 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
+    fn emulation_set_locale_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(locale) = params.get("locale").and_then(Value::as_str) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setLocaleOverride: required parameter 'locale' is missing or not a string"
+                    .to_string(),
+            ));
+        };
+        self.emulation_locale = locale.to_string();
+        Ok(json!({}))
+    }
+
     fn emulation_set_script_execution_disabled(&mut self, params: &Value) -> StatorResult<Value> {
         let Some(value) = params.get("value").and_then(Value::as_bool) else {
             return Err(crate::error::StatorError::TypeError(
@@ -2275,6 +2306,17 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_script_execution_disabled = value;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_focus_emulation_enabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setFocusEmulationEnabled: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.emulation_focus_emulation_enabled = enabled;
         Ok(json!({}))
     }
 
@@ -8214,29 +8256,69 @@ mod tests {
         );
         assert!(timezone_bad["error"].is_object());
 
+        let locale = dispatch(
+            &mut d,
+            r#"{"id":12,"method":"Emulation.setLocaleOverride","params":{"locale":"fr-FR"}}"#,
+        );
+        assert!(locale.get("error").is_none());
+        assert_eq!(d.emulation_locale(), "fr-FR");
+
+        let locale_clear = dispatch(
+            &mut d,
+            r#"{"id":13,"method":"Emulation.setLocaleOverride","params":{"locale":""}}"#,
+        );
+        assert!(locale_clear.get("error").is_none());
+        assert_eq!(d.emulation_locale(), "");
+
+        let locale_bad = dispatch(
+            &mut d,
+            r#"{"id":14,"method":"Emulation.setLocaleOverride","params":{"locale":1}}"#,
+        );
+        assert!(locale_bad["error"].is_object());
+
         let script_disabled = dispatch(
             &mut d,
-            r#"{"id":12,"method":"Emulation.setScriptExecutionDisabled","params":{"value":true}}"#,
+            r#"{"id":15,"method":"Emulation.setScriptExecutionDisabled","params":{"value":true}}"#,
         );
         assert!(script_disabled.get("error").is_none());
         assert!(d.emulation_script_execution_disabled());
 
         let script_enabled = dispatch(
             &mut d,
-            r#"{"id":13,"method":"Emulation.setScriptExecutionDisabled","params":{"value":false}}"#,
+            r#"{"id":16,"method":"Emulation.setScriptExecutionDisabled","params":{"value":false}}"#,
         );
         assert!(script_enabled.get("error").is_none());
         assert!(!d.emulation_script_execution_disabled());
 
         let script_bad = dispatch(
             &mut d,
-            r#"{"id":14,"method":"Emulation.setScriptExecutionDisabled","params":{}}"#,
+            r#"{"id":17,"method":"Emulation.setScriptExecutionDisabled","params":{}}"#,
         );
         assert!(script_bad["error"].is_object());
 
+        let focus_enabled = dispatch(
+            &mut d,
+            r#"{"id":18,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true}}"#,
+        );
+        assert!(focus_enabled.get("error").is_none());
+        assert!(d.emulation_focus_emulation_enabled());
+
+        let focus_disabled = dispatch(
+            &mut d,
+            r#"{"id":19,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":false}}"#,
+        );
+        assert!(focus_disabled.get("error").is_none());
+        assert!(!d.emulation_focus_emulation_enabled());
+
+        let focus_bad = dispatch(
+            &mut d,
+            r#"{"id":20,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":"yes"}}"#,
+        );
+        assert!(focus_bad["error"].is_object());
+
         let clear = dispatch(
             &mut d,
-            r#"{"id":15,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":21,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
