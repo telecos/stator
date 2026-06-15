@@ -65,11 +65,11 @@
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`        | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
-//! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled` | Minimal standalone page metadata |
+//! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -499,6 +499,8 @@ pub struct CdpDispatcher {
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
     page_lifecycle_events_enabled: bool,
+    /// Cached `Page.setBypassCSP` state.
+    page_bypass_csp: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -515,6 +517,10 @@ pub struct CdpDispatcher {
     emulation_touch_enabled: bool,
     /// Cached touch point count for touch emulation.
     emulation_max_touch_points: u32,
+    /// Cached `Emulation.setEmitTouchEventsForMouse` enabled state.
+    emulation_emit_touch_events_for_mouse_enabled: bool,
+    /// Cached `Emulation.setEmitTouchEventsForMouse` configuration.
+    emulation_emit_touch_events_for_mouse_configuration: String,
     /// Cached media type from `Emulation.setEmulatedMedia`.
     emulation_media: String,
     /// Cached media feature count from `Emulation.setEmulatedMedia`.
@@ -694,6 +700,7 @@ impl CdpDispatcher {
             network_bypass_service_worker: false,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
+            page_bypass_csp: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -702,6 +709,8 @@ impl CdpDispatcher {
             emulation_device_metrics: None,
             emulation_touch_enabled: false,
             emulation_max_touch_points: 0,
+            emulation_emit_touch_events_for_mouse_enabled: false,
+            emulation_emit_touch_events_for_mouse_configuration: String::new(),
             emulation_media: String::new(),
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
@@ -922,6 +931,11 @@ impl CdpDispatcher {
         self.page_lifecycle_events_enabled
     }
 
+    /// Returns the cached `Page.setBypassCSP` value.
+    pub fn page_bypass_csp(&self) -> bool {
+        self.page_bypass_csp
+    }
+
     /// Returns `true` if the Log domain is currently enabled.
     pub fn log_enabled(&self) -> bool {
         self.log_enabled
@@ -960,6 +974,16 @@ impl CdpDispatcher {
     /// Returns the cached max touch-point count.
     pub fn emulation_max_touch_points(&self) -> u32 {
         self.emulation_max_touch_points
+    }
+
+    /// Returns the cached mouse-to-touch event emulation enabled state.
+    pub fn emulation_emit_touch_events_for_mouse_enabled(&self) -> bool {
+        self.emulation_emit_touch_events_for_mouse_enabled
+    }
+
+    /// Returns the cached mouse-to-touch event emulation configuration.
+    pub fn emulation_emit_touch_events_for_mouse_configuration(&self) -> &str {
+        &self.emulation_emit_touch_events_for_mouse_configuration
     }
 
     /// Returns the cached emulated media string.
@@ -1938,6 +1962,7 @@ impl CdpDispatcher {
             "Page.getResourceTree" => self.page_get_resource_tree(),
             "Page.getFrameTree" => self.page_get_frame_tree(),
             "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
+            "Page.setBypassCSP" => self.page_set_bypass_csp(&req.params),
 
             // ── Log ───────────────────────────────────────────────────────
             "Log.enable" => {
@@ -1985,6 +2010,9 @@ impl CdpDispatcher {
             }
             "Emulation.setTouchEmulationEnabled" => {
                 self.emulation_set_touch_emulation_enabled(&req.params)
+            }
+            "Emulation.setEmitTouchEventsForMouse" => {
+                self.emulation_set_emit_touch_events_for_mouse(&req.params)
             }
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
             "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
@@ -2147,6 +2175,17 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
+    fn page_set_bypass_csp(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Page.setBypassCSP: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.page_bypass_csp = enabled;
+        Ok(json!({}))
+    }
+
     fn log_start_violations_report(&mut self, params: &Value) -> StatorResult<Value> {
         let Some(config) = params.get("config").and_then(Value::as_array) else {
             return Err(crate::error::StatorError::TypeError(
@@ -2239,6 +2278,36 @@ impl CdpDispatcher {
             .min(u32::MAX as u64) as u32;
         self.emulation_touch_enabled = enabled;
         self.emulation_max_touch_points = max_touch_points;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_emit_touch_events_for_mouse(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setEmitTouchEventsForMouse: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        let configuration = match params.get("configuration") {
+            Some(value) => {
+                let Some(configuration) = value.as_str() else {
+                    return Err(crate::error::StatorError::TypeError(
+                        "Emulation.setEmitTouchEventsForMouse: optional parameter 'configuration' must be a string"
+                            .to_string(),
+                    ));
+                };
+                if configuration != "mobile" && configuration != "desktop" {
+                    return Err(crate::error::StatorError::TypeError(
+                        "Emulation.setEmitTouchEventsForMouse: optional parameter 'configuration' must be 'mobile' or 'desktop'"
+                            .to_string(),
+                    ));
+                }
+                configuration
+            }
+            None => "",
+        };
+        self.emulation_emit_touch_events_for_mouse_enabled = enabled;
+        self.emulation_emit_touch_events_for_mouse_configuration = configuration.to_string();
         Ok(json!({}))
     }
 
@@ -8203,9 +8272,46 @@ mod tests {
         assert!(d.emulation_touch_enabled());
         assert_eq!(d.emulation_max_touch_points(), 5);
 
+        let emit_touch = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Emulation.setEmitTouchEventsForMouse","params":{"enabled":true,"configuration":"mobile"}}"#,
+        );
+        assert!(emit_touch.get("error").is_none());
+        assert!(d.emulation_emit_touch_events_for_mouse_enabled());
+        assert_eq!(
+            d.emulation_emit_touch_events_for_mouse_configuration(),
+            "mobile"
+        );
+
+        let emit_touch_disabled = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Emulation.setEmitTouchEventsForMouse","params":{"enabled":false}}"#,
+        );
+        assert!(emit_touch_disabled.get("error").is_none());
+        assert!(!d.emulation_emit_touch_events_for_mouse_enabled());
+        assert_eq!(d.emulation_emit_touch_events_for_mouse_configuration(), "");
+
+        let emit_touch_bad_enabled = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Emulation.setEmitTouchEventsForMouse","params":{"enabled":"yes"}}"#,
+        );
+        assert!(emit_touch_bad_enabled["error"].is_object());
+
+        let emit_touch_bad_config_type = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Emulation.setEmitTouchEventsForMouse","params":{"enabled":true,"configuration":1}}"#,
+        );
+        assert!(emit_touch_bad_config_type["error"].is_object());
+
+        let emit_touch_bad_config_value = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Emulation.setEmitTouchEventsForMouse","params":{"enabled":true,"configuration":"tablet"}}"#,
+        );
+        assert!(emit_touch_bad_config_value["error"].is_object());
+
         let media = dispatch(
             &mut d,
-            r#"{"id":4,"method":"Emulation.setEmulatedMedia","params":{"media":"print","features":[{"name":"prefers-color-scheme","value":"dark"}]}}"#,
+            r#"{"id":9,"method":"Emulation.setEmulatedMedia","params":{"media":"print","features":[{"name":"prefers-color-scheme","value":"dark"}]}}"#,
         );
         assert!(media.get("error").is_none());
         assert_eq!(d.emulation_media(), "print");
@@ -8213,112 +8319,112 @@ mod tests {
 
         let media_bad = dispatch(
             &mut d,
-            r#"{"id":5,"method":"Emulation.setEmulatedMedia","params":{"features":{}}}"#,
+            r#"{"id":10,"method":"Emulation.setEmulatedMedia","params":{"features":{}}}"#,
         );
         assert!(media_bad["error"].is_object());
 
         let cpu = dispatch(
             &mut d,
-            r#"{"id":6,"method":"Emulation.setCPUThrottlingRate","params":{"rate":4}}"#,
+            r#"{"id":11,"method":"Emulation.setCPUThrottlingRate","params":{"rate":4}}"#,
         );
         assert!(cpu.get("error").is_none());
         assert_eq!(d.emulation_cpu_throttling_rate(), 4.0);
 
         let cpu_bad_missing = dispatch(
             &mut d,
-            r#"{"id":7,"method":"Emulation.setCPUThrottlingRate","params":{}}"#,
+            r#"{"id":12,"method":"Emulation.setCPUThrottlingRate","params":{}}"#,
         );
         assert!(cpu_bad_missing["error"].is_object());
 
         let cpu_bad_negative = dispatch(
             &mut d,
-            r#"{"id":8,"method":"Emulation.setCPUThrottlingRate","params":{"rate":-1}}"#,
+            r#"{"id":13,"method":"Emulation.setCPUThrottlingRate","params":{"rate":-1}}"#,
         );
         assert!(cpu_bad_negative["error"].is_object());
 
         let timezone = dispatch(
             &mut d,
-            r#"{"id":9,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":"UTC"}}"#,
+            r#"{"id":14,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":"UTC"}}"#,
         );
         assert!(timezone.get("error").is_none());
         assert_eq!(d.emulation_timezone_id(), "UTC");
 
         let timezone_clear = dispatch(
             &mut d,
-            r#"{"id":10,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":""}}"#,
+            r#"{"id":15,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":""}}"#,
         );
         assert!(timezone_clear.get("error").is_none());
         assert_eq!(d.emulation_timezone_id(), "");
 
         let timezone_bad = dispatch(
             &mut d,
-            r#"{"id":11,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":1}}"#,
+            r#"{"id":16,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":1}}"#,
         );
         assert!(timezone_bad["error"].is_object());
 
         let locale = dispatch(
             &mut d,
-            r#"{"id":12,"method":"Emulation.setLocaleOverride","params":{"locale":"fr-FR"}}"#,
+            r#"{"id":17,"method":"Emulation.setLocaleOverride","params":{"locale":"fr-FR"}}"#,
         );
         assert!(locale.get("error").is_none());
         assert_eq!(d.emulation_locale(), "fr-FR");
 
         let locale_clear = dispatch(
             &mut d,
-            r#"{"id":13,"method":"Emulation.setLocaleOverride","params":{"locale":""}}"#,
+            r#"{"id":18,"method":"Emulation.setLocaleOverride","params":{"locale":""}}"#,
         );
         assert!(locale_clear.get("error").is_none());
         assert_eq!(d.emulation_locale(), "");
 
         let locale_bad = dispatch(
             &mut d,
-            r#"{"id":14,"method":"Emulation.setLocaleOverride","params":{"locale":1}}"#,
+            r#"{"id":19,"method":"Emulation.setLocaleOverride","params":{"locale":1}}"#,
         );
         assert!(locale_bad["error"].is_object());
 
         let script_disabled = dispatch(
             &mut d,
-            r#"{"id":15,"method":"Emulation.setScriptExecutionDisabled","params":{"value":true}}"#,
+            r#"{"id":20,"method":"Emulation.setScriptExecutionDisabled","params":{"value":true}}"#,
         );
         assert!(script_disabled.get("error").is_none());
         assert!(d.emulation_script_execution_disabled());
 
         let script_enabled = dispatch(
             &mut d,
-            r#"{"id":16,"method":"Emulation.setScriptExecutionDisabled","params":{"value":false}}"#,
+            r#"{"id":21,"method":"Emulation.setScriptExecutionDisabled","params":{"value":false}}"#,
         );
         assert!(script_enabled.get("error").is_none());
         assert!(!d.emulation_script_execution_disabled());
 
         let script_bad = dispatch(
             &mut d,
-            r#"{"id":17,"method":"Emulation.setScriptExecutionDisabled","params":{}}"#,
+            r#"{"id":22,"method":"Emulation.setScriptExecutionDisabled","params":{}}"#,
         );
         assert!(script_bad["error"].is_object());
 
         let focus_enabled = dispatch(
             &mut d,
-            r#"{"id":18,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true}}"#,
+            r#"{"id":23,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true}}"#,
         );
         assert!(focus_enabled.get("error").is_none());
         assert!(d.emulation_focus_emulation_enabled());
 
         let focus_disabled = dispatch(
             &mut d,
-            r#"{"id":19,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":false}}"#,
+            r#"{"id":24,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":false}}"#,
         );
         assert!(focus_disabled.get("error").is_none());
         assert!(!d.emulation_focus_emulation_enabled());
 
         let focus_bad = dispatch(
             &mut d,
-            r#"{"id":20,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":"yes"}}"#,
+            r#"{"id":25,"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":"yes"}}"#,
         );
         assert!(focus_bad["error"].is_object());
 
         let clear = dispatch(
             &mut d,
-            r#"{"id":21,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":26,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
@@ -8480,7 +8586,20 @@ mod tests {
         );
         assert!(lifecycle_bad["error"].is_object());
 
-        let disable = dispatch(&mut d, r#"{"id":6,"method":"Page.disable","params":{}}"#);
+        let bypass_csp = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Page.setBypassCSP","params":{"enabled":true}}"#,
+        );
+        assert!(bypass_csp.get("error").is_none());
+        assert!(d.page_bypass_csp());
+
+        let bypass_csp_bad = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Page.setBypassCSP","params":{}}"#,
+        );
+        assert!(bypass_csp_bad["error"].is_object());
+
+        let disable = dispatch(&mut d, r#"{"id":8,"method":"Page.disable","params":{}}"#);
         assert!(disable.get("error").is_none());
         assert!(!d.page_enabled());
     }
