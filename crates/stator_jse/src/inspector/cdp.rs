@@ -64,7 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
-//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
@@ -495,6 +495,14 @@ pub struct CdpDispatcher {
     network_cache_disabled: bool,
     /// Cached `Network.setBypassServiceWorker` state.
     network_bypass_service_worker: bool,
+    /// Cached `Network.setUserAgentOverride` user-agent string.
+    network_user_agent: String,
+    /// Cached `Network.setUserAgentOverride` accept-language string.
+    network_accept_language: String,
+    /// Cached `Network.setUserAgentOverride` platform string.
+    network_platform: String,
+    /// Cached `Network.setUserAgentOverride` user-agent metadata object.
+    network_user_agent_metadata: Option<Value>,
     /// Whether the Page domain is currently enabled for this session.
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
@@ -698,6 +706,10 @@ impl CdpDispatcher {
             network_enabled: false,
             network_cache_disabled: false,
             network_bypass_service_worker: false,
+            network_user_agent: String::new(),
+            network_accept_language: String::new(),
+            network_platform: String::new(),
+            network_user_agent_metadata: None,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
@@ -919,6 +931,26 @@ impl CdpDispatcher {
     /// Returns the cached `Network.setBypassServiceWorker` value.
     pub fn network_bypass_service_worker(&self) -> bool {
         self.network_bypass_service_worker
+    }
+
+    /// Returns the cached user-agent override string.
+    pub fn network_user_agent(&self) -> &str {
+        &self.network_user_agent
+    }
+
+    /// Returns the cached accept-language override string.
+    pub fn network_accept_language(&self) -> &str {
+        &self.network_accept_language
+    }
+
+    /// Returns the cached platform override string.
+    pub fn network_platform(&self) -> &str {
+        &self.network_platform
+    }
+
+    /// Returns the cached user-agent metadata override object, if present.
+    pub fn network_user_agent_metadata(&self) -> Option<&Value> {
+        self.network_user_agent_metadata.as_ref()
     }
 
     /// Returns `true` if the Page domain is currently enabled.
@@ -1949,6 +1981,7 @@ impl CdpDispatcher {
             }
             "Network.setCacheDisabled" => self.network_set_cache_disabled(&req.params),
             "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
+            "Network.setUserAgentOverride" => self.network_set_user_agent_override(&req.params),
             "Network.clearBrowserCache" => Ok(json!({})),
             "Network.clearBrowserCookies" => Ok(json!({})),
 
@@ -2126,6 +2159,33 @@ impl CdpDispatcher {
             ));
         };
         self.network_bypass_service_worker = bypass;
+        Ok(json!({}))
+    }
+
+    fn network_set_user_agent_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(user_agent) = params.get("userAgent").and_then(Value::as_str) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setUserAgentOverride: required parameter 'userAgent' is missing or not a string"
+                    .to_string(),
+            ));
+        };
+        let accept_language =
+            optional_string_param(params, "acceptLanguage", "Network.setUserAgentOverride")?;
+        let platform = optional_string_param(params, "platform", "Network.setUserAgentOverride")?;
+        let metadata = match params.get("userAgentMetadata") {
+            Some(value @ Value::Object(_)) => Some(value.clone()),
+            Some(_) => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Network.setUserAgentOverride: optional parameter 'userAgentMetadata' must be an object"
+                        .to_string(),
+                ));
+            }
+            None => None,
+        };
+        self.network_user_agent = user_agent.to_string();
+        self.network_accept_language = accept_language.unwrap_or("").to_string();
+        self.network_platform = platform.unwrap_or("").to_string();
+        self.network_user_agent_metadata = metadata;
         Ok(json!({}))
     }
 
@@ -5149,6 +5209,23 @@ fn optional_bool_param(container: &Value, field: &str, method: &str) -> StatorRe
             value.as_bool().ok_or_else(|| {
                 StatorError::TypeError(format!(
                     "{method}: optional parameter '{field}' must be a boolean"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn optional_string_param<'a>(
+    container: &'a Value,
+    field: &str,
+    method: &str,
+) -> StatorResult<Option<&'a str>> {
+    container
+        .get(field)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be a string"
                 ))
             })
         })
@@ -8639,19 +8716,60 @@ mod tests {
         );
         assert!(bypass_bad["error"].is_object());
 
+        let user_agent = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Network.setUserAgentOverride","params":{"userAgent":"Stator/1.0","acceptLanguage":"en-US","platform":"Win32","userAgentMetadata":{"brands":[]}}}"#,
+        );
+        assert!(user_agent.get("error").is_none());
+        assert_eq!(d.network_user_agent(), "Stator/1.0");
+        assert_eq!(d.network_accept_language(), "en-US");
+        assert_eq!(d.network_platform(), "Win32");
+        assert!(d.network_user_agent_metadata().is_some());
+
+        let user_agent_minimal = dispatch(
+            &mut d,
+            r#"{"id":7,"method":"Network.setUserAgentOverride","params":{"userAgent":"Stator/2.0"}}"#,
+        );
+        assert!(user_agent_minimal.get("error").is_none());
+        assert_eq!(d.network_user_agent(), "Stator/2.0");
+        assert_eq!(d.network_accept_language(), "");
+        assert_eq!(d.network_platform(), "");
+        assert!(d.network_user_agent_metadata().is_none());
+
+        let user_agent_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Network.setUserAgentOverride","params":{}}"#,
+        );
+        assert!(user_agent_bad_missing["error"].is_object());
+
+        let user_agent_bad_language = dispatch(
+            &mut d,
+            r#"{"id":9,"method":"Network.setUserAgentOverride","params":{"userAgent":"Stator/1.0","acceptLanguage":1}}"#,
+        );
+        assert!(user_agent_bad_language["error"].is_object());
+
+        let user_agent_bad_metadata = dispatch(
+            &mut d,
+            r#"{"id":10,"method":"Network.setUserAgentOverride","params":{"userAgent":"Stator/1.0","userAgentMetadata":[]}}"#,
+        );
+        assert!(user_agent_bad_metadata["error"].is_object());
+
         let clear_cache = dispatch(
             &mut d,
-            r#"{"id":6,"method":"Network.clearBrowserCache","params":{}}"#,
+            r#"{"id":11,"method":"Network.clearBrowserCache","params":{}}"#,
         );
         assert!(clear_cache.get("error").is_none());
 
         let clear_cookies = dispatch(
             &mut d,
-            r#"{"id":7,"method":"Network.clearBrowserCookies","params":{}}"#,
+            r#"{"id":12,"method":"Network.clearBrowserCookies","params":{}}"#,
         );
         assert!(clear_cookies.get("error").is_none());
 
-        let disable = dispatch(&mut d, r#"{"id":8,"method":"Network.disable","params":{}}"#);
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":13,"method":"Network.disable","params":{}}"#,
+        );
         assert!(disable.get("error").is_none());
         assert!(!d.network_enabled());
     }
