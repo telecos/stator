@@ -64,7 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
-//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders` | Validated cached setup settings |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
@@ -505,6 +505,8 @@ pub struct CdpDispatcher {
     network_user_agent_metadata: Option<Value>,
     /// Count of cached `Network.setExtraHTTPHeaders` entries.
     network_extra_http_header_count: usize,
+    /// Count of cached `Network.setBlockedURLs` URL patterns.
+    network_blocked_url_count: usize,
     /// Whether the Page domain is currently enabled for this session.
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
@@ -713,6 +715,7 @@ impl CdpDispatcher {
             network_platform: String::new(),
             network_user_agent_metadata: None,
             network_extra_http_header_count: 0,
+            network_blocked_url_count: 0,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
@@ -959,6 +962,11 @@ impl CdpDispatcher {
     /// Returns the number of cached extra HTTP headers.
     pub fn network_extra_http_header_count(&self) -> usize {
         self.network_extra_http_header_count
+    }
+
+    /// Returns the number of cached blocked URL patterns.
+    pub fn network_blocked_url_count(&self) -> usize {
+        self.network_blocked_url_count
     }
 
     /// Returns `true` if the Page domain is currently enabled.
@@ -1991,6 +1999,7 @@ impl CdpDispatcher {
             "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
             "Network.setUserAgentOverride" => self.network_set_user_agent_override(&req.params),
             "Network.setExtraHTTPHeaders" => self.network_set_extra_http_headers(&req.params),
+            "Network.setBlockedURLs" => self.network_set_blocked_urls(&req.params),
             "Network.clearBrowserCache" => Ok(json!({})),
             "Network.clearBrowserCookies" => Ok(json!({})),
 
@@ -2211,6 +2220,22 @@ impl CdpDispatcher {
             ));
         }
         self.network_extra_http_header_count = headers.len();
+        Ok(json!({}))
+    }
+
+    fn network_set_blocked_urls(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(urls) = params.get("urls").and_then(Value::as_array) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setBlockedURLs: required parameter 'urls' is missing or not an array"
+                    .to_string(),
+            ));
+        };
+        if urls.iter().any(|value| !value.is_string()) {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setBlockedURLs: URL patterns must be strings".to_string(),
+            ));
+        }
+        self.network_blocked_url_count = urls.len();
         Ok(json!({}))
     }
 
@@ -8805,21 +8830,47 @@ mod tests {
         );
         assert!(headers_bad_value["error"].is_object());
 
+        let blocked_urls = dispatch(
+            &mut d,
+            r#"{"id":15,"method":"Network.setBlockedURLs","params":{"urls":["*.png","https://example.test/*"]}}"#,
+        );
+        assert!(blocked_urls.get("error").is_none());
+        assert_eq!(d.network_blocked_url_count(), 2);
+
+        let blocked_urls_empty = dispatch(
+            &mut d,
+            r#"{"id":16,"method":"Network.setBlockedURLs","params":{"urls":[]}}"#,
+        );
+        assert!(blocked_urls_empty.get("error").is_none());
+        assert_eq!(d.network_blocked_url_count(), 0);
+
+        let blocked_urls_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":17,"method":"Network.setBlockedURLs","params":{}}"#,
+        );
+        assert!(blocked_urls_bad_missing["error"].is_object());
+
+        let blocked_urls_bad_value = dispatch(
+            &mut d,
+            r#"{"id":18,"method":"Network.setBlockedURLs","params":{"urls":["ok",1]}}"#,
+        );
+        assert!(blocked_urls_bad_value["error"].is_object());
+
         let clear_cache = dispatch(
             &mut d,
-            r#"{"id":15,"method":"Network.clearBrowserCache","params":{}}"#,
+            r#"{"id":19,"method":"Network.clearBrowserCache","params":{}}"#,
         );
         assert!(clear_cache.get("error").is_none());
 
         let clear_cookies = dispatch(
             &mut d,
-            r#"{"id":16,"method":"Network.clearBrowserCookies","params":{}}"#,
+            r#"{"id":20,"method":"Network.clearBrowserCookies","params":{}}"#,
         );
         assert!(clear_cookies.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":17,"method":"Network.disable","params":{}}"#,
+            r#"{"id":21,"method":"Network.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.network_enabled());
