@@ -521,6 +521,8 @@ pub struct CdpDispatcher {
     emulation_media_feature_count: usize,
     /// Cached `Emulation.setCPUThrottlingRate` value (1.0 means no throttling).
     emulation_cpu_throttling_rate: f64,
+    /// Cached `Emulation.setTimezoneOverride` timezone id.
+    emulation_timezone_id: String,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -697,6 +699,7 @@ impl CdpDispatcher {
             emulation_media: String::new(),
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
+            emulation_timezone_id: String::new(),
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -963,6 +966,11 @@ impl CdpDispatcher {
     /// Returns the cached CPU throttling rate.
     pub fn emulation_cpu_throttling_rate(&self) -> f64 {
         self.emulation_cpu_throttling_rate
+    }
+
+    /// Returns the cached timezone override id.
+    pub fn emulation_timezone_id(&self) -> &str {
+        &self.emulation_timezone_id
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -1956,6 +1964,7 @@ impl CdpDispatcher {
             }
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
             "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
+            "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2233,6 +2242,17 @@ impl CdpDispatcher {
             ));
         }
         self.emulation_cpu_throttling_rate = rate;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_timezone_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(timezone_id) = params.get("timezoneId").and_then(Value::as_str) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setTimezoneOverride: required parameter 'timezoneId' is missing or not a string"
+                    .to_string(),
+            ));
+        };
+        self.emulation_timezone_id = timezone_id.to_string();
         Ok(json!({}))
     }
 
@@ -8152,9 +8172,29 @@ mod tests {
         );
         assert!(cpu_bad_negative["error"].is_object());
 
+        let timezone = dispatch(
+            &mut d,
+            r#"{"id":9,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":"UTC"}}"#,
+        );
+        assert!(timezone.get("error").is_none());
+        assert_eq!(d.emulation_timezone_id(), "UTC");
+
+        let timezone_clear = dispatch(
+            &mut d,
+            r#"{"id":10,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":""}}"#,
+        );
+        assert!(timezone_clear.get("error").is_none());
+        assert_eq!(d.emulation_timezone_id(), "");
+
+        let timezone_bad = dispatch(
+            &mut d,
+            r#"{"id":11,"method":"Emulation.setTimezoneOverride","params":{"timezoneId":1}}"#,
+        );
+        assert!(timezone_bad["error"].is_object());
+
         let clear = dispatch(
             &mut d,
-            r#"{"id":9,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":12,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
