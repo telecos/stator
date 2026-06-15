@@ -63,7 +63,7 @@
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
-//! | `Network`      | `enable`/`disable`        | Acknowledges and tracks state      |
+//! | `Network`      | `enable`/`disable`/`clearBrowserCache` | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
@@ -1949,6 +1949,7 @@ impl CdpDispatcher {
             }
             "Network.setCacheDisabled" => self.network_set_cache_disabled(&req.params),
             "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
+            "Network.clearBrowserCache" => Ok(json!({})),
 
             // ── Page ──────────────────────────────────────────────────────
             "Page.enable" => {
@@ -8637,7 +8638,13 @@ mod tests {
         );
         assert!(bypass_bad["error"].is_object());
 
-        let disable = dispatch(&mut d, r#"{"id":6,"method":"Network.disable","params":{}}"#);
+        let clear_cache = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Network.clearBrowserCache","params":{}}"#,
+        );
+        assert!(clear_cache.get("error").is_none());
+
+        let disable = dispatch(&mut d, r#"{"id":7,"method":"Network.disable","params":{}}"#);
         assert!(disable.get("error").is_none());
         assert!(!d.network_enabled());
     }
