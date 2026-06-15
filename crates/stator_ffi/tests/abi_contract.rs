@@ -1082,6 +1082,15 @@ fn test_header_nullable_callbacks_are_c_function_pointers() {
 }
 
 #[test]
+fn test_header_contains_no_cbindgen_option_wrappers() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    assert!(
+        !header.contains("Option_"),
+        "generated stator.h should not expose cbindgen Option_* wrapper types"
+    );
+}
+
+#[test]
 fn test_header_module_cache_status_discriminants_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [
