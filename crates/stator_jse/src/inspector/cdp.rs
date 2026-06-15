@@ -530,6 +530,8 @@ pub struct CdpDispatcher {
     overlay_show_viewport_size_on_resize: bool,
     overlay_show_scroll_bottleneck_rects: bool,
     overlay_show_hit_test_borders: bool,
+    /// Cached grid overlay setup count from `Overlay.setShowGridOverlays`.
+    overlay_grid_overlay_count: usize,
     /// Cached inspect mode requested through `Overlay.setInspectMode`.
     overlay_inspect_mode: String,
     /// Whether the ServiceWorker domain is currently enabled for this session.
@@ -693,6 +695,7 @@ impl CdpDispatcher {
             overlay_show_viewport_size_on_resize: false,
             overlay_show_scroll_bottleneck_rects: false,
             overlay_show_hit_test_borders: false,
+            overlay_grid_overlay_count: 0,
             overlay_inspect_mode: "none".to_string(),
             service_worker_enabled: false,
             service_worker_force_update_on_page_load: false,
@@ -985,6 +988,11 @@ impl CdpDispatcher {
     /// Returns the cached hit-test-border overlay toggle.
     pub fn overlay_show_hit_test_borders(&self) -> bool {
         self.overlay_show_hit_test_borders
+    }
+
+    /// Returns the cached grid overlay setup count.
+    pub fn overlay_grid_overlay_count(&self) -> usize {
+        self.overlay_grid_overlay_count
     }
 
     /// Returns the cached inspect mode.
@@ -1931,6 +1939,7 @@ impl CdpDispatcher {
                 self.overlay_set_show_scroll_bottleneck_rects(&req.params)
             }
             "Overlay.setShowHitTestBorders" => self.overlay_set_show_hit_test_borders(&req.params),
+            "Overlay.setShowGridOverlays" => self.overlay_set_show_grid_overlays(&req.params),
             "Overlay.setInspectMode" => self.overlay_set_inspect_mode(&req.params),
             "Overlay.hideHighlight" => Ok(json!({})),
             "Overlay.highlightNode" => Ok(json!({})),
@@ -2212,6 +2221,31 @@ impl CdpDispatcher {
     fn overlay_set_show_hit_test_borders(&mut self, params: &Value) -> StatorResult<Value> {
         self.overlay_show_hit_test_borders =
             Self::overlay_required_bool(params, "Overlay.setShowHitTestBorders", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_grid_overlays(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(configs) = params.get("gridNodeHighlightConfigs") else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowGridOverlays: required parameter 'gridNodeHighlightConfigs' is missing"
+                    .to_string(),
+            ));
+        };
+        let Value::Array(configs) = configs else {
+            return Err(crate::error::StatorError::TypeError(
+                "Overlay.setShowGridOverlays: required parameter 'gridNodeHighlightConfigs' must be an array"
+                    .to_string(),
+            ));
+        };
+        for config in configs {
+            if !config.is_object() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Overlay.setShowGridOverlays: every grid overlay config must be an object"
+                        .to_string(),
+                ));
+            }
+        }
+        self.overlay_grid_overlay_count = configs.len();
         Ok(json!({}))
     }
 
@@ -7801,28 +7835,41 @@ mod tests {
         assert!(hit.get("error").is_none());
         assert!(d.overlay_show_hit_test_borders());
 
+        let grid = dispatch(
+            &mut d,
+            r#"{"id":10,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[{"nodeId":1,"gridHighlightConfig":{}},{"backendNodeId":2,"gridHighlightConfig":{}}]}}"#,
+        );
+        assert!(grid.get("error").is_none());
+        assert_eq!(d.overlay_grid_overlay_count(), 2);
+
         let inspect = dispatch(
             &mut d,
-            r#"{"id":10,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
+            r#"{"id":11,"method":"Overlay.setInspectMode","params":{"mode":"searchForNode"}}"#,
         );
         assert!(inspect.get("error").is_none());
         assert_eq!(d.overlay_inspect_mode(), "searchForNode");
 
         let bad = dispatch(
             &mut d,
-            r#"{"id":11,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
+            r#"{"id":12,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
         );
         assert!(bad["error"].is_object());
 
+        let bad_grid = dispatch(
+            &mut d,
+            r#"{"id":13,"method":"Overlay.setShowGridOverlays","params":{"gridNodeHighlightConfigs":[1]}}"#,
+        );
+        assert!(bad_grid["error"].is_object());
+
         let hide = dispatch(
             &mut d,
-            r#"{"id":12,"method":"Overlay.hideHighlight","params":{}}"#,
+            r#"{"id":14,"method":"Overlay.hideHighlight","params":{}}"#,
         );
         assert!(hide.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":13,"method":"Overlay.disable","params":{}}"#,
+            r#"{"id":15,"method":"Overlay.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.overlay_enabled());
