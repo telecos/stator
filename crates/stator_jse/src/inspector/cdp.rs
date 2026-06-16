@@ -57,7 +57,7 @@
 //! | `Profiler`     | `setSamplingInterval`     | Sets interval for the next profile |
 //! | `Profiler`     | `start`                   | Starts CPU profiling               |
 //! | `Profiler`     | `stop`                    | Stops profiling; returns profile    |
-//! | `HeapProfiler` | `enable`                  | Acknowledges                       |
+//! | `HeapProfiler` | `enable`/`disable`        | Tracks HeapProfiler domain enabled state |
 //! | `HeapProfiler` | `collectGarbage`          | Triggers the thread-local Stator GC runtime |
 //! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
@@ -530,6 +530,8 @@ pub struct CdpDispatcher {
     max_call_stack_size_to_capture: u32,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
+    /// Whether the `HeapProfiler` domain is currently enabled for this session.
+    heap_profiler_enabled: bool,
     /// Whether the Network domain is currently enabled for this session.
     network_enabled: bool,
     /// Cached `Network.setCacheDisabled` state.
@@ -783,6 +785,7 @@ impl CdpDispatcher {
             custom_object_formatter_enabled: false,
             max_call_stack_size_to_capture: 0,
             console_enabled: false,
+            heap_profiler_enabled: false,
             network_enabled: false,
             network_cache_disabled: false,
             network_bypass_service_worker: false,
@@ -1016,6 +1019,11 @@ impl CdpDispatcher {
     /// Returns the requested maximum stack size for captured call stacks.
     pub fn max_call_stack_size_to_capture(&self) -> u32 {
         self.max_call_stack_size_to_capture
+    }
+
+    /// Returns `true` if the HeapProfiler domain is currently enabled.
+    pub fn heap_profiler_enabled(&self) -> bool {
+        self.heap_profiler_enabled
     }
 
     /// Returns `true` if the Network domain is currently enabled.
@@ -2213,7 +2221,14 @@ impl CdpDispatcher {
             "Profiler.takeTypeProfile" => self.profiler_take_type_profile(),
 
             // ── HeapProfiler ──────────────────────────────────────────────
-            "HeapProfiler.enable" => Ok(json!({})),
+            "HeapProfiler.enable" => {
+                self.heap_profiler_enabled = true;
+                Ok(json!({}))
+            }
+            "HeapProfiler.disable" => {
+                self.heap_profiler_enabled = false;
+                Ok(json!({}))
+            }
             "HeapProfiler.collectGarbage" => self.collect_garbage(),
             "HeapProfiler.takeHeapSnapshot" => self.heap_profiler_take_snapshot(),
             "HeapProfiler.getHeapObjectId" => self.heap_profiler_get_heap_object_id(&req.params),
@@ -10176,6 +10191,27 @@ mod tests {
 
     fn fresh_dispatcher() -> CdpDispatcher {
         CdpDispatcher::with_globals(Rc::new(RefCell::new(GlobalEnv::new())))
+    }
+
+    #[test]
+    fn heap_profiler_enable_disable_tracks_state() {
+        let mut d = fresh_dispatcher();
+
+        let enable = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"HeapProfiler.enable","params":{}}"#,
+        );
+        assert_eq!(enable["id"], 1);
+        assert!(enable.get("error").is_none(), "enable should succeed");
+        assert!(d.heap_profiler_enabled());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"HeapProfiler.disable","params":{}}"#,
+        );
+        assert_eq!(disable["id"], 2);
+        assert!(disable.get("error").is_none(), "disable should succeed");
+        assert!(!d.heap_profiler_enabled());
     }
 
     #[test]
