@@ -578,6 +578,8 @@ pub struct CdpDispatcher {
     css_enabled: bool,
     /// Whether the LayerTree domain is currently enabled for this session.
     layer_tree_enabled: bool,
+    /// Whether the Accessibility domain is currently enabled for this session.
+    accessibility_enabled: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -838,6 +840,7 @@ impl CdpDispatcher {
             dom_enabled: false,
             css_enabled: false,
             layer_tree_enabled: false,
+            accessibility_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -1169,6 +1172,11 @@ impl CdpDispatcher {
     /// Returns `true` if the LayerTree domain is currently enabled.
     pub fn layer_tree_enabled(&self) -> bool {
         self.layer_tree_enabled
+    }
+
+    /// Returns `true` if the Accessibility domain is currently enabled.
+    pub fn accessibility_enabled(&self) -> bool {
+        self.accessibility_enabled
     }
 
     /// Returns `true` if the Log domain is currently enabled.
@@ -2247,6 +2255,9 @@ impl CdpDispatcher {
             "Runtime.setMaxCallStackSizeToCapture" => {
                 self.runtime_set_max_call_stack_size_to_capture(&req.params)
             }
+            "Runtime.setAsyncCallStackDepth" => {
+                self.set_async_call_stack_depth(&req.params, "Runtime.setAsyncCallStackDepth")
+            }
             "Runtime.discardConsoleEntries" => self.runtime_discard_console_entries(),
             "Runtime.globalLexicalScopeNames" => {
                 self.runtime_global_lexical_scope_names(&req.params)
@@ -2268,7 +2279,7 @@ impl CdpDispatcher {
             "Debugger.disable" => self.debugger_disable(),
             "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
             "Debugger.setAsyncCallStackDepth" => {
-                self.debugger_set_async_call_stack_depth(&req.params)
+                self.set_async_call_stack_depth(&req.params, "Debugger.setAsyncCallStackDepth")
             }
             "Debugger.getStackTrace" => self.debugger_get_stack_trace(&req.params),
             "Debugger.setBreakpoint" => self.debugger_set_breakpoint(&req.params),
@@ -2394,6 +2405,7 @@ impl CdpDispatcher {
             }
             "Page.getResourceTree" => self.page_get_resource_tree(),
             "Page.getFrameTree" => self.page_get_frame_tree(),
+            "Page.getNavigationHistory" => self.page_get_navigation_history(),
             "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
             "Page.setBypassCSP" => self.page_set_bypass_csp(&req.params),
             "Page.setAdBlockingEnabled" => self.page_set_ad_blocking_enabled(&req.params),
@@ -2425,6 +2437,16 @@ impl CdpDispatcher {
             }
             "LayerTree.disable" => {
                 self.layer_tree_enabled = false;
+                Ok(json!({}))
+            }
+
+            // ── Accessibility ──────────────────────────────────────────────
+            "Accessibility.enable" => {
+                self.accessibility_enabled = true;
+                Ok(json!({}))
+            }
+            "Accessibility.disable" => {
+                self.accessibility_enabled = false;
                 Ok(json!({}))
             }
 
@@ -2612,6 +2634,7 @@ impl CdpDispatcher {
             "Target.detachFromTarget" => self.target_detach_from_target(&req.params),
             "Target.closeTarget" => self.target_close_target(&req.params),
             "Target.sendMessageToTarget" => self.target_send_message_to_target(&req.params),
+            "Target.getBrowserContexts" => Ok(json!({ "browserContextIds": [] })),
 
             // ── Schema ────────────────────────────────────────────────────
             "Schema.getDomains" => Ok(schema_get_domains()),
@@ -2830,6 +2853,25 @@ impl CdpDispatcher {
     fn page_get_frame_tree(&self) -> StatorResult<Value> {
         Ok(json!({
             "frameTree": self.page_frame_tree(),
+        }))
+    }
+
+    fn page_get_navigation_history(&self) -> StatorResult<Value> {
+        let frame_tree = self.page_frame_tree();
+        let url = frame_tree["frame"]
+            .get("url")
+            .filter(|url| url.is_string())
+            .cloned()
+            .unwrap_or_else(|| json!("stator://page"));
+        Ok(json!({
+            "currentIndex": 0,
+            "entries": [{
+                "id": 0,
+                "url": url,
+                "userTypedURL": url,
+                "title": "",
+                "transitionType": "typed"
+            }]
         }))
     }
 
@@ -4433,12 +4475,11 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
-    fn debugger_set_async_call_stack_depth(&mut self, params: &Value) -> StatorResult<Value> {
+    fn set_async_call_stack_depth(&mut self, params: &Value, method: &str) -> StatorResult<Value> {
         let Some(max_depth) = params.get("maxDepth").and_then(Value::as_u64) else {
-            return Err(crate::error::StatorError::TypeError(
-                "Debugger.setAsyncCallStackDepth: required parameter 'maxDepth' is missing or not a number"
-                    .to_string(),
-            ));
+            return Err(crate::error::StatorError::TypeError(format!(
+                "{method}: required parameter 'maxDepth' is missing or not a number"
+            )));
         };
         self.async_call_stack_depth = max_depth.min(u32::MAX as u64) as u32;
         Ok(json!({}))
@@ -6456,6 +6497,7 @@ fn schema_get_domains() -> Value {
             { "name": "DOM", "version": "1.3" },
             { "name": "CSS", "version": "1.3" },
             { "name": "LayerTree", "version": "1.3" },
+            { "name": "Accessibility", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
             { "name": "Audits", "version": "1.3" },
@@ -10233,6 +10275,18 @@ mod tests {
             "stator-frame-7"
         );
 
+        let navigation_history = dispatch(
+            &mut d,
+            r#"{"id":11,"method":"Page.getNavigationHistory","params":{}}"#,
+        );
+        assert!(navigation_history.get("error").is_none());
+        assert_eq!(navigation_history["result"]["currentIndex"], 0);
+        let entries = navigation_history["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], 0);
+        assert_eq!(entries[0]["url"], "stator://test-page");
+        assert_eq!(entries[0]["userTypedURL"], "stator://test-page");
+
         let lifecycle = dispatch(
             &mut d,
             r#"{"id":4,"method":"Page.setLifecycleEventsEnabled","params":{"enabled":true}}"#,
@@ -10824,6 +10878,25 @@ mod tests {
     }
 
     #[test]
+    fn accessibility_enable_disable_tracks_state() {
+        let mut d = fresh_dispatcher();
+
+        let enable = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Accessibility.enable","params":{}}"#,
+        );
+        assert!(enable.get("error").is_none());
+        assert!(d.accessibility_enabled());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Accessibility.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.accessibility_enabled());
+    }
+
+    #[test]
     fn schema_get_domains_lists_supported_domains() {
         let mut d = fresh_dispatcher();
         let resp = dispatch(
@@ -10842,6 +10915,7 @@ mod tests {
         assert!(names.contains(&"DOM"));
         assert!(names.contains(&"CSS"));
         assert!(names.contains(&"LayerTree"));
+        assert!(names.contains(&"Accessibility"));
         assert!(names.contains(&"Input"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
@@ -10929,6 +11003,22 @@ mod tests {
         );
         assert_eq!(attach[0]["method"], "Target.attachedToTarget");
         assert_eq!(attach[0]["params"]["targetInfo"]["targetId"], "stator-2");
+    }
+
+    #[test]
+    fn target_get_browser_contexts_reports_no_extra_contexts() {
+        let mut d = fresh_dispatcher();
+        let resp = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.getBrowserContexts","params":{}}"#,
+        );
+        assert!(resp.get("error").is_none());
+        assert!(
+            resp["result"]["browserContextIds"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -12156,6 +12246,36 @@ mod tests {
             r#"{"id":4,"method":"Debugger.setBlackboxedRanges","params":{"scriptId":"7","positions":[{"lineNumber":0,"columnNumber":-1}]}}"#,
         );
         assert!(bad_number["error"].is_object());
+    }
+
+    #[test]
+    fn runtime_set_async_call_stack_depth_shares_debugger_depth_state() {
+        let mut d = fresh_dispatcher();
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Runtime.setAsyncCallStackDepth","params":{"maxDepth":3}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.async_call_stack_depth(), 3);
+
+        let huge = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Runtime.setAsyncCallStackDepth","params":{"maxDepth":9999999999}}"#,
+        );
+        assert!(huge.get("error").is_none());
+        assert_eq!(d.async_call_stack_depth(), u32::MAX);
+
+        let bad = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Runtime.setAsyncCallStackDepth","params":{}}"#,
+        );
+        assert!(bad["error"].is_object());
+        assert!(
+            bad["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Runtime.setAsyncCallStackDepth")
+        );
     }
 
     #[test]
