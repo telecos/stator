@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -543,6 +543,8 @@ pub struct CdpDispatcher {
     emulation_cpu_throttling_rate: f64,
     /// Cached `Emulation.setHardwareConcurrencyOverride` value.
     emulation_hardware_concurrency: u32,
+    /// Cached `Emulation.setAutoDarkModeOverride` state.
+    emulation_auto_dark_mode_enabled: Option<bool>,
     /// Cached `Emulation.setTimezoneOverride` timezone id.
     emulation_timezone_id: String,
     /// Cached `Emulation.setLocaleOverride` locale id.
@@ -740,6 +742,7 @@ impl CdpDispatcher {
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
             emulation_hardware_concurrency: 0,
+            emulation_auto_dark_mode_enabled: None,
             emulation_timezone_id: String::new(),
             emulation_locale: String::new(),
             emulation_script_execution_disabled: false,
@@ -1066,6 +1069,11 @@ impl CdpDispatcher {
     /// Returns the cached hardware-concurrency override value.
     pub fn emulation_hardware_concurrency(&self) -> u32 {
         self.emulation_hardware_concurrency
+    }
+
+    /// Returns the cached auto dark mode override state.
+    pub fn emulation_auto_dark_mode_enabled(&self) -> Option<bool> {
+        self.emulation_auto_dark_mode_enabled
     }
 
     /// Returns the cached timezone override id.
@@ -2100,6 +2108,9 @@ impl CdpDispatcher {
             "Emulation.setHardwareConcurrencyOverride" => {
                 self.emulation_set_hardware_concurrency_override(&req.params)
             }
+            "Emulation.setAutoDarkModeOverride" => {
+                self.emulation_set_auto_dark_mode_override(&req.params)
+            }
             "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
             "Emulation.setLocaleOverride" => self.emulation_set_locale_override(&req.params),
             "Emulation.setScriptExecutionDisabled" => {
@@ -2534,6 +2545,12 @@ impl CdpDispatcher {
             ));
         }
         self.emulation_hardware_concurrency = hardware_concurrency;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_auto_dark_mode_override(&mut self, params: &Value) -> StatorResult<Value> {
+        self.emulation_auto_dark_mode_enabled =
+            optional_bool_param(params, "enabled", "Emulation.setAutoDarkModeOverride")?;
         Ok(json!({}))
     }
 
@@ -8697,16 +8714,36 @@ mod tests {
         );
         assert!(hardware_concurrency_bad_fractional["error"].is_object());
 
+        let auto_dark_mode = dispatch(
+            &mut d,
+            r#"{"id":33,"method":"Emulation.setAutoDarkModeOverride","params":{"enabled":true}}"#,
+        );
+        assert!(auto_dark_mode.get("error").is_none());
+        assert_eq!(d.emulation_auto_dark_mode_enabled(), Some(true));
+
+        let clear_auto_dark_mode = dispatch(
+            &mut d,
+            r#"{"id":34,"method":"Emulation.setAutoDarkModeOverride","params":{}}"#,
+        );
+        assert!(clear_auto_dark_mode.get("error").is_none());
+        assert_eq!(d.emulation_auto_dark_mode_enabled(), None);
+
+        let auto_dark_mode_bad = dispatch(
+            &mut d,
+            r#"{"id":35,"method":"Emulation.setAutoDarkModeOverride","params":{"enabled":"yes"}}"#,
+        );
+        assert!(auto_dark_mode_bad["error"].is_object());
+
         let clear_idle = dispatch(
             &mut d,
-            r#"{"id":33,"method":"Emulation.clearIdleOverride","params":{}}"#,
+            r#"{"id":36,"method":"Emulation.clearIdleOverride","params":{}}"#,
         );
         assert!(clear_idle.get("error").is_none());
         assert_eq!(d.emulation_idle_override(), None);
 
         let clear = dispatch(
             &mut d,
-            r#"{"id":34,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":37,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
