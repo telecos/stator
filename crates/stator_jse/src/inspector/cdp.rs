@@ -67,6 +67,7 @@
 //! | `Network`      | `canEmulateNetworkConditions`/`canClearBrowserCache`/`canClearBrowserCookies` | Reports Stator standalone capability probes |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
+//! | `DOM`          | `enable`/`disable`        | Tracks DOM domain enabled state without fabricating a DOM tree |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
@@ -567,6 +568,8 @@ pub struct CdpDispatcher {
     page_bypass_csp: bool,
     /// Cached `Page.setAdBlockingEnabled` state.
     page_ad_blocking_enabled: bool,
+    /// Whether the DOM domain is currently enabled for this session.
+    dom_enabled: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -808,6 +811,7 @@ impl CdpDispatcher {
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
             page_ad_blocking_enabled: false,
+            dom_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -1116,6 +1120,11 @@ impl CdpDispatcher {
     /// Returns the cached `Page.setAdBlockingEnabled` value.
     pub fn page_ad_blocking_enabled(&self) -> bool {
         self.page_ad_blocking_enabled
+    }
+
+    /// Returns `true` if the DOM domain is currently enabled.
+    pub fn dom_enabled(&self) -> bool {
+        self.dom_enabled
     }
 
     /// Returns `true` if the Log domain is currently enabled.
@@ -2304,6 +2313,16 @@ impl CdpDispatcher {
             "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
             "Page.setBypassCSP" => self.page_set_bypass_csp(&req.params),
             "Page.setAdBlockingEnabled" => self.page_set_ad_blocking_enabled(&req.params),
+
+            // ── DOM ───────────────────────────────────────────────────────
+            "DOM.enable" => {
+                self.dom_enabled = true;
+                Ok(json!({}))
+            }
+            "DOM.disable" => {
+                self.dom_enabled = false;
+                Ok(json!({}))
+            }
 
             // ── Log ───────────────────────────────────────────────────────
             "Log.enable" => {
@@ -6157,6 +6176,7 @@ fn schema_get_domains() -> Value {
             { "name": "HeapProfiler", "version": "1.3" },
             { "name": "Network", "version": "1.3" },
             { "name": "Page", "version": "1.3" },
+            { "name": "DOM", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
             { "name": "Audits", "version": "1.3" },
@@ -9807,6 +9827,18 @@ mod tests {
     }
 
     #[test]
+    fn dom_enable_disable_tracks_state_without_tree_behavior() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"DOM.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.dom_enabled());
+
+        let disable = dispatch(&mut d, r#"{"id":2,"method":"DOM.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.dom_enabled());
+    }
+
+    #[test]
     fn network_setup_methods_store_settings_and_validate_input() {
         let mut d = fresh_dispatcher();
         let enable = dispatch(&mut d, r#"{"id":1,"method":"Network.enable","params":{}}"#);
@@ -10311,6 +10343,7 @@ mod tests {
         assert!(names.contains(&"Browser"));
         assert!(names.contains(&"Inspector"));
         assert!(names.contains(&"Audits"));
+        assert!(names.contains(&"DOM"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
