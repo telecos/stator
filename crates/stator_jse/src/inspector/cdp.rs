@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -551,6 +551,14 @@ pub struct CdpDispatcher {
     emulation_timezone_id: String,
     /// Cached `Emulation.setLocaleOverride` locale id.
     emulation_locale: String,
+    /// Cached `Emulation.setUserAgentOverride` user-agent string.
+    emulation_user_agent: String,
+    /// Cached `Emulation.setUserAgentOverride` accept-language string.
+    emulation_accept_language: String,
+    /// Cached `Emulation.setUserAgentOverride` platform string.
+    emulation_platform: String,
+    /// Cached `Emulation.setUserAgentOverride` user-agent metadata object.
+    emulation_user_agent_metadata: Option<Value>,
     /// Cached `Emulation.setScriptExecutionDisabled` state.
     emulation_script_execution_disabled: bool,
     /// Cached `Emulation.setFocusEmulationEnabled` state.
@@ -749,6 +757,10 @@ impl CdpDispatcher {
             emulation_document_cookie_disabled: false,
             emulation_timezone_id: String::new(),
             emulation_locale: String::new(),
+            emulation_user_agent: String::new(),
+            emulation_accept_language: String::new(),
+            emulation_platform: String::new(),
+            emulation_user_agent_metadata: None,
             emulation_script_execution_disabled: false,
             emulation_focus_emulation_enabled: false,
             emulation_idle_override: None,
@@ -1094,6 +1106,26 @@ impl CdpDispatcher {
     /// Returns the cached locale override id.
     pub fn emulation_locale(&self) -> &str {
         &self.emulation_locale
+    }
+
+    /// Returns the cached Emulation user-agent override string.
+    pub fn emulation_user_agent(&self) -> &str {
+        &self.emulation_user_agent
+    }
+
+    /// Returns the cached Emulation accept-language override string.
+    pub fn emulation_accept_language(&self) -> &str {
+        &self.emulation_accept_language
+    }
+
+    /// Returns the cached Emulation platform override string.
+    pub fn emulation_platform(&self) -> &str {
+        &self.emulation_platform
+    }
+
+    /// Returns the cached Emulation user-agent metadata object, if any.
+    pub fn emulation_user_agent_metadata(&self) -> Option<&Value> {
+        self.emulation_user_agent_metadata.as_ref()
     }
 
     /// Returns the cached script execution disabled state.
@@ -2131,6 +2163,7 @@ impl CdpDispatcher {
             }
             "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
             "Emulation.setLocaleOverride" => self.emulation_set_locale_override(&req.params),
+            "Emulation.setUserAgentOverride" => self.emulation_set_user_agent_override(&req.params),
             "Emulation.setScriptExecutionDisabled" => {
                 self.emulation_set_script_execution_disabled(&req.params)
             }
@@ -2244,28 +2277,11 @@ impl CdpDispatcher {
     }
 
     fn network_set_user_agent_override(&mut self, params: &Value) -> StatorResult<Value> {
-        let Some(user_agent) = params.get("userAgent").and_then(Value::as_str) else {
-            return Err(crate::error::StatorError::TypeError(
-                "Network.setUserAgentOverride: required parameter 'userAgent' is missing or not a string"
-                    .to_string(),
-            ));
-        };
-        let accept_language =
-            optional_string_param(params, "acceptLanguage", "Network.setUserAgentOverride")?;
-        let platform = optional_string_param(params, "platform", "Network.setUserAgentOverride")?;
-        let metadata = match params.get("userAgentMetadata") {
-            Some(value @ Value::Object(_)) => Some(value.clone()),
-            Some(_) => {
-                return Err(crate::error::StatorError::TypeError(
-                    "Network.setUserAgentOverride: optional parameter 'userAgentMetadata' must be an object"
-                        .to_string(),
-                ));
-            }
-            None => None,
-        };
-        self.network_user_agent = user_agent.to_string();
-        self.network_accept_language = accept_language.unwrap_or("").to_string();
-        self.network_platform = platform.unwrap_or("").to_string();
+        let (user_agent, accept_language, platform, metadata) =
+            parse_user_agent_override_params(params, "Network.setUserAgentOverride")?;
+        self.network_user_agent = user_agent;
+        self.network_accept_language = accept_language;
+        self.network_platform = platform;
         self.network_user_agent_metadata = metadata;
         Ok(json!({}))
     }
@@ -2603,6 +2619,16 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_locale = locale.to_string();
+        Ok(json!({}))
+    }
+
+    fn emulation_set_user_agent_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let (user_agent, accept_language, platform, metadata) =
+            parse_user_agent_override_params(params, "Emulation.setUserAgentOverride")?;
+        self.emulation_user_agent = user_agent;
+        self.emulation_accept_language = accept_language;
+        self.emulation_platform = platform;
+        self.emulation_user_agent_metadata = metadata;
         Ok(json!({}))
     }
 
@@ -5435,6 +5461,35 @@ fn optional_string_param<'a>(
             })
         })
         .transpose()
+}
+
+fn parse_user_agent_override_params(
+    params: &Value,
+    method: &str,
+) -> StatorResult<(String, String, String, Option<Value>)> {
+    let Some(user_agent) = params.get("userAgent").and_then(Value::as_str) else {
+        return Err(StatorError::TypeError(format!(
+            "{method}: required parameter 'userAgent' is missing or not a string"
+        )));
+    };
+    let accept_language = optional_string_param(params, "acceptLanguage", method)?;
+    let platform = optional_string_param(params, "platform", method)?;
+    let metadata = match params.get("userAgentMetadata") {
+        Some(value @ Value::Object(_)) => Some(value.clone()),
+        Some(_) => {
+            return Err(StatorError::TypeError(format!(
+                "{method}: optional parameter 'userAgentMetadata' must be an object"
+            )));
+        }
+        None => None,
+    };
+
+    Ok((
+        user_agent.to_string(),
+        accept_language.unwrap_or("").to_string(),
+        platform.unwrap_or("").to_string(),
+        metadata,
+    ))
 }
 
 fn u32_param(value: &Value, field: &str, method: &str) -> StatorResult<u32> {
@@ -8678,6 +8733,44 @@ mod tests {
             r#"{"id":19,"method":"Emulation.setLocaleOverride","params":{"locale":1}}"#,
         );
         assert!(locale_bad["error"].is_object());
+
+        let user_agent = dispatch(
+            &mut d,
+            r#"{"id":41,"method":"Emulation.setUserAgentOverride","params":{"userAgent":"Stator/1.0","acceptLanguage":"en-US","platform":"Win32","userAgentMetadata":{"brands":[]}}}"#,
+        );
+        assert!(user_agent.get("error").is_none());
+        assert_eq!(d.emulation_user_agent(), "Stator/1.0");
+        assert_eq!(d.emulation_accept_language(), "en-US");
+        assert_eq!(d.emulation_platform(), "Win32");
+        assert!(d.emulation_user_agent_metadata().is_some());
+
+        let user_agent_minimal = dispatch(
+            &mut d,
+            r#"{"id":42,"method":"Emulation.setUserAgentOverride","params":{"userAgent":"Stator/2.0"}}"#,
+        );
+        assert!(user_agent_minimal.get("error").is_none());
+        assert_eq!(d.emulation_user_agent(), "Stator/2.0");
+        assert_eq!(d.emulation_accept_language(), "");
+        assert_eq!(d.emulation_platform(), "");
+        assert!(d.emulation_user_agent_metadata().is_none());
+
+        let user_agent_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":43,"method":"Emulation.setUserAgentOverride","params":{}}"#,
+        );
+        assert!(user_agent_bad_missing["error"].is_object());
+
+        let user_agent_bad_platform = dispatch(
+            &mut d,
+            r#"{"id":44,"method":"Emulation.setUserAgentOverride","params":{"userAgent":"Stator/1.0","platform":1}}"#,
+        );
+        assert!(user_agent_bad_platform["error"].is_object());
+
+        let user_agent_bad_metadata = dispatch(
+            &mut d,
+            r#"{"id":45,"method":"Emulation.setUserAgentOverride","params":{"userAgent":"Stator/1.0","userAgentMetadata":[]}}"#,
+        );
+        assert!(user_agent_bad_metadata["error"].is_object());
 
         let script_disabled = dispatch(
             &mut d,
