@@ -71,7 +71,7 @@
 //! | `CSS`          | `enable`/`disable`        | Tracks CSS domain enabled state without fabricating CSSOM/layout behavior |
 //! | `LayerTree`    | `enable`/`disable`        | Tracks LayerTree domain enabled state without fabricating compositor/layout behavior |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
-//! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
+//! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors`/`setOverrideCertificateErrors` | Validated setup acknowledgements |
 //! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
 //! | `Performance`  | `enable`/`disable`/`getMetrics`/`setTimeDomain` | Reports deterministic runtime metrics and setup state |
 //! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride`/`setPageScaleFactor`/`resetPageScaleFactor`/`setScrollbarsHidden` | Validated setup state |
@@ -584,6 +584,8 @@ pub struct CdpDispatcher {
     security_enabled: bool,
     /// Cached `Security.setIgnoreCertificateErrors` state.
     security_ignore_certificate_errors: bool,
+    /// Cached `Security.setOverrideCertificateErrors` state.
+    security_override_certificate_errors: bool,
     /// Whether the Audits domain is currently enabled for this session.
     audits_enabled: bool,
     /// Whether the Performance domain is currently enabled for this session.
@@ -824,6 +826,7 @@ impl CdpDispatcher {
             log_violation_setting_count: 0,
             security_enabled: false,
             security_ignore_certificate_errors: false,
+            security_override_certificate_errors: false,
             audits_enabled: false,
             performance_enabled: false,
             performance_time_domain: "timeTicks".to_string(),
@@ -1163,6 +1166,11 @@ impl CdpDispatcher {
     /// Returns the cached certificate-error ignore setting.
     pub fn security_ignore_certificate_errors(&self) -> bool {
         self.security_ignore_certificate_errors
+    }
+
+    /// Returns the cached certificate-error override setting.
+    pub fn security_override_certificate_errors(&self) -> bool {
+        self.security_override_certificate_errors
     }
 
     /// Returns `true` if the Audits domain is currently enabled.
@@ -2387,6 +2395,9 @@ impl CdpDispatcher {
             "Security.setIgnoreCertificateErrors" => {
                 self.security_set_ignore_certificate_errors(&req.params)
             }
+            "Security.setOverrideCertificateErrors" => {
+                self.security_set_override_certificate_errors(&req.params)
+            }
 
             // ── Audits ──────────────────────────────────────────────────────
             "Audits.enable" => {
@@ -2808,6 +2819,17 @@ impl CdpDispatcher {
             ));
         };
         self.security_ignore_certificate_errors = ignore;
+        Ok(json!({}))
+    }
+
+    fn security_set_override_certificate_errors(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(override_errors) = params.get("override").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Security.setOverrideCertificateErrors: required parameter 'override' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.security_override_certificate_errors = override_errors;
         Ok(json!({}))
     }
 
@@ -9713,15 +9735,29 @@ mod tests {
         assert!(ignore.get("error").is_none());
         assert!(d.security_ignore_certificate_errors());
 
+        let override_errors = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Security.setOverrideCertificateErrors","params":{"override":true}}"#,
+        );
+        assert!(override_errors.get("error").is_none());
+        assert!(d.security_override_certificate_errors());
+
         let bad = dispatch(
             &mut d,
-            r#"{"id":3,"method":"Security.setIgnoreCertificateErrors","params":{}}"#,
+            r#"{"id":4,"method":"Security.setIgnoreCertificateErrors","params":{}}"#,
         );
         assert!(bad["error"].is_object());
 
+        let bad_override = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Security.setOverrideCertificateErrors","params":{}}"#,
+        );
+        assert!(bad_override["error"].is_object());
+        assert!(d.security_override_certificate_errors());
+
         let disable = dispatch(
             &mut d,
-            r#"{"id":4,"method":"Security.disable","params":{}}"#,
+            r#"{"id":6,"method":"Security.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.security_enabled());
