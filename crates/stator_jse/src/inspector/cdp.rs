@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride`/`setPageScaleFactor`/`resetPageScaleFactor`/`setScrollbarsHidden` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -609,6 +609,10 @@ pub struct CdpDispatcher {
     emulation_idle_override: Option<(bool, bool)>,
     /// Cached `Emulation.setGeolocationOverride` state.
     emulation_geolocation_override: Option<EmulationGeolocationOverride>,
+    /// Cached `Emulation.setPageScaleFactor` value.
+    emulation_page_scale_factor: Option<f64>,
+    /// Cached `Emulation.setScrollbarsHidden` state.
+    emulation_scrollbars_hidden: bool,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -810,6 +814,8 @@ impl CdpDispatcher {
             emulation_focus_emulation_enabled: false,
             emulation_idle_override: None,
             emulation_geolocation_override: None,
+            emulation_page_scale_factor: None,
+            emulation_scrollbars_hidden: false,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -1197,6 +1203,16 @@ impl CdpDispatcher {
     /// Returns the cached geolocation override state.
     pub fn emulation_geolocation_override(&self) -> Option<&EmulationGeolocationOverride> {
         self.emulation_geolocation_override.as_ref()
+    }
+
+    /// Returns the cached page-scale factor override.
+    pub fn emulation_page_scale_factor(&self) -> Option<f64> {
+        self.emulation_page_scale_factor
+    }
+
+    /// Returns the cached scrollbars-hidden state.
+    pub fn emulation_scrollbars_hidden(&self) -> bool {
+        self.emulation_scrollbars_hidden
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -2235,6 +2251,9 @@ impl CdpDispatcher {
                 self.emulation_set_geolocation_override(&req.params)
             }
             "Emulation.clearGeolocationOverride" => self.emulation_clear_geolocation_override(),
+            "Emulation.setPageScaleFactor" => self.emulation_set_page_scale_factor(&req.params),
+            "Emulation.resetPageScaleFactor" => self.emulation_reset_page_scale_factor(),
+            "Emulation.setScrollbarsHidden" => self.emulation_set_scrollbars_hidden(&req.params),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2838,6 +2857,39 @@ impl CdpDispatcher {
 
     fn emulation_clear_geolocation_override(&mut self) -> StatorResult<Value> {
         self.emulation_geolocation_override = None;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_page_scale_factor(&mut self, params: &Value) -> StatorResult<Value> {
+        let method = "Emulation.setPageScaleFactor";
+        let Some(page_scale_factor) = params.get("pageScaleFactor").and_then(Value::as_f64) else {
+            return Err(StatorError::TypeError(
+                "Emulation.setPageScaleFactor: required parameter 'pageScaleFactor' is missing or not a number"
+                    .to_string(),
+            ));
+        };
+        if !page_scale_factor.is_finite() || page_scale_factor <= 0.0 {
+            return Err(StatorError::TypeError(format!(
+                "{method}: 'pageScaleFactor' must be a finite, positive number"
+            )));
+        }
+        self.emulation_page_scale_factor = Some(page_scale_factor);
+        Ok(json!({}))
+    }
+
+    fn emulation_reset_page_scale_factor(&mut self) -> StatorResult<Value> {
+        self.emulation_page_scale_factor = None;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_scrollbars_hidden(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(hidden) = params.get("hidden").and_then(Value::as_bool) else {
+            return Err(StatorError::TypeError(
+                "Emulation.setScrollbarsHidden: required parameter 'hidden' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.emulation_scrollbars_hidden = hidden;
         Ok(json!({}))
     }
 
@@ -9256,6 +9308,55 @@ mod tests {
         );
         assert!(clear_geolocation.get("error").is_none());
         assert!(d.emulation_geolocation_override().is_none());
+
+        let page_scale = dispatch(
+            &mut d,
+            r#"{"id":54,"method":"Emulation.setPageScaleFactor","params":{"pageScaleFactor":1.25}}"#,
+        );
+        assert!(page_scale.get("error").is_none());
+        assert_eq!(d.emulation_page_scale_factor(), Some(1.25));
+
+        let page_scale_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":55,"method":"Emulation.setPageScaleFactor","params":{}}"#,
+        );
+        assert!(page_scale_bad_missing["error"].is_object());
+        assert_eq!(d.emulation_page_scale_factor(), Some(1.25));
+
+        let page_scale_bad_zero = dispatch(
+            &mut d,
+            r#"{"id":56,"method":"Emulation.setPageScaleFactor","params":{"pageScaleFactor":0}}"#,
+        );
+        assert!(page_scale_bad_zero["error"].is_object());
+        assert_eq!(d.emulation_page_scale_factor(), Some(1.25));
+
+        let reset_page_scale = dispatch(
+            &mut d,
+            r#"{"id":57,"method":"Emulation.resetPageScaleFactor","params":{}}"#,
+        );
+        assert!(reset_page_scale.get("error").is_none());
+        assert_eq!(d.emulation_page_scale_factor(), None);
+
+        let scrollbars_hidden = dispatch(
+            &mut d,
+            r#"{"id":58,"method":"Emulation.setScrollbarsHidden","params":{"hidden":true}}"#,
+        );
+        assert!(scrollbars_hidden.get("error").is_none());
+        assert!(d.emulation_scrollbars_hidden());
+
+        let scrollbars_bad = dispatch(
+            &mut d,
+            r#"{"id":59,"method":"Emulation.setScrollbarsHidden","params":{"hidden":"yes"}}"#,
+        );
+        assert!(scrollbars_bad["error"].is_object());
+        assert!(d.emulation_scrollbars_hidden());
+
+        let scrollbars_visible = dispatch(
+            &mut d,
+            r#"{"id":60,"method":"Emulation.setScrollbarsHidden","params":{"hidden":false}}"#,
+        );
+        assert!(scrollbars_visible.get("error").is_none());
+        assert!(!d.emulation_scrollbars_hidden());
 
         let clear_idle = dispatch(
             &mut d,
