@@ -3041,20 +3041,26 @@ fn call_plain_object_native_function(
     f: &crate::objects::value::NativeFn,
     args: CallArgs,
 ) -> StatorResult<JsValue> {
-    let pending_super_this = {
-        let env = ctx.frame.global_env.borrow();
+    let (is_super_callee, previous_this, pending_super_this, derived_init_caller) = {
+        let mut env = ctx.frame.global_env.borrow_mut();
         let is_super_callee = matches!(
             env.get("super"),
             Some(JsValue::PlainObject(super_map)) if Rc::ptr_eq(super_map, map)
         );
         if is_super_callee {
-            env.get(".class_pending_this").cloned()
+            (
+                true,
+                env.get_this().cloned(),
+                env.get(".class_pending_this").cloned(),
+                env.remove(".class_pending_derived_init"),
+            )
         } else {
-            None
+            (false, None, None, None)
         }
     };
+    let mut derived_init_caller = derived_init_caller;
 
-    if let Some(pending_this) = pending_super_this {
+    if let Some(pending_this) = pending_super_this.as_ref().cloned() {
         let current_this = ctx
             .frame
             .global_env
@@ -3070,8 +3076,41 @@ fn call_plain_object_native_function(
         ctx.frame.global_env.borrow_mut().set_this(pending_this);
     }
 
-    let result = f(args.into_vec())?;
+    let result = match f(args.into_vec()) {
+        Ok(result) => result,
+        Err(err) => {
+            if is_super_callee {
+                restore_failed_super_call_state(
+                    &ctx.frame.global_env,
+                    previous_this,
+                    pending_super_this.as_ref(),
+                    derived_init_caller.take(),
+                );
+                ctx.frame.global_cache_invalidate();
+            }
+            return Err(err);
+        }
+    };
     ctx.frame.global_cache_invalidate();
+    if is_super_callee && is_constructor_return_object(&result) {
+        ctx.frame.global_env.borrow_mut().set_this(result.clone());
+        ctx.frame.global_cache_invalidate();
+    }
+
+    // Run the derived caller's instance-field initializer immediately
+    // after `super()` returns successfully, before the rest of the
+    // derived constructor body continues (ES §15.7.14).
+    if let Some(JsValue::PlainObject(caller_class)) = derived_init_caller {
+        let this = ctx.frame.global_env.borrow().get_this().cloned();
+        if let Some(this) = this
+            && !matches!(this, JsValue::TheHole)
+        {
+            let new_target = ctx.frame.new_target.clone();
+            run_class_field_init(&ctx.frame.global_env, &this, &caller_class, &new_target)?;
+            ctx.frame.global_cache_invalidate();
+        }
+    }
+
     Ok(result)
 }
 fn call_plain_object_function(
@@ -3098,6 +3137,12 @@ fn call_plain_object_function(
     } else {
         false
     };
+    let previous_this = if is_class_constructor && is_super_callee {
+        ctx.frame.global_env.borrow().get_this().cloned()
+    } else {
+        None
+    };
+    let mut pending_super_this = None;
     if is_class_constructor {
         if !is_super_callee {
             return Err(StatorError::TypeError(
@@ -3112,6 +3157,7 @@ fn call_plain_object_function(
             .cloned();
         match pending_this {
             Some(pending_this) => {
+                pending_super_this = Some(pending_this.clone());
                 let current_this = ctx
                     .frame
                     .global_env
@@ -3127,7 +3173,6 @@ fn call_plain_object_function(
                 if !is_derived_constructor {
                     let mut env = ctx.frame.global_env.borrow_mut();
                     env.set_this(pending_this);
-                    env.remove(".class_pending_this");
                 }
             }
             None => {
@@ -3171,11 +3216,90 @@ fn call_plain_object_function(
     } else {
         None
     };
+    // Take the caller's pending derived-field-init marker.  When `super()`
+    // returns successfully we run the caller's instance-field initializer
+    // before the rest of its constructor body continues (ES §15.7.14).
+    // If this super-callee is itself a derived constructor, install its
+    // own marker so its `super()` call can consume it.
+    let mut derived_init_caller = if is_class_constructor && is_super_callee {
+        let mut env = ctx.frame.global_env.borrow_mut();
+        let caller = env.remove(".class_pending_derived_init");
+        if is_derived_constructor {
+            env.insert(
+                ".class_pending_derived_init".to_string(),
+                JsValue::PlainObject(Rc::clone(map)),
+            );
+        }
+        caller
+    } else {
+        None
+    };
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
+    let val = match result {
+        Ok(val) => val,
+        Err(err) => {
+            if is_class_constructor && is_super_callee {
+                if is_derived_constructor {
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .remove(".class_pending_derived_init");
+                }
+                restore_saved_super(&ctx.frame.global_env, saved_super);
+                restore_failed_super_call_state(
+                    &ctx.frame.global_env,
+                    previous_this,
+                    pending_super_this.as_ref(),
+                    derived_init_caller.take(),
+                );
+                ctx.frame.global_cache_invalidate();
+            } else {
+                restore_saved_super(&ctx.frame.global_env, saved_super);
+            }
+            return Err(err);
+        }
+    };
+    // Defensively clear any marker we installed for this super-callee in
+    // case its body did not consume it (e.g., never called `super()`).
+    if is_class_constructor && is_super_callee && is_derived_constructor {
+        ctx.frame
+            .global_env
+            .borrow_mut()
+            .remove(".class_pending_derived_init");
+    }
+    restore_saved_super(&ctx.frame.global_env, saved_super);
+    ctx.frame.global_cache_invalidate();
+    if is_class_constructor && is_super_callee && is_constructor_return_object(&val) {
+        ctx.frame.global_env.borrow_mut().set_this(val.clone());
+        ctx.frame.global_cache_invalidate();
+    }
+
+    // Run the derived caller's instance-field initializer immediately
+    // after `super()` returns successfully.
+    if let Some(JsValue::PlainObject(caller_class)) = derived_init_caller {
+        let this = ctx.frame.global_env.borrow().get_this().cloned();
+        if let Some(this) = this
+            && !matches!(this, JsValue::TheHole)
+        {
+            let new_target = ctx.frame.new_target.clone();
+            run_class_field_init(&ctx.frame.global_env, &this, &caller_class, &new_target)?;
+            ctx.frame.global_cache_invalidate();
+        }
+    }
+
+    ctx.frame.accumulator = val;
+    Ok(())
+}
+
+fn is_constructor_return_object(value: &JsValue) -> bool {
+    value.is_object_like() && !matches!(value, JsValue::TheHole)
+}
+
+fn restore_saved_super(global_env: &Rc<RefCell<GlobalEnv>>, saved_super: Option<Option<JsValue>>) {
     if let Some(saved_super) = saved_super {
-        let mut env = ctx.frame.global_env.borrow_mut();
+        let mut env = global_env.borrow_mut();
         match saved_super {
             Some(value) => {
                 env.insert("super".to_string(), value);
@@ -3185,8 +3309,83 @@ fn call_plain_object_function(
             }
         }
     }
-    ctx.frame.global_cache_invalidate();
-    ctx.frame.accumulator = result?;
+}
+
+fn restore_failed_super_call_state(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    previous_this: Option<JsValue>,
+    pending_this: Option<&JsValue>,
+    derived_init_caller: Option<JsValue>,
+) {
+    let mut env = global_env.borrow_mut();
+    match previous_this {
+        Some(value) => env.set_this(value),
+        None => env.remove_this(),
+    }
+    if let Some(pending_this) = pending_this {
+        env.insert(
+            ".class_pending_this".to_string(),
+            fresh_pending_this(pending_this),
+        );
+    }
+    if let Some(derived_init_caller) = derived_init_caller {
+        env.insert(
+            ".class_pending_derived_init".to_string(),
+            derived_init_caller,
+        );
+    }
+}
+
+fn fresh_pending_this(value: &JsValue) -> JsValue {
+    match value {
+        JsValue::PlainObject(map) => {
+            let mut fresh = PropertyMap::new();
+            let borrow = map.borrow();
+            if let Some(proto) = borrow.get("__proto__") {
+                fresh.insert("__proto__".to_string(), proto.clone());
+            }
+            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                fresh.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+            }
+            JsValue::PlainObject(Rc::new(RefCell::new(fresh)))
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Run a class's instance-field initializer closure on the given `this`.
+///
+/// Looks up the hidden `.class_field_initializer` property stored on
+/// the class constructor and, if present, invokes it with `this` as
+/// the implicit receiver and parameter.  The `new.target` of the
+/// surrounding `[[Construct]]` is propagated into the initializer
+/// frame so `new.target`-aware field initializers behave correctly.
+fn run_class_field_init(
+    env: &Rc<RefCell<GlobalEnv>>,
+    this: &JsValue,
+    class_map: &Rc<RefCell<PropertyMap>>,
+    new_target: &JsValue,
+) -> StatorResult<()> {
+    let init = class_map.borrow().get(".class_field_initializer").cloned();
+    let Some(JsValue::Function(init_ba)) = init else {
+        return Ok(());
+    };
+    let mut init_frame = acquire_frame(Rc::clone(&init_ba), vec![this.clone()], Rc::clone(env));
+    restore_closure_context(&mut init_frame, &init_ba);
+    init_frame.new_target = new_target.clone();
+    {
+        let mut globals = init_frame.global_env.borrow_mut();
+        globals.set_this(this.clone());
+        globals.insert(
+            ".class_initializer_class".to_string(),
+            JsValue::PlainObject(Rc::clone(class_map)),
+        );
+    }
+    push_call_frame("<field_init>")?;
+    let result = run_callee_pooled(init_frame);
+    pop_call_frame();
+    env.borrow_mut().remove(".class_initializer_class");
+    result?;
     Ok(())
 }
 
@@ -3202,13 +3401,14 @@ fn call_plain_object_function(
 ///   4. Invokes the hidden `.class_field_initializer` closure, if present.
 ///   5. Returns the `this` object (or an explicit object returned by the
 ///      constructor).
-fn construct_class_from_plain_object(
-    ctx: &mut DispatchContext,
+pub(super) fn construct_class_from_plain_object_value(
+    global_env: &Rc<RefCell<GlobalEnv>>,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
     class_map: &Rc<RefCell<PropertyMap>>,
     ctor_proto: &JsValue,
     args: CallArgs,
-) -> StatorResult<()> {
+    new_target: JsValue,
+) -> StatorResult<JsValue> {
     let constructor_args = args.clone();
     // 1. Create `this`.
     let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -3220,9 +3420,9 @@ fn construct_class_from_plain_object(
     let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
 
     // 2. Set up callee frame.
-    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
+    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(global_env));
     restore_closure_context(&mut callee_frame, ba);
-    callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
+    callee_frame.new_target = new_target.clone();
 
     // 3. Expose parent constructor as "super" for `super()` calls.
     // A class is "derived" only when it has an `extends` clause; we mark
@@ -3248,6 +3448,15 @@ fn construct_class_from_plain_object(
             .global_env
             .borrow_mut()
             .insert("super".to_string(), parent);
+        // Mark which class's instance-field initializer must run as soon
+        // as `super()` returns in the constructor body.  The super-call
+        // path consumes this marker; if it is still present after the
+        // body completes, super() never ran successfully and we leave
+        // field initialization to the fallback below (step 6).
+        callee_frame.global_env.borrow_mut().insert(
+            ".class_pending_derived_init".to_string(),
+            JsValue::PlainObject(Rc::clone(class_map)),
+        );
         true
     } else {
         callee_frame
@@ -3257,93 +3466,95 @@ fn construct_class_from_plain_object(
         false
     };
 
-    // Helper closure: run the field initializer on the given `this` value.
+    let body_env = Rc::clone(&callee_frame.global_env);
     let new_target = callee_frame.new_target.clone();
-    let run_field_init = |env: &Rc<RefCell<GlobalEnv>>, this: &JsValue| -> StatorResult<()> {
-        if let Some(JsValue::Function(init_ba)) =
-            class_map.borrow().get(".class_field_initializer").cloned()
-        {
-            let mut init_frame =
-                acquire_frame(Rc::clone(&init_ba), vec![this.clone()], Rc::clone(env));
-            restore_closure_context(&mut init_frame, &init_ba);
-            init_frame.new_target = new_target.clone();
-            {
-                let mut globals = init_frame.global_env.borrow_mut();
-                globals.set_this(this.clone());
-                globals.insert(
-                    ".class_initializer_class".to_string(),
-                    JsValue::PlainObject(Rc::clone(class_map)),
-                );
-            }
-            push_call_frame("<field_init>")?;
-            let result = run_callee_pooled(init_frame);
-            pop_call_frame();
-            env.borrow_mut().remove(".class_initializer_class");
-            result?;
-        }
-        Ok(())
-    };
 
     // 4. For base classes, fields are initialized before the constructor
     //    body runs (ES §15.7.14).  For derived classes, field
-    //    initialization is deferred until after the constructor (which
-    //    calls super()) so that `this` is available.
+    //    initialization happens at the point `super()` returns so that
+    //    `this` is available and the field initializers run before the
+    //    rest of the derived constructor body.
     if !is_derived {
-        run_field_init(&ctx.frame.global_env, &this_val)?;
-        ctx.frame.global_cache_invalidate();
+        run_class_field_init(global_env, &this_val, class_map, &new_target)?;
     }
 
     // 5. Run constructor body.
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
-    ctx.frame.global_cache_invalidate();
     let val = result?;
 
     if is_derived
-        && ctx
-            .frame
-            .global_env
+        && global_env
             .borrow()
             .get_this()
             .is_some_and(|this| *this == JsValue::TheHole)
         && let Some(parent) = class_map.borrow().get("__proto__").cloned()
-        && ctx
-            .frame
-            .global_env
+        && global_env
             .borrow()
             .get("Promise")
             .is_some_and(|promise_ctor| *promise_ctor == parent)
     {
-        ctx.frame.global_env.borrow_mut().set_this(this_val.clone());
+        global_env.borrow_mut().set_this(this_val.clone());
         dispatch_call_value(&parent, constructor_args.into_vec())?;
-        ctx.frame.global_cache_invalidate();
     }
 
-    // 6. For derived classes, run field initializer after the constructor.
+    // 6. Fallback: if the derived field initializer marker is still
+    //    present, `super()` did not run during the constructor body —
+    //    typically an explicit-return-without-super pattern.  Run the
+    //    field initializer on the current `this` if it has been bound
+    //    (e.g., via the Promise subclass shim above).
     if is_derived {
-        // After `super()`, `this` is the constructed value.
-        let derived_this = ctx
-            .frame
-            .global_env
+        let pending = body_env.borrow_mut().remove(".class_pending_derived_init");
+        if pending.is_some() {
+            let derived_this = global_env
+                .borrow()
+                .get_this()
+                .cloned()
+                .unwrap_or(this_val.clone());
+            if !matches!(derived_this, JsValue::TheHole) {
+                run_class_field_init(global_env, &derived_this, class_map, &new_target)?;
+            }
+        }
+    }
+
+    global_env.borrow_mut().remove(".class_pending_this");
+
+    let final_this = if is_derived {
+        global_env
             .borrow()
             .get_this()
             .cloned()
-            .unwrap_or(this_val.clone());
-        run_field_init(&ctx.frame.global_env, &derived_this)?;
-        ctx.frame.global_cache_invalidate();
-    }
-
-    ctx.frame
-        .global_env
-        .borrow_mut()
-        .remove(".class_pending_this");
-
-    // 7. If constructor returns an object, use it; else use `this`.
-    ctx.frame.accumulator = match val {
-        JsValue::PlainObject(_) | JsValue::Object(_) => val,
-        _ => this_val,
+            .filter(|this| !matches!(this, JsValue::TheHole))
+            .unwrap_or_else(|| this_val.clone())
+    } else {
+        this_val
     };
+
+    // 7. If constructor returns an object, use it; else use the bound `this`.
+    Ok(match val {
+        JsValue::PlainObject(_) | JsValue::Object(_) => val,
+        _ => final_this,
+    })
+}
+
+fn construct_class_from_plain_object(
+    ctx: &mut DispatchContext,
+    ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    class_map: &Rc<RefCell<PropertyMap>>,
+    ctor_proto: &JsValue,
+    args: CallArgs,
+    new_target: JsValue,
+) -> StatorResult<()> {
+    ctx.frame.accumulator = construct_class_from_plain_object_value(
+        &ctx.frame.global_env,
+        ba,
+        class_map,
+        ctor_proto,
+        args,
+        new_target,
+    )?;
+    ctx.frame.global_cache_invalidate();
     Ok(())
 }
 
@@ -3440,7 +3651,14 @@ fn handle_construct(
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(format!(
@@ -3541,7 +3759,14 @@ fn handle_construct_with_spread(
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -8006,7 +8231,14 @@ fn handle_construct_forward_all_args(
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(format!(
@@ -11067,10 +11299,93 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_fields_run_after_super_in_derived_constructor() {
         assert_eval_true(
             "class A { constructor() { this.log = ['base']; } } class B extends A { x = this.log.push('field'); constructor() { super(); this.log.push('ctor'); } } new B().log.join(',') === 'base,field,ctor'",
+        );
+    }
+
+    /// Field initializers in a 3-level derived chain run at each level
+    /// immediately after that level's `super()` returns, in correct order
+    /// (ES §15.7.14): grandparent body → parent field → parent ctor body →
+    /// child field → child ctor body.
+    #[test]
+    fn test_class_instance_fields_run_after_super_in_nested_derived_chain() {
+        assert_eval_true(
+            "class A { constructor() { this.log = ['A']; } } \
+             class B extends A { bf = this.log.push('Bf'); constructor() { super(); this.log.push('Bc'); } } \
+             class C extends B { cf = this.log.push('Cf'); constructor() { super(); this.log.push('Cc'); } } \
+             new C().log.join(',') === 'A,Bf,Bc,Cf,Cc'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_run_on_object_returned_from_super() {
+        assert_eval_true(
+            "class A { constructor() { return { log: [] }; } } \
+             class B extends A { field = this.log.push('field'); constructor() { super(); this.log.push('body'); } } \
+             new B().log.join(',') === 'field,body'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_survive_native_super_reentrant_construction() {
+        assert_eval_true(
+            "var log = []; \
+             class Outer extends Promise { \
+                 field = log.push('outer-field'); \
+                 constructor() { \
+                     super(function(resolve) { \
+                         class InnerBase { constructor() {} } \
+                         class Inner extends InnerBase { field = log.push('inner-field'); constructor() { super(); log.push('inner-body'); } } \
+                         new Inner(); \
+                         resolve(); \
+                     }); \
+                     log.push('outer-body'); \
+                 } \
+             } \
+             new Outer(); \
+             log.join(',') === 'inner-field,inner-body,outer-field,outer-body'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_retry_after_throwing_super() {
+        assert_eval_true(
+            "class A { \
+                 constructor(flag) { \
+                     if (flag) { this.leak = 'bad'; throw 1; } \
+                     this.log = ['base']; \
+                 } \
+             } \
+             class B extends A { \
+                 x = this.log.push('field'); \
+                 constructor() { \
+                     try { super(true); } catch (e) {} \
+                     super(false); \
+                     this.log.push('body'); \
+                 } \
+             } \
+             var b = new B(); \
+             b.log.join(',') === 'base,field,body' && b.leak === undefined",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_field_throw_keeps_successful_super_this() {
+        assert_eval_true(
+            "var ok = false; var secondSuperRejected = false; \
+             class A { constructor() { this.ready = true; } } \
+             class B extends A { \
+                 x = (function() { throw 1; })(); \
+                 constructor() { \
+                     try { super(); } catch (e) { \
+                         ok = this.ready === true; \
+                         try { super(); } catch (again) { secondSuperRejected = true; } \
+                     } \
+                 } \
+             } \
+             new B(); ok && secondSuperRejected",
         );
     }
 

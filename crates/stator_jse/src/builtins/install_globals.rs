@@ -26,7 +26,7 @@ use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
     arraybuffer_byte_length, dataview_byte_length, dataview_byte_offset,
 };
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::builtins::date::{
     date_construct_components, date_construct_now, date_construct_value, date_get_date,
@@ -136,11 +136,12 @@ use crate::builtins::weak_ref::{
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::console::{ProfileEvent, ProfileEventKind, push_profile_event};
 use crate::interpreter::{
-    current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
-    dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
-    dispatch_setter, function_display_name, function_length_value, function_to_string_value,
-    generator_object_prototype, get_object_prototype, has_property_in_chain,
-    has_prototype_in_chain, ordinary_set_prototype_of, plain_object_has_own_property,
+    current_construct_new_target, current_global_env, current_this, dispatch_call_value,
+    dispatch_call_with_this, dispatch_construct_call, dispatch_get_property_value,
+    dispatch_set_property_value, dispatch_setter, function_display_name, function_length_value,
+    function_to_string_value, generator_object_prototype, get_object_prototype,
+    has_property_in_chain, has_prototype_in_chain, ordinary_set_prototype_of,
+    plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -19593,9 +19594,89 @@ pub(crate) fn function_prototype_value() -> Option<JsValue> {
     })
 }
 
-fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> JsValue {
+/// Build a Bound Function Exotic Object (ES §10.4.1).
+///
+/// `call_fn` is the pre-built `[[Call]]` wrapper that invokes `target` with
+/// the bound `this`-arg and bound arguments prepended.  `target` and
+/// `bound_args` are also captured by the synthesised `__construct__` slot so
+/// that `new BoundFn(...)` ignores the bound `this`-arg, prepends
+/// `bound_args`, and constructs the underlying target.  Nested binds compose
+/// automatically because the construct path delegates back through the
+/// target's own `__construct__` when the target is itself a bound
+/// `PlainObject`.
+pub(crate) fn create_bound_function_object(
+    call_fn: JsValue,
+    target: JsValue,
+    bound_args: Vec<JsValue>,
+    name: String,
+    length: i32,
+) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert("__call__".to_string(), call_fn);
+
+    // §10.4.1.2 [[Construct]] for bound functions.
+    let bound_self: Rc<RefCell<Option<Weak<RefCell<PropertyMap>>>>> = Rc::new(RefCell::new(None));
+    let construct_target = target.clone();
+    let construct_bound_args = bound_args;
+    let construct_bound_self = Rc::clone(&bound_self);
+    let construct_fn = JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+        let mut all_args = construct_bound_args.clone();
+        all_args.extend(call_args);
+        let visible_new_target =
+            current_construct_new_target().unwrap_or_else(|| construct_target.clone());
+        let is_direct_bound_construct = match &visible_new_target {
+            JsValue::PlainObject(candidate) => construct_bound_self
+                .borrow()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|bound_map| Rc::ptr_eq(candidate, &bound_map)),
+            _ => false,
+        };
+        let effective_new_target = if is_direct_bound_construct {
+            construct_target.clone()
+        } else {
+            visible_new_target
+        };
+        // Allocate `this` from the target's `prototype` so direct construction
+        // of a non-bound target wires `__proto__` correctly.  Nested-bind
+        // targets are themselves `PlainObject`s without `prototype`; in that
+        // case dispatch enters the target's `__construct__` which allocates
+        // its own `this` and the one synthesised here is harmlessly unused.
+        let ctor_proto =
+            dispatch_get_property_value(&effective_new_target, JsValue::String("prototype".into()))
+                .unwrap_or(JsValue::Undefined);
+        let this_obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null)
+            && let JsValue::PlainObject(map) = &this_obj
+        {
+            map.borrow_mut().insert("__proto__".to_string(), ctor_proto);
+        }
+        let result = dispatch_construct_call(
+            &construct_target,
+            this_obj.clone(),
+            all_args,
+            effective_new_target,
+        )?;
+        // Constructor result: object → use it; non-object → `this`.
+        match result {
+            JsValue::PlainObject(_)
+            | JsValue::Object(_)
+            | JsValue::Array(_)
+            | JsValue::Error(_)
+            | JsValue::Promise(_)
+            | JsValue::ArrayBuffer(_)
+            | JsValue::TypedArray(_)
+            | JsValue::DataView(_)
+            | JsValue::Generator(_)
+            | JsValue::Iterator(_)
+            | JsValue::Function(_)
+            | JsValue::NativeFunction(_)
+            | JsValue::Proxy(_) => Ok(result),
+            _ => Ok(this_obj),
+        }
+    }));
+    props.insert("__construct__".to_string(), construct_fn);
+
     props.insert("name".to_string(), JsValue::String(name.into()));
     props.insert("length".to_string(), JsValue::Smi(length));
     props.insert(
@@ -19605,7 +19686,9 @@ fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> 
     if let Some(function_proto) = function_prototype_value() {
         props.insert("__proto__".to_string(), function_proto);
     }
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let map = Rc::new(RefCell::new(props));
+    *bound_self.borrow_mut() = Some(Rc::downgrade(&map));
+    JsValue::PlainObject(map)
 }
 
 /// Build the `Function` constructor/namespace object.
@@ -19759,28 +19842,42 @@ fn make_function() -> JsValue {
                 let bound_name = function_bound_name(&function_display_name(&func));
 
                 match &func {
-                    JsValue::NativeFunction(f) => Ok(create_bound_function_object(
-                        JsValue::NativeFunction(Rc::new({
+                    JsValue::NativeFunction(f) => {
+                        let call_this_arg = this_arg.clone();
+                        let call_bound_args = bound_args.clone();
+                        let call_fn = JsValue::NativeFunction(Rc::new({
                             let f = Rc::clone(f);
                             move |call_args: Vec<JsValue>| {
-                                let mut all_args = vec![this_arg.clone()];
-                                all_args.extend(bound_args.clone());
+                                let mut all_args = vec![call_this_arg.clone()];
+                                all_args.extend(call_bound_args.clone());
                                 all_args.extend(call_args);
                                 f(all_args)
                             }
-                        })),
-                        bound_name,
-                        result_len,
-                    )),
+                        }));
+                        Ok(create_bound_function_object(
+                            call_fn,
+                            func.clone(),
+                            bound_args,
+                            bound_name,
+                            result_len,
+                        ))
+                    }
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
+                        let target_for_call = func.clone();
+                        let call_bound_args = bound_args.clone();
+                        let call_this_arg = this_arg.clone();
                         let call_fn =
                             JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
-                                let mut all_args = bound_args.clone();
+                                let mut all_args = call_bound_args.clone();
                                 all_args.extend(call_args);
-                                dispatch_call_with_this(&func, this_arg.clone(), all_args)
+                                dispatch_call_with_this(
+                                    &target_for_call,
+                                    call_this_arg.clone(),
+                                    all_args,
+                                )
                             }));
                         Ok(create_bound_function_object(
-                            call_fn, bound_name, result_len,
+                            call_fn, func, bound_args, bound_name, result_len,
                         ))
                     }
                     _ => Err(StatorError::TypeError(
@@ -83003,7 +83100,6 @@ mod tests {
 
     /// bind: instanceof works with bound function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bind_instanceof() {
         assert_e2e_true(
             "function Foo() {} var BF = Foo.bind(null); var obj = new BF(); obj instanceof Foo",
@@ -83014,7 +83110,6 @@ mod tests {
 
     /// new on bound function ignores thisArg.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_ignores_this_arg() {
         assert_e2e_true(
             "function Ctor(x) { this.x = x; } \
@@ -83026,7 +83121,6 @@ mod tests {
 
     /// new on bound function passes bound args.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_bound_args() {
         assert_e2e_true(
             "function Ctor(a, b) { this.sum = a + b; } \
@@ -83038,7 +83132,6 @@ mod tests {
 
     /// new on double-bound function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_double_bind() {
         assert_e2e_true(
             "function Ctor(a, b, c) { this.r = a + b + c; } \
@@ -83046,6 +83139,39 @@ mod tests {
              var B2 = B1.bind(null, 2); \
              var obj = new B2(3); \
              obj.r === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_bound_class_constructor_runs_class_fields() {
+        assert_e2e_true(
+            "class C { field = 7; constructor(x) { this.x = x; this.isC = new.target === C; } } \
+             var Bound = C.bind({ ignored: true }, 42); \
+             var obj = new Bound(); \
+             obj.field === 7 && obj.x === 42 && obj.isC && obj instanceof C",
+        );
+    }
+
+    #[test]
+    fn e2e_bound_derived_class_constructor_calls_super() {
+        assert_e2e_true(
+            "class Base { constructor(x) { this.base = x; } } \
+             class Derived extends Base { constructor(x, y) { super(x); this.own = y; } } \
+             var Bound = Derived.bind(null, 5); \
+             var obj = new Bound(6); \
+             obj.base === 5 && obj.own === 6 && obj instanceof Derived && obj instanceof Base",
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_construct_bound_class_preserves_explicit_new_target() {
+        assert_e2e_true(
+            "class Base { constructor() { this.isAlt = new.target === Alt; } } \
+             function Alt() {} \
+             Alt.prototype = { marker: true }; \
+             var Bound = Base.bind(null); \
+             var obj = Reflect.construct(Bound, [], Alt); \
+             obj.isAlt === true && Object.getPrototypeOf(obj) === Alt.prototype",
         );
     }
 

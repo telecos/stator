@@ -185,6 +185,7 @@ use crate::builtins::error::{
     call_stack_depth, pop_call_frame, push_call_frame, with_anon_call_frame,
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
+use crate::builtins::install_globals::create_bound_function_object;
 use crate::builtins::proxy::{
     proxy_apply, proxy_get_with_receiver, proxy_has, proxy_set_with_receiver,
 };
@@ -349,6 +350,8 @@ thread_local! {
     static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
 
+    static CURRENT_CONSTRUCT_NEW_TARGET: RefCell<Option<JsValue>> = const { RefCell::new(None) };
+
     // Raw-pointer sentinel for the most-recently published global env.
     // Compared before touching `CURRENT_GLOBALS` or
     // `jit_runtime_set_global_env` to avoid Rc::clone + TLS borrow_mut
@@ -391,6 +394,24 @@ thread_local! {
     /// direct eval frame is running.
     static FUNCTION_CONSTRUCTOR_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
+}
+
+/// Return the `new.target` currently visible to a native constructor callback.
+pub(crate) fn current_construct_new_target() -> Option<JsValue> {
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|new_target| new_target.borrow().clone())
+}
+
+fn with_current_construct_new_target<F>(new_target: &JsValue, f: F) -> StatorResult<JsValue>
+where
+    F: FnOnce() -> StatorResult<JsValue>,
+{
+    let previous =
+        CURRENT_CONSTRUCT_NEW_TARGET.with(|slot| slot.borrow_mut().replace(new_target.clone()));
+    let result = f();
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|slot| {
+        *slot.borrow_mut() = previous;
+    });
+    result
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -443,6 +464,7 @@ pub fn clear_interpreter_state() {
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
     FRAME_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|new_target| *new_target.borrow_mut() = None);
     LAST_GLOBALS_PTR.with(|p| p.set(0));
     LAST_INSTALLED_GLOBALS_PTR.with(|p| p.set(0));
     PROTO_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -18617,37 +18639,29 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     } else {
                         vec![]
                     };
-                    let ba2 = Rc::clone(&ba);
                     let bound_count = bound_args.len() as i32;
                     let result_len =
                         function_length(ba.function_length(), bound_count as u32) as i32;
                     let target = JsValue::Function(Rc::clone(&ba));
                     let bound_name = function_bound_name(&function_display_name(&target));
 
-                    // Build bound function as a PlainObject with __call__,
-                    // carrying the correct `name` and `length` per ES ┬º20.2.3.2.
+                    // [[Call]] wrapper: forwards to the target with the
+                    // captured `this_arg` and bound prefix. The matching
+                    // [[Construct]] slot installed by
+                    // `create_bound_function_object` instead ignores
+                    // `this_arg`, prepends the bound prefix, and constructs
+                    // the target (ES §10.4.1).
+                    let target_for_call = target.clone();
+                    let call_bound_args = bound_args.clone();
                     let call_fn =
                         JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
-                            let mut all_args = bound_args.clone();
+                            let mut all_args = call_bound_args.clone();
                             all_args.extend(call_args);
-                            dispatch_call_with_this(
-                                &JsValue::Function(Rc::clone(&ba2)),
-                                this_arg.clone(),
-                                all_args,
-                            )
+                            dispatch_call_with_this(&target_for_call, this_arg.clone(), all_args)
                         }));
-                    let mut props = PropertyMap::new();
-                    props.insert("__call__".to_string(), call_fn);
-                    props.insert("name".to_string(), JsValue::String(bound_name.into()));
-                    props.insert("length".to_string(), JsValue::Smi(result_len));
-                    props.insert(
-                        "source".to_string(),
-                        JsValue::String(function_to_string("").into()),
-                    );
-                    if let Some(function_proto) = global_constructor_prototype("Function") {
-                        props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), function_proto);
-                    }
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+                    Ok(create_bound_function_object(
+                        call_fn, target, bound_args, bound_name, result_len,
+                    ))
                 }));
             }
             "name" => {
@@ -19546,7 +19560,7 @@ pub fn dispatch_construct_call(
     new_target: JsValue,
 ) -> StatorResult<JsValue> {
     let args: CallArgs = args.into_iter().collect();
-    match callee {
+    with_current_construct_new_target(&new_target, || match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
@@ -19556,7 +19570,7 @@ pub fn dispatch_construct_call(
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            frame.new_target = new_target;
+            frame.new_target = new_target.clone();
             frame.global_env.borrow_mut().set_this(this_val);
             let result = run_callee_pooled(frame);
             pop_call_frame();
@@ -19574,14 +19588,27 @@ pub fn dispatch_construct_call(
                     .or_else(|| borrow.get("__call__"))
                     .cloned()
             };
-            if let Some(f) = construct_fn {
-                dispatch_construct_call(&f, this_val, args, new_target)
-            } else {
-                Err(StatorError::TypeError("object is not a function".into()))
+            match construct_fn {
+                Some(JsValue::Function(ba)) => {
+                    let ctor_proto = proto_lookup(&new_target, "prototype");
+                    let global_env = fn_global_env_get(&ba)
+                        .or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+                        .unwrap_or_else(|| Rc::new(RefCell::new(GlobalEnv::new())));
+                    dispatch::construct_class_from_plain_object_value(
+                        &global_env,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        new_target.clone(),
+                    )
+                }
+                Some(f) => dispatch_construct_call(&f, this_val, args, new_target.clone()),
+                None => Err(StatorError::TypeError("object is not a function".into())),
             }
         }
         _ => Err(StatorError::TypeError("value is not a function".into())),
-    }
+    })
 }
 
 pub(super) fn construct_builtin_result(
