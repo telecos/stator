@@ -563,6 +563,7 @@ pub struct CdpDispatcher {
     overlay_show_paint_rects: bool,
     overlay_show_debug_borders: bool,
     overlay_show_fps_counter: bool,
+    overlay_show_web_vitals: bool,
     overlay_show_layout_shift_regions: bool,
     overlay_show_ad_highlights: bool,
     overlay_show_viewport_size_on_resize: bool,
@@ -755,6 +756,7 @@ impl CdpDispatcher {
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
             overlay_show_fps_counter: false,
+            overlay_show_web_vitals: false,
             overlay_show_layout_shift_regions: false,
             overlay_show_ad_highlights: false,
             overlay_show_viewport_size_on_resize: false,
@@ -1127,6 +1129,11 @@ impl CdpDispatcher {
     /// Returns the cached FPS-counter overlay toggle.
     pub fn overlay_show_fps_counter(&self) -> bool {
         self.overlay_show_fps_counter
+    }
+
+    /// Returns the cached Web Vitals overlay toggle.
+    pub fn overlay_show_web_vitals(&self) -> bool {
+        self.overlay_show_web_vitals
     }
 
     /// Returns the cached layout-shift overlay toggle.
@@ -2145,6 +2152,7 @@ impl CdpDispatcher {
             "Overlay.setShowPaintRects" => self.overlay_set_show_paint_rects(&req.params),
             "Overlay.setShowDebugBorders" => self.overlay_set_show_debug_borders(&req.params),
             "Overlay.setShowFPSCounter" => self.overlay_set_show_fps_counter(&req.params),
+            "Overlay.setShowWebVitals" => self.overlay_set_show_web_vitals(&req.params),
             "Overlay.setShowLayoutShiftRegions" => {
                 self.overlay_set_show_layout_shift_regions(&req.params)
             }
@@ -2665,6 +2673,12 @@ impl CdpDispatcher {
     fn overlay_set_show_fps_counter(&mut self, params: &Value) -> StatorResult<Value> {
         self.overlay_show_fps_counter =
             Self::overlay_required_bool(params, "Overlay.setShowFPSCounter", "show")?;
+        Ok(json!({}))
+    }
+
+    fn overlay_set_show_web_vitals(&mut self, params: &Value) -> StatorResult<Value> {
+        self.overlay_show_web_vitals =
+            Self::overlay_required_bool(params, "Overlay.setShowWebVitals", "show")?;
         Ok(json!({}))
     }
 
@@ -8391,6 +8405,13 @@ mod tests {
         assert!(fps.get("error").is_none());
         assert!(d.overlay_show_fps_counter());
 
+        let web_vitals = dispatch(
+            &mut d,
+            r#"{"id":24,"method":"Overlay.setShowWebVitals","params":{"show":true}}"#,
+        );
+        assert!(web_vitals.get("error").is_none());
+        assert!(d.overlay_show_web_vitals());
+
         let layout = dispatch(
             &mut d,
             r#"{"id":5,"method":"Overlay.setShowLayoutShiftRegions","params":{"result":true}}"#,
@@ -8473,6 +8494,12 @@ mod tests {
             r#"{"id":16,"method":"Overlay.setShowHitTestBorders","params":{"show":"yes"}}"#,
         );
         assert!(bad["error"].is_object());
+
+        let bad_web_vitals = dispatch(
+            &mut d,
+            r#"{"id":25,"method":"Overlay.setShowWebVitals","params":{"show":"yes"}}"#,
+        );
+        assert!(bad_web_vitals["error"].is_object());
 
         let bad_grid = dispatch(
             &mut d,
