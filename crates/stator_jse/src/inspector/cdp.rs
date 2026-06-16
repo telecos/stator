@@ -12,7 +12,7 @@
 //!
 //! | Domain         | Method                    | Behaviour                          |
 //! |----------------|---------------------------|------------------------------------|
-//! | `Runtime`      | `enable`                  | Acknowledges; emits context-created event |
+//! | `Runtime`      | `enable`/`disable`        | Tracks Runtime domain enabled state |
 //! | `Runtime`      | `evaluate`                | Parses and executes JavaScript; returns result |
 //! | `Runtime`      | `callFunctionOn`          | Evaluates a function call expression |
 //! | `Runtime`      | `awaitPromise`            | Drains microtasks and returns settled Promise results |
@@ -2111,6 +2111,7 @@ impl CdpDispatcher {
 
             // ── Runtime ───────────────────────────────────────────────────
             "Runtime.enable" => self.runtime_enable(),
+            "Runtime.disable" => self.runtime_disable(),
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
             "Runtime.callFunctionOn" => self.runtime_call_function_on(&req.params),
             "Runtime.awaitPromise" => self.runtime_await_promise(&req.params),
@@ -3240,7 +3241,7 @@ impl CdpDispatcher {
         Ok(json!({}))
     }
 
-    // ── Runtime.enable ────────────────────────────────────────────────────────
+    // ── Runtime.enable / Runtime.disable ─────────────────────────────────────
 
     fn runtime_enable(&mut self) -> StatorResult<Value> {
         self.runtime_enabled = true;
@@ -3249,6 +3250,11 @@ impl CdpDispatcher {
         for context in self.contexts.clone() {
             self.emit_execution_context_created(&context);
         }
+        Ok(json!({}))
+    }
+
+    fn runtime_disable(&mut self) -> StatorResult<Value> {
+        self.runtime_enabled = false;
         Ok(json!({}))
     }
 
@@ -7668,6 +7674,18 @@ mod tests {
         })
         .expect("parse ack");
         assert_eq!(ack["id"], 3u64);
+    }
+
+    #[test]
+    fn runtime_disable_clears_enabled_state() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Runtime.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.runtime_enabled());
+
+        let disable = dispatch(&mut d, r#"{"id":2,"method":"Runtime.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.runtime_enabled());
     }
 
     #[test]
