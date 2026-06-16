@@ -64,7 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
-//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs` | Validated cached setup settings |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
@@ -507,6 +507,8 @@ pub struct CdpDispatcher {
     network_extra_http_header_count: usize,
     /// Count of cached `Network.setBlockedURLs` URL patterns.
     network_blocked_url_count: usize,
+    /// Count of cached `Network.setAcceptedEncodings` entries.
+    network_accepted_encoding_count: usize,
     /// Whether the Page domain is currently enabled for this session.
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
@@ -716,6 +718,7 @@ impl CdpDispatcher {
             network_user_agent_metadata: None,
             network_extra_http_header_count: 0,
             network_blocked_url_count: 0,
+            network_accepted_encoding_count: 0,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
@@ -967,6 +970,11 @@ impl CdpDispatcher {
     /// Returns the number of cached blocked URL patterns.
     pub fn network_blocked_url_count(&self) -> usize {
         self.network_blocked_url_count
+    }
+
+    /// Returns the number of cached accepted content encodings.
+    pub fn network_accepted_encoding_count(&self) -> usize {
+        self.network_accepted_encoding_count
     }
 
     /// Returns `true` if the Page domain is currently enabled.
@@ -2000,6 +2008,10 @@ impl CdpDispatcher {
             "Network.setUserAgentOverride" => self.network_set_user_agent_override(&req.params),
             "Network.setExtraHTTPHeaders" => self.network_set_extra_http_headers(&req.params),
             "Network.setBlockedURLs" => self.network_set_blocked_urls(&req.params),
+            "Network.setAcceptedEncodings" => self.network_set_accepted_encodings(&req.params),
+            "Network.clearAcceptedEncodingsOverride" => {
+                self.network_clear_accepted_encodings_override()
+            }
             "Network.clearBrowserCache" => Ok(json!({})),
             "Network.clearBrowserCookies" => Ok(json!({})),
 
@@ -2236,6 +2248,34 @@ impl CdpDispatcher {
             ));
         }
         self.network_blocked_url_count = urls.len();
+        Ok(json!({}))
+    }
+
+    fn network_set_accepted_encodings(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(encodings) = params.get("encodings").and_then(Value::as_array) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Network.setAcceptedEncodings: required parameter 'encodings' is missing or not an array"
+                    .to_string(),
+            ));
+        };
+        for value in encodings {
+            let Some(encoding) = value.as_str() else {
+                return Err(crate::error::StatorError::TypeError(
+                    "Network.setAcceptedEncodings: encodings must be strings".to_string(),
+                ));
+            };
+            if !matches!(encoding, "br" | "deflate" | "gzip" | "identity" | "zstd") {
+                return Err(crate::error::StatorError::TypeError(format!(
+                    "Network.setAcceptedEncodings: unsupported encoding '{encoding}'"
+                )));
+            }
+        }
+        self.network_accepted_encoding_count = encodings.len();
+        Ok(json!({}))
+    }
+
+    fn network_clear_accepted_encodings_override(&mut self) -> StatorResult<Value> {
+        self.network_accepted_encoding_count = 0;
         Ok(json!({}))
     }
 
@@ -8856,21 +8896,67 @@ mod tests {
         );
         assert!(blocked_urls_bad_value["error"].is_object());
 
+        let accepted_encodings = dispatch(
+            &mut d,
+            r#"{"id":19,"method":"Network.setAcceptedEncodings","params":{"encodings":["gzip","br","zstd","identity","deflate"]}}"#,
+        );
+        assert!(accepted_encodings.get("error").is_none());
+        assert_eq!(d.network_accepted_encoding_count(), 5);
+
+        let accepted_encodings_empty = dispatch(
+            &mut d,
+            r#"{"id":20,"method":"Network.setAcceptedEncodings","params":{"encodings":[]}}"#,
+        );
+        assert!(accepted_encodings_empty.get("error").is_none());
+        assert_eq!(d.network_accepted_encoding_count(), 0);
+
+        let accepted_encodings_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":21,"method":"Network.setAcceptedEncodings","params":{}}"#,
+        );
+        assert!(accepted_encodings_bad_missing["error"].is_object());
+
+        let accepted_encodings_bad_value = dispatch(
+            &mut d,
+            r#"{"id":22,"method":"Network.setAcceptedEncodings","params":{"encodings":["gzip",1]}}"#,
+        );
+        assert!(accepted_encodings_bad_value["error"].is_object());
+
+        let accepted_encodings_bad_unsupported = dispatch(
+            &mut d,
+            r#"{"id":23,"method":"Network.setAcceptedEncodings","params":{"encodings":["gzip","compress"]}}"#,
+        );
+        assert!(accepted_encodings_bad_unsupported["error"].is_object());
+
+        let accepted_encodings_reset = dispatch(
+            &mut d,
+            r#"{"id":24,"method":"Network.setAcceptedEncodings","params":{"encodings":["gzip","br"]}}"#,
+        );
+        assert!(accepted_encodings_reset.get("error").is_none());
+        assert_eq!(d.network_accepted_encoding_count(), 2);
+
+        let clear_accepted_encodings = dispatch(
+            &mut d,
+            r#"{"id":25,"method":"Network.clearAcceptedEncodingsOverride","params":{}}"#,
+        );
+        assert!(clear_accepted_encodings.get("error").is_none());
+        assert_eq!(d.network_accepted_encoding_count(), 0);
+
         let clear_cache = dispatch(
             &mut d,
-            r#"{"id":19,"method":"Network.clearBrowserCache","params":{}}"#,
+            r#"{"id":26,"method":"Network.clearBrowserCache","params":{}}"#,
         );
         assert!(clear_cache.get("error").is_none());
 
         let clear_cookies = dispatch(
             &mut d,
-            r#"{"id":20,"method":"Network.clearBrowserCookies","params":{}}"#,
+            r#"{"id":27,"method":"Network.clearBrowserCookies","params":{}}"#,
         );
         assert!(clear_cookies.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":21,"method":"Network.disable","params":{}}"#,
+            r#"{"id":28,"method":"Network.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.network_enabled());
