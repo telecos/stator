@@ -62,7 +62,7 @@
 //! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
-//! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
+//! | `Target`       | `getTargets`/`getTargetInfo`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
@@ -1844,6 +1844,29 @@ impl CdpDispatcher {
         Ok(json!({ "targetInfos": target_infos }))
     }
 
+    fn target_get_target_info(&self, params: &Value) -> StatorResult<Value> {
+        let target_id = optional_string_param(params, "targetId", "Target.getTargetInfo")?;
+        let target_info = match target_id {
+            Some(target_id) => {
+                if !self.is_live_target(target_id) {
+                    return Err(StatorError::Internal(format!(
+                        "Target.getTargetInfo: unknown targetId `{target_id}`"
+                    )));
+                }
+                self.target_infos()
+                    .into_iter()
+                    .find(|info| info.get("targetId").and_then(Value::as_str) == Some(target_id))
+                    .unwrap_or_else(target_info)
+            }
+            None => self
+                .target_infos()
+                .into_iter()
+                .next()
+                .unwrap_or_else(target_info),
+        };
+        Ok(json!({ "targetInfo": target_info }))
+    }
+
     fn target_infos(&self) -> Vec<Value> {
         let mut groups: Vec<(u32, String, String)> = self
             .contexts
@@ -2346,6 +2369,7 @@ impl CdpDispatcher {
 
             // ── Target ────────────────────────────────────────────────────
             "Target.getTargets" => self.target_get_targets(),
+            "Target.getTargetInfo" => self.target_get_target_info(&req.params),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
             "Target.setAutoAttach" => self.target_set_auto_attach(&req.params),
             "Target.attachToTarget" => self.target_attach_to_target(&req.params),
@@ -10171,6 +10195,55 @@ mod tests {
         );
         assert_eq!(attach[0]["method"], "Target.attachedToTarget");
         assert_eq!(attach[0]["params"]["targetInfo"]["targetId"], "stator-2");
+    }
+
+    #[test]
+    fn target_get_target_info_reports_live_targets_and_rejects_bad_ids() {
+        let contexts = vec![
+            ExecutionContextDescription::new(1, 1, "https://a.test", "main", json!({})),
+            ExecutionContextDescription::new(2, 2, "https://b.test", "isolated", json!({})),
+        ];
+        let mut d = CdpDispatcher::with_globals_and_contexts(
+            Rc::new(RefCell::new(GlobalEnv::new())),
+            contexts,
+        );
+
+        let current = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.getTargetInfo","params":{}}"#,
+        );
+        assert_eq!(current["result"]["targetInfo"]["targetId"], "stator-1");
+        assert_eq!(current["result"]["targetInfo"]["url"], "https://a.test");
+
+        let explicit = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Target.getTargetInfo","params":{"targetId":"stator-2"}}"#,
+        );
+        assert_eq!(explicit["result"]["targetInfo"]["targetId"], "stator-2");
+        assert_eq!(explicit["result"]["targetInfo"]["url"], "https://b.test");
+
+        let non_string = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Target.getTargetInfo","params":{"targetId":2}}"#,
+        );
+        assert!(non_string["error"].is_object());
+
+        let unknown = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Target.getTargetInfo","params":{"targetId":"missing"}}"#,
+        );
+        assert!(unknown["error"].is_object());
+
+        let close = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Target.closeTarget","params":{"targetId":"stator-2"}}"#,
+        );
+        assert_eq!(close["result"]["success"], true);
+        let closed = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Target.getTargetInfo","params":{"targetId":"stator-2"}}"#,
+        );
+        assert!(closed["error"].is_object());
     }
 
     #[test]
