@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -541,6 +541,8 @@ pub struct CdpDispatcher {
     emulation_media_feature_count: usize,
     /// Cached `Emulation.setCPUThrottlingRate` value (1.0 means no throttling).
     emulation_cpu_throttling_rate: f64,
+    /// Cached `Emulation.setHardwareConcurrencyOverride` value.
+    emulation_hardware_concurrency: u32,
     /// Cached `Emulation.setTimezoneOverride` timezone id.
     emulation_timezone_id: String,
     /// Cached `Emulation.setLocaleOverride` locale id.
@@ -737,6 +739,7 @@ impl CdpDispatcher {
             emulation_media: String::new(),
             emulation_media_feature_count: 0,
             emulation_cpu_throttling_rate: 1.0,
+            emulation_hardware_concurrency: 0,
             emulation_timezone_id: String::new(),
             emulation_locale: String::new(),
             emulation_script_execution_disabled: false,
@@ -1058,6 +1061,11 @@ impl CdpDispatcher {
     /// Returns the cached CPU throttling rate.
     pub fn emulation_cpu_throttling_rate(&self) -> f64 {
         self.emulation_cpu_throttling_rate
+    }
+
+    /// Returns the cached hardware-concurrency override value.
+    pub fn emulation_hardware_concurrency(&self) -> u32 {
+        self.emulation_hardware_concurrency
     }
 
     /// Returns the cached timezone override id.
@@ -2089,6 +2097,9 @@ impl CdpDispatcher {
             }
             "Emulation.setEmulatedMedia" => self.emulation_set_emulated_media(&req.params),
             "Emulation.setCPUThrottlingRate" => self.emulation_set_cpu_throttling_rate(&req.params),
+            "Emulation.setHardwareConcurrencyOverride" => {
+                self.emulation_set_hardware_concurrency_override(&req.params)
+            }
             "Emulation.setTimezoneOverride" => self.emulation_set_timezone_override(&req.params),
             "Emulation.setLocaleOverride" => self.emulation_set_locale_override(&req.params),
             "Emulation.setScriptExecutionDisabled" => {
@@ -2504,6 +2515,25 @@ impl CdpDispatcher {
             ));
         }
         self.emulation_cpu_throttling_rate = rate;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_hardware_concurrency_override(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let hardware_concurrency = required_u32_param(
+            params,
+            "hardwareConcurrency",
+            "Emulation.setHardwareConcurrencyOverride",
+        )?;
+        if hardware_concurrency == 0 {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setHardwareConcurrencyOverride: 'hardwareConcurrency' must be a positive integer"
+                    .to_string(),
+            ));
+        }
+        self.emulation_hardware_concurrency = hardware_concurrency;
         Ok(json!({}))
     }
 
@@ -8642,16 +8672,41 @@ mod tests {
         );
         assert!(idle_bad_screen_unlocked["error"].is_object());
 
+        let hardware_concurrency = dispatch(
+            &mut d,
+            r#"{"id":29,"method":"Emulation.setHardwareConcurrencyOverride","params":{"hardwareConcurrency":8}}"#,
+        );
+        assert!(hardware_concurrency.get("error").is_none());
+        assert_eq!(d.emulation_hardware_concurrency(), 8);
+
+        let hardware_concurrency_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":30,"method":"Emulation.setHardwareConcurrencyOverride","params":{}}"#,
+        );
+        assert!(hardware_concurrency_bad_missing["error"].is_object());
+
+        let hardware_concurrency_bad_zero = dispatch(
+            &mut d,
+            r#"{"id":31,"method":"Emulation.setHardwareConcurrencyOverride","params":{"hardwareConcurrency":0}}"#,
+        );
+        assert!(hardware_concurrency_bad_zero["error"].is_object());
+
+        let hardware_concurrency_bad_fractional = dispatch(
+            &mut d,
+            r#"{"id":32,"method":"Emulation.setHardwareConcurrencyOverride","params":{"hardwareConcurrency":1.5}}"#,
+        );
+        assert!(hardware_concurrency_bad_fractional["error"].is_object());
+
         let clear_idle = dispatch(
             &mut d,
-            r#"{"id":29,"method":"Emulation.clearIdleOverride","params":{}}"#,
+            r#"{"id":33,"method":"Emulation.clearIdleOverride","params":{}}"#,
         );
         assert!(clear_idle.get("error").is_none());
         assert_eq!(d.emulation_idle_override(), None);
 
         let clear = dispatch(
             &mut d,
-            r#"{"id":30,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":34,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
