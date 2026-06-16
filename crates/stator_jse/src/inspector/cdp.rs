@@ -62,7 +62,7 @@
 //! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
 //! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
-//! | `Target`       | `getTargets`/`getTargetInfo`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
+//! | `Target`       | `getTargets`/`getTargetInfo`/`attachToTarget`/`closeTarget`/`setRemoteLocations` | Single-target DevTools compatibility and validated setup state |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
@@ -660,6 +660,8 @@ pub struct CdpDispatcher {
     target_auto_attach_flatten: bool,
     /// Number of cached auto-attach filter entries.
     target_auto_attach_filter_count: usize,
+    /// Number of cached remote-location entries from `Target.setRemoteLocations`.
+    target_remote_location_count: usize,
     /// Target IDs closed through `Target.closeTarget`.
     closed_target_ids: HashSet<String>,
     /// Monotonically increasing ID for attached Target sessions.
@@ -849,6 +851,7 @@ impl CdpDispatcher {
             target_auto_attach_wait_for_debugger_on_start: false,
             target_auto_attach_flatten: false,
             target_auto_attach_filter_count: 0,
+            target_remote_location_count: 0,
             closed_target_ids: HashSet::new(),
             next_target_session_id: 1,
             target_session_id: None,
@@ -1349,6 +1352,11 @@ impl CdpDispatcher {
         self.target_auto_attach_filter_count
     }
 
+    /// Returns the cached remote-location entry count.
+    pub fn target_remote_location_count(&self) -> usize {
+        self.target_remote_location_count
+    }
+
     /// Returns `true` if the Inspector domain is currently enabled.
     pub fn inspector_enabled(&self) -> bool {
         self.inspector_enabled
@@ -1836,6 +1844,41 @@ impl CdpDispatcher {
         self.target_auto_attach_wait_for_debugger_on_start = wait_for_debugger_on_start;
         self.target_auto_attach_flatten = flatten;
         self.target_auto_attach_filter_count = filter_count;
+        Ok(json!({}))
+    }
+
+    fn target_set_remote_locations(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(locations) = params.get("locations").and_then(Value::as_array) else {
+            return Err(StatorError::TypeError(
+                "Target.setRemoteLocations: required parameter 'locations' is missing or not an array"
+                    .to_string(),
+            ));
+        };
+
+        for location in locations {
+            let Some(location) = location.as_object() else {
+                return Err(StatorError::TypeError(
+                    "Target.setRemoteLocations: each location must be an object".to_string(),
+                ));
+            };
+            if location.get("host").and_then(Value::as_str).is_none() {
+                return Err(StatorError::TypeError(
+                    "Target.setRemoteLocations: each location requires string 'host'".to_string(),
+                ));
+            }
+            let Some(port) = location.get("port").and_then(Value::as_i64) else {
+                return Err(StatorError::TypeError(
+                    "Target.setRemoteLocations: each location requires integer 'port'".to_string(),
+                ));
+            };
+            if !(0..=65535).contains(&port) {
+                return Err(StatorError::RangeError(
+                    "Target.setRemoteLocations: location port must be in 0..=65535".to_string(),
+                ));
+            }
+        }
+
+        self.target_remote_location_count = locations.len();
         Ok(json!({}))
     }
 
@@ -2372,6 +2415,7 @@ impl CdpDispatcher {
             "Target.getTargetInfo" => self.target_get_target_info(&req.params),
             "Target.setDiscoverTargets" => self.target_set_discover_targets(&req.params),
             "Target.setAutoAttach" => self.target_set_auto_attach(&req.params),
+            "Target.setRemoteLocations" => self.target_set_remote_locations(&req.params),
             "Target.attachToTarget" => self.target_attach_to_target(&req.params),
             "Target.detachFromTarget" => self.target_detach_from_target(&req.params),
             "Target.closeTarget" => self.target_close_target(&req.params),
@@ -10285,6 +10329,56 @@ mod tests {
             r#"{"id":3,"method":"Target.setAutoAttach","params":{"autoAttach":false,"waitForDebuggerOnStart":false,"filter":true}}"#,
         );
         assert!(bad_filter["error"].is_object());
+    }
+
+    #[test]
+    fn target_remote_locations_setup_stores_state_and_validates_input() {
+        let mut d = fresh_dispatcher();
+        let ok = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Target.setRemoteLocations","params":{"locations":[{"host":"127.0.0.1","port":9222},{"host":"localhost","port":0}]}}"#,
+        );
+        assert!(ok.get("error").is_none());
+        assert_eq!(d.target_remote_location_count(), 2);
+
+        let empty = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Target.setRemoteLocations","params":{"locations":[]}}"#,
+        );
+        assert!(empty.get("error").is_none());
+        assert_eq!(d.target_remote_location_count(), 0);
+
+        let reset = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Target.setRemoteLocations","params":{"locations":[{"host":"remote.test","port":65535}]}}"#,
+        );
+        assert!(reset.get("error").is_none());
+        assert_eq!(d.target_remote_location_count(), 1);
+
+        for invalid_params in [
+            r#"{}"#,
+            r#"{"locations":{}}"#,
+            r#"{"locations":[true]}"#,
+            r#"{"locations":[{"port":9222}]}"#,
+            r#"{"locations":[{"host":1,"port":9222}]}"#,
+            r#"{"locations":[{"host":"localhost"}]}"#,
+            r#"{"locations":[{"host":"localhost","port":"9222"}]}"#,
+            r#"{"locations":[{"host":"localhost","port":1.5}]}"#,
+            r#"{"locations":[{"host":"localhost","port":-1}]}"#,
+            r#"{"locations":[{"host":"localhost","port":65536}]}"#,
+        ] {
+            let invalid = dispatch(
+                &mut d,
+                &format!(
+                    r#"{{"id":4,"method":"Target.setRemoteLocations","params":{invalid_params}}}"#
+                ),
+            );
+            assert!(
+                invalid["error"].is_object(),
+                "expected error for {invalid_params}"
+            );
+            assert_eq!(d.target_remote_location_count(), 1);
+        }
     }
 
     #[test]
