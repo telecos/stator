@@ -74,7 +74,9 @@
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors`/`setOverrideCertificateErrors` | Validated setup acknowledgements |
 //! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
 //! | `Performance`  | `enable`/`disable`/`getMetrics`/`setTimeDomain` | Reports deterministic runtime metrics and setup state |
+//! | `Emulation`    | `canEmulate`              | Reports Stator standalone emulation setup capability |
 //! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride`/`setPageScaleFactor`/`resetPageScaleFactor`/`setScrollbarsHidden` | Validated setup state |
+//! | `Input`        | `setIgnoreInputEvents`/`setInterceptDrags` | Validated input setup state only |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -638,6 +640,10 @@ pub struct CdpDispatcher {
     emulation_page_scale_factor: Option<f64>,
     /// Cached `Emulation.setScrollbarsHidden` state.
     emulation_scrollbars_hidden: bool,
+    /// Cached `Input.setIgnoreInputEvents` state.
+    input_ignore_input_events: bool,
+    /// Cached `Input.setInterceptDrags` state.
+    input_intercept_drags: bool,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -853,6 +859,8 @@ impl CdpDispatcher {
             emulation_geolocation_override: None,
             emulation_page_scale_factor: None,
             emulation_scrollbars_hidden: false,
+            input_ignore_input_events: false,
+            input_intercept_drags: false,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -1301,6 +1309,16 @@ impl CdpDispatcher {
     /// Returns the cached scrollbars-hidden state.
     pub fn emulation_scrollbars_hidden(&self) -> bool {
         self.emulation_scrollbars_hidden
+    }
+
+    /// Returns whether input events should be ignored.
+    pub fn input_ignore_input_events(&self) -> bool {
+        self.input_ignore_input_events
+    }
+
+    /// Returns whether drag interception setup is enabled.
+    pub fn input_intercept_drags(&self) -> bool {
+        self.input_intercept_drags
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -2422,6 +2440,7 @@ impl CdpDispatcher {
             "Performance.getMetrics" => self.performance_get_metrics(),
 
             // ── Emulation ─────────────────────────────────────────────────
+            "Emulation.canEmulate" => Ok(json!({ "result": true })),
             "Emulation.setDeviceMetricsOverride" => {
                 self.emulation_set_device_metrics_override(&req.params)
             }
@@ -2463,6 +2482,10 @@ impl CdpDispatcher {
             "Emulation.setPageScaleFactor" => self.emulation_set_page_scale_factor(&req.params),
             "Emulation.resetPageScaleFactor" => self.emulation_reset_page_scale_factor(),
             "Emulation.setScrollbarsHidden" => self.emulation_set_scrollbars_hidden(&req.params),
+
+            // ── Input ─────────────────────────────────────────────────────
+            "Input.setIgnoreInputEvents" => self.input_set_ignore_input_events(&req.params),
+            "Input.setInterceptDrags" => self.input_set_intercept_drags(&req.params),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -3148,6 +3171,28 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_scrollbars_hidden = hidden;
+        Ok(json!({}))
+    }
+
+    fn input_set_ignore_input_events(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(ignore) = params.get("ignore").and_then(Value::as_bool) else {
+            return Err(StatorError::TypeError(
+                "Input.setIgnoreInputEvents: required parameter 'ignore' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.input_ignore_input_events = ignore;
+        Ok(json!({}))
+    }
+
+    fn input_set_intercept_drags(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(enabled) = params.get("enabled").and_then(Value::as_bool) else {
+            return Err(StatorError::TypeError(
+                "Input.setInterceptDrags: required parameter 'enabled' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.input_intercept_drags = enabled;
         Ok(json!({}))
     }
 
@@ -6244,6 +6289,7 @@ fn schema_get_domains() -> Value {
             { "name": "Audits", "version": "1.3" },
             { "name": "Performance", "version": "1.3" },
             { "name": "Emulation", "version": "1.3" },
+            { "name": "Input", "version": "1.3" },
             { "name": "Overlay", "version": "1.3" },
             { "name": "ServiceWorker", "version": "1.3" },
             { "name": "Target", "version": "1.3" },
@@ -9222,6 +9268,12 @@ mod tests {
     #[test]
     fn emulation_setup_methods_store_state_and_validate_input() {
         let mut d = fresh_dispatcher();
+        let can_emulate = dispatch(
+            &mut d,
+            r#"{"id":61,"method":"Emulation.canEmulate","params":{}}"#,
+        );
+        assert_eq!(can_emulate["result"]["result"], true);
+
         let metrics = dispatch(
             &mut d,
             r#"{"id":1,"method":"Emulation.setDeviceMetricsOverride","params":{"width":800,"height":600,"deviceScaleFactor":2,"mobile":false}}"#,
@@ -9650,6 +9702,53 @@ mod tests {
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
+    }
+
+    #[test]
+    fn input_setup_methods_store_state_and_validate_input() {
+        let mut d = fresh_dispatcher();
+
+        let ignore = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"Input.setIgnoreInputEvents","params":{"ignore":true}}"#,
+        );
+        assert!(ignore.get("error").is_none());
+        assert!(d.input_ignore_input_events());
+
+        let ignore_bad_missing = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Input.setIgnoreInputEvents","params":{}}"#,
+        );
+        assert!(ignore_bad_missing["error"].is_object());
+        assert!(d.input_ignore_input_events());
+
+        let allow = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Input.setIgnoreInputEvents","params":{"ignore":false}}"#,
+        );
+        assert!(allow.get("error").is_none());
+        assert!(!d.input_ignore_input_events());
+
+        let intercept = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Input.setInterceptDrags","params":{"enabled":true}}"#,
+        );
+        assert!(intercept.get("error").is_none());
+        assert!(d.input_intercept_drags());
+
+        let intercept_bad_type = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Input.setInterceptDrags","params":{"enabled":"yes"}}"#,
+        );
+        assert!(intercept_bad_type["error"].is_object());
+        assert!(d.input_intercept_drags());
+
+        let intercept_disabled = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Input.setInterceptDrags","params":{"enabled":false}}"#,
+        );
+        assert!(intercept_disabled.get("error").is_none());
+        assert!(!d.input_intercept_drags());
     }
 
     #[test]
@@ -10452,6 +10551,7 @@ mod tests {
         assert!(names.contains(&"DOM"));
         assert!(names.contains(&"CSS"));
         assert!(names.contains(&"LayerTree"));
+        assert!(names.contains(&"Input"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
