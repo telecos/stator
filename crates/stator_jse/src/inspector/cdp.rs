@@ -64,7 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
-//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride` | Validated cached setup settings |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
@@ -187,6 +187,27 @@ fn normalize_aux_data(group_id: u32, aux_data: Value) -> Value {
     };
     object.entry("groupId").or_insert_with(|| json!(group_id));
     Value::Object(object)
+}
+
+/// Cached setup-only state requested through `Network.emulateNetworkConditions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkEmulatedConditions {
+    /// Whether the frontend requested offline network conditions.
+    pub offline: bool,
+    /// Requested network latency in milliseconds.
+    pub latency: f64,
+    /// Requested download throughput in bytes per second, or `-1` to disable throttling.
+    pub download_throughput: f64,
+    /// Requested upload throughput in bytes per second, or `-1` to disable throttling.
+    pub upload_throughput: f64,
+    /// Requested CDP connection type, when provided.
+    pub connection_type: Option<String>,
+    /// Requested packet loss percentage, when provided.
+    pub packet_loss: Option<f64>,
+    /// Requested packet queue length, when provided.
+    pub packet_queue_length: Option<u32>,
+    /// Requested packet reordering state, when provided.
+    pub packet_reordering: Option<bool>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -509,6 +530,8 @@ pub struct CdpDispatcher {
     network_blocked_url_count: usize,
     /// Count of cached `Network.setAcceptedEncodings` entries.
     network_accepted_encoding_count: usize,
+    /// Cached setup-only `Network.emulateNetworkConditions` request state.
+    network_emulated_conditions: Option<NetworkEmulatedConditions>,
     /// Whether the Page domain is currently enabled for this session.
     page_enabled: bool,
     /// Cached `Page.setLifecycleEventsEnabled` state.
@@ -736,6 +759,7 @@ impl CdpDispatcher {
             network_extra_http_header_count: 0,
             network_blocked_url_count: 0,
             network_accepted_encoding_count: 0,
+            network_emulated_conditions: None,
             page_enabled: false,
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
@@ -1001,6 +1025,11 @@ impl CdpDispatcher {
     /// Returns the number of cached accepted content encodings.
     pub fn network_accepted_encoding_count(&self) -> usize {
         self.network_accepted_encoding_count
+    }
+
+    /// Returns the cached `Network.emulateNetworkConditions` setup request.
+    pub fn network_emulated_conditions(&self) -> Option<&NetworkEmulatedConditions> {
+        self.network_emulated_conditions.as_ref()
     }
 
     /// Returns `true` if the Page domain is currently enabled.
@@ -2083,6 +2112,9 @@ impl CdpDispatcher {
             "Network.clearAcceptedEncodingsOverride" => {
                 self.network_clear_accepted_encodings_override()
             }
+            "Network.emulateNetworkConditions" => {
+                self.network_emulate_network_conditions(&req.params)
+            }
             "Network.clearBrowserCache" => Ok(json!({})),
             "Network.clearBrowserCookies" => Ok(json!({})),
 
@@ -2343,6 +2375,75 @@ impl CdpDispatcher {
 
     fn network_clear_accepted_encodings_override(&mut self) -> StatorResult<Value> {
         self.network_accepted_encoding_count = 0;
+        Ok(json!({}))
+    }
+
+    fn network_emulate_network_conditions(&mut self, params: &Value) -> StatorResult<Value> {
+        let offline = required_bool_param(params, "offline", "Network.emulateNetworkConditions")?;
+        let latency = required_finite_non_negative_number_param(
+            params,
+            "latency",
+            "Network.emulateNetworkConditions",
+        )?;
+        let download_throughput = required_throughput_param(
+            params,
+            "downloadThroughput",
+            "Network.emulateNetworkConditions",
+        )?;
+        let upload_throughput = required_throughput_param(
+            params,
+            "uploadThroughput",
+            "Network.emulateNetworkConditions",
+        )?;
+        let connection_type = match optional_string_param(
+            params,
+            "connectionType",
+            "Network.emulateNetworkConditions",
+        )? {
+            Some(connection_type) => {
+                if !matches!(
+                    connection_type,
+                    "none"
+                        | "cellular2g"
+                        | "cellular3g"
+                        | "cellular4g"
+                        | "bluetooth"
+                        | "ethernet"
+                        | "wifi"
+                        | "wimax"
+                        | "other"
+                ) {
+                    return Err(crate::error::StatorError::TypeError(format!(
+                        "Network.emulateNetworkConditions: unsupported connectionType '{connection_type}'"
+                    )));
+                }
+                Some(connection_type.to_string())
+            }
+            None => None,
+        };
+        let packet_loss =
+            optional_packet_loss_param(params, "packetLoss", "Network.emulateNetworkConditions")?;
+        let packet_queue_length = optional_u32_param(
+            params,
+            "packetQueueLength",
+            "Network.emulateNetworkConditions",
+        )?;
+        let packet_reordering = optional_bool_param(
+            params,
+            "packetReordering",
+            "Network.emulateNetworkConditions",
+        )?;
+
+        self.network_emulated_conditions = Some(NetworkEmulatedConditions {
+            offline,
+            latency,
+            download_throughput,
+            upload_throughput,
+            connection_type,
+            packet_loss,
+            packet_queue_length,
+            packet_reordering,
+        });
         Ok(json!({}))
     }
 
@@ -5424,6 +5525,78 @@ fn required_u32_param(container: &Value, field: &str, method: &str) -> StatorRes
         StatorError::TypeError(format!("{method}: required parameter '{field}' is missing"))
     })?;
     u32_param(value, field, method)
+}
+
+fn required_bool_param(container: &Value, field: &str, method: &str) -> StatorResult<bool> {
+    container
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            StatorError::TypeError(format!(
+                "{method}: required parameter '{field}' is missing or not a boolean"
+            ))
+        })
+}
+
+fn required_finite_non_negative_number_param(
+    container: &Value,
+    field: &str,
+    method: &str,
+) -> StatorResult<f64> {
+    let value = container
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            StatorError::TypeError(format!(
+                "{method}: required parameter '{field}' is missing or not a number"
+            ))
+        })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(StatorError::TypeError(format!(
+            "{method}: parameter '{field}' must be a finite, non-negative number"
+        )));
+    }
+    Ok(value)
+}
+
+fn required_throughput_param(container: &Value, field: &str, method: &str) -> StatorResult<f64> {
+    let value = container
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            StatorError::TypeError(format!(
+                "{method}: required parameter '{field}' is missing or not a number"
+            ))
+        })?;
+    if !value.is_finite() || !(value == -1.0 || value >= 0.0) {
+        return Err(StatorError::TypeError(format!(
+            "{method}: parameter '{field}' must be -1 or a finite, non-negative number"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_packet_loss_param(
+    container: &Value,
+    field: &str,
+    method: &str,
+) -> StatorResult<Option<f64>> {
+    container
+        .get(field)
+        .map(|value| {
+            let value = value.as_f64().ok_or_else(|| {
+                StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be a number"
+                ))
+            })?;
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be a finite number between 0 and 100"
+                )));
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn optional_u32_param(container: &Value, field: &str, method: &str) -> StatorResult<Option<u32>> {
@@ -9254,21 +9427,100 @@ mod tests {
         assert!(clear_accepted_encodings.get("error").is_none());
         assert_eq!(d.network_accepted_encoding_count(), 0);
 
+        let emulate_conditions = dispatch(
+            &mut d,
+            r#"{"id":26,"method":"Network.emulateNetworkConditions","params":{"offline":true,"latency":12.5,"downloadThroughput":1024,"uploadThroughput":2048,"connectionType":"wifi","packetLoss":1.5,"packetQueueLength":7,"packetReordering":true}}"#,
+        );
+        assert!(emulate_conditions.get("error").is_none());
+        let conditions = d.network_emulated_conditions().unwrap();
+        assert!(conditions.offline);
+        assert_eq!(conditions.latency, 12.5);
+        assert_eq!(conditions.download_throughput, 1024.0);
+        assert_eq!(conditions.upload_throughput, 2048.0);
+        assert_eq!(conditions.connection_type.as_deref(), Some("wifi"));
+        assert_eq!(conditions.packet_loss, Some(1.5));
+        assert_eq!(conditions.packet_queue_length, Some(7));
+        assert_eq!(conditions.packet_reordering, Some(true));
+
+        let emulate_conditions_minimal = dispatch(
+            &mut d,
+            r#"{"id":27,"method":"Network.emulateNetworkConditions","params":{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1}}"#,
+        );
+        assert!(emulate_conditions_minimal.get("error").is_none());
+        let conditions = d.network_emulated_conditions().unwrap();
+        assert!(!conditions.offline);
+        assert_eq!(conditions.latency, 0.0);
+        assert_eq!(conditions.download_throughput, -1.0);
+        assert_eq!(conditions.upload_throughput, -1.0);
+        assert_eq!(conditions.connection_type, None);
+        assert_eq!(conditions.packet_loss, None);
+        assert_eq!(conditions.packet_queue_length, None);
+        assert_eq!(conditions.packet_reordering, None);
+
+        let emulate_conditions_packet_loss_max = dispatch(
+            &mut d,
+            r#"{"id":28,"method":"Network.emulateNetworkConditions","params":{"offline":false,"latency":3,"downloadThroughput":0,"uploadThroughput":0,"packetLoss":100}}"#,
+        );
+        assert!(emulate_conditions_packet_loss_max.get("error").is_none());
+        assert_eq!(
+            d.network_emulated_conditions().unwrap().packet_loss,
+            Some(100.0)
+        );
+        let preserved_conditions = d.network_emulated_conditions().cloned();
+
+        for invalid_params in [
+            r#"{"latency":0,"downloadThroughput":-1,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"downloadThroughput":-1,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1}"#,
+            r#"{"offline":"false","latency":0,"downloadThroughput":-1,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":-1,"downloadThroughput":-1,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":null,"downloadThroughput":-1,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-2,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-0.5,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":null,"uploadThroughput":-1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-2}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-0.5}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":null}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"connectionType":"5g"}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"connectionType":null}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetLoss":100.1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetLoss":-0.1}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetQueueLength":1.5}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetReordering":"yes"}"#,
+            r#"{"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetReordering":null}"#,
+        ] {
+            let invalid_emulation = dispatch(
+                &mut d,
+                &format!(
+                    r#"{{"id":29,"method":"Network.emulateNetworkConditions","params":{invalid_params}}}"#
+                ),
+            );
+            assert!(
+                invalid_emulation["error"].is_object(),
+                "expected error for {invalid_params}"
+            );
+            assert_eq!(
+                d.network_emulated_conditions(),
+                preserved_conditions.as_ref()
+            );
+        }
+
         let clear_cache = dispatch(
             &mut d,
-            r#"{"id":26,"method":"Network.clearBrowserCache","params":{}}"#,
+            r#"{"id":30,"method":"Network.clearBrowserCache","params":{}}"#,
         );
         assert!(clear_cache.get("error").is_none());
 
         let clear_cookies = dispatch(
             &mut d,
-            r#"{"id":27,"method":"Network.clearBrowserCookies","params":{}}"#,
+            r#"{"id":31,"method":"Network.clearBrowserCookies","params":{}}"#,
         );
         assert!(clear_cookies.get("error").is_none());
 
         let disable = dispatch(
             &mut d,
-            r#"{"id":28,"method":"Network.disable","params":{}}"#,
+            r#"{"id":32,"method":"Network.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.network_enabled());
