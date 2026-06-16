@@ -68,6 +68,7 @@
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
 //! | `DOM`          | `enable`/`disable`        | Tracks DOM domain enabled state without fabricating a DOM tree |
+//! | `CSS`          | `enable`/`disable`        | Tracks CSS domain enabled state without fabricating CSSOM/layout behavior |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
@@ -570,6 +571,8 @@ pub struct CdpDispatcher {
     page_ad_blocking_enabled: bool,
     /// Whether the DOM domain is currently enabled for this session.
     dom_enabled: bool,
+    /// Whether the CSS domain is currently enabled for this session.
+    css_enabled: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -812,6 +815,7 @@ impl CdpDispatcher {
             page_bypass_csp: false,
             page_ad_blocking_enabled: false,
             dom_enabled: false,
+            css_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -1125,6 +1129,11 @@ impl CdpDispatcher {
     /// Returns `true` if the DOM domain is currently enabled.
     pub fn dom_enabled(&self) -> bool {
         self.dom_enabled
+    }
+
+    /// Returns `true` if the CSS domain is currently enabled.
+    pub fn css_enabled(&self) -> bool {
+        self.css_enabled
     }
 
     /// Returns `true` if the Log domain is currently enabled.
@@ -2321,6 +2330,16 @@ impl CdpDispatcher {
             }
             "DOM.disable" => {
                 self.dom_enabled = false;
+                Ok(json!({}))
+            }
+
+            // ── CSS ───────────────────────────────────────────────────────
+            "CSS.enable" => {
+                self.css_enabled = true;
+                Ok(json!({}))
+            }
+            "CSS.disable" => {
+                self.css_enabled = false;
                 Ok(json!({}))
             }
 
@@ -6177,6 +6196,7 @@ fn schema_get_domains() -> Value {
             { "name": "Network", "version": "1.3" },
             { "name": "Page", "version": "1.3" },
             { "name": "DOM", "version": "1.3" },
+            { "name": "CSS", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
             { "name": "Audits", "version": "1.3" },
@@ -9839,6 +9859,18 @@ mod tests {
     }
 
     #[test]
+    fn css_enable_disable_tracks_state_without_style_behavior() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"CSS.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.css_enabled());
+
+        let disable = dispatch(&mut d, r#"{"id":2,"method":"CSS.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.css_enabled());
+    }
+
+    #[test]
     fn network_setup_methods_store_settings_and_validate_input() {
         let mut d = fresh_dispatcher();
         let enable = dispatch(&mut d, r#"{"id":1,"method":"Network.enable","params":{}}"#);
@@ -10344,6 +10376,7 @@ mod tests {
         assert!(names.contains(&"Inspector"));
         assert!(names.contains(&"Audits"));
         assert!(names.contains(&"DOM"));
+        assert!(names.contains(&"CSS"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
