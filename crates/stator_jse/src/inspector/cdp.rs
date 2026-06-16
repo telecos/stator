@@ -69,7 +69,8 @@
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
-//! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
+//! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
+//! | `Performance`  | `enable`/`disable`/`getMetrics`/`setTimeDomain` | Reports deterministic runtime metrics and setup state |
 //! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride`/`setPageScaleFactor`/`resetPageScaleFactor`/`setScrollbarsHidden` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
@@ -574,8 +575,12 @@ pub struct CdpDispatcher {
     security_enabled: bool,
     /// Cached `Security.setIgnoreCertificateErrors` state.
     security_ignore_certificate_errors: bool,
+    /// Whether the Audits domain is currently enabled for this session.
+    audits_enabled: bool,
     /// Whether the Performance domain is currently enabled for this session.
     performance_enabled: bool,
+    /// Cached `Performance.setTimeDomain` value.
+    performance_time_domain: String,
     /// Cached `Emulation.setDeviceMetricsOverride` state.
     emulation_device_metrics: Option<Value>,
     /// Cached `Emulation.setTouchEmulationEnabled` state.
@@ -807,7 +812,9 @@ impl CdpDispatcher {
             log_violation_setting_count: 0,
             security_enabled: false,
             security_ignore_certificate_errors: false,
+            audits_enabled: false,
             performance_enabled: false,
+            performance_time_domain: "timeTicks".to_string(),
             emulation_device_metrics: None,
             emulation_touch_enabled: false,
             emulation_max_touch_points: 0,
@@ -1131,9 +1138,19 @@ impl CdpDispatcher {
         self.security_ignore_certificate_errors
     }
 
+    /// Returns `true` if the Audits domain is currently enabled.
+    pub fn audits_enabled(&self) -> bool {
+        self.audits_enabled
+    }
+
     /// Returns `true` if the Performance domain is currently enabled.
     pub fn performance_enabled(&self) -> bool {
         self.performance_enabled
+    }
+
+    /// Returns the cached Performance time-domain setting.
+    pub fn performance_time_domain(&self) -> &str {
+        &self.performance_time_domain
     }
 
     /// Returns the cached device metrics override payload, if any.
@@ -2314,6 +2331,16 @@ impl CdpDispatcher {
                 self.security_set_ignore_certificate_errors(&req.params)
             }
 
+            // ── Audits ──────────────────────────────────────────────────────
+            "Audits.enable" => {
+                self.audits_enabled = true;
+                Ok(json!({}))
+            }
+            "Audits.disable" => {
+                self.audits_enabled = false;
+                Ok(json!({}))
+            }
+
             // ── Performance ───────────────────────────────────────────────
             "Performance.enable" => {
                 self.performance_enabled = true;
@@ -2323,6 +2350,7 @@ impl CdpDispatcher {
                 self.performance_enabled = false;
                 Ok(json!({}))
             }
+            "Performance.setTimeDomain" => self.performance_set_time_domain(&req.params),
             "Performance.getMetrics" => self.performance_get_metrics(),
 
             // ── Emulation ─────────────────────────────────────────────────
@@ -2724,6 +2752,24 @@ impl CdpDispatcher {
         };
         self.security_ignore_certificate_errors = ignore;
         Ok(json!({}))
+    }
+
+    fn performance_set_time_domain(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(time_domain) = params.get("timeDomain").and_then(Value::as_str) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Performance.setTimeDomain: required parameter 'timeDomain' is missing or not a string"
+                    .to_string(),
+            ));
+        };
+        match time_domain {
+            "timeTicks" | "threadTicks" => {
+                self.performance_time_domain = time_domain.to_string();
+                Ok(json!({}))
+            }
+            other => Err(crate::error::StatorError::TypeError(format!(
+                "Performance.setTimeDomain: unsupported timeDomain '{other}'"
+            ))),
+        }
     }
 
     fn performance_get_metrics(&self) -> StatorResult<Value> {
@@ -6113,6 +6159,7 @@ fn schema_get_domains() -> Value {
             { "name": "Page", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
+            { "name": "Audits", "version": "1.3" },
             { "name": "Performance", "version": "1.3" },
             { "name": "Emulation", "version": "1.3" },
             { "name": "Overlay", "version": "1.3" },
@@ -9526,6 +9573,7 @@ mod tests {
     #[test]
     fn performance_domain_reports_metrics_and_tracks_enable_state() {
         let mut d = fresh_dispatcher();
+        assert_eq!(d.performance_time_domain(), "timeTicks");
         let enable = dispatch(
             &mut d,
             r#"{"id":1,"method":"Performance.enable","params":{}}"#,
@@ -9550,12 +9598,45 @@ mod tests {
         assert!(names.contains("JSHeapUsedSize"));
         assert!(names.contains("JSHeapTotalSize"));
 
+        let time_domain = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Performance.setTimeDomain","params":{"timeDomain":"threadTicks"}}"#,
+        );
+        assert!(time_domain.get("error").is_none());
+        assert_eq!(d.performance_time_domain(), "threadTicks");
+
+        let bad_time_domain = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Performance.setTimeDomain","params":{"timeDomain":"bogus"}}"#,
+        );
+        assert!(bad_time_domain["error"].is_object());
+        assert_eq!(d.performance_time_domain(), "threadTicks");
+
+        let missing_time_domain = dispatch(
+            &mut d,
+            r#"{"id":6,"method":"Performance.setTimeDomain","params":{}}"#,
+        );
+        assert!(missing_time_domain["error"].is_object());
+        assert_eq!(d.performance_time_domain(), "threadTicks");
+
         let disable = dispatch(
             &mut d,
             r#"{"id":3,"method":"Performance.disable","params":{}}"#,
         );
         assert!(disable.get("error").is_none());
         assert!(!d.performance_enabled());
+    }
+
+    #[test]
+    fn audits_enable_disable_tracks_state() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(&mut d, r#"{"id":1,"method":"Audits.enable","params":{}}"#);
+        assert!(enable.get("error").is_none());
+        assert!(d.audits_enabled());
+
+        let disable = dispatch(&mut d, r#"{"id":2,"method":"Audits.disable","params":{}}"#);
+        assert!(disable.get("error").is_none());
+        assert!(!d.audits_enabled());
     }
 
     #[test]
@@ -10229,6 +10310,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"Browser"));
         assert!(names.contains(&"Inspector"));
+        assert!(names.contains(&"Audits"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
