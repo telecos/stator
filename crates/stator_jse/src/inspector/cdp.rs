@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setTimezoneOverride`/`setLocaleOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -549,6 +549,8 @@ pub struct CdpDispatcher {
     emulation_script_execution_disabled: bool,
     /// Cached `Emulation.setFocusEmulationEnabled` state.
     emulation_focus_emulation_enabled: bool,
+    /// Cached `Emulation.setIdleOverride` state.
+    emulation_idle_override: Option<(bool, bool)>,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -739,6 +741,7 @@ impl CdpDispatcher {
             emulation_locale: String::new(),
             emulation_script_execution_disabled: false,
             emulation_focus_emulation_enabled: false,
+            emulation_idle_override: None,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -1075,6 +1078,11 @@ impl CdpDispatcher {
     /// Returns the cached focus emulation enabled state.
     pub fn emulation_focus_emulation_enabled(&self) -> bool {
         self.emulation_focus_emulation_enabled
+    }
+
+    /// Returns the cached idle override state as `(user_active, screen_unlocked)`.
+    pub fn emulation_idle_override(&self) -> Option<(bool, bool)> {
+        self.emulation_idle_override
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -2089,6 +2097,8 @@ impl CdpDispatcher {
             "Emulation.setFocusEmulationEnabled" => {
                 self.emulation_set_focus_emulation_enabled(&req.params)
             }
+            "Emulation.setIdleOverride" => self.emulation_set_idle_override(&req.params),
+            "Emulation.clearIdleOverride" => self.emulation_clear_idle_override(),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2538,6 +2548,28 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_focus_emulation_enabled = enabled;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_idle_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let Some(user_active) = params.get("userActive").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setIdleOverride: required parameter 'userActive' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        let Some(screen_unlocked) = params.get("screenUnlocked").and_then(Value::as_bool) else {
+            return Err(crate::error::StatorError::TypeError(
+                "Emulation.setIdleOverride: required parameter 'screenUnlocked' is missing or not a boolean"
+                    .to_string(),
+            ));
+        };
+        self.emulation_idle_override = Some((user_active, screen_unlocked));
+        Ok(json!({}))
+    }
+
+    fn emulation_clear_idle_override(&mut self) -> StatorResult<Value> {
+        self.emulation_idle_override = None;
         Ok(json!({}))
     }
 
@@ -8591,9 +8623,35 @@ mod tests {
         );
         assert!(focus_bad["error"].is_object());
 
+        let idle = dispatch(
+            &mut d,
+            r#"{"id":26,"method":"Emulation.setIdleOverride","params":{"userActive":true,"screenUnlocked":false}}"#,
+        );
+        assert!(idle.get("error").is_none());
+        assert_eq!(d.emulation_idle_override(), Some((true, false)));
+
+        let idle_bad_user_active = dispatch(
+            &mut d,
+            r#"{"id":27,"method":"Emulation.setIdleOverride","params":{"screenUnlocked":true}}"#,
+        );
+        assert!(idle_bad_user_active["error"].is_object());
+
+        let idle_bad_screen_unlocked = dispatch(
+            &mut d,
+            r#"{"id":28,"method":"Emulation.setIdleOverride","params":{"userActive":true,"screenUnlocked":"yes"}}"#,
+        );
+        assert!(idle_bad_screen_unlocked["error"].is_object());
+
+        let clear_idle = dispatch(
+            &mut d,
+            r#"{"id":29,"method":"Emulation.clearIdleOverride","params":{}}"#,
+        );
+        assert!(clear_idle.get("error").is_none());
+        assert_eq!(d.emulation_idle_override(), None);
+
         let clear = dispatch(
             &mut d,
-            r#"{"id":26,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
+            r#"{"id":30,"method":"Emulation.clearDeviceMetricsOverride","params":{}}"#,
         );
         assert!(clear.get("error").is_none());
         assert!(d.emulation_device_metrics().is_none());
