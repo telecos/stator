@@ -69,6 +69,7 @@
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
 //! | `DOM`          | `enable`/`disable`        | Tracks DOM domain enabled state without fabricating a DOM tree |
 //! | `CSS`          | `enable`/`disable`        | Tracks CSS domain enabled state without fabricating CSSOM/layout behavior |
+//! | `LayerTree`    | `enable`/`disable`        | Tracks LayerTree domain enabled state without fabricating compositor/layout behavior |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Audits`       | `enable`/`disable`        | Tracks Audits domain enabled state |
@@ -573,6 +574,8 @@ pub struct CdpDispatcher {
     dom_enabled: bool,
     /// Whether the CSS domain is currently enabled for this session.
     css_enabled: bool,
+    /// Whether the LayerTree domain is currently enabled for this session.
+    layer_tree_enabled: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -816,6 +819,7 @@ impl CdpDispatcher {
             page_ad_blocking_enabled: false,
             dom_enabled: false,
             css_enabled: false,
+            layer_tree_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -1134,6 +1138,11 @@ impl CdpDispatcher {
     /// Returns `true` if the CSS domain is currently enabled.
     pub fn css_enabled(&self) -> bool {
         self.css_enabled
+    }
+
+    /// Returns `true` if the LayerTree domain is currently enabled.
+    pub fn layer_tree_enabled(&self) -> bool {
+        self.layer_tree_enabled
     }
 
     /// Returns `true` if the Log domain is currently enabled.
@@ -2340,6 +2349,16 @@ impl CdpDispatcher {
             }
             "CSS.disable" => {
                 self.css_enabled = false;
+                Ok(json!({}))
+            }
+
+            // ── LayerTree ─────────────────────────────────────────────────
+            "LayerTree.enable" => {
+                self.layer_tree_enabled = true;
+                Ok(json!({}))
+            }
+            "LayerTree.disable" => {
+                self.layer_tree_enabled = false;
                 Ok(json!({}))
             }
 
@@ -6197,6 +6216,7 @@ fn schema_get_domains() -> Value {
             { "name": "Page", "version": "1.3" },
             { "name": "DOM", "version": "1.3" },
             { "name": "CSS", "version": "1.3" },
+            { "name": "LayerTree", "version": "1.3" },
             { "name": "Log", "version": "1.3" },
             { "name": "Security", "version": "1.3" },
             { "name": "Audits", "version": "1.3" },
@@ -9871,6 +9891,24 @@ mod tests {
     }
 
     #[test]
+    fn layer_tree_enable_disable_tracks_state_without_compositor_behavior() {
+        let mut d = fresh_dispatcher();
+        let enable = dispatch(
+            &mut d,
+            r#"{"id":1,"method":"LayerTree.enable","params":{}}"#,
+        );
+        assert!(enable.get("error").is_none());
+        assert!(d.layer_tree_enabled());
+
+        let disable = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"LayerTree.disable","params":{}}"#,
+        );
+        assert!(disable.get("error").is_none());
+        assert!(!d.layer_tree_enabled());
+    }
+
+    #[test]
     fn network_setup_methods_store_settings_and_validate_input() {
         let mut d = fresh_dispatcher();
         let enable = dispatch(&mut d, r#"{"id":1,"method":"Network.enable","params":{}}"#);
@@ -10377,6 +10415,7 @@ mod tests {
         assert!(names.contains(&"Audits"));
         assert!(names.contains(&"DOM"));
         assert!(names.contains(&"CSS"));
+        assert!(names.contains(&"LayerTree"));
         assert!(names.contains(&"Runtime"));
         assert!(names.contains(&"Debugger"));
         assert!(names.contains(&"Target"));
