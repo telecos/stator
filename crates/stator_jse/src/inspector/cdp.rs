@@ -64,6 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`getTargetInfo`/`attachToTarget`/`closeTarget`/`setRemoteLocations` | Single-target DevTools compatibility and validated setup state |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
+//! | `Network`      | `canEmulateNetworkConditions`/`canClearBrowserCache`/`canClearBrowserCookies` | Reports Stator standalone capability probes |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
@@ -2251,6 +2252,9 @@ impl CdpDispatcher {
             "Network.emulateNetworkConditions" => {
                 self.network_emulate_network_conditions(&req.params)
             }
+            "Network.canEmulateNetworkConditions" => Ok(json!({ "result": true })),
+            "Network.canClearBrowserCache" => Ok(json!({ "result": true })),
+            "Network.canClearBrowserCookies" => Ok(json!({ "result": true })),
             "Network.clearBrowserCache" => Ok(json!({})),
             "Network.clearBrowserCookies" => Ok(json!({})),
 
@@ -9995,6 +9999,24 @@ mod tests {
                 preserved_conditions.as_ref()
             );
         }
+
+        let can_emulate_network_conditions = dispatch(
+            &mut d,
+            r#"{"id":39,"method":"Network.canEmulateNetworkConditions","params":{}}"#,
+        );
+        assert_eq!(can_emulate_network_conditions["result"]["result"], true);
+
+        let can_clear_cache = dispatch(
+            &mut d,
+            r#"{"id":40,"method":"Network.canClearBrowserCache","params":{}}"#,
+        );
+        assert_eq!(can_clear_cache["result"]["result"], true);
+
+        let can_clear_cookies = dispatch(
+            &mut d,
+            r#"{"id":41,"method":"Network.canClearBrowserCookies","params":{}}"#,
+        );
+        assert_eq!(can_clear_cookies["result"]["result"], true);
 
         let clear_cache = dispatch(
             &mut d,
