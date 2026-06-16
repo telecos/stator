@@ -640,6 +640,16 @@ pub struct CdpDispatcher {
     emulation_page_scale_factor: Option<f64>,
     /// Cached `Emulation.setScrollbarsHidden` state.
     emulation_scrollbars_hidden: bool,
+    /// Cached `Emulation.setDefaultBackgroundColorOverride` color object.
+    emulation_default_background_color_override: Option<Value>,
+    /// Cached `Emulation.setEmulatedVisionDeficiency` value.
+    emulation_vision_deficiency: String,
+    /// Cached `Emulation.setEmulatedOSTextScale` scale.
+    emulation_os_text_scale: Option<f64>,
+    /// Cached `Emulation.setDataSaverOverride` state.
+    emulation_data_saver_enabled: Option<bool>,
+    /// Cached `Emulation.setDisabledImageTypes` image type list.
+    emulation_disabled_image_types: Vec<String>,
     /// Cached `Input.setIgnoreInputEvents` state.
     input_ignore_input_events: bool,
     /// Cached `Input.setInterceptDrags` state.
@@ -859,6 +869,11 @@ impl CdpDispatcher {
             emulation_geolocation_override: None,
             emulation_page_scale_factor: None,
             emulation_scrollbars_hidden: false,
+            emulation_default_background_color_override: None,
+            emulation_vision_deficiency: "none".to_string(),
+            emulation_os_text_scale: None,
+            emulation_data_saver_enabled: None,
+            emulation_disabled_image_types: Vec::new(),
             input_ignore_input_events: false,
             input_intercept_drags: false,
             overlay_enabled: false,
@@ -1309,6 +1324,31 @@ impl CdpDispatcher {
     /// Returns the cached scrollbars-hidden state.
     pub fn emulation_scrollbars_hidden(&self) -> bool {
         self.emulation_scrollbars_hidden
+    }
+
+    /// Returns the cached default background color override.
+    pub fn emulation_default_background_color_override(&self) -> Option<&Value> {
+        self.emulation_default_background_color_override.as_ref()
+    }
+
+    /// Returns the cached emulated vision deficiency.
+    pub fn emulation_vision_deficiency(&self) -> &str {
+        &self.emulation_vision_deficiency
+    }
+
+    /// Returns the cached OS text scale override.
+    pub fn emulation_os_text_scale(&self) -> Option<f64> {
+        self.emulation_os_text_scale
+    }
+
+    /// Returns the cached data-saver override.
+    pub fn emulation_data_saver_enabled(&self) -> Option<bool> {
+        self.emulation_data_saver_enabled
+    }
+
+    /// Returns the cached disabled-image-type list.
+    pub fn emulation_disabled_image_types(&self) -> &[String] {
+        &self.emulation_disabled_image_types
     }
 
     /// Returns whether input events should be ignored.
@@ -2482,6 +2522,19 @@ impl CdpDispatcher {
             "Emulation.setPageScaleFactor" => self.emulation_set_page_scale_factor(&req.params),
             "Emulation.resetPageScaleFactor" => self.emulation_reset_page_scale_factor(),
             "Emulation.setScrollbarsHidden" => self.emulation_set_scrollbars_hidden(&req.params),
+            "Emulation.setDefaultBackgroundColorOverride" => {
+                self.emulation_set_default_background_color_override(&req.params)
+            }
+            "Emulation.setEmulatedVisionDeficiency" => {
+                self.emulation_set_emulated_vision_deficiency(&req.params)
+            }
+            "Emulation.setEmulatedOSTextScale" => {
+                self.emulation_set_emulated_os_text_scale(&req.params)
+            }
+            "Emulation.setDataSaverOverride" => self.emulation_set_data_saver_override(&req.params),
+            "Emulation.setDisabledImageTypes" => {
+                self.emulation_set_disabled_image_types(&req.params)
+            }
 
             // ── Input ─────────────────────────────────────────────────────
             "Input.setIgnoreInputEvents" => self.input_set_ignore_input_events(&req.params),
@@ -3171,6 +3224,87 @@ impl CdpDispatcher {
             ));
         };
         self.emulation_scrollbars_hidden = hidden;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_default_background_color_override(
+        &mut self,
+        params: &Value,
+    ) -> StatorResult<Value> {
+        let method = "Emulation.setDefaultBackgroundColorOverride";
+        match params.get("color") {
+            Some(color) => {
+                validate_rgba_color_param(color, method)?;
+                self.emulation_default_background_color_override = Some(color.clone());
+            }
+            None => {
+                self.emulation_default_background_color_override = None;
+            }
+        }
+        Ok(json!({}))
+    }
+
+    fn emulation_set_emulated_vision_deficiency(&mut self, params: &Value) -> StatorResult<Value> {
+        let method = "Emulation.setEmulatedVisionDeficiency";
+        let Some(deficiency) = params.get("type").and_then(Value::as_str) else {
+            return Err(StatorError::TypeError(format!(
+                "{method}: required parameter 'type' is missing or not a string"
+            )));
+        };
+        if !matches!(
+            deficiency,
+            "none"
+                | "blurredVision"
+                | "reducedContrast"
+                | "achromatopsia"
+                | "deuteranopia"
+                | "protanopia"
+                | "tritanopia"
+        ) {
+            return Err(StatorError::TypeError(format!(
+                "{method}: unsupported vision deficiency '{deficiency}'"
+            )));
+        }
+        self.emulation_vision_deficiency = deficiency.to_string();
+        Ok(json!({}))
+    }
+
+    fn emulation_set_emulated_os_text_scale(&mut self, params: &Value) -> StatorResult<Value> {
+        let method = "Emulation.setEmulatedOSTextScale";
+        let scale = optional_finite_number_param(params, "scale", method)?;
+        validate_optional_non_negative_number(method, "scale", scale)?;
+        self.emulation_os_text_scale = scale;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_data_saver_override(&mut self, params: &Value) -> StatorResult<Value> {
+        self.emulation_data_saver_enabled =
+            optional_bool_param(params, "dataSaverEnabled", "Emulation.setDataSaverOverride")?;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_disabled_image_types(&mut self, params: &Value) -> StatorResult<Value> {
+        let method = "Emulation.setDisabledImageTypes";
+        let Some(image_types) = params.get("imageTypes").and_then(Value::as_array) else {
+            return Err(StatorError::TypeError(format!(
+                "{method}: required parameter 'imageTypes' is missing or not an array"
+            )));
+        };
+        let mut disabled_image_types = Vec::with_capacity(image_types.len());
+        for image_type in image_types {
+            let Some(image_type) = image_type.as_str() else {
+                return Err(StatorError::TypeError(format!(
+                    "{method}: imageTypes entries must be strings"
+                )));
+            };
+            if !matches!(image_type, "avif" | "jxl" | "webp") {
+                return Err(StatorError::TypeError(format!(
+                    "{method}: unsupported image type '{image_type}'"
+                )));
+            }
+            disabled_image_types.push(image_type.to_string());
+        }
+        self.emulation_disabled_image_types = disabled_image_types;
         Ok(json!({}))
     }
 
@@ -6109,6 +6243,44 @@ fn optional_string_param<'a>(
             })
         })
         .transpose()
+}
+
+fn validate_rgba_color_param(color: &Value, method: &str) -> StatorResult<()> {
+    let Some(color) = color.as_object() else {
+        return Err(StatorError::TypeError(format!(
+            "{method}: optional parameter 'color' must be an object"
+        )));
+    };
+    for component in ["r", "g", "b"] {
+        let Some(value) = color.get(component) else {
+            return Err(StatorError::TypeError(format!(
+                "{method}: color component '{component}' is missing"
+            )));
+        };
+        let Some(value) = value.as_u64() else {
+            return Err(StatorError::TypeError(format!(
+                "{method}: color component '{component}' must be an integer between 0 and 255"
+            )));
+        };
+        if value > 255 {
+            return Err(StatorError::TypeError(format!(
+                "{method}: color component '{component}' must be between 0 and 255"
+            )));
+        }
+    }
+    if let Some(alpha) = color.get("a") {
+        let Some(alpha) = alpha.as_f64() else {
+            return Err(StatorError::TypeError(format!(
+                "{method}: optional color component 'a' must be a number"
+            )));
+        };
+        if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+            return Err(StatorError::TypeError(format!(
+                "{method}: optional color component 'a' must be between 0 and 1"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_user_agent_override_params(
@@ -9688,6 +9860,125 @@ mod tests {
         );
         assert!(scrollbars_visible.get("error").is_none());
         assert!(!d.emulation_scrollbars_hidden());
+
+        let background_color = json!({"r":12,"g":34,"b":56,"a":0.5});
+        let background = dispatch(
+            &mut d,
+            r#"{"id":61,"method":"Emulation.setDefaultBackgroundColorOverride","params":{"color":{"r":12,"g":34,"b":56,"a":0.5}}}"#,
+        );
+        assert!(background.get("error").is_none());
+        assert_eq!(
+            d.emulation_default_background_color_override(),
+            Some(&background_color)
+        );
+
+        let background_bad_rgb = dispatch(
+            &mut d,
+            r#"{"id":62,"method":"Emulation.setDefaultBackgroundColorOverride","params":{"color":{"r":256,"g":34,"b":56}}}"#,
+        );
+        assert!(background_bad_rgb["error"].is_object());
+        assert_eq!(
+            d.emulation_default_background_color_override(),
+            Some(&background_color)
+        );
+
+        let background_bad_alpha = dispatch(
+            &mut d,
+            r#"{"id":63,"method":"Emulation.setDefaultBackgroundColorOverride","params":{"color":{"r":12,"g":34,"b":56,"a":2}}}"#,
+        );
+        assert!(background_bad_alpha["error"].is_object());
+        assert_eq!(
+            d.emulation_default_background_color_override(),
+            Some(&background_color)
+        );
+
+        let background_clear = dispatch(
+            &mut d,
+            r#"{"id":64,"method":"Emulation.setDefaultBackgroundColorOverride","params":{}}"#,
+        );
+        assert!(background_clear.get("error").is_none());
+        assert!(d.emulation_default_background_color_override().is_none());
+
+        let vision = dispatch(
+            &mut d,
+            r#"{"id":65,"method":"Emulation.setEmulatedVisionDeficiency","params":{"type":"deuteranopia"}}"#,
+        );
+        assert!(vision.get("error").is_none());
+        assert_eq!(d.emulation_vision_deficiency(), "deuteranopia");
+
+        let vision_bad = dispatch(
+            &mut d,
+            r#"{"id":66,"method":"Emulation.setEmulatedVisionDeficiency","params":{"type":"nightVision"}}"#,
+        );
+        assert!(vision_bad["error"].is_object());
+        assert_eq!(d.emulation_vision_deficiency(), "deuteranopia");
+
+        let os_text_scale = dispatch(
+            &mut d,
+            r#"{"id":67,"method":"Emulation.setEmulatedOSTextScale","params":{"scale":1.25}}"#,
+        );
+        assert!(os_text_scale.get("error").is_none());
+        assert_eq!(d.emulation_os_text_scale(), Some(1.25));
+
+        let os_text_scale_bad = dispatch(
+            &mut d,
+            r#"{"id":68,"method":"Emulation.setEmulatedOSTextScale","params":{"scale":-0.5}}"#,
+        );
+        assert!(os_text_scale_bad["error"].is_object());
+        assert_eq!(d.emulation_os_text_scale(), Some(1.25));
+
+        let os_text_scale_clear = dispatch(
+            &mut d,
+            r#"{"id":69,"method":"Emulation.setEmulatedOSTextScale","params":{}}"#,
+        );
+        assert!(os_text_scale_clear.get("error").is_none());
+        assert_eq!(d.emulation_os_text_scale(), None);
+
+        let data_saver = dispatch(
+            &mut d,
+            r#"{"id":70,"method":"Emulation.setDataSaverOverride","params":{"dataSaverEnabled":true}}"#,
+        );
+        assert!(data_saver.get("error").is_none());
+        assert_eq!(d.emulation_data_saver_enabled(), Some(true));
+
+        let data_saver_bad = dispatch(
+            &mut d,
+            r#"{"id":71,"method":"Emulation.setDataSaverOverride","params":{"dataSaverEnabled":"true"}}"#,
+        );
+        assert!(data_saver_bad["error"].is_object());
+        assert_eq!(d.emulation_data_saver_enabled(), Some(true));
+
+        let data_saver_clear = dispatch(
+            &mut d,
+            r#"{"id":72,"method":"Emulation.setDataSaverOverride","params":{}}"#,
+        );
+        assert!(data_saver_clear.get("error").is_none());
+        assert_eq!(d.emulation_data_saver_enabled(), None);
+
+        let disabled_image_types = dispatch(
+            &mut d,
+            r#"{"id":73,"method":"Emulation.setDisabledImageTypes","params":{"imageTypes":["webp","avif"]}}"#,
+        );
+        assert!(disabled_image_types.get("error").is_none());
+        assert_eq!(d.emulation_disabled_image_types().len(), 2);
+        assert_eq!(d.emulation_disabled_image_types()[0], "webp");
+        assert_eq!(d.emulation_disabled_image_types()[1], "avif");
+
+        let disabled_image_types_bad = dispatch(
+            &mut d,
+            r#"{"id":74,"method":"Emulation.setDisabledImageTypes","params":{"imageTypes":["png"]}}"#,
+        );
+        assert!(disabled_image_types_bad["error"].is_object());
+        assert_eq!(d.emulation_disabled_image_types().len(), 2);
+        assert_eq!(d.emulation_disabled_image_types()[0], "webp");
+        assert_eq!(d.emulation_disabled_image_types()[1], "avif");
+
+        let disabled_image_types_clear = dispatch(
+            &mut d,
+            r#"{"id":75,"method":"Emulation.setDisabledImageTypes","params":{"imageTypes":[]}}"#,
+        );
+        assert!(disabled_image_types_clear.get("error").is_none());
+        assert!(d.emulation_disabled_image_types().is_empty());
 
         let clear_idle = dispatch(
             &mut d,
