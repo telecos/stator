@@ -64,7 +64,7 @@
 //! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
-//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
+//! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
 //! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
@@ -535,6 +535,10 @@ pub struct CdpDispatcher {
     network_cache_disabled: bool,
     /// Cached `Network.setBypassServiceWorker` state.
     network_bypass_service_worker: bool,
+    /// Cached `Network.setAttachDebugStack` state.
+    network_attach_debug_stack: bool,
+    /// Cached `Network.setReportingApiEnabled` state.
+    network_reporting_api_enabled: bool,
     /// Cached `Network.setUserAgentOverride` user-agent string.
     network_user_agent: String,
     /// Cached `Network.setUserAgentOverride` accept-language string.
@@ -777,6 +781,8 @@ impl CdpDispatcher {
             network_enabled: false,
             network_cache_disabled: false,
             network_bypass_service_worker: false,
+            network_attach_debug_stack: false,
+            network_reporting_api_enabled: false,
             network_user_agent: String::new(),
             network_accept_language: String::new(),
             network_platform: String::new(),
@@ -1018,6 +1024,16 @@ impl CdpDispatcher {
     /// Returns the cached `Network.setBypassServiceWorker` value.
     pub fn network_bypass_service_worker(&self) -> bool {
         self.network_bypass_service_worker
+    }
+
+    /// Returns the cached `Network.setAttachDebugStack` value.
+    pub fn network_attach_debug_stack(&self) -> bool {
+        self.network_attach_debug_stack
+    }
+
+    /// Returns the cached `Network.setReportingApiEnabled` value.
+    pub fn network_reporting_api_enabled(&self) -> bool {
+        self.network_reporting_api_enabled
     }
 
     /// Returns the cached user-agent override string.
@@ -2148,6 +2164,8 @@ impl CdpDispatcher {
             }
             "Network.setCacheDisabled" => self.network_set_cache_disabled(&req.params),
             "Network.setBypassServiceWorker" => self.network_set_bypass_service_worker(&req.params),
+            "Network.setAttachDebugStack" => self.network_set_attach_debug_stack(&req.params),
+            "Network.setReportingApiEnabled" => self.network_set_reporting_api_enabled(&req.params),
             "Network.setUserAgentOverride" => self.network_set_user_agent_override(&req.params),
             "Network.setExtraHTTPHeaders" => self.network_set_extra_http_headers(&req.params),
             "Network.setBlockedURLs" => self.network_set_blocked_urls(&req.params),
@@ -2355,6 +2373,18 @@ impl CdpDispatcher {
             ));
         };
         self.network_bypass_service_worker = bypass;
+        Ok(json!({}))
+    }
+
+    fn network_set_attach_debug_stack(&mut self, params: &Value) -> StatorResult<Value> {
+        let enabled = required_bool_param(params, "enabled", "Network.setAttachDebugStack")?;
+        self.network_attach_debug_stack = enabled;
+        Ok(json!({}))
+    }
+
+    fn network_set_reporting_api_enabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let enabled = required_bool_param(params, "enabled", "Network.setReportingApiEnabled")?;
+        self.network_reporting_api_enabled = enabled;
         Ok(json!({}))
     }
 
@@ -9568,6 +9598,20 @@ mod tests {
         assert!(bypass.get("error").is_none());
         assert!(d.network_bypass_service_worker());
 
+        let attach_debug_stack = dispatch(
+            &mut d,
+            r#"{"id":33,"method":"Network.setAttachDebugStack","params":{"enabled":true}}"#,
+        );
+        assert!(attach_debug_stack.get("error").is_none());
+        assert!(d.network_attach_debug_stack());
+
+        let reporting_api = dispatch(
+            &mut d,
+            r#"{"id":34,"method":"Network.setReportingApiEnabled","params":{"enabled":true}}"#,
+        );
+        assert!(reporting_api.get("error").is_none());
+        assert!(d.network_reporting_api_enabled());
+
         let cache_bad = dispatch(
             &mut d,
             r#"{"id":4,"method":"Network.setCacheDisabled","params":{}}"#,
@@ -9579,6 +9623,34 @@ mod tests {
             r#"{"id":5,"method":"Network.setBypassServiceWorker","params":{}}"#,
         );
         assert!(bypass_bad["error"].is_object());
+
+        let attach_debug_stack_bad = dispatch(
+            &mut d,
+            r#"{"id":35,"method":"Network.setAttachDebugStack","params":{"enabled":"yes"}}"#,
+        );
+        assert!(attach_debug_stack_bad["error"].is_object());
+        assert!(d.network_attach_debug_stack());
+
+        let reporting_api_bad = dispatch(
+            &mut d,
+            r#"{"id":36,"method":"Network.setReportingApiEnabled","params":{}}"#,
+        );
+        assert!(reporting_api_bad["error"].is_object());
+        assert!(d.network_reporting_api_enabled());
+
+        let attach_debug_stack_reset = dispatch(
+            &mut d,
+            r#"{"id":37,"method":"Network.setAttachDebugStack","params":{"enabled":false}}"#,
+        );
+        assert!(attach_debug_stack_reset.get("error").is_none());
+        assert!(!d.network_attach_debug_stack());
+
+        let reporting_api_reset = dispatch(
+            &mut d,
+            r#"{"id":38,"method":"Network.setReportingApiEnabled","params":{"enabled":false}}"#,
+        );
+        assert!(reporting_api_reset.get("error").is_none());
+        assert!(!d.network_reporting_api_enabled());
 
         let user_agent = dispatch(
             &mut d,
