@@ -11075,7 +11075,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_name_evaluates_once() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 1",
@@ -11083,7 +11082,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_follow_source_order() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; [key('b')] = 2; } new C(); new C(); log.join(',') === 'a,b'",
@@ -11091,7 +11089,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_interleave_with_static_blocks() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static { log.push('b'); } [key('c')] = 2; } log.join(',') === 'a,b,c'",
@@ -11099,7 +11096,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_interleave_with_static_fields() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static x = log.push('b'); [key('c')] = 2; } log.join(',') === 'a,b,c'",
@@ -11107,7 +11103,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_cached_for_multiple_fields() {
         assert_eval_true(
             "var idx = 0; function key() { idx++; return 'k' + idx; } class C { [key()] = 1; [key()] = 2; } var o = new C(); idx === 2 && o.k1 === 1 && o.k2 === 2",
@@ -11115,7 +11110,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_cached_across_instances() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } var value = 0; class C { [key()] = ++value; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 2",
@@ -11123,7 +11117,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_only_run_once_for_derived_class() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class A {} class B extends A { [key()] = 1; } new B(); new B(); count === 1",
@@ -11131,7 +11124,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_name_with_this_based_initializer() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { y = 2; [key()] = this.y + 1; } var o = new C(); count === 1 && o.x === 3",
@@ -11139,7 +11131,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_defined_on_each_instance() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.hasOwnProperty('x') && b.hasOwnProperty('x')",

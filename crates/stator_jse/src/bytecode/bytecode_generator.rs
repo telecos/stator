@@ -2692,9 +2692,6 @@ impl FunctionCompiler {
                     ));
                     let key_reg = ic.allocator.allocate_temporary();
                     ic.emit_star(key_reg);
-                    ic.allocator
-                        .release_temporary(owner_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                     if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
@@ -2710,8 +2707,12 @@ impl FunctionCompiler {
                             slot,
                         ],
                     ));
+                    // Release in LIFO order: key_reg was allocated after owner_reg.
                     ic.allocator
                         .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    ic.allocator
+                        .release_temporary(owner_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
                 PropKey::Private(id) => {
