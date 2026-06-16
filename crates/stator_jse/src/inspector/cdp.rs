@@ -69,7 +69,7 @@
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
-//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride` | Validated setup state |
+//! | `Emulation`    | `setDeviceMetricsOverride`/`clearDeviceMetricsOverride`/`setTouchEmulationEnabled`/`setEmitTouchEventsForMouse`/`setEmulatedMedia`/`setCPUThrottlingRate`/`setHardwareConcurrencyOverride`/`setAutoDarkModeOverride`/`setDocumentCookieDisabled`/`setTimezoneOverride`/`setLocaleOverride`/`setUserAgentOverride`/`setScriptExecutionDisabled`/`setFocusEmulationEnabled`/`setIdleOverride`/`clearIdleOverride`/`setGeolocationOverride`/`clearGeolocationOverride` | Validated setup state |
 //! | `Overlay`      | `enable`/`disable`/visual setup toggles | Validated cached setup state |
 //! | `ServiceWorker` | `enable`/`disable`/`setForceUpdateOnPageLoad`/empty queries | Validated setup state |
 //! | `Schema`       | `getDomains`              | Reports the supported CDP domain names |
@@ -208,6 +208,25 @@ pub struct NetworkEmulatedConditions {
     pub packet_queue_length: Option<u32>,
     /// Requested packet reordering state, when provided.
     pub packet_reordering: Option<bool>,
+}
+
+/// Cached setup-only state requested through `Emulation.setGeolocationOverride`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmulationGeolocationOverride {
+    /// Requested latitude in degrees, when provided.
+    pub latitude: Option<f64>,
+    /// Requested longitude in degrees, when provided.
+    pub longitude: Option<f64>,
+    /// Requested position accuracy in meters, when provided.
+    pub accuracy: Option<f64>,
+    /// Requested altitude in meters, when provided.
+    pub altitude: Option<f64>,
+    /// Requested altitude accuracy in meters, when provided.
+    pub altitude_accuracy: Option<f64>,
+    /// Requested heading in degrees, when provided.
+    pub heading: Option<f64>,
+    /// Requested speed in meters per second, when provided.
+    pub speed: Option<f64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -588,6 +607,8 @@ pub struct CdpDispatcher {
     emulation_focus_emulation_enabled: bool,
     /// Cached `Emulation.setIdleOverride` state.
     emulation_idle_override: Option<(bool, bool)>,
+    /// Cached `Emulation.setGeolocationOverride` state.
+    emulation_geolocation_override: Option<EmulationGeolocationOverride>,
     /// Whether the Overlay domain is currently enabled for this session.
     overlay_enabled: bool,
     /// Cached Overlay visual-debugging toggles.
@@ -788,6 +809,7 @@ impl CdpDispatcher {
             emulation_script_execution_disabled: false,
             emulation_focus_emulation_enabled: false,
             emulation_idle_override: None,
+            emulation_geolocation_override: None,
             overlay_enabled: false,
             overlay_show_paint_rects: false,
             overlay_show_debug_borders: false,
@@ -1170,6 +1192,11 @@ impl CdpDispatcher {
     /// Returns the cached idle override state as `(user_active, screen_unlocked)`.
     pub fn emulation_idle_override(&self) -> Option<(bool, bool)> {
         self.emulation_idle_override
+    }
+
+    /// Returns the cached geolocation override state.
+    pub fn emulation_geolocation_override(&self) -> Option<&EmulationGeolocationOverride> {
+        self.emulation_geolocation_override.as_ref()
     }
 
     /// Returns `true` if the Overlay domain is currently enabled.
@@ -2204,6 +2231,10 @@ impl CdpDispatcher {
             }
             "Emulation.setIdleOverride" => self.emulation_set_idle_override(&req.params),
             "Emulation.clearIdleOverride" => self.emulation_clear_idle_override(),
+            "Emulation.setGeolocationOverride" => {
+                self.emulation_set_geolocation_override(&req.params)
+            }
+            "Emulation.clearGeolocationOverride" => self.emulation_clear_geolocation_override(),
 
             // ── Overlay ───────────────────────────────────────────────────
             "Overlay.enable" => {
@@ -2774,6 +2805,39 @@ impl CdpDispatcher {
 
     fn emulation_clear_idle_override(&mut self) -> StatorResult<Value> {
         self.emulation_idle_override = None;
+        Ok(json!({}))
+    }
+
+    fn emulation_set_geolocation_override(&mut self, params: &Value) -> StatorResult<Value> {
+        let method = "Emulation.setGeolocationOverride";
+        let latitude = optional_finite_number_param(params, "latitude", method)?;
+        validate_optional_number_range(method, "latitude", latitude, -90.0, 90.0)?;
+        let longitude = optional_finite_number_param(params, "longitude", method)?;
+        validate_optional_number_range(method, "longitude", longitude, -180.0, 180.0)?;
+        let accuracy = optional_finite_number_param(params, "accuracy", method)?;
+        validate_optional_non_negative_number(method, "accuracy", accuracy)?;
+        let altitude = optional_finite_number_param(params, "altitude", method)?;
+        let altitude_accuracy = optional_finite_number_param(params, "altitudeAccuracy", method)?;
+        validate_optional_non_negative_number(method, "altitudeAccuracy", altitude_accuracy)?;
+        let heading = optional_finite_number_param(params, "heading", method)?;
+        validate_optional_number_range(method, "heading", heading, 0.0, 360.0)?;
+        let speed = optional_finite_number_param(params, "speed", method)?;
+        validate_optional_non_negative_number(method, "speed", speed)?;
+
+        self.emulation_geolocation_override = Some(EmulationGeolocationOverride {
+            latitude,
+            longitude,
+            accuracy,
+            altitude,
+            altitude_accuracy,
+            heading,
+            speed,
+        });
+        Ok(json!({}))
+    }
+
+    fn emulation_clear_geolocation_override(&mut self) -> StatorResult<Value> {
+        self.emulation_geolocation_override = None;
         Ok(json!({}))
     }
 
@@ -5557,6 +5621,57 @@ fn required_finite_non_negative_number_param(
         )));
     }
     Ok(value)
+}
+
+fn optional_finite_number_param(
+    container: &Value,
+    field: &str,
+    method: &str,
+) -> StatorResult<Option<f64>> {
+    container
+        .get(field)
+        .map(|value| {
+            let value = value.as_f64().ok_or_else(|| {
+                StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be a number"
+                ))
+            })?;
+            if !value.is_finite() {
+                return Err(StatorError::TypeError(format!(
+                    "{method}: optional parameter '{field}' must be finite"
+                )));
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn validate_optional_number_range(
+    method: &str,
+    field: &str,
+    value: Option<f64>,
+    min: f64,
+    max: f64,
+) -> StatorResult<()> {
+    if value.is_some_and(|value| value < min || value > max) {
+        return Err(StatorError::TypeError(format!(
+            "{method}: optional parameter '{field}' must be between {min} and {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_non_negative_number(
+    method: &str,
+    field: &str,
+    value: Option<f64>,
+) -> StatorResult<()> {
+    if value.is_some_and(|value| value < 0.0) {
+        return Err(StatorError::TypeError(format!(
+            "{method}: optional parameter '{field}' must be non-negative"
+        )));
+    }
+    Ok(())
 }
 
 fn required_throughput_param(container: &Value, field: &str, method: &str) -> StatorResult<f64> {
@@ -9068,6 +9183,79 @@ mod tests {
             r#"{"id":38,"method":"Emulation.setDocumentCookieDisabled","params":{"disabled":"yes"}}"#,
         );
         assert!(document_cookie_bad["error"].is_object());
+
+        let geolocation = dispatch(
+            &mut d,
+            r#"{"id":46,"method":"Emulation.setGeolocationOverride","params":{"latitude":37.422,"longitude":-122.084,"accuracy":5,"altitude":12.5,"altitudeAccuracy":2,"heading":180,"speed":1.5}}"#,
+        );
+        assert!(geolocation.get("error").is_none());
+        let geolocation_state = d.emulation_geolocation_override().unwrap();
+        assert_eq!(geolocation_state.latitude, Some(37.422));
+        assert_eq!(geolocation_state.longitude, Some(-122.084));
+        assert_eq!(geolocation_state.accuracy, Some(5.0));
+        assert_eq!(geolocation_state.altitude, Some(12.5));
+        assert_eq!(geolocation_state.altitude_accuracy, Some(2.0));
+        assert_eq!(geolocation_state.heading, Some(180.0));
+        assert_eq!(geolocation_state.speed, Some(1.5));
+
+        let geolocation_unavailable = dispatch(
+            &mut d,
+            r#"{"id":47,"method":"Emulation.setGeolocationOverride","params":{}}"#,
+        );
+        assert!(geolocation_unavailable.get("error").is_none());
+        assert_eq!(
+            d.emulation_geolocation_override(),
+            Some(&EmulationGeolocationOverride {
+                latitude: None,
+                longitude: None,
+                accuracy: None,
+                altitude: None,
+                altitude_accuracy: None,
+                heading: None,
+                speed: None,
+            })
+        );
+
+        let geolocation_restore = dispatch(
+            &mut d,
+            r#"{"id":48,"method":"Emulation.setGeolocationOverride","params":{"latitude":1,"longitude":2,"accuracy":3}}"#,
+        );
+        assert!(geolocation_restore.get("error").is_none());
+
+        let geolocation_bad_range = dispatch(
+            &mut d,
+            r#"{"id":49,"method":"Emulation.setGeolocationOverride","params":{"latitude":91,"longitude":2,"accuracy":3}}"#,
+        );
+        assert!(geolocation_bad_range["error"].is_object());
+        assert_eq!(
+            d.emulation_geolocation_override().unwrap().latitude,
+            Some(1.0)
+        );
+
+        let geolocation_bad_accuracy = dispatch(
+            &mut d,
+            r#"{"id":50,"method":"Emulation.setGeolocationOverride","params":{"accuracy":-1}}"#,
+        );
+        assert!(geolocation_bad_accuracy["error"].is_object());
+
+        let geolocation_bad_longitude = dispatch(
+            &mut d,
+            r#"{"id":51,"method":"Emulation.setGeolocationOverride","params":{"longitude":181}}"#,
+        );
+        assert!(geolocation_bad_longitude["error"].is_object());
+
+        let geolocation_bad_type = dispatch(
+            &mut d,
+            r#"{"id":52,"method":"Emulation.setGeolocationOverride","params":{"heading":null}}"#,
+        );
+        assert!(geolocation_bad_type["error"].is_object());
+
+        let clear_geolocation = dispatch(
+            &mut d,
+            r#"{"id":53,"method":"Emulation.clearGeolocationOverride","params":{}}"#,
+        );
+        assert!(clear_geolocation.get("error").is_none());
+        assert!(d.emulation_geolocation_override().is_none());
 
         let clear_idle = dispatch(
             &mut d,
