@@ -65,7 +65,7 @@
 //! | `Target`       | `getTargets`/`attachToTarget`/`closeTarget` | Single-target DevTools compatibility |
 //! | `Network`      | `enable`/`disable`/`clearBrowserCache`/`clearBrowserCookies` | Acknowledges and tracks state      |
 //! | `Network`      | `setCacheDisabled`/`setBypassServiceWorker`/`setAttachDebugStack`/`setReportingApiEnabled`/`setUserAgentOverride`/`setExtraHTTPHeaders`/`setBlockedURLs`/`setAcceptedEncodings`/`clearAcceptedEncodingsOverride`/`emulateNetworkConditions` | Validated cached setup settings |
-//! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP` | Minimal standalone page metadata |
+//! | `Page`         | `enable`/`disable`/`getResourceTree`/`getFrameTree`/`setLifecycleEventsEnabled`/`setBypassCSP`/`setAdBlockingEnabled` | Minimal standalone page metadata |
 //! | `Log`          | `enable`/`disable`/`clear`/`startViolationsReport`/`stopViolationsReport` | Validated setup acknowledgements |
 //! | `Security`     | `enable`/`disable`/`setIgnoreCertificateErrors` | Validated setup acknowledgements |
 //! | `Performance`  | `enable`/`disable`/`getMetrics` | Reports deterministic runtime metrics |
@@ -561,6 +561,8 @@ pub struct CdpDispatcher {
     page_lifecycle_events_enabled: bool,
     /// Cached `Page.setBypassCSP` state.
     page_bypass_csp: bool,
+    /// Cached `Page.setAdBlockingEnabled` state.
+    page_ad_blocking_enabled: bool,
     /// Whether the Log domain is currently enabled for this session.
     log_enabled: bool,
     /// Number of cached violation-report settings from `Log.startViolationsReport`.
@@ -794,6 +796,7 @@ impl CdpDispatcher {
             page_enabled: false,
             page_lifecycle_events_enabled: false,
             page_bypass_csp: false,
+            page_ad_blocking_enabled: false,
             log_enabled: false,
             log_violation_setting_count: 0,
             security_enabled: false,
@@ -1089,6 +1092,11 @@ impl CdpDispatcher {
     /// Returns the cached `Page.setBypassCSP` value.
     pub fn page_bypass_csp(&self) -> bool {
         self.page_bypass_csp
+    }
+
+    /// Returns the cached `Page.setAdBlockingEnabled` value.
+    pub fn page_ad_blocking_enabled(&self) -> bool {
+        self.page_ad_blocking_enabled
     }
 
     /// Returns `true` if the Log domain is currently enabled.
@@ -2192,6 +2200,7 @@ impl CdpDispatcher {
             "Page.getFrameTree" => self.page_get_frame_tree(),
             "Page.setLifecycleEventsEnabled" => self.page_set_lifecycle_events_enabled(&req.params),
             "Page.setBypassCSP" => self.page_set_bypass_csp(&req.params),
+            "Page.setAdBlockingEnabled" => self.page_set_ad_blocking_enabled(&req.params),
 
             // ── Log ───────────────────────────────────────────────────────
             "Log.enable" => {
@@ -2583,6 +2592,12 @@ impl CdpDispatcher {
             ));
         };
         self.page_bypass_csp = enabled;
+        Ok(json!({}))
+    }
+
+    fn page_set_ad_blocking_enabled(&mut self, params: &Value) -> StatorResult<Value> {
+        let enabled = required_bool_param(params, "enabled", "Page.setAdBlockingEnabled")?;
+        self.page_ad_blocking_enabled = enabled;
         Ok(json!({}))
     }
 
@@ -9572,7 +9587,35 @@ mod tests {
         );
         assert!(bypass_csp_bad["error"].is_object());
 
-        let disable = dispatch(&mut d, r#"{"id":8,"method":"Page.disable","params":{}}"#);
+        let ad_blocking = dispatch(
+            &mut d,
+            r#"{"id":8,"method":"Page.setAdBlockingEnabled","params":{"enabled":true}}"#,
+        );
+        assert!(ad_blocking.get("error").is_none());
+        assert!(d.page_ad_blocking_enabled());
+
+        let ad_blocking_missing = dispatch(
+            &mut d,
+            r#"{"id":9,"method":"Page.setAdBlockingEnabled","params":{}}"#,
+        );
+        assert!(ad_blocking_missing["error"].is_object());
+        assert!(d.page_ad_blocking_enabled());
+
+        let ad_blocking_false = dispatch(
+            &mut d,
+            r#"{"id":10,"method":"Page.setAdBlockingEnabled","params":{"enabled":false}}"#,
+        );
+        assert!(ad_blocking_false.get("error").is_none());
+        assert!(!d.page_ad_blocking_enabled());
+
+        let ad_blocking_bad = dispatch(
+            &mut d,
+            r#"{"id":11,"method":"Page.setAdBlockingEnabled","params":{"enabled":"yes"}}"#,
+        );
+        assert!(ad_blocking_bad["error"].is_object());
+        assert!(!d.page_ad_blocking_enabled());
+
+        let disable = dispatch(&mut d, r#"{"id":12,"method":"Page.disable","params":{}}"#);
         assert!(disable.get("error").is_none());
         assert!(!d.page_enabled());
     }
