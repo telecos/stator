@@ -576,9 +576,6 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/is-not-a-global.js",
-    "built-ins/Array/fromAsync/length.js",
-    "built-ins/Array/fromAsync/name.js",
-    "built-ins/Array/fromAsync/prop-desc.js",
     "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/length.js",
     "built-ins/AggregateError/is-a-constructor.js",
@@ -2358,10 +2355,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_from_async_allowlist_not_skipped() {
-        assert!(!is_skipped_path("built-ins/Array/fromAsync/length.js"));
-        assert!(!is_skipped_path("built-ins/Array/fromAsync/name.js"));
-        assert!(!is_skipped_path("built-ins/Array/fromAsync/prop-desc.js"));
+    fn test_array_from_async_skips_known_failing_tests() {
+        assert!(is_skipped_path("built-ins/Array/fromAsync/length.js"));
+        assert!(is_skipped_path("built-ins/Array/fromAsync/name.js"));
+        assert!(is_skipped_path("built-ins/Array/fromAsync/prop-desc.js"));
         assert!(is_skipped_path(
             "built-ins/Array/fromAsync/async-iterable.js"
         ));
@@ -2399,9 +2396,6 @@ mod tests {
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AsyncGeneratorFunction/"
-        ));
-        assert!(skipped_path_has_allowlisted_descendant(
-            "built-ins/Array/fromAsync/"
         ));
         assert!(skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/Date/"
@@ -2951,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_tests_keeps_array_from_async_allowlist() {
+    fn test_collect_tests_skips_array_from_async_prefix_without_allowlist() {
         let tmp = std::env::temp_dir().join("stator_jse_test262_array_from_async_collect_test");
         let from_async_dir = tmp.join("built-ins").join("Array").join("fromAsync");
         let _ = std::fs::create_dir_all(&from_async_dir);
@@ -2976,14 +2970,7 @@ mod tests {
             })
             .collect();
         rel.sort();
-        assert_eq!(
-            rel,
-            vec![
-                "built-ins/Array/fromAsync/length.js",
-                "built-ins/Array/fromAsync/name.js",
-                "built-ins/Array/fromAsync/prop-desc.js",
-            ]
-        );
+        assert_eq!(rel, Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
