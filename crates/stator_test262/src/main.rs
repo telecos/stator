@@ -593,12 +593,10 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AggregateError/prototype/constructor.js",
     "built-ins/AggregateError/prototype/prop-desc.js",
     "built-ins/AggregateError/prototype/proto.js",
-    "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
     "built-ins/AggregateError/message-tostring-abrupt.js",
     "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
-    "built-ins/AggregateError/message-undefined-no-prop.js",
 ];
 
 /// Individual test files (relative to the `test/` directory, forward-slash
@@ -2251,7 +2249,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_error_allowlist_not_skipped() {
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/cause-property.js"
         ));
         assert!(!is_skipped_path(
@@ -2266,7 +2264,7 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-tostring-abrupt-symbol.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
@@ -2817,10 +2815,8 @@ mod tests {
         assert_eq!(
             rel,
             vec![
-                "built-ins/AggregateError/cause-property.js",
                 "built-ins/AggregateError/message-method-prop-cast.js",
                 "built-ins/AggregateError/message-method-prop.js",
-                "built-ins/AggregateError/message-undefined-no-prop.js",
                 "built-ins/AggregateError/name.js",
                 "built-ins/AggregateError/prop-desc.js",
                 "built-ins/AggregateError/proto.js",
