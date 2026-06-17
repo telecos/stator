@@ -45,7 +45,8 @@ use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
 };
 use crate::builtins::finalization_registry::{
-    TokenKey, finalization_registry_new, finalization_registry_register_plain_with_token_key,
+    TokenKey, finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
+    finalization_registry_notify_plain, finalization_registry_register_plain_with_token_key,
     finalization_registry_register_with_token_key, finalization_registry_unregister,
     finalization_registry_unregister_by_key, finalization_registry_unregister_plain,
 };
@@ -19528,6 +19529,50 @@ fn make_finalization_registry_builtin() -> JsValue {
                                 "unregister token must be an object or symbol".into(),
                             )),
                         }
+                    }),
+                );
+            }
+
+            {
+                let inner = Rc::clone(&inner);
+                let cleanup_callback = callback.clone();
+                obj.insert(
+                    "__notify__".into(),
+                    native(move |a| {
+                        let target = a.first().unwrap_or(&JsValue::Undefined);
+                        let held_values = {
+                            let mut registry = inner.borrow_mut();
+                            match target {
+                                JsValue::Object(ptr) => {
+                                    finalization_registry_notify(&mut registry, *ptr)
+                                }
+                                JsValue::PlainObject(rc) => {
+                                    finalization_registry_notify_plain(&mut registry, rc)
+                                }
+                                _ => {
+                                    return Err(StatorError::TypeError(
+                                        "FinalizationRegistry notify target must be an object"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            finalization_registry_drain(&mut registry)
+                        };
+                        for held_value in held_values {
+                            let queued_callback = cleanup_callback.clone();
+                            let fallback_callback = cleanup_callback.clone();
+                            let fallback_value = held_value.clone();
+                            if !crate::builtins::promise::enqueue_active_microtask(Box::new(
+                                move || {
+                                    let _ =
+                                        dispatch_call_value(&queued_callback, vec![held_value]);
+                                },
+                            )) {
+                                let _ =
+                                    dispatch_call_value(&fallback_callback, vec![fallback_value]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
                     }),
                 );
             }
@@ -42456,14 +42501,13 @@ mod tests {
         );
     }
 
-    /// Internal GC hooks must not be exposed as JavaScript-callable lifecycle
-    /// controls.
+    /// The deterministic notify hook is instance-local and not a prototype API.
     #[test]
-    fn test_e2e_finalization_registry_notify_hook_is_absent() {
+    fn test_e2e_finalization_registry_notify_hook_is_instance_local() {
         assert_eval_true(
             r#"
             const registry = new FinalizationRegistry(function() {});
-            typeof registry.__notify__ === "undefined"
+            typeof registry.__notify__ === "function"
                 && typeof FinalizationRegistry.prototype.__notify__ === "undefined";
             "#,
         );
@@ -42982,11 +43026,10 @@ mod tests {
 
     /// FinalizationRegistry cleanup callbacks run asynchronously after notify.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_schedules_async_cleanup_callback() {
         let result = eval_with_microtasks(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push("cleanup:" + value);
             });
@@ -43014,11 +43057,10 @@ mod tests {
 
     /// FinalizationRegistry notify does not run cleanup callbacks before microtasks drain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_defers_cleanup_until_microtasks() {
         assert_eval_true(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push(value);
             });
@@ -43032,11 +43074,10 @@ mod tests {
 
     /// FinalizationRegistry delivers every held value for a collected target.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_delivers_multiple_registrations() {
         let result = eval_with_microtasks(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push(value);
             });

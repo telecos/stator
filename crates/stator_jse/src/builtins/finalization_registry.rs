@@ -355,7 +355,9 @@ pub fn finalization_registry_notify(
     }
     let addr = target as usize;
     let mut remaining = HashMap::new();
-    for (id, reg) in registry.registrations.drain() {
+    let mut registrations = registry.registrations.drain().collect::<Vec<_>>();
+    registrations.sort_by_key(|(id, _)| *id);
+    for (id, reg) in registrations {
         if reg.target == addr {
             registry.cleanup_queue.push(reg.held_value);
         } else {
@@ -363,6 +365,29 @@ pub fn finalization_registry_notify(
         }
     }
     registry.registrations = remaining;
+}
+
+/// Test/host hook: notify the registry that an Rc-managed `PlainObject` target
+/// should be finalized.
+///
+/// This mirrors [`finalization_registry_notify`] for objects represented by
+/// [`PropertyMap`] handles instead of raw heap pointers.
+pub fn finalization_registry_notify_plain(
+    registry: &mut JsFinalizationRegistry,
+    target: &Rc<RefCell<PropertyMap>>,
+) {
+    let target = Rc::downgrade(target);
+    let mut remaining = HashMap::new();
+    let mut registrations = registry.plain_registrations.drain().collect::<Vec<_>>();
+    registrations.sort_by_key(|(id, _)| *id);
+    for (id, reg) in registrations {
+        if reg.target.ptr_eq(&target) {
+            registry.cleanup_queue.push(reg.held_value);
+        } else {
+            remaining.insert(id, reg);
+        }
+    }
+    registry.plain_registrations = remaining;
 }
 
 // ── finalization_registry_drain ──────────────────────────────────────────────
@@ -501,7 +526,9 @@ pub fn finalization_registry_unregister_plain(
 /// ```
 pub fn finalization_registry_sweep_plain(registry: &mut JsFinalizationRegistry) {
     let mut remaining = HashMap::new();
-    for (id, reg) in registry.plain_registrations.drain() {
+    let mut registrations = registry.plain_registrations.drain().collect::<Vec<_>>();
+    registrations.sort_by_key(|(id, _)| *id);
+    for (id, reg) in registrations {
         if reg.target.strong_count() == 0 {
             registry.cleanup_queue.push(reg.held_value);
         } else {
@@ -904,6 +931,19 @@ mod tests {
         finalization_registry_sweep_plain(&mut fr);
         assert!(finalization_registry_drain(&mut fr).is_empty());
         assert!(finalization_registry_has_registrations(&fr));
+    }
+
+    #[test]
+    fn test_finalization_registry_notify_plain_moves_matching_target() {
+        let mut fr = finalization_registry_new();
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        finalization_registry_register_plain(&mut fr, &obj, JsValue::String("held".into()), None);
+        finalization_registry_notify_plain(&mut fr, &obj);
+        assert_eq!(
+            finalization_registry_drain(&mut fr),
+            vec![JsValue::String("held".into())]
+        );
+        assert!(!finalization_registry_has_registrations(&fr));
     }
 
     #[test]
