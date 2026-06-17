@@ -8652,20 +8652,24 @@ fn simple_parameter_identifier(param: &Param) -> Option<&str> {
     }
 }
 
+fn has_simple_parameter_list(params: &[Param]) -> bool {
+    params
+        .iter()
+        .all(|param| simple_parameter_identifier(param).is_some())
+}
+
 fn mapped_arguments_aliases_for_params(
     params: &[Param],
     is_strict: bool,
     context_bindings: &HashMap<String, u32>,
 ) -> Vec<MappedArgumentAlias> {
-    if is_strict {
+    if is_strict || !has_simple_parameter_list(params) {
         return Vec::new();
     }
 
     let mut last_simple_formal_by_name = HashMap::new();
     for (index, param) in params.iter().enumerate() {
-        let Some(name) = simple_parameter_identifier(param) else {
-            return Vec::new();
-        };
+        let name = simple_parameter_identifier(param).expect("validated simple parameter list");
         last_simple_formal_by_name.insert(name.to_owned(), index);
     }
 
@@ -8741,24 +8745,26 @@ fn compile_function_inner(
         ));
     }
 
-    // Emit default-value and destructuring prologue for parameters.
-    compiler.emit_param_prologue(params)?;
-
     // Arrow functions do NOT get their own `arguments` object — they
     // inherit the enclosing function's `arguments` (ES §15.3.4).
+    let use_mapped_arguments = !is_strict && has_simple_parameter_list(params);
     if !is_arrow {
-        // Create the `arguments` object and bind it as a local variable.
+        // Create the `arguments` object before parameter initializers so
+        // defaults can reference the function's own arguments binding.
         compiler.emit(Instruction::new_unchecked(
-            if is_strict {
-                Opcode::CreateUnmappedArguments
-            } else {
+            if use_mapped_arguments {
                 Opcode::CreateMappedArguments
+            } else {
+                Opcode::CreateUnmappedArguments
             },
             vec![],
         ));
         let args_reg = compiler.define_local("arguments");
         compiler.emit_star(args_reg);
     }
+
+    // Emit default-value and destructuring prologue for parameters.
+    compiler.emit_param_prologue(params)?;
 
     // Named function expression self-reference: allocate a register so the
     // function body can reference the function by its own name (ES §15.2.4).

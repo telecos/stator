@@ -75387,6 +75387,40 @@ mod tests {
     }
 
     #[test]
+    fn e2e_arguments_default_parameter_initializers_see_arguments() {
+        let result = global_eval(
+            "function f(a = arguments[1]) { arguments[1] = 9; return a + ':' + arguments[1]; } f(undefined, 7)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7:9".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_default_parameters_use_unmapped_callee() {
+        let result = global_eval(
+            "function f(a = 1) { try { arguments.callee; return 'missing'; } catch (e) { return e.name; } } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_rest_parameters_are_unmapped() {
+        let result = global_eval(
+            "function f(a, ...rest) { arguments[0] = 7; a = 9; return a + ':' + arguments[0] + ':' + rest[0]; } f(1, 2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("9:7:2".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_destructuring_parameters_are_unmapped() {
+        assert_e2e_true(
+            "function f([a]) { arguments[0] = [7]; return a === 1 && arguments[0][0] === 7; } f([1])",
+        );
+    }
+
+    #[test]
     fn e2e_arguments_unmapped_param_ignores_arguments_assignment() {
         let result =
             global_eval("function f(a) { 'use strict'; arguments[0] = 7; return a; } f(1)")
