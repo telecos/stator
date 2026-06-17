@@ -440,6 +440,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
     "annexB/built-ins/RegExp/prototype/compile/length.js",
     "annexB/built-ins/RegExp/prototype/compile/name.js",
+    "annexB/built-ins/RegExp/prototype/compile/prop-desc.js",
     "annexB/built-ins/escape/argument_types.js",
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
@@ -2023,6 +2024,9 @@ mod tests {
             "annexB/built-ins/RegExp/prototype/compile/name.js"
         ));
         assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/escape/argument_types.js"
         ));
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
@@ -2629,6 +2633,59 @@ mod tests {
                 "annexB/built-ins/unescape/prop-desc.js",
                 "annexB/built-ins/unescape/two-ignore-non-hex.js",
                 "annexB/built-ins/unescape/two.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_compile_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_compile_collect_test");
+        let compile_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("RegExp")
+            .join("prototype")
+            .join("compile");
+        let _ = std::fs::create_dir_all(&compile_dir);
+        std::fs::write(
+            compile_dir.join("B.RegExp.prototype.compile.js"),
+            "RegExp.prototype.compile",
+        )
+        .unwrap();
+        std::fs::write(
+            compile_dir.join("length.js"),
+            "RegExp.prototype.compile.length",
+        )
+        .unwrap();
+        std::fs::write(compile_dir.join("name.js"), "RegExp.prototype.compile.name").unwrap();
+        std::fs::write(compile_dir.join("prop-desc.js"), "RegExp.prototype.compile").unwrap();
+        std::fs::write(
+            compile_dir.join("not-a-constructor.js"),
+            "new RegExp.prototype.compile()",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
+                "annexB/built-ins/RegExp/prototype/compile/length.js",
+                "annexB/built-ins/RegExp/prototype/compile/name.js",
+                "annexB/built-ins/RegExp/prototype/compile/prop-desc.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
