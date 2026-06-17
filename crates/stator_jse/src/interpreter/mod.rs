@@ -175,7 +175,7 @@ mod temporal_conformance_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
@@ -199,7 +199,8 @@ use crate::bytecode::bytecode_array::MaglevJitCodeCache;
 use crate::bytecode::bytecode_array::TurbofanJitCodeCache;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
-    MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
+    MAGLEV_TIERING_THRESHOLD, MappedArgumentAlias, MappedArgumentTarget, TIERING_THRESHOLD,
+    TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 #[cfg(any(
@@ -352,6 +353,13 @@ thread_local! {
 
     static CURRENT_CONSTRUCT_NEW_TARGET: RefCell<Option<JsValue>> = const { RefCell::new(None) };
 
+    static CURRENT_INTERPRETER_FRAME: Cell<*mut InterpreterFrame> =
+        const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_INTERPRETER_FRAMES: RefCell<Vec<*mut InterpreterFrame>> =
+        const { RefCell::new(Vec::new()) };
+    static CONTEXT_MAPPED_ARGUMENT_ALIASES: RefCell<Vec<ContextMappedArgumentAliasEntry>> =
+        const { RefCell::new(Vec::new()) };
+
     // Raw-pointer sentinel for the most-recently published global env.
     // Compared before touching `CURRENT_GLOBALS` or
     // `jit_runtime_set_global_env` to avoid Rc::clone + TLS borrow_mut
@@ -394,6 +402,40 @@ thread_local! {
     /// direct eval frame is running.
     static FUNCTION_CONSTRUCTOR_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
+}
+
+struct CurrentInterpreterFrameGuard {
+    frame: *mut InterpreterFrame,
+    previous: *mut InterpreterFrame,
+}
+
+impl CurrentInterpreterFrameGuard {
+    fn new(frame: *mut InterpreterFrame) -> Self {
+        let previous = CURRENT_INTERPRETER_FRAME.with(|current| {
+            let previous = current.get();
+            current.set(frame);
+            previous
+        });
+        CURRENT_INTERPRETER_FRAMES.with(|frames| frames.borrow_mut().push(frame));
+        Self { frame, previous }
+    }
+}
+
+impl Drop for CurrentInterpreterFrameGuard {
+    fn drop(&mut self) {
+        CURRENT_INTERPRETER_FRAME.with(|current| current.set(self.previous));
+        CURRENT_INTERPRETER_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            if frames.last().copied() == Some(self.frame) {
+                frames.pop();
+            } else {
+                debug_assert!(false, "interpreter frame stack out of order");
+                if let Some(pos) = frames.iter().rposition(|frame| *frame == self.frame) {
+                    frames.remove(pos);
+                }
+            }
+        });
+    }
 }
 
 /// Return the `new.target` currently visible to a native constructor callback.
@@ -3146,6 +3188,7 @@ pub(super) fn acquire_frame(
 
         frame.bytecode_array = bytecode_array;
         frame.call_args = args;
+        frame.mapped_arguments_aliases = None;
         frame.accumulator = JsValue::Undefined;
         frame.pc = 0;
         frame.context = None;
@@ -3190,6 +3233,7 @@ fn release_frame(mut frame: InterpreterFrame) {
     frame.accumulator = JsValue::Undefined;
     frame.context = None;
     frame.call_args.clear();
+    frame.mapped_arguments_aliases = None;
     frame.pending_message = JsValue::Undefined;
     frame.new_target = JsValue::Undefined;
     frame.suspend_result = None;
@@ -3671,6 +3715,316 @@ impl HotRegisters {
 // InterpreterFrame
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
+struct MappedArgumentsAliases {
+    object: Rc<RefCell<PropertyMap>>,
+    aliases: Vec<LiveMappedArgumentAlias>,
+}
+
+struct LiveMappedArgumentAlias {
+    argument_index: u32,
+    target: MappedArgumentTarget,
+    live: Rc<Cell<bool>>,
+}
+
+fn canonical_mapped_arguments_index(key: &str) -> Option<usize> {
+    if key.is_empty() {
+        return None;
+    }
+    if key == "0" {
+        return Some(0);
+    }
+    if key.starts_with('0') || !key.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    key.parse().ok()
+}
+
+pub(crate) fn notify_mapped_arguments_define_own_property(
+    object: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    descriptor: &PropertyMap,
+) {
+    let has_value = descriptor.contains_key("value");
+    let is_accessor_descriptor = descriptor.contains_key("get") || descriptor.contains_key("set");
+    let makes_non_writable = descriptor
+        .get("writable")
+        .is_some_and(|writable| !writable.to_boolean());
+
+    if !has_value && !is_accessor_descriptor && !makes_non_writable {
+        return;
+    }
+
+    if has_value {
+        notify_mapped_arguments_property_write(object, key);
+    }
+    if is_accessor_descriptor || makes_non_writable {
+        notify_mapped_arguments_property_delete(object, key);
+    }
+}
+
+pub(crate) fn notify_mapped_arguments_property_write(object: &Rc<RefCell<PropertyMap>>, key: &str) {
+    let Some(index) = canonical_mapped_arguments_index(key) else {
+        return;
+    };
+    let Some(value) = object.borrow().get(key).map(JsValue::cheap_clone) else {
+        return;
+    };
+
+    CURRENT_INTERPRETER_FRAMES.with(|frames| {
+        let frames = frames.borrow().clone();
+        for frame in frames.into_iter().rev().filter(|frame| !frame.is_null()) {
+            // SAFETY: `CURRENT_INTERPRETER_FRAMES` is maintained by
+            // `CurrentInterpreterFrameGuard` for nested `run_inner` calls on
+            // this thread. Each pointer remains valid until its guard drops,
+            // and frames are visited one at a time while the interpreter owns
+            // them exclusively.
+            let frame = unsafe { &mut *frame };
+            frame.sync_mapped_parameter_from_arguments_property(object, key);
+            if let Some(context) = frame.current_context_rc() {
+                sync_context_mapped_argument_from_arguments_property(
+                    &context, object, index, &value,
+                );
+            }
+        }
+    });
+    sync_registered_context_mapped_argument_aliases(object, index, &value);
+}
+
+pub(crate) fn notify_mapped_arguments_property_delete(
+    object: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+) {
+    let Some(index) = canonical_mapped_arguments_index(key) else {
+        return;
+    };
+
+    CURRENT_INTERPRETER_FRAMES.with(|frames| {
+        let frames = frames.borrow().clone();
+        for frame in frames.into_iter().rev().filter(|frame| !frame.is_null()) {
+            // SAFETY: `CURRENT_INTERPRETER_FRAMES` is maintained by
+            // `CurrentInterpreterFrameGuard` for nested `run_inner` calls on
+            // this thread. Each pointer remains valid until its guard drops,
+            // and frames are visited one at a time while the interpreter owns
+            // them exclusively.
+            let frame = unsafe { &mut *frame };
+            frame.sever_mapped_argument_alias(object, key);
+            if let Some(context) = frame.current_context_rc() {
+                sever_context_mapped_argument_alias(&context, object, index);
+            }
+        }
+    });
+    sever_registered_context_mapped_argument_aliases(object, index);
+}
+
+pub(crate) fn notify_mapped_arguments_freeze(object: &Rc<RefCell<PropertyMap>>) {
+    let mapped_keys = object
+        .borrow()
+        .keys()
+        .filter(|key| canonical_mapped_arguments_index(key).is_some())
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>();
+    for key in mapped_keys {
+        notify_mapped_arguments_property_delete(object, &key);
+    }
+}
+
+fn sync_context_mapped_argument_from_arguments_property(
+    start: &Rc<RefCell<crate::objects::value::JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+    value: &JsValue,
+) {
+    let mut current = Some(Rc::clone(start));
+    while let Some(context_rc) = current {
+        let (slot_indexes, parent) = {
+            let mut context = context_rc.borrow_mut();
+            let slot_indexes = context
+                .mapped_argument_aliases
+                .iter()
+                .filter(|alias| {
+                    alias.live.get()
+                        && alias.argument_index as usize == argument_index
+                        && Rc::ptr_eq(&alias.object, object)
+                })
+                .map(|alias| alias.slot_index)
+                .collect::<Vec<_>>();
+            for slot_index in &slot_indexes {
+                let slot = *slot_index as usize;
+                if slot >= context.slots.len() {
+                    context.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                context.slots[slot] = value.cheap_clone();
+            }
+            (slot_indexes, context.parent.clone())
+        };
+        for slot_index in slot_indexes {
+            sync_context_mapped_arguments(&context_rc, slot_index, value);
+        }
+        current = parent;
+    }
+}
+
+fn sever_context_mapped_argument_alias(
+    start: &Rc<RefCell<crate::objects::value::JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+) {
+    let mut current = Some(Rc::clone(start));
+    while let Some(context_rc) = current {
+        let parent = {
+            let mut context = context_rc.borrow_mut();
+            for alias in &mut context.mapped_argument_aliases {
+                if alias.argument_index as usize == argument_index
+                    && Rc::ptr_eq(&alias.object, object)
+                {
+                    alias.live.set(false);
+                }
+            }
+            context.parent.clone()
+        };
+        current = parent;
+    }
+}
+
+struct ContextMappedArgumentAliasEntry {
+    context: Weak<RefCell<JsContext>>,
+    object: Weak<RefCell<PropertyMap>>,
+    slot_index: u32,
+    argument_index: u32,
+    live: Weak<Cell<bool>>,
+}
+
+pub(super) fn register_context_mapped_argument_alias(
+    context: &Rc<RefCell<JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    slot_index: u32,
+    argument_index: u32,
+    live: &Rc<Cell<bool>>,
+) {
+    CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|entry| {
+            entry.context.strong_count() > 0
+                && entry.object.strong_count() > 0
+                && entry.live.upgrade().is_some_and(|live| live.get())
+        });
+
+        let context = Rc::downgrade(context);
+        let object = Rc::downgrade(object);
+        let live = Rc::downgrade(live);
+        if registry.iter().any(|entry| {
+            entry.slot_index == slot_index
+                && entry.argument_index == argument_index
+                && entry.context.ptr_eq(&context)
+                && entry.object.ptr_eq(&object)
+        }) {
+            return;
+        }
+
+        registry.push(ContextMappedArgumentAliasEntry {
+            context,
+            object,
+            slot_index,
+            argument_index,
+            live,
+        });
+    });
+}
+
+fn sync_registered_context_mapped_argument_aliases(
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+    value: &JsValue,
+) {
+    let aliases = CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        let mut aliases = Vec::new();
+        registry.borrow_mut().retain(|entry| {
+            let Some(context) = entry.context.upgrade() else {
+                return false;
+            };
+            let Some(registered_object) = entry.object.upgrade() else {
+                return false;
+            };
+            let Some(live) = entry.live.upgrade() else {
+                return false;
+            };
+            if !live.get() {
+                return false;
+            }
+            if entry.argument_index as usize == argument_index
+                && Rc::ptr_eq(&registered_object, object)
+            {
+                aliases.push((context, entry.slot_index));
+            }
+            true
+        });
+        aliases
+    });
+
+    for (context, slot_index) in aliases {
+        {
+            let mut context = context.borrow_mut();
+            let slot = slot_index as usize;
+            if slot >= context.slots.len() {
+                context.slots.resize(slot + 1, JsValue::Undefined);
+            }
+            context.slots[slot] = value.cheap_clone();
+        }
+        sync_context_mapped_arguments(&context, slot_index, value);
+    }
+}
+
+fn sever_registered_context_mapped_argument_aliases(
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+) {
+    CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        registry.borrow_mut().retain(|entry| {
+            if entry.context.strong_count() == 0 {
+                return false;
+            }
+            let Some(registered_object) = entry.object.upgrade() else {
+                return false;
+            };
+            let Some(live) = entry.live.upgrade() else {
+                return false;
+            };
+            if !live.get() {
+                return false;
+            }
+            if entry.argument_index as usize == argument_index
+                && Rc::ptr_eq(&registered_object, object)
+            {
+                live.set(false);
+                return false;
+            }
+            true
+        });
+    });
+}
+
+fn sync_context_mapped_arguments(
+    context: &Rc<RefCell<crate::objects::value::JsContext>>,
+    slot_index: u32,
+    value: &JsValue,
+) {
+    let aliases = {
+        let context = context.borrow();
+        context
+            .mapped_argument_aliases
+            .iter()
+            .filter(|alias| alias.live.get() && alias.slot_index == slot_index)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for alias in aliases {
+        alias
+            .object
+            .borrow_mut()
+            .insert(alias.argument_index.to_string(), value.cheap_clone());
+    }
+}
+
 /// A single activation frame for the Stator bytecode interpreter.
 ///
 /// The frame owns:
@@ -3689,6 +4043,7 @@ pub struct InterpreterFrame {
     /// Full argument list supplied to the current call, including extras beyond
     /// the formal parameter count.
     pub call_args: CallArgs,
+    mapped_arguments_aliases: Option<MappedArgumentsAliases>,
     /// The implicit accumulator register used by most instructions.
     pub accumulator: JsValue,
     /// Program counter: index of the *next* instruction to execute in the
@@ -3847,6 +4202,7 @@ impl InterpreterFrame {
             bytecode_array,
             registers,
             call_args: args,
+            mapped_arguments_aliases: None,
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
@@ -3945,6 +4301,7 @@ impl InterpreterFrame {
             bytecode_array,
             registers,
             call_args: args,
+            mapped_arguments_aliases: None,
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
@@ -3970,6 +4327,224 @@ impl InterpreterFrame {
             hot_registers: None,
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
+        }
+    }
+
+    pub(super) fn install_mapped_arguments_aliases(
+        &mut self,
+        object: Rc<RefCell<PropertyMap>>,
+        alias_metadata: &[MappedArgumentAlias],
+    ) {
+        if alias_metadata.is_empty() {
+            self.mapped_arguments_aliases = None;
+            return;
+        }
+        let mut aliases = Vec::with_capacity(alias_metadata.len());
+        {
+            let mut object = object.borrow_mut();
+            for metadata in alias_metadata {
+                if !object.contains_key(&metadata.argument_index.to_string()) {
+                    continue;
+                }
+                let value = match metadata.target {
+                    MappedArgumentTarget::Register(register) => self
+                        .registers
+                        .get(register as usize)
+                        .map(JsValue::cheap_clone)
+                        .unwrap_or(JsValue::Undefined),
+                    MappedArgumentTarget::CurrentContextSlot(slot) => self
+                        .current_context_slot_value(slot)
+                        .unwrap_or(JsValue::Undefined),
+                };
+                object.insert(metadata.argument_index.to_string(), value);
+                aliases.push(LiveMappedArgumentAlias {
+                    argument_index: metadata.argument_index,
+                    target: metadata.target.clone(),
+                    live: Rc::new(Cell::new(true)),
+                });
+            }
+        }
+        self.mapped_arguments_aliases = Some(MappedArgumentsAliases { object, aliases });
+    }
+
+    #[inline]
+    pub(super) fn clear_mapped_arguments_aliases(&mut self) {
+        self.mapped_arguments_aliases = None;
+    }
+
+    pub(super) fn is_mapped_arguments_object(&self, object: &Rc<RefCell<PropertyMap>>) -> bool {
+        self.mapped_arguments_aliases
+            .as_ref()
+            .is_some_and(|aliases| Rc::ptr_eq(&aliases.object, object))
+    }
+
+    fn sync_mapped_argument_from_parameter_index(&mut self, index: usize) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        let Some(value) = self.registers.get(index).map(JsValue::cheap_clone) else {
+            return;
+        };
+        let mut object = aliases.object.borrow_mut();
+        for alias in aliases.aliases.iter().filter(|alias| {
+            alias.live.get() && alias.target == MappedArgumentTarget::Register(index as u32)
+        }) {
+            object.insert(alias.argument_index.to_string(), value.cheap_clone());
+        }
+    }
+
+    fn current_context_slot_value(&self, slot: u32) -> Option<JsValue> {
+        let JsValue::Context(context) = self.context.as_ref()? else {
+            return None;
+        };
+        context
+            .borrow()
+            .slots
+            .get(slot as usize)
+            .map(JsValue::cheap_clone)
+    }
+
+    fn current_context_rc(&self) -> Option<Rc<RefCell<crate::objects::value::JsContext>>> {
+        let JsValue::Context(context) = self.context.as_ref()? else {
+            return None;
+        };
+        Some(Rc::clone(context))
+    }
+
+    fn install_context_mapped_argument_aliases(
+        &self,
+        object: &Rc<RefCell<PropertyMap>>,
+        aliases: &[LiveMappedArgumentAlias],
+    ) {
+        let Some(context_rc) = self.current_context_rc() else {
+            return;
+        };
+        let mut context = context_rc.borrow_mut();
+        for alias in aliases {
+            if let MappedArgumentTarget::CurrentContextSlot(slot_index) = &alias.target {
+                if context.mapped_argument_aliases.iter().any(|existing| {
+                    existing.slot_index == *slot_index
+                        && existing.argument_index == alias.argument_index
+                        && Rc::ptr_eq(&existing.object, object)
+                }) {
+                    continue;
+                }
+                context.mapped_argument_aliases.push(
+                    crate::objects::value::JsContextMappedArgumentAlias {
+                        slot_index: *slot_index,
+                        argument_index: alias.argument_index,
+                        object: Rc::clone(object),
+                        live: Rc::clone(&alias.live),
+                    },
+                );
+                register_context_mapped_argument_alias(
+                    &context_rc,
+                    object,
+                    *slot_index,
+                    alias.argument_index,
+                    &alias.live,
+                );
+            }
+        }
+    }
+
+    pub(super) fn install_mapped_arguments_aliases_for_current_context(&self) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        self.install_context_mapped_argument_aliases(&aliases.object, &aliases.aliases);
+    }
+
+    pub(super) fn sync_mapped_arguments_from_context_slot(
+        &self,
+        context: &Rc<RefCell<crate::objects::value::JsContext>>,
+        slot_index: u32,
+        value: &JsValue,
+    ) {
+        sync_context_mapped_arguments(context, slot_index, value);
+    }
+
+    pub(super) fn sync_mapped_parameter_from_arguments_property(
+        &mut self,
+        object: &Rc<RefCell<PropertyMap>>,
+        key: &str,
+    ) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        if !Rc::ptr_eq(&aliases.object, object) {
+            return;
+        }
+        let Some(index) = canonical_mapped_arguments_index(key) else {
+            return;
+        };
+        let Some(alias) = aliases
+            .aliases
+            .iter()
+            .find(|alias| alias.live.get() && alias.argument_index as usize == index)
+        else {
+            return;
+        };
+        let target = alias.target.clone();
+        let Some(value) = object.borrow().get(key).map(JsValue::cheap_clone) else {
+            return;
+        };
+        match target {
+            MappedArgumentTarget::Register(register_index) => {
+                if let Some(register) = self.registers.get_mut(register_index as usize) {
+                    *register = value;
+                }
+            }
+            MappedArgumentTarget::CurrentContextSlot(slot_index) => {
+                if let Some(context) = self.current_context_rc() {
+                    {
+                        let mut context = context.borrow_mut();
+                        let slot = slot_index as usize;
+                        if slot >= context.slots.len() {
+                            context.slots.resize(slot + 1, JsValue::Undefined);
+                        }
+                        context.slots[slot] = value.cheap_clone();
+                    }
+                    sync_context_mapped_arguments(&context, slot_index, &value);
+                }
+            }
+        }
+    }
+
+    pub(super) fn sever_mapped_argument_alias(
+        &mut self,
+        object: &Rc<RefCell<PropertyMap>>,
+        key: &str,
+    ) {
+        let current_context = self.current_context_rc();
+        let Some(aliases) = &mut self.mapped_arguments_aliases else {
+            return;
+        };
+        if !Rc::ptr_eq(&aliases.object, object) {
+            return;
+        }
+        let Some(index) = canonical_mapped_arguments_index(key) else {
+            return;
+        };
+        for alias in aliases
+            .aliases
+            .iter_mut()
+            .filter(|alias| alias.argument_index as usize == index)
+        {
+            alias.live.set(false);
+            if let MappedArgumentTarget::CurrentContextSlot(slot_index) = &alias.target
+                && let Some(context) = current_context.as_ref()
+            {
+                let mut context = context.borrow_mut();
+                for context_alias in &mut context.mapped_argument_aliases {
+                    if Rc::ptr_eq(&context_alias.object, object)
+                        && context_alias.argument_index as usize == index
+                        && context_alias.slot_index == *slot_index
+                    {
+                        context_alias.live.set(false);
+                    }
+                }
+            }
         }
     }
 
@@ -4124,6 +4699,7 @@ impl InterpreterFrame {
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
+        self.sync_mapped_argument_from_parameter_index(idx);
         Ok(())
     }
 
@@ -4144,6 +4720,7 @@ impl InterpreterFrame {
         debug_assert!(idx < self.registers.len());
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
+        self.sync_mapped_argument_from_parameter_index(idx);
     }
 
     /// Replace the register value and return the old one, without bounds
@@ -4165,7 +4742,9 @@ impl InterpreterFrame {
         };
         debug_assert!(idx < self.registers.len());
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
-        std::mem::replace(unsafe { self.registers.get_unchecked_mut(idx) }, value)
+        let old = std::mem::replace(unsafe { self.registers.get_unchecked_mut(idx) }, value);
+        self.sync_mapped_argument_from_parameter_index(idx);
+        old
     }
 
     /// Copy a value from register `src` to register `dst` directly,
@@ -4178,6 +4757,7 @@ impl InterpreterFrame {
         if src_idx != dst_idx {
             let val = self.registers[src_idx].cheap_clone();
             self.registers[dst_idx] = val;
+            self.sync_mapped_argument_from_parameter_index(dst_idx);
         }
         Ok(())
     }
@@ -4621,56 +5201,60 @@ impl Interpreter {
         )))]
         let _ = inv_count;
 
-        let result = (|| {
-            if skip_globals {
-                // Caller guarantees CURRENT_GLOBALS is already published.
-            } else {
-                // Fast pointer comparison: skip all Rc cloning and TLS
-                // mutations when the global env is unchanged from the last
-                // run_inner call on this thread.
-                let env_ptr = Rc::as_ptr(&frame.global_env) as usize;
-                let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
-                if env_ptr != cached_ptr {
-                    LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
-                    CURRENT_GLOBALS.with(|g| {
-                        *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                    });
-                    #[cfg(any(
-                        stator_baseline_jit_x86_64,
-                        all(target_arch = "x86_64", any(unix, windows))
-                    ))]
-                    {
-                        use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
-                        jit_runtime_set_global_env(frame.global_env.clone());
+        let result = {
+            let _current_frame = CurrentInterpreterFrameGuard::new(frame as *mut InterpreterFrame);
+            (|| {
+                if skip_globals {
+                    // Caller guarantees CURRENT_GLOBALS is already published.
+                } else {
+                    // Fast pointer comparison: skip all Rc cloning and TLS
+                    // mutations when the global env is unchanged from the last
+                    // run_inner call on this thread.
+                    let env_ptr = Rc::as_ptr(&frame.global_env) as usize;
+                    let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
+                    if env_ptr != cached_ptr {
+                        LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
+                        CURRENT_GLOBALS.with(|g| {
+                            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                        });
+                        #[cfg(any(
+                            stator_baseline_jit_x86_64,
+                            all(target_arch = "x86_64", any(unix, windows))
+                        ))]
+                        {
+                            use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+                            jit_runtime_set_global_env(frame.global_env.clone());
+                        }
                     }
                 }
-            }
-            if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
-                return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
-            }
+                if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
+                    return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
+                }
 
-            // JIT fast-path: attempt JIT execution BEFORE the stacker closure
-            // boundary.  Previously the JIT check lived only inside
-            // `run_dispatch`, reached through `stacker::maybe_grow`.  On
-            // Linux x86-64 the stacker closure prevented the JIT entry from
-            // being reached during Criterion measurement for all benchmarks
-            // except `fib_40` (the only one where Maglev never deopted).
-            // Moving the check here ensures `try_execute_best_jit` is always
-            // called, regardless of stack-growth mechanics.
-            if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-            {
-                return jit_result;
-            }
+                // JIT fast-path: attempt JIT execution BEFORE the stacker closure
+                // boundary.  Previously the JIT check lived only inside
+                // `run_dispatch`, reached through `stacker::maybe_grow`.  On
+                // Linux x86-64 the stacker closure prevented the JIT entry from
+                // being reached during Criterion measurement for all benchmarks
+                // except `fib_40` (the only one where Maglev never deopted).
+                // Moving the check here ensures `try_execute_best_jit` is always
+                // called, regardless of stack-growth mechanics.
+                if let Some(jit_result) =
+                    try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                {
+                    return jit_result;
+                }
 
-            // run_callee() handles the stacker guard for deep recursion.
-            // Top-level calls (via `run()`) also need it.
-            if skip_globals {
-                // Nested call: run_callee already guarded the stack.
-                Self::run_dispatch(frame)
-            } else {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
-            }
-        })();
+                // run_callee() handles the stacker guard for deep recursion.
+                // Top-level calls (via `run()`) also need it.
+                if skip_globals {
+                    // Nested call: run_callee already guarded the stack.
+                    Self::run_dispatch(frame)
+                } else {
+                    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
+                }
+            })()
+        };
         // Write back the per-frame IC state to the shared BytecodeArray cache
         // so that subsequent invocations of the same function start warm.
         if let Some(ic) = frame.mega_load_ic.take() {
@@ -7897,7 +8481,14 @@ impl Interpreter {
                                     if depth == 0 {
                                         let mut borrow = ctx_rc.borrow_mut();
                                         if slot < borrow.slots.len() {
-                                            borrow.slots[slot] = materialize_acc!();
+                                            let value = materialize_acc!();
+                                            borrow.slots[slot] = value.cheap_clone();
+                                            drop(borrow);
+                                            frame.sync_mapped_arguments_from_context_slot(
+                                                ctx_rc,
+                                                slot as u32,
+                                                &value,
+                                            );
                                             continue 'smi;
                                         }
                                     } else {
@@ -7918,7 +8509,14 @@ impl Interpreter {
                                         }
                                         let mut borrow = current.borrow_mut();
                                         if slot < borrow.slots.len() {
-                                            borrow.slots[slot] = materialize_acc!();
+                                            let value = materialize_acc!();
+                                            borrow.slots[slot] = value.cheap_clone();
+                                            drop(borrow);
+                                            frame.sync_mapped_arguments_from_context_slot(
+                                                &current,
+                                                slot as u32,
+                                                &value,
+                                            );
                                             continue 'smi;
                                         }
                                     }
@@ -7973,17 +8571,25 @@ impl Interpreter {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
-                                    let mut borrow = ctx_rc.borrow_mut();
-                                    if slot >= borrow.slots.len() {
-                                        borrow.slots.resize(slot + 1, JsValue::Undefined);
+                                    let value = materialize_acc!();
+                                    {
+                                        let mut borrow = ctx_rc.borrow_mut();
+                                        if slot >= borrow.slots.len() {
+                                            borrow.slots.resize(slot + 1, JsValue::Undefined);
+                                        }
+                                        let old_val = std::mem::replace(
+                                            &mut borrow.slots[slot],
+                                            value.cheap_clone(),
+                                        );
+                                        if let JsValue::PlainObject(rc) = old_val {
+                                            recycle_object_rc(rc);
+                                        }
                                     }
-                                    let old_val = std::mem::replace(
-                                        &mut borrow.slots[slot],
-                                        materialize_acc!(),
+                                    frame.sync_mapped_arguments_from_context_slot(
+                                        ctx_rc,
+                                        slot as u32,
+                                        &value,
                                     );
-                                    if let JsValue::PlainObject(rc) = old_val {
-                                        recycle_object_rc(rc);
-                                    }
                                     continue 'smi;
                                 }
                                 acc = materialize_acc!();
@@ -11583,16 +12189,19 @@ impl Interpreter {
                         if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
-                            let mut borrowed = js_ctx.borrow_mut();
                             let slot = slot_idx as usize;
-                            if slot >= borrowed.slots.len() {
-                                borrowed.slots.resize(slot + 1, JsValue::Undefined);
+                            {
+                                let mut borrowed = js_ctx.borrow_mut();
+                                if slot >= borrowed.slots.len() {
+                                    borrowed.slots.resize(slot + 1, JsValue::Undefined);
+                                }
+                                let old_val =
+                                    std::mem::replace(&mut borrowed.slots[slot], acc.cheap_clone());
+                                if let JsValue::PlainObject(rc) = old_val {
+                                    recycle_object_rc(rc);
+                                }
                             }
-                            let old_val =
-                                std::mem::replace(&mut borrowed.slots[slot], acc.cheap_clone());
-                            if let JsValue::PlainObject(rc) = old_val {
-                                recycle_object_rc(rc);
-                            }
+                            frame.sync_mapped_arguments_from_context_slot(js_ctx, slot_idx, &acc);
                             continue 'dispatch;
                         }
                         // Fall through to table dispatch.
@@ -12259,6 +12868,12 @@ impl Interpreter {
                                 let mut borrow = ctx_rc.borrow_mut();
                                 if slot < borrow.slots.len() {
                                     borrow.slots[slot] = acc.cheap_clone();
+                                    drop(borrow);
+                                    frame.sync_mapped_arguments_from_context_slot(
+                                        ctx_rc,
+                                        slot as u32,
+                                        &acc,
+                                    );
                                     continue 'dispatch;
                                 }
                             }
@@ -12489,6 +13104,7 @@ impl Interpreter {
             bytecode_array: bytecode_array.clone(),
             registers,
             call_args: CallArgs::new(),
+            mapped_arguments_aliases: None,
             accumulator: input,
             pc: resume_pc,
             context: None,
@@ -19963,6 +20579,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             }
             map.borrow_mut().insert(prop_name.clone(), value.clone());
             sync_global_object_property_store(map, &prop_name, value);
+            notify_mapped_arguments_property_write(map, &prop_name);
             // If this is an array-like PlainObject, update "length".
             let is_array = {
                 let pm = map.borrow();

@@ -34,7 +34,8 @@ use std::{
 };
 
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, SourcePosition,
+    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MappedArgumentAlias, MappedArgumentTarget,
+    SourcePosition,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
 use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
@@ -8641,6 +8642,53 @@ fn find_captures_in_pat_exprs(
     }
 }
 
+fn simple_parameter_identifier(param: &Param) -> Option<&str> {
+    if let Pat::Ident(ident) = &param.pat
+        && param.default.is_none()
+    {
+        Some(&ident.name)
+    } else {
+        None
+    }
+}
+
+fn mapped_arguments_aliases_for_params(
+    params: &[Param],
+    is_strict: bool,
+    context_bindings: &HashMap<String, u32>,
+) -> Vec<MappedArgumentAlias> {
+    if is_strict {
+        return Vec::new();
+    }
+
+    let mut last_simple_formal_by_name = HashMap::new();
+    for (index, param) in params.iter().enumerate() {
+        let Some(name) = simple_parameter_identifier(param) else {
+            return Vec::new();
+        };
+        last_simple_formal_by_name.insert(name.to_owned(), index);
+    }
+
+    let mut aliases = Vec::new();
+    for (index, param) in params.iter().enumerate() {
+        let name = simple_parameter_identifier(param).expect("validated simple parameter list");
+        if last_simple_formal_by_name.get(name).copied() != Some(index) {
+            continue;
+        }
+        let argument_index = index as u32;
+        let target = context_bindings
+            .get(name)
+            .copied()
+            .map(MappedArgumentTarget::CurrentContextSlot)
+            .unwrap_or(MappedArgumentTarget::Register(argument_index));
+        aliases.push(MappedArgumentAlias {
+            argument_index,
+            target,
+        });
+    }
+    aliases
+}
+
 /// Core function compiler.  `is_arrow` controls whether an `arguments`
 /// binding is emitted (arrow functions inherit the enclosing `arguments`).
 /// `self_name` enables named function expression scoping — the name is
@@ -8776,9 +8824,10 @@ fn compile_function_inner(
 
     if must_push_context {
         let mut slot_idx = 0u32;
-        // Sort own captured names for deterministic slot assignment.
+        // Sort own context-backed names for deterministic slot assignment.
         let mut owned: Vec<_> = captured.into_iter().collect();
         owned.sort();
+        owned.dedup();
         for name in &owned {
             compiler.context_bindings.insert(name.clone(), slot_idx);
             slot_idx += 1;
@@ -8821,8 +8870,8 @@ fn compile_function_inner(
             vec![to_reg_op(saved_ctx_reg)],
         ));
 
-        // Copy own parameter values that are captured from their registers
-        // into the newly created context slots.
+        // Copy own parameter values that are context-backed from their
+        // registers into the newly created context slots.
         for name in &owned {
             if let Some(binding) = compiler.scopes[0].get(name) {
                 let slot = compiler.context_bindings[name];
@@ -8851,12 +8900,22 @@ fn compile_function_inner(
                 Opcode::StaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(new_slot)],
             ));
+            compiler.emit(Instruction::new_unchecked(
+                Opcode::ForwardMappedArgumentAlias,
+                vec![
+                    to_reg_op(saved_ctx_reg),
+                    Operand::ConstantPoolIdx(*parent_slot),
+                    Operand::ConstantPoolIdx(new_slot),
+                ],
+            ));
         }
     }
     // If we do NOT push a context, the inherited `closure_captures` map is
     // left in place.  Each `LdaCurrentContextSlot(slot)` then reads from the
     // parent's context (which is still the current context for this frame),
     // so the original slot indices remain valid.
+    let mapped_arguments_aliases =
+        mapped_arguments_aliases_for_params(params, is_strict, &compiler.context_bindings);
 
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
@@ -8877,6 +8936,7 @@ fn compile_function_inner(
             .take_while(|param| param.default.is_none() && !matches!(param.pat, Pat::Rest(_)))
             .count() as u32,
     );
+    ba = ba.with_mapped_arguments_aliases(mapped_arguments_aliases);
     if let Some(reg) = self_name_reg {
         ba = ba.with_self_name_register(reg.0);
     }

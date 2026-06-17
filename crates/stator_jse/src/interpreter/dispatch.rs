@@ -29,10 +29,12 @@ use super::{
     fast_array_method_target, find_handler, fn_props_get, fn_props_set, has_property_in_chain,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
-    ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
-    resolve_jump, restore_closure_context, restore_no_receiver_this, run_callee_pooled,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    notify_mapped_arguments_property_delete, notify_mapped_arguments_property_write,
+    number_to_jsvalue, ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name,
+    proto_lookup, proto_lookup_cached_resolution, proto_lookup_chain_depth,
+    register_context_mapped_argument_alias, resolve_construct_proto, resolve_jump,
+    restore_closure_context, restore_no_receiver_this, run_callee_pooled,
     set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
     sync_global_object_property_delete, sync_global_object_property_store, to_array_index,
     to_bigint, to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
@@ -53,8 +55,8 @@ use crate::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use crate::inspector::debugger::PauseFrameSnapshot;
 use crate::objects::js_object::JsObject;
 use crate::objects::value::{
-    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
-    NativeIterator,
+    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext,
+    JsContextMappedArgumentAlias, JsValue, NativeIterator,
 };
 
 /// Stack-allocated integer-to-string conversion.
@@ -96,6 +98,48 @@ fn itoa_stack(mut n: u32) -> StackStr {
     s.len = i as u8;
     s.buf[..i].reverse();
     s
+}
+
+fn plain_object_index_store_needs_general_path(map: &PropertyMap, key: &str) -> bool {
+    if map.get("__typed_array__").is_some() {
+        return true;
+    }
+
+    let has_own_key = map.contains_key(key);
+    if map.has_accessors && (map.has_getter_for(key) || map.has_setter_for(key)) {
+        return true;
+    }
+    if has_own_key && !map.is_writable(key) {
+        return true;
+    }
+    if !has_own_key && !map.extensible {
+        return true;
+    }
+
+    let mut proto = map
+        .get(INTERNAL_PROTO_PROPERTY_KEY)
+        .or_else(|| map.get("__proto__"))
+        .cloned();
+    for _ in 0..256 {
+        match proto.take() {
+            Some(JsValue::PlainObject(p)) => {
+                let pb = p.borrow();
+                if pb.has_accessors && (pb.has_getter_for(key) || pb.has_setter_for(key)) {
+                    return true;
+                }
+                if pb.contains_key(key) && !pb.is_writable(key) {
+                    return true;
+                }
+                proto = pb
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| pb.get("__proto__"))
+                    .cloned();
+            }
+            _ => break,
+        }
+    }
+
+    false
 }
 
 /// Result of executing a single opcode handler.
@@ -636,8 +680,8 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
         return Err(err_bad_operand("Star", 0));
     };
     let val = ctx.frame.accumulator.cheap_clone();
-    let idx = ctx.frame.reg_index(v)?;
-    let old = std::mem::replace(&mut ctx.frame.registers[idx], val);
+    ctx.frame.reg_index(v)?;
+    let old = unsafe { ctx.frame.swap_reg_unchecked(v, val) };
     if let JsValue::PlainObject(rc) = old {
         recycle_object_rc(rc);
     }
@@ -2319,6 +2363,7 @@ fn handle_tail_call(
                 let inherited_new_target = ctx.frame.new_target.clone();
                 ctx.frame.bytecode_array = Rc::clone(&ba);
                 ctx.frame.call_args = args;
+                ctx.frame.clear_mapped_arguments_aliases();
                 ctx.frame.registers.clear();
                 ctx.frame.registers.resize(total_regs, JsValue::Undefined);
                 for (i, arg) in ctx
@@ -3800,6 +3845,8 @@ fn handle_push_context(
     let old_ctx = ctx.frame.context.take().unwrap_or(JsValue::Undefined);
     ctx.frame.write_reg(v, old_ctx)?;
     ctx.frame.context = Some(ctx.frame.accumulator.cheap_clone());
+    ctx.frame
+        .install_mapped_arguments_aliases_for_current_context();
     Ok(DispatchAction::Continue)
 }
 
@@ -3905,12 +3952,17 @@ fn handle_sta_context_slot(
     let ctx_val = ctx.frame.read_reg(ctx_v)?.cheap_clone();
     let js_ctx = extract_context(&ctx_val, "StaContextSlot")?;
     let target = walk_context_chain(&js_ctx, depth as u32, "StaContextSlot")?;
-    let mut borrowed = target.borrow_mut();
     let slot = slot_idx as usize;
-    if slot >= borrowed.slots.len() {
-        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    let value = ctx.frame.accumulator.cheap_clone();
+    {
+        let mut borrowed = target.borrow_mut();
+        if slot >= borrowed.slots.len() {
+            borrowed.slots.resize(slot + 1, JsValue::Undefined);
+        }
+        borrowed.slots[slot] = value.cheap_clone();
     }
-    borrowed.slots[slot] = ctx.frame.accumulator.cheap_clone();
+    ctx.frame
+        .sync_mapped_arguments_from_context_slot(&target, slot_idx, &value);
     Ok(DispatchAction::Continue)
 }
 
@@ -3939,6 +3991,62 @@ fn handle_sta_current_context_slot(
     );
     if let JsValue::PlainObject(rc) = old {
         recycle_object_rc(rc);
+    }
+    drop(borrowed);
+    let value = ctx.frame.accumulator.cheap_clone();
+    ctx.frame
+        .sync_mapped_arguments_from_context_slot(&js_ctx, slot_idx, &value);
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_forward_mapped_argument_alias(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(parent_ctx_reg) = *instr.operand(0) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 0));
+    };
+    let Operand::ConstantPoolIdx(parent_slot) = *instr.operand(1) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 1));
+    };
+    let Operand::ConstantPoolIdx(current_slot) = *instr.operand(2) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 2));
+    };
+    let parent_ctx = ctx.frame.read_reg(parent_ctx_reg)?.cheap_clone();
+    let JsValue::Context(parent_ctx) = parent_ctx else {
+        return Ok(DispatchAction::Continue);
+    };
+    let Some(JsValue::Context(current_ctx)) = ctx.frame.context.as_ref() else {
+        return Ok(DispatchAction::Continue);
+    };
+    let aliases = {
+        let parent_ctx = parent_ctx.borrow();
+        parent_ctx
+            .mapped_argument_aliases
+            .iter()
+            .filter(|alias| alias.slot_index == parent_slot && alias.live.get())
+            .map(|alias| JsContextMappedArgumentAlias {
+                slot_index: current_slot,
+                argument_index: alias.argument_index,
+                object: Rc::clone(&alias.object),
+                live: Rc::clone(&alias.live),
+            })
+            .collect::<Vec<_>>()
+    };
+    if !aliases.is_empty() {
+        for alias in &aliases {
+            register_context_mapped_argument_alias(
+                current_ctx,
+                &alias.object,
+                alias.slot_index,
+                alias.argument_index,
+                &alias.live,
+            );
+        }
+        current_ctx
+            .borrow_mut()
+            .mapped_argument_aliases
+            .extend(aliases);
     }
     Ok(DispatchAction::Continue)
 }
@@ -4960,9 +5068,8 @@ fn handle_sta_keyed_property(
         return Err(err_bad_operand("StaKeyedProperty", 1));
     };
     ic_counters::record_probe(IcTier::Interpreter, IcOp::IndexedStore);
-    // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
-    // Skips setter check, prototype walk, writable check, and string alloc.
-    // Numeric indices on array-like PlainObjects never have setter accessors.
+    // ── Fast path: Smi key — Array first (hot for sieve), then plain data
+    // PlainObject stores that do not need descriptor/accessor semantics.
     if let JsValue::Smi(idx) = ctx.frame.read_reg(key_v)?
         && *idx >= 0
     {
@@ -4970,8 +5077,8 @@ fn handle_sta_keyed_property(
         // Read accumulator before the object register so we don't need
         // Rc::clone — both reads are shared borrows of ctx.frame.
         let val = ctx.frame.accumulator.cheap_clone();
-        let obj_ref = ctx.frame.read_reg(obj_v)?;
-        if let JsValue::Array(items) = obj_ref {
+        let obj_ref = ctx.frame.read_reg(obj_v)?.cheap_clone();
+        if let JsValue::Array(items) = &obj_ref {
             let i = idx_val as usize;
             // SAFETY: single-threaded interpreter; no concurrent borrows
             // possible between the raw deref and the element write.
@@ -4987,26 +5094,36 @@ fn handle_sta_keyed_property(
             }
             ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
-        } else if let JsValue::PlainObject(map) = obj_ref {
-            // SAFETY: single-threaded interpreter; no concurrent borrows.
-            let m = unsafe { &mut *map.as_ptr() };
-            // TypedArray: skip the fast path so integer indices reach the
-            // shared backing buffer via keyed_store, not a wrapper own
-            // property that would shadow the buffer.
-            if m.get("__typed_array__").is_some() {
-                // Fall through to general path.
-            } else {
+        } else if let JsValue::PlainObject(map) = &obj_ref {
+            let fast_key = {
+                // SAFETY: single-threaded interpreter; no concurrent borrows
+                // possible during this scoped raw access. Drop the raw mutable
+                // borrow before notifying mapped-arguments aliases, which can
+                // re-enter the same RefCell through context-slot sync.
+                let m = unsafe { &mut *map.as_ptr() };
                 let key_str = itoa_stack(idx_val as u32);
-                m.insert(key_str.as_str().to_owned(), val);
-                // Update length if needed for array-like objects.
-                let i = idx_val as usize;
-                let cur_len = match m.get("length") {
-                    Some(JsValue::Smi(n)) => *n as usize,
-                    _ => 0,
-                };
-                if i >= cur_len {
-                    m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+                let key_ref = key_str.as_str();
+                if plain_object_index_store_needs_general_path(m, key_ref) {
+                    // Fall through to general path.
+                    None
+                } else {
+                    let key = key_ref.to_owned();
+                    m.insert(key.clone(), val);
+                    if matches!(m.get("__is_array__"), Some(JsValue::Boolean(true))) {
+                        let i = idx_val as usize;
+                        let cur_len = match m.get("length") {
+                            Some(JsValue::Smi(n)) => *n as usize,
+                            _ => 0,
+                        };
+                        if i >= cur_len {
+                            m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+                        }
+                    }
+                    Some(key)
                 }
+            };
+            if let Some(key) = fast_key {
+                notify_mapped_arguments_property_write(map, &key);
                 ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
                 return Ok(DispatchAction::Continue);
             }
@@ -5137,6 +5254,14 @@ fn handle_sta_keyed_property(
                                 return Ok(DispatchAction::Continue);
                             }
                         }
+                        if pb.contains_key(&key_str) && !pb.is_writable(&key_str) {
+                            if ctx.frame.bytecode_array.is_strict() {
+                                return Err(StatorError::TypeError(format!(
+                                    "Cannot assign to read only property '{key_str}'"
+                                )));
+                            }
+                            return Ok(DispatchAction::Continue);
+                        }
                         proto = pb
                             .get(INTERNAL_PROTO_PROPERTY_KEY)
                             .or_else(|| pb.get("__proto__"))
@@ -5167,7 +5292,20 @@ fn handle_sta_keyed_property(
         }
         drop(pm);
     }
-    keyed_store(&obj, &key, val)?;
+    let mapped_store = if let JsValue::PlainObject(map) = &obj
+        && ctx.frame.is_mapped_arguments_object(map)
+    {
+        let prop_name = to_property_key(&key)?;
+        keyed_store(&obj, &JsValue::String(prop_name.clone().into()), val)?;
+        Some((Rc::clone(map), prop_name))
+    } else {
+        keyed_store(&obj, &key, val)?;
+        None
+    };
+    if let Some((map, key)) = mapped_store {
+        ctx.frame
+            .sync_mapped_parameter_from_arguments_property(&map, &key);
+    }
     // Accumulator stays unchanged.
     Ok(DispatchAction::Continue)
 }
@@ -7001,6 +7139,9 @@ fn handle_delete_property_sloppy(
         // Primitives and other object types: delete returns true.
         true
     };
+    if removed && let JsValue::PlainObject(ref map) = obj {
+        notify_mapped_arguments_property_delete(map, &key);
+    }
     ctx.frame.accumulator = JsValue::Boolean(removed);
     Ok(DispatchAction::Continue)
 }
@@ -7040,6 +7181,7 @@ fn handle_delete_property_strict(
             }
             drop(pm);
             sync_global_object_property_delete(map, &key);
+            notify_mapped_arguments_property_delete(map, &key);
         } else if pm.contains_key(&key) && !pm.is_configurable(&key) {
             return Err(StatorError::TypeError(format!(
                 "Cannot delete property '{key}' of object"
@@ -7048,6 +7190,7 @@ fn handle_delete_property_strict(
             drop(pm);
             map.borrow_mut().remove(&key);
             sync_global_object_property_delete(map, &key);
+            notify_mapped_arguments_property_delete(map, &key);
         }
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {
@@ -7110,7 +7253,11 @@ fn handle_create_mapped_arguments(
             )))
         })),
     );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    let object = Rc::new(RefCell::new(map));
+    let aliases = ctx.frame.bytecode_array.mapped_arguments_aliases().to_vec();
+    ctx.frame
+        .install_mapped_arguments_aliases(Rc::clone(&object), &aliases);
+    ctx.frame.accumulator = JsValue::PlainObject(object);
     Ok(DispatchAction::Continue)
 }
 
@@ -9482,6 +9629,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::CreateObjectFromIterable as usize] = handle_create_object_from_iterable;
     table[Opcode::PushContext as usize] = handle_push_context;
     table[Opcode::PopContext as usize] = handle_pop_context;
+    table[Opcode::ForwardMappedArgumentAlias as usize] = handle_forward_mapped_argument_alias;
     table[Opcode::ForInEnumerate as usize] = handle_for_in_enumerate;
     table[Opcode::ForInPrepare as usize] = handle_for_in_prepare;
     table[Opcode::ForInNext as usize] = handle_for_in_next;
@@ -10271,6 +10419,31 @@ mod tests {
             result.is_err(),
             "strict mode write to non-writable should throw"
         );
+    }
+
+    #[test]
+    fn e2e_inherited_non_writable_index_store_does_not_create_own_property() {
+        let result = crate::builtins::global::global_eval(
+            "var p = {}; \
+             Object.defineProperty(p, '0', { value: 1, writable: false }); \
+             var o = Object.create(p); \
+             o[0] = 2; \
+             o[0] + ':' + Object.prototype.hasOwnProperty.call(o, '0')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1:false".into()));
+    }
+
+    #[test]
+    fn e2e_inherited_non_writable_index_store_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; \
+             var p = {}; \
+             Object.defineProperty(p, '0', { value: 1, writable: false }); \
+             var o = Object.create(p); \
+             o[0] = 2;",
+        );
+        assert!(result.is_err());
     }
 
     /// preventExtensions: new property in sloppy mode silently fails.

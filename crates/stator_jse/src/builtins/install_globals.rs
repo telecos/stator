@@ -1198,6 +1198,7 @@ fn define_plain_own_property(
             }
         }
     }
+    crate::interpreter::notify_mapped_arguments_define_own_property(map, key, desc);
     Ok(())
 }
 
@@ -1384,12 +1385,16 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
         borrow.remove(&setter_key);
         borrow.remove(key);
         borrow.unmark_accessor_property(key);
+        drop(borrow);
+        crate::interpreter::notify_mapped_arguments_property_delete(map, key);
         true
     } else if borrow.contains_key(key) {
         if !borrow.is_configurable(key) {
             return false;
         }
         borrow.remove(key);
+        drop(borrow);
+        crate::interpreter::notify_mapped_arguments_property_delete(map, key);
         true
     } else {
         true
@@ -15417,6 +15422,7 @@ fn make_object() -> JsValue {
                     }
                 }
             }
+            crate::interpreter::notify_mapped_arguments_define_own_property(map, key, desc);
             Ok(())
         }
 
@@ -15851,7 +15857,10 @@ fn make_object() -> JsValue {
             builtin_fn("freeze", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
                 match &obj {
-                    JsValue::PlainObject(map) => map.borrow_mut().freeze(),
+                    JsValue::PlainObject(map) => {
+                        map.borrow_mut().freeze();
+                        crate::interpreter::notify_mapped_arguments_freeze(map);
+                    }
                     JsValue::Error(e) => e.props.borrow_mut().freeze(),
                     _ => {}
                 }
@@ -72963,6 +72972,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
+    #[test]
     fn e2e_define_property_data_to_accessor_updates_descriptor_shape() {
         let result = global_eval(
             "var o = { x: 1 }; \
@@ -75070,17 +75080,310 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_mapped_param_reads_arguments_assignment() {
         let result = global_eval("function f(a) { arguments[0] = 7; return a; } f(1)").unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_mapped_arguments_reads_param_assignment() {
         let result = global_eval("function f(a) { a = 9; return arguments[0]; } f(1)").unwrap();
         assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_object_key_store_avoids_extra_key_conversion() {
+        let result = global_eval(
+            "function f(a) { var count = 0; \
+             var key = { toString: function() { count = count + 1; return '0'; } }; \
+             arguments[key] = 7; return count < 3 && a === 7 && arguments[0] === 7; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_param_assignment() {
+        let result =
+            global_eval("function f(a) { delete arguments[0]; a = 9; return arguments[0]; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_argument_assignment() {
+        let result =
+            global_eval("function f(a) { delete arguments[0]; arguments[0] = 9; return a; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_failed_delete_preserves_alias() {
+        let result = global_eval(
+            "function f(a) { Object.defineProperty(arguments, '0', { configurable: false }); \
+             var deleted = delete arguments[0]; a = 9; return deleted + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false:9".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_object_define_value_syncs_parameter() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7 }); \
+             return a === 7 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_reflect_define_value_syncs_parameter() {
+        assert_e2e_true(
+            "function f(a) { var ok = Reflect.defineProperty(arguments, '0', { value: 7 }); \
+             return ok && a === 7 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_accessor_descriptor_severs_alias() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { get: function() { return 11; } }); \
+             a = 9; return a === 9 && arguments[0] === 11; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_non_writable_descriptor_syncs_then_severs() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7, writable: false }); \
+             var synced = a; a = 9; return synced === 7 && a === 9 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_non_writable_numeric_store_does_not_bypass_descriptor() {
+        let result = global_eval(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7, writable: false }); \
+             arguments[0] = 8; return a + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7:7".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_failed_define_preserves_alias() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { configurable: false }); \
+             var ok = Reflect.defineProperty(arguments, '0', { get: function() { return 3; } }); \
+             a = 9; return ok === false && arguments[0] === 9; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_extra_args_are_not_aliases() {
+        let result =
+            global_eval("function f(a) { arguments[1] = 9; a = 5; return arguments[1]; } f(1, 2)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_noncanonical_numeric_key_is_not_alias() {
+        let result = global_eval(
+            "function f(a) { arguments['01'] = 9; return a === 1 && arguments['01'] === 9; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_duplicate_formal_last_duplicate_wins() {
+        assert_e2e_true(
+            "function f(a, a) { arguments[0] = 7; var before = a; arguments[1] = 8; return arguments[0] === 7 && before === 2 && a === 8; } f(1, 2)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_duplicate_formal_param_syncs_last_argument() {
+        assert_e2e_true(
+            "function f(a, a) { a = 9; return arguments[0] === 1 && arguments[1] === 9; } f(1, 2)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_captured_param_reads_arguments_assignment() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } arguments[0] = 7; return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_arguments_reads_captured_param_assignment() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } a = 9; return arguments[0] === 9 && g() === 9; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } delete arguments[0]; a = 9; arguments[0] = 8; return g() === 9 && arguments[0] === 8; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_closure_write_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { args[0] = 7; return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_object_assign_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.assign(args, {'0': 7}); return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_write_syncs_uncaptured_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { args[0] = 99; })(); return a + ':' + args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("99:99".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_reflect_delete_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Reflect.deleteProperty(args, '0'); a = 9; args[0] = 8; return a === 9 && args[0] === 8; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_delete_severs_uncaptured_param_alias() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { delete args[0]; })(); a = 99; return args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_define_property_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.defineProperty(args, '0', { value: 7 }); return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_define_accessor_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.defineProperty(args, '0', { get: function() { return 11; } }); a = 9; return a === 9 && args[0] === 11; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_freeze_severs_alias() {
+        let result = global_eval(
+            "function f(a) { Object.freeze(arguments); a = 9; return arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_freeze_ignores_argument_assignment() {
+        let result = global_eval(
+            "function f(a) { Object.freeze(arguments); arguments[0] = 9; return a + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1:1".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_freeze_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.freeze(args); a = 9; return args[0] === 1 && a === 9; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_freeze_severs_uncaptured_param_alias() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { Object.freeze(args); })(); a = 99; return args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_nested_escaped_closure_syncs_captured_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; function m() { function h() { args[0] = 7; return a; } return h(); } return m(); } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_nested_out_of_chain_write_syncs_forwarded_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; function m() { return function() { return a; }; } \
+             var h = m(); args[0] = 7; return h(); } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_write_syncs_forwarded_param() {
+        let result = global_eval(
+            "var saved, h; function f(a) { saved = arguments; function m() { return function() { return a; }; } \
+             h = m(); } f(1); saved[0] = 7; h();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_write_syncs_captured_param() {
+        let result = global_eval(
+            "var saved; function f(a) { saved = arguments; return function() { return a; }; } \
+             var g = f(1); saved[0] = 7; g();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_delete_severs_captured_param() {
+        let result = global_eval(
+            "var saved; function f(a) { saved = arguments; return function() { a = 9; return saved[0]; }; } \
+             var g = f(1); delete saved[0]; g();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_deleted_index_respects_inherited_non_writable() {
+        let result = global_eval(
+            "function f(a) { delete arguments[0]; var p = {}; \
+             Object.defineProperty(p, '0', { value: 4, writable: false }); \
+             Object.setPrototypeOf(arguments, p); arguments[0] = 7; \
+             return Object.prototype.hasOwnProperty.call(arguments, '0') + ':' + arguments[0] + ':' + a; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false:4:1".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_complex_parameters_are_unmapped() {
+        assert_e2e_true(
+            "function f(a = 1) { arguments[0] = 9; return a === 1 && arguments[0] === 9; } f(undefined)",
+        );
     }
 
     #[test]
@@ -83030,14 +83333,12 @@ mod tests {
 
     /// Arguments in sloppy mode: mutation of param reflects in arguments.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_sloppy_param_mutation() {
         assert_e2e_true("function f(a) { a = 99; return arguments[0] === 99; } f(1)");
     }
 
     /// Arguments in sloppy mode: mutation of arguments[0] reflects in param.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_sloppy_arg_mutation() {
         assert_e2e_true("function f(a) { arguments[0] = 42; return a === 42; } f(1)");
     }

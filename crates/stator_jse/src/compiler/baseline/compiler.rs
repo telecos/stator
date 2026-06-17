@@ -8305,6 +8305,7 @@ pub(crate) mod jit_runtime {
         let ctx = JsContext {
             slots: vec![JsValue::Smi(0); 3],
             parent: None,
+            mapped_argument_aliases: Vec::new(),
         };
         let data_ptr = ctx.slots.as_ptr() as usize;
         let data_len = ctx.slots.len();
@@ -15977,6 +15978,19 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 let reg_flat = self.reg_flat_index(v) as i64;
                 self.emit_runtime_stub(Opcode::PopContext, reg_flat, 0, bytecode_offset);
+            }
+
+            Opcode::ForwardMappedArgumentAlias => {
+                let Operand::Register(_) = *instr.operand(0) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 0));
+                };
+                let Operand::ConstantPoolIdx(_) = *instr.operand(1) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 1));
+                };
+                let Operand::ConstantPoolIdx(_) = *instr.operand(2) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 2));
+                };
+                self.emit_deopt(bytecode_offset);
             }
 
             // ── Div / Mod runtime stubs ─────────────────────────────────────

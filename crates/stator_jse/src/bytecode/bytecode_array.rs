@@ -89,6 +89,24 @@ pub struct HandlerTableEntry {
     pub is_finally: bool,
 }
 
+/// Runtime storage location for a sloppy mapped-arguments alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappedArgumentTarget {
+    /// The alias targets the formal parameter register at the given flat index.
+    Register(u32),
+    /// The alias targets a slot in the current function context.
+    CurrentContextSlot(u32),
+}
+
+/// Immutable bytecode metadata for one sloppy mapped-arguments alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedArgumentAlias {
+    /// Canonical `arguments[index]` property that participates in aliasing.
+    pub argument_index: u32,
+    /// Parameter storage location that remains aliased until delete succeeds.
+    pub target: MappedArgumentTarget,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConstantPoolEntry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -451,6 +469,8 @@ struct SharedBytecodeTemplate {
     binding_registers: Rc<HashMap<String, i32>>,
     /// Sparse mapping from bytecode offsets to source locations.
     source_positions: Rc<[SourcePosition]>,
+    /// Sloppy mapped-arguments aliases compiled for this function.
+    mapped_arguments_aliases: Rc<[MappedArgumentAlias]>,
     /// Compile-time description of all inline-cache feedback slots.
     feedback_metadata: Rc<FeedbackMetadata>,
     /// Runtime inline-cache feedback shared by all clones of this function.
@@ -614,6 +634,7 @@ impl PartialEq for BytecodeArray {
             && self.inner.source_text == other.inner.source_text
             && self.inner.binding_registers == other.inner.binding_registers
             && self.inner.source_positions == other.inner.source_positions
+            && self.inner.mapped_arguments_aliases == other.inner.mapped_arguments_aliases
             && self.inner.feedback_metadata == other.inner.feedback_metadata
             && self.inner.handler_table == other.inner.handler_table
             && self.inner.is_generator == other.inner.is_generator
@@ -662,6 +683,7 @@ impl BytecodeArray {
                 source_text: None,
                 binding_registers: Rc::new(HashMap::new()),
                 source_positions: source_positions.into(),
+                mapped_arguments_aliases: Rc::from([]),
                 feedback_metadata: Rc::new(feedback_metadata),
                 feedback_vector: Rc::new(RefCell::new(feedback_vector)),
                 handler_table: Rc::new(handler_table),
@@ -1410,6 +1432,19 @@ impl BytecodeArray {
     /// The source-position table (may be empty if debug info was stripped).
     pub fn source_positions(&self) -> &[SourcePosition] {
         &self.inner.source_positions
+    }
+
+    /// Sloppy mapped-arguments alias metadata for this function.
+    pub fn mapped_arguments_aliases(&self) -> &[MappedArgumentAlias] {
+        &self.inner.mapped_arguments_aliases
+    }
+
+    /// Set sloppy mapped-arguments alias metadata for this function.
+    pub fn with_mapped_arguments_aliases(mut self, aliases: Vec<MappedArgumentAlias>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_mapped_arguments_aliases called after sharing")
+            .mapped_arguments_aliases = aliases.into();
+        self
     }
 
     /// The compile-time feedback metadata for all inline-cache slots.
@@ -2170,14 +2205,9 @@ mod tests {
 
     #[test]
     fn test_decoded_instructions_are_cached() {
-        let mut array = make_simple_array();
+        let array = make_simple_array();
 
-        // Decode fresh to compare against cached version.
-        let expected_offsets = bytecodes::decode_with_byte_offsets(array.bytecodes())
-            .expect("valid bytecode")
-            .1;
-
-        // First call populates the cache (uses &mut self).
+        // First call populates the cache.
         // The peephole optimizer fuses LdaSmi+Star into LdaSmiStar, yielding
         // two instructions instead of three.
         {
@@ -2228,7 +2258,7 @@ mod tests {
 
     #[test]
     fn test_decoded_instructions_cache_includes_jump_targets() {
-        let mut array = make_jump_array();
+        let array = make_jump_array();
 
         let (instructions, _offsets, jump_targets) =
             array.decoded_instructions().expect("valid bytecode");
@@ -2262,7 +2292,7 @@ mod tests {
         *resolved[4].operand_mut(0) =
             Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
-        let mut array = BytecodeArray::new(
+        let array = BytecodeArray::new(
             encode(&resolved),
             vec![],
             4,

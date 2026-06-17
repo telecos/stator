@@ -30,7 +30,7 @@
 //! - [`NativeIterator`] — a Rust-level iterator that wraps a pre-collected
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -428,11 +428,26 @@ const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 /// Each context contains a vector of numbered slots and an optional parent
 /// pointer so that inner scopes can walk the chain to reach outer scopes.
 #[derive(Debug, Clone, PartialEq)]
+pub struct JsContextMappedArgumentAlias {
+    /// Slot in this context that remains aliased to a mapped `arguments` index.
+    pub slot_index: u32,
+    /// Canonical `arguments[index]` property backed by the context slot.
+    pub argument_index: u32,
+    /// The mapped `arguments` object that owns the aliased property.
+    pub object: Rc<RefCell<crate::objects::property_map::PropertyMap>>,
+    /// Shared liveness flag, cleared after a successful delete/freeze severs the mapped alias.
+    pub live: Rc<Cell<bool>>,
+}
+
+/// A captured lexical environment with optional mapped-arguments alias state.
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsContext {
     /// The captured variable slots.
     pub slots: Vec<JsValue>,
     /// The enclosing (parent) context, or `None` for the outermost scope.
     pub parent: Option<Rc<RefCell<JsContext>>>,
+    /// Mapped `arguments` aliases whose targets live in this context.
+    pub mapped_argument_aliases: Vec<JsContextMappedArgumentAlias>,
 }
 
 impl JsContext {
@@ -452,12 +467,14 @@ impl JsContext {
             ctx.slots.clear();
             ctx.slots.resize(slot_count, JsValue::Undefined);
             ctx.parent = parent;
+            ctx.mapped_argument_aliases.clear();
             drop(ctx);
             rc
         } else {
             Rc::new(RefCell::new(Self {
                 slots: vec![JsValue::Undefined; slot_count],
                 parent,
+                mapped_argument_aliases: Vec::new(),
             }))
         }
     }
