@@ -80926,7 +80926,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_in_operator_subclass_instance_true() {
         assert_eval_true(
             "class Base { #x = 1; static has(o) { return #x in o; } } \
@@ -80970,7 +80969,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_fields_in_subclass_inherit_parent_access() {
         assert_eval_true(
             "class Base { #x = 5; getBase() { return this.#x; } } \
@@ -80980,7 +80978,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_fields_in_subclass_keep_own_fields() {
         assert_eval_true(
             "class Base { #x = 5; getBase() { return this.#x; } } \
@@ -80991,7 +80988,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_shadowing_parent_child() {
         assert_eval_true(
             "class Base { #x = 1; getBase() { return this.#x; } } \
@@ -81001,7 +80997,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_shadowing_parent_child() {
         assert_eval_true(
             "class Base { #m() { return 1; } callBase() { return this.#m(); } } \
@@ -81048,7 +81043,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_brand_shadowing_adds_both_brands() {
         assert_eval_true(
             "class Base { #x = 1; static hasBase(o) { return #x in o; } getBase() { return this.#x; } } \
@@ -81094,7 +81088,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_can_access_parent_private_field_on_subclass_instance() {
         assert_eval_true(
             "class Base { #x = 10; #m() { return this.#x; } callBase() { return this.#m(); } } \

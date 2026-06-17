@@ -3217,7 +3217,7 @@ fn call_plain_object_function(
                 }
                 if !is_derived_constructor {
                     let mut env = ctx.frame.global_env.borrow_mut();
-                    env.set_this(pending_this);
+                    env.set_this(pending_this.clone());
                 }
             }
             None => {
@@ -3279,6 +3279,13 @@ fn call_plain_object_function(
     } else {
         None
     };
+    if is_class_constructor
+        && is_super_callee
+        && !is_derived_constructor
+        && let Some(this) = pending_super_this.as_ref()
+    {
+        run_class_field_init(&ctx.frame.global_env, this, map, &ctx.frame.new_target)?;
+    }
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
