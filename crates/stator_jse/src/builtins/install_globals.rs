@@ -71194,7 +71194,6 @@ mod tests {
 
     /// finally overrides the return value from try block.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix finally-return interaction
     fn e2e_finally_overrides_return() {
         let r = global_eval(
             r#"
@@ -71210,7 +71209,6 @@ mod tests {
 
     /// finally overrides the return value from catch block.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_finally_overrides_catch_return() {
         let r = global_eval(
             r#"

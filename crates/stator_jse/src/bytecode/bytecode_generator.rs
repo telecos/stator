@@ -1001,9 +1001,12 @@ impl FunctionCompiler {
     /// `try-finally` has its finally body executed before control
     /// transfers away.
     fn inline_pending_finally_blocks(&mut self) -> StatorResult<()> {
-        let blocks: Vec<_> = self.finally_stack.clone();
-        for block in blocks.iter().rev() {
-            self.compile_block(block)?;
+        let blocks = self.finally_stack.clone();
+        for i in (0..blocks.len()).rev() {
+            let saved_stack = std::mem::replace(&mut self.finally_stack, blocks[..i].to_vec());
+            let result = self.compile_block(&blocks[i]);
+            self.finally_stack = saved_stack;
+            result?;
         }
         Ok(())
     }
@@ -3217,8 +3220,9 @@ impl FunctionCompiler {
         // Compile try block.
         self.compile_block(&s.block)?;
 
-        // Pop the finalizer — normal-path finally is compiled explicitly below.
-        if s.finalizer.is_some() {
+        // Pop the finalizer for try/finally. For try/catch/finally, keep it
+        // pending while compiling catch so returns in catch also run finally.
+        if s.finalizer.is_some() && s.handler.is_none() {
             self.finally_stack.pop();
         }
 
@@ -3253,6 +3257,9 @@ impl FunctionCompiler {
                 }
             }
             self.compile_block(&handler.body)?;
+            if s.finalizer.is_some() {
+                self.finally_stack.pop();
+            }
             self.pop_scope();
             let catch_end = self.instructions.len() as u32;
 
@@ -13591,7 +13598,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: hangs in CI – finally/return interaction
     fn test_finally_overrides_return() {
         let result = crate::builtins::global::global_eval(
             "(function() { try { return 1; } finally { return 2; } })()",
