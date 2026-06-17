@@ -1919,10 +1919,16 @@ impl CdpDispatcher {
     }
 
     fn target_set_discover_targets(&mut self, params: &Value) -> StatorResult<Value> {
-        self.target_discovery_enabled = params
-            .get("discover")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let discover = required_bool_param(params, "discover", "Target.setDiscoverTargets")?;
+        if let Some(filter) = params.get("filter")
+            && !filter.is_array()
+        {
+            return Err(StatorError::TypeError(
+                "Target.setDiscoverTargets: optional parameter 'filter' must be an array"
+                    .to_string(),
+            ));
+        }
+        self.target_discovery_enabled = discover;
         if self.target_discovery_enabled {
             for target_info in self.target_infos() {
                 self.push_event("Target.targetCreated", json!({ "targetInfo": target_info }));
@@ -11083,6 +11089,31 @@ mod tests {
             DEFAULT_TARGET_ID
         );
         assert_eq!(messages[1]["id"], 1);
+
+        let ok_with_filter = dispatch(
+            &mut d,
+            r#"{"id":2,"method":"Target.setDiscoverTargets","params":{"discover":false,"filter":[{"type":"page"}]}}"#,
+        );
+        assert!(ok_with_filter.get("error").is_none());
+        assert!(!d.target_discovery_enabled);
+
+        let missing_discover = dispatch(
+            &mut d,
+            r#"{"id":3,"method":"Target.setDiscoverTargets","params":{}}"#,
+        );
+        assert!(missing_discover["error"].is_object());
+
+        let bad_discover = dispatch(
+            &mut d,
+            r#"{"id":4,"method":"Target.setDiscoverTargets","params":{"discover":"yes"}}"#,
+        );
+        assert!(bad_discover["error"].is_object());
+
+        let bad_filter = dispatch(
+            &mut d,
+            r#"{"id":5,"method":"Target.setDiscoverTargets","params":{"discover":false,"filter":true}}"#,
+        );
+        assert!(bad_filter["error"].is_object());
     }
 
     #[test]
