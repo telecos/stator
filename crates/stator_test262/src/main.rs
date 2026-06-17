@@ -607,12 +607,9 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
 const SKIPPED_TEST_FILES: &[&str] = &[
     // Catastrophic backtracking: ((.*\n?)*?) in a body-matching regex.
     "built-ins/RegExp/S15.10.2.8_A3_T17.js",
-    // Slow catastrophic backtracking (35+ seconds).
-    "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
     // Slow regex quantifier tests that exceed the per-test deadline.
     "built-ins/RegExp/S15.10.2.8_A3_T15.js",
     "built-ins/RegExp/S15.10.2.8_A3_T16.js",
-    "built-ins/RegExp/S15.10.2.8_A3_T18.js",
 ];
 
 /// Returns `true` when `rel_path` starts with any of the [`SKIPPED_PATH_PREFIXES`]
@@ -2373,6 +2370,18 @@ mod tests {
     }
 
     #[test]
+    fn test_regexp_file_skips_keep_only_blocked_cases() {
+        assert!(!is_skipped_path(
+            "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js"
+        ));
+        assert!(!is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T18.js"));
+
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T17.js"));
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T15.js"));
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T16.js"));
+    }
+
+    #[test]
     fn test_skipped_path_descendant_allowlist() {
         assert!(skipped_path_has_allowlisted_descendant("annexB/"));
         assert!(skipped_path_has_allowlisted_descendant(
@@ -2537,6 +2546,40 @@ mod tests {
         collect_tests(&tmp, &tmp, &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("a.js"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_reenabled_regexp_files() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_regexp_file_collect_test");
+        let regexp_dir = tmp.join("built-ins").join("RegExp");
+        let exec_dir = regexp_dir.join("prototype").join("exec");
+        let _ = std::fs::create_dir_all(&exec_dir);
+        std::fs::write(exec_dir.join("S15.10.6.2_A3_T7.js"), "/(a*)/.exec('aaa')").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T15.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T16.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T17.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T18.js"), "/a*/").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/RegExp/S15.10.2.8_A3_T18.js",
+                "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
+            ]
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
