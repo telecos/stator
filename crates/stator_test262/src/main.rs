@@ -564,34 +564,21 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/String/prototype/trimRight/name.js",
     "annexB/built-ins/String/prototype/trimRight/prop-desc.js",
     "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js",
-    "built-ins/AsyncGeneratorFunction/instance-length.js",
     "built-ins/AsyncGeneratorFunction/extensibility.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
     "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
-    "built-ins/AsyncFunction/instance-length.js",
-    "built-ins/AsyncFunction/instance-has-name.js",
-    "built-ins/AsyncFunction/instance-prototype-property.js",
     "built-ins/AsyncFunction/AsyncFunction.js",
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/is-not-a-global.js",
-    "built-ins/AggregateError/name.js",
-    "built-ins/AggregateError/length.js",
     "built-ins/AggregateError/is-a-constructor.js",
     "built-ins/AggregateError/newtarget-is-undefined.js",
     "built-ins/AggregateError/newtarget-proto-custom.js",
     "built-ins/AggregateError/newtarget-proto.js",
-    "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
     "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
-    "built-ins/AggregateError/prototype/name.js",
-    "built-ins/AggregateError/prototype/message.js",
-    "built-ins/AggregateError/prototype/constructor.js",
-    "built-ins/AggregateError/prototype/prop-desc.js",
     "built-ins/AggregateError/prototype/proto.js",
-    "built-ins/AggregateError/message-method-prop.js",
-    "built-ins/AggregateError/message-method-prop-cast.js",
     "built-ins/AggregateError/message-tostring-abrupt.js",
     "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
 ];
@@ -2249,10 +2236,10 @@ mod tests {
         assert!(is_skipped_path(
             "built-ins/AggregateError/cause-property.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/message-method-prop.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/message-method-prop-cast.js"
         ));
         assert!(!is_skipped_path(
@@ -2264,8 +2251,8 @@ mod tests {
         assert!(is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
-        assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
-        assert!(!is_skipped_path("built-ins/AggregateError/length.js"));
+        assert!(is_skipped_path("built-ins/AggregateError/name.js"));
+        assert!(is_skipped_path("built-ins/AggregateError/length.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/is-a-constructor.js"
         ));
@@ -2278,21 +2265,21 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/newtarget-proto.js"
         ));
-        assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
+        assert!(is_skipped_path("built-ins/AggregateError/prop-desc.js"));
         assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/errors-absent-on-prototype.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/prototype/name.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/prototype/message.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/prototype/constructor.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AggregateError/prototype/prop-desc.js"
         ));
         assert!(!is_skipped_path(
@@ -2305,13 +2292,13 @@ mod tests {
 
     #[test]
     fn test_async_function_allowlist_not_skipped() {
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AsyncFunction/instance-length.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AsyncFunction/instance-has-name.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AsyncFunction/instance-prototype-property.js"
         ));
         assert!(!is_skipped_path("built-ins/AsyncFunction/AsyncFunction.js"));
@@ -2331,7 +2318,7 @@ mod tests {
 
     #[test]
     fn test_async_generator_function_allowlist_not_skipped() {
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "built-ins/AsyncGeneratorFunction/instance-length.js"
         ));
         assert!(!is_skipped_path(
@@ -2775,10 +2762,32 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            aggregate_dir.join("message-tostring-abrupt.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-tostring-abrupt-symbol.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
             aggregate_dir.join("message-undefined-no-prop.js"),
             "AggregateError",
         )
         .unwrap();
+        std::fs::write(aggregate_dir.join("is-a-constructor.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("newtarget-is-undefined.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("newtarget-proto-custom.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(aggregate_dir.join("newtarget-proto.js"), "AggregateError").unwrap();
         std::fs::write(aggregate_dir.join("name.js"), "AggregateError").unwrap();
         std::fs::write(aggregate_dir.join("prop-desc.js"), "AggregateError").unwrap();
         std::fs::write(aggregate_dir.join("proto.js"), "AggregateError").unwrap();
@@ -2789,10 +2798,16 @@ mod tests {
         .unwrap();
         let prototype_dir = aggregate_dir.join("prototype");
         let _ = std::fs::create_dir_all(&prototype_dir);
+        std::fs::write(
+            prototype_dir.join("errors-absent-on-prototype.js"),
+            "AggregateError",
+        )
+        .unwrap();
         std::fs::write(prototype_dir.join("name.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("message.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("constructor.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("not-a-constructor.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("proto.js"), "AggregateError").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
         collect_tests(&tmp, &tmp, &mut out).unwrap();
@@ -2809,14 +2824,15 @@ mod tests {
         assert_eq!(
             rel,
             vec![
-                "built-ins/AggregateError/message-method-prop-cast.js",
-                "built-ins/AggregateError/message-method-prop.js",
-                "built-ins/AggregateError/name.js",
-                "built-ins/AggregateError/prop-desc.js",
+                "built-ins/AggregateError/is-a-constructor.js",
+                "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
+                "built-ins/AggregateError/message-tostring-abrupt.js",
+                "built-ins/AggregateError/newtarget-is-undefined.js",
+                "built-ins/AggregateError/newtarget-proto-custom.js",
+                "built-ins/AggregateError/newtarget-proto.js",
                 "built-ins/AggregateError/proto.js",
-                "built-ins/AggregateError/prototype/constructor.js",
-                "built-ins/AggregateError/prototype/message.js",
-                "built-ins/AggregateError/prototype/name.js",
+                "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
+                "built-ins/AggregateError/prototype/proto.js",
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2866,9 +2882,6 @@ mod tests {
                 "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
                 "built-ins/AsyncFunction/AsyncFunction.js",
                 "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
-                "built-ins/AsyncFunction/instance-has-name.js",
-                "built-ins/AsyncFunction/instance-length.js",
-                "built-ins/AsyncFunction/instance-prototype-property.js",
                 "built-ins/AsyncFunction/is-not-a-global.js",
             ]
         );
@@ -2937,7 +2950,6 @@ mod tests {
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
                 "built-ins/AsyncGeneratorFunction/extensibility.js",
-                "built-ins/AsyncGeneratorFunction/instance-length.js",
                 "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
             ]
         );
