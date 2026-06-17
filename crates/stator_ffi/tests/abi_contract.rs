@@ -633,6 +633,38 @@ fn test_header_opaque_runtime_typedef_docs_use_c_friendly_names() {
 }
 
 #[test]
+fn test_header_function_template_signature_signatures_and_docs_match_abi() {
+    let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
+    for signature in [
+        "struct StatorSignature *stator_signature_new(const struct StatorFunctionTemplate *receiver);",
+        "void stator_signature_destroy(struct StatorSignature *signature);",
+        "enum StatorStatus stator_function_template_set_signature(struct StatorFunctionTemplate *tmpl,\n                                                         const struct StatorSignature *signature);",
+    ] {
+        assert!(
+            header.contains(signature),
+            "generated stator.h function-template signature declaration drifted:\n{signature}"
+        );
+    }
+
+    let start = header
+        .find("Create a signature requiring receivers created from `receiver`.")
+        .expect("generated stator.h should document StatorSignature creation");
+    let end = header[start..]
+        .find("Test whether `value` is an instance of `tmpl`.")
+        .map(|offset| start + offset)
+        .expect(
+            "generated stator.h should document function template HasInstance after signatures",
+        );
+    let docs = &header[start..end];
+    for marker in ["[`", "StatorStatus::", "*mut "] {
+        assert!(
+            !docs.contains(marker),
+            "generated stator.h function-template signature docs should not expose Rust-specific marker `{marker}`:\n{docs}"
+        );
+    }
+}
+
+#[test]
 fn test_header_status_discriminants_and_docs_match_abi() {
     let header = fs::read_to_string(header_path()).expect("generated stator.h must exist");
     for (name, discriminant) in [

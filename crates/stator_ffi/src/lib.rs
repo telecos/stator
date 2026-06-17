@@ -14793,7 +14793,7 @@ pub struct StatorSignature {
 /// Returns null when `receiver` is null.
 ///
 /// # Safety
-/// `receiver` must be either null or a valid, live [`StatorFunctionTemplate`]
+/// `receiver` must be either null or a valid, live `StatorFunctionTemplate`
 /// pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_signature_new(
@@ -14810,11 +14810,11 @@ pub unsafe extern "C" fn stator_signature_new(
     }))
 }
 
-/// Destroy a signature created by [`stator_signature_new`].
+/// Destroy a signature created by `stator_signature_new`.
 ///
 /// # Safety
 /// `signature` must be either null or a pointer returned by
-/// [`stator_signature_new`] that has not already been destroyed.
+/// `stator_signature_new` that has not already been destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_signature_destroy(signature: *mut StatorSignature) {
     if !signature.is_null() {
@@ -14830,8 +14830,8 @@ pub unsafe extern "C" fn stator_signature_destroy(signature: *mut StatorSignatur
 /// existing signature. Cross-isolate signatures are rejected.
 ///
 /// # Safety
-/// `tmpl` must be a valid, live [`StatorFunctionTemplate`] pointer. `signature`
-/// must be either null or a valid [`StatorSignature`] pointer.
+/// `tmpl` must be a valid, live `StatorFunctionTemplate` pointer. `signature`
+/// must be either null or a valid `StatorSignature` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_function_template_set_signature(
     tmpl: *mut StatorFunctionTemplate,

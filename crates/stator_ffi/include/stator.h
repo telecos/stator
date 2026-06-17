@@ -6780,17 +6780,17 @@ enum StatorStatus stator_function_template_inherit(struct StatorFunctionTemplate
  * Returns null when `receiver` is null.
  *
  * # Safety
- * `receiver` must be either null or a valid, live [`StatorFunctionTemplate`]
+ * `receiver` must be either null or a valid, live `StatorFunctionTemplate`
  * pointer.
  */
 struct StatorSignature *stator_signature_new(const struct StatorFunctionTemplate *receiver);
 
 /**
- * Destroy a signature created by [`stator_signature_new`].
+ * Destroy a signature created by `stator_signature_new`.
  *
  * # Safety
  * `signature` must be either null or a pointer returned by
- * [`stator_signature_new`] that has not already been destroyed.
+ * `stator_signature_new` that has not already been destroyed.
  */
 void stator_signature_destroy(struct StatorSignature *signature);
 
@@ -6802,8 +6802,8 @@ void stator_signature_destroy(struct StatorSignature *signature);
  * existing signature. Cross-isolate signatures are rejected.
  *
  * # Safety
- * `tmpl` must be a valid, live [`StatorFunctionTemplate`] pointer. `signature`
- * must be either null or a valid [`StatorSignature`] pointer.
+ * `tmpl` must be a valid, live `StatorFunctionTemplate` pointer. `signature`
+ * must be either null or a valid `StatorSignature` pointer.
  */
 enum StatorStatus stator_function_template_set_signature(struct StatorFunctionTemplate *tmpl,
                                                          const struct StatorSignature *signature);
