@@ -1676,6 +1676,16 @@ impl PropertyMap {
                 .any(|existing| existing.as_ref() == key)
     }
 
+    /// Returns the logical accessor property names tracked by this map.
+    ///
+    /// Accessor-backed properties use ordinary backing storage keys such as
+    /// `__get_x__` and `__set_x__`. Callers that clone or inspect a property
+    /// map must preserve this explicit marker set instead of inferring
+    /// accessors from backing key names.
+    pub fn accessor_property_names(&self) -> impl Iterator<Item = &str> {
+        self.accessor_properties.iter().map(|name| name.as_ref())
+    }
+
     /// Returns `true` if an accessor getter `__get_{key}__` exists in this
     /// map.  Uses a stack-allocated buffer to avoid heap `format!()`.
     #[inline]
