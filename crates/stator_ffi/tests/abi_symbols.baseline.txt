@@ -6,6 +6,7 @@ stator_cdp_server_local_port
 stator_cdp_server_run_background
 stator_context_destroy
 stator_context_enter
+stator_context_entered_on_current_thread
 stator_context_exit
 stator_context_get_embedder_data
 stator_context_global
@@ -161,6 +162,7 @@ stator_isolate_create
 stator_isolate_destroy
 stator_isolate_dispose
 stator_isolate_enter
+stator_isolate_entered_on_current_thread
 stator_isolate_exit
 stator_isolate_gc
 stator_isolate_get_current_context

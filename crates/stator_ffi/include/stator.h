@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 32
+#define STATOR_FFI_ABI_VERSION_MINOR 33
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -3906,6 +3906,8 @@ void stator_isolate_dispose(struct StatorIsolate *isolate);
  *
  * Each call to `stator_isolate_enter` must be balanced by a corresponding
  * call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+ * If another thread has already entered the isolate, this call fails closed:
+ * the enter count is not incremented and no isolate state is changed.
  *
  * # Safety
  * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
@@ -3916,12 +3918,24 @@ void stator_isolate_enter(struct StatorIsolate *isolate);
  * Unmark `isolate` as entered on the current thread.
  *
  * Must be called once for every preceding [`stator_isolate_enter`] call.
- * Does nothing when `isolate` is null.
+ * Does nothing when `isolate` is null.  If the isolate is currently entered on
+ * a different thread, this call fails closed and leaves the enter count intact.
  *
  * # Safety
  * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_exit(struct StatorIsolate *isolate);
+
+/**
+ * Returns whether `isolate` is currently entered on the calling thread.
+ *
+ * Returns `false` when `isolate` is null, not entered, or entered on a
+ * different thread.
+ *
+ * # Safety
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
+ */
+bool stator_isolate_entered_on_current_thread(const struct StatorIsolate *isolate);
 
 /**
  * Store an opaque embedder-defined pointer at `slot` on the isolate.
@@ -4329,6 +4343,8 @@ void stator_context_destroy(struct StatorContext *ctx);
  * Each call to `stator_context_enter` must be balanced by a corresponding
  * call to [`stator_context_exit`].  Entering a context also makes it the
  * current context on its associated isolate.  Does nothing when `ctx` is null.
+ * If another thread has already entered the context, this call fails closed:
+ * the enter count is not incremented and no context or isolate state changes.
  *
  * # Safety
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -4341,11 +4357,24 @@ void stator_context_enter(struct StatorContext *ctx);
  * Must be called once for every preceding [`stator_context_enter`] call.
  * When the enter count reaches zero the context is no longer recorded as
  * current on its associated isolate.  Does nothing when `ctx` is null.
+ * If the context is currently entered on a different thread, this call fails
+ * closed and leaves the enter count and current-context slot intact.
  *
  * # Safety
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
  */
 void stator_context_exit(struct StatorContext *ctx);
+
+/**
+ * Returns whether `ctx` is currently entered on the calling thread.
+ *
+ * Returns `false` when `ctx` is null, not entered, or entered on a different
+ * thread.
+ *
+ * # Safety
+ * `ctx` must be null or a valid pointer to a live `StatorContext`.
+ */
+bool stator_context_entered_on_current_thread(const struct StatorContext *ctx);
 
 /**
  * Return a non-owning pointer to the global object of `ctx`.

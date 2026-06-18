@@ -22,6 +22,7 @@ use std::io::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::ThreadId;
 
 use stator_jse::builtins::error::{ErrorKind, JsError};
 use stator_jse::builtins::promise::{
@@ -96,7 +97,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 32;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 33;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -163,6 +164,8 @@ pub struct StatorIsolate {
     embedder_data: Vec<*mut c_void>,
     /// Number of times the isolate has been entered without a matching exit.
     enter_count: u32,
+    /// Thread that currently owns entered access to this isolate.
+    entered_thread: Option<ThreadId>,
     /// The context most recently set as current via [`stator_context_new`] or
     /// cleared via [`stator_context_destroy`].  Non-owning; the context is
     /// owned by the embedder and must outlive the isolate or be destroyed first.
@@ -280,6 +283,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         live_objects: 0,
         embedder_data: Vec::new(),
         enter_count: 0,
+        entered_thread: None,
         current_context: std::ptr::null_mut(),
         pending_exception: None,
         pending_exception_owned: false,
@@ -341,34 +345,89 @@ pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
     unsafe { stator_isolate_destroy(isolate) };
 }
 
+fn enter_on_current_thread(owner: &mut Option<ThreadId>) -> bool {
+    let current = std::thread::current().id();
+    match owner.as_ref() {
+        None => {
+            *owner = Some(current);
+            true
+        }
+        Some(thread) if thread == &current => true,
+        Some(_) => false,
+    }
+}
+
+fn is_entered_on_current_thread(owner: &Option<ThreadId>) -> bool {
+    let current = std::thread::current().id();
+    owner.as_ref().is_some_and(|thread| thread == &current)
+}
+
 /// Mark `isolate` as entered on the current thread.
 ///
 /// Each call to `stator_isolate_enter` must be balanced by a corresponding
 /// call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+/// If another thread has already entered the isolate, this call fails closed:
+/// the enter count is not incremented and no isolate state is changed.
 ///
 /// # Safety
 /// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
-    if !isolate.is_null() {
-        // SAFETY: caller guarantees `isolate` is valid.
-        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_add(1) };
+    if isolate.is_null() {
+        return;
     }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if !enter_on_current_thread(&mut isolate_ref.entered_thread) {
+        return;
+    }
+    isolate_ref.enter_count = isolate_ref.enter_count.saturating_add(1);
 }
 
 /// Unmark `isolate` as entered on the current thread.
 ///
 /// Must be called once for every preceding [`stator_isolate_enter`] call.
-/// Does nothing when `isolate` is null.
+/// Does nothing when `isolate` is null.  If the isolate is currently entered on
+/// a different thread, this call fails closed and leaves the enter count intact.
 ///
 /// # Safety
 /// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
-    if !isolate.is_null() {
-        // SAFETY: caller guarantees `isolate` is valid.
-        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_sub(1) };
+    if isolate.is_null() {
+        return;
     }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if isolate_ref.enter_count == 0 {
+        isolate_ref.entered_thread = None;
+        return;
+    }
+    if !is_entered_on_current_thread(&isolate_ref.entered_thread) {
+        return;
+    }
+    isolate_ref.enter_count = isolate_ref.enter_count.saturating_sub(1);
+    if isolate_ref.enter_count == 0 {
+        isolate_ref.entered_thread = None;
+    }
+}
+
+/// Returns whether `isolate` is currently entered on the calling thread.
+///
+/// Returns `false` when `isolate` is null, not entered, or entered on a
+/// different thread.
+///
+/// # Safety
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_entered_on_current_thread(
+    isolate: *const StatorIsolate,
+) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    is_entered_on_current_thread(&unsafe { &*isolate }.entered_thread)
 }
 
 /// Store an opaque embedder-defined pointer at `slot` on the isolate.
@@ -1829,6 +1888,8 @@ pub struct StatorContext {
     _isolate: *mut StatorIsolate,
     /// Number of times the context has been entered without a matching exit.
     enter_count: u32,
+    /// Thread that currently owns entered access to this context.
+    entered_thread: Option<ThreadId>,
     /// The global object for this context.  Owned by the context; embedders
     /// receive a non-owning pointer via [`stator_context_global`] and must
     /// **not** call [`stator_object_destroy`] on it.
@@ -1888,6 +1949,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
     let ctx = Box::into_raw(Box::new(StatorContext {
         _isolate: isolate,
         enter_count: 0,
+        entered_thread: None,
         global: StatorObject {
             inner: Rc::new(RefCell::new(PropertyMap::new())),
             isolate,
@@ -1939,6 +2001,8 @@ pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
 /// Each call to `stator_context_enter` must be balanced by a corresponding
 /// call to [`stator_context_exit`].  Entering a context also makes it the
 /// current context on its associated isolate.  Does nothing when `ctx` is null.
+/// If another thread has already entered the context, this call fails closed:
+/// the enter count is not incremented and no context or isolate state changes.
 ///
 /// # Safety
 /// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -1948,12 +2012,15 @@ pub unsafe extern "C" fn stator_context_enter(ctx: *mut StatorContext) {
         return;
     }
     // SAFETY: caller guarantees `ctx` is valid.
-    unsafe {
-        (*ctx).enter_count = (*ctx).enter_count.saturating_add(1);
-        let isolate = (*ctx)._isolate;
-        if !isolate.is_null() {
-            (*isolate).current_context = ctx;
-        }
+    let ctx_ref = unsafe { &mut *ctx };
+    if !enter_on_current_thread(&mut ctx_ref.entered_thread) {
+        return;
+    }
+    ctx_ref.enter_count = ctx_ref.enter_count.saturating_add(1);
+    let isolate = ctx_ref._isolate;
+    if !isolate.is_null() {
+        // SAFETY: context owns a valid isolate pointer by construction.
+        unsafe { (*isolate).current_context = ctx };
     }
 }
 
@@ -1962,6 +2029,8 @@ pub unsafe extern "C" fn stator_context_enter(ctx: *mut StatorContext) {
 /// Must be called once for every preceding [`stator_context_enter`] call.
 /// When the enter count reaches zero the context is no longer recorded as
 /// current on its associated isolate.  Does nothing when `ctx` is null.
+/// If the context is currently entered on a different thread, this call fails
+/// closed and leaves the enter count and current-context slot intact.
 ///
 /// # Safety
 /// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -1971,15 +2040,54 @@ pub unsafe extern "C" fn stator_context_exit(ctx: *mut StatorContext) {
         return;
     }
     // SAFETY: caller guarantees `ctx` is valid.
-    unsafe {
-        (*ctx).enter_count = (*ctx).enter_count.saturating_sub(1);
-        if (*ctx).enter_count == 0 {
-            let isolate = (*ctx)._isolate;
-            if !isolate.is_null() && (*isolate).current_context == ctx {
-                (*isolate).current_context = std::ptr::null_mut();
+    let ctx_ref = unsafe { &mut *ctx };
+    if ctx_ref.enter_count == 0 {
+        ctx_ref.entered_thread = None;
+        let isolate = ctx_ref._isolate;
+        if !isolate.is_null() {
+            // SAFETY: context owns a valid isolate pointer by construction.
+            unsafe {
+                if (*isolate).current_context == ctx {
+                    (*isolate).current_context = std::ptr::null_mut();
+                }
+            }
+        }
+        return;
+    }
+    if !is_entered_on_current_thread(&ctx_ref.entered_thread) {
+        return;
+    }
+    ctx_ref.enter_count = ctx_ref.enter_count.saturating_sub(1);
+    if ctx_ref.enter_count == 0 {
+        ctx_ref.entered_thread = None;
+        let isolate = ctx_ref._isolate;
+        if !isolate.is_null() {
+            // SAFETY: context owns a valid isolate pointer by construction.
+            unsafe {
+                if (*isolate).current_context == ctx {
+                    (*isolate).current_context = std::ptr::null_mut();
+                }
             }
         }
     }
+}
+
+/// Returns whether `ctx` is currently entered on the calling thread.
+///
+/// Returns `false` when `ctx` is null, not entered, or entered on a different
+/// thread.
+///
+/// # Safety
+/// `ctx` must be null or a valid pointer to a live `StatorContext`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_entered_on_current_thread(
+    ctx: *const StatorContext,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    is_entered_on_current_thread(&unsafe { &*ctx }.entered_thread)
 }
 
 /// Return a non-owning pointer to the global object of `ctx`.
@@ -27961,6 +28069,45 @@ mod tests {
     }
 
     #[test]
+    fn test_isolate_enter_exit_fail_closed_across_threads() {
+        let iso = IsolateGuard::new();
+        let isolate_addr = iso.as_ptr() as usize;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let isolate = isolate_addr as *mut StatorIsolate;
+            // SAFETY: the main thread keeps the isolate alive until this worker exits.
+            unsafe { stator_isolate_enter(isolate) };
+            assert!(unsafe { stator_isolate_entered_on_current_thread(isolate) });
+            entered_tx.send(()).unwrap();
+            exit_rx.recv().unwrap();
+            // SAFETY: this worker owns the active enter.
+            unsafe { stator_isolate_exit(isolate) };
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(!unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+        // SAFETY: cross-thread calls must fail closed while the worker owns the enter.
+        unsafe {
+            stator_isolate_enter(iso.as_ptr());
+            stator_isolate_exit(iso.as_ptr());
+        }
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 1);
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 0);
+        assert!(!unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+
+        // SAFETY: after the worker exits, ownership can move to the main thread.
+        unsafe { stator_isolate_enter(iso.as_ptr()) };
+        assert!(unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+        // SAFETY: main owns the active enter.
+        unsafe { stator_isolate_exit(iso.as_ptr()) };
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 0);
+    }
+
+    #[test]
     fn test_isolate_set_get_data_roundtrip() {
         let iso = IsolateGuard::new();
         let sentinel = 0xDEAD_BEEFusize as *mut c_void;
@@ -28174,6 +28321,64 @@ mod tests {
         // SAFETY: `ctx` is valid.
         unsafe { stator_context_exit(ctx) };
         unsafe { stator_context_exit(ctx) };
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_enter_exit_fail_closed_across_threads() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: clear the current-context slot created by `context_new`.
+        unsafe { stator_context_exit(ctx) };
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
+        let ctx_addr = ctx as usize;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let ctx = ctx_addr as *mut StatorContext;
+            // SAFETY: the main thread keeps the context alive until this worker exits.
+            unsafe { stator_context_enter(ctx) };
+            assert!(unsafe { stator_context_entered_on_current_thread(ctx) });
+            entered_tx.send(()).unwrap();
+            exit_rx.recv().unwrap();
+            // SAFETY: this worker owns the active enter.
+            unsafe { stator_context_exit(ctx) };
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(!unsafe { stator_context_entered_on_current_thread(ctx) });
+        assert_eq!(unsafe { (*ctx).enter_count }, 1);
+        // SAFETY: cross-thread calls must fail closed while the worker owns the enter.
+        unsafe {
+            stator_context_enter(ctx);
+            stator_context_exit(ctx);
+        }
+        assert_eq!(unsafe { (*ctx).enter_count }, 1);
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(unsafe { (*ctx).enter_count }, 0);
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
+        // SAFETY: after the worker exits, ownership can move to the main thread.
+        unsafe { stator_context_enter(ctx) };
+        assert!(unsafe { stator_context_entered_on_current_thread(ctx) });
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+        // SAFETY: main owns the active enter.
+        unsafe { stator_context_exit(ctx) };
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
         // SAFETY: `ctx` is non-null and live.
         unsafe { stator_context_destroy(ctx) };
     }
