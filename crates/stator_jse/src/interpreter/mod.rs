@@ -32503,7 +32503,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_with_closure_captures_with_scope() {
         let r = eval(
             "var obj = {x: 7}; var fn; with (obj) { fn = function() { return x; }; } return fn();",

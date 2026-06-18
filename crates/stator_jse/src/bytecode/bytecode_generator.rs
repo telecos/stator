@@ -204,6 +204,8 @@ struct FunctionCompileOptions {
     /// parent compiler so the inner function can emit context-slot operations
     /// instead of global loads/stores.  Maps variable name → context slot index.
     closure_captures: HashMap<String, u32>,
+    /// Active dynamic `with` scopes inherited from the enclosing compile site.
+    with_depth: usize,
     is_module: bool,
     module_variables: HashMap<String, (u32, i32)>,
     /// Local imported binding name → `(source, imported_name)`.
@@ -1819,6 +1821,7 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(decl.loc),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
@@ -5288,6 +5291,7 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
@@ -5339,6 +5343,7 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
@@ -5395,6 +5400,7 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
@@ -5483,6 +5489,7 @@ impl FunctionCompiler {
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
@@ -7432,6 +7439,7 @@ fn compile_function_with_private_names(
             source_text: None,
             source_span: None,
             closure_captures: HashMap::new(),
+            with_depth: 0,
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
@@ -8724,6 +8732,7 @@ fn compile_function_inner(
         source_text,
         source_span,
         closure_captures,
+        with_depth,
         is_module,
         module_variables,
         imported_module_bindings,
@@ -8734,6 +8743,7 @@ fn compile_function_inner(
     compiler.private_names = private_names;
     compiler.source_text = source_text;
     compiler.closure_captures = closure_captures;
+    compiler.with_depth = with_depth;
     compiler.is_module = is_module;
     let _ = module_variables;
     compiler.module_variables = HashMap::new();
