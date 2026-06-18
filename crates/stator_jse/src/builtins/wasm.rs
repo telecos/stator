@@ -13,6 +13,8 @@
 //! | `WebAssembly.compile(bytes)`             | [`wasm_compile`]         |
 //! | `WebAssembly.instantiate(src, imports?)` | [`wasm_instantiate`]     |
 //! | `new WebAssembly.Module(bytes)`          | [`wasm_module_ctor`]     |
+//! | `WebAssembly.Module.exports(module)`     | [`wasm_module_exports`]  |
+//! | `WebAssembly.Module.imports(module)`     | [`wasm_module_imports`]  |
 //! | `new WebAssembly.Instance(mod, imp?)`    | [`wasm_instance_ctor`]   |
 //!
 //! # Fail-closed surface
@@ -223,7 +225,19 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
     map.borrow_mut()
         .insert("__wasm_bytes__".to_string(), JsValue::new_array(js_bytes));
 
-    // Build the exports descriptor array (`WebAssembly.Module.exports(mod)`).
+    map.borrow_mut()
+        .insert("exports".to_string(), make_module_exports_array(module));
+
+    // Build the imports descriptor array (`WebAssembly.Module.imports(mod)`).
+    // Stator still fails closed when instantiating imports, but exposing the
+    // metadata lets embedders and diagnostics inspect why a module cannot run.
+    map.borrow_mut()
+        .insert("imports".to_string(), make_module_imports_array(module));
+
+    JsValue::PlainObject(map)
+}
+
+fn make_module_exports_array(module: &WasmModule) -> JsValue {
     let export_descs: Vec<JsValue> = module
         .inner()
         .exports()
@@ -245,12 +259,10 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
             JsValue::PlainObject(desc)
         })
         .collect();
-    map.borrow_mut()
-        .insert("exports".to_string(), JsValue::new_array(export_descs));
+    JsValue::new_array(export_descs)
+}
 
-    // Build the imports descriptor array (`WebAssembly.Module.imports(mod)`).
-    // Stator still fails closed when instantiating imports, but exposing the
-    // metadata lets embedders and diagnostics inspect why a module cannot run.
+fn make_module_imports_array(module: &WasmModule) -> JsValue {
     let import_descs: Vec<JsValue> = module
         .imports()
         .into_iter()
@@ -267,10 +279,7 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
             JsValue::PlainObject(desc)
         })
         .collect();
-    map.borrow_mut()
-        .insert("imports".to_string(), JsValue::new_array(import_descs));
-
-    JsValue::PlainObject(map)
+    JsValue::new_array(import_descs)
 }
 
 fn wasm_extern_kind_name(kind: &WasmExternKind) -> &'static str {
@@ -607,6 +616,24 @@ pub fn wasm_module_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     Ok(make_module_object(&module, bytes))
 }
 
+/// `WebAssembly.Module.exports(module)` — return module export descriptors.
+pub fn wasm_module_exports(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let module_obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+    let bytes = extract_bytes_from_module(&module_obj)?;
+    let engine = WasmEngine::new();
+    let module = compile_bytes(&engine, &bytes)?;
+    Ok(make_module_exports_array(&module))
+}
+
+/// `WebAssembly.Module.imports(module)` — return module import descriptors.
+pub fn wasm_module_imports(args: Vec<JsValue>) -> StatorResult<JsValue> {
+    let module_obj = args.into_iter().next().unwrap_or(JsValue::Undefined);
+    let bytes = extract_bytes_from_module(&module_obj)?;
+    let engine = WasmEngine::new();
+    let module = compile_bytes(&engine, &bytes)?;
+    Ok(make_module_imports_array(&module))
+}
+
 /// `new WebAssembly.Instance(module, importObject?)` — ECMAScript WebAssembly API §6.
 ///
 /// Instantiates an existing `WebAssembly.Module` object.
@@ -690,6 +717,44 @@ fn wasm_unsupported_error(name: &str) -> StatorError {
     StatorError::TypeError(format!("WebAssembly.{name}: not implemented"))
 }
 
+fn make_wasm_builtin_function(name: &'static str, length: i32, f: NativeFn) -> JsValue {
+    let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    {
+        let mut m = map.borrow_mut();
+        m.insert("__call__".to_string(), JsValue::NativeFunction(f));
+        m.insert("name".to_string(), JsValue::String(name.to_string().into()));
+        m.insert("length".to_string(), JsValue::Smi(length));
+    }
+    JsValue::PlainObject(map)
+}
+
+fn make_wasm_module_constructor() -> JsValue {
+    let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    let ctor = Rc::new(wasm_module_ctor) as NativeFn;
+    {
+        let mut m = map.borrow_mut();
+        m.insert(
+            "__call__".to_string(),
+            JsValue::NativeFunction(Rc::clone(&ctor)),
+        );
+        m.insert("__construct__".to_string(), JsValue::NativeFunction(ctor));
+        m.insert(
+            "name".to_string(),
+            JsValue::String("Module".to_string().into()),
+        );
+        m.insert("length".to_string(), JsValue::Smi(1));
+        m.insert(
+            "exports".to_string(),
+            make_wasm_builtin_function("exports", 1, Rc::new(wasm_module_exports)),
+        );
+        m.insert(
+            "imports".to_string(),
+            make_wasm_builtin_function("imports", 1, Rc::new(wasm_module_imports)),
+        );
+    }
+    JsValue::PlainObject(map)
+}
+
 /// Build the `WebAssembly` namespace object.
 ///
 /// Real implementations are wired for `validate`, `compile`, `instantiate`,
@@ -714,10 +779,7 @@ pub fn make_webassembly_object() -> JsValue {
             "instantiate".to_string(),
             JsValue::NativeFunction(Rc::new(wasm_instantiate)),
         );
-        m.insert(
-            "Module".to_string(),
-            JsValue::NativeFunction(Rc::new(wasm_module_ctor)),
-        );
+        m.insert("Module".to_string(), make_wasm_module_constructor());
         m.insert(
             "Instance".to_string(),
             JsValue::NativeFunction(Rc::new(wasm_instance_ctor)),
@@ -752,6 +814,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::builtins::global::global_eval;
     use crate::objects::property_map::PropertyMap;
 
     // ── WAT helpers ──────────────────────────────────────────────────────────
@@ -1286,6 +1349,130 @@ mod tests {
         assert!(matches!(err, StatorError::TypeError(_)));
     }
 
+    #[test]
+    fn test_module_exports_static_returns_export_descriptors() {
+        let module = wasm_module_ctor(vec![wat_val(ADD_WAT)]).unwrap();
+        let exports = wasm_module_exports(vec![module]).unwrap();
+        if let JsValue::Array(arr) = exports {
+            assert_eq!(arr.borrow().len(), 1);
+            if let JsValue::PlainObject(desc) = &arr.borrow()[0] {
+                assert_eq!(
+                    desc.borrow().get("name").cloned(),
+                    Some(JsValue::String("add".to_string().into()))
+                );
+                assert_eq!(
+                    desc.borrow().get("kind").cloned(),
+                    Some(JsValue::String("function".to_string().into()))
+                );
+            } else {
+                panic!("expected PlainObject descriptor");
+            }
+        } else {
+            panic!("expected exports Array");
+        }
+    }
+
+    #[test]
+    fn test_module_imports_static_returns_import_descriptors() {
+        let module = wasm_module_ctor(vec![wat_val(IMPORTED_FUNC_WAT)]).unwrap();
+        let imports = wasm_module_imports(vec![module]).unwrap();
+        if let JsValue::Array(arr) = imports {
+            assert_eq!(arr.borrow().len(), 1);
+            if let JsValue::PlainObject(desc) = &arr.borrow()[0] {
+                assert_eq!(
+                    desc.borrow().get("module").cloned(),
+                    Some(JsValue::String("env".to_string().into()))
+                );
+                assert_eq!(
+                    desc.borrow().get("name").cloned(),
+                    Some(JsValue::String("f".to_string().into()))
+                );
+                assert_eq!(
+                    desc.borrow().get("kind").cloned(),
+                    Some(JsValue::String("function".to_string().into()))
+                );
+            } else {
+                panic!("expected PlainObject descriptor");
+            }
+        } else {
+            panic!("expected imports Array");
+        }
+    }
+
+    #[test]
+    fn test_module_static_methods_reject_non_modules() {
+        let exports_err = wasm_module_exports(vec![descriptor(&[])]).unwrap_err();
+        assert!(matches!(exports_err, StatorError::TypeError(_)));
+
+        let imports_err = wasm_module_imports(vec![JsValue::Undefined]).unwrap_err();
+        assert!(matches!(imports_err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_module_static_descriptor_arrays_are_fresh() {
+        let module = wasm_module_ctor(vec![wat_val(ADD_WAT)]).unwrap();
+        let first = wasm_module_exports(vec![module.clone()]).unwrap();
+        if let JsValue::Array(arr) = &first
+            && let JsValue::PlainObject(desc) = &arr.borrow()[0]
+        {
+            desc.borrow_mut().insert(
+                "name".to_string(),
+                JsValue::String("mutated".to_string().into()),
+            );
+        } else {
+            panic!("expected exports descriptor array");
+        }
+
+        let second = wasm_module_exports(vec![module.clone()]).unwrap();
+        if let JsValue::Array(arr) = second
+            && let JsValue::PlainObject(desc) = &arr.borrow()[0]
+        {
+            assert_eq!(
+                desc.borrow().get("name").cloned(),
+                Some(JsValue::String("add".to_string().into()))
+            );
+        } else {
+            panic!("expected exports descriptor array");
+        }
+
+        if let JsValue::PlainObject(map) = module
+            && let Some(JsValue::Array(arr)) = map.borrow().get("exports").cloned()
+            && let JsValue::PlainObject(desc) = &arr.borrow()[0]
+        {
+            assert_eq!(
+                desc.borrow().get("name").cloned(),
+                Some(JsValue::String("add".to_string().into()))
+            );
+        } else {
+            panic!("expected module-owned exports descriptor array");
+        }
+    }
+
+    #[test]
+    fn test_module_static_methods_work_through_webassembly_namespace() {
+        let export_name = global_eval(
+            r#"
+            var m = new WebAssembly.Module('(module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))');
+            WebAssembly.Module.exports(m)[0].name;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(export_name, JsValue::String("add".to_string().into()));
+
+        let import_summary = global_eval(
+            r#"
+            var m = new WebAssembly.Module('(module (import "env" "f" (func)))');
+            var i = WebAssembly.Module.imports(m)[0];
+            i.module + "." + i.name + "." + i.kind;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            import_summary,
+            JsValue::String("env.f.function".to_string().into())
+        );
+    }
+
     // ── wasm_instance_ctor ────────────────────────────────────────────────────
 
     #[test]
@@ -1600,15 +1787,47 @@ mod tests {
     }
 
     #[test]
-    fn test_make_webassembly_object_all_values_are_native_functions() {
+    fn test_make_webassembly_object_entries_are_callable() {
         let wasm = make_webassembly_object();
         if let JsValue::PlainObject(map) = wasm {
             for (key, val) in map.borrow().iter() {
-                assert!(
-                    matches!(val, JsValue::NativeFunction(_)),
-                    "WebAssembly.{key} is not a NativeFunction"
-                );
+                match (&**key, val) {
+                    ("Module", JsValue::PlainObject(module)) => {
+                        assert!(module.borrow().contains_key("__call__"));
+                        assert!(module.borrow().contains_key("__construct__"));
+                        assert!(module.borrow().contains_key("exports"));
+                        assert!(module.borrow().contains_key("imports"));
+                    }
+                    (_, JsValue::NativeFunction(_)) => {}
+                    _ => panic!("WebAssembly.{key} is not callable"),
+                }
             }
+        }
+    }
+
+    #[test]
+    fn test_make_webassembly_object_exposes_module_static_methods_on_constructor() {
+        let wasm = make_webassembly_object();
+        if let JsValue::PlainObject(map) = wasm {
+            assert!(!map.borrow().contains_key("Module.exports"));
+            assert!(!map.borrow().contains_key("Module.imports"));
+
+            if let Some(JsValue::PlainObject(module)) = map.borrow().get("Module").cloned() {
+                assert!(module.borrow().contains_key("exports"));
+                assert!(module.borrow().contains_key("imports"));
+                assert!(matches!(
+                    module.borrow().get("exports"),
+                    Some(JsValue::PlainObject(_))
+                ));
+                assert!(matches!(
+                    module.borrow().get("imports"),
+                    Some(JsValue::PlainObject(_))
+                ));
+            } else {
+                panic!("expected WebAssembly.Module constructor object");
+            }
+        } else {
+            panic!("expected PlainObject");
         }
     }
 
