@@ -436,18 +436,10 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
 
 /// Individual tests under otherwise-skipped path prefixes that are supported.
 const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
-    "annexB/built-ins/Date/prototype/toGMTString/prop-desc.js",
-    "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
-    "annexB/built-ins/RegExp/prototype/compile/length.js",
-    "annexB/built-ins/RegExp/prototype/compile/name.js",
-    "annexB/built-ins/RegExp/prototype/compile/prop-desc.js",
     "annexB/built-ins/escape/argument_types.js",
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
     "annexB/built-ins/escape/escape-below.js",
-    "annexB/built-ins/escape/length.js",
-    "annexB/built-ins/escape/name.js",
-    "annexB/built-ins/escape/prop-desc.js",
     "annexB/built-ins/escape/to-primitive-observe.js",
     "annexB/built-ins/escape/to-string-err.js",
     "annexB/built-ins/escape/to-string-err-symbol.js",
@@ -458,111 +450,46 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/unescape/four.js",
     "annexB/built-ins/unescape/two-ignore-non-hex.js",
     "annexB/built-ins/unescape/four-ignore-bad-u.js",
-    "annexB/built-ins/unescape/length.js",
-    "annexB/built-ins/unescape/name.js",
-    "annexB/built-ins/unescape/prop-desc.js",
     "annexB/built-ins/unescape/to-primitive-observe.js",
     "annexB/built-ins/unescape/to-string-err.js",
     "annexB/built-ins/unescape/to-string-observe.js",
     "annexB/built-ins/String/prototype/anchor/B.2.3.2.js",
     "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js",
-    "annexB/built-ins/String/prototype/anchor/length.js",
-    "annexB/built-ins/String/prototype/anchor/name.js",
-    "annexB/built-ins/String/prototype/anchor/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/anchor/prop-desc.js",
     "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/big/B.2.3.3.js",
-    "annexB/built-ins/String/prototype/big/length.js",
-    "annexB/built-ins/String/prototype/big/name.js",
-    "annexB/built-ins/String/prototype/big/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/big/prop-desc.js",
     "annexB/built-ins/String/prototype/big/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/blink/B.2.3.4.js",
-    "annexB/built-ins/String/prototype/blink/length.js",
-    "annexB/built-ins/String/prototype/blink/name.js",
-    "annexB/built-ins/String/prototype/blink/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/blink/prop-desc.js",
     "annexB/built-ins/String/prototype/blink/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/bold/B.2.3.5.js",
-    "annexB/built-ins/String/prototype/bold/length.js",
-    "annexB/built-ins/String/prototype/bold/name.js",
-    "annexB/built-ins/String/prototype/bold/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/bold/prop-desc.js",
     "annexB/built-ins/String/prototype/bold/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fixed/B.2.3.6.js",
-    "annexB/built-ins/String/prototype/fixed/length.js",
-    "annexB/built-ins/String/prototype/fixed/name.js",
-    "annexB/built-ins/String/prototype/fixed/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/fixed/prop-desc.js",
     "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
     "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js",
-    "annexB/built-ins/String/prototype/fontcolor/length.js",
-    "annexB/built-ins/String/prototype/fontcolor/name.js",
-    "annexB/built-ins/String/prototype/fontcolor/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
     "annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
     "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js",
-    "annexB/built-ins/String/prototype/fontsize/length.js",
-    "annexB/built-ins/String/prototype/fontsize/name.js",
-    "annexB/built-ins/String/prototype/fontsize/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/fontsize/prop-desc.js",
     "annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
-    "annexB/built-ins/String/prototype/italics/length.js",
-    "annexB/built-ins/String/prototype/italics/name.js",
-    "annexB/built-ins/String/prototype/italics/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/italics/prop-desc.js",
     "annexB/built-ins/String/prototype/italics/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/link/B.2.3.10.js",
     "annexB/built-ins/String/prototype/link/attr-tostring-err.js",
-    "annexB/built-ins/String/prototype/link/length.js",
-    "annexB/built-ins/String/prototype/link/name.js",
-    "annexB/built-ins/String/prototype/link/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/link/prop-desc.js",
     "annexB/built-ins/String/prototype/link/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/small/B.2.3.11.js",
-    "annexB/built-ins/String/prototype/small/length.js",
-    "annexB/built-ins/String/prototype/small/name.js",
-    "annexB/built-ins/String/prototype/small/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/small/prop-desc.js",
     "annexB/built-ins/String/prototype/small/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/strike/B.2.3.12.js",
-    "annexB/built-ins/String/prototype/strike/length.js",
-    "annexB/built-ins/String/prototype/strike/name.js",
-    "annexB/built-ins/String/prototype/strike/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/strike/prop-desc.js",
     "annexB/built-ins/String/prototype/strike/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/sub/B.2.3.13.js",
-    "annexB/built-ins/String/prototype/sub/length.js",
-    "annexB/built-ins/String/prototype/sub/name.js",
-    "annexB/built-ins/String/prototype/sub/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/sub/prop-desc.js",
     "annexB/built-ins/String/prototype/sub/this-val-tostring-err.js",
     "annexB/built-ins/String/prototype/sup/B.2.3.14.js",
-    "annexB/built-ins/String/prototype/sup/length.js",
-    "annexB/built-ins/String/prototype/sup/name.js",
-    "annexB/built-ins/String/prototype/sup/not-a-constructor.js",
-    "annexB/built-ins/String/prototype/sup/prop-desc.js",
     "annexB/built-ins/String/prototype/sup/this-val-tostring-err.js",
-    "annexB/built-ins/String/prototype/substr/B.2.3.js",
-    "annexB/built-ins/String/prototype/substr/length.js",
     "annexB/built-ins/String/prototype/substr/length-falsey.js",
     "annexB/built-ins/String/prototype/substr/length-negative.js",
     "annexB/built-ins/String/prototype/substr/length-positive.js",
-    "annexB/built-ins/String/prototype/substr/name.js",
-    "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
     "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
     "annexB/built-ins/String/prototype/substr/this-to-str-err.js",
     "annexB/built-ins/String/prototype/substr/start-negative.js",
-    "annexB/built-ins/String/prototype/trimLeft/length.js",
-    "annexB/built-ins/String/prototype/trimLeft/name.js",
-    "annexB/built-ins/String/prototype/trimLeft/prop-desc.js",
     "annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js",
-    "annexB/built-ins/String/prototype/trimRight/length.js",
-    "annexB/built-ins/String/prototype/trimRight/name.js",
-    "annexB/built-ins/String/prototype/trimRight/prop-desc.js",
     "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js",
     "built-ins/AsyncGeneratorFunction/extensibility.js",
     "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
@@ -1993,16 +1920,16 @@ mod tests {
 
     #[test]
     fn test_annex_b_escape_allowlist_not_skipped() {
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/length.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/name.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/prop-desc.js"
         ));
         assert!(!is_skipped_path(
@@ -2011,9 +1938,9 @@ mod tests {
         assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
         assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
-        assert!(!is_skipped_path("annexB/built-ins/escape/length.js"));
-        assert!(!is_skipped_path("annexB/built-ins/escape/name.js"));
-        assert!(!is_skipped_path("annexB/built-ins/escape/prop-desc.js"));
+        assert!(is_skipped_path("annexB/built-ins/escape/length.js"));
+        assert!(is_skipped_path("annexB/built-ins/escape/name.js"));
+        assert!(is_skipped_path("annexB/built-ins/escape/prop-desc.js"));
         assert!(!is_skipped_path(
             "annexB/built-ins/escape/to-primitive-observe.js"
         ));
@@ -2024,10 +1951,10 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/escape/to-string-observe.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/substr/B.2.3.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/substr/length.js"
         ));
         assert!(!is_skipped_path(
@@ -2039,7 +1966,7 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/length-positive.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/substr/name.js"
         ));
         assert!(!is_skipped_path(
@@ -2048,7 +1975,7 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/substr/this-to-str-err.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
         ));
         assert!(!is_skipped_path(
@@ -2065,9 +1992,9 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/unescape/four-ignore-bad-u.js"
         ));
-        assert!(!is_skipped_path("annexB/built-ins/unescape/length.js"));
-        assert!(!is_skipped_path("annexB/built-ins/unescape/name.js"));
-        assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
+        assert!(is_skipped_path("annexB/built-ins/unescape/length.js"));
+        assert!(is_skipped_path("annexB/built-ins/unescape/name.js"));
+        assert!(is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
         assert!(!is_skipped_path(
             "annexB/built-ins/unescape/to-primitive-observe.js"
         ));
@@ -2087,17 +2014,17 @@ mod tests {
             "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js"
         ));
         for method in ["anchor", "trimLeft", "trimRight"] {
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/length.js"
             )));
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/name.js"
             )));
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/prop-desc.js"
             )));
         }
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/anchor/not-a-constructor.js"
         ));
         assert!(!is_skipped_path(
@@ -2109,13 +2036,13 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/big/B.2.3.3.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/big/length.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/big/name.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/big/prop-desc.js"
         ));
         assert!(!is_skipped_path(
@@ -2140,16 +2067,16 @@ mod tests {
             "sub",
             "sup",
         ] {
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/length.js"
             )));
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/name.js"
             )));
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/prop-desc.js"
             )));
-            assert!(!is_skipped_path(&format!(
+            assert!(is_skipped_path(&format!(
                 "annexB/built-ins/String/prototype/{method}/not-a-constructor.js"
             )));
         }
@@ -2222,7 +2149,7 @@ mod tests {
         assert!(!is_skipped_path(
             "annexB/built-ins/String/prototype/sup/this-val-tostring-err.js"
         ));
-        assert!(!is_skipped_path(
+        assert!(is_skipped_path(
             "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
         ));
         assert!(!is_skipped_path(
@@ -2384,7 +2311,7 @@ mod tests {
         assert!(skipped_path_has_allowlisted_descendant(
             "built-ins/AsyncGeneratorFunction/"
         ));
-        assert!(skipped_path_has_allowlisted_descendant(
+        assert!(!skipped_path_has_allowlisted_descendant(
             "annexB/built-ins/Date/"
         ));
     }
@@ -2632,27 +2559,17 @@ mod tests {
         assert_eq!(
             rel,
             vec![
-                "annexB/built-ins/String/prototype/substr/B.2.3.js",
                 "annexB/built-ins/String/prototype/substr/length-falsey.js",
                 "annexB/built-ins/String/prototype/substr/length-negative.js",
                 "annexB/built-ins/String/prototype/substr/length-positive.js",
-                "annexB/built-ins/String/prototype/substr/length.js",
-                "annexB/built-ins/String/prototype/substr/name.js",
-                "annexB/built-ins/String/prototype/substr/not-a-constructor.js",
                 "annexB/built-ins/String/prototype/substr/start-negative.js",
                 "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
                 "annexB/built-ins/escape/empty-string.js",
                 "annexB/built-ins/escape/escape-below.js",
-                "annexB/built-ins/escape/length.js",
-                "annexB/built-ins/escape/name.js",
-                "annexB/built-ins/escape/prop-desc.js",
                 "annexB/built-ins/escape/unmodified.js",
                 "annexB/built-ins/unescape/empty-string.js",
                 "annexB/built-ins/unescape/four-ignore-bad-u.js",
                 "annexB/built-ins/unescape/four.js",
-                "annexB/built-ins/unescape/length.js",
-                "annexB/built-ins/unescape/name.js",
-                "annexB/built-ins/unescape/prop-desc.js",
                 "annexB/built-ins/unescape/two-ignore-non-hex.js",
                 "annexB/built-ins/unescape/two.js",
             ]
@@ -2661,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_tests_keeps_annex_b_regexp_compile_allowlist() {
+    fn test_collect_tests_skips_annex_b_regexp_compile_without_allowlist() {
         let tmp =
             std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_compile_collect_test");
         let compile_dir = tmp
@@ -2701,20 +2618,12 @@ mod tests {
             })
             .collect();
         rel.sort();
-        assert_eq!(
-            rel,
-            vec![
-                "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
-                "annexB/built-ins/RegExp/prototype/compile/length.js",
-                "annexB/built-ins/RegExp/prototype/compile/name.js",
-                "annexB/built-ins/RegExp/prototype/compile/prop-desc.js",
-            ]
-        );
+        assert!(rel.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_collect_tests_keeps_annex_b_date_allowlist() {
+    fn test_collect_tests_skips_annex_b_date_without_allowlist() {
         let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_date_collect_test");
         let date_dir = tmp
             .join("annexB")
@@ -2738,10 +2647,7 @@ mod tests {
             })
             .collect();
         rel.sort();
-        assert_eq!(
-            rel,
-            vec!["annexB/built-ins/Date/prototype/toGMTString/prop-desc.js"]
-        );
+        assert!(rel.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
