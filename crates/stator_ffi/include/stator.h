@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 31
+#define STATOR_FFI_ABI_VERSION_MINOR 32
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -4924,8 +4924,8 @@ bool stator_value_is_boolean(const struct StatorValue *val);
 /**
  * Returns `true` if `val` is a JavaScript object (excludes `null`).
  *
- * Arrays, dates, regexps, promises, maps, and sets are all objects in
- * ECMAScript and therefore also return `true`.
+ * Arrays, dates, regexps, promises, maps, sets, ArrayBuffers, TypedArrays, and
+ * DataViews are all objects in ECMAScript and therefore also return `true`.
  *
  * # Safety
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -5009,6 +5009,30 @@ bool stator_value_is_map(const struct StatorValue *val);
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 bool stator_value_is_set(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `ArrayBuffer` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_array_buffer(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `TypedArray` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_typed_array(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `DataView` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_data_view(const struct StatorValue *val);
 
 /**
  * Create a new, empty JavaScript object.
@@ -6328,8 +6352,8 @@ bool stator_value_to_boolean(const struct StatorValue *val);
  * - Booleans: value equality.
  * - Tag-only object / function / array / promise placeholders: `false`
  *   because they carry no shared identity in FFI handles.
- * - Shared-storage object, DOM wrapper, and Promise handles: identity equality
- *   based on the underlying shared engine handle.
+ * - Shared-storage object, DOM wrapper, Promise, and binary-view handles:
+ *   identity equality based on the underlying shared engine handle.
  *
  * Both null pointers are treated as `undefined`.
  *

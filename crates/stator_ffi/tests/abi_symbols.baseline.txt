@@ -369,7 +369,9 @@ stator_value_get_number
 stator_value_get_string_utf8_length
 stator_value_get_uint32
 stator_value_is_array
+stator_value_is_array_buffer
 stator_value_is_boolean
+stator_value_is_data_view
 stator_value_is_date
 stator_value_is_dom_object_wrap_class
 stator_value_is_function
@@ -382,6 +384,7 @@ stator_value_is_promise
 stator_value_is_regexp
 stator_value_is_set
 stator_value_is_string
+stator_value_is_typed_array
 stator_value_is_uint32
 stator_value_is_undefined
 stator_value_new_array_tag

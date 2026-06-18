@@ -27,6 +27,7 @@ use stator_jse::builtins::error::{ErrorKind, JsError};
 use stator_jse::builtins::promise::{
     JsPromise, MicrotaskQueue, PromiseState, active_microtask_queue, install_active_microtask_queue,
 };
+use stator_jse::builtins::typed_array::{JsArrayBuffer, JsDataView, JsTypedArray};
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
@@ -95,7 +96,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 31;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 32;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -2379,6 +2380,12 @@ enum StatorValueInner {
     Map,
     /// A JavaScript `Set` object.
     Set,
+    /// A JavaScript `ArrayBuffer` backed by engine-owned binary storage.
+    ArrayBuffer(Rc<RefCell<JsArrayBuffer>>),
+    /// A JavaScript `TypedArray` view backed by engine-owned binary storage.
+    TypedArray(Rc<RefCell<JsTypedArray>>),
+    /// A JavaScript `DataView` backed by engine-owned binary storage.
+    DataView(Rc<RefCell<JsDataView>>),
 }
 
 type MaterializedDomWrapRegistry = HashMap<usize, (*mut StatorDomObjectWrap, Rc<Cell<bool>>)>;
@@ -2422,6 +2429,9 @@ fn clone_stator_value_inner(inner: &StatorValueInner) -> StatorValueInner {
         },
         StatorValueInner::Map => StatorValueInner::Map,
         StatorValueInner::Set => StatorValueInner::Set,
+        StatorValueInner::ArrayBuffer(buffer) => StatorValueInner::ArrayBuffer(Rc::clone(buffer)),
+        StatorValueInner::TypedArray(array) => StatorValueInner::TypedArray(Rc::clone(array)),
+        StatorValueInner::DataView(view) => StatorValueInner::DataView(Rc::clone(view)),
     }
 }
 
@@ -3295,7 +3305,10 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
         | StatorValueInner::Promise
         | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => c"object".as_ptr(),
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => c"object".as_ptr(),
     }
 }
 
@@ -3332,7 +3345,10 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
         | StatorValueInner::Promise
         | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => f64::NAN,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => f64::NAN,
     }
 }
 
@@ -3366,7 +3382,10 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Promise
         | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => c"".as_ptr(),
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => c"".as_ptr(),
     }
 }
 
@@ -3441,8 +3460,8 @@ pub unsafe extern "C" fn stator_value_is_boolean(val: *const StatorValue) -> boo
 
 /// Returns `true` if `val` is a JavaScript object (excludes `null`).
 ///
-/// Arrays, dates, regexps, promises, maps, and sets are all objects in
-/// ECMAScript and therefore also return `true`.
+/// Arrays, dates, regexps, promises, maps, sets, ArrayBuffers, TypedArrays, and
+/// DataViews are all objects in ECMAScript and therefore also return `true`.
 ///
 /// # Safety
 /// `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -3464,6 +3483,9 @@ pub unsafe extern "C" fn stator_value_is_object(val: *const StatorValue) -> bool
             | StatorValueInner::PromiseHandle { .. }
             | StatorValueInner::Map
             | StatorValueInner::Set
+            | StatorValueInner::ArrayBuffer(_)
+            | StatorValueInner::TypedArray(_)
+            | StatorValueInner::DataView(_)
     )
 }
 
@@ -3602,6 +3624,45 @@ pub unsafe extern "C" fn stator_value_is_set(val: *const StatorValue) -> bool {
     }
     // SAFETY: caller guarantees `val` is valid.
     matches!(unsafe { &(*val).inner }, StatorValueInner::Set)
+}
+
+/// Returns `true` if `val` is a JavaScript `ArrayBuffer` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_array_buffer(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::ArrayBuffer(_))
+}
+
+/// Returns `true` if `val` is a JavaScript `TypedArray` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_typed_array(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::TypedArray(_))
+}
+
+/// Returns `true` if `val` is a JavaScript `DataView` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_data_view(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::DataView(_))
 }
 
 /// An opaque handle to a JavaScript object.
@@ -13578,7 +13639,10 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         | StatorValueInner::Promise
         | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => true,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => true,
     }
 }
 
@@ -13593,8 +13657,8 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
 /// - Booleans: value equality.
 /// - Tag-only object / function / array / promise placeholders: `false`
 ///   because they carry no shared identity in FFI handles.
-/// - Shared-storage object, DOM wrapper, and Promise handles: identity equality
-///   based on the underlying shared engine handle.
+/// - Shared-storage object, DOM wrapper, Promise, and binary-view handles:
+///   identity equality based on the underlying shared engine handle.
 ///
 /// Both null pointers are treated as `undefined`.
 ///
@@ -13641,6 +13705,9 @@ pub unsafe extern "C" fn stator_value_strict_equals(
             StatorValueInner::PromiseHandle { promise: x, .. },
             StatorValueInner::PromiseHandle { promise: y, .. },
         ) => x == y,
+        (StatorValueInner::ArrayBuffer(x), StatorValueInner::ArrayBuffer(y)) => Rc::ptr_eq(x, y),
+        (StatorValueInner::TypedArray(x), StatorValueInner::TypedArray(y)) => Rc::ptr_eq(x, y),
+        (StatorValueInner::DataView(x), StatorValueInner::DataView(y)) => Rc::ptr_eq(x, y),
         // Object-like tags carry no identity in FFI handles → never equal.
         _ => false,
     }
@@ -15694,7 +15761,10 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
         | StatorValueInner::Promise
         | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => f64::NAN,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => f64::NAN,
     }
 }
 
@@ -15735,6 +15805,9 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
         }
         StatorValueInner::Map => "[object Map]".to_owned(),
         StatorValueInner::Set => "[object Set]".to_owned(),
+        StatorValueInner::ArrayBuffer(_) => "[object ArrayBuffer]".to_owned(),
+        StatorValueInner::TypedArray(_) => "[object TypedArray]".to_owned(),
+        StatorValueInner::DataView(_) => "[object DataView]".to_owned(),
     }
 }
 
@@ -15769,6 +15842,9 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         StatorValueInner::PromiseHandle { promise, .. } => JsValue::Promise(promise.clone()),
         StatorValueInner::ObjectHandle(rc) => JsValue::PlainObject(Rc::clone(rc)),
         StatorValueInner::DomWrapHandle { plain, .. } => JsValue::PlainObject(Rc::clone(plain)),
+        StatorValueInner::ArrayBuffer(buffer) => JsValue::ArrayBuffer(Rc::clone(buffer)),
+        StatorValueInner::TypedArray(array) => JsValue::TypedArray(Rc::clone(array)),
+        StatorValueInner::DataView(view) => JsValue::DataView(Rc::clone(view)),
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))
@@ -15813,13 +15889,7 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         JsValue::Object(_) | JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => {
             StatorValueInner::Object
         }
-        JsValue::Symbol(_)
-        | JsValue::BigInt(_)
-        | JsValue::Context(_)
-        | JsValue::Proxy(_)
-        | JsValue::ArrayBuffer(_)
-        | JsValue::TypedArray(_)
-        | JsValue::DataView(_) => {
+        JsValue::Symbol(_) | JsValue::BigInt(_) | JsValue::Context(_) | JsValue::Proxy(_) => {
             // Symbols, BigInts, and Contexts are not yet representable in StatorValueInner;
             // fall back to a string representation so callers can inspect them.
             let s = v.to_js_string().unwrap_or_else(|_| "undefined".to_owned());
@@ -15831,6 +15901,9 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
                 ))
             }
         }
+        JsValue::ArrayBuffer(buffer) => StatorValueInner::ArrayBuffer(Rc::clone(buffer)),
+        JsValue::TypedArray(array) => StatorValueInner::TypedArray(Rc::clone(array)),
+        JsValue::DataView(view) => StatorValueInner::DataView(Rc::clone(view)),
     }
 }
 
@@ -24934,6 +25007,9 @@ impl StatorValueInner {
             },
             Self::Map => Self::Map,
             Self::Set => Self::Set,
+            Self::ArrayBuffer(buffer) => Self::ArrayBuffer(Rc::clone(buffer)),
+            Self::TypedArray(array) => Self::TypedArray(Rc::clone(array)),
+            Self::DataView(view) => Self::DataView(Rc::clone(view)),
         }
     }
 }
@@ -26920,6 +26996,117 @@ mod tests {
         // SAFETY: null isolate is documented to return null.
         let val = unsafe { stator_value_new_number(std::ptr::null_mut(), 1.0) };
         assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_value_preserves_array_buffer_handle_roundtrip() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4],
+        }));
+
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_object(val) });
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+
+        // SAFETY: `val` is non-null and live.
+        let cloned =
+            unsafe { allocate_stator_value(iso.as_ptr(), clone_stator_value_inner(&(*val).inner)) };
+        assert!(unsafe { stator_value_strict_equals(val, cloned) });
+
+        // SAFETY: `cloned` is non-null and live.
+        let roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*cloned).inner) };
+        let JsValue::ArrayBuffer(returned) = roundtrip else {
+            panic!("ArrayBuffer StatorValue must round-trip as JsValue::ArrayBuffer");
+        };
+        assert!(Rc::ptr_eq(&returned, &buffer));
+        returned.borrow_mut().data[0] = 9;
+        assert_eq!(buffer.borrow().data[0], 9);
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(cloned);
+            stator_value_destroy(val);
+        }
+    }
+
+    #[test]
+    fn test_value_preserves_typed_array_and_data_view_handles() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: None,
+            detached: false,
+            data: vec![10, 20, 30, 40],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: stator_jse::builtins::typed_array::TypedArrayKind::Uint8,
+            byte_offset: 1,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 1,
+            byte_length: 2,
+            auto_length: false,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+
+        assert!(unsafe { stator_value_is_object(typed_value) });
+        assert!(unsafe { stator_value_is_typed_array(typed_value) });
+        assert!(!unsafe { stator_value_is_array_buffer(typed_value) });
+        assert!(unsafe { stator_value_is_object(view_value) });
+        assert!(unsafe { stator_value_is_data_view(view_value) });
+        assert!(!unsafe { stator_value_strict_equals(typed_value, view_value) });
+
+        // SAFETY: both values are non-null and live.
+        let typed_roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*typed_value).inner) };
+        let JsValue::TypedArray(returned_typed_array) = typed_roundtrip else {
+            panic!("TypedArray StatorValue must round-trip as JsValue::TypedArray");
+        };
+        assert!(Rc::ptr_eq(&returned_typed_array, &typed_array));
+        assert!(Rc::ptr_eq(&returned_typed_array.borrow().buffer, &buffer));
+
+        // SAFETY: `view_value` is non-null and live.
+        let view_roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*view_value).inner) };
+        let JsValue::DataView(returned_data_view) = view_roundtrip else {
+            panic!("DataView StatorValue must round-trip as JsValue::DataView");
+        };
+        assert!(Rc::ptr_eq(&returned_data_view, &data_view));
+        assert!(Rc::ptr_eq(&returned_data_view.borrow().buffer, &buffer));
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(view_value);
+            stator_value_destroy(typed_value);
+        }
     }
 
     #[test]
