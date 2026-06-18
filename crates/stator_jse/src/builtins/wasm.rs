@@ -64,7 +64,7 @@
 //!
 //! | `__wasm_type__`          | additional properties                        |
 //! |--------------------------|----------------------------------------------|
-//! | `"WebAssembly.Module"`   | `exports` (Array of descriptors), `__wasm_bytes__` |
+//! | `"WebAssembly.Module"`   | `exports` / `imports` descriptor arrays, `__wasm_bytes__` |
 //! | `"WebAssembly.Instance"` | `exports` (PlainObject of callable exports)  |
 //!
 //! [WebAssembly JavaScript API]: https://webassembly.github.io/spec/js-api/
@@ -76,7 +76,8 @@ use crate::error::{StatorError, StatorResult};
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::{JsValue, NativeFn};
 use crate::wasm::{
-    WasmEngine, WasmInstance, WasmModule, js_value_to_wasm_val, wasm_val_to_js_value,
+    WasmEngine, WasmExternKind, WasmInstance, WasmModule, js_value_to_wasm_val,
+    wasm_val_to_js_value,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +208,7 @@ fn compile_bytes(engine: &WasmEngine, bytes: &[u8]) -> StatorResult<WasmModule> 
 /// - `__wasm_type__` → `"WebAssembly.Module"`
 /// - `__wasm_bytes__` → `Array` of `Smi` (byte values 0–255)
 /// - `exports` → `Array` of export descriptor objects `{name, kind}`
+/// - `imports` → `Array` of import descriptor objects `{module, name, kind}`
 fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
     let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
@@ -246,7 +248,39 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
     map.borrow_mut()
         .insert("exports".to_string(), JsValue::new_array(export_descs));
 
+    // Build the imports descriptor array (`WebAssembly.Module.imports(mod)`).
+    // Stator still fails closed when instantiating imports, but exposing the
+    // metadata lets embedders and diagnostics inspect why a module cannot run.
+    let import_descs: Vec<JsValue> = module
+        .imports()
+        .into_iter()
+        .map(|import| {
+            let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            desc.borrow_mut()
+                .insert("module".to_string(), JsValue::String(import.module.into()));
+            desc.borrow_mut()
+                .insert("name".to_string(), JsValue::String(import.name.into()));
+            desc.borrow_mut().insert(
+                "kind".to_string(),
+                JsValue::String(wasm_extern_kind_name(&import.kind).into()),
+            );
+            JsValue::PlainObject(desc)
+        })
+        .collect();
+    map.borrow_mut()
+        .insert("imports".to_string(), JsValue::new_array(import_descs));
+
     JsValue::PlainObject(map)
+}
+
+fn wasm_extern_kind_name(kind: &WasmExternKind) -> &'static str {
+    match kind {
+        WasmExternKind::Func { .. } => "function",
+        WasmExternKind::Global { .. } => "global",
+        WasmExternKind::Memory { .. } => "memory",
+        WasmExternKind::Table { .. } => "table",
+        WasmExternKind::Other => "other",
+    }
 }
 
 /// Extract the raw bytes stored inside a `WebAssembly.Module` object.
@@ -1195,6 +1229,30 @@ mod tests {
                 assert_eq!(arr.borrow().len(), 1);
             } else {
                 panic!("expected exports array with one entry");
+            }
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_module_ctor_add_imports_descriptor() {
+        let m = wasm_module_ctor(vec![wat_val(IMPORTED_FUNC_WAT)]).unwrap();
+        if let JsValue::PlainObject(map) = m {
+            if let Some(JsValue::Array(arr)) = map.borrow().get("imports").cloned() {
+                assert_eq!(arr.borrow().len(), 1);
+                if let JsValue::PlainObject(desc) = &arr.borrow()[0] {
+                    let module = desc.borrow().get("module").cloned();
+                    let name = desc.borrow().get("name").cloned();
+                    let kind = desc.borrow().get("kind").cloned();
+                    assert_eq!(module, Some(JsValue::String("env".to_string().into())));
+                    assert_eq!(name, Some(JsValue::String("f".to_string().into())));
+                    assert_eq!(kind, Some(JsValue::String("function".to_string().into())));
+                } else {
+                    panic!("expected PlainObject import descriptor");
+                }
+            } else {
+                panic!("expected imports array with one entry");
             }
         } else {
             panic!("expected PlainObject");
