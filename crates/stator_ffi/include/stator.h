@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 34
+#define STATOR_FFI_ABI_VERSION_MINOR 35
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -420,6 +420,60 @@ typedef enum StatorPromiseState {
    */
   StatorPromiseStateInvalid = 3,
 } StatorPromiseState;
+
+/**
+ * C ABI representation of JavaScript typed-array element kinds.
+ */
+typedef enum StatorTypedArrayKind {
+  /**
+   * Not a typed-array value or an unknown future typed-array kind.
+   */
+  StatorTypedArrayKindInvalid = 0,
+  /**
+   * `Int8Array`.
+   */
+  StatorTypedArrayKindInt8 = 1,
+  /**
+   * `Uint8Array`.
+   */
+  StatorTypedArrayKindUint8 = 2,
+  /**
+   * `Uint8ClampedArray`.
+   */
+  StatorTypedArrayKindUint8Clamped = 3,
+  /**
+   * `Int16Array`.
+   */
+  StatorTypedArrayKindInt16 = 4,
+  /**
+   * `Uint16Array`.
+   */
+  StatorTypedArrayKindUint16 = 5,
+  /**
+   * `Int32Array`.
+   */
+  StatorTypedArrayKindInt32 = 6,
+  /**
+   * `Uint32Array`.
+   */
+  StatorTypedArrayKindUint32 = 7,
+  /**
+   * `Float32Array`.
+   */
+  StatorTypedArrayKindFloat32 = 8,
+  /**
+   * `Float64Array`.
+   */
+  StatorTypedArrayKindFloat64 = 9,
+  /**
+   * `BigInt64Array`.
+   */
+  StatorTypedArrayKindBigInt64 = 10,
+  /**
+   * `BigUint64Array`.
+   */
+  StatorTypedArrayKindBigUint64 = 11,
+} StatorTypedArrayKind;
 
 /**
  * Status for classic-script code-cache operations.
@@ -5094,12 +5148,78 @@ size_t stator_value_array_buffer_copy_contents(const struct StatorValue *val,
 bool stator_value_is_typed_array(const struct StatorValue *val);
 
 /**
+ * Returns the element kind for a JavaScript `TypedArray`.
+ *
+ * Returns `StatorTypedArrayKindInvalid` when `val` is
+ * null or is not a `TypedArray`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+enum StatorTypedArrayKind stator_value_typed_array_kind(const struct StatorValue *val);
+
+/**
+ * Returns the current byte offset of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_byte_offset(const struct StatorValue *val);
+
+/**
+ * Returns the current element length of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_length(const struct StatorValue *val);
+
+/**
+ * Returns the current byte length of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_byte_length(const struct StatorValue *val);
+
+/**
  * Returns `true` if `val` is a JavaScript `DataView` object.
  *
  * # Safety
- * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * `val` must be either null or a valid, live `StatorValue` pointer.
  */
 bool stator_value_is_data_view(const struct StatorValue *val);
+
+/**
+ * Returns the current byte offset of a JavaScript `DataView`.
+ *
+ * Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_data_view_byte_offset(const struct StatorValue *val);
+
+/**
+ * Returns the current byte length of a JavaScript `DataView`.
+ *
+ * Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_data_view_byte_length(const struct StatorValue *val);
 
 /**
  * Create a new, empty JavaScript object.
