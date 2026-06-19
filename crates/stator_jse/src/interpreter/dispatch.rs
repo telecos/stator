@@ -8503,6 +8503,11 @@ fn handle_call_direct_eval(
             }
         };
         let binding_registers = ctx.frame.bytecode_array.binding_registers().clone();
+        let context_bindings = ctx.frame.bytecode_array.context_bindings().clone();
+        let caller_context = match &ctx.frame.context {
+            Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+            _ => None,
+        };
         let original_global_names: HashSet<String> =
             ctx.frame.global_env.borrow().vars.keys().cloned().collect();
         let mut eval_bindings = ctx.frame.global_env.borrow().vars.clone();
@@ -8513,6 +8518,14 @@ fn handle_call_direct_eval(
         }
         for (name, reg) in &binding_registers {
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.cheap_clone());
+        }
+        if let Some(context) = &caller_context {
+            let context = context.borrow();
+            for (name, slot) in &context_bindings {
+                if let Some(value) = context.slots.get(*slot as usize) {
+                    eval_bindings.insert(name.clone(), value.cheap_clone());
+                }
+            }
         }
         let eval_env = Rc::new(RefCell::new(GlobalEnv::with_vars(eval_bindings)));
         let function_global_env = super::current_function_constructor_global_env()
@@ -8526,7 +8539,7 @@ fn handle_call_direct_eval(
                     ctx.frame.bytecode_array.is_strict(),
                 )
             })?;
-        let (register_updates, global_updates) = {
+        let (register_updates, context_updates, global_updates) = {
             let final_bindings = final_env.borrow();
             let register_updates: Vec<(u32, JsValue)> = binding_registers
                 .iter()
@@ -8536,11 +8549,17 @@ fn handle_call_direct_eval(
                         .map(|value| (*reg as u32, value.clone()))
                 })
                 .collect();
+            let context_updates: Vec<(u32, JsValue)> = context_bindings
+                .iter()
+                .filter_map(|(name, slot)| {
+                    final_bindings.get(name).map(|value| (*slot, value.clone()))
+                })
+                .collect();
             let global_updates: Vec<(String, JsValue)> = final_bindings
                 .vars
                 .iter()
                 .filter_map(|(name, value)| {
-                    if binding_registers.contains_key(name) {
+                    if binding_registers.contains_key(name) || context_bindings.contains_key(name) {
                         return None;
                     }
                     if !is_strict || original_global_names.contains(name) {
@@ -8550,10 +8569,27 @@ fn handle_call_direct_eval(
                     }
                 })
                 .collect();
-            (register_updates, global_updates)
+            (register_updates, context_updates, global_updates)
         };
         for (reg, value) in register_updates {
             ctx.frame.write_reg(reg, value)?;
+        }
+        if let Some(context_rc) = caller_context {
+            let mut applied_context_updates = Vec::with_capacity(context_updates.len());
+            let mut context = context_rc.borrow_mut();
+            for (slot, value) in context_updates {
+                let slot = slot as usize;
+                if slot >= context.slots.len() {
+                    context.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                context.slots[slot] = value.cheap_clone();
+                applied_context_updates.push((slot as u32, value));
+            }
+            drop(context);
+            for (slot, value) in applied_context_updates {
+                ctx.frame
+                    .sync_mapped_arguments_from_context_slot(&context_rc, slot, &value);
+            }
         }
         {
             let mut globals = ctx.frame.global_env.borrow_mut();

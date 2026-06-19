@@ -7335,7 +7335,8 @@ impl FunctionCompiler {
             .with_module_flag(self.is_module)
             .with_strict_flag(self.is_strict)
             .with_top_level_flag(self.is_program)
-            .with_binding_registers(binding_registers))
+            .with_binding_registers(binding_registers)
+            .with_context_bindings(self.context_bindings))
     }
 }
 

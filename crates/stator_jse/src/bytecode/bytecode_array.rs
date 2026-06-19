@@ -467,6 +467,8 @@ struct SharedBytecodeTemplate {
     source_text: Option<Rc<str>>,
     /// Visible binding-to-register mapping for direct `eval()`.
     binding_registers: Rc<HashMap<String, i32>>,
+    /// Captured local binding-to-context-slot mapping for direct `eval()`.
+    context_bindings: Rc<HashMap<String, u32>>,
     /// Sparse mapping from bytecode offsets to source locations.
     source_positions: Rc<[SourcePosition]>,
     /// Sloppy mapped-arguments aliases compiled for this function.
@@ -633,6 +635,7 @@ impl PartialEq for BytecodeArray {
             && self.inner.function_name == other.inner.function_name
             && self.inner.source_text == other.inner.source_text
             && self.inner.binding_registers == other.inner.binding_registers
+            && self.inner.context_bindings == other.inner.context_bindings
             && self.inner.source_positions == other.inner.source_positions
             && self.inner.mapped_arguments_aliases == other.inner.mapped_arguments_aliases
             && self.inner.feedback_metadata == other.inner.feedback_metadata
@@ -682,6 +685,7 @@ impl BytecodeArray {
                 function_name: Rc::from(""),
                 source_text: None,
                 binding_registers: Rc::new(HashMap::new()),
+                context_bindings: Rc::new(HashMap::new()),
                 source_positions: source_positions.into(),
                 mapped_arguments_aliases: Rc::from([]),
                 feedback_metadata: Rc::new(feedback_metadata),
@@ -1421,11 +1425,24 @@ impl BytecodeArray {
         &self.inner.binding_registers
     }
 
+    /// Captured local binding-to-context-slot mapping for direct `eval()`.
+    pub fn context_bindings(&self) -> &HashMap<String, u32> {
+        &self.inner.context_bindings
+    }
+
     /// Set the binding-to-register mapping used by direct `eval()`.
     pub fn with_binding_registers(mut self, binding_registers: HashMap<String, i32>) -> Self {
         Rc::get_mut(&mut self.inner)
             .expect("with_binding_registers called after sharing")
             .binding_registers = Rc::new(binding_registers);
+        self
+    }
+
+    /// Set the captured binding-to-context-slot mapping used by direct `eval()`.
+    pub fn with_context_bindings(mut self, context_bindings: HashMap<String, u32>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_context_bindings called after sharing")
+            .context_bindings = Rc::new(context_bindings);
         self
     }
 

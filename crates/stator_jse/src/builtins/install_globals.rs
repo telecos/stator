@@ -75780,7 +75780,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_nested_closure_reads_updated_outer_binding_after_eval() {
         let result = global_eval(
             "function outer() { var x = 1; var read = function() { return x; }; eval('x = 14'); return read(); } outer()",

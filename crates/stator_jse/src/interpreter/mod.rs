@@ -30867,7 +30867,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_parameters() {
         let result = compile_source_and_run(
             "async function* g(a, b) { yield a; yield b; yield a + b; } async function f() { var s = 0; for await (const x of g(3, 7)) { s = s + x; } return s; } f()",
