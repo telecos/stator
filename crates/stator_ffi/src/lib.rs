@@ -97,7 +97,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 33;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 34;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -3745,6 +3745,88 @@ pub unsafe extern "C" fn stator_value_is_array_buffer(val: *const StatorValue) -
     }
     // SAFETY: caller guarantees `val` is valid.
     matches!(unsafe { &(*val).inner }, StatorValueInner::ArrayBuffer(_))
+}
+
+/// Returns the byte length of a JavaScript `ArrayBuffer`.
+///
+/// Returns `0` when `val` is null, is not an `ArrayBuffer`, or the buffer is
+/// detached.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_byte_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => {
+            let buffer = buffer.borrow();
+            if buffer.detached {
+                0
+            } else {
+                buffer.data.len()
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Returns whether a JavaScript `ArrayBuffer` has been detached.
+///
+/// Returns `false` when `val` is null or is not an `ArrayBuffer`.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_is_detached(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow().detached,
+        _ => false,
+    }
+}
+
+/// Copy bytes out of a JavaScript `ArrayBuffer` into caller-owned memory.
+///
+/// Returns the number of bytes copied. Returns `0` when `val` is null, is not an
+/// `ArrayBuffer`, the buffer is detached, `dst` is null, `dst_len` is zero, or
+/// `src_offset` is outside the buffer.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+/// - The destination range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_copy_contents(
+    val: *const StatorValue,
+    dst: *mut u8,
+    dst_len: usize,
+    src_offset: usize,
+) -> usize {
+    if val.is_null() || dst.is_null() || dst_len == 0 {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let buffer = match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow(),
+        _ => return 0,
+    };
+    if buffer.detached || src_offset >= buffer.data.len() {
+        return 0;
+    }
+    let available = buffer.data.len() - src_offset;
+    let to_copy = available.min(dst_len);
+    // SAFETY: caller guarantees `dst` is valid for `dst_len` bytes and the
+    // destination does not overlap Stator-managed backing storage.
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.data.as_ptr().add(src_offset), dst, to_copy);
+    }
+    to_copy
 }
 
 /// Returns `true` if `val` is a JavaScript `TypedArray` object.
@@ -27147,6 +27229,122 @@ mod tests {
             stator_value_destroy(cloned);
             stator_value_destroy(val);
         }
+    }
+
+    #[test]
+    fn test_value_array_buffer_read_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4, 5],
+        }));
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+
+        // SAFETY: `val` is non-null and live.
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 5);
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(val) });
+
+        let mut out = [0u8; 3];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable for its full length.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 1) },
+            3
+        );
+        assert_eq!(out, [2, 3, 4]);
+
+        let mut tail = [0u8; 8];
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(val, tail.as_mut_ptr(), tail.len(), 3)
+            },
+            2
+        );
+        assert_eq!(&tail[..2], &[4, 5]);
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(val, tail.as_mut_ptr(), tail.len(), 5)
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: `val` is live; null destination is documented to return 0.
+            unsafe { stator_value_array_buffer_copy_contents(val, std::ptr::null_mut(), 1, 0) },
+            0
+        );
+
+        buffer.borrow_mut().detached = true;
+        // SAFETY: `val` is non-null and live.
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 0);
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_array_buffer_is_detached(val) });
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable for its full length.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            0
+        );
+
+        // SAFETY: `val` was allocated by Stator.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_array_buffer_read_accessors_reject_invalid_values() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe { stator_value_array_buffer_byte_length(std::ptr::null()) },
+            0
+        );
+        // SAFETY: null values are documented to return false.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(std::ptr::null()) });
+        let mut out = [9u8; 2];
+        assert_eq!(
+            // SAFETY: null values are documented to return 0 without writing.
+            unsafe {
+                stator_value_array_buffer_copy_contents(
+                    std::ptr::null(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(out, [9, 9]);
+
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!non_buffer.is_null());
+        assert_eq!(
+            // SAFETY: `non_buffer` is non-null and live.
+            unsafe { stator_value_array_buffer_byte_length(non_buffer) },
+            0
+        );
+        // SAFETY: `non_buffer` is non-null and live.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(non_buffer) });
+        assert_eq!(
+            // SAFETY: `non_buffer` is live and `out` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(non_buffer, out.as_mut_ptr(), out.len(), 0)
+            },
+            0
+        );
+        assert_eq!(out, [9, 9]);
+
+        // SAFETY: `non_buffer` was allocated by Stator.
+        unsafe { stator_value_destroy(non_buffer) };
     }
 
     #[test]

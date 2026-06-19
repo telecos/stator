@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 33
+#define STATOR_FFI_ABI_VERSION_MINOR 34
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5046,6 +5046,44 @@ bool stator_value_is_set(const struct StatorValue *val);
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 bool stator_value_is_array_buffer(const struct StatorValue *val);
+
+/**
+ * Returns the byte length of a JavaScript `ArrayBuffer`.
+ *
+ * Returns `0` when `val` is null, is not an `ArrayBuffer`, or the buffer is
+ * detached.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+size_t stator_value_array_buffer_byte_length(const struct StatorValue *val);
+
+/**
+ * Returns whether a JavaScript `ArrayBuffer` has been detached.
+ *
+ * Returns `false` when `val` is null or is not an `ArrayBuffer`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_array_buffer_is_detached(const struct StatorValue *val);
+
+/**
+ * Copy bytes out of a JavaScript `ArrayBuffer` into caller-owned memory.
+ *
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not an
+ * `ArrayBuffer`, the buffer is detached, `dst` is null, `dst_len` is zero, or
+ * `src_offset` is outside the buffer.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_array_buffer_copy_contents(const struct StatorValue *val,
+                                               uint8_t *dst,
+                                               size_t dst_len,
+                                               size_t src_offset);
 
 /**
  * Returns `true` if `val` is a JavaScript `TypedArray` object.
