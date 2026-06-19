@@ -369,6 +369,7 @@ stator_value_as_string
 stator_value_call
 stator_value_data_view_byte_length
 stator_value_data_view_byte_offset
+stator_value_data_view_copy_contents
 stator_value_destroy
 stator_value_get_boolean
 stator_value_get_int32
@@ -417,6 +418,7 @@ stator_value_to_uint32
 stator_value_type
 stator_value_typed_array_byte_length
 stator_value_typed_array_byte_offset
+stator_value_typed_array_copy_contents
 stator_value_typed_array_kind
 stator_value_typed_array_length
 stator_value_write_string_utf8

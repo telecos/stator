@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 35
+#define STATOR_FFI_ABI_VERSION_MINOR 36
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5192,6 +5192,24 @@ size_t stator_value_typed_array_length(const struct StatorValue *val);
 size_t stator_value_typed_array_byte_length(const struct StatorValue *val);
 
 /**
+ * Copy bytes out of a JavaScript `TypedArray` view into caller-owned memory.
+ *
+ * `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+ * `TypedArray`, the view is detached or out of bounds, `dst` is null,
+ * `dst_len` is zero, or `src_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_typed_array_copy_contents(const struct StatorValue *val,
+                                              uint8_t *dst,
+                                              size_t dst_len,
+                                              size_t src_offset);
+
+/**
  * Returns `true` if `val` is a JavaScript `DataView` object.
  *
  * # Safety
@@ -5220,6 +5238,24 @@ size_t stator_value_data_view_byte_offset(const struct StatorValue *val);
  * `val` must be either null or a valid, live `StatorValue` pointer.
  */
 size_t stator_value_data_view_byte_length(const struct StatorValue *val);
+
+/**
+ * Copy bytes out of a JavaScript `DataView` into caller-owned memory.
+ *
+ * `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+ * `DataView`, the view is detached or out of bounds, `dst` is null, `dst_len`
+ * is zero, or `src_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_data_view_copy_contents(const struct StatorValue *val,
+                                            uint8_t *dst,
+                                            size_t dst_len,
+                                            size_t src_offset);
 
 /**
  * Create a new, empty JavaScript object.
