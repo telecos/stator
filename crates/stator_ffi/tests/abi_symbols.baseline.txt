@@ -395,6 +395,8 @@ stator_value_is_string
 stator_value_is_typed_array
 stator_value_is_uint32
 stator_value_is_undefined
+stator_value_new_array_buffer
+stator_value_new_array_buffer_copy
 stator_value_new_array_tag
 stator_value_new_boolean
 stator_value_new_date_tag

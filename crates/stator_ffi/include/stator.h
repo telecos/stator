@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 36
+#define STATOR_FFI_ABI_VERSION_MINOR 37
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -4647,6 +4647,31 @@ struct StatorValue *stator_value_new_number(struct StatorIsolate *isolate, doubl
 struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
                                             const char *data,
                                             size_t len);
+
+/**
+ * Create a new zero-filled JavaScript `ArrayBuffer`.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ */
+struct StatorValue *stator_value_new_array_buffer(struct StatorIsolate *isolate,
+                                                  size_t byte_length);
+
+/**
+ * Create a new JavaScript `ArrayBuffer` by copying bytes from caller memory.
+ *
+ * `data` is copied immediately; the caller retains ownership of the source
+ * memory. Returns a null pointer if `isolate` or `data` is null.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `data` must be valid for reads of `len` bytes.
+ */
+struct StatorValue *stator_value_new_array_buffer_copy(struct StatorIsolate *isolate,
+                                                       const uint8_t *data,
+                                                       size_t len);
 
 /**
  * Create a new boolean value.

@@ -28,7 +28,9 @@ use stator_jse::builtins::error::{ErrorKind, JsError};
 use stator_jse::builtins::promise::{
     JsPromise, MicrotaskQueue, PromiseState, active_microtask_queue, install_active_microtask_queue,
 };
-use stator_jse::builtins::typed_array::{JsArrayBuffer, JsDataView, JsTypedArray, TypedArrayKind};
+use stator_jse::builtins::typed_array::{
+    JsArrayBuffer, JsDataView, JsTypedArray, TypedArrayKind, arraybuffer_new,
+};
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
@@ -97,7 +99,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 36;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 37;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -2770,6 +2772,59 @@ pub unsafe extern "C" fn stator_value_new_string(
         }
     }
     val
+}
+
+/// Create a new zero-filled JavaScript `ArrayBuffer`.
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_array_buffer(
+    isolate: *mut StatorIsolate,
+    byte_length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let buffer = Rc::new(RefCell::new(arraybuffer_new(byte_length)));
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { allocate_stator_value(isolate, StatorValueInner::ArrayBuffer(buffer)) }
+}
+
+/// Create a new JavaScript `ArrayBuffer` by copying bytes from caller memory.
+///
+/// `data` is copied immediately; the caller retains ownership of the source
+/// memory. Returns a null pointer if `isolate` or `data` is null.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `data` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_array_buffer_copy(
+    isolate: *mut StatorIsolate,
+    data: *const u8,
+    len: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || data.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `data` is valid for `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let buffer = JsArrayBuffer {
+        shared: false,
+        max_byte_length: None,
+        detached: false,
+        data: bytes.to_vec(),
+    };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::ArrayBuffer(Rc::new(RefCell::new(buffer))),
+        )
+    }
 }
 
 /// Create a new boolean value.
@@ -27426,6 +27481,95 @@ mod tests {
         assert_eq!(got, "hello");
         // SAFETY: `val` is non-null and live.
         unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_zero_filled_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is non-null and live.
+        let val = unsafe { stator_value_new_array_buffer(iso.as_ptr(), 4) };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 4);
+
+        let mut out = [9u8; 4];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            4
+        );
+        assert_eq!(out, [0, 0, 0, 0]);
+
+        // SAFETY: `val` is non-null and live.
+        let js_value = unsafe { stator_value_inner_to_jsvalue(&(*val).inner) };
+        let JsValue::ArrayBuffer(buffer) = js_value else {
+            panic!("ArrayBuffer constructor must produce JsValue::ArrayBuffer");
+        };
+        assert_eq!(buffer.borrow().data, [0, 0, 0, 0]);
+        assert!(!buffer.borrow().shared);
+        assert!(!buffer.borrow().detached);
+        assert_eq!(buffer.borrow().max_byte_length, None);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_copy_copies_embedder_bytes() {
+        let iso = IsolateGuard::new();
+        let mut source = [1u8, 2, 3, 4, 5];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let val = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 5);
+
+        source.fill(9);
+        let mut out = [0u8; 5];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            5
+        );
+        assert_eq!(out, [1, 2, 3, 4, 5]);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_constructors_reject_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe { stator_value_new_array_buffer(std::ptr::null_mut(), 4) }.is_null()
+        );
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe {
+                stator_value_new_array_buffer_copy(
+                    std::ptr::null_mut(),
+                    c"x".as_ptr() as *const u8,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: null data is documented to return null.
+            unsafe { stator_value_new_array_buffer_copy(iso.as_ptr(), std::ptr::null(), 1) }
+                .is_null()
+        );
+
+        // SAFETY: `iso` is non-null and live; `empty` is readable for zero bytes.
+        let empty = unsafe { stator_value_new_array_buffer(iso.as_ptr(), 0) };
+        assert!(!empty.is_null());
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(empty) }, 0);
+
+        // SAFETY: `empty` is non-null and live.
+        unsafe { stator_value_destroy(empty) };
     }
 
     #[test]
