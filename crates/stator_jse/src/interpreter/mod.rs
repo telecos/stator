@@ -31538,7 +31538,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // debug: frames too large; release/linux: Maglev JIT boolean return bug
     fn test_tail_call_mutual_recursion_sloppy_small() {
         test_tail_call_assert_bool(
             "function even(n) { \
