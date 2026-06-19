@@ -297,6 +297,46 @@ fn materialize_array_holes(items: &[JsValue]) -> Vec<JsValue> {
         .collect()
 }
 
+fn is_function_prototype_dispatcher(receiver: &JsValue) -> bool {
+    let Some(JsValue::PlainObject(function_proto)) = constructor_prototype("Function") else {
+        return false;
+    };
+    let function_proto = function_proto.borrow();
+    ["call", "apply", "bind"].iter().any(|name| {
+        function_proto
+            .get(name)
+            .is_some_and(|method| method == receiver)
+    })
+}
+
+fn resolve_function_prototype_target(args: &[JsValue]) -> Option<(JsValue, usize)> {
+    let receiver = current_this().filter(is_callable);
+
+    if let Some(first) = args.first().filter(|value| is_callable(value))
+        && receiver
+            .as_ref()
+            .is_none_or(is_function_prototype_dispatcher)
+    {
+        return Some((first.clone(), 1));
+    }
+
+    receiver.map(|receiver| (receiver, 0))
+}
+
+fn resolve_object_prototype_receiver_and_key(args: &[JsValue]) -> (JsValue, JsValue) {
+    if args.len() >= 2 {
+        (
+            args.first().cloned().unwrap_or(JsValue::Undefined),
+            args.get(1).cloned().unwrap_or(JsValue::Undefined),
+        )
+    } else {
+        (
+            current_this().unwrap_or(JsValue::Undefined),
+            args.first().cloned().unwrap_or(JsValue::Undefined),
+        )
+    }
+}
+
 /// Extract elements from an array-like value, preserving holes as `undefined`.
 fn try_to_array_like_elements(val: &JsValue) -> StatorResult<(Vec<JsValue>, usize)> {
     let len = array_like_length(val)?;
@@ -16364,10 +16404,9 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "hasOwnProperty".into(),
             builtin_fn("hasOwnProperty", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let key = args.get(1).unwrap_or(&JsValue::Undefined);
+                let (this, key) = resolve_object_prototype_receiver_and_key(&args);
                 let prop = key.to_property_key()?;
-                match this {
+                match &this {
                     JsValue::PlainObject(map) => {
                         let has = plain_object_has_own_property(&map.borrow(), &prop);
                         Ok(JsValue::Boolean(has))
@@ -16381,12 +16420,11 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "isPrototypeOf".into(),
             builtin_fn("isPrototypeOf", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let target = args.get(1).unwrap_or(&JsValue::Undefined);
-                if let JsValue::PlainObject(_) = this
+                let (this, target) = resolve_object_prototype_receiver_and_key(&args);
+                if let JsValue::PlainObject(_) = &this
                     && target.is_object_like()
                 {
-                    return Ok(JsValue::Boolean(has_prototype_in_chain(target, this)));
+                    return Ok(JsValue::Boolean(has_prototype_in_chain(&target, &this)));
                 }
                 Ok(JsValue::Boolean(false))
             }),
@@ -16396,10 +16434,9 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "propertyIsEnumerable".into(),
             builtin_fn("propertyIsEnumerable", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let key = args.get(1).unwrap_or(&JsValue::Undefined);
+                let (this, key) = resolve_object_prototype_receiver_and_key(&args);
                 let prop = key.to_property_key()?;
-                match this {
+                match &this {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
                         let exists = borrow.contains_key(&prop) && prop != "__proto__";
@@ -19772,30 +19809,16 @@ fn make_function() -> JsValue {
         proto.insert(
             "call".into(),
             native(|args| {
-                // Two invocation conventions converge here:
-                //   * `Function.prototype.call.call(fn, thisArg, ...)` —
-                //     `function_call` prepends `fn` so `args[0]` is the
-                //     target callable.
-                //   * `fn.call(thisArg, ...)` via method dispatch — the
-                //     receiver lives in `current_this()` and `args[0]` is
-                //     the user's `thisArg`.
-                // Prefer `args[0]` only when it is itself callable, which
-                // disambiguates the two paths (a callable PlainObject `this`
-                // would otherwise be mistaken for an argument list head).
-                let (func, this_arg, call_args): (JsValue, JsValue, Vec<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2..).unwrap_or(&[]).to_vec(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1..).unwrap_or(&[]).to_vec(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.call requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let call_args = args.get(this_arg_index + 1..).unwrap_or(&[]).to_vec();
                 match &func {
                     JsValue::NativeFunction(f) => function_call(f, &this_arg, &call_args),
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
@@ -19812,22 +19835,16 @@ fn make_function() -> JsValue {
         proto.insert(
             "apply".into(),
             native(|args| {
-                // See `Function.prototype.call` above for the dual
-                // invocation conventions handled here.
-                let (func, this_arg, args_slot): (JsValue, JsValue, Option<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2).cloned(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1).cloned(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.apply requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let args_slot = args.get(this_arg_index + 1).cloned();
                 let args_array = match args_slot {
                     Some(JsValue::Array(arr)) => Some(arr.borrow().clone()),
                     Some(JsValue::PlainObject(map)) => {
@@ -19872,24 +19889,16 @@ fn make_function() -> JsValue {
         proto.insert(
             "bind".into(),
             native(|args| {
-                // See `Function.prototype.call` above for the dual
-                // invocation conventions handled here. This enables
-                // chained `f.bind(...).bind(...)` where the second `.bind`
-                // is dispatched as a method on the bound PlainObject.
-                let (func, this_arg, bound_args): (JsValue, JsValue, Vec<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2..).unwrap_or(&[]).to_vec(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1..).unwrap_or(&[]).to_vec(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.bind requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let bound_args = args.get(this_arg_index + 1..).unwrap_or(&[]).to_vec();
                 let result_len =
                     function_length(function_length_value(&func) as u32, bound_args.len() as u32)
                         as i32;
@@ -30061,7 +30070,8 @@ mod tests {
             JsValue::Promise(promise) => {
                 assert!(
                     promise.is_fulfilled(),
-                    "expected fulfilled promise for {script:?}"
+                    "expected fulfilled promise for {script:?}, got {:?}",
+                    promise.state()
                 );
                 assert_eq!(promise.value(), Some(expected));
             }
@@ -47348,6 +47358,70 @@ mod tests {
     #[test]
     fn e2e_function_call_explicit_this_binding() {
         assert_eval_true("function f(a) { return this.base + a; } f.call({ base: 5 }, 7) === 12");
+    }
+
+    #[test]
+    fn e2e_function_call_supports_callable_this_arg() {
+        assert_eval_true(
+            "function f() { return this === Object.prototype.hasOwnProperty; } \
+             f.call(Object.prototype.hasOwnProperty)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_supports_callable_receiver_equal_this_arg() {
+        assert_eval_true(
+            "function f() { 'use strict'; return this === f && arguments.length === 0; } \
+             f.call(f)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "Function.prototype.call.call( \
+                 function(value) { 'use strict'; return this === null && value === 7; }, \
+                 null, \
+                 7)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "Function.prototype.apply.call( \
+                 function(a, b) { 'use strict'; return this === null && a + b === 11; }, \
+                 null, \
+                 [5, 6])",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "var bound = Function.prototype.bind.call( \
+                 function(suffix) { 'use strict'; return this.prefix + suffix; }, \
+                 { prefix: 'sta' }, \
+                 'tor'); \
+             bound() === 'stator'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_bind_uncurries_object_builtin() {
+        assert_eval_true(
+            "var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+             hasOwn(String.prototype.anchor, 'length')",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_bind_uncurries_property_is_enumerable() {
+        assert_eval_true(
+            "var isEnumerable = \
+                 Function.prototype.call.bind(Object.prototype.propertyIsEnumerable); \
+             isEnumerable(String.prototype.anchor, 'length') === false",
+        );
     }
 
     #[test]
@@ -71819,7 +71893,6 @@ mod tests {
 
     /// Generator with arguments passed to the factory function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_with_arguments() {
         let r = global_eval(
             r#"
@@ -71833,6 +71906,165 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("3,4,5,6".into()));
+    }
+
+    /// Generator activation stores the actual arguments object.
+    #[test]
+    fn e2e_generator_activation_preserves_actual_arguments() {
+        let r = global_eval(
+            r#"
+            function* gen(a) {
+                yield arguments.length;
+                yield arguments[2];
+            }
+            var it = gen('first', 'second', 'third');
+            var a = it.next().value;
+            var b = it.next().value;
+            a + ':' + b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3:third".into()));
+    }
+
+    /// Generator resume uses saved registers instead of reseeding parameters.
+    #[test]
+    fn e2e_generator_resume_preserves_modified_parameters() {
+        let r = global_eval(
+            r#"
+            function* gen(value) {
+                value = 9;
+                yield 1;
+                return value;
+            }
+            var it = gen(2);
+            it.next();
+            it.next(100).value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(9));
+    }
+
+    /// Generator no-receiver calls preserve strict vs sloppy `this` semantics.
+    #[test]
+    fn e2e_generator_activation_preserves_no_receiver_this() {
+        let r = global_eval(
+            r#"
+            function* strictGen() { 'use strict'; yield this === undefined; }
+            function* sloppyGen() { yield this === globalThis; }
+            strictGen().next().value && sloppyGen().next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Generator method calls preserve the property receiver.
+    #[test]
+    fn e2e_generator_activation_preserves_method_receiver() {
+        let r = global_eval(
+            r#"
+            var obj = { value: 17, *gen(extra) { yield this.value + extra; } };
+            obj.gen(5).next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(22));
+    }
+
+    /// Spread calls still capture actual generator arguments.
+    #[test]
+    fn e2e_generator_activation_preserves_spread_arguments() {
+        let r = global_eval(
+            r#"
+            function* gen(a, b, c) { yield a + b + c + ':' + arguments.length; }
+            gen(...[2, 3, 4]).next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("9:3".into()));
+    }
+
+    /// Async function activation stores the actual arguments object.
+    #[test]
+    fn e2e_async_function_activation_preserves_actual_arguments() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function f(a) {
+                return arguments.length === 3 && arguments[2] === 'third';
+            }
+            f('first', 'second', 'third')
+            "#,
+        );
+    }
+
+    /// Async no-receiver calls preserve strict vs sloppy `this` semantics.
+    #[test]
+    fn e2e_async_function_activation_preserves_no_receiver_this() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function strictFn() { 'use strict'; return this === undefined; }
+            async function sloppyFn() { return this === globalThis; }
+            async function check() { return (await strictFn()) && (await sloppyFn()); }
+            check()
+            "#,
+        );
+    }
+
+    /// Async method calls preserve the property receiver.
+    #[test]
+    fn e2e_async_function_activation_preserves_method_receiver() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var obj = { value: 17, async f(extra) { return this.value + extra; } };
+            async function check() { return await obj.f(5) === 22; }
+            check()
+            "#,
+        );
+    }
+
+    /// Spread calls still capture actual async function arguments.
+    #[test]
+    fn e2e_async_function_activation_preserves_spread_arguments() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function f(a, b, c) {
+                return a + b + c === 9 && arguments.length === 3;
+            }
+            f(...[2, 3, 4])
+            "#,
+        );
+    }
+
+    /// Async arrows keep lexical `this` from their creation context.
+    #[test]
+    fn e2e_async_arrow_preserves_lexical_this() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var obj = {
+                value: 31,
+                make() { return (async () => this.value)(); }
+            };
+            async function check() { return await obj.make() === 31; }
+            check()
+            "#,
+        );
+    }
+
+    /// Async arrows keep lexical `new.target` from their creation context.
+    #[test]
+    fn e2e_async_arrow_preserves_lexical_new_target() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function check() {
+                function F() { this.promise = (async () => new.target === F)(); }
+                var instance = new F();
+                return await instance.promise;
+            }
+            check()
+            "#,
+        );
     }
 
     /// Multiple generators can run independently.

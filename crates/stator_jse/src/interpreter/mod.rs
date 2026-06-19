@@ -1864,9 +1864,16 @@ impl TierRequestResult {
     }
 }
 
+fn tiering_blocked_by_tail_call(ba: &BytecodeArray) -> bool {
+    ba.contains_tail_call()
+}
+
 /// Observe whether `ba` has completed compilation for `tier`.
 #[must_use]
 pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     if ba.jit_disabled() {
         return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
     }
@@ -1937,11 +1944,15 @@ pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
 /// are returned as structured statuses.
 #[must_use]
 pub fn force_tier_sync(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
-    if ba.jit_disabled() {
-        return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
-    }
     let observed = observe_tier(ba, tier);
-    if observed.ready {
+    if observed.ready
+        || matches!(
+            observed.status,
+            TierRequestStatus::UnsupportedTier
+                | TierRequestStatus::JitDisabled
+                | TierRequestStatus::DeoptBlocked
+        )
+    {
         return observed;
     }
     match tier {
@@ -2038,6 +2049,9 @@ fn jsvalue_to_jit(v: &JsValue) -> i64 {
 /// and stores the cached executable code via [`BytecodeArray::store_jit_code`].
 /// On other platforms this is a no-op.
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(any(
         stator_baseline_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2069,6 +2083,9 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
 
 fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
     let tier = JitTier::Baseline;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     #[cfg(any(
         stator_baseline_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2211,6 +2228,9 @@ struct MaglevCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub fn maybe_compile_maglev(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2404,6 +2424,9 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     use crate::compiler::tier_latency::{PromotionTier, PromotionTimer};
 
     let tier = JitTier::Maglev;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     let timer = PromotionTimer::start(PromotionTier::Maglev);
     if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
         timer.discard();
@@ -2501,6 +2524,9 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     all(target_arch = "x86_64", any(unix, windows))
 ))]
 pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
+    if tiering_blocked_by_tail_call(ba) {
+        return false;
+    }
     force_maglev_sync(ba).ready
 }
 
@@ -2515,6 +2541,9 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
 fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2677,6 +2706,9 @@ struct TurbofanCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::bytecode::feedback::FeedbackVector;
@@ -2752,6 +2784,9 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 
 fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
     let tier = JitTier::Turbofan;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
@@ -2872,6 +2907,9 @@ pub(super) fn try_execute_best_jit(
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
     if DEBUG_ATTACHED.with(|f| f.get()) {
@@ -2894,6 +2932,9 @@ pub(super) fn try_execute_best_jit_no_result(
     args: &[JsValue],
 ) -> Option<StatorResult<()>> {
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     if DEBUG_ATTACHED.with(|f| f.get()) {
         return None;
     }
@@ -4178,6 +4219,109 @@ pub(super) fn restore_no_receiver_this(
     }
 }
 
+fn effective_call_global_env(
+    ba: &Rc<BytecodeArray>,
+    fallback: &Rc<RefCell<GlobalEnv>>,
+) -> Rc<RefCell<GlobalEnv>> {
+    fn_global_env_get(ba).unwrap_or_else(|| Rc::clone(fallback))
+}
+
+fn global_this_from_env(global_env: &Rc<RefCell<GlobalEnv>>) -> JsValue {
+    global_env
+        .borrow()
+        .get("globalThis")
+        .cloned()
+        .unwrap_or(JsValue::Undefined)
+}
+
+fn fresh_global_env_rc() -> Rc<RefCell<GlobalEnv>> {
+    let mut global_env = GlobalEnv::new();
+    crate::builtins::install_globals::install_globals(&mut global_env.vars);
+    global_env.rebuild_slots();
+    global_env.globals_installed = true;
+    Rc::new(RefCell::new(global_env))
+}
+
+fn lexical_this_binding(ba: &Rc<BytecodeArray>) -> Option<JsValue> {
+    if ba.is_arrow() && ba.has_fn_props() {
+        Some(fn_props_get(ba, ".this"))
+    } else {
+        None
+    }
+}
+
+fn lexical_new_target(ba: &Rc<BytecodeArray>) -> JsValue {
+    if ba.is_arrow() && ba.has_fn_props() {
+        fn_props_get(ba, ".new_target")
+    } else {
+        JsValue::Undefined
+    }
+}
+
+pub(super) fn no_receiver_activation_this(
+    ba: &Rc<BytecodeArray>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Option<JsValue> {
+    lexical_this_binding(ba).or_else(|| {
+        Some(if ba.is_strict() {
+            JsValue::Undefined
+        } else {
+            global_this_from_env(global_env)
+        })
+    })
+}
+
+pub(super) fn receiver_activation_this(
+    ba: &Rc<BytecodeArray>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    this_val: JsValue,
+) -> Option<JsValue> {
+    lexical_this_binding(ba).or_else(|| {
+        Some(if !ba.is_strict() && this_val.is_nullish() {
+            global_this_from_env(global_env)
+        } else {
+            this_val
+        })
+    })
+}
+
+pub(super) fn make_generator_no_receiver_activation(
+    ba: &Rc<BytecodeArray>,
+    args: CallArgs,
+    caller_global_env: &Rc<RefCell<GlobalEnv>>,
+) -> JsValue {
+    let global_env = effective_call_global_env(ba, caller_global_env);
+    let this_binding = no_receiver_activation_this(ba, &global_env);
+    let state = GeneratorState::with_activation(
+        Rc::clone(ba),
+        args,
+        global_env,
+        this_binding,
+        lexical_new_target(ba),
+    );
+    init_generator_state_prototype(&state, ba);
+    JsValue::Generator(state)
+}
+
+pub(super) fn make_generator_with_receiver_activation(
+    ba: &Rc<BytecodeArray>,
+    args: CallArgs,
+    caller_global_env: &Rc<RefCell<GlobalEnv>>,
+    this_val: JsValue,
+) -> JsValue {
+    let global_env = effective_call_global_env(ba, caller_global_env);
+    let this_binding = receiver_activation_this(ba, &global_env, this_val);
+    let state = GeneratorState::with_activation(
+        Rc::clone(ba),
+        args,
+        global_env,
+        this_binding,
+        lexical_new_target(ba),
+    );
+    init_generator_state_prototype(&state, ba);
+    JsValue::Generator(state)
+}
+
 impl InterpreterFrame {
     /// Create a new frame for the given [`BytecodeArray`], pre-loading `args`
     /// into the parameter registers.
@@ -5228,7 +5372,11 @@ impl Interpreter {
                     }
                 }
                 if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
-                    return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
+                    return Self::run_async_function_no_receiver(
+                        frame.bytecode_array.clone(),
+                        frame.call_args.clone(),
+                        Rc::clone(&frame.global_env),
+                    );
                 }
 
                 // JIT fast-path: attempt JIT execution BEFORE the stacker closure
@@ -13069,13 +13217,27 @@ impl Interpreter {
         state: &Rc<RefCell<GeneratorState>>,
         input: JsValue,
     ) -> StatorResult<GeneratorStep> {
-        let (status, resume_mode, bytecode_array, saved_registers, resume_pc) = {
+        let (
+            status,
+            resume_mode,
+            bytecode_array,
+            saved_registers,
+            saved_call_args,
+            saved_global_env,
+            saved_this_binding,
+            saved_new_target,
+            resume_pc,
+        ) = {
             let gs = state.borrow();
             (
                 gs.status,
                 gs.resume_mode.clone(),
                 gs.bytecode_array.clone(),
                 gs.registers.clone(),
+                gs.call_args.clone(),
+                gs.global_env.clone(),
+                gs.this_binding.clone(),
+                gs.new_target.clone(),
                 gs.resume_pc,
             )
         };
@@ -13099,28 +13261,39 @@ impl Interpreter {
         // the first step (saved_registers is empty).
         let mut registers = saved_registers;
         registers.resize(total, JsValue::Undefined);
+        if status == GeneratorStatus::SuspendedAtStart {
+            for (i, arg) in saved_call_args
+                .iter()
+                .cloned()
+                .enumerate()
+                .take(param_count)
+            {
+                registers[i] = arg;
+            }
+        }
+
+        let call_args: CallArgs = saved_call_args.iter().cloned().collect();
+        let global_env = saved_global_env
+            .or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            .unwrap_or_else(fresh_global_env_rc);
 
         let mut frame = InterpreterFrame {
             bytecode_array: bytecode_array.clone(),
             registers,
-            call_args: CallArgs::new(),
+            call_args,
             mapped_arguments_aliases: None,
             accumulator: input,
             pc: resume_pc,
             context: None,
             suspend_result: None,
             generator_state: Some(Rc::clone(state)),
-            global_env: CURRENT_GLOBALS.with(|g| {
-                g.borrow()
-                    .clone()
-                    .unwrap_or_else(|| Rc::new(RefCell::new(GlobalEnv::new())))
-            }),
+            global_env,
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
             deadline: None,
             pending_message: JsValue::Undefined,
-            new_target: JsValue::Undefined,
+            new_target: saved_new_target,
             mono_load_cache: None,
             poly_load_cache: None,
             mega_load_ic: None,
@@ -13161,7 +13334,20 @@ impl Interpreter {
         state.borrow_mut().status = GeneratorStatus::Executing;
 
         push_call_frame("<generator>")?;
+        let previous_this = if let Some(this_binding) = saved_this_binding {
+            let old_this = frame.global_env.borrow().get_this().cloned();
+            frame.global_env.borrow_mut().set_this(this_binding);
+            Some(old_this)
+        } else {
+            None
+        };
         let return_val = run_callee(&mut frame);
+        if let Some(old_this) = previous_this {
+            match old_this {
+                Some(value) => frame.global_env.borrow_mut().set_this(value),
+                None => frame.global_env.borrow_mut().remove_this(),
+            }
+        }
         pop_call_frame();
         let return_val = match return_val {
             Ok(value) => value,
@@ -13198,12 +13384,75 @@ impl Interpreter {
     /// value, or already rejected if the async body threw.
     pub fn run_async_function(
         bytecode_array: Rc<BytecodeArray>,
-        _args: impl IntoIterator<Item = JsValue>,
+        args: impl IntoIterator<Item = JsValue>,
+    ) -> StatorResult<JsValue> {
+        let caller_global_env = CURRENT_GLOBALS
+            .with(|globals| globals.borrow().clone())
+            .unwrap_or_else(fresh_global_env_rc);
+        Self::run_async_function_no_receiver(bytecode_array, args, caller_global_env)
+    }
+
+    /// Run an async function call that did not provide an explicit receiver.
+    ///
+    /// Captures the caller's effective global environment, the actual call
+    /// arguments, lexical arrow bindings, and strict/sloppy no-receiver `this`
+    /// semantics before driving the async generator body to completion.
+    pub fn run_async_function_no_receiver(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        caller_global_env: Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<JsValue> {
+        let global_env = effective_call_global_env(&bytecode_array, &caller_global_env);
+        let this_binding = no_receiver_activation_this(&bytecode_array, &global_env);
+        Self::run_async_function_with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            lexical_new_target,
+        )
+    }
+
+    /// Run an async function call with an explicit receiver value.
+    ///
+    /// Captures the caller's effective global environment, the actual call
+    /// arguments, lexical arrow bindings, and the receiver-adjusted `this`
+    /// binding before driving the async generator body to completion.
+    pub fn run_async_function_with_receiver(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        caller_global_env: Rc<RefCell<GlobalEnv>>,
+        this_val: JsValue,
+    ) -> StatorResult<JsValue> {
+        let global_env = effective_call_global_env(&bytecode_array, &caller_global_env);
+        let this_binding = receiver_activation_this(&bytecode_array, &global_env, this_val);
+        Self::run_async_function_with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            lexical_new_target,
+        )
+    }
+
+    fn run_async_function_with_activation(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        global_env: Rc<RefCell<GlobalEnv>>,
+        this_binding: Option<JsValue>,
+        new_target: fn(&Rc<BytecodeArray>) -> JsValue,
     ) -> StatorResult<JsValue> {
         use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
         let queue = MicrotaskQueue::new();
-        let state = GeneratorState::new(bytecode_array);
+        let new_target = new_target(&bytecode_array);
+        let state = GeneratorState::with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            new_target,
+        );
         let mut input = JsValue::Undefined;
 
         loop {
@@ -14542,13 +14791,16 @@ pub(super) fn dispatch_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                frame.accumulator = JsValue::Generator(state);
+                frame.accumulator =
+                    make_generator_no_receiver_activation(ba, args, &frame.global_env);
             } else if ba.is_async() {
                 // Async (non-generator) function: drive the internal generator
                 // to completion and return a Promise.
-                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
+                frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(ba),
+                    args,
+                    Rc::clone(&frame.global_env),
+                )?;
             } else {
                 let count = ba.increment_invocation_count();
                 // Only check tiering/JIT when the function has been called
@@ -14642,11 +14894,15 @@ pub(super) fn dispatch_call_property(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                frame.accumulator = JsValue::Generator(state);
+                frame.accumulator =
+                    make_generator_with_receiver_activation(ba, args, &frame.global_env, this_val);
             } else if ba.is_async() {
-                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
+                frame.accumulator = Interpreter::run_async_function_with_receiver(
+                    Rc::clone(ba),
+                    args,
+                    Rc::clone(&frame.global_env),
+                    this_val,
+                )?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -19992,9 +20248,24 @@ pub fn dispatch_call_value(
             // Generator functions return a suspended generator object instead
             // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                return Ok(JsValue::Generator(state));
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Ok(make_generator_no_receiver_activation(
+                    ba,
+                    args,
+                    &caller_global_env,
+                ));
+            }
+            if ba.is_async() {
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Interpreter::run_async_function_no_receiver(
+                    Rc::clone(ba),
+                    args,
+                    caller_global_env,
+                );
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) =
@@ -20045,9 +20316,26 @@ pub fn dispatch_call_with_this(
             // Generator functions return a suspended generator object instead
             // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                return Ok(JsValue::Generator(state));
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Ok(make_generator_with_receiver_activation(
+                    ba,
+                    args,
+                    &caller_global_env,
+                    this_val,
+                ));
+            }
+            if ba.is_async() {
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Interpreter::run_async_function_with_receiver(
+                    Rc::clone(ba),
+                    args,
+                    caller_global_env,
+                    this_val,
+                );
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) =
@@ -23222,6 +23510,114 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         make_bytecode(instrs, 1, 2) // frame_size=1, param_count=2
+    }
+
+    /// Build a bytecode array containing a `TailCall` opcode.
+    ///
+    /// Simulates `return add(4, 5)` using a tail-position call, so the bytecode
+    /// remains interpreter-valid while tiering/JIT paths must reject it.
+    fn make_tail_call_bytecode() -> BytecodeArray {
+        let add_ba = make_add_bytecode();
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(4)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::TailCall,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
+        make_bytecode_with_pool(instrs, pool, 3, 0)
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_interprets_without_jit() {
+        let tail_ba = make_tail_call_bytecode();
+        assert!(tail_ba.contains_tail_call());
+
+        let mut frame = InterpreterFrame::new(Rc::new(tail_ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_reports_deopt_blocked_for_all_tiers() {
+        let tail_ba = make_tail_call_bytecode();
+
+        for tier in [JitTier::Baseline, JitTier::Maglev, JitTier::Turbofan] {
+            let observed = observe_tier(&tail_ba, tier);
+            assert_eq!(observed.requested_tier, tier);
+            assert_eq!(observed.status, TierRequestStatus::DeoptBlocked);
+            assert!(!observed.ready);
+
+            let forced = force_tier_sync(&tail_ba, tier);
+            assert_eq!(forced.requested_tier, tier);
+            assert_eq!(forced.status, TierRequestStatus::DeoptBlocked);
+            assert!(!forced.ready);
+
+            let waited = wait_for_tier(&tail_ba, tier, Duration::from_millis(0));
+            assert_eq!(waited.requested_tier, tier);
+            assert_eq!(waited.status, TierRequestStatus::DeoptBlocked);
+            assert!(!waited.ready);
+        }
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_deopt_blocked_precedes_jit_disabled() {
+        let tail_ba = make_tail_call_bytecode();
+        tail_ba.set_jit_disabled(true);
+
+        let result = force_tier_sync(&tail_ba, JitTier::Baseline);
+
+        assert!(!result.ready);
+        assert_eq!(result.status, TierRequestStatus::DeoptBlocked);
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_compile_requests_do_not_populate_jit_caches() {
+        let tail_ba = make_tail_call_bytecode();
+
+        maybe_compile_baseline(&tail_ba);
+        maybe_compile_maglev(&tail_ba);
+        maybe_compile_turbofan(&tail_ba);
+
+        assert!(!tail_ba.has_baseline_jit_code());
+        assert!(!tail_ba.has_maglev_jit_code());
+        assert!(!tail_ba.has_maglev_executable_cached());
+        assert!(!tail_ba.maglev_compile_attempted());
+        assert!(!tail_ba.has_turbofan_jit_code());
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_tail_call_bytecode_maglev_sync_and_execution_decline() {
+        let tail_ba = make_tail_call_bytecode();
+
+        assert!(!compile_maglev_sync(&tail_ba));
+        assert!(!tail_ba.has_maglev_executable_cached());
+        assert!(try_execute_maglev_raw(&tail_ba, &[]).is_none());
+        assert!(try_execute_best_jit(&tail_ba, &[]).is_none());
+        assert!(try_execute_best_jit_no_result(&tail_ba, &[]).is_none());
     }
 
     /// Calling a function more than [`TIERING_THRESHOLD`] times must trigger

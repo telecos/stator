@@ -126,6 +126,8 @@ pub struct GeneratorState {
     pub call_args: Vec<JsValue>,
     /// Global environment used to execute/resume the activation.
     pub global_env: Option<Rc<RefCell<crate::interpreter::GlobalEnv>>>,
+    /// `this` binding captured when the generator activation was created.
+    pub this_binding: Option<JsValue>,
     /// Instruction index to resume from; `0` = start of function body.
     pub resume_pc: usize,
     /// Current lifecycle status.
@@ -147,11 +149,32 @@ impl GeneratorState {
             registers: crate::interpreter::RegisterFile::new(),
             call_args: Vec::new(),
             global_env: None,
+            this_binding: None,
             resume_pc: 0,
             status: GeneratorStatus::SuspendedAtStart,
             resume_mode: GeneratorResumeMode::Normal,
             new_target: JsValue::Undefined,
         }))
+    }
+
+    /// Create a generator with the activation metadata needed to start the
+    /// body later through [`crate::interpreter::Interpreter::run_generator_step`].
+    pub fn with_activation(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        global_env: Rc<RefCell<crate::interpreter::GlobalEnv>>,
+        this_binding: Option<JsValue>,
+        new_target: JsValue,
+    ) -> Rc<RefCell<Self>> {
+        let state = Self::new(bytecode_array);
+        {
+            let mut borrow = state.borrow_mut();
+            borrow.call_args = args.into_iter().collect();
+            borrow.global_env = Some(global_env);
+            borrow.this_binding = this_binding;
+            borrow.new_target = new_target;
+        }
+        state
     }
 }
 

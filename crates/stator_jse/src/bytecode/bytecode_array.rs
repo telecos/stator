@@ -1512,6 +1512,23 @@ impl BytecodeArray {
         bytecodes::decode(&self.inner.bytecodes)
     }
 
+    /// Return whether this bytecode stream contains a tail-call opcode.
+    ///
+    /// Tail-call bytecode is currently interpreter-only. If decoding fails,
+    /// report `true` so tiering paths conservatively avoid compiling unknown
+    /// bytecode.
+    #[must_use]
+    pub fn contains_tail_call(&self) -> bool {
+        self.decoded_instructions()
+            .map(|decoded| {
+                decoded
+                    .0
+                    .iter()
+                    .any(|instruction| instruction.opcode == bytecodes::Opcode::TailCall)
+            })
+            .unwrap_or(true)
+    }
+
     fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<DecodedBytecode>> {
         if self.inner.cached_decode.get().is_none() {
             let (mut instructions, mut byte_offsets) =
@@ -2068,6 +2085,33 @@ mod tests {
         assert_eq!(instrs[0].opcode, Opcode::LdaSmi);
         assert_eq!(instrs[1].opcode, Opcode::Star);
         assert_eq!(instrs[2].opcode, Opcode::Return);
+    }
+
+    #[test]
+    fn test_contains_tail_call_detects_tail_call_opcode() {
+        let tail_call = BytecodeArray::new(
+            encode(&[
+                Instruction::new_unchecked(
+                    Opcode::TailCall,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::RegisterCount(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ]),
+            vec![],
+            2,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+
+        assert!(!make_simple_array().contains_tail_call());
+        assert!(tail_call.contains_tail_call());
     }
 
     #[test]

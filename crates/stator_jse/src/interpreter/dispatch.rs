@@ -26,10 +26,11 @@ use super::{
     constant_to_value, construct_builtin_result, decode_string_constant, dispatch_call_property,
     dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
     err_bad_operand, error_message_from_value, extract_context, fast_array_method_name,
-    fast_array_method_target, find_handler, fn_props_get, fn_props_set, has_property_in_chain,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    fast_array_method_target, find_handler, fn_global_env_get, fn_props_get, fn_props_set,
+    has_property_in_chain, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
+    keyed_load, keyed_store, make_construct_this, make_generator_no_receiver_activation,
+    make_generator_with_receiver_activation, maybe_cache_construct_boilerplate,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
     notify_mapped_arguments_property_delete, notify_mapped_arguments_property_write,
     number_to_jsvalue, ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name,
     proto_lookup, proto_lookup_cached_resolution, proto_lookup_chain_depth,
@@ -46,8 +47,8 @@ use crate::builtins::proxy::{
     proxy_apply, proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
 };
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
-    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
+    ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
+    TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
@@ -55,8 +56,8 @@ use crate::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use crate::inspector::debugger::PauseFrameSnapshot;
 use crate::objects::js_object::JsObject;
 use crate::objects::value::{
-    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext,
-    JsContextMappedArgumentAlias, JsValue, NativeIterator,
+    GeneratorResumeMode, GeneratorStatus, GeneratorStep, JsContext, JsContextMappedArgumentAlias,
+    JsValue, NativeIterator,
 };
 
 /// Stack-allocated integer-to-string conversion.
@@ -2196,12 +2197,16 @@ fn handle_call_any_receiver(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(&ba));
-                super::init_generator_state_prototype(&state, &ba);
-                ctx.frame.accumulator = JsValue::Generator(state);
+                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
             } else if ba.is_async() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 // ── Inline small functions (zero-arg fast path) ──
                 if arg_count == 0
@@ -2240,8 +2245,9 @@ fn handle_call_any_receiver(
                 } else {
                     None
                 };
-                let mut callee_frame =
-                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
+                let global_env =
+                    fn_global_env_get(&ba).unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
+                let mut callee_frame = acquire_frame(Rc::clone(&ba), args, global_env);
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2302,14 +2308,6 @@ fn handle_tail_call(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if !ctx.frame.bytecode_array.is_strict() {
-        // TailCall is terminal — the callee's result must be returned to
-        // our caller, not continued past the (non-existent) next bytecode.
-        // handle_call_any_receiver sets the accumulator and returns Continue;
-        // convert that into Return so the frame unwinds correctly.
-        handle_call_any_receiver(ctx, instr)?;
-        return Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()));
-    }
     let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("TailCall", 0));
     };
@@ -2323,16 +2321,8 @@ fn handle_tail_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() || ba.is_async() {
-                // Generators/async cannot be tail-called;
-                // fall back to a normal call.
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                if ba.is_generator() {
-                    let state = GeneratorState::new(Rc::clone(&ba));
-                    super::init_generator_state_prototype(&state, &ba);
-                    ctx.frame.accumulator = JsValue::Generator(state);
-                } else {
-                    ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
-                }
+                handle_call_any_receiver(ctx, instr)?;
+                Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()))
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering (cold path: compile but do NOT execute JIT
@@ -2361,8 +2351,11 @@ fn handle_tail_call(
                 let frame_size = ba.frame_size() as usize;
                 let total_regs = param_count + frame_size;
                 let inherited_new_target = ctx.frame.new_target.clone();
+                let global_env =
+                    fn_global_env_get(&ba).unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
                 ctx.frame.bytecode_array = Rc::clone(&ba);
                 ctx.frame.call_args = args;
+                ctx.frame.global_env = global_env;
                 ctx.frame.clear_mapped_arguments_aliases();
                 ctx.frame.registers.clear();
                 ctx.frame.registers.resize(total_regs, JsValue::Undefined);
@@ -2403,32 +2396,14 @@ fn handle_tail_call(
                 ctx.frame.mega_store_ic = None;
                 ctx.frame.global_ic_reset();
                 ctx.frame.global_cache_invalidate();
-                return Ok(DispatchAction::TailCall);
+                Ok(DispatchAction::TailCall)
             }
         }
-        JsValue::NativeFunction(f) => {
-            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args.into_vec())?;
-            ctx.frame.global_cache_invalidate();
-        }
-        JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = f(args.into_vec())?;
-                ctx.frame.global_cache_invalidate();
-            } else {
-                return Err(StatorError::TypeError(
-                    "TailCall: callee is not a function (got PlainObject)".to_string(),
-                ));
-            }
-        }
-        other => {
-            return Err(StatorError::TypeError(format!(
-                "TailCall: callee is not a function (got {other:?})"
-            )));
+        _ => {
+            handle_call_any_receiver(ctx, instr)?;
+            Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()))
         }
     }
-    Ok(DispatchAction::Continue)
 }
 
 fn handle_call_undefined_receiver0(
@@ -2467,19 +2442,17 @@ fn handle_call_undefined_receiver0(
                 }
             }
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
+                ctx.frame.accumulator = make_generator_no_receiver_activation(
+                    &ba,
+                    CallArgs::new(),
+                    &ctx.frame.global_env,
+                );
             } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), CallArgs::new())
-                }
-                ctx.frame.accumulator = run_async(&ba)?;
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    CallArgs::new(),
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let no_args: &[JsValue] = &[];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
@@ -2603,21 +2576,18 @@ fn handle_call_undefined_receiver1(
                 }
             }
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
-            } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), args)
-                }
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1];
-                ctx.frame.accumulator = run_async(&ba, args)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+            } else if ba.is_async() {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let args: CallArgs = smallvec![arg1];
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
@@ -2715,22 +2685,20 @@ fn handle_call_undefined_receiver2(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
-            } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), args)
-                }
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1, arg2];
-                ctx.frame.accumulator = run_async(&ba, args)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+            } else if ba.is_async() {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
+                let args: CallArgs = smallvec![arg1, arg2];
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
@@ -3015,6 +2983,19 @@ fn handle_call_with_spread(
     let args = expand_spread_args(raw_args);
     match callee {
         JsValue::Function(ba) => {
+            if ba.is_generator() {
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+                return Ok(DispatchAction::Continue);
+            }
+            if ba.is_async() {
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
+                return Ok(DispatchAction::Continue);
+            }
             // ── Tiering ──────────────────────────────────────
             let count = ba.increment_invocation_count();
             if count >= TIERING_THRESHOLD && !ba.has_any_jit_code() {
@@ -3056,7 +3037,23 @@ fn handle_call_with_spread(
                     ctx.frame.accumulator = call_plain_object_native_function(ctx, map, &f, args)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    call_plain_object_function(ctx, &ba, map, args)?;
+                    if ba.is_generator() {
+                        ctx.frame.accumulator = make_generator_with_receiver_activation(
+                            &ba,
+                            args,
+                            &ctx.frame.global_env,
+                            JsValue::PlainObject(Rc::clone(map)),
+                        );
+                    } else if ba.is_async() {
+                        ctx.frame.accumulator = Interpreter::run_async_function_with_receiver(
+                            Rc::clone(&ba),
+                            args,
+                            Rc::clone(&ctx.frame.global_env),
+                            JsValue::PlainObject(Rc::clone(map)),
+                        )?;
+                    } else {
+                        call_plain_object_function(ctx, &ba, map, args)?;
+                    }
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -8529,21 +8526,39 @@ fn handle_call_direct_eval(
                     ctx.frame.bytecode_array.is_strict(),
                 )
             })?;
-        let final_bindings = final_env.borrow();
-        for (name, reg) in &binding_registers {
-            if let Some(value) = final_bindings.get(name) {
-                ctx.frame.write_reg(*reg as u32, value.clone())?;
-            }
+        let (register_updates, global_updates) = {
+            let final_bindings = final_env.borrow();
+            let register_updates: Vec<(u32, JsValue)> = binding_registers
+                .iter()
+                .filter_map(|(name, reg)| {
+                    final_bindings
+                        .get(name)
+                        .map(|value| (*reg as u32, value.clone()))
+                })
+                .collect();
+            let global_updates: Vec<(String, JsValue)> = final_bindings
+                .vars
+                .iter()
+                .filter_map(|(name, value)| {
+                    if binding_registers.contains_key(name) {
+                        return None;
+                    }
+                    if !is_strict || original_global_names.contains(name) {
+                        Some((name.clone(), value.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (register_updates, global_updates)
+        };
+        for (reg, value) in register_updates {
+            ctx.frame.write_reg(reg, value)?;
         }
         {
             let mut globals = ctx.frame.global_env.borrow_mut();
-            for (name, value) in final_bindings.vars.iter() {
-                if binding_registers.contains_key(name) {
-                    continue;
-                }
-                if !is_strict || original_global_names.contains(name) {
-                    globals.insert(name.clone(), value.clone());
-                }
+            for (name, value) in global_updates {
+                globals.insert(name, value);
             }
         }
         ctx.frame.accumulator = result;
@@ -8552,9 +8567,14 @@ fn handle_call_direct_eval(
         match callee {
             JsValue::Function(ba) => {
                 if ba.is_generator() {
-                    let state = GeneratorState::new(Rc::clone(&ba));
-                    super::init_generator_state_prototype(&state, &ba);
-                    ctx.frame.accumulator = JsValue::Generator(state);
+                    ctx.frame.accumulator =
+                        make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+                } else if ba.is_async() {
+                    ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                        Rc::clone(&ba),
+                        args,
+                        Rc::clone(&ctx.frame.global_env),
+                    )?;
                 } else {
                     let mut callee_frame =
                         acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));

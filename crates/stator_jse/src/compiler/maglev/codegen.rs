@@ -11309,7 +11309,7 @@ mod tests {
 
         // Create empty blocks and add them to the graph first so that
         // `add_value_node` can assign graph-global unique IDs.
-        let mut b0 = BasicBlock::new(0);
+        let b0 = BasicBlock::new(0);
         let mut b1 = BasicBlock::new(1);
         b1.add_predecessor(0);
         graph.add_block(b0);
