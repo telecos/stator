@@ -1847,6 +1847,13 @@ impl FunctionCompiler {
                 self.define_local(&id.name)
             };
             self.emit_star(reg);
+            if let Some(slot) = self.context_bindings.get(&id.name).copied() {
+                self.emit_ldar(reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(slot)],
+                ));
+            }
             // Top-level script function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
             if self.is_program && !self.is_module && !self.is_strict {
@@ -7784,8 +7791,7 @@ fn collect_free_refs_in_stmt(
             collect_free_refs_in_stmt(&w.body, scopes, free_refs);
         }
         Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            let nested_free_refs = collect_function_free_refs(&f.params, &f.body.body, self_name);
+            let nested_free_refs = collect_function_free_refs(&f.params, &f.body.body, None);
             for name in nested_free_refs {
                 record_free_ref(&name, scopes, free_refs);
             }
@@ -8179,8 +8185,7 @@ fn walk_stmt_for_inner_refs(stmt: &Stmt, out: &mut HashSet<String>) {
             walk_stmt_for_inner_refs(&w.body, out);
         }
         Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            for n in collect_function_free_refs(&f.params, &f.body.body, self_name) {
+            for n in collect_function_free_refs(&f.params, &f.body.body, None) {
                 out.insert(n);
             }
         }
@@ -8445,14 +8450,11 @@ fn find_captures_in_stmt(
             find_captures_in_expr(&w.object, scopes, captured);
             find_captures_in_stmt(&w.body, scopes, captured);
         }
-        Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            capture_visible_free_refs(
-                collect_function_free_refs(&f.params, &f.body.body, self_name),
-                scopes,
-                captured,
-            );
-        }
+        Stmt::FnDecl(f) => capture_visible_free_refs(
+            collect_function_free_refs(&f.params, &f.body.body, None),
+            scopes,
+            captured,
+        ),
         _ => {}
     }
 }
