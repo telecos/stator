@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 37
+#define STATOR_FFI_ABI_VERSION_MINOR 38
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -347,6 +347,60 @@ typedef enum StatorParserMetadata {
 } StatorParserMetadata;
 
 /**
+ * C ABI representation of JavaScript typed-array element kinds.
+ */
+typedef enum StatorTypedArrayKind {
+  /**
+   * Not a typed-array value or an unknown future typed-array kind.
+   */
+  StatorTypedArrayKindInvalid = 0,
+  /**
+   * `Int8Array`.
+   */
+  StatorTypedArrayKindInt8 = 1,
+  /**
+   * `Uint8Array`.
+   */
+  StatorTypedArrayKindUint8 = 2,
+  /**
+   * `Uint8ClampedArray`.
+   */
+  StatorTypedArrayKindUint8Clamped = 3,
+  /**
+   * `Int16Array`.
+   */
+  StatorTypedArrayKindInt16 = 4,
+  /**
+   * `Uint16Array`.
+   */
+  StatorTypedArrayKindUint16 = 5,
+  /**
+   * `Int32Array`.
+   */
+  StatorTypedArrayKindInt32 = 6,
+  /**
+   * `Uint32Array`.
+   */
+  StatorTypedArrayKindUint32 = 7,
+  /**
+   * `Float32Array`.
+   */
+  StatorTypedArrayKindFloat32 = 8,
+  /**
+   * `Float64Array`.
+   */
+  StatorTypedArrayKindFloat64 = 9,
+  /**
+   * `BigInt64Array`.
+   */
+  StatorTypedArrayKindBigInt64 = 10,
+  /**
+   * `BigUint64Array`.
+   */
+  StatorTypedArrayKindBigUint64 = 11,
+} StatorTypedArrayKind;
+
+/**
  * Stable status code returned by typed-accessor and Maybe-style FFI entry
  * points so that C callers can distinguish a missing value, an invalid
  * argument, an unsupported operation, and a JavaScript exception without
@@ -420,60 +474,6 @@ typedef enum StatorPromiseState {
    */
   StatorPromiseStateInvalid = 3,
 } StatorPromiseState;
-
-/**
- * C ABI representation of JavaScript typed-array element kinds.
- */
-typedef enum StatorTypedArrayKind {
-  /**
-   * Not a typed-array value or an unknown future typed-array kind.
-   */
-  StatorTypedArrayKindInvalid = 0,
-  /**
-   * `Int8Array`.
-   */
-  StatorTypedArrayKindInt8 = 1,
-  /**
-   * `Uint8Array`.
-   */
-  StatorTypedArrayKindUint8 = 2,
-  /**
-   * `Uint8ClampedArray`.
-   */
-  StatorTypedArrayKindUint8Clamped = 3,
-  /**
-   * `Int16Array`.
-   */
-  StatorTypedArrayKindInt16 = 4,
-  /**
-   * `Uint16Array`.
-   */
-  StatorTypedArrayKindUint16 = 5,
-  /**
-   * `Int32Array`.
-   */
-  StatorTypedArrayKindInt32 = 6,
-  /**
-   * `Uint32Array`.
-   */
-  StatorTypedArrayKindUint32 = 7,
-  /**
-   * `Float32Array`.
-   */
-  StatorTypedArrayKindFloat32 = 8,
-  /**
-   * `Float64Array`.
-   */
-  StatorTypedArrayKindFloat64 = 9,
-  /**
-   * `BigInt64Array`.
-   */
-  StatorTypedArrayKindBigInt64 = 10,
-  /**
-   * `BigUint64Array`.
-   */
-  StatorTypedArrayKindBigUint64 = 11,
-} StatorTypedArrayKind;
 
 /**
  * Status for classic-script code-cache operations.
@@ -4672,6 +4672,53 @@ struct StatorValue *stator_value_new_array_buffer(struct StatorIsolate *isolate,
 struct StatorValue *stator_value_new_array_buffer_copy(struct StatorIsolate *isolate,
                                                        const uint8_t *data,
                                                        size_t len);
+
+/**
+ * Create a new zero-filled JavaScript `TypedArray`.
+ *
+ * Returns a null pointer if `isolate` is null or `kind` is
+ * `StatorTypedArrayKindInvalid`.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ */
+struct StatorValue *stator_value_new_typed_array(struct StatorIsolate *isolate,
+                                                 enum StatorTypedArrayKind kind,
+                                                 size_t length);
+
+/**
+ * Create a JavaScript `TypedArray` view over a JavaScript `ArrayBuffer`.
+ *
+ * `byte_offset` and `length` are fixed-length view parameters. Returns a null
+ * pointer if `isolate` or `buffer` is null, `kind` is invalid, `buffer` is not
+ * an `ArrayBuffer` owned by `isolate`, or the requested view is unaligned,
+ * detached, or out of bounds.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `buffer` must be either null or a valid, live `StatorValue` pointer.
+ */
+struct StatorValue *stator_value_new_typed_array_from_array_buffer(struct StatorIsolate *isolate,
+                                                                   enum StatorTypedArrayKind kind,
+                                                                   const struct StatorValue *buffer,
+                                                                   size_t byte_offset,
+                                                                   size_t length);
+
+/**
+ * Create a JavaScript `DataView` over a JavaScript `ArrayBuffer`.
+ *
+ * Returns a null pointer if `isolate` or `buffer` is null, `buffer` is not an
+ * `ArrayBuffer` owned by `isolate`, or the requested view is detached or out of
+ * bounds.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `buffer` must be either null or a valid, live `StatorValue` pointer.
+ */
+struct StatorValue *stator_value_new_data_view_from_array_buffer(struct StatorIsolate *isolate,
+                                                                 const struct StatorValue *buffer,
+                                                                 size_t byte_offset,
+                                                                 size_t byte_length);
 
 /**
  * Create a new boolean value.

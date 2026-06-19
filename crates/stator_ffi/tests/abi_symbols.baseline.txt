@@ -399,6 +399,7 @@ stator_value_new_array_buffer
 stator_value_new_array_buffer_copy
 stator_value_new_array_tag
 stator_value_new_boolean
+stator_value_new_data_view_from_array_buffer
 stator_value_new_date_tag
 stator_value_new_function_tag
 stator_value_new_map_tag
@@ -409,6 +410,8 @@ stator_value_new_promise_tag
 stator_value_new_regexp_tag
 stator_value_new_set_tag
 stator_value_new_string
+stator_value_new_typed_array
+stator_value_new_typed_array_from_array_buffer
 stator_value_new_undefined
 stator_value_strict_equals
 stator_value_to_boolean

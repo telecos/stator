@@ -29,7 +29,8 @@ use stator_jse::builtins::promise::{
     JsPromise, MicrotaskQueue, PromiseState, active_microtask_queue, install_active_microtask_queue,
 };
 use stator_jse::builtins::typed_array::{
-    JsArrayBuffer, JsDataView, JsTypedArray, TypedArrayKind, arraybuffer_new,
+    JsArrayBuffer, JsDataView, JsTypedArray, TypedArrayKind, arraybuffer_new, dataview_new,
+    typed_array_new_from_buffer, typed_array_new_from_length,
 };
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
@@ -99,7 +100,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 37;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 38;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -162,6 +163,25 @@ impl From<TypedArrayKind> for StatorTypedArrayKind {
             TypedArrayKind::BigInt64 => Self::StatorTypedArrayKindBigInt64,
             TypedArrayKind::BigUint64 => Self::StatorTypedArrayKindBigUint64,
         }
+    }
+}
+
+fn typed_array_kind_from_ffi(kind: StatorTypedArrayKind) -> Option<TypedArrayKind> {
+    match kind {
+        StatorTypedArrayKind::StatorTypedArrayKindInt8 => Some(TypedArrayKind::Int8),
+        StatorTypedArrayKind::StatorTypedArrayKindUint8 => Some(TypedArrayKind::Uint8),
+        StatorTypedArrayKind::StatorTypedArrayKindUint8Clamped => {
+            Some(TypedArrayKind::Uint8Clamped)
+        }
+        StatorTypedArrayKind::StatorTypedArrayKindInt16 => Some(TypedArrayKind::Int16),
+        StatorTypedArrayKind::StatorTypedArrayKindUint16 => Some(TypedArrayKind::Uint16),
+        StatorTypedArrayKind::StatorTypedArrayKindInt32 => Some(TypedArrayKind::Int32),
+        StatorTypedArrayKind::StatorTypedArrayKindUint32 => Some(TypedArrayKind::Uint32),
+        StatorTypedArrayKind::StatorTypedArrayKindFloat32 => Some(TypedArrayKind::Float32),
+        StatorTypedArrayKind::StatorTypedArrayKindFloat64 => Some(TypedArrayKind::Float64),
+        StatorTypedArrayKind::StatorTypedArrayKindBigInt64 => Some(TypedArrayKind::BigInt64),
+        StatorTypedArrayKind::StatorTypedArrayKindBigUint64 => Some(TypedArrayKind::BigUint64),
+        StatorTypedArrayKind::StatorTypedArrayKindInvalid => None,
     }
 }
 
@@ -2823,6 +2843,122 @@ pub unsafe extern "C" fn stator_value_new_array_buffer_copy(
         allocate_stator_value(
             isolate,
             StatorValueInner::ArrayBuffer(Rc::new(RefCell::new(buffer))),
+        )
+    }
+}
+
+/// Create a new zero-filled JavaScript `TypedArray`.
+///
+/// Returns a null pointer if `isolate` is null or `kind` is
+/// `StatorTypedArrayKindInvalid`.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_typed_array(
+    isolate: *mut StatorIsolate,
+    kind: StatorTypedArrayKind,
+    length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(kind) = typed_array_kind_from_ffi(kind) else {
+        return std::ptr::null_mut();
+    };
+    let typed_array = typed_array_new_from_length(kind, length);
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::TypedArray(Rc::new(RefCell::new(typed_array))),
+        )
+    }
+}
+
+/// Create a JavaScript `TypedArray` view over a JavaScript `ArrayBuffer`.
+///
+/// `byte_offset` and `length` are fixed-length view parameters. Returns a null
+/// pointer if `isolate` or `buffer` is null, `kind` is invalid, `buffer` is not
+/// an `ArrayBuffer` owned by `isolate`, or the requested view is unaligned,
+/// detached, or out of bounds.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `buffer` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_typed_array_from_array_buffer(
+    isolate: *mut StatorIsolate,
+    kind: StatorTypedArrayKind,
+    buffer: *const StatorValue,
+    byte_offset: usize,
+    length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || buffer.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(kind) = typed_array_kind_from_ffi(kind) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: caller guarantees `buffer` is valid.
+    let buffer_value = unsafe { &*buffer };
+    if buffer_value.isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    let StatorValueInner::ArrayBuffer(array_buffer) = &buffer_value.inner else {
+        return std::ptr::null_mut();
+    };
+    let typed_array =
+        match typed_array_new_from_buffer(kind, Rc::clone(array_buffer), byte_offset, Some(length))
+        {
+            Ok(array) => array,
+            Err(_) => return std::ptr::null_mut(),
+        };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::TypedArray(Rc::new(RefCell::new(typed_array))),
+        )
+    }
+}
+
+/// Create a JavaScript `DataView` over a JavaScript `ArrayBuffer`.
+///
+/// Returns a null pointer if `isolate` or `buffer` is null, `buffer` is not an
+/// `ArrayBuffer` owned by `isolate`, or the requested view is detached or out of
+/// bounds.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `buffer` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_data_view_from_array_buffer(
+    isolate: *mut StatorIsolate,
+    buffer: *const StatorValue,
+    byte_offset: usize,
+    byte_length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || buffer.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `buffer` is valid.
+    let buffer_value = unsafe { &*buffer };
+    if buffer_value.isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    let StatorValueInner::ArrayBuffer(array_buffer) = &buffer_value.inner else {
+        return std::ptr::null_mut();
+    };
+    let data_view = match dataview_new(Rc::clone(array_buffer), byte_offset, Some(byte_length)) {
+        Ok(view) => view,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::DataView(Rc::new(RefCell::new(data_view))),
         )
     }
 }
@@ -27570,6 +27706,233 @@ mod tests {
 
         // SAFETY: `empty` is non-null and live.
         unsafe { stator_value_destroy(empty) };
+    }
+
+    #[test]
+    fn test_value_new_typed_array_zero_filled_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is non-null and live.
+        let val = unsafe {
+            stator_value_new_typed_array(
+                iso.as_ptr(),
+                StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                3,
+            )
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_typed_array(val) });
+        assert_eq!(
+            unsafe { stator_value_typed_array_kind(val) },
+            StatorTypedArrayKind::StatorTypedArrayKindUint16
+        );
+        assert_eq!(unsafe { stator_value_typed_array_length(val) }, 3);
+        assert_eq!(unsafe { stator_value_typed_array_byte_length(val) }, 6);
+
+        let mut out = [9u8; 6];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_typed_array_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            6
+        );
+        assert_eq!(out, [0, 0, 0, 0, 0, 0]);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_backed_typed_array_and_data_view() {
+        let iso = IsolateGuard::new();
+        let source = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let buffer = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!buffer.is_null());
+
+        // SAFETY: `buffer` is a live ArrayBuffer value owned by `iso`.
+        let typed = unsafe {
+            stator_value_new_typed_array_from_array_buffer(
+                iso.as_ptr(),
+                StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                buffer,
+                2,
+                2,
+            )
+        };
+        assert!(!typed.is_null());
+        assert_eq!(unsafe { stator_value_typed_array_byte_offset(typed) }, 2);
+        assert_eq!(unsafe { stator_value_typed_array_byte_length(typed) }, 4);
+        let mut typed_out = [0u8; 4];
+        assert_eq!(
+            // SAFETY: `typed` is live and `typed_out` is writable.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    typed,
+                    typed_out.as_mut_ptr(),
+                    typed_out.len(),
+                    0,
+                )
+            },
+            4
+        );
+        assert_eq!(typed_out, [2, 3, 4, 5]);
+
+        // SAFETY: `buffer` is a live ArrayBuffer value owned by `iso`.
+        let view =
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 3, 4) };
+        assert!(!view.is_null());
+        assert_eq!(unsafe { stator_value_data_view_byte_offset(view) }, 3);
+        assert_eq!(unsafe { stator_value_data_view_byte_length(view) }, 4);
+        let mut view_out = [0u8; 4];
+        assert_eq!(
+            // SAFETY: `view` is live and `view_out` is writable.
+            unsafe {
+                stator_value_data_view_copy_contents(view, view_out.as_mut_ptr(), view_out.len(), 0)
+            },
+            4
+        );
+        assert_eq!(view_out, [3, 4, 5, 6]);
+
+        // SAFETY: values are non-null and live.
+        unsafe {
+            let JsValue::ArrayBuffer(backing) = stator_value_inner_to_jsvalue(&(*buffer).inner)
+            else {
+                panic!("expected ArrayBuffer backing");
+            };
+            let JsValue::TypedArray(returned_typed) =
+                stator_value_inner_to_jsvalue(&(*typed).inner)
+            else {
+                panic!("expected TypedArray");
+            };
+            let JsValue::DataView(returned_view) = stator_value_inner_to_jsvalue(&(*view).inner)
+            else {
+                panic!("expected DataView");
+            };
+            assert!(Rc::ptr_eq(&returned_typed.borrow().buffer, &backing));
+            assert!(Rc::ptr_eq(&returned_view.borrow().buffer, &backing));
+        }
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(view);
+            stator_value_destroy(typed);
+            stator_value_destroy(buffer);
+        }
+    }
+
+    #[test]
+    fn test_value_new_typed_array_and_data_view_constructors_reject_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other_iso = IsolateGuard::new();
+        let source = [0u8, 1, 2, 3];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let buffer = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!buffer.is_null());
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe {
+                stator_value_new_typed_array(
+                    std::ptr::null_mut(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: invalid kind is documented to return null.
+            unsafe {
+                stator_value_new_typed_array(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindInvalid,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: null buffer is documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    std::ptr::null(),
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: non-buffer value is live and documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    non_buffer,
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: cross-isolate buffers are documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    other_iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    buffer,
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: unaligned Uint16 byte offset is documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                    buffer,
+                    1,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: out-of-bounds view is documented to return null.
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 3, 2) }
+                .is_null()
+        );
+
+        // SAFETY: `buffer` is live and points to an ArrayBuffer value.
+        unsafe {
+            let JsValue::ArrayBuffer(backing) = stator_value_inner_to_jsvalue(&(*buffer).inner)
+            else {
+                panic!("expected ArrayBuffer backing");
+            };
+            backing.borrow_mut().detached = true;
+        }
+        assert!(
+            // SAFETY: detached backing stores are documented to return null.
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 0, 1) }
+                .is_null()
+        );
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_buffer);
+            stator_value_destroy(buffer);
+        }
     }
 
     #[test]
