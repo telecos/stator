@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 38
+#define STATOR_FFI_ABI_VERSION_MINOR 39
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -5212,6 +5212,23 @@ size_t stator_value_array_buffer_copy_contents(const struct StatorValue *val,
                                                size_t src_offset);
 
 /**
+ * Copy bytes from caller-owned memory into a JavaScript `ArrayBuffer`.
+ *
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not
+ * an `ArrayBuffer`, the buffer is detached, `src` is null, `src_len` is zero,
+ * or `dst_offset` is outside the buffer.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_array_buffer_write_contents(struct StatorValue *val,
+                                                const uint8_t *src,
+                                                size_t src_len,
+                                                size_t dst_offset);
+
+/**
  * Returns `true` if `val` is a JavaScript `TypedArray` object.
  *
  * # Safety
@@ -5282,6 +5299,24 @@ size_t stator_value_typed_array_copy_contents(const struct StatorValue *val,
                                               size_t src_offset);
 
 /**
+ * Copy bytes from caller-owned memory into a JavaScript `TypedArray` view.
+ *
+ * `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not a
+ * `TypedArray`, the view is detached or out of bounds, `src` is null, `src_len`
+ * is zero, or `dst_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_typed_array_write_contents(struct StatorValue *val,
+                                               const uint8_t *src,
+                                               size_t src_len,
+                                               size_t dst_offset);
+
+/**
  * Returns `true` if `val` is a JavaScript `DataView` object.
  *
  * # Safety
@@ -5328,6 +5363,24 @@ size_t stator_value_data_view_copy_contents(const struct StatorValue *val,
                                             uint8_t *dst,
                                             size_t dst_len,
                                             size_t src_offset);
+
+/**
+ * Copy bytes from caller-owned memory into a JavaScript `DataView`.
+ *
+ * `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not a
+ * `DataView`, the view is detached or out of bounds, `src` is null, `src_len`
+ * is zero, or `dst_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_data_view_write_contents(struct StatorValue *val,
+                                             const uint8_t *src,
+                                             size_t src_len,
+                                             size_t dst_offset);
 
 /**
  * Create a new, empty JavaScript object.

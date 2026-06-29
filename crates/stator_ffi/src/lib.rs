@@ -100,7 +100,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 38;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 39;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -4068,6 +4068,44 @@ pub unsafe extern "C" fn stator_value_array_buffer_copy_contents(
     to_copy
 }
 
+/// Copy bytes from caller-owned memory into a JavaScript `ArrayBuffer`.
+///
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not
+/// an `ArrayBuffer`, the buffer is detached, `src` is null, `src_len` is zero,
+/// or `dst_offset` is outside the buffer.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() || src.is_null() || src_len == 0 {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let mut buffer = match unsafe { &mut (*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow_mut(),
+        _ => return 0,
+    };
+    if buffer.detached || dst_offset >= buffer.data.len() {
+        return 0;
+    }
+    let available = buffer.data.len() - dst_offset;
+    let to_write = available.min(src_len);
+    // SAFETY: caller guarantees `src` is valid for `src_len` bytes and the
+    // source does not overlap Stator-managed backing storage.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, buffer.data.as_mut_ptr().add(dst_offset), to_write);
+    }
+    to_write
+}
+
 /// Returns `true` if `val` is a JavaScript `TypedArray` object.
 ///
 /// # Safety
@@ -4189,6 +4227,36 @@ fn copy_view_bytes(
     to_copy
 }
 
+fn write_view_bytes(
+    data: &mut [u8],
+    byte_offset: usize,
+    byte_length: usize,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if src.is_null() || src_len == 0 || dst_offset >= byte_length {
+        return 0;
+    }
+    let Some(range_end) = byte_offset.checked_add(byte_length) else {
+        return 0;
+    };
+    let Some(write_start) = byte_offset.checked_add(dst_offset) else {
+        return 0;
+    };
+    if range_end > data.len() || write_start >= range_end {
+        return 0;
+    }
+    let to_write = (byte_length - dst_offset).min(src_len);
+    // SAFETY: caller guarantees `src` is valid for `src_len` bytes and the
+    // source does not overlap Stator-managed backing storage. Destination bounds
+    // were verified against `data` above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, data.as_mut_ptr().add(write_start), to_write);
+    }
+    to_write
+}
+
 /// Copy bytes out of a JavaScript `TypedArray` view into caller-owned memory.
 ///
 /// `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
@@ -4224,6 +4292,47 @@ pub unsafe extern "C" fn stator_value_typed_array_copy_contents(
                 dst,
                 dst_len,
                 src_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
+/// Copy bytes from caller-owned memory into a JavaScript `TypedArray` view.
+///
+/// `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not a
+/// `TypedArray`, the view is detached or out of bounds, `src` is null, `src_len`
+/// is zero, or `dst_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &mut (*val).inner } {
+        StatorValueInner::TypedArray(array) => {
+            let array = array.borrow();
+            let byte_offset = array.effective_byte_offset();
+            let byte_length = array.effective_byte_length();
+            let mut buffer = array.buffer.borrow_mut();
+            write_view_bytes(
+                &mut buffer.data,
+                byte_offset,
+                byte_length,
+                src,
+                src_len,
+                dst_offset,
             )
         }
         _ => 0,
@@ -4338,6 +4447,48 @@ pub unsafe extern "C" fn stator_value_data_view_copy_contents(
                 dst,
                 dst_len,
                 src_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
+/// Copy bytes from caller-owned memory into a JavaScript `DataView`.
+///
+/// `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not a
+/// `DataView`, the view is detached or out of bounds, `src` is null, `src_len`
+/// is zero, or `dst_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_data_view_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &mut (*val).inner } {
+        StatorValueInner::DataView(view) => {
+            let view = view.borrow();
+            let Some((byte_offset, byte_length)) = dataview_effective_range(&view) else {
+                return 0;
+            };
+            let mut buffer = view.buffer.borrow_mut();
+            write_view_bytes(
+                &mut buffer.data,
+                byte_offset,
+                byte_length,
+                src,
+                src_len,
+                dst_offset,
             )
         }
         _ => 0,
@@ -28153,6 +28304,99 @@ mod tests {
     }
 
     #[test]
+    fn test_value_array_buffer_write_accessor() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4, 5],
+        }));
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+
+        let patch = [9u8, 8, 7];
+        assert_eq!(
+            // SAFETY: `val` is live and `patch` is readable.
+            unsafe {
+                stator_value_array_buffer_write_contents(val, patch.as_ptr(), patch.len(), 1)
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 5]);
+
+        let tail = [6u8, 5, 4];
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is readable.
+            unsafe { stator_value_array_buffer_write_contents(val, tail.as_ptr(), tail.len(), 4) },
+            1
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+        assert_eq!(
+            // SAFETY: source offsets outside the buffer are documented to return 0.
+            unsafe { stator_value_array_buffer_write_contents(val, tail.as_ptr(), tail.len(), 5) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: null source is documented to return 0.
+            unsafe { stator_value_array_buffer_write_contents(val, std::ptr::null(), 1, 0) },
+            0
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+
+        buffer.borrow_mut().detached = true;
+        assert_eq!(
+            // SAFETY: detached buffers are documented to return 0.
+            unsafe {
+                stator_value_array_buffer_write_contents(val, patch.as_ptr(), patch.len(), 0)
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+
+        // SAFETY: `val` was allocated by Stator.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_array_buffer_write_accessor_rejects_invalid_values() {
+        let iso = IsolateGuard::new();
+        let patch = [1u8, 2];
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe {
+                stator_value_array_buffer_write_contents(
+                    std::ptr::null_mut(),
+                    patch.as_ptr(),
+                    patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!non_buffer.is_null());
+        assert_eq!(
+            // SAFETY: `non_buffer` is non-null and live.
+            unsafe {
+                stator_value_array_buffer_write_contents(non_buffer, patch.as_ptr(), patch.len(), 0)
+            },
+            0
+        );
+
+        // SAFETY: `non_buffer` was allocated by Stator.
+        unsafe { stator_value_destroy(non_buffer) };
+    }
+
+    #[test]
     fn test_value_preserves_typed_array_and_data_view_handles() {
         let iso = IsolateGuard::new();
         let buffer = Rc::new(RefCell::new(JsArrayBuffer {
@@ -28569,6 +28813,212 @@ mod tests {
             },
             0
         );
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_view_value);
+            stator_value_destroy(auto_view_value);
+            stator_value_destroy(view_value);
+            stator_value_destroy(out_of_bounds_typed_value);
+            stator_value_destroy(typed_value);
+        }
+    }
+
+    #[test]
+    fn test_value_typed_array_and_data_view_write_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(16),
+            detached: false,
+            data: vec![0, 1, 2, 3, 4, 5, 6, 7],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint16,
+            byte_offset: 2,
+            length: 2,
+            auto_length: false,
+        }));
+        let out_of_bounds_typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint32,
+            byte_offset: 6,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 3,
+            byte_length: 4,
+            auto_length: false,
+        }));
+        let auto_data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 5,
+            byte_length: 0,
+            auto_length: true,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let out_of_bounds_typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(
+                    &out_of_bounds_typed_array,
+                ))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let auto_view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&auto_data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid.
+        let non_view_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+
+        let typed_patch = [9u8, 8, 7];
+        assert_eq!(
+            // SAFETY: `typed_value` is live and `typed_patch` is readable.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    typed_value,
+                    typed_patch.as_ptr(),
+                    typed_patch.len(),
+                    1,
+                )
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 7, 6, 7]);
+
+        let view_patch = [6u8, 5, 4, 3];
+        assert_eq!(
+            // SAFETY: `view_value` is live and `view_patch` is readable.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    2,
+                )
+            },
+            2
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 6, 5, 7]);
+
+        assert_eq!(
+            // SAFETY: `auto_view_value` is live and `view_patch` is readable.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    auto_view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 6, 5, 4]);
+
+        let unchanged = buffer.borrow().data.clone();
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    std::ptr::null_mut(),
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: non-view values are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    non_view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: out-of-bounds views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    out_of_bounds_typed_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: null sources are documented to return 0.
+            unsafe { stator_value_data_view_write_contents(view_value, std::ptr::null(), 1, 0) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: destination offsets outside the view are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    4,
+                )
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, unchanged);
+
+        buffer.borrow_mut().detached = true;
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    typed_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, unchanged);
 
         // SAFETY: values were allocated by Stator.
         unsafe {
