@@ -875,11 +875,18 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/is-not-a-global.js",
     "built-ins/AggregateError/is-a-constructor.js",
+    "built-ins/AggregateError/length.js",
+    "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/newtarget-is-undefined.js",
     "built-ins/AggregateError/newtarget-proto-custom.js",
     "built-ins/AggregateError/newtarget-proto.js",
+    "built-ins/AggregateError/prop-desc.js",
     "built-ins/AggregateError/proto.js",
+    "built-ins/AggregateError/prototype/constructor.js",
     "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
+    "built-ins/AggregateError/prototype/message.js",
+    "built-ins/AggregateError/prototype/name.js",
+    "built-ins/AggregateError/prototype/prop-desc.js",
     "built-ins/AggregateError/prototype/proto.js",
     "built-ins/AggregateError/message-tostring-abrupt.js",
     "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
@@ -2864,8 +2871,8 @@ mod tests {
         assert!(is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
-        assert!(is_skipped_path("built-ins/AggregateError/name.js"));
-        assert!(is_skipped_path("built-ins/AggregateError/length.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/length.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/is-a-constructor.js"
         ));
@@ -2875,24 +2882,27 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/newtarget-proto-custom.js"
         ));
+        assert!(is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto-fallback.js"
+        ));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/newtarget-proto.js"
         ));
-        assert!(is_skipped_path("built-ins/AggregateError/prop-desc.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
         assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
         assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/errors-absent-on-prototype.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/name.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/message.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/constructor.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/prototype/prop-desc.js"
         ));
         assert!(!is_skipped_path(
@@ -3368,6 +3378,7 @@ mod tests {
             "AggregateError",
         )
         .unwrap();
+        std::fs::write(aggregate_dir.join("length.js"), "AggregateError").unwrap();
         std::fs::write(
             aggregate_dir.join("message-tostring-abrupt.js"),
             "AggregateError",
@@ -3414,6 +3425,7 @@ mod tests {
         std::fs::write(prototype_dir.join("message.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("constructor.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("not-a-constructor.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("prop-desc.js"), "AggregateError").unwrap();
         std::fs::write(prototype_dir.join("proto.js"), "AggregateError").unwrap();
 
         let mut out: Vec<PathBuf> = Vec::new();
@@ -3432,13 +3444,20 @@ mod tests {
             rel,
             vec![
                 "built-ins/AggregateError/is-a-constructor.js",
+                "built-ins/AggregateError/length.js",
                 "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
                 "built-ins/AggregateError/message-tostring-abrupt.js",
+                "built-ins/AggregateError/name.js",
                 "built-ins/AggregateError/newtarget-is-undefined.js",
                 "built-ins/AggregateError/newtarget-proto-custom.js",
                 "built-ins/AggregateError/newtarget-proto.js",
+                "built-ins/AggregateError/prop-desc.js",
                 "built-ins/AggregateError/proto.js",
+                "built-ins/AggregateError/prototype/constructor.js",
                 "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
+                "built-ins/AggregateError/prototype/message.js",
+                "built-ins/AggregateError/prototype/name.js",
+                "built-ins/AggregateError/prototype/prop-desc.js",
                 "built-ins/AggregateError/prototype/proto.js",
             ]
         );
