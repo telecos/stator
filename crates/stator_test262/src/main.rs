@@ -884,6 +884,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
     "built-ins/AsyncFunction/is-not-a-global.js",
     "built-ins/AggregateError/is-a-constructor.js",
+    "built-ins/AggregateError/cause-property.js",
     "built-ins/AggregateError/length.js",
     "built-ins/AggregateError/message-method-prop-cast.js",
     "built-ins/AggregateError/message-method-prop.js",
@@ -2904,7 +2905,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_error_allowlist_not_skipped() {
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/cause-property.js"
         ));
         assert!(!is_skipped_path(
@@ -3590,6 +3591,7 @@ mod tests {
         assert_eq!(
             rel,
             vec![
+                "built-ins/AggregateError/cause-property.js",
                 "built-ins/AggregateError/is-a-constructor.js",
                 "built-ins/AggregateError/length.js",
                 "built-ins/AggregateError/message-method-prop-cast.js",
