@@ -2618,7 +2618,9 @@ fn error_instanceof(value: &JsValue, prototype: &JsValue, kind: Option<ErrorKind
 #[inline(never)]
 fn make_error_constructor(kind: ErrorKind) -> JsValue {
     native(move |args| {
-        let message = match args.first() {
+        let message_arg = args.first();
+        let has_message = !matches!(message_arg, None | Some(JsValue::Undefined));
+        let message = match message_arg {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
@@ -2630,6 +2632,13 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
         }
         let mut err = JsError::new(kind, message);
         let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        if has_message {
+            err.props.borrow_mut().insert_with_attrs(
+                "message".to_string(),
+                JsValue::String(err.message().to_string().into()),
+                attrs,
+            );
+        }
         if let Some(ref cause_val) = cause {
             err.props
                 .borrow_mut()
@@ -2732,7 +2741,9 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
         let (inner_errors, _) = to_array_like_elements(errors_val);
         // Second arg: message.
-        let message = match args.get(1) {
+        let message_arg = args.get(1);
+        let has_message = !matches!(message_arg, None | Some(JsValue::Undefined));
+        let message = match message_arg {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
@@ -2748,6 +2759,13 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
         let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        if has_message {
+            err.props.borrow_mut().insert_with_attrs(
+                "message".to_string(),
+                JsValue::String(err.message().to_string().into()),
+                attrs,
+            );
+        }
         err.props.borrow_mut().insert_with_attrs(
             "errors".to_string(),
             JsValue::new_array(err.errors.clone()),
@@ -16411,6 +16429,10 @@ fn make_object() -> JsValue {
                         let has = plain_object_has_own_property(&map.borrow(), &prop);
                         Ok(JsValue::Boolean(has))
                     }
+                    JsValue::Error(error) => {
+                        let has = plain_object_has_own_property(&error.props.borrow(), &prop);
+                        Ok(JsValue::Boolean(has))
+                    }
                     _ => Ok(JsValue::Boolean(false)),
                 }
             }),
@@ -16440,6 +16462,12 @@ fn make_object() -> JsValue {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
                         let exists = borrow.contains_key(&prop) && prop != "__proto__";
+                        let enumerable = exists && borrow.is_enumerable(&prop);
+                        Ok(JsValue::Boolean(enumerable))
+                    }
+                    JsValue::Error(error) => {
+                        let borrow = error.props.borrow();
+                        let exists = plain_object_has_own_property(&borrow, &prop);
                         let enumerable = exists && borrow.is_enumerable(&prop);
                         Ok(JsValue::Boolean(enumerable))
                     }

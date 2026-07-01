@@ -756,7 +756,16 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
 /// Individual tests under otherwise-skipped path prefixes that are supported.
 const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "annexB/built-ins/Date/prototype/toGMTString/prop-desc.js",
+    "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js",
+    "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js",
+    "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js",
     "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
+    "annexB/built-ins/RegExp/RegExp-leading-escape.js",
+    "annexB/built-ins/RegExp/RegExp-trailing-escape.js",
     "annexB/built-ins/escape/argument_types.js",
     "annexB/built-ins/escape/empty-string.js",
     "annexB/built-ins/escape/unmodified.js",
@@ -876,6 +885,8 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AsyncFunction/is-not-a-global.js",
     "built-ins/AggregateError/is-a-constructor.js",
     "built-ins/AggregateError/length.js",
+    "built-ins/AggregateError/message-method-prop-cast.js",
+    "built-ins/AggregateError/message-method-prop.js",
     "built-ins/AggregateError/name.js",
     "built-ins/AggregateError/newtarget-is-undefined.js",
     "built-ins/AggregateError/newtarget-proto-custom.js",
@@ -890,6 +901,7 @@ const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
     "built-ins/AggregateError/prototype/proto.js",
     "built-ins/AggregateError/message-tostring-abrupt.js",
     "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
+    "built-ins/AggregateError/message-undefined-no-prop.js",
 ];
 
 /// Individual test files (relative to the `test/` directory, forward-slash
@@ -2614,6 +2626,33 @@ mod tests {
     #[test]
     fn test_annex_b_escape_allowlist_not_skipped() {
         assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/input/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/named-groups/non-unicode-malformed.js"
+        ));
+        assert!(!is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js"
         ));
         assert!(is_skipped_path(
@@ -2624,6 +2663,18 @@ mod tests {
         ));
         assert!(is_skipped_path(
             "annexB/built-ins/RegExp/prototype/compile/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-leading-escape.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-trailing-escape.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js"
         ));
         assert!(!is_skipped_path(
             "annexB/built-ins/escape/argument_types.js"
@@ -2856,10 +2907,10 @@ mod tests {
         assert!(is_skipped_path(
             "built-ins/AggregateError/cause-property.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/message-method-prop.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/message-method-prop-cast.js"
         ));
         assert!(!is_skipped_path(
@@ -2868,7 +2919,7 @@ mod tests {
         assert!(!is_skipped_path(
             "built-ins/AggregateError/message-tostring-abrupt-symbol.js"
         ));
-        assert!(is_skipped_path(
+        assert!(!is_skipped_path(
             "built-ins/AggregateError/message-undefined-no-prop.js"
         ));
         assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
@@ -3331,6 +3382,102 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_legacy_accessors_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_accessors_collect_test");
+        let accessors_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("RegExp")
+            .join("legacy-accessors");
+        for name in [
+            "index",
+            "input",
+            "lastMatch",
+            "lastParen",
+            "leftContext",
+            "rightContext",
+        ] {
+            let dir = accessors_dir.join(name);
+            let _ = std::fs::create_dir_all(&dir);
+            std::fs::write(dir.join("prop-desc.js"), "RegExp legacy accessor").unwrap();
+            std::fs::write(dir.join("this-not-regexp-constructor.js"), "RegExp").unwrap();
+        }
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_syntax_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_syntax_collect_test");
+        let regexp_dir = tmp.join("annexB").join("built-ins").join("RegExp");
+        let _ = std::fs::create_dir_all(&regexp_dir);
+        std::fs::write(
+            regexp_dir.join("incomplete_hex_unicode_escape.js"),
+            "RegExp",
+        )
+        .unwrap();
+        std::fs::write(regexp_dir.join("RegExp-leading-escape.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-leading-escape-BMP.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-trailing-escape.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-trailing-escape-BMP.js"), "RegExp").unwrap();
+        let named_groups_dir = regexp_dir.join("named-groups");
+        let _ = std::fs::create_dir_all(&named_groups_dir);
+        std::fs::write(
+            named_groups_dir.join("non-unicode-malformed-lookbehind.js"),
+            "RegExp",
+        )
+        .unwrap();
+        std::fs::write(named_groups_dir.join("non-unicode-malformed.js"), "RegExp").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/RegExp/RegExp-leading-escape.js",
+                "annexB/built-ins/RegExp/RegExp-trailing-escape.js",
+                "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js",
+                "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn test_collect_tests_keeps_annex_b_date_allowlist() {
         let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_date_collect_test");
         let date_dir = tmp
@@ -3445,8 +3592,11 @@ mod tests {
             vec![
                 "built-ins/AggregateError/is-a-constructor.js",
                 "built-ins/AggregateError/length.js",
+                "built-ins/AggregateError/message-method-prop-cast.js",
+                "built-ins/AggregateError/message-method-prop.js",
                 "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
                 "built-ins/AggregateError/message-tostring-abrupt.js",
+                "built-ins/AggregateError/message-undefined-no-prop.js",
                 "built-ins/AggregateError/name.js",
                 "built-ins/AggregateError/newtarget-is-undefined.js",
                 "built-ins/AggregateError/newtarget-proto-custom.js",
