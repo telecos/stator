@@ -30609,7 +30609,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_yield_await_chain() {
         // yield await p1; yield await p2 ΓÇö two awaits in sequence.
         let result = compile_source_and_run(
@@ -30971,7 +30970,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_with_yield_await() {
         let result = compile_source_and_run(
             "async function* g() { yield await Promise.resolve(5); yield await Promise.resolve(15); } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
