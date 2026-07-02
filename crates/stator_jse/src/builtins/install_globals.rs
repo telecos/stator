@@ -141,8 +141,8 @@ use crate::interpreter::{
     dispatch_call_with_this, dispatch_construct_call, dispatch_get_property_value,
     dispatch_set_property_value, dispatch_setter, function_display_name, function_length_value,
     function_to_string_value, generator_object_prototype, get_object_prototype,
-    has_property_in_chain, has_prototype_in_chain, ordinary_set_prototype_of,
-    plain_object_has_own_property,
+    has_property_in_chain, has_prototype_in_chain, leaked_internal_await_error,
+    ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -20076,6 +20076,9 @@ fn make_generator_function() -> JsValue {
                 JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, input)? {
                     GeneratorStep::Yield(v) => Ok(make_iter_result(v, false)),
                     GeneratorStep::Return(v) => Ok(make_iter_result(v, true)),
+                    GeneratorStep::Await(_) => {
+                        Err(leaked_internal_await_error("Generator.prototype.next"))
+                    }
                 },
                 _ => Err(StatorError::TypeError(
                     "Generator.prototype.next requires a generator receiver".into(),

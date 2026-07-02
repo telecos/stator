@@ -16,6 +16,7 @@ use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
     dispatch_call_value, dispatch_call_with_this, dispatch_get_property_value,
+    leaked_internal_await_error,
 };
 use crate::objects::value::{GeneratorStep, JsValue, NativeIterator};
 
@@ -196,6 +197,7 @@ pub fn iterator_next(iter: &JsValue) -> StatorResult<IteratorRecord> {
             match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
                 GeneratorStep::Yield(v) => Ok(IteratorRecord::value(v)),
                 GeneratorStep::Return(v) => Ok(IteratorRecord::done(v)),
+                GeneratorStep::Await(_) => Err(leaked_internal_await_error("iterator_next")),
             }
         }
         JsValue::PlainObject(_) => {

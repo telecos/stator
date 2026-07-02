@@ -173,6 +173,19 @@ impl SourcePosition {
     }
 }
 
+/// Classification for a generator suspension point.
+///
+/// User-visible `yield` suspensions must resolve generator `.next()` calls,
+/// while internal `await` suspensions in async generators must resume after the
+/// awaited value settles without leaking an iterator result to user code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendKind {
+    /// A user-visible generator `yield` or delegated `yield*` suspension.
+    Yield,
+    /// An internal `await` suspension.
+    Await,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BytecodeArray
 // ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +492,8 @@ struct SharedBytecodeTemplate {
     feedback_vector: SharedFeedbackVector,
     /// Per-function exception handler table (pre-peephole instruction indices).
     handler_table: Rc<Vec<HandlerTableEntry>>,
+    /// Suspension metadata keyed by the `SuspendGenerator` suspend id.
+    suspend_kinds: Rc<[SuspendKind]>,
     /// Lazily-populated remapped handler table (post-peephole instruction
     /// indices).
     handler_table_remapped: Rc<OnceCell<Rc<Vec<HandlerTableEntry>>>>,
@@ -640,6 +655,7 @@ impl PartialEq for BytecodeArray {
             && self.inner.mapped_arguments_aliases == other.inner.mapped_arguments_aliases
             && self.inner.feedback_metadata == other.inner.feedback_metadata
             && self.inner.handler_table == other.inner.handler_table
+            && self.inner.suspend_kinds == other.inner.suspend_kinds
             && self.inner.is_generator == other.inner.is_generator
             && self.inner.is_async == other.inner.is_async
             && self.inner.is_module == other.inner.is_module
@@ -691,6 +707,7 @@ impl BytecodeArray {
                 feedback_metadata: Rc::new(feedback_metadata),
                 feedback_vector: Rc::new(RefCell::new(feedback_vector)),
                 handler_table: Rc::new(handler_table),
+                suspend_kinds: Rc::from([]),
                 handler_table_remapped: Rc::new(OnceCell::new()),
                 cached_decode: Rc::new(OnceCell::new()),
                 fusion_pattern_cache: Rc::new(OnceCell::new()),
@@ -758,6 +775,31 @@ impl BytecodeArray {
     #[cfg(test)]
     pub(crate) fn template_cache_len(&self) -> usize {
         self.inner.template_cache.borrow().len()
+    }
+
+    /// Attach suspension metadata keyed by `SuspendGenerator` suspend id.
+    pub fn with_suspend_kinds(mut self, suspend_kinds: Vec<SuspendKind>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_suspend_kinds called after sharing")
+            .suspend_kinds = suspend_kinds.into();
+        self
+    }
+
+    /// Return the kind recorded for a generator suspension id.
+    ///
+    /// Missing metadata is treated as [`SuspendKind::Yield`] to preserve legacy
+    /// bytecode behavior for old callers and hand-built bytecode in tests.
+    pub fn suspend_kind(&self, suspend_id: u32) -> SuspendKind {
+        self.inner
+            .suspend_kinds
+            .get(suspend_id as usize)
+            .copied()
+            .unwrap_or(SuspendKind::Yield)
+    }
+
+    /// Return all recorded suspension kinds.
+    pub fn suspend_kinds(&self) -> &[SuspendKind] {
+        &self.inner.suspend_kinds
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.

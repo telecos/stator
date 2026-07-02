@@ -28,14 +28,14 @@ use super::{
     err_bad_operand, error_message_from_value, extract_context, fast_array_method_name,
     fast_array_method_target, find_handler, fn_global_env_get, fn_props_get, fn_props_set,
     has_property_in_chain, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
-    keyed_load, keyed_store, make_construct_this, make_generator_no_receiver_activation,
-    make_generator_with_receiver_activation, maybe_cache_construct_boilerplate,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    notify_mapped_arguments_property_delete, notify_mapped_arguments_property_write,
-    number_to_jsvalue, ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name,
-    proto_lookup, proto_lookup_cached_resolution, proto_lookup_chain_depth,
-    register_context_mapped_argument_alias, resolve_construct_proto, resolve_jump,
-    restore_closure_context, restore_no_receiver_this, run_callee_pooled,
+    keyed_load, keyed_store, leaked_internal_await_error, make_construct_this,
+    make_generator_no_receiver_activation, make_generator_with_receiver_activation,
+    maybe_cache_construct_boilerplate, maybe_compile_baseline, maybe_compile_maglev,
+    maybe_compile_turbofan, normalize_async_iterator, notify_mapped_arguments_property_delete,
+    notify_mapped_arguments_property_write, number_to_jsvalue, ordinary_set_prototype_of,
+    plain_object_to_array_items, populate_self_name, proto_lookup, proto_lookup_cached_resolution,
+    proto_lookup_chain_depth, register_context_mapped_argument_alias, resolve_construct_proto,
+    resolve_jump, restore_closure_context, restore_no_receiver_this, run_callee_pooled,
     set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
     sync_global_object_property_delete, sync_global_object_property_store, to_array_index,
     to_bigint, to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
@@ -2847,7 +2847,7 @@ fn handle_call_property(
 /// into the flattened output, leaving non-array values untouched.
 ///
 /// Also handles iterables (String, Iterator, Generator) for robustness.
-fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
+fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> StatorResult<CallArgs> {
     let mut out = SmallVec::new();
     for arg in raw_args {
         match &arg {
@@ -2897,7 +2897,12 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
                                             }
                                             break;
                                         }
-                                        Err(_) => break,
+                                        Ok(GeneratorStep::Await(_)) => {
+                                            return Err(leaked_internal_await_error(
+                                                "object spread iterator",
+                                            ));
+                                        }
+                                        Err(error) => return Err(error),
                                     }
                                 },
                                 // PlainObject with "next" → user-defined iterator.
@@ -2952,7 +2957,10 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
                         }
                         break;
                     }
-                    Err(_) => break,
+                    Ok(GeneratorStep::Await(_)) => {
+                        return Err(leaked_internal_await_error("spread iterator"));
+                    }
+                    Err(error) => return Err(error),
                 }
             },
             _ => {
@@ -2960,7 +2968,7 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn handle_call_with_spread(
@@ -2980,7 +2988,7 @@ fn handle_call_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
-    let args = expand_spread_args(raw_args);
+    let args = expand_spread_args(raw_args)?;
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -3751,7 +3759,7 @@ fn handle_construct_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
-    let args = expand_spread_args(raw_args);
+    let args = expand_spread_args(raw_args)?;
     match ctor {
         JsValue::Function(ba) => {
             // Fast path: resolve prototype from cache when available.
@@ -5513,18 +5521,16 @@ fn handle_iterator_next(
         JsValue::Generator(gs) => {
             if gs.borrow().bytecode_array.is_async() {
                 let queue = crate::builtins::promise::MicrotaskQueue::new();
-                let result = Interpreter::run_generator_step(&gs, JsValue::Undefined).map(
-                    |step| match step {
-                        GeneratorStep::Yield(v) => super::make_iterator_result(v, false),
-                        GeneratorStep::Return(v) => super::make_iterator_result(v, true),
-                    },
-                )?;
+                let result = Interpreter::async_generator_next(&gs, JsValue::Undefined)?;
                 settle_async_iterator_result(result, &queue)
                     .map_err(super::async_iterator_reason_to_error)?
             } else {
                 match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
                     GeneratorStep::Yield(v) => (v, false),
                     GeneratorStep::Return(v) => (v, true),
+                    GeneratorStep::Await(_) => {
+                        return Err(leaked_internal_await_error("IteratorNext"));
+                    }
                 }
             }
         }
@@ -5752,9 +5758,10 @@ fn handle_copy_data_properties(
 #[cold]
 fn handle_suspend_generator(
     ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let yield_val = ctx.frame.accumulator.cheap_clone();
+    let suspend_id = instr.immediate(3);
 
     // Save state into the attached GeneratorState (if any).
     if let Some(gs_rc) = ctx.frame.generator_state.as_ref() {
@@ -5765,6 +5772,7 @@ fn handle_suspend_generator(
         // ctx.frame.pc was already advanced past this instruction.
         gs.resume_pc = ctx.frame.pc;
         gs.status = GeneratorStatus::SuspendedAtYield;
+        gs.last_suspend_id = (suspend_id >= 0).then_some(suspend_id as u32);
     }
 
     ctx.frame.suspend_result = Some(yield_val.clone());
@@ -6284,6 +6292,9 @@ fn handle_create_array_from_iterable(
                         }
                         break;
                     }
+                    GeneratorStep::Await(_) => {
+                        return Err(leaked_internal_await_error("CreateArrayFromIterable"));
+                    }
                 }
             }
             out
@@ -6319,6 +6330,11 @@ fn handle_create_array_from_iterable(
                                         out.push(v);
                                     }
                                     break;
+                                }
+                                GeneratorStep::Await(_) => {
+                                    return Err(leaked_internal_await_error(
+                                        "CreateArrayFromIterable",
+                                    ));
                                 }
                             }
                         }

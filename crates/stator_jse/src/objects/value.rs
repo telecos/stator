@@ -136,6 +136,8 @@ pub struct GeneratorState {
     pub resume_mode: GeneratorResumeMode,
     /// The `new.target` value visible to the activation.
     pub new_target: JsValue,
+    /// Metadata id of the most recent `SuspendGenerator` instruction.
+    pub last_suspend_id: Option<u32>,
 }
 
 impl GeneratorState {
@@ -154,6 +156,7 @@ impl GeneratorState {
             status: GeneratorStatus::SuspendedAtStart,
             resume_mode: GeneratorResumeMode::Normal,
             new_target: JsValue::Undefined,
+            last_suspend_id: None,
         }))
     }
 
@@ -185,6 +188,9 @@ pub enum GeneratorStep {
     /// The generator suspended at a `yield` expression; the contained value
     /// is the yielded result.  The generator may be resumed.
     Yield(JsValue),
+    /// The generator suspended at an internal `await`; the contained value is
+    /// awaited by async function/module/async-generator drivers.
+    Await(JsValue),
     /// The generator's function body returned; the contained value is the
     /// final return value.  The generator is now exhausted.
     Return(JsValue),

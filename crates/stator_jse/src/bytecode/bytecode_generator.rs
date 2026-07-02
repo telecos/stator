@@ -35,7 +35,7 @@ use std::{
 
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MappedArgumentAlias, MappedArgumentTarget,
-    SourcePosition,
+    SourcePosition, SuspendKind,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
 use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
@@ -286,6 +286,8 @@ struct FunctionCompiler {
     /// Counter used to generate unique `suspend_id` immediates for each
     /// [`Opcode::SuspendGenerator`] instruction in this function.
     yield_suspend_id: u32,
+    /// Suspension metadata keyed by `SuspendGenerator` suspend id.
+    suspend_kinds: Vec<SuspendKind>,
     /// `true` when compiling the top-level program body (as opposed to a
     /// nested function).  Top-level function declarations are also stored
     /// as globals via `StaGlobal` so that recursive calls can find them.
@@ -395,6 +397,7 @@ impl FunctionCompiler {
             is_generator: false,
             is_async: false,
             yield_suspend_id: 0,
+            suspend_kinds: Vec::new(),
             is_program: false,
             is_eval_scope: false,
             is_module: false,
@@ -2579,6 +2582,7 @@ impl FunctionCompiler {
             handler_table: Vec::new(),
             is_generator: false,
             yield_suspend_id: 0,
+            suspend_kinds: Vec::new(),
             is_program: false,
             is_async: false,
             is_eval_scope: false,
@@ -6138,8 +6142,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
 
         // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -6160,6 +6163,14 @@ impl FunctionCompiler {
         Ok(())
     }
 
+    fn allocate_suspend_id(&mut self, kind: SuspendKind) -> u32 {
+        let suspend_id = self.yield_suspend_id;
+        self.yield_suspend_id += 1;
+        debug_assert_eq!(self.suspend_kinds.len(), suspend_id as usize);
+        self.suspend_kinds.push(kind);
+        suspend_id
+    }
+
     /// Compile an `await expr` expression inside an async (generator) function.
     ///
     /// Uses the same suspend/resume mechanism as `yield` so the runtime can
@@ -6171,8 +6182,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
 
         // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Await);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -6287,8 +6297,7 @@ impl FunctionCompiler {
             self.emit_ldar(value_reg);
 
             self.bind_label(yield_resume_lbl);
-            let suspend_id = self.yield_suspend_id;
-            self.yield_suspend_id += 1;
+            let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
             self.emit(Instruction::new_unchecked(
                 Opcode::SuspendGenerator,
                 vec![
@@ -6500,8 +6509,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
         self.emit_ldar(val_reg);
 
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -7336,7 +7344,8 @@ impl FunctionCompiler {
             .with_strict_flag(self.is_strict)
             .with_top_level_flag(self.is_program)
             .with_binding_registers(binding_registers)
-            .with_context_bindings(self.context_bindings))
+            .with_context_bindings(self.context_bindings)
+            .with_suspend_kinds(self.suspend_kinds))
     }
 }
 
@@ -10969,6 +10978,11 @@ mod tests {
         if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
             assert!(ba.is_generator(), "must be marked as generator");
             assert!(ba.is_async(), "must be marked as async");
+            assert_eq!(
+                ba.suspend_kinds(),
+                &[SuspendKind::Yield, SuspendKind::Yield],
+                "async generator yield suspensions must be user-visible"
+            );
             let inner_instrs = ba.instructions().unwrap();
             assert_eq!(
                 inner_instrs[0].opcode,
@@ -11001,6 +11015,11 @@ mod tests {
         let pool = arr.constant_pool();
         if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
             assert!(ba.is_async(), "must be marked as async");
+            assert_eq!(
+                ba.suspend_kinds(),
+                &[SuspendKind::Await, SuspendKind::Yield],
+                "await suspensions must not be exposed as user-visible yields"
+            );
             let inner_instrs = ba.instructions().unwrap();
             // The body should have two SuspendGenerator instructions: one for
             // await (suspend/resume) and one for yield.

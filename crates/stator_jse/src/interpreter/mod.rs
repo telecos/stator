@@ -199,8 +199,8 @@ use crate::bytecode::bytecode_array::MaglevJitCodeCache;
 use crate::bytecode::bytecode_array::TurbofanJitCodeCache;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
-    MAGLEV_TIERING_THRESHOLD, MappedArgumentAlias, MappedArgumentTarget, TIERING_THRESHOLD,
-    TURBOFAN_TIERING_THRESHOLD,
+    MAGLEV_TIERING_THRESHOLD, MappedArgumentAlias, MappedArgumentTarget, SuspendKind,
+    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 #[cfg(any(
@@ -13366,7 +13366,15 @@ impl Interpreter {
         };
 
         if let Some(yield_val) = frame.suspend_result {
-            Ok(GeneratorStep::Yield(yield_val))
+            let suspend_kind = state
+                .borrow()
+                .last_suspend_id
+                .map(|suspend_id| frame.bytecode_array.suspend_kind(suspend_id))
+                .unwrap_or(SuspendKind::Yield);
+            match suspend_kind {
+                SuspendKind::Yield => Ok(GeneratorStep::Yield(yield_val)),
+                SuspendKind::Await => Ok(GeneratorStep::Await(yield_val)),
+            }
         } else {
             state.borrow_mut().status = GeneratorStatus::Completed;
             Ok(GeneratorStep::Return(return_val))
@@ -13457,7 +13465,7 @@ impl Interpreter {
 
         loop {
             match Interpreter::run_generator_step(&state, input) {
-                Ok(GeneratorStep::Yield(awaited)) => {
+                Ok(GeneratorStep::Await(awaited)) => {
                     match resolve_promise_like(awaited, &queue) {
                         AwaitResolution::Fulfilled(value) => input = value,
                         AwaitResolution::Rejected(reason) => {
@@ -13470,6 +13478,11 @@ impl Interpreter {
                             input = JsValue::Undefined;
                         }
                     }
+                }
+                Ok(GeneratorStep::Yield(_)) => {
+                    return Err(StatorError::Internal(
+                        "async function suspended with public yield".into(),
+                    ));
                 }
                 Ok(GeneratorStep::Return(v)) => {
                     let p = promise_resolve(v, &queue);
@@ -13488,6 +13501,48 @@ impl Interpreter {
                     }
                     return Err(e);
                 }
+            }
+        }
+    }
+
+    fn drive_async_generator_step(
+        state: &Rc<RefCell<GeneratorState>>,
+        mut input: JsValue,
+    ) -> StatorResult<GeneratorStep> {
+        let queue = crate::builtins::promise::MicrotaskQueue::new();
+        loop {
+            match Self::run_generator_step(state, input)? {
+                GeneratorStep::Await(awaited) => match resolve_promise_like(awaited, &queue) {
+                    AwaitResolution::Fulfilled(value) => input = value,
+                    AwaitResolution::Rejected(reason) => {
+                        state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
+                        input = JsValue::Undefined;
+                    }
+                    AwaitResolution::Pending => {
+                        return Err(StatorError::TypeError(
+                            "async generator await on a pending promise: Stator's async generator \
+                             driver does not yet drive an event loop"
+                                .into(),
+                        ));
+                    }
+                },
+                step @ (GeneratorStep::Yield(_) | GeneratorStep::Return(_)) => return Ok(step),
+            }
+        }
+    }
+
+    /// Execute one async-generator `.next(value)` step and drive internal
+    /// `await` suspensions until a user-visible `{ value, done }` result is
+    /// available.
+    pub(crate) fn async_generator_next(
+        state: &Rc<RefCell<GeneratorState>>,
+        input: JsValue,
+    ) -> StatorResult<JsValue> {
+        match Self::drive_async_generator_step(state, input)? {
+            GeneratorStep::Yield(value) => Ok(make_iterator_result(value, false)),
+            GeneratorStep::Return(value) => Ok(make_iterator_result(value, true)),
+            GeneratorStep::Await(_) => {
+                Err(leaked_internal_await_error("AsyncGenerator.prototype.next"))
             }
         }
     }
@@ -13680,7 +13735,7 @@ fn drive_module_top_level(
         }
 
         match Interpreter::run_generator_step(state, input)? {
-            GeneratorStep::Yield(awaited) => match resolve_promise_like(awaited.clone(), queue) {
+            GeneratorStep::Await(awaited) => match resolve_promise_like(awaited.clone(), queue) {
                 AwaitResolution::Fulfilled(value) => input = value,
                 AwaitResolution::Rejected(reason) => {
                     state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
@@ -13700,6 +13755,11 @@ fn drive_module_top_level(
                     }));
                 }
             },
+            GeneratorStep::Yield(_) => {
+                return Err(StatorError::Internal(
+                    "async module suspended with public yield".into(),
+                ));
+            }
             GeneratorStep::Return(value) => {
                 queue.drain();
                 return Ok(ModuleTopLevelStep::Completed(value));
@@ -13767,6 +13827,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Return(value.clone());
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.return"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         state.borrow_mut().status = GeneratorStatus::Completed;
@@ -13800,6 +13863,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value.clone());
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.throw"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         // Uncaught ΓÇö mark the generator as completed.
@@ -13812,6 +13878,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value);
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.throw"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         state.borrow_mut().status = GeneratorStatus::Completed;
@@ -13846,6 +13915,10 @@ pub(crate) fn resolve_promise_like(
     } else {
         AwaitResolution::Pending
     }
+}
+
+pub(crate) fn leaked_internal_await_error(context: &str) -> StatorError {
+    StatorError::Internal(format!("internal await suspension leaked into {context}"))
 }
 
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -13962,6 +14035,9 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
                 JsValue::Generator(gs) => match Interpreter::run_generator_step(gs, input) {
                     Ok(GeneratorStep::Yield(value)) => Ok(make_iterator_result(value, false)),
                     Ok(GeneratorStep::Return(value)) => Ok(make_iterator_result(value, true)),
+                    Ok(GeneratorStep::Await(_)) => Err(leaked_internal_await_error(
+                        "async-from-sync iterator wrapper",
+                    )),
                     Err(error) => Err(error),
                 },
                 JsValue::PlainObject(map) => {
@@ -19321,11 +19397,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 if is_async_generator {
                     JsValue::NativeFunction(Rc::new(move |args| {
                         let input = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                        let result =
-                            Interpreter::run_generator_step(&gs, input).map(|step| match step {
-                                GeneratorStep::Yield(value) => make_iterator_result(value, false),
-                                GeneratorStep::Return(value) => make_iterator_result(value, true),
-                            });
+                        let result = Interpreter::async_generator_next(&gs, input);
                         async_iterator_result_promise(result)
                     }))
                 } else {
@@ -19334,6 +19406,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         match Interpreter::run_generator_step(&gs, input)? {
                             GeneratorStep::Yield(v) => Ok(make_iterator_result(v, false)),
                             GeneratorStep::Return(v) => Ok(make_iterator_result(v, true)),
+                            GeneratorStep::Await(_) => {
+                                Err(leaked_internal_await_error("Generator.prototype.next"))
+                            }
                         }
                     }))
                 }
@@ -31158,7 +31233,9 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let ba = make_bytecode(instrs, 3, 0).with_async_flag(true);
+        let ba = make_bytecode(instrs, 3, 0)
+            .with_suspend_kinds(vec![SuspendKind::Await])
+            .with_async_flag(true);
         let result = Interpreter::run_async_function(Rc::new(ba), vec![]).unwrap();
         if let JsValue::Promise(p) = &result {
             assert_eq!(
