@@ -62208,13 +62208,13 @@ mod tests {
              ta[0] = 5; old = Atomics.and(ta, 0, valueThatStores(10, 3)); checks.push(old === 10 && ta[0] === 2); \
              ta[0] = 5; old = Atomics.or(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 11); \
              ta[0] = 5; old = Atomics.xor(ta, 0, valueThatStores(10, 3)); checks.push(old === 10 && ta[0] === 9); \
-             ta[0] = 5; old = Atomics.exchange(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 1); \
+             ta[0] = 5; old = Atomics.exchange(ta, 0, valueThatStores(10, 1)); checks.push(old === 10); checks.push(ta[0] === 1); \
              checks.join(',')",
         )
         .unwrap();
         assert_eq!(
             result,
-            JsValue::String("true,true,true,true,true,true".into())
+            JsValue::String("true,true,true,true,true,true,true".into())
         );
     }
 
