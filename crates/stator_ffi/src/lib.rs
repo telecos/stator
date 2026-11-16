@@ -26673,7 +26673,7 @@ pub unsafe extern "C" fn stator_persistent_make_weak(
 
 /// Opaque traced-handle slot exposed to the embedder.
 ///
-/// The pointer returned by [`stator_traced_new`] is the address of a
+/// The pointer returned by `stator_traced_new` is the address of a
 /// stable, isolate-owned slot. Its address remains valid until the isolate is
 /// destroyed. The bytes pointed at are implementation-defined and must not be
 /// inspected or mutated by the embedder.
@@ -26824,8 +26824,8 @@ pub unsafe extern "C" fn stator_traced_new(
 
 /// Clear the referent stored in `traced` without freeing the slot.
 ///
-/// After `reset()`, [`stator_traced_is_empty`] returns `true` and
-/// [`stator_traced_get`] returns null.  The slot pointer itself remains
+/// After `reset()`, `stator_traced_is_empty` returns `true` and
+/// `stator_traced_get` returns null.  The slot pointer itself remains
 /// valid until the isolate is destroyed. A
 /// subsequent embedder visitor call that visits this slot still marks it
 /// as visited, but no strong reference is restored because the weak
@@ -26924,7 +26924,7 @@ pub unsafe extern "C" fn stator_traced_get(traced: *const StatorTraced) -> *mut 
 ///
 /// # Safety
 /// `traced` must be null or a slot pointer returned by
-/// [`stator_traced_new`]. After this call returns, the embedder must treat the
+/// `stator_traced_new`. After this call returns, the embedder must treat the
 /// pointer as invalid except for a redundant dispose while the isolate lives.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
