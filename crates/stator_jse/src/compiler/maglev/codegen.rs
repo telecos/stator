@@ -6317,6 +6317,14 @@ impl<'a> MaglevCodegen<'a> {
         true
     }
 
+    #[cfg(not(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
+    fn try_emit_int32_mod_by_constant(&mut self, _id: NodeId, _left: NodeId, _d: i32) -> bool {
+        false
+    }
+
     /// Inline Smi fast path for `GenericDivide`.
     ///
     /// Same structure as [`emit_inline_generic_mod`] but returns the
