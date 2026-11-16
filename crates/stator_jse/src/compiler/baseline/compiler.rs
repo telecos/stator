@@ -485,20 +485,6 @@ pub(crate) mod jit_runtime {
             Cell::new(ObjectLiteralIcEntry::EMPTY)
         };
 
-        /// Cached resolved pattern for [`SpeculativeCallFusion`] runtime
-        /// stub.  Stores only value-type data (no pointers) so it is
-        /// safe to keep across JIT invocations without invalidation.
-        ///
-        /// On a cache hit (same `callee` heap handle, which is
-        /// deterministic when the heap is cleared between iterations),
-        /// the fusion function skips the [`Rc`] deref into the
-        /// [`OnceCell`]-based pattern cache and the pattern-match
-        /// destructure — going straight to the heap lookup for the
-        /// closure context.
-        static RT_FUSION_CACHE: Cell<FusionFastCache> = const {
-            Cell::new(FusionFastCache::EMPTY)
-        };
-
         /// Cached Vec pointer for `jit_runtime_array_push`.  Avoids
         /// repeated heap → JsValue::Array → Rc<RefCell<Vec>> dereferences
         /// when the receiver is the same array across iterations.
@@ -680,29 +666,6 @@ pub(crate) mod jit_runtime {
     /// Reset all per-stub call counts to zero.
     pub fn reset_stub_call_counts() {
         RT_STUB_CALL_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
-    }
-
-    /// Cached fusion-pattern data for [`SpeculativeCallFusion`] runtime stub.
-    ///
-    /// Stores only value-type data (heap-handle identity, slot index,
-    /// increment constant) — no raw pointers — so the cache is safe to
-    /// keep across `jit_runtime_setup` / `jit_runtime_teardown` cycles.
-    #[derive(Clone, Copy)]
-    struct FusionFastCache {
-        /// Callee heap handle used as the cache key.
-        callee: i64,
-        /// Context-slot index from the fusion pattern.
-        slot: usize,
-        /// Increment constant from the fusion pattern.
-        k: i64,
-    }
-
-    impl FusionFastCache {
-        const EMPTY: Self = Self {
-            callee: 0,
-            slot: 0,
-            k: 0,
-        };
     }
 
     /// Lightweight fusion resolve stub: given a callee heap handle and
@@ -1105,8 +1068,8 @@ pub(crate) mod jit_runtime {
     /// `Box<ObjectLiteralTemplate>` inside
     /// `ObjectLiteralCacheEntry::Cached`.  That heap allocation is stable
     /// because cached entries are never removed or replaced.  The IC is
-    /// invalidated when the [`BytecodeArray`] changes (see
-    /// [`jit_runtime_setup`]).
+    /// invalidated when the JIT heap is recycled or the [`BytecodeArray`]
+    /// changes (see [`jit_runtime_setup`] and [`jit_runtime_teardown`]).
     #[derive(Clone, Copy)]
     struct ObjectLiteralIcEntry {
         /// Feedback slot this entry is for.
@@ -1230,6 +1193,7 @@ pub(crate) mod jit_runtime {
             recycle_and_clear_heap();
             RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
             RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+            RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
             CACHED_CALLEE.with(|c| {
                 let old = c.get();
                 drop_cached_callee_entry(old);
@@ -1343,6 +1307,7 @@ pub(crate) mod jit_runtime {
         // set the flag so setup can skip the redundant work.
         RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
         RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+        RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
         CACHED_CALLEE.with(|c| {
             let old = c.get();
             drop_cached_callee_entry(old);
@@ -1389,7 +1354,6 @@ pub(crate) mod jit_runtime {
         });
         DIRECT_CALL_OLD_CTX.with(|c| *c.borrow_mut() = None);
         RT_LAST_BA.with(|b| b.set((std::ptr::null(), 0)));
-        RT_FUSION_CACHE.with(|c| c.set(FusionFastCache::EMPTY));
         RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
         // ── Clear heap so recycled PlainObjects don't linger ───────
         RT_HEAP.with(|h| h.borrow_mut().clear());
@@ -3533,25 +3497,12 @@ pub(crate) mod jit_runtime {
             _ => return fail,
         };
 
-        // ── Resolve (slot, k) pattern (with TLS fast cache) ─────────
-        let cache = RT_FUSION_CACHE.with(|c| c.get());
-        let (slot, k) = if cache.callee == callee_i64 && cache.callee != 0 {
-            (cache.slot, cache.k)
-        } else {
-            let &pattern = ba
-                .fusion_pattern_cache()
-                .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
-            let Some((slot, k)) = pattern else {
-                return fail;
-            };
-            RT_FUSION_CACHE.with(|c| {
-                c.set(FusionFastCache {
-                    callee: callee_i64,
-                    slot,
-                    k,
-                });
-            });
-            (slot, k)
+        // ── Resolve (slot, k) pattern ───────────────────────────────
+        let &pattern = ba
+            .fusion_pattern_cache()
+            .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
+        let Some((slot, k)) = pattern else {
+            return fail;
         };
 
         // ── Get closure-context slot pointer ─────────────────────────

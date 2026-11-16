@@ -7366,10 +7366,7 @@ fn serialize_js_module_payload(payload: &JsModulePayload, out: &mut Vec<u8>) -> 
         }
     }
 
-    if !push_bytes(out, &payload.bytecode) {
-        return false;
-    }
-    true
+    push_bytes(out, &payload.bytecode)
 }
 
 fn serialize_wasm_val_kinds(kinds: &[HostValKind], out: &mut Vec<u8>) -> bool {
