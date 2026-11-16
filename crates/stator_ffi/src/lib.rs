@@ -11690,10 +11690,7 @@ unsafe fn run_script_inner(
     // microtask drains poll it.  Cleared on drop, even on panic.
     let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
-    let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b,
-        None => return None,
-    };
+    let bytecodes = unsafe { (*script).bytecodes.as_ref()? };
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };
@@ -11737,10 +11734,7 @@ unsafe fn run_script_no_result_inner(
     }
     let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
-    let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b,
-        None => return None,
-    };
+    let bytecodes = unsafe { (*script).bytecodes.as_ref()? };
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };

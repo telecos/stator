@@ -1055,12 +1055,11 @@ fn find_chained_addend(
             total_min = total_min.checked_add(addend.min)?;
             total_max = total_max.checked_add(addend.max)?;
             current = left;
-        } else if let Some(addend) = left_range {
+        } else {
+            let addend = left_range?;
             total_min = total_min.checked_add(addend.min)?;
             total_max = total_max.checked_add(addend.max)?;
             current = right;
-        } else {
-            return None;
         }
     }
 }

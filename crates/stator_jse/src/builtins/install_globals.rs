@@ -62199,17 +62199,22 @@ mod tests {
 
     #[test]
     fn e2e_atomics_read_modify_write_converts_value_before_reading_number_slot() {
-        assert_eval_true(
+        let result = global_eval(
             "var ta = new Int32Array(new SharedArrayBuffer(4)); \
-             var ok = true; \
+             var checks = []; \
              function valueThatStores(n, r) { return { valueOf: function() { ta[0] = n; return r; } }; } \
-             ta[0] = 5; ok = ok && Atomics.add(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 11; \
-             ta[0] = 5; ok = ok && Atomics.sub(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 9; \
-             ta[0] = 5; ok = ok && Atomics.and(ta, 0, valueThatStores(10, 3)) === 10 && ta[0] === 2; \
-             ta[0] = 5; ok = ok && Atomics.or(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 11; \
-             ta[0] = 5; ok = ok && Atomics.xor(ta, 0, valueThatStores(10, 3)) === 10 && ta[0] === 9; \
-             ta[0] = 5; ok = ok && Atomics.exchange(ta, 0, valueThatStores(10, 1)) === 10 && ta[0] === 1; \
-             ok",
+             ta[0] = 5; var old = Atomics.add(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 11); \
+             ta[0] = 5; old = Atomics.sub(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 9); \
+             ta[0] = 5; old = Atomics.and(ta, 0, valueThatStores(10, 3)); checks.push(old === 10 && ta[0] === 2); \
+             ta[0] = 5; old = Atomics.or(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 11); \
+             ta[0] = 5; old = Atomics.xor(ta, 0, valueThatStores(10, 3)); checks.push(old === 10 && ta[0] === 9); \
+             ta[0] = 5; old = Atomics.exchange(ta, 0, valueThatStores(10, 1)); checks.push(old === 10 && ta[0] === 1); \
+             checks.join(',')",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("true,true,true,true,true,true".into())
         );
     }
 
