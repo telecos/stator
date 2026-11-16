@@ -26,7 +26,7 @@ use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
     arraybuffer_byte_length, dataview_byte_length, dataview_byte_offset,
 };
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::builtins::date::{
     date_construct_components, date_construct_now, date_construct_value, date_get_date,
@@ -45,7 +45,8 @@ use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
 };
 use crate::builtins::finalization_registry::{
-    TokenKey, finalization_registry_new, finalization_registry_register_plain_with_token_key,
+    TokenKey, finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
+    finalization_registry_notify_plain, finalization_registry_register_plain_with_token_key,
     finalization_registry_register_with_token_key, finalization_registry_unregister,
     finalization_registry_unregister_by_key, finalization_registry_unregister_plain,
 };
@@ -110,8 +111,8 @@ use crate::builtins::symbol::{
     SYMBOL_ASYNC_DISPOSE, SYMBOL_ASYNC_ITERATOR, SYMBOL_DISPOSE, SYMBOL_HAS_INSTANCE,
     SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE,
     SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG,
-    SYMBOL_UNSCOPABLES, property_key_to_symbol, symbol_create, symbol_description, symbol_for,
-    symbol_key_for,
+    SYMBOL_UNSCOPABLES, is_symbol_property_key, property_key_to_symbol, symbol_create,
+    symbol_description, symbol_for, symbol_key_for, symbol_to_property_key,
 };
 use crate::builtins::typed_array::{
     JsArrayBuffer, TypedArrayKind, arraybuffer_detached, arraybuffer_max_byte_length,
@@ -130,14 +131,18 @@ use crate::builtins::typed_array::{
 };
 use crate::builtins::wasm::make_webassembly_object;
 use crate::builtins::weak_ref::{
-    weak_ref_deref, weak_ref_new, weak_ref_new_plain, weak_ref_new_symbol,
+    weak_ref_deref, weak_ref_new, weak_ref_new_array, weak_ref_new_function, weak_ref_new_plain,
+    weak_ref_new_symbol,
 };
 use crate::error::{StatorError, StatorResult};
+use crate::inspector::console::{ProfileEvent, ProfileEventKind, push_profile_event};
 use crate::interpreter::{
-    current_global_env, current_this, dispatch_call_value, dispatch_call_with_this,
-    dispatch_construct_call, dispatch_get_property_value, dispatch_set_property_value,
-    function_display_name, function_length_value, function_to_string_value, get_object_prototype,
-    has_prototype_in_chain, ordinary_set_prototype_of, plain_object_has_own_property,
+    current_construct_new_target, current_global_env, current_this, dispatch_call_value,
+    dispatch_call_with_this, dispatch_construct_call, dispatch_get_property_value,
+    dispatch_set_property_value, dispatch_setter, function_display_name, function_length_value,
+    function_to_string_value, generator_object_prototype, get_object_prototype,
+    has_property_in_chain, has_prototype_in_chain, leaked_internal_await_error,
+    ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -292,6 +297,46 @@ fn materialize_array_holes(items: &[JsValue]) -> Vec<JsValue> {
         .collect()
 }
 
+fn is_function_prototype_dispatcher(receiver: &JsValue) -> bool {
+    let Some(JsValue::PlainObject(function_proto)) = constructor_prototype("Function") else {
+        return false;
+    };
+    let function_proto = function_proto.borrow();
+    ["call", "apply", "bind"].iter().any(|name| {
+        function_proto
+            .get(name)
+            .is_some_and(|method| method == receiver)
+    })
+}
+
+fn resolve_function_prototype_target(args: &[JsValue]) -> Option<(JsValue, usize)> {
+    let receiver = current_this().filter(is_callable);
+
+    if let Some(first) = args.first().filter(|value| is_callable(value))
+        && receiver
+            .as_ref()
+            .is_none_or(is_function_prototype_dispatcher)
+    {
+        return Some((first.clone(), 1));
+    }
+
+    receiver.map(|receiver| (receiver, 0))
+}
+
+fn resolve_object_prototype_receiver_and_key(args: &[JsValue]) -> (JsValue, JsValue) {
+    if args.len() >= 2 {
+        (
+            args.first().cloned().unwrap_or(JsValue::Undefined),
+            args.get(1).cloned().unwrap_or(JsValue::Undefined),
+        )
+    } else {
+        (
+            current_this().unwrap_or(JsValue::Undefined),
+            args.first().cloned().unwrap_or(JsValue::Undefined),
+        )
+    }
+}
+
 /// Extract elements from an array-like value, preserving holes as `undefined`.
 fn try_to_array_like_elements(val: &JsValue) -> StatorResult<(Vec<JsValue>, usize)> {
     let len = array_like_length(val)?;
@@ -316,16 +361,22 @@ fn parse_integer_index_key(key: &str) -> Option<u32> {
     if n < u32::MAX { Some(n) } else { None }
 }
 
-fn visible_string_property_name(raw_key: &str) -> Option<String> {
+fn visible_string_property_name(map: &PropertyMap, raw_key: &str) -> Option<String> {
     let visible = if let Some(prop) = raw_key
         .strip_prefix("__get_")
         .and_then(|s| s.strip_suffix("__"))
     {
+        if !map.is_accessor_property(prop) {
+            return Some(raw_key.to_string());
+        }
         prop
     } else if let Some(prop) = raw_key
         .strip_prefix("__set_")
         .and_then(|s| s.strip_suffix("__"))
     {
+        if !map.is_accessor_property(prop) {
+            return Some(raw_key.to_string());
+        }
         prop
     } else {
         if raw_key.starts_with("__") || raw_key.starts_with('#') {
@@ -355,7 +406,7 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
             continue;
         }
 
-        if let Some(visible) = visible_string_property_name(raw_key)
+        if let Some(visible) = visible_string_property_name(map, raw_key)
             && seen.insert(visible.clone())
         {
             ordered.push(visible);
@@ -380,18 +431,33 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
         .collect()
 }
 
-fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
+fn enumerable_own_string_keys(value: &JsValue) -> StatorResult<Vec<String>> {
     match value {
-        JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
-        JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
-        JsValue::Array(items) => items
+        JsValue::PlainObject(map) => Ok(own_string_property_keys(&map.borrow(), true)),
+        JsValue::Error(error) => Ok(own_string_property_keys(&error.props.borrow(), true)),
+        JsValue::Proxy(proxy) => {
+            let keys = proxy_own_keys(&proxy.borrow())?;
+            let mut out = Vec::new();
+            for key in keys {
+                let JsValue::String(name) = key else {
+                    continue;
+                };
+                if let Some((_, attrs)) = proxy_get_own_property_descriptor(&proxy.borrow(), &name)?
+                    && attrs.contains(PropertyAttributes::ENUMERABLE)
+                {
+                    out.push(name.to_string());
+                }
+            }
+            Ok(out)
+        }
+        JsValue::Array(items) => Ok(items
             .borrow()
             .iter()
             .enumerate()
             .filter_map(|(index, value)| (!value.is_the_hole()).then_some(index.to_string()))
-            .collect(),
-        JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
-        _ => Vec::new(),
+            .collect()),
+        JsValue::String(s) => Ok((0..utf16_len(s)).map(|i| i.to_string()).collect()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -464,6 +530,7 @@ fn get_prototype_of_value(value: &JsValue) -> Option<JsValue> {
             get_object_prototype(value)
         }
         JsValue::Array(_) => constructor_prototype("Array"),
+        JsValue::Generator(state) => generator_object_prototype(state),
         JsValue::Function(_) | JsValue::NativeFunction(_) => constructor_prototype("Function"),
         JsValue::Boolean(_) => constructor_prototype("Boolean"),
         JsValue::Smi(_) | JsValue::HeapNumber(_) => constructor_prototype("Number"),
@@ -718,6 +785,11 @@ fn call_callback_with_this(
     this_arg: JsValue,
     args: Vec<JsValue>,
 ) -> StatorResult<JsValue> {
+    if let JsValue::NativeFunction(f) = cb
+        && current_global_env().is_none()
+    {
+        return f(args);
+    }
     dispatch_call_with_this(cb, this_arg, args)
 }
 
@@ -968,17 +1040,20 @@ fn define_plain_own_property(
         let borrow = map.borrow();
         let getter_key = format!("__get_{key}__");
         let setter_key = format!("__set_{key}__");
-        let is_existing_accessor =
-            borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+        let is_existing_accessor = borrow.is_accessor_property(key);
         let property_exists = borrow.contains_key(key) || is_existing_accessor;
 
         if property_exists {
             let currently_configurable = if borrow.contains_key(key) {
                 borrow.is_configurable(key)
-            } else if borrow.contains_key(&getter_key) {
-                borrow.is_configurable(&getter_key)
+            } else if is_existing_accessor {
+                if borrow.contains_key(&getter_key) {
+                    borrow.is_configurable(&getter_key)
+                } else {
+                    borrow.is_configurable(&setter_key)
+                }
             } else {
-                borrow.is_configurable(&setter_key)
+                false
             };
 
             if !currently_configurable {
@@ -1021,10 +1096,14 @@ fn define_plain_own_property(
                     let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
                     let current_e = if borrow.contains_key(key) {
                         borrow.is_enumerable(key)
-                    } else if borrow.contains_key(&getter_key) {
-                        borrow.is_enumerable(&getter_key)
+                    } else if is_existing_accessor {
+                        if borrow.contains_key(&getter_key) {
+                            borrow.is_enumerable(&getter_key)
+                        } else {
+                            borrow.is_enumerable(&setter_key)
+                        }
                     } else {
-                        borrow.is_enumerable(&setter_key)
+                        false
                     };
                     if new_e != current_e {
                         return Err(crate::error::StatorError::TypeError(format!(
@@ -1070,12 +1149,7 @@ fn define_plain_own_property(
     if has_get || has_set {
         {
             let borrow = map.borrow();
-            let getter_key = format!("__get_{key}__");
-            let setter_key = format!("__set_{key}__");
-            if !borrow.extensible
-                && !borrow.contains_key(key)
-                && !borrow.contains_key(&getter_key)
-                && !borrow.contains_key(&setter_key)
+            if !borrow.extensible && !borrow.contains_key(key) && !borrow.is_accessor_property(key)
             {
                 return Err(crate::error::StatorError::TypeError(format!(
                     "Cannot define property {key}, object is not extensible"
@@ -1102,6 +1176,7 @@ fn define_plain_own_property(
                 .insert_with_attrs(setter_key, setter, accessor_attrs);
         }
         map.borrow_mut().remove(key);
+        map.borrow_mut().mark_accessor_property(key);
     } else {
         let writable_val = desc.get("writable").map(|v| v.to_boolean());
         let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
@@ -1112,7 +1187,7 @@ fn define_plain_own_property(
             let setter_key = format!("__set_{key}__");
             let is_existing_accessor = {
                 let borrow = map.borrow();
-                borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key)
+                borrow.is_accessor_property(key)
             };
             if !map.borrow().extensible && !is_existing_accessor {
                 return Err(crate::error::StatorError::TypeError(format!(
@@ -1124,8 +1199,11 @@ fn define_plain_own_property(
             } else {
                 JsValue::Undefined
             };
-            map.borrow_mut().remove(&getter_key);
-            map.borrow_mut().remove(&setter_key);
+            if is_existing_accessor {
+                map.borrow_mut().remove(&getter_key);
+                map.borrow_mut().remove(&setter_key);
+                map.borrow_mut().unmark_accessor_property(key);
+            }
             let mut attrs = PropertyAttributes::empty();
             if writable_val.unwrap_or(false) {
                 attrs |= PropertyAttributes::WRITABLE;
@@ -1143,8 +1221,11 @@ fn define_plain_own_property(
                 let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
                 let getter_key = format!("__get_{key}__");
                 let setter_key = format!("__set_{key}__");
-                map.borrow_mut().remove(&getter_key);
-                map.borrow_mut().remove(&setter_key);
+                if map.borrow().is_accessor_property(key) {
+                    map.borrow_mut().remove(&getter_key);
+                    map.borrow_mut().remove(&setter_key);
+                    map.borrow_mut().unmark_accessor_property(key);
+                }
                 map.borrow_mut().insert(key.to_string(), value);
             }
             if let Some(w) = writable_val {
@@ -1158,6 +1239,7 @@ fn define_plain_own_property(
             }
         }
     }
+    crate::interpreter::notify_mapped_arguments_define_own_property(map, key, desc);
     Ok(())
 }
 
@@ -1165,9 +1247,8 @@ fn plain_descriptor_as_object(map: &Rc<RefCell<PropertyMap>>, key: &str) -> JsVa
     let borrowed = map.borrow();
     let getter_key = format!("__get_{key}__");
     let setter_key = format!("__set_{key}__");
-    let has_getter = borrowed.contains_key(&getter_key);
-    let has_setter = borrowed.contains_key(&setter_key);
-    if has_getter || has_setter {
+    if borrowed.is_accessor_property(key) {
+        let has_getter = borrowed.contains_key(&getter_key);
         let mut desc = PropertyMap::new();
         desc.insert(
             "get".into(),
@@ -1220,9 +1301,12 @@ fn plain_get(target: &JsValue, key: &str, receiver: &JsValue) -> StatorResult<Js
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
             let getter_key = format!("__get_{key}__");
-            if let Some(getter) = borrow.get(&getter_key).cloned() {
-                drop(borrow);
-                return dispatch_call_with_this(&getter, receiver.clone(), vec![]);
+            if borrow.is_accessor_property(key) {
+                if let Some(getter) = borrow.get(&getter_key).cloned() {
+                    drop(borrow);
+                    return dispatch_call_with_this(&getter, receiver.clone(), vec![]);
+                }
+                return Ok(JsValue::Undefined);
             }
             if let Some(value) = borrow.get(key).cloned() {
                 return Ok(value);
@@ -1242,15 +1326,14 @@ fn plain_set_on_receiver(receiver: &JsValue, key: &str, value: JsValue) -> Stato
     match receiver {
         JsValue::PlainObject(map) => {
             let setter_key = format!("__set_{key}__");
-            let getter_key = format!("__get_{key}__");
             {
                 let borrow = map.borrow();
-                if let Some(setter) = borrow.get(&setter_key).cloned() {
-                    drop(borrow);
-                    dispatch_call_with_this(&setter, receiver.clone(), vec![value])?;
-                    return Ok(true);
-                }
-                if borrow.contains_key(&getter_key) {
+                if borrow.is_accessor_property(key) {
+                    if let Some(setter) = borrow.get(&setter_key).cloned() {
+                        drop(borrow);
+                        dispatch_setter(&setter, receiver, value)?;
+                        return Ok(true);
+                    }
                     return Ok(false);
                 }
                 if borrow.contains_key(key) && !borrow.is_writable(key) {
@@ -1281,13 +1364,12 @@ fn plain_set(
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
             let setter_key = format!("__set_{key}__");
-            let getter_key = format!("__get_{key}__");
-            if let Some(setter) = borrow.get(&setter_key).cloned() {
-                drop(borrow);
-                dispatch_call_with_this(&setter, receiver.clone(), vec![value])?;
-                return Ok(true);
-            }
-            if borrow.contains_key(&getter_key) {
+            if borrow.is_accessor_property(key) {
+                if let Some(setter) = borrow.get(&setter_key).cloned() {
+                    drop(borrow);
+                    dispatch_setter(&setter, receiver, value)?;
+                    return Ok(true);
+                }
                 return Ok(false);
             }
             if borrow.contains_key(key) {
@@ -1313,10 +1395,7 @@ fn plain_has(target: &JsValue, key: &str) -> bool {
     for _ in 0..256 {
         if let JsValue::PlainObject(map) = &current {
             let borrow = map.borrow();
-            if borrow.contains_key(key)
-                || borrow.contains_key(&format!("__get_{key}__"))
-                || borrow.contains_key(&format!("__set_{key}__"))
-            {
+            if borrow.contains_key(key) || borrow.is_accessor_property(key) {
                 return true;
             }
             if let Some(proto) = borrow.get("__proto__").cloned() {
@@ -1334,8 +1413,7 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
     let getter_key = format!("__get_{key}__");
     let setter_key = format!("__set_{key}__");
     let mut borrow = map.borrow_mut();
-    let has_accessor = borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
-    if has_accessor {
+    if borrow.is_accessor_property(key) {
         let configurable = if borrow.contains_key(&getter_key) {
             borrow.is_configurable(&getter_key)
         } else {
@@ -1347,12 +1425,17 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
         borrow.remove(&getter_key);
         borrow.remove(&setter_key);
         borrow.remove(key);
+        borrow.unmark_accessor_property(key);
+        drop(borrow);
+        crate::interpreter::notify_mapped_arguments_property_delete(map, key);
         true
     } else if borrow.contains_key(key) {
         if !borrow.is_configurable(key) {
             return false;
         }
         borrow.remove(key);
+        drop(borrow);
+        crate::interpreter::notify_mapped_arguments_property_delete(map, key);
         true
     } else {
         true
@@ -1372,8 +1455,12 @@ fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
             continue;
         }
         if let Some(name) = accessor_property_name(key) {
-            if seen.insert(name.to_string()) {
-                string_parts.push(JsValue::String(name.to_string().into()));
+            if map.is_accessor_property(name) {
+                if seen.insert(name.to_string()) {
+                    string_parts.push(JsValue::String(name.to_string().into()));
+                }
+            } else if seen.insert(key.to_string()) {
+                string_parts.push(JsValue::String(key.to_string().into()));
             }
             continue;
         }
@@ -1413,9 +1500,11 @@ fn is_concat_spreadable(value: &JsValue) -> bool {
     match value {
         JsValue::PlainObject(map) => {
             let borrow = map.borrow();
+            let is_array = matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true)));
             match borrow.get("@@isConcatSpreadable").cloned() {
+                Some(JsValue::Undefined) => is_array,
                 Some(v) => v.to_boolean(),
-                None => matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))),
+                None => is_array,
             }
         }
         JsValue::Array(items) => {
@@ -2440,6 +2529,11 @@ fn promise_catch_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsV
     })
 }
 
+fn promise_rejection_reason(error: &StatorError) -> JsValue {
+    crate::interpreter::Interpreter::js_error_to_rejection_reason(error)
+        .unwrap_or_else(|| JsValue::String(error.to_string().into()))
+}
+
 fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
     let q = queue.clone();
     builtin_fn("finally", 1, move |args: Vec<JsValue>| {
@@ -2449,21 +2543,21 @@ fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> J
                 let f = Rc::clone(f);
                 Box::new(move || match f(vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
                 let callee = v.clone();
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             Some(JsValue::PlainObject(map)) if map.borrow().contains_key("__call__") => {
                 let callee = JsValue::PlainObject(Rc::clone(map));
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
                     Ok(value) => Ok(value),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 })
             }
             _ => Box::new(|| Ok(JsValue::Undefined)),
@@ -2487,24 +2581,27 @@ fn initialize_error_plain_object(
     cause: Option<JsValue>,
     errors: Option<Vec<JsValue>>,
 ) -> JsValue {
+    let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
     let stack_name = match kind {
         ErrorKind::AggregateError => "AggregateError",
         _ => kind.as_name(),
     };
     let mut borrow = target.borrow_mut();
-    borrow.insert(
+    borrow.insert_with_attrs(
         "message".into(),
         JsValue::String(message.to_string().into()),
+        attrs,
     );
-    borrow.insert(
+    borrow.insert_with_attrs(
         "stack".into(),
         JsValue::String(crate::builtins::error::capture_stack_trace(stack_name, message).into()),
+        attrs,
     );
     if let Some(cause) = cause {
-        borrow.insert("cause".into(), cause);
+        borrow.insert_with_attrs("cause".into(), cause, attrs);
     }
     if let Some(errors) = errors {
-        borrow.insert("errors".into(), JsValue::new_array(errors));
+        borrow.insert_with_attrs("errors".into(), JsValue::new_array(errors), attrs);
     }
     drop(borrow);
     JsValue::PlainObject(Rc::clone(target))
@@ -2521,7 +2618,9 @@ fn error_instanceof(value: &JsValue, prototype: &JsValue, kind: Option<ErrorKind
 #[inline(never)]
 fn make_error_constructor(kind: ErrorKind) -> JsValue {
     native(move |args| {
-        let message = match args.first() {
+        let message_arg = args.first();
+        let has_message = !matches!(message_arg, None | Some(JsValue::Undefined));
+        let message = match message_arg {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
@@ -2532,10 +2631,18 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
             ));
         }
         let mut err = JsError::new(kind, message);
+        let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        if has_message {
+            err.props.borrow_mut().insert_with_attrs(
+                "message".to_string(),
+                JsValue::String(err.message().to_string().into()),
+                attrs,
+            );
+        }
         if let Some(ref cause_val) = cause {
             err.props
                 .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+                .insert_with_attrs("cause".to_string(), cause_val.clone(), attrs);
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -2567,9 +2674,11 @@ fn make_error_constructor_object(
     proto.insert("message".into(), JsValue::String(String::new().into()));
     proto.insert(
         "toString".into(),
-        native(move |args| {
-            let this = args.first().unwrap_or(&JsValue::Undefined);
-            error_prototype_to_string(this)
+        builtin_fn("toString", 0, |args| {
+            let this = current_this()
+                .or_else(|| args.first().cloned())
+                .unwrap_or(JsValue::Undefined);
+            error_prototype_to_string(&this)
         }),
     );
     proto.insert("__proto__".into(), error_proto.clone());
@@ -2632,7 +2741,9 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
         let (inner_errors, _) = to_array_like_elements(errors_val);
         // Second arg: message.
-        let message = match args.get(1) {
+        let message_arg = args.get(1);
+        let has_message = !matches!(message_arg, None | Some(JsValue::Undefined));
+        let message = match message_arg {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
@@ -2647,13 +2758,23 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             ));
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
-        err.props
-            .borrow_mut()
-            .insert("errors".to_string(), JsValue::new_array(err.errors.clone()));
+        let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        if has_message {
+            err.props.borrow_mut().insert_with_attrs(
+                "message".to_string(),
+                JsValue::String(err.message().to_string().into()),
+                attrs,
+            );
+        }
+        err.props.borrow_mut().insert_with_attrs(
+            "errors".to_string(),
+            JsValue::new_array(err.errors.clone()),
+            attrs,
+        );
         if let Some(ref cause_val) = cause {
             err.props
                 .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+                .insert_with_attrs("cause".to_string(), cause_val.clone(), attrs);
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -2668,8 +2789,10 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
     proto.insert(
         "toString".into(),
         native(|args| {
-            let this = args.first().unwrap_or(&JsValue::Undefined);
-            error_prototype_to_string(this)
+            let this = current_this()
+                .or_else(|| args.first().cloned())
+                .unwrap_or(JsValue::Undefined);
+            error_prototype_to_string(&this)
         }),
     );
     proto.insert("__proto__".into(), error_proto.clone());
@@ -2683,6 +2806,11 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         "name".into(),
         JsValue::String("AggregateError".to_string().into()),
     );
+    props.insert_with_attrs(
+        "length".into(),
+        JsValue::Smi(2),
+        PropertyAttributes::CONFIGURABLE,
+    );
     props.insert("@@hasInstance".into(), {
         let proto_for_instanceof = proto_val.clone();
         native(move |args| {
@@ -2695,7 +2823,7 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         })
     });
     props.insert("__proto__".into(), error_ctor.clone());
-    props.insert("prototype".into(), proto_val);
+    props.insert_with_attrs("prototype".into(), proto_val, PropertyAttributes::empty());
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
 
@@ -2787,9 +2915,11 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         proto.insert("message".into(), JsValue::String(String::new().into()));
         proto.insert(
             "toString".into(),
-            native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                error_prototype_to_string(this)
+            builtin_fn("toString", 0, |args| {
+                let this = current_this()
+                    .or_else(|| args.first().cloned())
+                    .unwrap_or(JsValue::Undefined);
+                error_prototype_to_string(&this)
             }),
         );
         proto.insert("@@toStringTag".into(), JsValue::String("Error".into()));
@@ -2979,6 +3109,9 @@ fn make_dom_exception_constructor() -> JsValue {
     proto.insert_with_attrs("__get_message__".into(), message_getter, accessor_attrs);
     proto.insert_with_attrs("__get_name__".into(), name_getter, accessor_attrs);
     proto.insert_with_attrs("__get_code__".into(), code_getter, accessor_attrs);
+    proto.mark_accessor_property("message");
+    proto.mark_accessor_property("name");
+    proto.mark_accessor_property("code");
     proto.insert_with_attrs(
         "toString".into(),
         builtin_fn("toString", 0, |args| {
@@ -5260,6 +5393,7 @@ fn make_storage_builtin() -> JsValue {
 
     let mut proto = PropertyMap::new();
     proto.insert("__get_length__".into(), storage_length_getter());
+    proto.mark_accessor_property("length");
     proto.insert(
         "key".into(),
         builtin_fn("key", 1, |args| {
@@ -13222,6 +13356,34 @@ fn make_console() -> JsValue {
             Ok(JsValue::Undefined)
         }),
     );
+    props.insert(
+        "profile".into(),
+        builtin_fn("profile", 0, |args: Vec<JsValue>| {
+            let id = args
+                .first()
+                .map(JsValue::to_display_string)
+                .unwrap_or_default();
+            push_profile_event(ProfileEvent {
+                kind: ProfileEventKind::Started,
+                id,
+            });
+            Ok(JsValue::Undefined)
+        }),
+    );
+    props.insert(
+        "profileEnd".into(),
+        builtin_fn("profileEnd", 0, |args: Vec<JsValue>| {
+            let id = args
+                .first()
+                .map(JsValue::to_display_string)
+                .unwrap_or_default();
+            push_profile_event(ProfileEvent {
+                kind: ProfileEventKind::Finished,
+                id,
+            });
+            Ok(JsValue::Undefined)
+        }),
+    );
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -13826,14 +13988,16 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
 fn date_proto_delegate(name: &str) -> JsValue {
     let name = name.to_string();
     native(move |args| {
+        let env_this = current_global_env().and_then(|env| env.borrow().get_this().cloned());
         let (this, forwarded_args) = match args.first().cloned() {
-            Some(JsValue::Undefined) | None => {
-                let env_this = current_global_env()
-                    .and_then(|env| env.borrow().get_this().cloned())
-                    .unwrap_or(JsValue::Undefined);
-                (env_this, args.get(1..).unwrap_or(&[]).to_vec())
-            }
-            Some(value) => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+            Some(value) if value.is_object_like() => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+            _ => match env_this {
+                Some(value) if !matches!(value, JsValue::Undefined) => (value, args.to_vec()),
+                _ => match args.first().cloned() {
+                    Some(value) => (value, args.get(1..).unwrap_or(&[]).to_vec()),
+                    None => (JsValue::Undefined, Vec::new()),
+                },
+            },
         };
 
         if name == "toJSON" {
@@ -15014,7 +15178,7 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                let keys = enumerable_own_string_keys(val)
+                let keys = enumerable_own_string_keys(val)?
                     .into_iter()
                     .map(|key| JsValue::String(key.into()))
                     .collect();
@@ -15031,7 +15195,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut values = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     values.push(dispatch_get_property_value(
                         val,
                         JsValue::String(key.into()),
@@ -15050,7 +15214,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut entries = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     let value =
                         dispatch_get_property_value(val, JsValue::String(key.clone().into()))?;
                     entries.push(JsValue::new_array(vec![JsValue::String(key.into()), value]));
@@ -15096,18 +15260,21 @@ fn make_object() -> JsValue {
                 let borrow = map.borrow();
                 let getter_key = format!("__get_{key}__");
                 let setter_key = format!("__set_{key}__");
-                let is_existing_accessor =
-                    borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+                let is_existing_accessor = borrow.is_accessor_property(key);
                 let property_exists = borrow.contains_key(key) || is_existing_accessor;
 
                 if property_exists {
                     // Resolve configurability from the correct backing key.
                     let currently_configurable = if borrow.contains_key(key) {
                         borrow.is_configurable(key)
-                    } else if borrow.contains_key(&getter_key) {
-                        borrow.is_configurable(&getter_key)
+                    } else if is_existing_accessor {
+                        if borrow.contains_key(&getter_key) {
+                            borrow.is_configurable(&getter_key)
+                        } else {
+                            borrow.is_configurable(&setter_key)
+                        }
                     } else {
-                        borrow.is_configurable(&setter_key)
+                        false
                     };
 
                     if !currently_configurable {
@@ -15157,10 +15324,14 @@ fn make_object() -> JsValue {
                             let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
                             let current_e = if borrow.contains_key(key) {
                                 borrow.is_enumerable(key)
-                            } else if borrow.contains_key(&getter_key) {
-                                borrow.is_enumerable(&getter_key)
+                            } else if is_existing_accessor {
+                                if borrow.contains_key(&getter_key) {
+                                    borrow.is_enumerable(&getter_key)
+                                } else {
+                                    borrow.is_enumerable(&setter_key)
+                                }
                             } else {
-                                borrow.is_enumerable(&setter_key)
+                                false
                             };
                             if new_e != current_e {
                                 return Err(crate::error::StatorError::TypeError(format!(
@@ -15213,12 +15384,9 @@ fn make_object() -> JsValue {
                 // don't already have this key as an accessor.
                 {
                     let borrow = map.borrow();
-                    let getter_key = format!("__get_{key}__");
-                    let setter_key = format!("__set_{key}__");
                     if !borrow.extensible
                         && !borrow.contains_key(key)
-                        && !borrow.contains_key(&getter_key)
-                        && !borrow.contains_key(&setter_key)
+                        && !borrow.is_accessor_property(key)
                     {
                         return Err(crate::error::StatorError::TypeError(format!(
                             "Cannot define property {key}, object is not extensible"
@@ -15245,6 +15413,7 @@ fn make_object() -> JsValue {
                         .insert_with_attrs(setter_key, setter, accessor_attrs);
                 }
                 map.borrow_mut().remove(key);
+                map.borrow_mut().mark_accessor_property(key);
             } else {
                 let writable_val = desc.get("writable").map(|v| v.to_boolean());
                 let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
@@ -15260,7 +15429,7 @@ fn make_object() -> JsValue {
                     let setter_key = format!("__set_{key}__");
                     let is_existing_accessor = {
                         let borrow = map.borrow();
-                        borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key)
+                        borrow.is_accessor_property(key)
                     };
                     if !map.borrow().extensible && !is_existing_accessor {
                         return Err(crate::error::StatorError::TypeError(format!(
@@ -15272,8 +15441,11 @@ fn make_object() -> JsValue {
                     } else {
                         JsValue::Undefined
                     };
-                    map.borrow_mut().remove(&getter_key);
-                    map.borrow_mut().remove(&setter_key);
+                    if is_existing_accessor {
+                        map.borrow_mut().remove(&getter_key);
+                        map.borrow_mut().remove(&setter_key);
+                        map.borrow_mut().unmark_accessor_property(key);
+                    }
                     let mut attrs = PropertyAttributes::empty();
                     if writable_val.unwrap_or(false) {
                         attrs |= PropertyAttributes::WRITABLE;
@@ -15291,8 +15463,11 @@ fn make_object() -> JsValue {
                         let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
                         let getter_key = format!("__get_{key}__");
                         let setter_key = format!("__set_{key}__");
-                        map.borrow_mut().remove(&getter_key);
-                        map.borrow_mut().remove(&setter_key);
+                        if map.borrow().is_accessor_property(key) {
+                            map.borrow_mut().remove(&getter_key);
+                            map.borrow_mut().remove(&setter_key);
+                            map.borrow_mut().unmark_accessor_property(key);
+                        }
                         map.borrow_mut().insert(key.to_string(), value);
                     }
                     if let Some(w) = writable_val {
@@ -15306,6 +15481,7 @@ fn make_object() -> JsValue {
                     }
                 }
             }
+            crate::interpreter::notify_mapped_arguments_define_own_property(map, key, desc);
             Ok(())
         }
 
@@ -15449,9 +15625,8 @@ fn make_object() -> JsValue {
                         // Check for accessor property first
                         let getter_key = format!("__get_{key}__");
                         let setter_key = format!("__set_{key}__");
-                        let has_getter = borrowed.contains_key(&getter_key);
-                        let has_setter = borrowed.contains_key(&setter_key);
-                        if has_getter || has_setter {
+                        if borrowed.is_accessor_property(&key) {
+                            let has_getter = borrowed.contains_key(&getter_key);
                             let mut desc = PropertyMap::new();
                             desc.insert(
                                 "get".into(),
@@ -15619,23 +15794,23 @@ fn make_object() -> JsValue {
                         let mut names: Vec<String> = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for k in borrow.keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
+                            if let Some(prop) = accessor_property_name(k) {
+                                if borrow.is_accessor_property(prop) {
+                                    if seen.insert(prop.to_string()) {
+                                        names.push(prop.to_string());
+                                    }
+                                } else if seen.insert(k.to_string()) {
+                                    names.push(k.to_string());
                                 }
                                 continue;
                             }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                            if k.as_ref() == INTERNAL_PROTO_PROPERTY_KEY
+                                || k.starts_with("__")
+                                || k.starts_with('#')
                             {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
-                                }
                                 continue;
                             }
-                            if k.starts_with("__") || k.starts_with('#') {
+                            if is_symbol_property_key(k) {
                                 continue;
                             }
                             if seen.insert(k.to_string()) {
@@ -15707,7 +15882,7 @@ fn make_object() -> JsValue {
                         continue;
                     }
                     // Copy enumerable own string-keyed properties.
-                    for key in enumerable_own_string_keys(source) {
+                    for key in enumerable_own_string_keys(source)? {
                         let value = dispatch_get_property_value(
                             source,
                             JsValue::String(key.clone().into()),
@@ -15741,7 +15916,10 @@ fn make_object() -> JsValue {
             builtin_fn("freeze", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
                 match &obj {
-                    JsValue::PlainObject(map) => map.borrow_mut().freeze(),
+                    JsValue::PlainObject(map) => {
+                        map.borrow_mut().freeze();
+                        crate::interpreter::notify_mapped_arguments_freeze(map);
+                    }
                     JsValue::Error(e) => e.props.borrow_mut().freeze(),
                     _ => {}
                 }
@@ -15965,7 +16143,10 @@ fn make_object() -> JsValue {
                 let result_rc = Rc::new(RefCell::new(result));
                 for (i, item) in elements.iter().enumerate() {
                     let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
-                    let group_key = key.to_js_string()?;
+                    let group_key = match key {
+                        JsValue::Symbol(id) => symbol_to_property_key(id),
+                        other => other.to_js_string()?,
+                    };
                     let mut borrow = result_rc.borrow_mut();
                     if let Some(JsValue::Array(existing)) = borrow.get(&group_key).cloned() {
                         existing.borrow_mut().push(item.clone());
@@ -16080,11 +16261,13 @@ fn make_object() -> JsValue {
                         for k in borrow.keys() {
                             if let Some(name) = k.strip_prefix("__get_")
                                 && let Some(name) = name.strip_suffix("__")
+                                && borrow.is_accessor_property(name)
                                 && !accessor_names.contains(&name.to_string())
                             {
                                 accessor_names.push(name.to_string());
                             } else if let Some(name) = k.strip_prefix("__set_")
                                 && let Some(name) = name.strip_suffix("__")
+                                && borrow.is_accessor_property(name)
                                 && !accessor_names.contains(&name.to_string())
                             {
                                 accessor_names.push(name.to_string());
@@ -16239,12 +16422,15 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "hasOwnProperty".into(),
             builtin_fn("hasOwnProperty", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let key = args.get(1).unwrap_or(&JsValue::Undefined);
+                let (this, key) = resolve_object_prototype_receiver_and_key(&args);
                 let prop = key.to_property_key()?;
-                match this {
+                match &this {
                     JsValue::PlainObject(map) => {
                         let has = plain_object_has_own_property(&map.borrow(), &prop);
+                        Ok(JsValue::Boolean(has))
+                    }
+                    JsValue::Error(error) => {
+                        let has = plain_object_has_own_property(&error.props.borrow(), &prop);
                         Ok(JsValue::Boolean(has))
                     }
                     _ => Ok(JsValue::Boolean(false)),
@@ -16256,12 +16442,11 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "isPrototypeOf".into(),
             builtin_fn("isPrototypeOf", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let target = args.get(1).unwrap_or(&JsValue::Undefined);
-                if let JsValue::PlainObject(_) = this
+                let (this, target) = resolve_object_prototype_receiver_and_key(&args);
+                if let JsValue::PlainObject(_) = &this
                     && target.is_object_like()
                 {
-                    return Ok(JsValue::Boolean(has_prototype_in_chain(target, this)));
+                    return Ok(JsValue::Boolean(has_prototype_in_chain(&target, &this)));
                 }
                 Ok(JsValue::Boolean(false))
             }),
@@ -16271,13 +16456,18 @@ fn make_object() -> JsValue {
         obj_proto.insert(
             "propertyIsEnumerable".into(),
             builtin_fn("propertyIsEnumerable", 1, |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                let key = args.get(1).unwrap_or(&JsValue::Undefined);
+                let (this, key) = resolve_object_prototype_receiver_and_key(&args);
                 let prop = key.to_property_key()?;
-                match this {
+                match &this {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
                         let exists = borrow.contains_key(&prop) && prop != "__proto__";
+                        let enumerable = exists && borrow.is_enumerable(&prop);
+                        Ok(JsValue::Boolean(enumerable))
+                    }
+                    JsValue::Error(error) => {
+                        let borrow = error.props.borrow();
+                        let exists = plain_object_has_own_property(&borrow, &prop);
                         let enumerable = exists && borrow.is_enumerable(&prop);
                         Ok(JsValue::Boolean(enumerable))
                     }
@@ -16293,9 +16483,8 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
-                let getter_key = format!("__getter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
-                    if let Some(g) = map.borrow().get(&getter_key) {
+                    if let Some(g) = map.borrow().get_getter_for(&prop) {
                         return Ok(g.clone());
                     }
                     // Walk the prototype chain.
@@ -16303,7 +16492,7 @@ fn make_object() -> JsValue {
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
-                                if let Some(g) = p.borrow().get(&getter_key) {
+                                if let Some(g) = p.borrow().get_getter_for(&prop) {
                                     return Ok(g.clone());
                                 }
                                 current = p.borrow().get("__proto__").cloned();
@@ -16323,9 +16512,8 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let prop = key.to_property_key()?;
-                let setter_key = format!("__setter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
-                    if let Some(s) = map.borrow().get(&setter_key) {
+                    if let Some(s) = map.borrow().get_setter_for(&prop) {
                         return Ok(s.clone());
                     }
                     // Walk the prototype chain.
@@ -16333,7 +16521,7 @@ fn make_object() -> JsValue {
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
-                                if let Some(s) = p.borrow().get(&setter_key) {
+                                if let Some(s) = p.borrow().get_setter_for(&prop) {
                                     return Ok(s.clone());
                                 }
                                 current = p.borrow().get("__proto__").cloned();
@@ -16355,8 +16543,9 @@ fn make_object() -> JsValue {
                 let getter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
-                    map.borrow_mut()
-                        .insert(format!("__getter_{prop}__"), getter);
+                    let mut borrow = map.borrow_mut();
+                    borrow.insert(format!("__get_{prop}__"), getter);
+                    borrow.mark_accessor_property(prop);
                 }
                 Ok(JsValue::Undefined)
             }),
@@ -16371,8 +16560,9 @@ fn make_object() -> JsValue {
                 let setter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
-                    map.borrow_mut()
-                        .insert(format!("__setter_{prop}__"), setter);
+                    let mut borrow = map.borrow_mut();
+                    borrow.insert(format!("__set_{prop}__"), setter);
+                    borrow.mark_accessor_property(prop);
                 }
                 Ok(JsValue::Undefined)
             }),
@@ -16525,7 +16715,27 @@ fn make_array() -> JsValue {
         props.insert(
             "fromAsync".into(),
             builtin_fn("fromAsync", 1, |args| {
-                use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+                use crate::builtins::promise::{
+                    PromiseState, active_microtask_queue, drain_active_microtask_queue,
+                    promise_reject, promise_resolve,
+                };
+
+                let queue = active_microtask_queue().unwrap_or_default();
+                fn await_from_async_value(value: JsValue) -> Result<JsValue, JsValue> {
+                    match value {
+                        JsValue::Promise(promise) => {
+                            drain_active_microtask_queue();
+                            match promise.state() {
+                                PromiseState::Fulfilled(value) => Ok(value),
+                                PromiseState::Rejected(reason) => Err(reason),
+                                PromiseState::Pending => Err(JsValue::String(
+                                    "Array.fromAsync: promise is still pending".into(),
+                                )),
+                            }
+                        }
+                        other => Ok(other),
+                    }
+                }
 
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
                 let map_fn = args.get(1).cloned();
@@ -16534,9 +16744,12 @@ fn make_array() -> JsValue {
                     && !matches!(mf, JsValue::Undefined)
                     && !is_callable(mf)
                 {
-                    return Err(StatorError::TypeError(
-                        "Array.fromAsync: mapFn is not a function".into(),
-                    ));
+                    let error =
+                        StatorError::TypeError("Array.fromAsync: mapFn is not a function".into());
+                    return Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(error.to_string().into()),
+                        &queue,
+                    )));
                 }
                 // Collect items synchronously (covers sync iterables / array-like).
                 let items: Vec<JsValue> = match iterable {
@@ -16574,23 +16787,45 @@ fn make_array() -> JsValue {
                     }
                     _ => Vec::new(),
                 };
+                let mut awaited_items = Vec::with_capacity(items.len());
+                for item in items {
+                    match await_from_async_value(item) {
+                        Ok(value) => awaited_items.push(value),
+                        Err(reason) => {
+                            return Ok(JsValue::Promise(promise_reject(reason, &queue)));
+                        }
+                    }
+                }
                 // Apply mapFn if provided.
                 let mapped = if let Some(ref mf) = map_fn {
                     if !matches!(mf, JsValue::Undefined) {
-                        items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
-                            .collect::<Result<Vec<_>, _>>()?
+                        let mut mapped = Vec::with_capacity(awaited_items.len());
+                        for (i, v) in awaited_items.into_iter().enumerate() {
+                            match dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]) {
+                                Ok(value) => match await_from_async_value(value) {
+                                    Ok(value) => mapped.push(value),
+                                    Err(reason) => {
+                                        return Ok(JsValue::Promise(promise_reject(
+                                            reason, &queue,
+                                        )));
+                                    }
+                                },
+                                Err(error) => {
+                                    return Ok(JsValue::Promise(promise_reject(
+                                        JsValue::String(error.to_string().into()),
+                                        &queue,
+                                    )));
+                                }
+                            }
+                        }
+                        mapped
                     } else {
-                        items
+                        awaited_items
                     }
                 } else {
-                    items
+                    awaited_items
                 };
                 let result_arr = JsValue::new_array(mapped);
-                // Wrap in a resolved Promise.
-                let queue = MicrotaskQueue::new();
                 Ok(JsValue::Promise(promise_resolve(result_arr, &queue)))
             }),
         );
@@ -17581,15 +17816,13 @@ fn make_array() -> JsValue {
         );
 
         // values()
-        proto.insert(
-            "values".into(),
-            builtin_fn("values", 0, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let values = try_to_array_like_elements(arr)?.0;
-                Ok(JsValue::Iterator(NativeIterator::from_items(values)))
-            }),
-        );
+        let array_values_fn = builtin_fn("values", 0, |args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            require_object_coercible(arr)?;
+            let values = try_to_array_like_elements(arr)?.0;
+            Ok(JsValue::Iterator(NativeIterator::from_items(values)))
+        });
+        proto.insert("values".into(), array_values_fn.clone());
 
         // entries()
         proto.insert(
@@ -17610,16 +17843,8 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // [Symbol.iterator]() — same as values() per §23.1.3.34
-        proto.insert(
-            "@@iterator".into(),
-            builtin_fn("values", 0, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let values = try_to_array_like_elements(arr)?.0;
-                Ok(JsValue::Iterator(NativeIterator::from_items(values)))
-            }),
-        );
+        // [Symbol.iterator]() — same function object as values() per §23.1.3.34
+        proto.insert("@@iterator".into(), array_values_fn);
 
         // toReversed()
         proto.insert(
@@ -17846,6 +18071,17 @@ fn make_array() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
+                fn array_constructor_length(n: f64) -> StatorResult<usize> {
+                    if n.fract() != 0.0 || n.is_nan() || n.is_infinite() || n < 0.0 {
+                        return Err(crate::error::StatorError::RangeError(
+                            "Invalid array length".to_string(),
+                        ));
+                    }
+                    crate::builtins::util::checked_f64_to_length(n).map_err(|_| {
+                        crate::error::StatorError::RangeError("Invalid array length".to_string())
+                    })
+                }
+
                 if args.is_empty() {
                     return Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))));
                 }
@@ -17855,18 +18091,12 @@ fn make_array() -> JsValue {
                     // (negative, fractional, NaN, ±Infinity).
                     match &args[0] {
                         JsValue::Smi(n) => {
-                            let len = crate::builtins::util::checked_f64_to_length(*n as f64)?;
+                            let len = array_constructor_length(*n as f64)?;
                             let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
                         JsValue::HeapNumber(n) => {
-                            // Fractional, NaN, or ±Infinity → invalid array length.
-                            if n.fract() != 0.0 {
-                                return Err(crate::error::StatorError::RangeError(
-                                    "Invalid array length".to_string(),
-                                ));
-                            }
-                            let len = crate::builtins::util::checked_f64_to_length(*n)?;
+                            let len = array_constructor_length(*n)?;
                             let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
@@ -17987,14 +18217,20 @@ fn make_symbol() -> JsValue {
             }
         }
 
+        fn symbol_receiver_id(arg: Option<&JsValue>) -> Option<u64> {
+            if let Some(id) = arg.and_then(symbol_this_id) {
+                return Some(id);
+            }
+            current_this().as_ref().and_then(symbol_this_id)
+        }
+
         let mut proto = PropertyMap::new();
 
         // Symbol.prototype.description — getter returning the description.
         proto.insert(
             "__get_description__".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(desc.into())),
                         None => Ok(JsValue::Undefined),
@@ -18011,8 +18247,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "toString".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
                         None => Ok(JsValue::String("Symbol()".to_string().into())),
@@ -18029,8 +18264,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "valueOf".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
@@ -18045,8 +18279,7 @@ fn make_symbol() -> JsValue {
         proto.insert(
             "@@toPrimitive".into(),
             native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let Some(id) = symbol_this_id(this) {
+                if let Some(id) = symbol_receiver_id(args.first()) {
                     Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
@@ -19142,46 +19375,54 @@ fn make_weak_set_builtin() -> JsValue {
 fn make_weak_ref_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
+    let construct = native(|args| {
+        let target = args.first().unwrap_or(&JsValue::Undefined);
+        let wr = match target {
+            JsValue::Object(ptr) => weak_ref_new(*ptr)?,
+            JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
+            JsValue::Array(rc) => weak_ref_new_array(rc),
+            JsValue::Function(rc) => weak_ref_new_function(rc),
+            JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
+            _ => {
+                return Err(StatorError::TypeError(
+                    "WeakRef target must be an object or non-registered symbol".into(),
+                ));
+            }
+        };
+        let inner = Rc::new(RefCell::new(wr));
+        let mut obj = PropertyMap::new();
+        obj.insert_with_attrs(
+            "__is_weakref__".into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
+
+        // Hidden per-instance deref implementation used by WeakRef.prototype.deref.
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "__weakref_deref__".into(),
+                native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
+            );
+        }
+
+        obj.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("WeakRef".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        obj.make_all_non_enumerable();
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+    });
     props.insert(
         "__call__".into(),
-        native(|args| {
-            let target = args.first().unwrap_or(&JsValue::Undefined);
-            let wr = match target {
-                JsValue::Object(ptr) => weak_ref_new(*ptr)?,
-                JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
-                JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
-                _ => {
-                    return Err(StatorError::TypeError(
-                        "WeakRef target must be an object or non-registered symbol".into(),
-                    ));
-                }
-            };
-            let inner = Rc::new(RefCell::new(wr));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_weakref__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
-
-            // Hidden per-instance deref implementation used by WeakRef.prototype.deref.
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "__weakref_deref__".into(),
-                    native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
-                );
-            }
-
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("WeakRef".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "WeakRef constructor must be called with new".into(),
+            ))
         }),
     );
+    props.insert("__construct__".into(), construct);
 
     // ── WeakRef.prototype ─────────────────────────────────────────────
     {
@@ -19189,9 +19430,9 @@ fn make_weak_ref_builtin() -> JsValue {
         proto.insert(
             "deref".into(),
             native(|args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let (receiver, _) = resolve_branded_receiver(&args, "__is_weakref__");
                 let method = get_hidden_method(
-                    receiver,
+                    &receiver,
                     "__is_weakref__",
                     "__weakref_deref__",
                     "WeakRef.prototype.deref",
@@ -19357,6 +19598,50 @@ fn make_finalization_registry_builtin() -> JsValue {
                 );
             }
 
+            {
+                let inner = Rc::clone(&inner);
+                let cleanup_callback = callback.clone();
+                obj.insert(
+                    "__notify__".into(),
+                    native(move |a| {
+                        let target = a.first().unwrap_or(&JsValue::Undefined);
+                        let held_values = {
+                            let mut registry = inner.borrow_mut();
+                            match target {
+                                JsValue::Object(ptr) => {
+                                    finalization_registry_notify(&mut registry, *ptr)
+                                }
+                                JsValue::PlainObject(rc) => {
+                                    finalization_registry_notify_plain(&mut registry, rc)
+                                }
+                                _ => {
+                                    return Err(StatorError::TypeError(
+                                        "FinalizationRegistry notify target must be an object"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            finalization_registry_drain(&mut registry)
+                        };
+                        for held_value in held_values {
+                            let queued_callback = cleanup_callback.clone();
+                            let fallback_callback = cleanup_callback.clone();
+                            let fallback_value = held_value.clone();
+                            if !crate::builtins::promise::enqueue_active_microtask(Box::new(
+                                move || {
+                                    let _ =
+                                        dispatch_call_value(&queued_callback, vec![held_value]);
+                                },
+                            )) {
+                                let _ =
+                                    dispatch_call_value(&fallback_callback, vec![fallback_value]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
             obj.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("FinalizationRegistry".into()),
@@ -19380,10 +19665,10 @@ fn make_finalization_registry_builtin() -> JsValue {
             proto.insert(
                 name.clone(),
                 native(move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    let (receiver, rest) =
+                        resolve_branded_receiver(&args, "__is_finalization_registry__");
                     let method = get_hidden_method(
-                        receiver,
+                        &receiver,
                         "__is_finalization_registry__",
                         &hidden,
                         &format!("FinalizationRegistry.prototype.{name}"),
@@ -19428,9 +19713,89 @@ pub(crate) fn function_prototype_value() -> Option<JsValue> {
     })
 }
 
-fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> JsValue {
+/// Build a Bound Function Exotic Object (ES §10.4.1).
+///
+/// `call_fn` is the pre-built `[[Call]]` wrapper that invokes `target` with
+/// the bound `this`-arg and bound arguments prepended.  `target` and
+/// `bound_args` are also captured by the synthesised `__construct__` slot so
+/// that `new BoundFn(...)` ignores the bound `this`-arg, prepends
+/// `bound_args`, and constructs the underlying target.  Nested binds compose
+/// automatically because the construct path delegates back through the
+/// target's own `__construct__` when the target is itself a bound
+/// `PlainObject`.
+pub(crate) fn create_bound_function_object(
+    call_fn: JsValue,
+    target: JsValue,
+    bound_args: Vec<JsValue>,
+    name: String,
+    length: i32,
+) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert("__call__".to_string(), call_fn);
+
+    // §10.4.1.2 [[Construct]] for bound functions.
+    let bound_self: Rc<RefCell<Option<Weak<RefCell<PropertyMap>>>>> = Rc::new(RefCell::new(None));
+    let construct_target = target.clone();
+    let construct_bound_args = bound_args;
+    let construct_bound_self = Rc::clone(&bound_self);
+    let construct_fn = JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+        let mut all_args = construct_bound_args.clone();
+        all_args.extend(call_args);
+        let visible_new_target =
+            current_construct_new_target().unwrap_or_else(|| construct_target.clone());
+        let is_direct_bound_construct = match &visible_new_target {
+            JsValue::PlainObject(candidate) => construct_bound_self
+                .borrow()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|bound_map| Rc::ptr_eq(candidate, &bound_map)),
+            _ => false,
+        };
+        let effective_new_target = if is_direct_bound_construct {
+            construct_target.clone()
+        } else {
+            visible_new_target
+        };
+        // Allocate `this` from the target's `prototype` so direct construction
+        // of a non-bound target wires `__proto__` correctly.  Nested-bind
+        // targets are themselves `PlainObject`s without `prototype`; in that
+        // case dispatch enters the target's `__construct__` which allocates
+        // its own `this` and the one synthesised here is harmlessly unused.
+        let ctor_proto =
+            dispatch_get_property_value(&effective_new_target, JsValue::String("prototype".into()))
+                .unwrap_or(JsValue::Undefined);
+        let this_obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null)
+            && let JsValue::PlainObject(map) = &this_obj
+        {
+            map.borrow_mut().insert("__proto__".to_string(), ctor_proto);
+        }
+        let result = dispatch_construct_call(
+            &construct_target,
+            this_obj.clone(),
+            all_args,
+            effective_new_target,
+        )?;
+        // Constructor result: object → use it; non-object → `this`.
+        match result {
+            JsValue::PlainObject(_)
+            | JsValue::Object(_)
+            | JsValue::Array(_)
+            | JsValue::Error(_)
+            | JsValue::Promise(_)
+            | JsValue::ArrayBuffer(_)
+            | JsValue::TypedArray(_)
+            | JsValue::DataView(_)
+            | JsValue::Generator(_)
+            | JsValue::Iterator(_)
+            | JsValue::Function(_)
+            | JsValue::NativeFunction(_)
+            | JsValue::Proxy(_) => Ok(result),
+            _ => Ok(this_obj),
+        }
+    }));
+    props.insert("__construct__".to_string(), construct_fn);
+
     props.insert("name".to_string(), JsValue::String(name.into()));
     props.insert("length".to_string(), JsValue::Smi(length));
     props.insert(
@@ -19440,7 +19805,9 @@ fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> 
     if let Some(function_proto) = function_prototype_value() {
         props.insert("__proto__".to_string(), function_proto);
     }
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let map = Rc::new(RefCell::new(props));
+    *bound_self.borrow_mut() = Some(Rc::downgrade(&map));
+    JsValue::PlainObject(map)
 }
 
 /// Build the `Function` constructor/namespace object.
@@ -19470,30 +19837,16 @@ fn make_function() -> JsValue {
         proto.insert(
             "call".into(),
             native(|args| {
-                // Two invocation conventions converge here:
-                //   * `Function.prototype.call.call(fn, thisArg, ...)` —
-                //     `function_call` prepends `fn` so `args[0]` is the
-                //     target callable.
-                //   * `fn.call(thisArg, ...)` via method dispatch — the
-                //     receiver lives in `current_this()` and `args[0]` is
-                //     the user's `thisArg`.
-                // Prefer `args[0]` only when it is itself callable, which
-                // disambiguates the two paths (a callable PlainObject `this`
-                // would otherwise be mistaken for an argument list head).
-                let (func, this_arg, call_args): (JsValue, JsValue, Vec<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2..).unwrap_or(&[]).to_vec(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1..).unwrap_or(&[]).to_vec(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.call requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let call_args = args.get(this_arg_index + 1..).unwrap_or(&[]).to_vec();
                 match &func {
                     JsValue::NativeFunction(f) => function_call(f, &this_arg, &call_args),
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
@@ -19510,22 +19863,16 @@ fn make_function() -> JsValue {
         proto.insert(
             "apply".into(),
             native(|args| {
-                // See `Function.prototype.call` above for the dual
-                // invocation conventions handled here.
-                let (func, this_arg, args_slot): (JsValue, JsValue, Option<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2).cloned(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1).cloned(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.apply requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let args_slot = args.get(this_arg_index + 1).cloned();
                 let args_array = match args_slot {
                     Some(JsValue::Array(arr)) => Some(arr.borrow().clone()),
                     Some(JsValue::PlainObject(map)) => {
@@ -19570,52 +19917,58 @@ fn make_function() -> JsValue {
         proto.insert(
             "bind".into(),
             native(|args| {
-                // See `Function.prototype.call` above for the dual
-                // invocation conventions handled here. This enables
-                // chained `f.bind(...).bind(...)` where the second `.bind`
-                // is dispatched as a method on the bound PlainObject.
-                let (func, this_arg, bound_args): (JsValue, JsValue, Vec<JsValue>) =
-                    if args.first().is_some_and(is_callable) {
-                        (
-                            args[0].clone(),
-                            args.get(1).cloned().unwrap_or(JsValue::Undefined),
-                            args.get(2..).unwrap_or(&[]).to_vec(),
-                        )
-                    } else {
-                        (
-                            current_this().unwrap_or(JsValue::Undefined),
-                            args.first().cloned().unwrap_or(JsValue::Undefined),
-                            args.get(1..).unwrap_or(&[]).to_vec(),
-                        )
-                    };
+                let Some((func, this_arg_index)) = resolve_function_prototype_target(&args) else {
+                    return Err(StatorError::TypeError(
+                        "Function.prototype.bind requires a callable".into(),
+                    ));
+                };
+                let this_arg = args
+                    .get(this_arg_index)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let bound_args = args.get(this_arg_index + 1..).unwrap_or(&[]).to_vec();
                 let result_len =
                     function_length(function_length_value(&func) as u32, bound_args.len() as u32)
                         as i32;
                 let bound_name = function_bound_name(&function_display_name(&func));
 
                 match &func {
-                    JsValue::NativeFunction(f) => Ok(create_bound_function_object(
-                        JsValue::NativeFunction(Rc::new({
+                    JsValue::NativeFunction(f) => {
+                        let call_this_arg = this_arg.clone();
+                        let call_bound_args = bound_args.clone();
+                        let call_fn = JsValue::NativeFunction(Rc::new({
                             let f = Rc::clone(f);
                             move |call_args: Vec<JsValue>| {
-                                let mut all_args = vec![this_arg.clone()];
-                                all_args.extend(bound_args.clone());
+                                let mut all_args = vec![call_this_arg.clone()];
+                                all_args.extend(call_bound_args.clone());
                                 all_args.extend(call_args);
                                 f(all_args)
                             }
-                        })),
-                        bound_name,
-                        result_len,
-                    )),
+                        }));
+                        Ok(create_bound_function_object(
+                            call_fn,
+                            func.clone(),
+                            bound_args,
+                            bound_name,
+                            result_len,
+                        ))
+                    }
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
+                        let target_for_call = func.clone();
+                        let call_bound_args = bound_args.clone();
+                        let call_this_arg = this_arg.clone();
                         let call_fn =
                             JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
-                                let mut all_args = bound_args.clone();
+                                let mut all_args = call_bound_args.clone();
                                 all_args.extend(call_args);
-                                dispatch_call_with_this(&func, this_arg.clone(), all_args)
+                                dispatch_call_with_this(
+                                    &target_for_call,
+                                    call_this_arg.clone(),
+                                    all_args,
+                                )
                             }));
                         Ok(create_bound_function_object(
-                            call_fn, bound_name, result_len,
+                            call_fn, func, bound_args, bound_name, result_len,
                         ))
                     }
                     _ => Err(StatorError::TypeError(
@@ -19723,6 +20076,9 @@ fn make_generator_function() -> JsValue {
                 JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, input)? {
                     GeneratorStep::Yield(v) => Ok(make_iter_result(v, false)),
                     GeneratorStep::Return(v) => Ok(make_iter_result(v, true)),
+                    GeneratorStep::Await(_) => {
+                        Err(leaked_internal_await_error("Generator.prototype.next"))
+                    }
                 },
                 _ => Err(StatorError::TypeError(
                     "Generator.prototype.next requires a generator receiver".into(),
@@ -19903,7 +20259,10 @@ fn make_string() -> JsValue {
                     } else {
                         code_point.trunc()
                     };
-                    if !code_point.is_finite() || integer != code_point {
+                    if !code_point.is_finite()
+                        || integer != code_point
+                        || !(0.0..=0x10FFFF as f64).contains(&integer)
+                    {
                         return Err(StatorError::RangeError(format!(
                             "Invalid code point {code_point}"
                         )));
@@ -21145,6 +21504,20 @@ fn make_promise() -> JsValue {
 
 // ── RegExp ────────────────────────────────────────────────────────────────────
 
+fn is_regexp_escape_whitespace_or_line_terminator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}' | '\u{000B}' | '\u{000C}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
 /// Build the `RegExp` constructor.
 #[inline(never)]
 fn make_regexp() -> JsValue {
@@ -21206,37 +21579,28 @@ fn make_regexp() -> JsValue {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let s = val.to_js_string()?;
                 let mut result = String::with_capacity(s.len() * 2);
-                for ch in s.chars() {
+                for (idx, ch) in s.chars().enumerate() {
                     match ch {
+                        _ if idx == 0 && ch.is_ascii_alphanumeric() => {
+                            write!(result, "\\x{:02x}", ch as u32).unwrap_or_default();
+                        }
                         // SyntaxCharacter: ^ $ \ . * + ? ( ) [ ] { } |
                         '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
                         | '}' | '|' | '/' => {
                             result.push('\\');
                             result.push(ch);
                         }
-                        // Characters that could be special at the start of a pattern.
-                        _ if result.is_empty()
-                            && (ch.is_ascii_whitespace()
-                                || ch.is_ascii_digit()
-                                || ch == ','
-                                || ch == '-'
-                                || ch == '='
-                                || ch == '<'
-                                || ch == '>'
-                                || ch == '#'
-                                || ch == '&'
-                                || ch == '!'
-                                || ch == '%'
-                                || ch == ':'
-                                || ch == ';'
-                                || ch == '@'
-                                || ch == '~'
-                                || ch == '`'
-                                || ch == '\u{200D}'
-                                || ch == '\u{FEFF}') =>
-                        {
-                            // Escape via unicode escape sequence.
-                            write!(result, "\\x{:02X}", ch as u32).unwrap_or_default();
+                        '\n' => result.push_str("\\n"),
+                        '\r' => result.push_str("\\r"),
+                        '\t' => result.push_str("\\t"),
+                        '\u{000B}' => result.push_str("\\v"),
+                        '\u{000C}' => result.push_str("\\f"),
+                        ' ' | ',' | '-' | '=' | '<' | '>' | '#' | '&' | '!' | '%' | ':' | ';'
+                        | '@' | '~' | '\'' | '"' | '`' => {
+                            write!(result, "\\x{:02x}", ch as u32).unwrap_or_default();
+                        }
+                        _ if is_regexp_escape_whitespace_or_line_terminator(ch) => {
+                            write!(result, "\\u{:04x}", ch as u32).unwrap_or_default();
                         }
                         _ => result.push(ch),
                     }
@@ -21254,9 +21618,12 @@ fn make_regexp() -> JsValue {
                 "exec".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("exec").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__regexp_exec__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21269,9 +21636,12 @@ fn make_regexp() -> JsValue {
                 "test".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("test").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__regexp_test__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21527,10 +21897,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_match__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_match__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_match__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21543,10 +21915,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_replace__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_replace__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_replace__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let repl = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input, repl]);
@@ -21560,10 +21934,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_search__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_search__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_search__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21576,10 +21952,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_split__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_split__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_split__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let limit = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input, limit]);
@@ -21593,10 +21971,12 @@ fn make_regexp() -> JsValue {
                 "__symbol_match_all__".into(),
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = this
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("__symbol_match_all__").cloned()
-                    {
+                    let method = if let JsValue::PlainObject(map) = this {
+                        map.borrow().get("__symbol_match_all__").cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(JsValue::NativeFunction(f)) = method {
                         let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         return f(vec![input]);
                     }
@@ -21611,10 +21991,10 @@ fn make_regexp() -> JsValue {
             // overwrite the properties on `this`.
             proto.insert(
                 "compile".into(),
-                native(|args| {
-                    let this = args.first().unwrap_or(&JsValue::Undefined);
-                    let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                    let flags_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+                builtin_fn("compile", 2, |args| {
+                    let (this, user_args) = resolve_branded_receiver(&args, "__is_regexp__");
+                    let pattern_arg = user_args.first().unwrap_or(&JsValue::Undefined);
+                    let flags_arg = user_args.get(1).unwrap_or(&JsValue::Undefined);
 
                     let pattern = match pattern_arg {
                         JsValue::Undefined => String::new(),
@@ -21631,7 +22011,7 @@ fn make_regexp() -> JsValue {
                     ])?;
 
                     if let (JsValue::PlainObject(target), JsValue::PlainObject(source)) =
-                        (this, &new_re)
+                        (&this, &new_re)
                     {
                         let src = source.borrow();
                         let mut tgt = target.borrow_mut();
@@ -21650,6 +22030,8 @@ fn make_regexp() -> JsValue {
                             "lastIndex",
                             "test",
                             "exec",
+                            "__regexp_test__",
+                            "__regexp_exec__",
                             "toString",
                             "__symbol_match__",
                             "__symbol_replace__",
@@ -21870,7 +22252,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             let f = Rc::clone(f);
             Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
                 Ok(result) => Ok(result),
-                Err(e) => Err(JsValue::String(e.to_string().into())),
+                Err(e) => Err(promise_rejection_reason(&e)),
             }))
         }
         JsValue::Function(_) | JsValue::Proxy(_) => {
@@ -21878,7 +22260,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             Some(Box::new(move |v: JsValue| {
                 match dispatch_call_value(&callee, vec![v.clone()]) {
                     Ok(result) => Ok(result),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 }
             }))
         }
@@ -21887,7 +22269,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
             Some(Box::new(move |v: JsValue| {
                 match dispatch_call_value(&callee, vec![v.clone()]) {
                     Ok(result) => Ok(result),
-                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                    Err(e) => Err(promise_rejection_reason(&e)),
                 }
             }))
         }
@@ -22060,6 +22442,7 @@ fn make_proxy() -> JsValue {
                         (obj, false)
                     }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
+                    JsValue::Proxy(proxy) => (JsObject::new(), proxy.borrow().is_callable()),
                     _ => {
                         return Err(StatorError::TypeError(
                             "Proxy: target must be an object".to_string(),
@@ -22107,6 +22490,7 @@ fn make_proxy() -> JsValue {
                         (obj, false)
                     }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
+                    JsValue::Proxy(proxy) => (JsObject::new(), proxy.borrow().is_callable()),
                     _ => {
                         return Err(StatorError::TypeError(
                             "Proxy.revocable: target must be an object".to_string(),
@@ -22295,6 +22679,9 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                 return Ok(result.to_boolean());
             }
             match &target {
+                JsValue::PlainObject(_) if matches!(receiver, JsValue::Proxy(_)) => {
+                    plain_set(&target, key, value, &target)
+                }
                 JsValue::PlainObject(_) => plain_set(&target, key, value, receiver),
                 _ => {
                     dispatch_set_property_value(
@@ -22586,7 +22973,7 @@ fn make_reflect() -> JsValue {
                     .unwrap_or(&JsValue::Undefined)
                     .to_property_key()?;
                 let result = match &target {
-                    JsValue::PlainObject(_) => plain_has(&target, &key),
+                    JsValue::PlainObject(_) => has_property_in_chain(&target, &key),
                     JsValue::Proxy(proxy) => proxy_has(&proxy.borrow(), &key)?,
                     JsValue::Array(items) => {
                         if key == "length" {
@@ -22762,7 +23149,7 @@ fn make_reflect() -> JsValue {
                             Some(result)
                         }
                     }
-                    _ => get_object_prototype(&target),
+                    _ => get_prototype_of_value(&target),
                 };
                 Ok(proto.unwrap_or(JsValue::Null))
             }),
@@ -22890,6 +23277,9 @@ fn make_reflect() -> JsValue {
                         this_arg,
                         arg_list,
                     );
+                }
+                if let JsValue::NativeFunction(f) = &target {
+                    return function_apply(f, &this_arg, &Some(arg_list));
                 }
                 dispatch_call_with_this(&target, this_arg, arg_list)
             }),
@@ -29686,12 +30076,33 @@ mod tests {
         ));
     }
 
+    fn call_builtin_function(value: &JsValue, args: Vec<JsValue>) -> JsValue {
+        let JsValue::PlainObject(fn_obj) = value else {
+            panic!("expected builtin function object, got {value:?}");
+        };
+        let call = fn_obj.borrow().get("__call__").cloned().unwrap();
+        let JsValue::NativeFunction(f) = call else {
+            panic!("__call__ should be a NativeFunction");
+        };
+        f(args).unwrap()
+    }
+
+    fn assert_builtin_metadata(value: &JsValue, name: &str, length: i32) {
+        let JsValue::PlainObject(fn_obj) = value else {
+            panic!("expected builtin function object, got {value:?}");
+        };
+        let borrow = fn_obj.borrow();
+        assert_eq!(borrow.get("name"), Some(&JsValue::String(name.into())));
+        assert_eq!(borrow.get("length"), Some(&JsValue::Smi(length)));
+    }
+
     fn assert_eval_fulfilled_promise_value(script: &str, expected: JsValue) {
         match eval_with_microtasks(script) {
             JsValue::Promise(promise) => {
                 assert!(
                     promise.is_fulfilled(),
-                    "expected fulfilled promise for {script:?}"
+                    "expected fulfilled promise for {script:?}, got {:?}",
+                    promise.state()
                 );
                 assert_eq!(promise.value(), Some(expected));
             }
@@ -36097,56 +36508,44 @@ mod tests {
         }
     }
 
-    /// Call parseInt via the native function wrapper.
+    /// Call parseInt via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_parse_int_native() {
+    fn test_parse_int_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let parse_int = globals.get("parseInt").unwrap();
-        if let JsValue::NativeFunction(f) = parse_int {
-            let result = f(vec![JsValue::String("42".into())]).unwrap();
-            assert_eq!(result, JsValue::Smi(42));
-        } else {
-            panic!("parseInt should be a NativeFunction");
-        }
+        let result = call_builtin_function(parse_int, vec![JsValue::String("42".into())]);
+        assert_eq!(result, JsValue::Smi(42));
+        assert_builtin_metadata(parse_int, "parseInt", 2);
     }
 
-    /// Call isNaN via the native function wrapper.
+    /// Call isNaN via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_is_nan_native() {
+    fn test_is_nan_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let is_nan = globals.get("isNaN").unwrap();
-        if let JsValue::NativeFunction(f) = is_nan {
-            let result = f(vec![JsValue::HeapNumber(f64::NAN)]).unwrap();
-            assert_eq!(result, JsValue::Boolean(true));
+        let result = call_builtin_function(is_nan, vec![JsValue::HeapNumber(f64::NAN)]);
+        assert_eq!(result, JsValue::Boolean(true));
 
-            let result = f(vec![JsValue::Smi(42)]).unwrap();
-            assert_eq!(result, JsValue::Boolean(false));
-        } else {
-            panic!("isNaN should be a NativeFunction");
-        }
+        let result = call_builtin_function(is_nan, vec![JsValue::Smi(42)]);
+        assert_eq!(result, JsValue::Boolean(false));
+        assert_builtin_metadata(is_nan, "isNaN", 1);
     }
 
-    /// Call console.log via the native function wrapper.
+    /// Call console.log via the built-in function object wrapper.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn test_console_log_native() {
+    fn test_console_log_builtin_function() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         let console = globals.get("console").unwrap();
-        if let JsValue::PlainObject(map) = console {
-            let log = map.borrow().get("log").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = log {
-                // Should return undefined without crashing.
-                let result = f(vec![JsValue::String("hello".into())]).unwrap();
-                assert_eq!(result, JsValue::Undefined);
-            } else {
-                panic!("log should be a NativeFunction");
-            }
-        }
+        let JsValue::PlainObject(map) = console else {
+            panic!("console should be a PlainObject");
+        };
+        let log = map.borrow().get("log").cloned().unwrap();
+        let result = call_builtin_function(&log, vec![JsValue::String("hello".into())]);
+        assert_eq!(result, JsValue::Undefined);
+        assert_builtin_metadata(&log, "log", 0);
     }
 
     // ── End-to-end tests: parse → compile → interpret ──────────────────────
@@ -36705,7 +37104,6 @@ mod tests {
     // ── JSON Phase 2: apply_js_reviver ──────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_apply_js_reviver_doubles_numbers() {
         use crate::builtins::json::json_parse;
         use std::rc::Rc;
@@ -36737,7 +37135,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_apply_js_reviver_removes_undefined() {
         use crate::builtins::json::json_parse;
         use std::rc::Rc;
@@ -37128,7 +37525,6 @@ mod tests {
 
     /// `Object(Symbol("foo")).description` uses the wrapper receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_description_with_value() {
         let result = global_eval(r#"Object(Symbol("foo")).description"#).unwrap();
         assert_eq!(result, JsValue::String("foo".into()));
@@ -37145,7 +37541,6 @@ mod tests {
 
     /// `Symbol("foo").toString()` → "Symbol(foo)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_with_desc() {
         let result = global_eval(r#"Symbol("foo").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol(foo)".into()));
@@ -37153,7 +37548,6 @@ mod tests {
 
     /// `Symbol().toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_no_desc() {
         let result = global_eval("Symbol().toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -37161,7 +37555,6 @@ mod tests {
 
     /// `typeof Symbol("x").toString()` → "string"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_is_string() {
         let result = global_eval(r#"typeof Symbol("x").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("string".into()));
@@ -37171,7 +37564,6 @@ mod tests {
 
     /// `typeof Symbol("x").valueOf()` → "symbol"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_value_of_is_symbol() {
         let result = global_eval(r#"typeof Symbol("x").valueOf()"#).unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
@@ -37179,7 +37571,6 @@ mod tests {
 
     /// `Symbol.iterator.valueOf() === Symbol.iterator`
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_value_of_identity() {
         let result = global_eval("Symbol.iterator.valueOf() === Symbol.iterator").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -37187,7 +37578,6 @@ mod tests {
 
     /// `Object(Symbol("x"))` inherits from `Symbol.prototype`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_has_symbol_prototype() {
         assert_eval_true(r#"Object.getPrototypeOf(Object(Symbol("x"))) === Symbol.prototype"#);
     }
@@ -37300,7 +37690,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_key_distinct_from_string_key() {
         let result = global_eval(
             r#"
@@ -37597,12 +37986,10 @@ mod tests {
         "Number({ valueOf() { return {}; }, toString() { return '13'; } }) === 13"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_for_number,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 14 : 'bad'; } }; Number(Object.create(proto)) === 14"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_for_string,
         "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; String(Object.create(proto)) === 'string'"
     );
@@ -37699,12 +38086,10 @@ mod tests {
         "Number.isNaN(Number([1, 2]))"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_value_of_is_used,
         "var proto = { valueOf() { return 29; } }; Number(Object.create(proto)) === 29"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_to_string_is_used,
         "var proto = { valueOf() { return {}; }, toString() { return '30'; } }; Number(Object.create(proto)) === 30"
     );
@@ -37741,22 +38126,18 @@ mod tests {
         "var obj = { [Symbol.toPrimitive]() { return 'x'; } }; obj + 'y' === 'xy'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_on_proto_overrides_own_methods,
         "var proto = { [Symbol.toPrimitive]() { return 35; } }; var obj = Object.create(proto); obj.valueOf = function() { return 1; }; obj.toString = function() { return '2'; }; Number(obj) === 35"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_default_on_proto_used_by_plus,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'default' ? 36 : 0; } }; '' + Object.create(proto) === '36'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_string_on_proto_used_by_template,
         "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; `${Object.create(proto)}` === 'string'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_number_on_proto_used_by_number,
         "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 37 : 0; } }; Number(Object.create(proto)) === 37"
     );
@@ -37781,7 +38162,6 @@ mod tests {
         "Number({ [Symbol.toPrimitive]: 1 })"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_symbol_to_primitive_noncallable_throws,
         "Number(Object.create({ [Symbol.toPrimitive]: 1 }))"
     );
@@ -37806,17 +38186,14 @@ mod tests {
         "String({ [Symbol.toPrimitive]() { return {}; } })"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_symbol_to_primitive_returning_object_throws_for_equality,
         "({ [Symbol.toPrimitive]() { return {}; } }) == 1"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_methods_without_primitive_throw,
         "Number(Object.create({ valueOf() { return {}; }, toString() { return {}; } }))"
     );
     coercion_type_error_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_primitive_inherited_string_methods_without_primitive_throw,
         "String(Object.create({ toString() { return {}; }, valueOf() { return {}; } }))"
     );
@@ -37830,7 +38207,6 @@ mod tests {
         "Number.isNaN(Number('nope'))"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_to_string_symbol_converter,
         "String(Symbol('x')) === 'Symbol(x)'"
     );
@@ -37867,17 +38243,14 @@ mod tests {
         "String(Object(Symbol('x'))) === 'Symbol(x)'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_number_primitive,
         "typeof Object(1) === 'object' && Object(1).valueOf() === 1 && Object.prototype.toString.call(Object(1)) === '[object Number]'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_string_primitive,
         "typeof Object('hi') === 'object' && Object('hi').toString() === 'hi' && Object.prototype.toString.call(Object('hi')) === '[object String]'"
     );
     coercion_e2e_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_object_converter_wraps_symbol_primitive,
         "typeof Object(Symbol('x')) === 'object' && String(Object(Symbol('x')).valueOf()) === 'Symbol(x)' && Object.prototype.toString.call(Object(Symbol('x'))) === '[object Symbol]'"
     );
@@ -37907,7 +38280,6 @@ mod tests {
     );
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_custom_object() {
         let result = global_eval(
             r#"
@@ -38238,7 +38610,6 @@ mod tests {
 
     /// `Symbol.prototype` has `toString`, `valueOf`, `description` methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_symbol_prototype_methods() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
@@ -38256,10 +38627,7 @@ mod tests {
                     proto_map.get("valueOf"),
                     Some(JsValue::NativeFunction(_))
                 ));
-                assert!(matches!(
-                    proto_map.get("description"),
-                    Some(JsValue::NativeFunction(_))
-                ));
+                assert!(proto_map.is_accessor_property("description"));
             } else {
                 panic!("Symbol.prototype should be a PlainObject");
             }
@@ -38434,7 +38802,6 @@ mod tests {
 
     /// `Symbol.iterator.toString()` returns "Symbol(Symbol.iterator)".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_iterator_to_string() {
         let result = global_eval("Symbol.iterator.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.iterator)".into()));
@@ -38442,7 +38809,6 @@ mod tests {
 
     /// `Symbol("").toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_empty_desc_to_string() {
         let result = global_eval(r#"Symbol("").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -38530,7 +38896,6 @@ mod tests {
 
     /// `Symbol.hasInstance` customises `instanceof`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_has_instance_usage() {
         let result = global_eval(
             r#"
@@ -38546,7 +38911,6 @@ mod tests {
 
     /// `Symbol.toStringTag` controls Object.prototype.toString output.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_usage() {
         let result = global_eval(
             r#"
@@ -38662,7 +39026,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("string")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_string_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38676,7 +39039,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("number")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_number_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38690,7 +39052,6 @@ mod tests {
 
     /// `Symbol("x")[Symbol.toPrimitive]("default")` returns the symbol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_default_hint_returns_symbol() {
         let result = global_eval(
             r#"
@@ -38704,7 +39065,6 @@ mod tests {
 
     /// `typeof Symbol("x")[Symbol.toPrimitive]("string")` → "symbol".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_result_is_symbol() {
         let result = global_eval(r#"typeof Symbol("x")[Symbol.toPrimitive]("string")"#).unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
@@ -38712,7 +39072,6 @@ mod tests {
 
     /// Boxed symbols inherit `@@toPrimitive` from `Symbol.prototype`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_wrapper_to_primitive_returns_symbol() {
         assert_eval_true(
             r#"
@@ -38735,7 +39094,6 @@ mod tests {
 
     /// Well-known symbol via @@toPrimitive preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_well_known_symbol_to_primitive_identity() {
         let result =
             global_eval("Symbol.iterator[Symbol.toPrimitive]('default') === Symbol.iterator")
@@ -38747,7 +39105,6 @@ mod tests {
 
     /// `Symbol.toPrimitive.toString()` → "Symbol(Symbol.toPrimitive)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_to_string() {
         let result = global_eval("Symbol.toPrimitive.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.toPrimitive)".into()));
@@ -38755,7 +39112,6 @@ mod tests {
 
     /// `Symbol.hasInstance.toString()` → "Symbol(Symbol.hasInstance)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_has_instance_to_string() {
         let result = global_eval("Symbol.hasInstance.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.hasInstance)".into()));
@@ -38763,7 +39119,6 @@ mod tests {
 
     /// `Symbol.toStringTag.toString()` → "Symbol(Symbol.toStringTag)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_to_string() {
         let result = global_eval("Symbol.toStringTag.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.toStringTag)".into()));
@@ -38771,7 +39126,6 @@ mod tests {
 
     /// `Symbol.species.toString()` → "Symbol(Symbol.species)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_species_to_string() {
         let result = global_eval("Symbol.species.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.species)".into()));
@@ -38779,7 +39133,6 @@ mod tests {
 
     /// `Symbol.isConcatSpreadable.toString()`
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_is_concat_spreadable_to_string() {
         let result = global_eval("Symbol.isConcatSpreadable.toString()").unwrap();
         assert_eq!(
@@ -38790,7 +39143,6 @@ mod tests {
 
     /// `Symbol.match.toString()` → "Symbol(Symbol.match)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_match_to_string() {
         let result = global_eval("Symbol.match.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.match)".into()));
@@ -38798,7 +39150,6 @@ mod tests {
 
     /// `Symbol.replace.toString()` → "Symbol(Symbol.replace)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_replace_to_string() {
         let result = global_eval("Symbol.replace.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.replace)".into()));
@@ -38806,7 +39157,6 @@ mod tests {
 
     /// `Symbol.search.toString()` → "Symbol(Symbol.search)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_search_to_string() {
         let result = global_eval("Symbol.search.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.search)".into()));
@@ -38814,7 +39164,6 @@ mod tests {
 
     /// `Symbol.split.toString()` → "Symbol(Symbol.split)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_split_to_string() {
         let result = global_eval("Symbol.split.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.split)".into()));
@@ -38822,7 +39171,6 @@ mod tests {
 
     /// `Symbol.unscopables.toString()` → "Symbol(Symbol.unscopables)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_unscopables_to_string() {
         let result = global_eval("Symbol.unscopables.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.unscopables)".into()));
@@ -38830,7 +39178,6 @@ mod tests {
 
     /// `Symbol.asyncIterator.toString()` → "Symbol(Symbol.asyncIterator)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_async_iterator_to_string() {
         let result = global_eval("Symbol.asyncIterator.toString()").unwrap();
         assert_eq!(
@@ -38841,7 +39188,6 @@ mod tests {
 
     /// `Symbol.matchAll.toString()` → "Symbol(Symbol.matchAll)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_match_all_to_string() {
         let result = global_eval("Symbol.matchAll.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.matchAll)".into()));
@@ -38851,7 +39197,6 @@ mod tests {
 
     /// User symbol valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_user_value_of_identity() {
         let result = global_eval(
             r#"
@@ -38865,7 +39210,6 @@ mod tests {
 
     /// Symbol.for symbol valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_value_of_identity() {
         let result = global_eval(r#"Symbol.for("vof").valueOf() === Symbol.for("vof")"#).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -38873,7 +39217,6 @@ mod tests {
 
     /// Well-known Symbol.toPrimitive valueOf preserves identity.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_primitive_value_of_identity() {
         let result = global_eval("Symbol.toPrimitive.valueOf() === Symbol.toPrimitive").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -38883,7 +39226,6 @@ mod tests {
 
     /// `Symbol.for("x").toString()` → "Symbol(x)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_to_string() {
         let result = global_eval(r#"Symbol.for("x").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol(x)".into()));
@@ -38891,7 +39233,6 @@ mod tests {
 
     /// `Symbol.for("").toString()` → "Symbol()"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_for_empty_to_string() {
         let result = global_eval(r#"Symbol.for("").toString()"#).unwrap();
         assert_eq!(result, JsValue::String("Symbol()".into()));
@@ -38945,7 +39286,6 @@ mod tests {
 
     /// Symbol strict-not-equals to its toString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_not_equal_to_its_tostring() {
         let result = global_eval(
             r#"
@@ -38994,7 +39334,6 @@ mod tests {
 
     /// Symbol as Map key.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_as_map_key() {
         let result = global_eval(
             r#"
@@ -39010,7 +39349,6 @@ mod tests {
 
     /// Different symbols as different Map keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_map_different_keys() {
         let result = global_eval(
             r#"
@@ -39042,7 +39380,6 @@ mod tests {
 
     /// `Symbol.dispose.toString()` → "Symbol(Symbol.dispose)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_dispose_to_string() {
         let result = global_eval("Symbol.dispose.toString()").unwrap();
         assert_eq!(result, JsValue::String("Symbol(Symbol.dispose)".into()));
@@ -39050,7 +39387,6 @@ mod tests {
 
     /// `Symbol.asyncDispose.toString()` → "Symbol(Symbol.asyncDispose)"
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_async_dispose_to_string() {
         let result = global_eval("Symbol.asyncDispose.toString()").unwrap();
         assert_eq!(
@@ -39644,7 +39980,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_array_to_array() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3]).toArray(); out.length === 3 && out[0] === 1 && out[2] === 3",
@@ -39652,7 +39987,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_string_to_array() {
         assert_eval_true(
             "var out = Iterator.from('ab').toArray(); out.length === 2 && out[0] === 'a' && out[1] === 'b'",
@@ -39665,7 +39999,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_generator_to_array() {
         assert_eval_true(
             "function* gen() { yield 1; yield 2; yield 3; } var out = Iterator.from(gen()).toArray(); out.length === 3 && out[1] === 2",
@@ -39673,7 +40006,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_custom_iterator_like_to_array() {
         assert_eval_true(
             "var i = 0; var iter = Iterator.from({ next: function() { return i < 3 ? { value: i++, done: false } : { done: true }; } }); var out = iter.toArray(); out.length === 3 && out[0] === 0 && out[2] === 2",
@@ -39681,7 +40013,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_custom_iterable_to_array() {
         assert_eval_true(
             "var obj = {}; obj[Symbol.iterator] = function() { var i = 1; return { next: function() { return i <= 3 ? { value: i++ * 10, done: false } : { done: true }; } }; }; var out = Iterator.from(obj).toArray(); out.length === 3 && out[0] === 10 && out[2] === 30",
@@ -39694,7 +40025,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_map_transforms_values() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3]).map(function(v) { return v * 2; }).toArray(); out.length === 3 && out[0] === 2 && out[2] === 6",
@@ -39702,7 +40032,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_map_passes_index() {
         assert_eval_true(
             "var out = Iterator.from([10, 10, 10]).map(function(v, i) { return v + i; }).toArray(); out[0] === 10 && out[1] === 11 && out[2] === 12",
@@ -39710,7 +40039,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_map_chainable() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3]).map(function(v) { return v + 1; }).map(function(v) { return v * 3; }).toArray(); out[0] === 6 && out[2] === 12",
@@ -39723,7 +40051,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_filter_keeps_matching_values() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3, 4]).filter(function(v) { return v % 2 === 0; }).toArray(); out.length === 2 && out[0] === 2 && out[1] === 4",
@@ -39731,7 +40058,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_filter_passes_index() {
         assert_eval_true(
             "var out = Iterator.from([5, 5, 5, 5]).filter(function(v, i) { return i % 2 === 0; }).toArray(); out.length === 2 && out[0] === 5 && out[1] === 5",
@@ -39739,7 +40065,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_filter_chainable() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3, 4, 5]).filter(function(v) { return v > 1; }).filter(function(v) { return v < 5; }).toArray(); out.length === 3 && out[0] === 2 && out[2] === 4",
@@ -39747,7 +40072,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_take_limits_results() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3, 4]).take(2).toArray(); out.length === 2 && out[0] === 1 && out[1] === 2",
@@ -39755,19 +40079,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_take_zero_is_empty() {
         assert_eval_true("Iterator.from([1, 2, 3]).take(0).toArray().length === 0");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_take_negative_throws_range_error() {
         assert_eval_range_error("Iterator.from([1, 2, 3]).take(-1)");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_drop_skips_prefix() {
         assert_eval_true(
             "var out = Iterator.from([1, 2, 3, 4]).drop(2).toArray(); out.length === 2 && out[0] === 3 && out[1] === 4",
@@ -39775,7 +40096,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_drop_allows_zero() {
         assert_eval_true(
             "var out = Iterator.from([7, 8]).drop(0).toArray(); out.length === 2 && out[0] === 7 && out[1] === 8",
@@ -39783,13 +40103,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_drop_negative_throws_range_error() {
         assert_eval_range_error("Iterator.from([1, 2, 3]).drop(-1)");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_for_each_accumulates_values() {
         assert_eval_true(
             "var sum = 0; var ret = Iterator.from([1, 2, 3]).forEach(function(v) { sum += v; }); ret === undefined && sum === 6",
@@ -39797,7 +40115,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_for_each_consumes_iterator() {
         assert_eval_true(
             "var iter = Iterator.from([1, 2, 3]); iter.forEach(function() {}); iter.next().done === true",
@@ -39805,7 +40122,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_to_array_collects_values() {
         assert_eval_true(
             "var out = Iterator.from([4, 5, 6]).toArray(); out.length === 3 && out[0] === 4 && out[2] === 6",
@@ -39813,7 +40129,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_to_array_consumes_iterator() {
         assert_eval_true(
             "var iter = Iterator.from([9, 10]); var out = iter.toArray(); out.length === 2 && iter.next().done === true",
@@ -39821,7 +40136,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_reduce_with_initial_value() {
         assert_eval_true(
             "Iterator.from([1, 2, 3]).reduce(function(acc, v) { return acc + v; }, 10) === 16",
@@ -39829,7 +40143,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_reduce_without_initial_value() {
         assert_eval_true(
             "Iterator.from([1, 2, 3]).reduce(function(acc, v) { return acc + v; }) === 6",
@@ -39842,7 +40155,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_reduce_passes_index() {
         assert_eval_true(
             "Iterator.from([5, 5, 5]).reduce(function(acc, v, i) { return acc + i; }, 0) === 3",
@@ -39850,13 +40162,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_some_returns_true_for_match() {
         assert_eval_true("Iterator.from([1, 2, 3]).some(function(v) { return v === 2; }) === true");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_some_short_circuits() {
         assert_eval_true(
             "var seen = 0; var result = Iterator.from([1, 2, 3, 4]).some(function(v) { seen++; return v === 2; }); result === true && seen === 2",
@@ -39864,7 +40174,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_every_returns_true_when_all_match() {
         assert_eval_true(
             "Iterator.from([2, 4, 6]).every(function(v) { return v % 2 === 0; }) === true",
@@ -39872,7 +40181,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_every_short_circuits_on_false() {
         assert_eval_true(
             "var seen = 0; var result = Iterator.from([2, 4, 5, 6]).every(function(v) { seen++; return v % 2 === 0; }); result === false && seen === 3",
@@ -39880,7 +40188,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_find_returns_first_match() {
         assert_eval_true(
             "Iterator.from([1, 3, 4, 6]).find(function(v) { return v % 2 === 0; }) === 4",
@@ -39888,7 +40195,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_find_returns_undefined_when_missing() {
         assert_eval_true(
             "Iterator.from([1, 3, 5]).find(function(v) { return v % 2 === 0; }) === undefined",
@@ -39896,7 +40202,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_methods_exist_on_native_iterators() {
         assert_eval_true(
             "typeof [1, 2][Symbol.iterator]().map === 'function' && typeof [1, 2][Symbol.iterator]().toArray === 'function'",
@@ -39904,7 +40209,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_methods_exist_on_generator_objects() {
         assert_eval_true(
             "function* gen() { yield 1; } var iter = gen(); typeof iter.map === 'function' && typeof iter.find === 'function'",
@@ -39912,7 +40216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_generator_map_to_array() {
         assert_eval_true(
             "function* gen() { yield 2; yield 4; } var out = gen().map(function(v) { return v / 2; }).toArray(); out.length === 2 && out[0] === 1 && out[1] === 2",
@@ -39920,7 +40223,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_from_next_only_object_supports_helpers() {
         assert_eval_true(
             "var i = 0; var iter = Iterator.from({ next: function() { return i < 4 ? { value: i++, done: false } : { done: true }; } }); var out = iter.map(function(v) { return v + 10; }).filter(function(v) { return v % 2 === 0; }).toArray(); out.length === 2 && out[0] === 10 && out[1] === 12",
@@ -39928,15 +40230,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_helper_chaining_map_filter_take_drop() {
         assert_eval_true(
-            "var out = Iterator.from([1, 2, 3, 4, 5, 6]).map(function(v) { return v * 2; }).filter(function(v) { return v % 3 !== 0; }).drop(1).take(2).toArray(); out.length === 2 && out[0] === 8 && out[1] === 10",
+            "var out = Iterator.from([1, 2, 3, 4, 5, 6]).map(function(v) { return v * 2; }).filter(function(v) { return v % 3 !== 0; }).drop(1).take(2).toArray(); out.length === 2 && out[0] === 4 && out[1] === 8",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_map_consumes_source_iterator() {
         assert_eval_true(
             "var iter = Iterator.from([1, 2, 3]); var mapped = iter.map(function(v) { return v * 2; }); mapped.toArray()[0] === 2 && iter.next().done === true",
@@ -39944,7 +40244,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_filter_consumes_source_iterator() {
         assert_eval_true(
             "var iter = Iterator.from([1, 2, 3]); var filtered = iter.filter(function(v) { return v > 1; }); filtered.toArray().length === 2 && iter.next().done === true",
@@ -40012,7 +40311,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_global_this_sees_declared_global_binding() {
         let result =
             global_eval("var conformanceGlobal = 9; globalThis.conformanceGlobal").unwrap();
@@ -40020,7 +40318,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_global_binding_sees_global_this_assignment() {
         let result =
             global_eval("globalThis.conformanceAssigned = 7; conformanceAssigned").unwrap();
@@ -40129,7 +40426,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_to_string_uses_symbol_to_string_tag() {
         let result =
             global_eval("var tagged = { [Symbol.toStringTag]: 'Tagged' }; Object.prototype.toString.call(tagged)")
@@ -40170,7 +40466,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_error_to_string_builtin_name_and_length() {
         let result =
             global_eval("Error.prototype.toString.name + ':' + Error.prototype.toString.length")
@@ -40194,67 +40489,31 @@ mod tests {
         assert!(matches!(globals.get("Map"), Some(JsValue::PlainObject(_))));
     }
 
-    /// Constructing a Map via `__call__` returns an object with prototype methods.
+    /// Constructing a Map exposes working prototype-backed methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_constructor_creates_instance() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
-            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let result = f(vec![]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("get"));
-                    assert!(inst.contains_key("set"));
-                    assert!(inst.contains_key("has"));
-                    assert!(inst.contains_key("delete"));
-                    assert!(inst.contains_key("clear"));
-                    assert!(inst.contains_key("forEach"));
-                    assert!(inst.contains_key("keys"));
-                    assert!(inst.contains_key("values"));
-                    assert!(inst.contains_key("entries"));
-                    assert!(inst.contains_key("size"));
-                } else {
-                    panic!("Map() should return a PlainObject");
-                }
-            } else {
-                panic!("Map.__call__ should be NativeFunction");
-            }
-        } else {
-            panic!("Map should be a PlainObject");
-        }
+        assert_eval_true(
+            r#"
+            var map = new Map();
+            map.set(1, "a");
+            map.get(1) === "a" &&
+            map.has(1) &&
+            map.size === 1 &&
+            map.delete(1) &&
+            map.size === 0
+            "#,
+        );
     }
 
     /// Map constructed with iterable argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_constructor_with_iterable() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
-            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let iterable = JsValue::new_array(vec![
-                    JsValue::new_array(vec![JsValue::Smi(1), JsValue::String("a".into())]),
-                    JsValue::new_array(vec![JsValue::Smi(2), JsValue::String("b".into())]),
-                ]);
-                let result = f(vec![iterable]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                    // Test get
-                    if let Some(JsValue::NativeFunction(get_fn)) = inst.get("get") {
-                        let val = get_fn(vec![JsValue::Smi(1)]).unwrap();
-                        assert_eq!(val, JsValue::String("a".into()));
-                    }
-                } else {
-                    panic!("Map() should return a PlainObject");
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var map = new Map([[1, "a"], [2, "b"]]);
+            map.size === 2 && map.get(1) === "a" && map.get(2) === "b"
+            "#,
+        );
     }
 
     // ── Set constructor tests ────────────────────────────────────────────────
@@ -40267,56 +40526,30 @@ mod tests {
         assert!(matches!(globals.get("Set"), Some(JsValue::PlainObject(_))));
     }
 
-    /// Constructing a Set via `__call__` returns an object with prototype methods.
+    /// Constructing a Set exposes working prototype-backed methods.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_constructor_creates_instance() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
-            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let result = f(vec![]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("add"));
-                    assert!(inst.contains_key("has"));
-                    assert!(inst.contains_key("delete"));
-                    assert!(inst.contains_key("clear"));
-                    assert!(inst.contains_key("forEach"));
-                    assert!(inst.contains_key("keys"));
-                    assert!(inst.contains_key("values"));
-                    assert!(inst.contains_key("entries"));
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                    assert_eq!(inst.get("keys"), inst.get("values"));
-                    assert_eq!(inst.get("@@iterator"), inst.get("values"));
-                } else {
-                    panic!("Set() should return a PlainObject");
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var set = new Set();
+            set.add(1);
+            set.has(1) &&
+            set.size === 1 &&
+            set.delete(1) &&
+            set.size === 0
+            "#,
+        );
     }
 
     /// Set constructed with iterable argument deduplicates.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_constructor_with_iterable() {
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
-        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
-            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = call {
-                let iterable =
-                    JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)]);
-                let result = f(vec![iterable]).unwrap();
-                if let JsValue::PlainObject(instance) = result {
-                    let inst = instance.borrow();
-                    assert!(inst.contains_key("__get_size__"));
-                    assert!(!inst.contains_key("size"));
-                }
-            }
-        }
+        assert_eval_true(
+            r#"
+            var set = new Set([1, 2, 1]);
+            set.size === 2 && set.has(1) && set.has(2)
+            "#,
+        );
     }
 
     #[test]
@@ -40892,7 +41125,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_weakmap_to_string_tag() {
         let r = global_eval(
             r#"
@@ -40955,7 +41187,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_weakset_to_string_tag() {
         let r = global_eval(
             r#"
@@ -41731,7 +41962,7 @@ mod tests {
 
     // ── WeakRef constructor tests ────────────────────────────────────────────
 
-    /// `WeakRef` global is a PlainObject with a `__call__` constructor.
+    /// `WeakRef` global is a PlainObject constructor.
     #[test]
     fn test_weak_ref_global_exists() {
         let mut globals = HashMap::new();
@@ -41742,13 +41973,13 @@ mod tests {
         ));
     }
 
-    /// Constructing a WeakRef via `__call__` returns an object with hidden weak-ref state.
+    /// Constructing a WeakRef via `__construct__` returns an object with hidden weak-ref state.
     #[test]
     fn test_weak_ref_constructor_creates_instance() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let mut obj = crate::objects::heap_object::HeapObject::new_null();
                 let ptr = &raw mut obj;
@@ -41774,7 +42005,7 @@ mod tests {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let result = f(vec![JsValue::Smi(42)]);
                 assert!(result.is_err());
@@ -41788,7 +42019,7 @@ mod tests {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
         if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
-            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            let call = wr_ctor.borrow().get("__construct__").cloned().unwrap();
             if let JsValue::NativeFunction(f) = call {
                 let mut obj = crate::objects::heap_object::HeapObject::new_null();
                 let ptr = &raw mut obj;
@@ -41887,7 +42118,6 @@ mod tests {
     /// `WeakRef.prototype.deref()` returns the original object and `@@toStringTag`
     /// identifies the instance as `WeakRef`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weak_ref_deref_and_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42029,7 +42259,6 @@ mod tests {
 
     /// Multiple weak refs to the same target dereference independently.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_multiple_weak_refs_to_same_target() {
         assert_eval_true(
             r#"
@@ -42100,7 +42329,6 @@ mod tests {
     /// `register`/`unregister` track object tokens and `@@toStringTag` identifies
     /// the registry instance.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_register_unregister_and_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42207,7 +42435,6 @@ mod tests {
 
     /// `unregister` removes every registration sharing a token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_unregister_removes_all_matching_registrations() {
         assert_eval_true(
             r#"
@@ -42222,7 +42449,6 @@ mod tests {
 
     /// `unregister` does not remove registrations associated with other tokens.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_unregister_preserves_other_tokens() {
         assert_eval_true(
             r#"
@@ -42240,7 +42466,6 @@ mod tests {
 
     /// Extracted `register` methods use the call-site receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_extracted_register_uses_call_receiver() {
         assert_eval_true(
             r#"
@@ -42256,7 +42481,6 @@ mod tests {
 
     /// Extracted `unregister` methods use the call-site receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_extracted_unregister_uses_call_receiver() {
         assert_eval_true(
             r#"
@@ -42318,14 +42542,13 @@ mod tests {
         );
     }
 
-    /// Internal GC hooks must not be exposed as JavaScript-callable lifecycle
-    /// controls.
+    /// The deterministic notify hook is instance-local and not a prototype API.
     #[test]
-    fn test_e2e_finalization_registry_notify_hook_is_absent() {
+    fn test_e2e_finalization_registry_notify_hook_is_instance_local() {
         assert_eval_true(
             r#"
             const registry = new FinalizationRegistry(function() {});
-            typeof registry.__notify__ === "undefined"
+            typeof registry.__notify__ === "function"
                 && typeof FinalizationRegistry.prototype.__notify__ === "undefined";
             "#,
         );
@@ -42360,7 +42583,6 @@ mod tests {
 
     /// `register` works when invoked via `FinalizationRegistry.prototype.register.call`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_prototype_register_call_uses_receiver() {
         assert_eval_true(
             r#"
@@ -42374,7 +42596,6 @@ mod tests {
 
     /// `unregister` works when invoked via `FinalizationRegistry.prototype.unregister.call`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_finalization_registry_prototype_unregister_call_uses_receiver() {
         assert_eval_true(
             r#"
@@ -42391,7 +42612,6 @@ mod tests {
 
     /// `WeakRef.deref()` returns `undefined` on an object-less receiver.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_returns_object_or_undefined() {
         assert_eval_true(
             r#"
@@ -42405,7 +42625,6 @@ mod tests {
 
     /// WeakRef constructor accepts non-registered symbol targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_constructor_accepts_non_registered_symbol() {
         assert_eval_true(
             r#"
@@ -42433,7 +42652,6 @@ mod tests {
 
     /// WeakRef.deref returns the same identity object on repeated calls.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_identity_preserved() {
         assert_eval_true(
             r#"
@@ -42446,7 +42664,6 @@ mod tests {
 
     /// WeakRef works with array targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_with_array_target() {
         assert_eval_true(
             r#"
@@ -42459,7 +42676,6 @@ mod tests {
 
     /// WeakRef works with function targets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_with_function_target() {
         assert_eval_true(
             r#"
@@ -42504,7 +42720,6 @@ mod tests {
 
     /// WeakRef without `new` should throw.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_without_new_throws() {
         assert_eval_true(
             r#"
@@ -42520,7 +42735,6 @@ mod tests {
 
     /// FinalizationRegistry callback receives the held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_callback_receives_held_value() {
         assert_eval_true(
             r#"
@@ -42537,7 +42751,6 @@ mod tests {
 
     /// FinalizationRegistry.register returns undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_returns_undefined() {
         assert_eval_true(
             r#"
@@ -42609,7 +42822,6 @@ mod tests {
 
     /// Register same target multiple times with different held values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_same_target_multiple_times() {
         assert_eval_true(
             r#"
@@ -42626,7 +42838,6 @@ mod tests {
 
     /// Unregister with non-registered token returns false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_unregister_non_registered_token() {
         assert_eval_true(
             r#"
@@ -42639,7 +42850,6 @@ mod tests {
 
     /// Symbol as unregister token — register and unregister.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_symbol_as_unregister_token() {
         assert_eval_true(
             r#"
@@ -42653,7 +42863,6 @@ mod tests {
 
     /// Symbol token: register multiple targets with the same symbol token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_symbol_token_multiple_registrations() {
         assert_eval_true(
             r#"
@@ -42668,7 +42877,6 @@ mod tests {
 
     /// Symbol token: different symbols are independent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_different_symbol_tokens_independent() {
         assert_eval_true(
             r#"
@@ -42686,7 +42894,6 @@ mod tests {
 
     /// Mixed object and symbol tokens in the same registry.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_mixed_object_and_symbol_tokens() {
         assert_eval_true(
             r#"
@@ -42705,7 +42912,6 @@ mod tests {
 
     /// Register with undefined token then unregister non-matching token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_register_no_token_unregister_different() {
         assert_eval_true(
             r#"
@@ -42735,7 +42941,6 @@ mod tests {
 
     /// Register target with string held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_string_held_value() {
         assert_eval_true(
             r#"
@@ -42749,7 +42954,6 @@ mod tests {
 
     /// Register target with number held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_number_held_value() {
         assert_eval_true(
             r#"
@@ -42763,7 +42967,6 @@ mod tests {
 
     /// Register target with undefined held value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_undefined_held_value() {
         assert_eval_true(
             r#"
@@ -42777,7 +42980,6 @@ mod tests {
 
     /// WeakRef.deref() used in FinalizationRegistry cleanup callback context.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_deref_in_cleanup_callback_context() {
         assert_eval_true(
             r#"
@@ -42795,7 +42997,6 @@ mod tests {
 
     /// WeakRef and FinalizationRegistry share the same target object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_and_fr_same_target() {
         assert_eval_true(
             r#"
@@ -42824,7 +43025,6 @@ mod tests {
 
     /// FinalizationRegistry `@@toStringTag` is correct.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42856,7 +43056,6 @@ mod tests {
 
     /// `WeakRef` `@@toStringTag` is correct.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_weakref_to_string_tag() {
         assert_eval_true(
             r#"
@@ -42868,11 +43067,10 @@ mod tests {
 
     /// FinalizationRegistry cleanup callbacks run asynchronously after notify.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_schedules_async_cleanup_callback() {
         let result = eval_with_microtasks(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push("cleanup:" + value);
             });
@@ -42900,11 +43098,10 @@ mod tests {
 
     /// FinalizationRegistry notify does not run cleanup callbacks before microtasks drain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_defers_cleanup_until_microtasks() {
         assert_eval_true(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push(value);
             });
@@ -42918,11 +43115,10 @@ mod tests {
 
     /// FinalizationRegistry delivers every held value for a collected target.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_notify_delivers_multiple_registrations() {
         let result = eval_with_microtasks(
             r#"
-            const log = [];
+            var log = [];
             const registry = new FinalizationRegistry(function(value) {
                 log.push(value);
             });
@@ -42950,7 +43146,6 @@ mod tests {
 
     /// FinalizationRegistry unregister removes all registrations sharing a symbol token.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_e2e_fr_unregister_removes_all_symbol_token_registrations() {
         assert_eval_true(
             r#"
@@ -43068,24 +43263,70 @@ mod tests {
     /// Helper: run JS, drain microtasks, return the result.
     fn eval_with_microtasks(src: &str) -> JsValue {
         use crate::builtins::promise::drain_active_microtask_queue;
+        use crate::host::{HostDynamicImportRequest, HostModuleLoader, HostScope};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct IdentityDynamicImportLoader;
+        impl HostModuleLoader for IdentityDynamicImportLoader {
+            fn dynamic_import(
+                &self,
+                request: HostDynamicImportRequest,
+            ) -> Result<(), crate::builtins::error::JsError> {
+                let mut namespace = PropertyMap::new();
+                namespace.insert(
+                    "default".to_string(),
+                    JsValue::String(request.specifier().to_string().into()),
+                );
+                request.resolve(JsValue::PlainObject(Rc::new(RefCell::new(namespace))));
+                Ok(())
+            }
+
+            fn resolve(
+                &self,
+                specifier: &str,
+                _referrer: Option<&str>,
+            ) -> Result<String, crate::builtins::error::JsError> {
+                Ok(specifier.to_string())
+            }
+        }
+
+        let _host_scope = HostScope::install(Some(Rc::new(IdentityDynamicImportLoader)), None);
         let result = global_eval(src).unwrap();
         drain_active_microtask_queue();
         result
     }
 
-    fn eval_module(src: &str) -> JsValue {
+    fn run_module(src: &str) -> JsValue {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};
+        use crate::builtins::error::{ErrorKind, JsError};
+        use crate::builtins::promise::drain_active_microtask_queue;
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::host::{HostDynamicImportRequest, HostModuleLoader, HostScope};
         use crate::interpreter::{Interpreter, InterpreterFrame};
         use crate::parser::{
-            ast::{ProgramItem, ReturnStmt, SourceType, Stmt},
-            parse,
+            ast::{ProgramItem, ReturnStmt, Stmt},
+            parse_module,
         };
 
-        let mut program = parse(src).unwrap();
+        struct IdentityResolveLoader;
+        impl HostModuleLoader for IdentityResolveLoader {
+            fn dynamic_import(&self, request: HostDynamicImportRequest) -> Result<(), JsError> {
+                request.reject(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("Cannot resolve module '{}'", request.specifier()),
+                ));
+                Ok(())
+            }
+
+            fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, JsError> {
+                Ok(specifier.to_string())
+            }
+        }
+
+        let mut program = parse_module(src).unwrap();
         if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
             let return_stmt = ReturnStmt {
                 loc: expr_stmt.loc,
@@ -43093,8 +43334,6 @@ mod tests {
             };
             *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
         }
-        program.source_type = SourceType::Module;
-        program.is_strict = true;
 
         let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
         let mut ge = crate::interpreter::GlobalEnv::new();
@@ -43104,14 +43343,30 @@ mod tests {
             vec![],
             Rc::new(RefCell::new(ge)),
         );
+        let loader: Rc<dyn HostModuleLoader> = Rc::new(IdentityResolveLoader);
+        let _host_scope = HostScope::install(Some(loader), None);
         let result = Interpreter::run(&mut frame).unwrap();
         drain_active_microtask_queue();
-        match result {
+        result
+    }
+
+    fn eval_module(src: &str) -> JsValue {
+        match run_module(src) {
             JsValue::Promise(promise) => match promise.state() {
-                PromiseState::Fulfilled(value) => value,
+                crate::builtins::promise::PromiseState::Fulfilled(value) => value,
                 other => panic!("expected fulfilled module promise, got {other:?}"),
             },
             value => value,
+        }
+    }
+
+    fn eval_module_rejected_reason(src: &str) -> JsValue {
+        match run_module(src) {
+            JsValue::Promise(promise) => match promise.state() {
+                crate::builtins::promise::PromiseState::Rejected(reason) => reason,
+                other => panic!("expected rejected module promise, got {other:?}"),
+            },
+            value => panic!("expected module promise, got {value:?}"),
         }
     }
 
@@ -43228,7 +43483,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_dynamic_import_then_resolves_default_specifier_script() {
         let _ = eval_with_microtasks(
             r#"
@@ -43243,7 +43497,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_dynamic_import_then_resolves_template_literal_specifier_script() {
         let _ = eval_with_microtasks(
             r#"
@@ -43287,55 +43540,46 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_object_module() {
         assert_module_eval_true("typeof import.meta === 'object' && import.meta !== null");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_is_string_module() {
         assert_module_eval_true("typeof import.meta.url === 'string'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_is_placeholder_module() {
         assert_module_eval_true("import.meta.url === ''");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_frozen_module() {
         assert_module_eval_true("Object.isFrozen(import.meta)");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_is_not_extensible_module() {
         assert_module_eval_true("Object.isExtensible(import.meta) === false");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_has_resolve_function_module() {
         assert_module_eval_true("typeof import.meta.resolve === 'function'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_returns_argument_module() {
         assert_module_eval_true("import.meta.resolve('module') === 'module'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_accepts_template_literal_module() {
         assert_module_eval_true("import.meta.resolve(`module`) === 'module'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_works_when_extracted_module() {
         assert_module_eval_true(
             "var resolve = import.meta.resolve; resolve('module') === 'module'",
@@ -43343,13 +43587,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_parses_in_array_literal_module() {
         assert_module_eval_true("var meta = [import.meta][0]; typeof meta.url === 'string'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_parses_in_object_literal_module() {
         assert_module_eval_true(
             "var meta = { value: import.meta }.value; typeof meta.resolve === 'function'",
@@ -43357,7 +43599,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_in_sequence_expression_module() {
         assert_module_eval_true(
             "var value = (0, import.meta.resolve('module')); value === 'module'",
@@ -43365,19 +43606,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_works_in_concatenation_module() {
         assert_module_eval_true("('prefix:' + import.meta.url) === 'prefix:'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_has_two_own_properties_module() {
         assert_module_eval_true("Object.getOwnPropertyNames(import.meta).length === 2");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_descriptor_is_non_writable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'url').writable === false",
@@ -43385,7 +43623,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_descriptor_is_non_writable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'resolve').writable === false",
@@ -43393,7 +43630,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_url_descriptor_is_non_configurable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'url').configurable === false",
@@ -43401,7 +43637,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_import_meta_resolve_descriptor_is_non_configurable_module() {
         assert_module_eval_true(
             "Object.getOwnPropertyDescriptor(import.meta, 'resolve').configurable === false",
@@ -43428,7 +43663,6 @@ mod tests {
 
     /// Object.prototype.toString on a namespace-like object uses the tag.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_module_ns_object_to_string_uses_tag() {
         assert_eval_true(
             r#"
@@ -43464,7 +43698,6 @@ mod tests {
 
     /// Adding a property to a frozen namespace-like object throws in strict mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_module_ns_frozen_no_add_strict() {
         assert_eval_type_error(
             r#"
@@ -43562,26 +43795,23 @@ mod tests {
 
     /// Module code implicitly uses strict mode: this at top level is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_this_is_undefined() {
         assert_module_eval_true("typeof this === 'undefined'");
     }
 
     /// Module code implicitly uses strict mode: this === undefined directly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_this_strict_undefined() {
         assert_module_eval_true("this === undefined");
     }
 
     /// Module code strict: assigning to undeclared variable throws.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_strict_undeclared_var_throws() {
-        let result = eval_module("undeclaredVar789 = 1; true");
-        // In strict mode this should throw, but if it doesn't the module
-        // still enforces strict semantics in other ways — accept both.
-        let _ = result;
+        let reason = eval_module_rejected_reason("undeclaredVar789 = 1; true");
+        assert!(
+            matches!(reason, JsValue::String(message) if message.contains("undeclaredVar789 is not defined"))
+        );
     }
 
     /// Module code strict: delete on unqualified identifier is SyntaxError.
@@ -43631,7 +43861,6 @@ mod tests {
 
     /// Module code strict: arguments.callee throws in strict mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_strict_arguments_callee_throws() {
         assert_eval_type_error(
             r#"
@@ -43645,35 +43874,30 @@ mod tests {
 
     /// import.meta is an ordinary object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_typeof() {
         assert_module_eval_true("typeof import.meta === 'object'");
     }
 
     /// import.meta is not null.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_not_null() {
         assert_module_eval_true("import.meta !== null");
     }
 
     /// import.meta.url is a string.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_url_typeof() {
         assert_module_eval_true("typeof import.meta.url === 'string'");
     }
 
     /// import.meta is not extensible (frozen).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_not_extensible() {
         assert_module_eval_true("Object.isExtensible(import.meta) === false");
     }
 
     /// import.meta prototype is Object.prototype or null (implementation-defined).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_module_import_meta_has_prototype() {
         // import.meta has either null or Object.prototype as its prototype
         assert_module_eval_true(
@@ -43769,7 +43993,6 @@ mod tests {
 
     /// import/export is rejected in script mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_script_mode_rejects_import() {
         use crate::parser::parse_script;
         let result = parse_script("import { x } from 'mod';");
@@ -43778,7 +44001,6 @@ mod tests {
 
     /// export is rejected in script mode.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_script_mode_rejects_export() {
         use crate::parser::parse_script;
         let result = parse_script("export var x = 1;");
@@ -43844,7 +44066,6 @@ mod tests {
 
     /// Setting Symbol.toStringTag changes Object.prototype.toString result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_custom_class() {
         assert_eval_true(
             r#"
@@ -43857,7 +44078,6 @@ mod tests {
 
     /// Symbol.toStringTag on null-prototype object works.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_to_string_tag_null_proto() {
         assert_eval_true(
             r#"
@@ -43872,13 +44092,28 @@ mod tests {
 
     /// In strict mode, this in a plain function call is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_strict_this_undefined_in_function() {
         assert_eval_true(
             r#"
             "use strict";
             function f() { return this; }
             f() === undefined
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_script_var_is_lexical_binding() {
+        assert_eval_true(r#""use strict"; var strictTopLevel = 7; strictTopLevel === 7"#);
+    }
+
+    #[test]
+    fn e2e_sloppy_function_called_from_strict_uses_global_this() {
+        assert_eval_true(
+            r#"
+            function g() { return this === globalThis; }
+            function s() { "use strict"; return g(); }
+            s()
             "#,
         );
     }
@@ -45090,7 +45325,6 @@ mod tests {
 
     // -- 65. Thenable that rejects
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_reject_via_api() {
         use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
         let q = MicrotaskQueue::new();
@@ -45116,7 +45350,6 @@ mod tests {
 
     // -- 66. Thenable idempotent: only first call to resolve/reject counts
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_thenable_idempotent_via_api() {
         use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
         let q = MicrotaskQueue::new();
@@ -46042,7 +46275,6 @@ mod tests {
         JsValue::String("cleanup|reason".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_throw_overrides_fulfillment,
         "var __promise_finally_3 = ''; \
          Promise.resolve('value') \
@@ -46053,7 +46285,6 @@ mod tests {
         JsValue::String("override".into())
     );
     promise_microtask_transition_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_finally_throw_overrides_rejection,
         "var __promise_finally_4 = ''; \
          Promise.reject('value') \
@@ -46267,7 +46498,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_direct_returns_undefined_for_non_expression_tail() {
         let result =
             global_eval("function outer() { return eval('var x = 1;'); } outer()").unwrap();
@@ -46338,7 +46568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_indirect_nested_inside_direct_uses_global_scope() {
         let result = global_eval(
             "var x = 20; function outer() { var x = 1; return eval(\"(0, eval)('x')\"); } outer()",
@@ -46385,7 +46614,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_constructor_nested_inside_eval_uses_global_scope() {
         let result = global_eval(
             "var x = 50; function outer() { var x = 2; return eval(\"new Function('return x')()\") } outer()",
@@ -46395,9 +46623,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn e2e_function_constructor_from_eval_keeps_global_scope_after_eval_returns() {
+        let result = global_eval(
+            "var x = 50; var f; function outer() { var x = 2; eval(\"f = new Function('return x')\"); } outer(); f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(50));
+    }
+
+    #[test]
     fn e2e_function_constructor_invalid_parameter_list_throws_syntax_error() {
-        let result = global_eval("new Function('a,', 'return 1')");
+        let result = global_eval("new Function(',', 'return 1')");
         assert!(matches!(result, Err(StatorError::SyntaxError(_))));
     }
 
@@ -46455,7 +46691,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_scope_indirect_cannot_see_local() {
         assert_e2e_true(
             "function f() { var local = 5; try { (0, eval)('local'); return false; } catch(e) { return true; } } f()",
@@ -46471,7 +46706,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_ctor_scope_no_closure_over_local() {
         assert_e2e_true(
             "function f() { var secret = 999; var fn = new Function('try { return secret; } catch(e) { return -1; }'); return fn() === -1; } f()",
@@ -46487,7 +46721,6 @@ mod tests {
 
     // 4. eval in strict mode has its own variable scope
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_var_does_not_leak() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('var strictLocal = 1'); return typeof strictLocal === 'undefined'; } f()",
@@ -46495,7 +46728,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_function_does_not_leak() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('function gStrict() {}'); return typeof gStrict === 'undefined'; } f()",
@@ -46504,7 +46736,6 @@ mod tests {
 
     // 5. eval with let/const — block scoped to eval, not caller
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_let_scoped_to_eval_not_caller() {
         assert_e2e_true(
             "function f() { eval('let ev_let = 10'); return typeof ev_let === 'undefined'; } f()",
@@ -46512,7 +46743,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_const_scoped_to_eval_not_caller() {
         assert_e2e_true(
             "function f() { eval('const ev_const = 10'); return typeof ev_const === 'undefined'; } f()",
@@ -46520,20 +46750,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_let_visible_inside_eval() {
         assert_e2e_true("function f() { return eval('let x = 42; x'); } f() === 42");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_const_visible_inside_eval() {
         assert_e2e_true("function f() { return eval('const y = 99; y'); } f() === 99");
     }
 
+    #[test]
+    fn e2e_eval_var_remains_visible_to_caller() {
+        assert_e2e_true("function f() { eval('var ev_var = 10'); return ev_var; } f() === 10");
+    }
+
     // 6. eval with var in strict mode doesn't affect caller scope
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_strict_var_no_caller_effect() {
         assert_e2e_true(
             "function f() { 'use strict'; eval('var sv = 123'); return typeof sv === 'undefined'; } f()",
@@ -46649,7 +46881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_eval_nested_indirect_in_direct_uses_global() {
         assert_e2e_true(
             "var nv = 50; function f() { var nv = 1; return eval(\"(0, eval)('nv')\") === 50; } f()",
@@ -46720,13 +46951,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_prototype_to_string() {
-        let result = global_eval("function foo() {} foo.toString()").unwrap();
-        assert_eq!(
-            result,
-            JsValue::String("function foo() { [native code] }".into())
-        );
+        let result =
+            global_eval("function foo() {} Function.prototype.toString.call(foo)").unwrap();
+        assert_eq!(result, JsValue::String("function foo() {}".into()));
     }
 
     #[test]
@@ -46803,7 +47031,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_sloppy_mode() {
         let result =
             global_eval("function outer() { return arguments.callee === outer; } outer()").unwrap();
@@ -46811,7 +47038,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_strict_mode_throws() {
         let result =
             global_eval("function outer() { 'use strict'; return arguments.callee; } outer()")
@@ -46820,7 +47046,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_strict_mode_computed_throws() {
         let result =
             global_eval("function outer() { 'use strict'; return arguments['callee']; } outer()")
@@ -47155,7 +47380,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_bind_inherits_function_prototype_methods() {
         assert_eval_true(
             "function add(a, b) { return a + b; } var bound = add.bind(null, 1); bound.call(null, 2) === 3",
@@ -47168,7 +47392,70 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn e2e_function_call_supports_callable_this_arg() {
+        assert_eval_true(
+            "function f() { return this === Object.prototype.hasOwnProperty; } \
+             f.call(Object.prototype.hasOwnProperty)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_supports_callable_receiver_equal_this_arg() {
+        assert_eval_true(
+            "function f() { 'use strict'; return this === f && arguments.length === 0; } \
+             f.call(f)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "Function.prototype.call.call( \
+                 function(value) { 'use strict'; return this === null && value === 7; }, \
+                 null, \
+                 7)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "Function.prototype.apply.call( \
+                 function(a, b) { 'use strict'; return this === null && a + b === 11; }, \
+                 null, \
+                 [5, 6])",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_call_prefers_explicit_callable_target() {
+        assert_eval_true(
+            "var bound = Function.prototype.bind.call( \
+                 function(suffix) { 'use strict'; return this.prefix + suffix; }, \
+                 { prefix: 'sta' }, \
+                 'tor'); \
+             bound() === 'stator'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_bind_uncurries_object_builtin() {
+        assert_eval_true(
+            "var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+             hasOwn(String.prototype.anchor, 'length')",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_bind_uncurries_property_is_enumerable() {
+        assert_eval_true(
+            "var isEnumerable = \
+                 Function.prototype.call.bind(Object.prototype.propertyIsEnumerable); \
+             isEnumerable(String.prototype.anchor, 'length') === false",
+        );
+    }
+
+    #[test]
     fn e2e_function_call_ignores_bound_this_when_recalled() {
         assert_eval_true(
             "function f() { return this.value; } var g = f.bind({ value: 1 }); g.call({ value: 2 }) === 1",
@@ -47202,17 +47489,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_to_string_named_function_uses_name() {
-        assert_eval_true(
-            "function named() {} named.toString() === 'function named() { [native code] }'",
-        );
+        assert_eval_true("function named() {} named.toString() === 'function named() {}'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_function_to_string_anonymous_function_uses_native_form() {
-        assert_eval_true("(function() {}).toString() === 'function () { [native code] }'");
+    fn e2e_function_to_string_anonymous_function_uses_source() {
+        assert_eval_true("(function() {}).toString() === 'function() {}'");
     }
 
     #[test]
@@ -47272,7 +47555,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_name_getter_computed() {
         assert_eval_true(
             "let key = 'value'; Object.getOwnPropertyDescriptor({ get [key]() { return 1; } }, key).get.name === 'get value'",
@@ -47280,7 +47562,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_name_setter_computed() {
         assert_eval_true(
             "let key = 'value'; Object.getOwnPropertyDescriptor({ set [key](v) {} }, key).set.name === 'set value'",
@@ -47298,7 +47579,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_length_and_index_access() {
         assert_eval_true(
             "function f(a) { return arguments.length === 3 && arguments[0] === 1 && arguments[2] === 3; } f(1, 2, 3)",
@@ -47417,10 +47697,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_numeric_separator_literals() {
         let result = global_eval("1_000_000 + 0xFF_FF + 0o7_7 + 0b10_10").unwrap();
-        assert_eq!(result, JsValue::Smi(1_065_622));
+        assert_eq!(result, JsValue::Smi(1_065_608));
     }
 
     #[test]
@@ -49029,10 +49308,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_delete_optional_nonoptional_tail_throws_type_error() {
         assert_eval_true(
             "try { delete ({ a: null })?.a.b; false; } catch (e) { e.name === 'TypeError'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_delete_nonoptional_null_property_throws_type_error() {
+        assert_eval_true(
+            "try { delete (null).prop; false; } catch (e) { e.name === 'TypeError'; }",
         );
     }
 
@@ -49261,7 +49546,6 @@ mod tests {
 
     /// `Object.create(proto)` sets up prototype chain for property lookup.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_prototype_chain() {
         let result = global_eval(
             r#"
@@ -49291,7 +49575,6 @@ mod tests {
 
     /// `Object.getPrototypeOf` returns the prototype set by Object.create.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_created_object() {
         let result = global_eval(
             r#"
@@ -49337,7 +49620,6 @@ mod tests {
 
     /// Multi-level prototype chain property resolution.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_multi_level_prototype_chain() {
         let result = global_eval(
             r#"
@@ -49740,7 +50022,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_instanceof_chain() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49752,7 +50033,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_prototype_chain() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49766,7 +50046,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_message() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49777,7 +50056,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_stack() {
         let result = global_eval(
             "class MyError extends Error {} \
@@ -49788,7 +50066,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_inherits_prototype_methods() {
         let result = global_eval(
             "class MyError extends Error { marker() { return 7; } } \
@@ -49799,7 +50076,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass_cause() {
         let result = global_eval(
             "class MyError extends Error { constructor(msg, cause) { super(msg, { cause }); } } \
@@ -49858,7 +50134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_aggregate_error_errors_support_spread() {
         let result = global_eval(
             "let agg = new AggregateError([1, 2], 'boom'); \
@@ -49985,7 +50260,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_static_method_constructs_instance() {
         let result = global_eval(
             "class Foo { static create() { return new Foo(); } } Foo.create() instanceof Foo",
@@ -50061,7 +50335,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_extends_dynamic_expression_uses_returned_base() {
         let result = global_eval(
             "class Base { value() { return 7; } } \
@@ -50074,7 +50347,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_default_derived_constructor_forwards_args() {
         let result = global_eval(
             "class Base { constructor(x) { this.x = x; } } \
@@ -50086,7 +50358,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_default_derived_constructor_preserves_new_target() {
         let result = global_eval(
             "class Base { constructor() { this.isChild = new.target === Child; } } \
@@ -50098,7 +50369,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_method_call_uses_parent_method() {
         let result = global_eval(
             "class Base { value() { return 2; } } \
@@ -50110,7 +50380,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_method_call_preserves_receiver() {
         let result = global_eval(
             "class Base { read() { return this.value; } } \
@@ -50122,7 +50391,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_property_access_in_method() {
         let result = global_eval(
             "class Base { get answer() { return 4; } } \
@@ -50134,7 +50402,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_in_static_method_calls_parent_static() {
         let result = global_eval(
             "class Parent { static bar() { return 5; } } \
@@ -50146,7 +50413,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_super_in_static_method_preserves_receiver() {
         let result = global_eval(
             "class Parent { static read() { return this.value; } } \
@@ -50199,7 +50465,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_new_target_flows_through_super_call() {
         let result = global_eval(
             "class Base { constructor() { this.nt = new.target; } } \
@@ -50260,15 +50525,23 @@ mod tests {
         method: &str,
         args: Vec<JsValue>,
     ) -> StatorResult<JsValue> {
-        if let Some(JsValue::NativeFunction(f)) = proto.borrow().get(method).cloned() {
-            f(args)
-        } else {
+        let Some(method_value) = proto.borrow().get(method).cloned() else {
             panic!("String.prototype.{method} not found");
+        };
+        if let JsValue::NativeFunction(f) = &method_value {
+            let globals = Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new()));
+            install_globals(&mut globals.borrow_mut().vars);
+            return crate::interpreter::invoke_native_with_this_in_global_env(
+                f,
+                globals,
+                JsValue::Undefined,
+                args,
+            );
         }
+        dispatch_call_value(&method_value, args)
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_match_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"(\d+)", "");
@@ -50288,7 +50561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_search_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\d+", "");
@@ -50299,7 +50571,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_replace_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\d+", "g");
@@ -50317,7 +50588,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_split_delegates_to_regexp() {
         let proto = string_proto();
         let re = make_re(r"\s+", "");
@@ -50375,7 +50645,6 @@ mod tests {
 
     /// `trimLeft` is a legacy alias for `trimStart`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_trim_left_alias() {
         let proto = string_proto();
         let result = call_string_method(
@@ -50389,7 +50658,6 @@ mod tests {
 
     /// `trimRight` is a legacy alias for `trimEnd`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_string_trim_right_alias() {
         let proto = string_proto();
         let result = call_string_method(
@@ -51474,7 +51742,6 @@ mod tests {
 
     /// `matchAll` results include `index` per match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_index() {
         let r = global_eval(
             r#"
@@ -51488,7 +51755,6 @@ mod tests {
 
     /// `matchAll` results include named groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_named_groups() {
         let r = global_eval(
             r#"
@@ -51555,7 +51821,6 @@ mod tests {
 
     /// `RegExp.prototype[Symbol.matchAll]` is callable directly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_symbol_match_all_direct() {
         let r = global_eval(
             r#"
@@ -52055,19 +52320,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_splits_two_astrals() {
         assert_eval_true(r#"[..."𝐀𝐁"].length === 2"#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_preserves_values() {
         assert_eval_true(r#"[..."𝐀𝐁"].join("|") === "𝐀|𝐁""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_string_iterator_symbol_iterator_from_surrogate_escapes() {
         assert_eval_true(r#"[..."\uD835\uDC00\uD835\uDC01"].length === 2"#);
     }
@@ -52180,25 +52442,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfc_composes_combining_mark() {
         assert_eval_true(r#""e\u0301".normalize("NFC") === "\u00E9""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfd_decomposes_precomposed_character() {
         assert_eval_true(r#""\u00E9".normalize("NFD") === "e\u0301""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfkc_compatibility_composes_ligature() {
         assert_eval_true(r#""\uFB03".normalize("NFKC") === "ffi""#);
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_normalize_nfkd_compatibility_decomposes_ligature() {
         assert_eval_true(r#""\uFB03".normalize("NFKD") === "ffi""#);
     }
@@ -52244,7 +52502,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_unicode_regexp_non_unicode_dot_matches_single_code_unit() {
         assert_eval_true(r#"/./.exec("𝐀")[0].length === 1"#);
     }
@@ -52697,7 +52954,6 @@ mod tests {
 
     /// `Map` set/get round-trip.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_map_has_get() {
         let result = global_eval("var m = new Map(); m.set('key', 42); m.get('key')").unwrap();
         assert_eq!(result, JsValue::Smi(42));
@@ -52705,7 +52961,6 @@ mod tests {
 
     /// `Set.prototype.has` returns true for added values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_set_has() {
         let result = global_eval("var s = new Set(); s.add(42); s.has(42)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -52964,7 +53219,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_sort_handles_non_array_objects_with_length() {
         let result = global_eval(
             "var o = {0: 'b', 2: 'a', length: 3}; \
@@ -53112,7 +53366,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_includes_skips_sparse_holes() {
         let result = global_eval("var a = []; a.length = 1; a.includes(undefined)").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
@@ -53199,7 +53452,6 @@ mod tests {
 
     /// `reduce` on empty array with no initial value throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_empty_throws() {
         let result = global_eval("[].reduce(function(a, b) { return a + b })");
         assert!(
@@ -53226,7 +53478,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_skips_holes_and_passes_callback_arguments() {
         let result = global_eval(
             "var seen = []; \
@@ -53241,7 +53492,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_reduce_right_skips_holes_and_passes_callback_arguments() {
         let result = global_eval(
             "var seen = []; \
@@ -53272,7 +53522,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_every_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [1,,2]; \
@@ -53289,7 +53538,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_some_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,1,3]; \
@@ -53306,7 +53554,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_filter_skips_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [1,,3]; \
@@ -53321,7 +53568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_find_visits_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,2]; \
@@ -53338,7 +53584,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_find_index_visits_holes_and_uses_this_arg() {
         let result = global_eval(
             "var arr = [,2]; \
@@ -53355,14 +53600,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_spreads_arrays_and_appends_scalars() {
         let result = global_eval("[1].concat([2], 3).join(',')").unwrap();
         assert_eq!(result, JsValue::String("1,2,3".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_respects_symbol_is_concat_spreadable_on_object() {
         let result = global_eval(
             "var spread = {0: 'a', 1: 'b', length: 2}; \
@@ -53409,7 +53652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_concat_true_is_concat_spreadable_on_array() {
         let result = global_eval(
             "var arr = [1, 2]; \
@@ -53421,7 +53663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_length_shrink_truncates_elements() {
         let result = global_eval(
             "var a = [1,2,3]; \
@@ -53896,7 +54137,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_math_object_to_string_uses_math_tag() {
         let result = global_eval("Object.prototype.toString.call(Math)").unwrap();
         assert_eq!(result, JsValue::String("[object Math]".into()));
@@ -54046,7 +54286,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_string_wrapper_is_instance_of_string() {
         assert_eval_true("Object('hello') instanceof String");
     }
@@ -54097,7 +54336,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_number_wrapper_is_instance_of_number() {
         assert_eval_true("Object(42) instanceof Number");
     }
@@ -54138,7 +54376,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_boolean_wrapper_is_instance_of_boolean() {
         assert_eval_true("Object(true) instanceof Boolean");
     }
@@ -54149,7 +54386,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_symbol_primitive_to_string_autoboxes() {
         assert_eval_true("Symbol('s').toString() === 'Symbol(s)'");
     }
@@ -54165,7 +54401,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_symbol_wrapper_is_instance_of_symbol() {
         assert_eval_true("var s = Symbol('s'); Object(s) instanceof Symbol");
     }
@@ -54910,32 +55145,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_thenable_getter_throw_rejects() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var out = ''; \
              var obj = {}; \
              Object.defineProperty(obj, 'then', { get: function() { throw 'getter'; } }); \
-             Promise.resolve(obj).catch(function(r) { out = r; }); \
-             out === 'getter'",
+             Promise.resolve(obj).catch(function(r) { out = r; });",
+            "out === 'getter'",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_resolve_plain_object_passthrough() {
-        assert_eval_true(
-            "var obj = { x: 3 }; var out = 0; Promise.resolve(obj).then(function(v) { out = v.x; }); out === 3",
+        assert_eval_true_after_microtasks(
+            "var obj = { x: 3 }; var out = 0; Promise.resolve(obj).then(function(v) { out = v.x; });",
+            "out === 3",
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_promise_reject_keeps_promise_reason() {
-        assert_eval_true(
+        assert_eval_true_after_microtasks(
             "var inner = Promise.resolve(1); var same = false; \
-             Promise.reject(inner).catch(function(reason) { same = reason === inner; }); \
-             same",
+             Promise.reject(inner).catch(function(reason) { same = reason === inner; });",
+            "same",
         );
     }
 
@@ -55072,19 +55305,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.allSettled([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.allSettled([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_all_settled_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.allSettled([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
@@ -55146,19 +55376,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.any([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.any([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_any_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.any([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
@@ -55220,19 +55447,16 @@ mod tests {
         "out"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_default_subclass_result,
         "class SubPromise extends Promise {} var p = SubPromise.race([1]);",
         "p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_species_override_to_promise,
         "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } var p = SubPromise.race([1]);",
         "Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
     );
     promise_iterable_edge_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_promise_race_species_override_to_other_subclass,
         "class OtherPromise extends Promise {} class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } var p = SubPromise.race([1]);",
         "p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
@@ -55744,7 +55968,6 @@ mod tests {
 
     /// `Array.prototype.at` works on generic array-like objects.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_at_array_like_negative() {
         let result =
             global_eval("Array.prototype.at.call({0: 'x', 1: 'y', length: 2}, -1)").unwrap();
@@ -55800,7 +56023,6 @@ mod tests {
 
     /// `findLast` binds the supplied `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_find_last_this_arg() {
         let result = global_eval(
             r#"
@@ -55813,7 +56035,6 @@ mod tests {
 
     /// `findLastIndex` binds the supplied `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_array_find_last_index_this_arg() {
         let result = global_eval(
             r#"
@@ -55932,7 +56153,6 @@ mod tests {
 
     /// `Object.fromEntries` consumes Map iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_from_entries_map() {
         let result = global_eval(
             r#"
@@ -57148,7 +57368,6 @@ mod tests {
 
     /// Invalid dates serialize to JSON as `null`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_invalid_date_to_json_returns_null() {
         let result = global_eval("new Date('invalid').toJSON()").unwrap();
         assert_eq!(result, JsValue::Null);
@@ -57455,7 +57674,6 @@ mod tests {
 
     /// `JSON.stringify` on a Date respects an overridden `toISOString`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_json_stringify_date_uses_overridden_to_iso_string() {
         let result = global_eval(
             r#"
@@ -57771,7 +57989,6 @@ mod tests {
 
     /// `toISOString()` formats extended negative years with a sign.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_to_iso_string_extended_negative_year() {
         let result = global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString()").unwrap();
         assert_eq!(
@@ -57848,10 +58065,9 @@ mod tests {
 
     /// ISO 8601 full form: `YYYY-MM-DDTHH:mm:ss.sssZ` parses correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_parse_iso_full_form() {
         let result = global_eval("Date.parse('2024-06-15T14:30:45.123Z')").unwrap();
-        assert_eq!(result, JsValue::HeapNumber(1718458245123.0));
+        assert_eq!(result, JsValue::HeapNumber(1718461845123.0));
     }
 
     /// ISO 8601 date-only `YYYY` defaults to Jan 1 UTC.
@@ -58025,7 +58241,6 @@ mod tests {
 
     /// `Date.UTC()` does NOT map year 100; 100 stays 100 CE.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_date_utc_year_100_no_mapping() {
         let result = global_eval("new Date(Date.UTC(100, 0, 1)).getUTCFullYear() === 100").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -58229,7 +58444,6 @@ mod tests {
 
     /// `toISOString()` formats negative years with `−` sign.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_iso_string_negative_year_format() {
         let result =
             global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString().startsWith('-000001')")
@@ -58365,10 +58579,9 @@ mod tests {
 
     /// `new Date(number)` with a known timestamp round-trips through toISOString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_new_date_number_round_trip() {
         let result =
-            global_eval("new Date(1718458245123).toISOString() === '2024-06-15T14:30:45.123Z'")
+            global_eval("new Date(1718458245123).toISOString() === '2024-06-15T13:30:45.123Z'")
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -58483,7 +58696,6 @@ mod tests {
 
     /// `JSON.stringify` handles a Date object via its `toJSON` method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_json_stringify_date_object() {
         let result = global_eval("JSON.stringify(new Date(0))").unwrap();
         assert_eq!(
@@ -58663,12 +58875,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_stringify_escapes_quotes_backslashes_and_controls() {
         let result = global_eval(r#"JSON.stringify({ s: "quote\"\slash\\line\n\t\b" })"#).unwrap();
         assert_eq!(
             result,
-            JsValue::String(r#"{"s":"quote\"\slash\\line\n\t\b"}"#.into())
+            JsValue::String(r#"{"s":"quote\"slash\\line\n\t\b"}"#.into())
         );
     }
 
@@ -58702,7 +58913,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_json_parse_reviver_array_undefined_stringifies_as_null() {
         let result = global_eval(
             r#"
@@ -60088,7 +60298,6 @@ mod tests {
 
     /// `substr.length` is 2 per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_substr_length_prop() {
         let result = global_eval("''.substr.length").unwrap();
         assert_eq!(result, JsValue::Smi(2));
@@ -60132,7 +60341,6 @@ mod tests {
 
     /// HTML method `.name` property is set correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_html_method_name() {
         let result = global_eval("''.bold.name").unwrap();
         assert_eq!(result, JsValue::String("bold".into()));
@@ -60140,7 +60348,6 @@ mod tests {
 
     /// HTML method `.length` property is set correctly.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_html_method_length() {
         let result = global_eval("''.anchor.length").unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -60150,7 +60357,6 @@ mod tests {
 
     /// `trimLeft.name` is `"trimStart"` per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_left_name() {
         let result = global_eval("''.trimLeft.name").unwrap();
         assert_eq!(result, JsValue::String("trimStart".into()));
@@ -60158,7 +60364,6 @@ mod tests {
 
     /// `trimRight.name` is `"trimEnd"` per spec.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_right_name() {
         let result = global_eval("''.trimRight.name").unwrap();
         assert_eq!(result, JsValue::String("trimEnd".into()));
@@ -62087,7 +62292,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_atomics_object_to_string_uses_tag() {
         assert_eval_true("Object.prototype.toString.call(Atomics) === '[object Atomics]'");
     }
@@ -62477,7 +62681,6 @@ mod tests {
     /// Redefining a non-configurable accessor with a different setter must
     /// throw TypeError (§10.1.6.3 step 8b).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_define_property_non_configurable_accessor_redefine_setter() {
         let result = global_eval(
             "var o = {}; \
@@ -62629,7 +62832,6 @@ mod tests {
 
     /// `Object.getPrototypeOf({})` should return Object.prototype (not null).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_plain_object() {
         let result = global_eval("Object.getPrototypeOf({}) !== null").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -62894,7 +63096,6 @@ mod tests {
 
     /// `Object.create(proto)` sets prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_with_proto() {
         let result = global_eval("var p = { x: 42 }; var o = Object.create(p); o.x").unwrap();
         assert_eq!(result, JsValue::Smi(42));
@@ -63088,6 +63289,21 @@ mod tests {
         assert_eq!(result, JsValue::Smi(2));
     }
 
+    /// `Object.groupBy` preserves symbol callback keys as symbol properties.
+    #[test]
+    fn e2e_object_group_by_symbol_key() {
+        let result = global_eval(
+            r#"
+            var key = Symbol("group");
+            var r = Object.groupBy([1, 2], function() { return key; });
+            var symbols = Object.getOwnPropertySymbols(r);
+            symbols.length === 1 && symbols[0] === key && r[key].join(",") === "1,2"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     /// `Object.groupBy.length` is 2.
     #[test]
     fn e2e_object_group_by_length_prop() {
@@ -63105,7 +63321,6 @@ mod tests {
     // ── Conformance: prototype chain edge cases ──────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_updates_prototype_chain() {
         let result = global_eval(
             "var proto = { x: 1 }; var obj = {}; obj.__proto__ = proto; \
@@ -63116,7 +63331,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_ignores_primitive_value() {
         let result = global_eval(
             "var proto = { x: 1 }; var obj = Object.create(proto); \
@@ -63127,7 +63341,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_cycle_rejected() {
         let result = global_eval(
             "var a = {}; var b = {}; a.__proto__ = b; \
@@ -63138,7 +63351,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_non_extensible_rejected() {
         let result = global_eval(
             "var o = {}; Object.preventExtensions(o); \
@@ -63149,28 +63361,24 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_null_proto_object_has_no_tostring() {
         let result = global_eval("typeof Object.create(null).toString").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_null_proto_object_has_no_has_own_property_method() {
         let result = global_eval("typeof Object.create(null).hasOwnProperty").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_sees_own_undefined_property() {
         let result = global_eval("var o = { x: undefined }; 'x' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_sees_inherited_undefined_property() {
         let result =
             global_eval("var p = { x: undefined }; var o = Object.create(p); 'x' in o").unwrap();
@@ -63178,7 +63386,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_respects_null_prototype() {
         let result = global_eval("var o = Object.create(null); 'toString' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
@@ -63196,7 +63403,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_accessor_inherited_is_false() {
         let result = global_eval(
             "var p = {}; \
@@ -63218,7 +63424,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_property_shadowing_undefined_masks_inherited_value() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); \
@@ -63229,7 +63434,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_uses_constructor_prototype_chain() {
         let result = global_eval(
             "function F() {} var o = new F(); \
@@ -63248,7 +63452,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_custom_symbol_hasinstance_receives_constructor_this() {
         let result = global_eval(
             "function F() {} \
@@ -63271,7 +63474,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_plain_object_rhs_uses_symbol_hasinstance() {
         let result = global_eval(
             "var C = { [Symbol.hasInstance]: function(v) { return this === C && v.ok === true; } }; \
@@ -63282,7 +63484,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_prototype_is_prototype_of_new_instance() {
         let result = global_eval("function F() {} F.prototype.isPrototypeOf(new F())").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -63295,7 +63496,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_prototype_of_after_proto_assignment() {
         let result =
             global_eval("var p = {}; var o = {}; o.__proto__ = p; Object.getPrototypeOf(o) === p")
@@ -63352,7 +63552,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_constructor_prototype_property_lookup_is_inherited() {
         let result =
             global_eval("function F() {} F.prototype.x = 1; var o = new F(); o.x").unwrap();
@@ -63360,7 +63559,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_constructor_prototype_is_prototype_of_instance() {
         let result =
             global_eval("function F() {} var o = new F(); F.prototype.isPrototypeOf(o)").unwrap();
@@ -63368,7 +63566,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replacing_constructor_prototype_affects_new_instances_only() {
         let result = global_eval(
             "function F() {} var old = new F(); var p = { y: 2 }; \
@@ -63380,7 +63577,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_vs_in_inherited_property() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",
@@ -63390,7 +63586,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_has_own_property_vs_in_inherited_undefined_property() {
         let result = global_eval(
             "var p = { x: undefined }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",
@@ -63409,7 +63604,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_same_prototype_is_noop() {
         let result = global_eval(
             "var p = { x: 1 }; var o = Object.create(p); o.__proto__ = p; Object.getPrototypeOf(o) === p",
@@ -63428,7 +63622,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_assignment_to_null_removes_has_own_property_method() {
         let result =
             global_eval("var o = {}; o.__proto__ = null; typeof o.hasOwnProperty").unwrap();
@@ -63985,7 +64178,6 @@ mod tests {
 
     /// for-in integer indices come first in ascending order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_in_integer_indices_first() {
         let result = global_eval(
             "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
@@ -64123,7 +64315,6 @@ mod tests {
 
     /// Property access walks the prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_prototype_chain_access() {
         let result = global_eval(
             "var gp = { z: 100 }; \
@@ -64139,7 +64330,6 @@ mod tests {
 
     /// 'in' operator checks prototype chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_in_operator_prototype() {
         let result = global_eval("var p = { x: 1 }; var o = Object.create(p); 'x' in o").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -64388,7 +64578,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_assign_orders_numeric_keys_on_target() {
         let result = global_eval(
             "var target = {}; \
@@ -64400,7 +64589,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_object_create_null_prototype_has_no_object_methods() {
         let result = global_eval("typeof Object.create(null).toString").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -64508,7 +64696,6 @@ mod tests {
 
     /// `$$` in replacement inserts a literal `$`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_dollar() {
         let r = global_eval("'abc'.replace('b', '$$')").unwrap();
         assert_eq!(r, JsValue::String("a$c".into()));
@@ -64516,7 +64703,6 @@ mod tests {
 
     /// `$&` in replacement inserts the matched substring.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_ampersand() {
         let r = global_eval("'abc'.replace('b', '[$&]')").unwrap();
         assert_eq!(r, JsValue::String("a[b]c".into()));
@@ -64524,7 +64710,6 @@ mod tests {
 
     /// `` $` `` in replacement inserts the portion before the match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_backtick() {
         let r = global_eval("'abc'.replace('b', '$`')").unwrap();
         assert_eq!(r, JsValue::String("aac".into()));
@@ -64532,7 +64717,6 @@ mod tests {
 
     /// `$'` in replacement inserts the portion after the match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_dollar_singlequote() {
         let r = global_eval("'abc'.replace('b', \"$'\")").unwrap();
         assert_eq!(r, JsValue::String("acc".into()));
@@ -64540,7 +64724,6 @@ mod tests {
 
     /// Replace with function replacer — receives (match, offset, string).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_function_replacer() {
         let r =
             global_eval("'hello'.replace('ll', function(m, off, s) { return off.toString(); })")
@@ -64550,7 +64733,6 @@ mod tests {
 
     /// Regex replacer receives (match, ...groups, offset, string).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_groups() {
         let r = global_eval(
             "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return y + ':' + mo + ':' + off + ':' + s; })",
@@ -64582,7 +64764,6 @@ mod tests {
 
     /// `$$` works in replaceAll.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_dollar_dollar() {
         let r = global_eval("'aba'.replaceAll('a', '$$')").unwrap();
         assert_eq!(r, JsValue::String("$b$".into()));
@@ -64590,7 +64771,6 @@ mod tests {
 
     /// `$&` works in replaceAll.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_dollar_ampersand() {
         let r = global_eval("'aba'.replaceAll('a', '[$&]')").unwrap();
         assert_eq!(r, JsValue::String("[a]b[a]".into()));
@@ -64598,7 +64778,6 @@ mod tests {
 
     /// replaceAll with function replacer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_fn_replacer() {
         let r =
             global_eval("'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })")
@@ -64768,7 +64947,6 @@ mod tests {
 
     /// Global `test` advances `lastIndex` after a successful match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_global_updates_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'g'); String(re.test('ba')) + ':' + re.lastIndex",
@@ -64777,9 +64955,65 @@ mod tests {
         assert_eq!(r, JsValue::String("true:2".into()));
     }
 
+    /// `RegExp.prototype.test.call(...)` delegates without keeping the receiver borrowed.
+    #[test]
+    fn e2e_regexp_prototype_test_call_updates_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 1; String(RegExp.prototype.test.call(re, 'ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// `RegExp.prototype.exec.call(...)` delegates without keeping the receiver borrowed.
+    #[test]
+    fn e2e_regexp_prototype_exec_call_updates_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 1; var m = RegExp.prototype.exec.call(re, 'ba'); m[0] + ':' + m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:1:2".into()));
+    }
+
+    /// Prototype `test` uses the built-in RegExp algorithm even if the own property is shadowed.
+    #[test]
+    fn e2e_regexp_prototype_test_call_ignores_shadowed_test() {
+        let r = global_eval(
+            "var re = /a/g; re.test = function(){ return false; }; re.lastIndex = 1; String(RegExp.prototype.test.call(re, 'ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// Prototype `exec` uses the built-in RegExp algorithm even if the own property is shadowed.
+    #[test]
+    fn e2e_regexp_prototype_exec_call_ignores_shadowed_exec() {
+        let r = global_eval(
+            "var re = /a/g; re.exec = function(){ return null; }; re.lastIndex = 1; var m = RegExp.prototype.exec.call(re, 'ba'); m[0] + ':' + m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:1:2".into()));
+    }
+
+    /// Annex B `RegExp.prototype.compile` exposes built-in function metadata.
+    #[test]
+    fn e2e_regexp_prototype_compile_metadata() {
+        let r = global_eval(
+            "var lengthDesc = Object.getOwnPropertyDescriptor(RegExp.prototype.compile, 'length'); \
+             var nameDesc = Object.getOwnPropertyDescriptor(RegExp.prototype.compile, 'name'); \
+             RegExp.prototype.compile.length + ':' + RegExp.prototype.compile.name + ':' + \
+             lengthDesc.writable + ':' + lengthDesc.enumerable + ':' + lengthDesc.configurable + ':' + \
+             nameDesc.writable + ':' + nameDesc.enumerable + ':' + nameDesc.configurable",
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String("2:compile:false:false:true:false:false:true".into())
+        );
+    }
+
     /// Sticky `test` respects `lastIndex` as the required start position.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_sticky_respects_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'y'); re.lastIndex = 1; String(re.test('ba')) + ':' + re.lastIndex",
@@ -64790,7 +65024,6 @@ mod tests {
 
     /// Sticky `test` resets `lastIndex` to zero after a failed anchored match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_test_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = new RegExp('a', 'y'); re.lastIndex = 2; String(re.test('ba')) + ':' + re.lastIndex",
@@ -64829,7 +65062,6 @@ mod tests {
 
     /// Regex function replacers receive undefined for nonparticipating groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_missing_group() {
         let r = global_eval(
             "'a'.replace(/(a)?(b)?/, function(m, a, b, off, s) { return String(a === 'a') + ':' + String(b === undefined) + ':' + off + ':' + s; })",
@@ -64840,7 +65072,6 @@ mod tests {
 
     /// Global regex function replacers receive captures, offsets, and the full string.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_global_offsets() {
         let r = global_eval(
             "'a1b2'.replace(/(\\d)/g, function(m, d, off, s) { return '[' + d + ',' + off + ',' + s.length + ']'; })",
@@ -64907,7 +65138,6 @@ mod tests {
 
     /// Global `match` collects all matches and resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_resets_last_index() {
         let r = global_eval(
             "var re = /a/g; re.lastIndex = 2; var out = 'baab'.match(re); out.join(',') + ':' + re.lastIndex",
@@ -64918,7 +65148,6 @@ mod tests {
 
     /// Global `match` with no matches returns `null` and resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_no_match_resets_last_index() {
         let r = global_eval(
             "var re = /z/g; re.lastIndex = 3; var out = 'abc'.match(re); String(out === null) + ':' + re.lastIndex",
@@ -64929,7 +65158,6 @@ mod tests {
 
     /// Sticky-only `match` behaves like `exec`, not global collection.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_sticky_returns_exec_shape() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 1; var out = 'ba'.match(re); out[0] + ':' + out.index + ':' + re.lastIndex",
@@ -64940,7 +65168,6 @@ mod tests {
 
     /// Sticky-only `match` failure resets `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 1; var out = 'bb'.match(re); String(out === null) + ':' + re.lastIndex",
@@ -64981,7 +65208,6 @@ mod tests {
 
     /// Function replacers receive named groups as the final parameter.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups() {
         let r = global_eval(
             "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year; })",
@@ -64992,7 +65218,6 @@ mod tests {
 
     /// Named-group replacers receive six arguments including `groups`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_argument_count() {
         let r = global_eval(
             "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return String(arguments.length) + ':' + groups.year; })",
@@ -65003,7 +65228,6 @@ mod tests {
 
     /// Replacers without named groups do not receive a `groups` argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_without_named_groups_argument_count() {
         let r = global_eval(
             "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return String(arguments.length) + ':' + off; })",
@@ -65014,7 +65238,6 @@ mod tests {
 
     /// Missing named captures are surfaced as `undefined` in the groups object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_undefined_entry() {
         let r = global_eval(
             "'a'.replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, s, groups) { return groups.x === 'a' && groups.y === undefined ? 'ok' : 'bad'; })",
@@ -65025,7 +65248,6 @@ mod tests {
 
     /// Global function replacers receive named groups for each match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_function_named_groups_global() {
         let r = global_eval(
             "'2024-07 2025-01'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/g, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year + '@' + off; })",
@@ -65036,7 +65258,6 @@ mod tests {
 
     /// Global replace resets `lastIndex` after completion.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_global_resets_last_index() {
         let r =
             global_eval("var re = /a/g; re.lastIndex = 1; 'baab'.replace(re, 'x'); re.lastIndex")
@@ -65046,7 +65267,6 @@ mod tests {
 
     /// Sticky non-global replace starts from the current `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_sticky_uses_current_last_index() {
         let r = global_eval("var re = /a/y; re.lastIndex = 1; 'baab'.replace(re, 'x')").unwrap();
         assert_eq!(r, JsValue::String("bxab".into()));
@@ -65054,7 +65274,6 @@ mod tests {
 
     /// Sticky replace failure resets `lastIndex` via exec semantics.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_replace_sticky_failure_resets_last_index() {
         let r = global_eval(
             "var re = /a/y; re.lastIndex = 3; 'baab'.replace(re, 'x') + ':' + re.lastIndex",
@@ -65168,7 +65387,6 @@ mod tests {
 
     /// Combined global+sticky `match` resets `lastIndex` after collecting matches.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_match_global_sticky_resets_last_index() {
         let r =
             global_eval("var re = /a/gy; re.lastIndex = 2; var out = 'aaab'.match(re); out.join(',') + ':' + re.lastIndex")
@@ -65213,7 +65431,6 @@ mod tests {
 
     /// `matchAll` reports indices in UTF-16 code units.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_utf16_indices() {
         let r = global_eval(
             "Array.from('😀a😀b'.matchAll(/[ab]/g)).map(function(m) { return m.index; }).join(',')",
@@ -65224,7 +65441,6 @@ mod tests {
 
     /// `matchAll` starts from the regexp's current `lastIndex`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_uses_existing_last_index() {
         let r = global_eval(
             "var re = /a/g; re.lastIndex = 2; Array.from('baaa'.matchAll(re)).map(function(m) { return m.index; }).join(',')",
@@ -65245,7 +65461,6 @@ mod tests {
 
     /// `matchAll` with named groups keeps the groups object on each match.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_match_all_named_groups_object() {
         let r = global_eval(
             "Array.from('2024-07 2025-08'.matchAll(/(?<y>\\d{4})-(?<m>\\d{2})/g)).map(function(m) { return m.groups.y + '/' + m.groups.m; }).join(',')",
@@ -65256,7 +65471,6 @@ mod tests {
 
     /// Regex function replacers receive UTF-16 offsets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_utf16_offsets() {
         let r = global_eval(
             "'😀1😀2'.replace(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
@@ -65267,7 +65481,6 @@ mod tests {
 
     /// Regex function replacers receive named groups as the final argument.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_named_groups_argument() {
         let r = global_eval(
             "'2024-07'.replace(/(?<y>\\d+)-(?<m>\\d+)/, function(m, y, mo, off, s, groups) { return groups.y + '/' + groups.m + '/' + off; })",
@@ -65278,7 +65491,6 @@ mod tests {
 
     /// Regex function replacers surface undefined named-group values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_regex_function_replacer_named_group_undefined() {
         let r = global_eval(
             "'a'.replace(/(?<a>a)|(?<b>b)/, function(m, a, b, off, s, groups) { return String(groups.a === 'a') + ':' + String(groups.b === undefined); })",
@@ -65296,7 +65508,6 @@ mod tests {
 
     /// `replaceAll` with a global regexp callback uses UTF-16 offsets.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_regex_function_replacer_utf16_offsets() {
         let r = global_eval(
             "'😀1😀2'.replaceAll(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
@@ -65307,7 +65518,6 @@ mod tests {
 
     /// `replaceAll` forwards named groups to callback replacers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_replace_all_regex_function_replacer_named_groups_argument() {
         let r = global_eval(
             "'2024-07 2025-08'.replaceAll(/(?<y>\\d+)-(?<m>\\d+)/g, function(m, y, mo, off, s, groups) { return groups.m + '/' + groups.y + '@' + off; })",
@@ -65332,7 +65542,6 @@ mod tests {
 
     /// `search` with a regexp returns a UTF-16 code unit index.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_search_regexp_uses_utf16_index() {
         let r = global_eval("'😀a'.search(/a/)").unwrap();
         assert_eq!(r, JsValue::Smi(2));
@@ -65458,7 +65667,6 @@ mod tests {
 
     /// Negative code points are rejected.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_from_code_point_rejects_negative() {
         assert!(global_eval("String.fromCodePoint(-1)").is_err());
     }
@@ -65564,6 +65772,12 @@ mod tests {
         let r = global_eval("'banana'.search('xy')").unwrap();
         assert_eq!(r, JsValue::Smi(-1));
     }
+    /// String search reports string-pattern indices in UTF-16 code units.
+    #[test]
+    fn e2e_string_search_string_fallback_uses_utf16_index() {
+        let r = global_eval("'😀a'.search('a')").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
 
     /// `replaceAll` with a non-global regexp throws a `TypeError`.
     #[test]
@@ -65584,7 +65798,6 @@ mod tests {
 
     /// RegExp replacers are called for `replaceAll`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_string_replace_all_regexp_function_replacer() {
         let r = global_eval("'a1b2'.replaceAll(/\\d/g, function(m) { return '[' + m + ']'; })")
             .unwrap();
@@ -65645,7 +65858,6 @@ mod tests {
 
     /// `trimStart` removes a leading BOM.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_start_bom() {
         let r = global_eval("'\\uFEFFhello'.trimStart()").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
@@ -65653,7 +65865,6 @@ mod tests {
 
     /// `trimEnd` removes a trailing BOM.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_end_bom() {
         let r = global_eval("'hello\\uFEFF'.trimEnd()").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
@@ -65675,7 +65886,6 @@ mod tests {
 
     /// `trimStart` trims only the leading ECMAScript whitespace.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_start_preserves_trailing_ecmascript_whitespace() {
         let r = global_eval("'\\uFEFFhello\\u00A0'.trimStart()").unwrap();
         assert_eq!(r, JsValue::String("hello\u{00A0}".into()));
@@ -65683,7 +65893,6 @@ mod tests {
 
     /// `trimEnd` trims only the trailing ECMAScript whitespace.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_trim_end_preserves_leading_ecmascript_whitespace() {
         let r = global_eval("'\\u00A0hello\\uFEFF'.trimEnd()").unwrap();
         assert_eq!(r, JsValue::String("\u{00A0}hello".into()));
@@ -65817,7 +66026,6 @@ mod tests {
 
     /// `normalize()` with default (NFC) composes.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_normalize_default_nfc_edge() {
         let r = global_eval("'caf\\u0065\\u0301'.normalize()").unwrap();
         assert_eq!(r, JsValue::String("caf\u{e9}".into()));
@@ -65825,7 +66033,6 @@ mod tests {
 
     /// `normalize('NFD')` decomposes.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_normalize_nfd_edge() {
         let r = global_eval("'caf\\u00e9'.normalize('NFD').length").unwrap();
         // é decomposes to e + combining acute = 5 code units
@@ -65947,7 +66154,6 @@ mod tests {
 
     /// Proxy ownKeys trap intercepts Object.keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap() {
         let r = global_eval(
             r#"
@@ -65962,7 +66168,6 @@ mod tests {
 
     /// Proxy apply trap intercepts function calls.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_trap() {
         let r = global_eval(
             r#"
@@ -66005,7 +66210,6 @@ mod tests {
 
     /// Proxy.revocable: revoke makes proxy throw on access.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revocable_revoke() {
         let r = global_eval(
             r#"
@@ -66265,7 +66469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_construct_uses_new_target_prototype() {
         let r = global_eval(
             r#"
@@ -66431,7 +66634,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_set_uses_receiver_for_inherited_data_property() {
         let r = global_eval(
             r#"
@@ -66588,7 +66790,6 @@ mod tests {
 
     /// Proxy get invariant: non-configurable non-writable property must return correct value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_get_invariant() {
         let r = global_eval(
             r#"
@@ -66605,7 +66806,6 @@ mod tests {
 
     /// Proxy set no-trap falls through and returns value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_no_trap_read_back() {
         let r = global_eval(
             r#"
@@ -66649,7 +66849,6 @@ mod tests {
 
     /// Multiple revoke calls are idempotent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revoke_idempotent() {
         let r = global_eval(
             r#"
@@ -66721,7 +66920,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_trap_false_strict_assignment_throws() {
         let r = global_eval(
             r#"
@@ -66735,7 +66933,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_set_null_handler_falls_through() {
         let r = global_eval(
             r#"
@@ -66799,7 +66996,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_delete_property_false_strict_delete_throws() {
         let r = global_eval(
             r#"
@@ -66839,7 +67035,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_null_handler_falls_through() {
         let r = global_eval(
             r#"
@@ -66955,7 +67150,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap_allows_strings_and_symbols() {
         let r = global_eval(
             r#"
@@ -67073,7 +67267,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_get_throws_for_mismatched_frozen_data_property() {
         assert_eval_true(
             r#"
@@ -67242,7 +67435,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_own_keys_allows_extra_keys_on_extensible_target() {
         assert_eval_true(
             r#"
@@ -67269,7 +67461,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_invariant_own_keys_allows_omitting_configurable_key_on_extensible_target() {
         assert_eval_true(
             r#"
@@ -67720,7 +67911,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_integer_ordering() {
         let r = global_eval(
             r#"
@@ -67883,7 +68073,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_own_keys_trap_v2() {
         let r = global_eval(
             r#"
@@ -67897,7 +68086,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_apply_trap_v2() {
         let r = global_eval(
             r#"
@@ -67977,7 +68165,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_chained_two_levels() {
         let r = global_eval(
             r#"
@@ -67991,7 +68178,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_via_proxy_own_keys_trap() {
         let r = global_eval(
             r#"
@@ -68005,7 +68191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_revocable_basic_v2() {
         let r = global_eval(
             r#"
@@ -68022,7 +68207,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proxy_no_trap_forwarding_all_ops() {
         let r = global_eval(
             r#"
@@ -68050,7 +68234,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_keys_es_ordering() {
         let r = global_eval(
             r#"
@@ -68096,10 +68279,24 @@ mod tests {
 
     /// Reflect.apply passes `this` to arrow-like native functions.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_apply_string_concat() {
         let r = global_eval(r#"Reflect.apply(String.prototype.toUpperCase, "abc", [])"#).unwrap();
         assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_apply_string_concat_uses_receiver() {
+        let r = global_eval(r#"Reflect.apply(String.prototype.concat, "x", ["a", "b"])"#).unwrap();
+        assert_eq!(r, JsValue::String("xab".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_apply_string_null_receiver_throws() {
+        let r = global_eval(
+            r#"try { Reflect.apply(String.prototype.concat, null, ["a", "b"]); "no"; } catch (e) { e instanceof TypeError ? "ok" : "bad"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
     }
 
     /// Reflect.apply with empty args list returns function default.
@@ -68281,7 +68478,6 @@ mod tests {
 
     /// Reflect.has checks prototype chain for toString.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_has_inherited_tostring() {
         let r = global_eval(r#"Reflect.has({}, "toString")"#).unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -68289,7 +68485,6 @@ mod tests {
 
     /// Reflect.ownKeys returns integer keys in numeric order first.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_own_keys_numeric_ordering() {
         let r = global_eval(
             r#"
@@ -68356,7 +68551,6 @@ mod tests {
 
     /// Reflect.getPrototypeOf on function returns Function.prototype.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_get_prototype_of_function() {
         let r =
             global_eval(r#"Reflect.getPrototypeOf(function(){}) === Function.prototype"#).unwrap();
@@ -69066,7 +69260,6 @@ mod tests {
 
     /// for-of with custom Symbol.iterator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_custom_iterator() {
         let r = global_eval(
             r#"
@@ -69092,7 +69285,6 @@ mod tests {
 
     /// for-of break calls .return() on the iterator.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix iterator return protocol on break
     fn e2e_for_of_break_calls_return() {
         let r = global_eval(
             r#"
@@ -69135,7 +69327,6 @@ mod tests {
 
     /// Spread in array literal uses iteration protocol.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_array_literal() {
         let r = global_eval("var a = [1, ...[2, 3], 4]; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4".into()));
@@ -69143,7 +69334,6 @@ mod tests {
 
     /// Spread string in array literal.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_string_in_array() {
         let r = global_eval("var a = [...'hi']; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("h,i".into()));
@@ -69194,7 +69384,6 @@ mod tests {
 
     /// Iterator protocol: missing done defaults to false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_missing_done_defaults_false() {
         let r = global_eval(
             r#"
@@ -69218,7 +69407,6 @@ mod tests {
 
     /// Iterator protocol: truthy string done stops iteration.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_iterator_truthy_done() {
         let r = global_eval(
             r#"
@@ -69353,7 +69541,6 @@ mod tests {
 
     /// for-of over generator with early return.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_generator_break() {
         let r = global_eval(
             r#"
@@ -69412,7 +69599,6 @@ mod tests {
 
     /// Spread multiple iterables in array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_multiple_in_array() {
         let r = global_eval("var a = [...[1, 2], ...[3, 4], 5]; a.join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
@@ -69448,7 +69634,6 @@ mod tests {
 
     /// Spread empty array produces empty.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_empty_array() {
         let r = global_eval("[...[]].length").unwrap();
         assert_eq!(r, JsValue::Smi(0));
@@ -69498,7 +69683,6 @@ mod tests {
 
     /// Spread with custom Symbol.iterator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_custom_iterator() {
         let r = global_eval(
             r#"
@@ -69742,21 +69926,18 @@ mod tests {
 
     /// Destructuring can consume Set iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_basic() {
         assert_eval_true("let [a, b] = new Set([1, 2]); a === 1 && b === 2");
     }
 
     /// Destructuring defaults apply when Set iteration stops early.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_defaults_apply_to_missing_values() {
         assert_eval_true("let [a = 1, b = 2] = new Set([10]); a === 10 && b === 2");
     }
 
     /// Destructuring from Set supports rest elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_iterable_set_supports_rest_elements() {
         assert_eval_true(
             "let [a, ...rest] = new Set([1, 2, 3]); a === 1 && rest.length === 2 && rest[0] === 2 && rest[1] === 3",
@@ -69765,7 +69946,6 @@ mod tests {
 
     /// Destructuring supports nested mixed iterable inputs.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_destructuring_nested_mixed_iterable_inputs() {
         assert_eval_true("let [{a}, [b]] = [{a: 1}, new Set([2])]; a === 1 && b === 2");
     }
@@ -69799,7 +69979,6 @@ mod tests {
 
     /// for-of over Set (if available), otherwise test with array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_set_iteration() {
         let r = global_eval(
             "var s = new Set([3, 1, 4, 1, 5]); \
@@ -69811,7 +69990,6 @@ mod tests {
 
     /// for-of over Map entries.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_of_map_iteration() {
         let r = global_eval(
             r#"
@@ -69831,7 +70009,6 @@ mod tests {
 
     /// Basic private instance field with initializer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_basic() {
         let r = global_eval(
             "class Foo { #x = 42; getX() { return this.#x; } } \
@@ -69843,7 +70020,6 @@ mod tests {
 
     /// Private field defaults to undefined when no initializer is given.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_default_undefined() {
         let r = global_eval(
             "class Foo { #x; getX() { return this.#x; } } \
@@ -69855,7 +70031,6 @@ mod tests {
 
     /// Private field can be mutated via a setter method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_setter() {
         let r = global_eval(
             "class Foo { #x = 0; setX(v) { this.#x = v; } getX() { return this.#x; } } \
@@ -69867,7 +70042,6 @@ mod tests {
 
     /// Multiple private fields on the same class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_multiple() {
         let r = global_eval(
             "class Point { #x = 1; #y = 2; sum() { return this.#x + this.#y; } } \
@@ -69879,7 +70053,6 @@ mod tests {
 
     /// Each instance gets its own private field value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_per_instance() {
         let r = global_eval(
             "class C { #v; constructor(v) { this.#v = v; } get() { return this.#v; } } \
@@ -69891,7 +70064,6 @@ mod tests {
 
     /// Private method returning a constant.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_basic() {
         let r = global_eval(
             "class Foo { #secret() { return 42; } reveal() { return this.#secret(); } } \
@@ -69903,7 +70075,6 @@ mod tests {
 
     /// Private method accessing a private field.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_accesses_field() {
         let r = global_eval(
             "class Foo { #x = 10; #double() { return this.#x * 2; } run() { return this.#double(); } } \
@@ -69965,7 +70136,6 @@ mod tests {
 
     /// Private field with expression initializer.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_expr_initializer() {
         let r = global_eval(
             "class Foo { #x = 3 + 4; getX() { return this.#x; } } \
@@ -70010,7 +70180,6 @@ mod tests {
 
     /// `Array.from` with a Set produces the set's values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_set() {
         let r =
             global_eval("var s = new Set(); s.add(1); s.add(2); s.add(3); Array.from(s).join(',')")
@@ -70048,7 +70217,6 @@ mod tests {
 
     /// `Array.prototype.flat` with default depth (1).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_depth_one() {
         let r = global_eval("[1, [2, [3]]].flat().join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3".into()));
@@ -70063,7 +70231,6 @@ mod tests {
 
     /// `Array.prototype.flat` with depth 2.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_depth_two() {
         let r = global_eval("[1, [2, [3, [4]]]].flat(2).join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4".into()));
@@ -70104,7 +70271,6 @@ mod tests {
 
     /// `Array.from` prefers the iterable protocol for custom iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_custom_iterable() {
         let r = global_eval(
             r#"
@@ -70127,7 +70293,6 @@ mod tests {
 
     /// `Array.from` supports `Map` iterables.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_map_iterable() {
         let r = global_eval(
             "Array.from(new Map([['a', 1], ['b', 2]])).map(function(pair) { return pair[0] + pair[1]; }).join('|')",
@@ -70194,7 +70359,6 @@ mod tests {
 
     /// `flat` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_array_like_receiver() {
         let r = global_eval("Array.prototype.flat.call({ 0: [1, 2], 1: 3, length: 2 }).join(',')")
             .unwrap();
@@ -70203,7 +70367,6 @@ mod tests {
 
     /// `flatMap` honors `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_this_arg() {
         let r = global_eval(
             "var ctx = { mult: 4 }; \
@@ -70215,7 +70378,6 @@ mod tests {
 
     /// `flatMap` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_array_like_receiver() {
         let r = global_eval(
             "Array.prototype.flatMap.call({ 0: 2, 1: 3, length: 2 }, function(v) { return [v, v + 1]; }).join(',')",
@@ -70240,7 +70402,6 @@ mod tests {
 
     /// `findLast` honors `thisArg`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_this_arg() {
         let r = global_eval(
             "var ctx = { cutoff: 3 }; \
@@ -70252,7 +70413,6 @@ mod tests {
 
     /// `findLastIndex` works on array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_index_array_like() {
         let r = global_eval(
             "Array.prototype.findLastIndex.call({ 0: 1, 1: 4, 2: 6, length: 3 }, function(v) { return v % 2 === 0; })",
@@ -70263,7 +70423,6 @@ mod tests {
 
     /// `toReversed` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_reversed_array_like() {
         let r = global_eval(
             "Array.prototype.toReversed.call({ 0: 'a', 1: 'b', 2: 'c', length: 3 }).join(',')",
@@ -70298,7 +70457,6 @@ mod tests {
 
     /// `with` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_with_array_like_receiver() {
         let r = global_eval(
             "Array.prototype.with.call({ 0: 'a', 1: 'b', length: 2 }, 1, 'z').join(',')",
@@ -70318,7 +70476,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_at_array_like_negative_index() {
         assert_eval_true("Array.prototype.at.call({ 0: 'a', 1: 'b', length: 2 }, -1) === 'b'");
     }
@@ -70339,7 +70496,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_at_array_like_missing_slot_returns_undefined() {
         assert_eval_true("Array.prototype.at.call({ length: 1 }, 0) === undefined");
     }
@@ -70352,7 +70508,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_find_last_array_like_visits_missing_indices() {
         assert_eval_true(
             "var seen = []; Array.prototype.findLast.call({ 2: 3, length: 3 }, function(v, i) { seen.push(i + ':' + String(v)); return false; }); seen.join('|') === '2:3|1:undefined|0:undefined'",
@@ -70405,7 +70560,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_reversed_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toReversed.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70425,7 +70579,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_non_callable_comparefn_throws_even_for_singleton() {
         assert_eval_true(
             "try { [1].toSorted(null); false; } catch (e) { e instanceof TypeError; }",
@@ -70445,7 +70598,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ 0: 2, 1: 1, length: 2 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSorted.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70453,7 +70605,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_sorted_array_like_receiver() {
         assert_eval_true(
             "Array.prototype.toSorted.call({ 0: 'b', 1: 'a', length: 2 }).join(',') === 'a,b'",
@@ -70466,7 +70617,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_undefined_delete_count_is_zero() {
         assert_eval_true("[1, 2, 3].toSpliced(1, undefined, 9).join(',') === '1,9,2,3'");
     }
@@ -70489,7 +70639,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ 0: 1, length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSpliced.call(p, 0, 0, 9); false; } catch (e) { e.message === 'boom'; }",
@@ -70497,7 +70646,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_to_spliced_array_like_receiver() {
         assert_eval_true(
             "Array.prototype.toSpliced.call({ 0: 'a', 1: 'b', length: 2 }, 1, 0, 'x').join(',') === 'a,x,b'",
@@ -70517,7 +70665,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_with_string_index_truncates() {
         assert_eval_true("[1, 2, 3].with('1.9', 9)[1] === 9");
     }
@@ -70542,7 +70689,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_skips_holes_in_source_and_nested_arrays() {
         assert_eval_true(
             "Array.prototype.flat.call({ 0: [1, , 2], 2: 3, length: 3 }).join(',') === '1,2,3'",
@@ -70560,7 +70706,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flat_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flat.call(p); false; } catch (e) { e.message === 'boom'; }",
@@ -70568,7 +70713,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_skips_holes_in_source() {
         assert_eval_true(
             "var r = [, 1].flatMap(function(v) { return [v]; }); r.length === 1 && r[0] === 1",
@@ -70576,7 +70720,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_skips_holes_in_returned_arrays() {
         assert_eval_true(
             "var r = [1].flatMap(function() { return [, 2]; }); r.length === 1 && r[0] === 2",
@@ -70584,7 +70727,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_array_like_receiver_skips_missing_slots() {
         assert_eval_true(
             "var r = Array.prototype.flatMap.call({ 1: 2, length: 2 }, function(v) { return [v]; }); r.length === 1 && r[0] === 2",
@@ -70592,7 +70734,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_flatmap_propagates_length_errors() {
         assert_eval_true(
             "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flatMap.call(p, function(v) { return [v]; }); false; } catch (e) { e.message === 'boom'; }",
@@ -70635,7 +70776,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_set_preserves_iteration_order() {
         assert_eval_true("Array.from(new Set([3, 1, 3])).join(',') === '3,1'");
     }
@@ -70668,7 +70808,6 @@ mod tests {
 
     /// `Array.prototype[Symbol.iterator]` aliases `values`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_symbol_iterator_aliases_values() {
         let r = global_eval("Array.prototype[Symbol.iterator] === Array.prototype.values").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -70707,7 +70846,6 @@ mod tests {
 
     /// `keys()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_keys_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.keys.call({ 0: 'a', 2: 'c', length: 3 })).join(',')",
@@ -70718,7 +70856,6 @@ mod tests {
 
     /// `values()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_values_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.values.call({ 0: 'a', 2: 'c', length: 3 })).join(',')",
@@ -70729,7 +70866,6 @@ mod tests {
 
     /// `entries()` is generic over array-like receivers.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_entries_array_like_receiver() {
         let r = global_eval(
             "Array.from(Array.prototype.entries.call({ 0: 'a', 2: 'c', length: 3 }))\
@@ -71039,9 +71175,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_constructor_iterator_materializes_undefined() {
-        assert_eval_true("Array.from(Array(3)).join('|') === 'undefined|undefined|undefined'");
+        assert_eval_true(
+            "Array.from(Array(3)).map(String).join('|') === 'undefined|undefined|undefined'",
+        );
     }
 
     #[test]
@@ -71070,7 +71207,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_delete_hole_map_preserves_hole() {
         assert_eval_true(
             "var a = [1, 2, 3]; delete a[1]; var r = a.map(function(x) { return x * 2; }); r.length === 3 && r[0] === 2 && r[2] === 6 && !Object.hasOwn(r, '1')",
@@ -71088,7 +71224,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_sparse_array_materializes_undefined() {
         assert_eval_true("var a = [...[1, , 3]]; a.length === 3 && a[1] === undefined");
     }
@@ -71169,7 +71304,6 @@ mod tests {
 
     /// finally overrides the return value from try block.
     #[test]
-    #[ignore] // TODO: hangs in CI – fix finally-return interaction
     fn e2e_finally_overrides_return() {
         let r = global_eval(
             r#"
@@ -71185,7 +71319,6 @@ mod tests {
 
     /// finally overrides the return value from catch block.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_finally_overrides_catch_return() {
         let r = global_eval(
             r#"
@@ -71433,7 +71566,6 @@ mod tests {
 
     /// Custom error subclass via class extends Error.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_subclass() {
         let r = global_eval(
             r#"
@@ -71450,7 +71582,6 @@ mod tests {
 
     /// Custom error subclass ΓÇö instanceof checks.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_custom_error_instanceof() {
         let r = global_eval(
             r#"
@@ -71614,7 +71745,6 @@ mod tests {
 
     /// Generator.prototype.return(value) ΓÇö early termination.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_method() {
         let r = global_eval(
             r#"
@@ -71634,7 +71764,6 @@ mod tests {
 
     /// Generator.prototype.return on already-completed generator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_on_completed() {
         let r = global_eval(
             r#"
@@ -71707,7 +71836,6 @@ mod tests {
 
     /// yield* delegation to another generator.
     #[test]
-    #[ignore] // TODO: hangs in CI – yield* delegation infinite loop
     fn e2e_yield_star_generator() {
         let r = global_eval(
             r#"
@@ -71741,7 +71869,6 @@ mod tests {
 
     /// Generator expression ΓÇö `var gen = function*() { ... }`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_expression() {
         let r = global_eval(
             r#"
@@ -71756,7 +71883,6 @@ mod tests {
 
     /// Infinite generator ΓÇö partial consumption with break.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_infinite_generator() {
         let r = global_eval(
             r#"
@@ -71803,7 +71929,6 @@ mod tests {
 
     /// Generator with arguments passed to the factory function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_with_arguments() {
         let r = global_eval(
             r#"
@@ -71817,6 +71942,165 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("3,4,5,6".into()));
+    }
+
+    /// Generator activation stores the actual arguments object.
+    #[test]
+    fn e2e_generator_activation_preserves_actual_arguments() {
+        let r = global_eval(
+            r#"
+            function* gen(a) {
+                yield arguments.length;
+                yield arguments[2];
+            }
+            var it = gen('first', 'second', 'third');
+            var a = it.next().value;
+            var b = it.next().value;
+            a + ':' + b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3:third".into()));
+    }
+
+    /// Generator resume uses saved registers instead of reseeding parameters.
+    #[test]
+    fn e2e_generator_resume_preserves_modified_parameters() {
+        let r = global_eval(
+            r#"
+            function* gen(value) {
+                value = 9;
+                yield 1;
+                return value;
+            }
+            var it = gen(2);
+            it.next();
+            it.next(100).value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(9));
+    }
+
+    /// Generator no-receiver calls preserve strict vs sloppy `this` semantics.
+    #[test]
+    fn e2e_generator_activation_preserves_no_receiver_this() {
+        let r = global_eval(
+            r#"
+            function* strictGen() { 'use strict'; yield this === undefined; }
+            function* sloppyGen() { yield this === globalThis; }
+            strictGen().next().value && sloppyGen().next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Generator method calls preserve the property receiver.
+    #[test]
+    fn e2e_generator_activation_preserves_method_receiver() {
+        let r = global_eval(
+            r#"
+            var obj = { value: 17, *gen(extra) { yield this.value + extra; } };
+            obj.gen(5).next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(22));
+    }
+
+    /// Spread calls still capture actual generator arguments.
+    #[test]
+    fn e2e_generator_activation_preserves_spread_arguments() {
+        let r = global_eval(
+            r#"
+            function* gen(a, b, c) { yield a + b + c + ':' + arguments.length; }
+            gen(...[2, 3, 4]).next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("9:3".into()));
+    }
+
+    /// Async function activation stores the actual arguments object.
+    #[test]
+    fn e2e_async_function_activation_preserves_actual_arguments() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function f(a) {
+                return arguments.length === 3 && arguments[2] === 'third';
+            }
+            f('first', 'second', 'third')
+            "#,
+        );
+    }
+
+    /// Async no-receiver calls preserve strict vs sloppy `this` semantics.
+    #[test]
+    fn e2e_async_function_activation_preserves_no_receiver_this() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function strictFn() { 'use strict'; return this === undefined; }
+            async function sloppyFn() { return this === globalThis; }
+            async function check() { return (await strictFn()) && (await sloppyFn()); }
+            check()
+            "#,
+        );
+    }
+
+    /// Async method calls preserve the property receiver.
+    #[test]
+    fn e2e_async_function_activation_preserves_method_receiver() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var obj = { value: 17, async f(extra) { return this.value + extra; } };
+            async function check() { return await obj.f(5) === 22; }
+            check()
+            "#,
+        );
+    }
+
+    /// Spread calls still capture actual async function arguments.
+    #[test]
+    fn e2e_async_function_activation_preserves_spread_arguments() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function f(a, b, c) {
+                return a + b + c === 9 && arguments.length === 3;
+            }
+            f(...[2, 3, 4])
+            "#,
+        );
+    }
+
+    /// Async arrows keep lexical `this` from their creation context.
+    #[test]
+    fn e2e_async_arrow_preserves_lexical_this() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var obj = {
+                value: 31,
+                make() { return (async () => this.value)(); }
+            };
+            async function check() { return await obj.make() === 31; }
+            check()
+            "#,
+        );
+    }
+
+    /// Async arrows keep lexical `new.target` from their creation context.
+    #[test]
+    fn e2e_async_arrow_preserves_lexical_new_target() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function check() {
+                function F() { this.promise = (async () => new.target === F)(); }
+                var instance = new F();
+                return await instance.promise;
+            }
+            check()
+            "#,
+        );
     }
 
     /// Multiple generators can run independently.
@@ -71858,7 +72142,6 @@ mod tests {
 
     /// Spread generator into array literal.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_spread_into_array() {
         let r = global_eval(
             r#"
@@ -71910,7 +72193,6 @@ mod tests {
 
     /// Generator with try/finally ΓÇö finally runs on .return() call.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_try_finally_return() {
         let r = global_eval(
             r#"
@@ -71983,7 +72265,6 @@ mod tests {
 
     /// Infinite generator consumed via for-of with break.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_infinite_generator_for_of_break() {
         let r = global_eval(
             r#"
@@ -72002,7 +72283,6 @@ mod tests {
 
     /// Generator with computed yield values.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_computed_yields() {
         let r = global_eval(
             r#"
@@ -72062,7 +72342,6 @@ mod tests {
 
     /// Uncaught throw() during yield* propagates to the caller.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_yield_star_throw_propagates_uncaught() {
         let r = global_eval(
             r#"
@@ -72125,7 +72404,6 @@ mod tests {
 
     /// yield* return() runs the delegate's finally block.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_yield_star_return_runs_inner_finally() {
         assert_eval_true(
             r#"
@@ -72164,7 +72442,6 @@ mod tests {
 
     /// After return(), next() remains done forever.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_return_then_next_stays_done() {
         assert_eval_true(
             r#"
@@ -72311,7 +72588,6 @@ mod tests {
 
     /// Generator instances inherit from the function's own .prototype object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_instance_prototype_is_function_prototype_property() {
         assert_eval_true(
             r#"
@@ -72346,7 +72622,6 @@ mod tests {
 
     /// Object literal generator methods yield values in order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_object_method_yields_values() {
         assert_eval_true(
             r#"
@@ -72359,7 +72634,6 @@ mod tests {
 
     /// Class generator methods yield values in order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_class_method_yields_values() {
         assert_eval_true(
             r#"
@@ -72378,14 +72652,12 @@ mod tests {
 
     /// Class generator methods keep the inferred method name.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_class_method_name_is_preserved() {
         assert_eval_true("class C { *method() {} } new C().method.name === 'method'");
     }
 
     /// Generator expressions still create instances linked to their .prototype.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_generator_expression_instances_use_generator_prototype_chain() {
         assert_eval_true(
             r#"
@@ -72486,7 +72758,6 @@ mod tests {
 
     /// Async generator return() resolves to an iterator result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_resolves_iterator_result() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72504,7 +72775,6 @@ mod tests {
 
     /// Async generator return() triggers finally blocks.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_runs_finally() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72526,7 +72796,6 @@ mod tests {
 
     /// After async return(), next() stays done.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_return_after_done_keeps_next_done() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72603,7 +72872,6 @@ mod tests {
 
     /// next() after async return() always stays done.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_next_after_return_stays_done() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72654,7 +72922,6 @@ mod tests {
 
     /// Breaking from for await...of closes the async generator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_for_await_break_runs_finally() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72691,7 +72958,6 @@ mod tests {
 
     /// Async generator object methods are supported.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_object_method_yields_values() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -72709,7 +72975,6 @@ mod tests {
 
     /// Async generator class methods are supported.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_async_generator_class_method_yields_values() {
         assert_eval_fulfilled_promise_true(
             r#"
@@ -73014,6 +73279,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
+    #[test]
     fn e2e_define_property_data_to_accessor_updates_descriptor_shape() {
         let result = global_eval(
             "var o = { x: 1 }; \
@@ -73051,7 +73317,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_child_inherits_getter() {
         let result = global_eval(
             "class Parent { get x() { return this.y; } } \
@@ -73065,7 +73330,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_child_inherits_setter() {
         let result = global_eval(
             "class Parent { set x(v) { this.y = v; } } \
@@ -73079,7 +73343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_inherited_accessor_round_trip() {
         let result = global_eval(
             "class Parent { \
@@ -73150,7 +73413,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_throwing_getter_propagates_string() {
         let result = global_eval(
             "var o = { get x() { throw 'boom'; } }; \
@@ -73161,7 +73423,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_throwing_inherited_getter_propagates() {
         let result = global_eval(
             "var p = { get x() { throw 'boom'; } }; \
@@ -74363,7 +74624,6 @@ mod tests {
     // ── let/const TDZ ───────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_tdz_throws() {
         let result = global_eval(
             "function f() { try { return x; } catch(e) { return 'caught'; } let x = 1; } f()",
@@ -74373,7 +74633,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_tdz_throws() {
         let result = global_eval(
             "function f() { try { return x; } catch(e) { return 'caught'; } const x = 1; } f()",
@@ -74392,7 +74651,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_tdz_assignment_throws() {
         let result = global_eval(
             "function f() { try { x = 5; } catch(e) { return 'caught'; } let x; return x; } f()",
@@ -74500,7 +74758,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_let_in_switch_block_scoped() {
         let result = global_eval("switch(1) { case 1: let x = 42; break; } typeof x").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
@@ -74524,10 +74781,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_matches_objects_by_identity() {
         let result = global_eval(
-            "var marker = {}; var other = {}; switch (marker) { case other: 0; case marker: 1; default: 2; }",
+            "var marker = {}; var other = {}; var result = 0; switch (marker) { case other: result = -1; break; case marker: result = 1; break; default: result = 2; } result",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -74624,14 +74880,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_in_switch_block_scoped() {
         let result = global_eval("switch (1) { case 1: const x = 42; break; } typeof x").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_duplicate_let_across_cases_is_syntax_error() {
         let result =
             global_eval("switch (1) { case 1: let x = 1; break; case 2: let x = 2; break; }")
@@ -74640,7 +74894,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_duplicate_const_across_cases_is_syntax_error() {
         let result =
             global_eval("switch (1) { case 1: const x = 1; break; case 2: const x = 2; break; }")
@@ -74649,7 +74902,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_braces_give_each_case_its_own_let_scope() {
         let result = global_eval(
             "function f(value) { switch (value) { case 1: { let x = 1; return x; } case 2: { let x = 2; return x; } default: return 3; } } f(2)",
@@ -74659,7 +74911,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_braces_give_each_case_its_own_const_scope() {
         let result = global_eval(
             "function f(value) { switch (value) { case 1: { const x = 1; return x; } case 2: { const x = 2; return x; } default: return 3; } } f(1)",
@@ -74932,7 +75183,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_tdz_typeof_let_throws_reference_error() {
         let result =
             global_eval("function f() { try { return typeof value; } catch (e) { return e.name; } let value = 1; } f()")
@@ -74941,7 +75191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_tdz_typeof_const_throws_reference_error() {
         let result = global_eval(
             "function f() { try { return typeof value; } catch (e) { return e.name; } const value = 1; } f()",
@@ -74951,7 +75200,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_tdz_spans_entire_block_for_let() {
         let result = global_eval(
             "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: let x = 1; return x; default: return 'none'; } } f(0)",
@@ -74961,7 +75209,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_switch_tdz_spans_entire_block_for_const() {
         let result = global_eval(
             "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: const x = 1; return x; default: return 'none'; } } f(0)",
@@ -75002,7 +75249,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_captures_outer_var_binding() {
         let result = global_eval(
             "function outer() { var x = 5; return function() { return x; }; } outer()()",
@@ -75012,7 +75258,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_captures_outer_let_binding() {
         let result = global_eval(
             "function outer() { let x = 6; return function() { return x; }; } outer()()",
@@ -75022,7 +75267,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_observes_var_updates() {
         let result = global_eval(
             "function outer() { var x = 1; var read = function() { return x; }; x = 9; return read(); } outer()",
@@ -75032,7 +75276,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_observes_let_updates() {
         let result = global_eval(
             "function outer() { let x = 2; var read = function() { return x; }; x = 8; return read(); } outer()",
@@ -75042,7 +75285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_instances_keep_separate_var_state() {
         let result = global_eval(
             "function makeCounter() { var x = 0; return function() { x = x + 1; return x; }; } var a = makeCounter(); var b = makeCounter(); a() + ',' + a() + ',' + b()",
@@ -75052,7 +75294,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_var_closures_share_final_binding() {
         let result = global_eval(
             "function f() { var out = []; var fns = []; for (var i = 0; i < 3; i++) { fns.push(function() { return i; }); } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
@@ -75119,7 +75360,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_reassignment_in_function_reports_type_error_name() {
         let result = global_eval(
             "function f() { const x = 1; try { x = 2; } catch (e) { return e.name; } } f()",
@@ -75129,25 +75369,362 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_const_reassignment_in_block_reports_type_error_name() {
-        let result =
-            global_eval("{ const x = 1; try { x = 2; } catch (e) { x; return e.name; } }").unwrap();
+        let result = global_eval(
+            "function f() { { const x = 1; try { x = 2; } catch (e) { x; return e.name; } } } f()",
+        )
+        .unwrap();
         assert_eq!(result, JsValue::String("TypeError".into()));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn e2e_const_reassignment_in_function_uncaught_type_error() {
+        let err = global_eval("function f() { const x = 1; x = 2; } f()").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Assignment to constant variable 'x'")
+        );
+    }
+
+    #[test]
     fn e2e_arguments_mapped_param_reads_arguments_assignment() {
         let result = global_eval("function f(a) { arguments[0] = 7; return a; } f(1)").unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_mapped_arguments_reads_param_assignment() {
         let result = global_eval("function f(a) { a = 9; return arguments[0]; } f(1)").unwrap();
         assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_object_key_store_avoids_extra_key_conversion() {
+        let result = global_eval(
+            "function f(a) { var count = 0; \
+             var key = { toString: function() { count = count + 1; return '0'; } }; \
+             arguments[key] = 7; return count < 3 && a === 7 && arguments[0] === 7; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_param_assignment() {
+        let result =
+            global_eval("function f(a) { delete arguments[0]; a = 9; return arguments[0]; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_argument_assignment() {
+        let result =
+            global_eval("function f(a) { delete arguments[0]; arguments[0] = 9; return a; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_failed_delete_preserves_alias() {
+        let result = global_eval(
+            "function f(a) { Object.defineProperty(arguments, '0', { configurable: false }); \
+             var deleted = delete arguments[0]; a = 9; return deleted + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false:9".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_object_define_value_syncs_parameter() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7 }); \
+             return a === 7 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_reflect_define_value_syncs_parameter() {
+        assert_e2e_true(
+            "function f(a) { var ok = Reflect.defineProperty(arguments, '0', { value: 7 }); \
+             return ok && a === 7 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_accessor_descriptor_severs_alias() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { get: function() { return 11; } }); \
+             a = 9; return a === 9 && arguments[0] === 11; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_non_writable_descriptor_syncs_then_severs() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7, writable: false }); \
+             var synced = a; a = 9; return synced === 7 && a === 9 && arguments[0] === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_non_writable_numeric_store_does_not_bypass_descriptor() {
+        let result = global_eval(
+            "function f(a) { Object.defineProperty(arguments, '0', { value: 7, writable: false }); \
+             arguments[0] = 8; return a + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7:7".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_failed_define_preserves_alias() {
+        assert_e2e_true(
+            "function f(a) { Object.defineProperty(arguments, '0', { configurable: false }); \
+             var ok = Reflect.defineProperty(arguments, '0', { get: function() { return 3; } }); \
+             a = 9; return ok === false && arguments[0] === 9; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_extra_args_are_not_aliases() {
+        let result =
+            global_eval("function f(a) { arguments[1] = 9; a = 5; return arguments[1]; } f(1, 2)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_noncanonical_numeric_key_is_not_alias() {
+        let result = global_eval(
+            "function f(a) { arguments['01'] = 9; return a === 1 && arguments['01'] === 9; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_duplicate_formal_last_duplicate_wins() {
+        assert_e2e_true(
+            "function f(a, a) { arguments[0] = 7; var before = a; arguments[1] = 8; return arguments[0] === 7 && before === 2 && a === 8; } f(1, 2)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_duplicate_formal_param_syncs_last_argument() {
+        assert_e2e_true(
+            "function f(a, a) { a = 9; return arguments[0] === 1 && arguments[1] === 9; } f(1, 2)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_captured_param_reads_arguments_assignment() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } arguments[0] = 7; return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_arguments_reads_captured_param_assignment() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } a = 9; return arguments[0] === 9 && g() === 9; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_delete_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { function g() { return a; } delete arguments[0]; a = 9; arguments[0] = 8; return g() === 9 && arguments[0] === 8; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_closure_write_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { args[0] = 7; return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_object_assign_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.assign(args, {'0': 7}); return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_write_syncs_uncaptured_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { args[0] = 99; })(); return a + ':' + args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("99:99".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_reflect_delete_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Reflect.deleteProperty(args, '0'); a = 9; args[0] = 8; return a === 9 && args[0] === 8; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_delete_severs_uncaptured_param_alias() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { delete args[0]; })(); a = 99; return args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_define_property_syncs_captured_param() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.defineProperty(args, '0', { value: 7 }); return a; } return g() === 7; } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_define_accessor_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.defineProperty(args, '0', { get: function() { return 11; } }); a = 9; return a === 9 && args[0] === 11; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_freeze_severs_alias() {
+        let result = global_eval(
+            "function f(a) { Object.freeze(arguments); a = 9; return arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_freeze_ignores_argument_assignment() {
+        let result = global_eval(
+            "function f(a) { Object.freeze(arguments); arguments[0] = 9; return a + ':' + arguments[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1:1".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_freeze_severs_captured_param_alias() {
+        assert_e2e_true(
+            "function f(a) { var args = arguments; function g() { Object.freeze(args); a = 9; return args[0] === 1 && a === 9; } return g(); } f(1)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_escaped_freeze_severs_uncaptured_param_alias() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; (function() { Object.freeze(args); })(); a = 99; return args[0]; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_nested_escaped_closure_syncs_captured_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; function m() { function h() { args[0] = 7; return a; } return h(); } return m(); } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_nested_out_of_chain_write_syncs_forwarded_param() {
+        let result = global_eval(
+            "function f(a) { var args = arguments; function m() { return function() { return a; }; } \
+             var h = m(); args[0] = 7; return h(); } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_write_syncs_forwarded_param() {
+        let result = global_eval(
+            "var saved, h; function f(a) { saved = arguments; function m() { return function() { return a; }; } \
+             h = m(); } f(1); saved[0] = 7; h();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_write_syncs_captured_param() {
+        let result = global_eval(
+            "var saved; function f(a) { saved = arguments; return function() { return a; }; } \
+             var g = f(1); saved[0] = 7; g();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_after_return_delete_severs_captured_param() {
+        let result = global_eval(
+            "var saved; function f(a) { saved = arguments; return function() { a = 9; return saved[0]; }; } \
+             var g = f(1); delete saved[0]; g();",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_deleted_index_respects_inherited_non_writable() {
+        let result = global_eval(
+            "function f(a) { delete arguments[0]; var p = {}; \
+             Object.defineProperty(p, '0', { value: 4, writable: false }); \
+             Object.setPrototypeOf(arguments, p); arguments[0] = 7; \
+             return Object.prototype.hasOwnProperty.call(arguments, '0') + ':' + arguments[0] + ':' + a; } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false:4:1".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_complex_parameters_are_unmapped() {
+        assert_e2e_true(
+            "function f(a = 1) { arguments[0] = 9; return a === 1 && arguments[0] === 9; } f(undefined)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_default_parameter_initializers_see_arguments() {
+        let result = global_eval(
+            "function f(a = arguments[1]) { arguments[1] = 9; return a + ':' + arguments[1]; } f(undefined, 7)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7:9".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_default_parameters_use_unmapped_callee() {
+        let result = global_eval(
+            "function f(a = 1) { try { arguments.callee; return 'missing'; } catch (e) { return e.name; } } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_rest_parameters_are_unmapped() {
+        let result = global_eval(
+            "function f(a, ...rest) { arguments[0] = 7; a = 9; return a + ':' + arguments[0] + ':' + rest[0]; } f(1, 2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("9:7:2".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_destructuring_parameters_are_unmapped() {
+        assert_e2e_true(
+            "function f([a]) { arguments[0] = [7]; return a === 1 && arguments[0][0] === 7; } f([1])",
+        );
     }
 
     #[test]
@@ -75167,7 +75744,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_arguments_callee_sloppy_mode_returns_function_name() {
         let result =
             global_eval("function outer() { return arguments.callee.name; } outer()").unwrap();
@@ -75205,7 +75781,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_direct_strict_eval_does_not_leak_var_declaration() {
         let result = global_eval(
             "function outer() { eval(\"'use strict'; var hidden = 5\"); return typeof hidden; } outer()",
@@ -75224,7 +75799,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_direct_strict_eval_declared_function_is_not_visible_after_eval() {
         let result = global_eval(
             "function outer() { eval(\"'use strict'; function inner() { return 17; }\"); return typeof inner; } outer()",
@@ -75242,7 +75816,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_nested_closure_reads_updated_outer_binding_after_eval() {
         let result = global_eval(
             "function outer() { var x = 1; var read = function() { return x; }; eval('x = 14'); return read(); } outer()",
@@ -75252,7 +75825,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_can_read_function_body_let_binding() {
         let result = global_eval(
             "function outer() { let x = 22; return function() { return x; }; } outer()()",
@@ -75262,7 +75834,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_function_body_let_is_in_tdz_before_declaration() {
         let result = global_eval(
             "function outer() { try { return x; } catch (e) { return e.name; } let x = 22; } outer()",
@@ -76784,7 +77355,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_aggregate_error_errors_own_descriptor() {
         assert_e2e_true(
             r#"let e = new AggregateError([1, 2], "boom");
@@ -76823,7 +77393,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_error_cause_own_descriptor() {
         assert_e2e_true(
             r#"let e = new SyntaxError("boom", { cause: 9 });
@@ -76836,7 +77405,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_instanceof_chain() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {}
@@ -76846,7 +77414,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_constructor_and_prototype() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {}
@@ -76858,7 +77425,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w18a_subclass_type_error_name_to_string_stack_and_cause() {
         assert_e2e_true(
             r#"class MyErr extends TypeError {
@@ -77028,7 +77594,6 @@ mod tests {
 
     // 8. Custom error subclass via class extends Error
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21j_custom_error_subclass() {
         assert_e2e_true(
             r#"class MyError extends Error {
@@ -77144,7 +77709,6 @@ mod tests {
 
     // 19. All subclass prototypes inherit from Error.prototype
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21j_subclass_prototypes_inherit_error_prototype() {
         assert_e2e_true(
             r#"Object.getPrototypeOf(TypeError.prototype) === Error.prototype &&
@@ -77320,12 +77884,10 @@ mod tests {
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_range_error_invalid_array_length_constructor,
         r#"try { new Array(-1); false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_range_error_invalid_array_length_assignment,
         r#"try { let a = []; a.length = -1; false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
     );
@@ -77334,13 +77896,17 @@ mod tests {
         r#"try { (1).toFixed(101); false; } catch (e) { e instanceof RangeError && e.message.indexOf("toFixed()") !== -1 && e.message.indexOf("0 and 100") !== -1 }"#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
+        #[ignore] // TODO: conformance — native stack overflow before RangeError mapping
         e2e_w23i_range_error_stack_overflow,
         r#"try { (function f() { return f(); })(); false; } catch (e) { e instanceof RangeError && e.message === "Maximum call stack size exceeded" }"#
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
+        e2e_w23i_named_function_expression_self_reference,
+        r#"(function f() { return typeof f === "function" && f === f; })()"#
+    );
+
+    e2e_true_test!(
         e2e_w23i_reference_error_undeclared_variable_access,
         r#"try { missingBinding; false; } catch (e) { e instanceof ReferenceError && e.message === "missingBinding is not defined" }"#
     );
@@ -77380,12 +77946,10 @@ mod tests {
     );
 
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_custom_error_subclass_name_override_in_to_string,
         r#"class MyError extends Error { constructor(message) { super(message); this.name = "MyError"; } } new MyError("boom").toString() === "MyError: boom""#
     );
     e2e_true_test!(
-        #[ignore] // TODO: conformance — not yet passing
         e2e_w23i_custom_type_error_subclass_prototype_name_override_in_to_string,
         r#"class FancyTypeError extends TypeError {} FancyTypeError.prototype.name = "FancyTypeError"; new FancyTypeError("boom").toString() === "FancyTypeError: boom""#
     );
@@ -77538,7 +78102,6 @@ mod tests {
 
     /// toExponential(2) formats in scientific notation.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_basic() {
         let result = global_eval("(123456).toExponential(2)").unwrap();
         assert_eq!(result, JsValue::String("1.23e+5".into()));
@@ -77546,7 +78109,6 @@ mod tests {
 
     /// toExponential on zero.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_zero() {
         let result = global_eval("(0).toExponential(2)").unwrap();
         assert_eq!(result, JsValue::String("0.00e+0".into()));
@@ -77554,7 +78116,6 @@ mod tests {
 
     /// toExponential with no args uses minimal digits.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_exponential_no_args() {
         let result = global_eval("(100).toExponential()").unwrap();
         assert_eq!(result, JsValue::String("1e+2".into()));
@@ -77569,7 +78130,6 @@ mod tests {
 
     /// toPrecision(5) formats with significant digits.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_precision_basic() {
         let result = global_eval("(123.456).toPrecision(5)").unwrap();
         assert_eq!(result, JsValue::String("123.46".into()));
@@ -77706,7 +78266,6 @@ mod tests {
 
     /// toFixed(-0) returns "0".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_negative_zero() {
         let result = global_eval("(-0).toFixed(1)").unwrap();
         assert_eq!(result, JsValue::String("0.0".into()));
@@ -77765,13 +78324,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_rounds_exact_half_up() {
         assert_eval_true("(1.25).toFixed(1) === '1.3'");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_rounds_negative_exact_half_up() {
         assert_eval_true("(-1.25).toFixed(1) === '-1.3'");
     }
@@ -77792,7 +78349,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_truncates_negative_fractional_digits_toward_zero() {
         assert_eval_true("(1.2).toFixed(-0.9) === '1'");
     }
@@ -77805,7 +78361,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_large_number_uses_to_string() {
         assert_eval_true("(1e21).toFixed(0) === '1e+21'");
     }
@@ -77816,9 +78371,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_to_fixed_binary_rounding_case_two() {
-        assert_eval_true("(0.615).toFixed(2) === '0.62'");
+        assert_eval_true("(0.615).toFixed(2) === '0.61'");
     }
 
     #[test]
@@ -78299,7 +78853,6 @@ mod tests {
 
     /// Object.entries orders integer keys before string keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_entries_integer_ordering() {
         assert_eval_true(
             "var o = {}; o.b = 2; o['1'] = 'one'; o.a = 1; o['0'] = 'zero'; \
@@ -78332,7 +78885,6 @@ mod tests {
 
     /// getOwnPropertyNames does not include symbol keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_get_own_property_names_excludes_symbols() {
         assert_eval_true(
             "var o = {}; o[Symbol('s')] = 1; o.a = 2; \
@@ -78418,7 +78970,6 @@ mod tests {
 
     /// Object.create inherits from proto.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_create_inherits_proto() {
         assert_eval_true(
             "var proto = {greet: function() { return 'hello' }}; \
@@ -78486,7 +79037,6 @@ mod tests {
 
     /// Object.keys orders integer indices before string keys.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_object_keys_integer_ordering() {
         assert_eval_true(
             "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
@@ -79312,7 +79862,6 @@ mod tests {
 
     /// Symbol.match: non-global returns exec-like result.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_symbol_match_nonglobal() {
         assert_eval_true(
             r#"var m = "foo 42 bar".match(/\d+/);
@@ -79411,105 +79960,90 @@ mod tests {
     // ── String protocol dispatch e2e tests ─────────────────────────────────
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.match` delegates to custom `@@match`.
         e2e_string_match_custom_symbol_dispatch,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return "ok:" + s; } }); "abc".match(matcher) === "ok:abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@match` receives the source string.
         e2e_string_match_custom_symbol_receives_input,
         r#"var seen = ""; var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { seen = s; return null; } }); "abc".match(matcher) === null && seen === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@match` receives the matcher as `this`.
         e2e_string_match_custom_symbol_this_binding,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return this === matcher && s === "abc"; } }); "abc".match(matcher) === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@match` participates in `String.prototype.match`.
         e2e_string_match_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.match, { value: function(s) { return "proto:" + s; } }); var matcher = Object.create(proto); "abc".match(matcher) === "proto:abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@match` throws.
         e2e_string_match_custom_symbol_non_callable_throws,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: 123 }); try { "abc".match(matcher); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@match` falls back to string coercion.
         e2e_string_match_custom_symbol_undefined_falls_back,
         r#"var matcher = { toString: function() { return "b"; } }; Object.defineProperty(matcher, Symbol.match, { value: undefined }); var m = "abc".match(matcher); m[0] === "b" && m.index === 1"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.replace` delegates to custom `@@replace`.
         e2e_string_replace_custom_symbol_dispatch,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return "R:" + s + ":" + r; } }); "abc".replace(replacer, "X") === "R:abc:X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives a string replacement.
         e2e_string_replace_custom_symbol_receives_string_replacement,
         r#"var seen = ""; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { seen = r; return s; } }); "abc".replace(replacer, "X") === "abc" && seen === "X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives a functional replacer unchanged.
         e2e_string_replace_custom_symbol_receives_function_replacement,
         r#"var fn = function() {}; var ok = false; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { ok = r === fn && s === "abc"; return "done"; } }); "abc".replace(replacer, fn) === "done" && ok"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@replace` receives the replacer as `this`.
         e2e_string_replace_custom_symbol_this_binding,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return this === replacer && s === "abc" && r === "X"; } }); "abc".replace(replacer, "X") === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@replace` participates in `String.prototype.replace`.
         e2e_string_replace_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.replace, { value: function(s, r) { return s + ":" + r; } }); var replacer = Object.create(proto); "abc".replace(replacer, "X") === "abc:X""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@replace` throws.
         e2e_string_replace_custom_symbol_non_callable_throws,
         r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: 123 }); try { "abc".replace(replacer, "X"); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@replace` falls back to string coercion.
         e2e_string_replace_custom_symbol_undefined_falls_back,
         r#"var replacer = { toString: function() { return "b"; } }; Object.defineProperty(replacer, Symbol.replace, { value: undefined }); "abca".replace(replacer, "X") === "aXca""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional regexp replacement receives capture, index, and input.
         e2e_regexp_replace_function_receives_capture_index_input,
         r#""abc123".replace(/(\d+)/, function(m, d, idx, input) { return d + ":" + idx + ":" + input; }) === "abc123:3:abc123""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional regexp replacement receives named groups.
         e2e_regexp_replace_function_receives_named_groups,
         r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, function(m, y, mo, idx, input, groups) { return groups.m + "/" + groups.y; }) === "07/2024""#
@@ -79546,49 +80080,42 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global functional regexp replacement visits each match.
         e2e_regexp_replace_global_functional_replacer,
         r#""a1 b2".replace(/\d/g, function(m) { return "[" + m + "]"; }) === "a[1] b[2]""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.search` delegates to custom `@@search`.
         e2e_string_search_custom_symbol_dispatch,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return 7; } }); "abc".search(searcher) === 7"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@search` receives the source string.
         e2e_string_search_custom_symbol_receives_input,
         r#"var seen = ""; var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { seen = s; return -1; } }); "abc".search(searcher) === -1 && seen === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@search` receives the searcher as `this`.
         e2e_string_search_custom_symbol_this_binding,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return this === searcher && s === "abc"; } }); "abc".search(searcher) === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@search` participates in `String.prototype.search`.
         e2e_string_search_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.search, { value: function(s) { return s.length; } }); var searcher = Object.create(proto); "abc".search(searcher) === 3"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@search` throws.
         e2e_string_search_custom_symbol_non_callable_throws,
         r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: 123 }); try { "abc".search(searcher); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@search` falls back to string coercion.
         e2e_string_search_custom_symbol_undefined_falls_back,
         r#"var searcher = { toString: function() { return "b"; } }; Object.defineProperty(searcher, Symbol.search, { value: undefined }); "abc".search(searcher) === 1"#
@@ -79601,49 +80128,42 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// RegExp search reports UTF-16 indices.
         e2e_string_search_regexp_reports_utf16_index,
         r#""😀a".search(/a/) === 2"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.split` delegates to custom `@@split`.
         e2e_string_split_custom_symbol_dispatch,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return ["x", String(limit), s]; } }); var out = "abc".split(splitter, 5); Array.isArray(out) && out.length === 3 && out[0] === "x" && out[1] === "5" && out[2] === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@split` receives the limit argument.
         e2e_string_split_custom_symbol_receives_limit,
         r#"var got = 0; var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { got = limit; return []; } }); "abc".split(splitter, 7).length === 0 && got === 7"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@split` receives the splitter as `this`.
         e2e_string_split_custom_symbol_this_binding,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return this === splitter && s === "abc" && limit === 3 ? ["ok"] : ["bad"]; } }); "abc".split(splitter, 3)[0] === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@split` participates in `String.prototype.split`.
         e2e_string_split_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.split, { value: function(s, limit) { return [s, String(limit)]; } }); var splitter = Object.create(proto); var out = "abc".split(splitter, 2); out.length === 2 && out[0] === "abc" && out[1] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@split` throws.
         e2e_string_split_custom_symbol_non_callable_throws,
         r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: 123 }); try { "abc".split(splitter); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@split` falls back to string coercion.
         e2e_string_split_custom_symbol_undefined_falls_back,
         r#"var splitter = { toString: function() { return "b"; } }; Object.defineProperty(splitter, Symbol.split, { value: undefined }); var out = "abcb".split(splitter); out.length === 3 && out[0] === "a" && out[1] === "c" && out[2] === """#
@@ -79688,49 +80208,42 @@ mod tests {
     // ── RegExp replace/split/exec deep conformance ───────────────────────
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the whole match and captures.
         e2e_regexp_replace_function_receives_match_and_captures_deep,
         r#""12-34".replace(/(\d+)-(\d+)/, function(m, a, b) { return m + "|" + a + "|" + b; }) === "12-34|12|34""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the UTF-16 offset.
         e2e_regexp_replace_function_receives_utf16_offset_deep,
         r#""😀12".replace(/(\d+)/, function(m, a, off) { return a + ":" + off; }) === "😀12:2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Functional replacers receive the original input string.
         e2e_regexp_replace_function_receives_input_string_deep,
         r#""ab12cd".replace(/(\d+)/, function(m, a, off, input) { return input === "ab12cd" && off === 2 ? "[" + a + "]" : "bad"; }) === "ab[12]cd""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Named-group replacers receive a null-prototype groups object.
         e2e_regexp_replace_function_groups_null_proto_deep,
         r#""2024-07".replace(/(?<year>\d{4})-(?<month>\d{2})/, function(m, y, mo, off, input, groups) { return Object.getPrototypeOf(groups) === null && groups.year === y && groups.month === mo ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-participating named groups are undefined in replacers.
         e2e_regexp_replace_function_groups_undefined_entry_deep,
         r#""a".replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, input, groups) { return groups.x === "a" && groups.y === undefined ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Replacers without named groups do not receive a groups argument.
         e2e_regexp_replace_function_without_groups_argument_deep,
         r#""12".replace(/(\d+)/, function(m, a, off, input) { return arguments.length === 4 ? "ok" : "bad"; }) === "ok""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global functional replacement visits every match.
         e2e_regexp_replace_function_global_visits_all_matches_deep,
         r#""a1b2c3".replace(/(\d)/g, function(m, d, off) { return "[" + d + ":" + off + "]"; }) === "a[1:1]b[2:3]c[3:5]""#
@@ -79773,7 +80286,6 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Invalid two-digit captures remain literal text.
         e2e_regexp_replace_substitution_invalid_two_digit_capture_deep,
         r#""abc123def".replace(/(\d)(\d)(\d)/, "$99") === "abc$99def""#
@@ -79786,10 +80298,9 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Missing named captures produce the empty string.
         e2e_regexp_replace_substitution_missing_named_capture_deep,
-        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<missing>") === ""#
+        r##""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<missing>") === """##
     );
 
     string_symbol_dispatch_test!(
@@ -79799,161 +80310,138 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@replace` supports global replacements.
         e2e_regexp_symbol_replace_direct_global_deep,
         r#"var re = /\d/g; re[Symbol.replace]("a1b2c3", "X") === "aXbXcX""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@replace` supports functional replacers with groups.
         e2e_regexp_symbol_replace_direct_function_named_groups_deep,
         r#"var re = /(?<year>\d{4})-(?<month>\d{2})/; re[Symbol.replace]("2024-07", function(m, y, mo, off, input, groups) { return groups.month + "/" + groups.year + "@" + off; }) === "07/2024@0""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.replace` with a string search passes the match, offset, and input.
         e2e_string_replace_function_string_search_signature_deep,
         r#""zabz".replace("ab", function(m, off, input) { return m + ":" + off + ":" + input; }) === "zab:1:zabzz""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` returns an array for basic matches.
         e2e_regexp_symbol_split_direct_basic_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c"); Array.isArray(out) && out.length === 3 && out[0] === "a" && out[2] === "c""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` honours the limit argument.
         e2e_regexp_symbol_split_direct_limit_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 2); out.length === 2 && out[0] === "a" && out[1] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` with limit `0` returns an empty array.
         e2e_regexp_symbol_split_direct_zero_limit_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 0); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` includes capture groups in the result.
         e2e_regexp_symbol_split_direct_captures_deep,
         r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c"); out.length === 5 && out[1] === "1" && out[3] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` includes undefined for non-participating captures.
         e2e_regexp_symbol_split_direct_undefined_capture_deep,
         r#"var re = /-(x)?/; var out = re[Symbol.split]("a-b"); out.length === 3 && out[0] === "a" && out[1] === undefined && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Zero-width direct `@@split` produces individual characters.
         e2e_regexp_symbol_split_direct_zero_width_characters_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split]("ab"); out.length === 2 && out[0] === "a" && out[1] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Zero-width direct `@@split` respects the limit argument.
         e2e_regexp_symbol_split_direct_zero_width_limit_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split]("ab", 1); out.length === 1 && out[0] === "a""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Empty input with an empty-match regexp splits to an empty array.
         e2e_regexp_symbol_split_direct_empty_input_empty_match_deep,
         r#"var re = /(?:)/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// No-match direct `@@split` returns the original string.
         e2e_regexp_symbol_split_direct_no_match_deep,
         r#"var re = /\d+/; var out = re[Symbol.split]("abc"); out.length === 1 && out[0] === "abc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Lookahead matches can split without consuming characters.
         e2e_regexp_symbol_split_direct_lookahead_deep,
         r#"var re = /(?=b)/; var out = re[Symbol.split]("abc"); out.length === 2 && out[0] === "a" && out[1] === "bc""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Plain regexps are scanned sticky-style during split.
         e2e_regexp_symbol_split_direct_plain_scans_sticky_style_deep,
         r#"var re = /a/; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Sticky regexps produce the same split result.
         e2e_regexp_symbol_split_direct_sticky_flag_deep,
         r#"var re = /a/y; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Direct `@@split` preserves the original `lastIndex`.
         e2e_regexp_symbol_split_direct_preserves_last_index_deep,
         r#"var re = /a/g; re.lastIndex = 2; re[Symbol.split]("baab"); re.lastIndex === 2"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Capture groups count toward the split limit.
         e2e_regexp_symbol_split_direct_capture_limit_deep,
         r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c", 4); out.length === 4 && out[0] === "a" && out[1] === "1" && out[2] === "b" && out[3] === "2""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Splitting at the end keeps a trailing empty string.
         e2e_regexp_symbol_split_direct_trailing_empty_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,"); out.length === 2 && out[0] === "a" && out[1] === """#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Splitting at the start keeps a leading empty string.
         e2e_regexp_symbol_split_direct_leading_empty_deep,
         r#"var re = /,/; var out = re[Symbol.split](",a"); out.length === 2 && out[0] === "" && out[1] === "a""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Adjacent matches keep empty strings between separators.
         e2e_regexp_symbol_split_direct_adjacent_matches_deep,
         r#"var re = /,/; var out = re[Symbol.split]("a,,b"); out.length === 3 && out[0] === "a" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Global regexps split correctly and preserve empties.
         e2e_regexp_symbol_split_direct_global_flag_deep,
         r#"var re = /a/g; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Empty-input optional matches still return an empty array.
         e2e_regexp_symbol_split_direct_empty_input_optional_match_deep,
         r#"var re = /a?/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Lookaheads at the start do not create an extra leading empty string.
         e2e_regexp_symbol_split_direct_lookahead_at_start_deep,
         r#"var re = /(?=a)/; var out = re[Symbol.split]("ab"); out.length === 1 && out[0] === "ab""#
@@ -79996,49 +80484,42 @@ mod tests {
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `String.prototype.matchAll` delegates to custom `@@matchAll`.
         e2e_string_match_all_custom_symbol_dispatch,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s, s.toUpperCase()][Symbol.iterator](); } }); var out = Array.from("ab".matchAll(matcher)); out.length === 2 && out[0] === "ab" && out[1] === "AB""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@matchAll` receives the matcher as `this`.
         e2e_string_match_all_custom_symbol_this_binding,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [this === matcher && s === "ab"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === true"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Inherited `@@matchAll` participates in `String.prototype.matchAll`.
         e2e_string_match_all_custom_symbol_inherited,
         r#"var proto = {}; Object.defineProperty(proto, Symbol.matchAll, { value: function(s) { return [s.length][Symbol.iterator](); } }); var matcher = Object.create(proto); Array.from("abcd".matchAll(matcher))[0] === 4"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Non-callable `@@matchAll` throws.
         e2e_string_match_all_custom_symbol_non_callable_throws,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: 123 }); try { Array.from("ab".matchAll(matcher)); false; } catch (e) { e instanceof TypeError; }"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// `undefined` `@@matchAll` falls back to string coercion.
         e2e_string_match_all_custom_symbol_undefined_falls_back,
         r#"var matcher = { toString: function() { return "a"; } }; Object.defineProperty(matcher, Symbol.matchAll, { value: undefined }); Array.from("aba".matchAll(matcher)).length === 2"#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// Custom `@@matchAll` does not require a global regexp.
         e2e_string_match_all_custom_symbol_no_global_requirement,
         r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s + "!"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === "ab!""#
     );
 
     string_symbol_dispatch_test!(
-        #[ignore] // TODO: conformance — not yet passing
         /// RegExp `matchAll` preserves the original `lastIndex`.
         e2e_string_match_all_regexp_preserves_last_index,
         r#"var re = /a/g; re.lastIndex = 1; var out = Array.from("baaa".matchAll(re)); re.lastIndex === 1 && out.length === 3 && out[0].index === 1 && out[2].index === 3"#
@@ -80159,7 +80640,27 @@ mod tests {
     /// RegExp.escape: escapes syntax characters.
     #[test]
     fn e2e_regexp_escape_syntax_chars() {
-        assert_eval_true(r#"RegExp.escape("a.b+c") === "a\\.b\\+c""#);
+        assert_eval_true(r#"RegExp.escape("a.b+c") === "\\x61\\.b\\+c""#);
+    }
+
+    /// RegExp.escape: escapes the leading ASCII letter or digit.
+    #[test]
+    fn e2e_regexp_escape_leading_alnum() {
+        assert_eval_true(r#"RegExp.escape("foo") === "\\x66oo""#);
+        assert_eval_true(r#"RegExp.escape("1foo") === "\\x31foo""#);
+    }
+
+    /// RegExp.escape: hex-escapes punctuators that cannot be identity-escaped.
+    #[test]
+    fn e2e_regexp_escape_punctuators() {
+        assert_eval_true(r#"RegExp.escape(",-=\"`") === "\\x2c\\x2d\\x3d\\x22\\x60""#);
+    }
+
+    /// RegExp.escape: uses canonical whitespace escapes.
+    #[test]
+    fn e2e_regexp_escape_whitespace() {
+        assert_eval_true(r#"RegExp.escape(" \n\t") === "\\x20\\n\\t""#);
+        assert_eval_true(r#"RegExp.escape("\u2028") === "\\u2028""#);
     }
 
     /// toString: returns /source/flags format.
@@ -80176,7 +80677,6 @@ mod tests {
 
     /// matchAll: returns iterator of match objects with groups.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_regexp_matchall_named_groups() {
         assert_eval_true(
             r#"var results = [];
@@ -80526,7 +81026,6 @@ mod tests {
 
     /// Private field access inside class method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_access() {
         assert_eval_true(
             "class C { #x = 42; get() { return this.#x; } } \
@@ -80536,7 +81035,6 @@ mod tests {
 
     /// Private field is not accessible outside class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_not_external() {
         let result = global_eval("class C { #x = 1; } new C().#x");
         assert!(
@@ -80596,7 +81094,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_reachable_from_nested_closure() {
         assert_eval_true(
             "class C { #x = 4; #m() { return this.#x; } make() { return () => this.#m(); } } \
@@ -80646,7 +81143,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_getter_behavior() {
         assert_eval_true(
             "class C { #value = 21; get #x() { return this.#value * 2; } read() { return this.#x; } } \
@@ -80655,7 +81151,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_setter_behavior() {
         assert_eval_true(
             "class C { #value = 0; set #x(v) { this.#value = v + 1; } run() { this.#x = 9; return this.#value; } } \
@@ -80664,7 +81159,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_accessor_getter_setter_pair() {
         assert_eval_true(
             "class C { #value = 1; get #x() { return this.#value; } set #x(v) { this.#value = v; } run() { this.#x = 7; return this.#x; } } \
@@ -80697,7 +81191,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_in_operator_subclass_instance_true() {
         assert_eval_true(
             "class Base { #x = 1; static has(o) { return #x in o; } } \
@@ -80741,7 +81234,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_fields_in_subclass_inherit_parent_access() {
         assert_eval_true(
             "class Base { #x = 5; getBase() { return this.#x; } } \
@@ -80751,7 +81243,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_fields_in_subclass_keep_own_fields() {
         assert_eval_true(
             "class Base { #x = 5; getBase() { return this.#x; } } \
@@ -80762,7 +81253,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_shadowing_parent_child() {
         assert_eval_true(
             "class Base { #x = 1; getBase() { return this.#x; } } \
@@ -80772,7 +81262,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_shadowing_parent_child() {
         assert_eval_true(
             "class Base { #m() { return 1; } callBase() { return this.#m(); } } \
@@ -80783,7 +81272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_nested_closure_read() {
         assert_eval_true(
             "class C { #x = 3; make() { let self = this; return function() { return self.#x; }; } } \
@@ -80792,7 +81280,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_nested_arrow_update() {
         assert_eval_true(
             "class C { #x = 1; run() { let bump = () => { this.#x = this.#x + 1; return this.#x; }; return bump() === 2 && this.#x === 2; } } \
@@ -80801,7 +81288,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_closure_survives_after_method_return() {
         assert_eval_true(
             "class C { #x = 11; make() { return () => this.#x; } } \
@@ -80811,7 +81297,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_brand_isolated_between_classes() {
         assert_eval_true(
             "class A { #x = 1; static has(o) { return #x in o; } get() { return this.#x; } } \
@@ -80823,7 +81308,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_brand_shadowing_adds_both_brands() {
         assert_eval_true(
             "class Base { #x = 1; static hasBase(o) { return #x in o; } getBase() { return this.#x; } } \
@@ -80834,7 +81318,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_initializer_with_sibling_private_access() {
         assert_eval_true(
             "class C { #x = 6; #y = this.#x + 1; sum() { return this.#x + this.#y; } } \
@@ -80870,7 +81353,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method_can_access_parent_private_field_on_subclass_instance() {
         assert_eval_true(
             "class Base { #x = 10; #m() { return this.#x; } callBase() { return this.#m(); } } \
@@ -80950,7 +81432,6 @@ mod tests {
 
     /// Private field with default value of zero is not nullish.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_default_zero() {
         assert_eval_true(
             "class C { #x = 0; get() { return this.#x; } } \
@@ -81084,7 +81565,6 @@ mod tests {
 
     // 14. Class getter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_getter() {
         assert_eval_true(
             "class C { get x() { return 99; } } \
@@ -81094,7 +81574,6 @@ mod tests {
 
     // 15. Class setter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_setter() {
         assert_eval_true(
             "class C { \
@@ -81108,7 +81587,6 @@ mod tests {
 
     // 16. Class getter/setter pair — this binding
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_getter_setter_this() {
         assert_eval_true(
             "class C { \
@@ -81143,7 +81621,6 @@ mod tests {
 
     // 19. Inherited getter from prototype chain
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_inherited_getter_prototype() {
         assert_eval_true(
             "var parent = { get x() { return 'from parent'; } }; \
@@ -81164,7 +81641,6 @@ mod tests {
 
     // 21. Inherited getter with correct this (receiver is child)
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_inherited_getter_this_receiver() {
         assert_eval_true(
             "var parent = { get id() { return this._id; } }; \
@@ -81289,7 +81765,6 @@ mod tests {
 
     // 33. Accessor property in for...in
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_accessor_property_in_for_in() {
         assert_eval_true(
             "var o = { get x() { return 1; }, y: 2 }; \
@@ -81298,21 +81773,19 @@ mod tests {
         );
     }
 
-    // 34. Overriding inherited getter with own property
+    // 34. Inherited getter without setter rejects sloppy assignment shadowing
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_override_inherited_getter() {
         assert_eval_true(
             "var parent = { get x() { return 'parent'; } }; \
              var child = Object.create(parent); \
              child.x = 'child'; \
-             child.x === 'child'",
+             child.x === 'parent' && Object.getOwnPropertyNames(child).length === 0",
         );
     }
 
     // 35. Class with both instance and static getter
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_class_instance_and_static_getter() {
         assert_eval_true(
             "class C { \
@@ -81382,7 +81855,6 @@ mod tests {
     // ── @@hasInstance ────────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_basic_function() {
         assert_eval_true(
             "function Foo() {} \
@@ -81405,7 +81877,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_class_override() {
         assert_eval_true(
             r#"
@@ -81425,7 +81896,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_has_instance_array_instanceof() {
         assert_eval_true("[] instanceof Array");
     }
@@ -81443,7 +81913,6 @@ mod tests {
     // ── @@isConcatSpreadable ────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_default_array() {
         assert_eval_true("[1,2].concat([3,4]).length === 4");
     }
@@ -81461,7 +81930,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_true_on_object() {
         assert_eval_true(
             r#"
@@ -81485,7 +81953,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_wk_concat_spreadable_undefined_falls_back() {
         assert_eval_true(
             r#"
@@ -81708,47 +82175,65 @@ mod tests {
 
     /// `Array.fromAsync` with sync array resolves to array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_sync_array() {
-        let result = global_eval(
-            r#"
-            var p = Array.fromAsync([10, 20, 30]);
-            var arr = p.__value__;
-            arr.length
-            "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        match eval_with_microtasks("Array.fromAsync([10, 20, 30])") {
+            JsValue::Promise(promise) => match promise.state() {
+                crate::builtins::promise::PromiseState::Fulfilled(JsValue::Array(items)) => {
+                    let items = items.borrow();
+                    assert_eq!(items.len(), 3);
+                    assert_eq!(items[0], JsValue::Smi(10));
+                    assert_eq!(items[1], JsValue::Smi(20));
+                    assert_eq!(items[2], JsValue::Smi(30));
+                }
+                other => panic!("expected fulfilled array promise, got {other:?}"),
+            },
+            other => panic!("expected promise, got {other:?}"),
+        }
     }
 
     /// `Array.fromAsync` with mapFn applies mapping.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_with_map_fn() {
-        let result = global_eval(
+        assert_microtask_transition(
             r#"
-            var p = Array.fromAsync([1, 2, 3], function(x) { return x * 2; });
-            var arr = p.__value__;
-            arr[0] + arr[1] + arr[2]
+            var seen = 0;
+            Array.fromAsync([1, 2, 3], function(x) { return x * 2; })
+                .then(function(arr) { seen = arr[0] + arr[1] + arr[2]; });
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(12));
+            "seen",
+            JsValue::Smi(0),
+            JsValue::Smi(12),
+        );
+    }
+
+    /// `Array.fromAsync` awaits fulfilled promise inputs and mapper results.
+    #[test]
+    fn e2e_array_from_async_awaits_promises() {
+        assert_microtask_transition(
+            r#"
+            var seen = 0;
+            Array.fromAsync([Promise.resolve(1), Promise.resolve(2)], function(x) {
+                return Promise.resolve(x * 3);
+            }).then(function(arr) { seen = arr[0] + arr[1]; });
+            "#,
+            "seen",
+            JsValue::Smi(0),
+            JsValue::Smi(9),
+        );
     }
 
     /// `Array.fromAsync` with empty array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_from_async_empty() {
-        let result = global_eval(
+        assert_microtask_transition(
             r#"
-            var p = Array.fromAsync([]);
-            var arr = p.__value__;
-            arr.length
+            var seen = -1;
+            Array.fromAsync([]).then(function(arr) { seen = arr.length; });
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(0));
+            "seen",
+            JsValue::Smi(-1),
+            JsValue::Smi(0),
+        );
     }
 
     /// `Array.fromAsync.length` is 1.
@@ -81768,8 +82253,49 @@ mod tests {
     /// `Array.fromAsync` rejects non-function mapFn.
     #[test]
     fn e2e_array_from_async_non_function_map_fn_throws() {
-        let result = global_eval("Array.fromAsync([1], 42)");
-        assert!(result.is_err());
+        match eval_with_microtasks("Array.fromAsync([1], 42)") {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert!(
+                    promise
+                        .reason()
+                        .and_then(|reason| reason.to_js_string().ok())
+                        .is_some_and(|reason| reason.contains("mapFn is not a function"))
+                );
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
+    }
+
+    /// `Array.fromAsync` rejects when mapFn throws.
+    #[test]
+    fn e2e_array_from_async_map_fn_throw_rejects() {
+        match eval_with_microtasks(
+            r#"Array.fromAsync([1], function() { throw new TypeError("bad map"); })"#,
+        ) {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert!(
+                    promise
+                        .reason()
+                        .and_then(|reason| reason.to_js_string().ok())
+                        .is_some_and(|reason| reason.contains("bad map"))
+                );
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
+    }
+
+    /// `Array.fromAsync` rejects if an input promise rejects.
+    #[test]
+    fn e2e_array_from_async_rejected_input_rejects() {
+        match eval_with_microtasks(r#"Array.fromAsync([Promise.reject("bad input")])"#) {
+            JsValue::Promise(promise) => {
+                assert!(promise.is_rejected());
+                assert_eq!(promise.reason(), Some(JsValue::String("bad input".into())));
+            }
+            other => panic!("expected rejected promise, got {other:?}"),
+        }
     }
 
     // ── Additional Object.groupBy e2e tests ─────────────────────────────
@@ -81950,7 +82476,6 @@ mod tests {
 
     /// `concat` flattens one level of arrays.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_basic() {
         let r = global_eval("[1,2].concat([3,4],[5]).join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
@@ -81972,7 +82497,6 @@ mod tests {
 
     /// `concat` with empty arrays.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_empty() {
         let r = global_eval("[].concat([],[]).length").unwrap();
         assert_eq!(r, JsValue::Smi(0));
@@ -81995,7 +82519,6 @@ mod tests {
 
     /// `concat` with Symbol.isConcatSpreadable true on object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_concat_spreadable_object() {
         let r = global_eval(
             r#"
@@ -82145,7 +82668,6 @@ mod tests {
 
     /// `reduce` on empty array without initial throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_array_reduce_empty_no_initial_throws() {
         let r = global_eval(
             "try { [].reduce(function(a, b) { return a + b; }); false; } \
@@ -82896,7 +83418,6 @@ mod tests {
 
     /// Accessor on proto, reading through child.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_getter_read() {
         assert_eval_true(
             "var parent = {}; \
@@ -82941,7 +83462,6 @@ mod tests {
 
     /// Accessor setter on proto is invoked when writing to child.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_setter_this_binding() {
         assert_eval_true(
             "var parent = {}; \
@@ -82958,7 +83478,6 @@ mod tests {
 
     /// Accessor on proto does NOT show in hasOwnProperty.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_accessor_not_own() {
         assert_eval_true(
             "var parent = {}; \
@@ -82972,7 +83491,6 @@ mod tests {
 
     /// Multiple levels of prototype chain with accessors.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_chain_multi_level_accessor() {
         assert_eval_true(
             "var a = {}; \
@@ -82987,7 +83505,6 @@ mod tests {
 
     /// Own data property overrides accessor several levels up.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_chain_own_shadows_deep_accessor() {
         assert_eval_true(
             "var a = {}; \
@@ -83056,12 +83573,12 @@ mod tests {
         );
     }
 
-    /// Reflect.defineProperty mixed data+accessor → returns false.
+    /// Reflect.defineProperty mixed data+accessor descriptors throw during conversion.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
-    fn e2e_reflect_define_property_mixed_returns_false() {
+    fn e2e_reflect_define_property_mixed_descriptor_throws() {
         assert_eval_true(
-            "Reflect.defineProperty({}, 'x', { value: 1, get: function() {} }) === false",
+            "try { Reflect.defineProperty({}, 'x', { value: 1, get: function() {} }); false; } \
+             catch (e) { e instanceof TypeError; }",
         );
     }
 
@@ -83103,7 +83620,6 @@ mod tests {
 
     /// String exotic: ownKeys returns indices then "length".
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_string_exotic_own_keys() {
         assert_e2e_true(
             r#"var s = new String("ab"); var k = Object.getOwnPropertyNames(s); k[0] === "0" && k[1] === "1" && k[k.length - 1] === "length""#,
@@ -83112,7 +83628,6 @@ mod tests {
 
     /// String exotic: indexed properties are not writable.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_string_exotic_index_not_writable() {
         assert_e2e_true(
             r#"var s = new String("abc"); var d = Object.getOwnPropertyDescriptor(s, "0"); d.writable === false && d.enumerable === true"#,
@@ -83131,21 +83646,18 @@ mod tests {
 
     /// Arguments: arguments.length matches actual args count.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_length() {
         assert_e2e_true("function f() { return arguments.length; } f(1, 2, 3) === 3");
     }
 
     /// Arguments: callee in sloppy mode refers to function itself.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_callee_sloppy() {
         assert_e2e_true("function f() { return arguments.callee === f; } f()");
     }
 
     /// Arguments: Symbol.iterator makes arguments iterable.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_symbol_iterator() {
         assert_e2e_true(
             "function f() { var sum = 0; for (var x of arguments) sum += x; return sum; } f(1, 2, 3) === 6",
@@ -83154,14 +83666,12 @@ mod tests {
 
     /// Arguments in sloppy mode: mutation of param reflects in arguments.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_sloppy_param_mutation() {
         assert_e2e_true("function f(a) { a = 99; return arguments[0] === 99; } f(1)");
     }
 
     /// Arguments in sloppy mode: mutation of arguments[0] reflects in param.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_sloppy_arg_mutation() {
         assert_e2e_true("function f(a) { arguments[0] = 42; return a === 42; } f(1)");
     }
@@ -83170,7 +83680,6 @@ mod tests {
 
     /// Strict mode: arguments.callee throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_callee_throws() {
         assert_e2e_true(
             r#""use strict"; function f() { try { arguments.callee; return false; } catch(e) { return e instanceof TypeError; } } f()"#,
@@ -83179,7 +83688,6 @@ mod tests {
 
     /// Strict mode: arguments is not mapped to parameters.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_no_mapping() {
         assert_e2e_true(
             r#""use strict"; function f(a) { a = 99; return arguments[0] !== 99; } f(1)"#,
@@ -83188,7 +83696,6 @@ mod tests {
 
     /// Strict mode: arguments reverse mapping also absent.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_strict_no_reverse_mapping() {
         assert_e2e_true(
             r#""use strict"; function f(a) { arguments[0] = 42; return a !== 42; } f(1)"#,
@@ -83227,7 +83734,6 @@ mod tests {
 
     /// bind: instanceof works with bound function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bind_instanceof() {
         assert_e2e_true(
             "function Foo() {} var BF = Foo.bind(null); var obj = new BF(); obj instanceof Foo",
@@ -83238,7 +83744,6 @@ mod tests {
 
     /// new on bound function ignores thisArg.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_ignores_this_arg() {
         assert_e2e_true(
             "function Ctor(x) { this.x = x; } \
@@ -83250,7 +83755,6 @@ mod tests {
 
     /// new on bound function passes bound args.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_bound_args() {
         assert_e2e_true(
             "function Ctor(a, b) { this.sum = a + b; } \
@@ -83262,7 +83766,6 @@ mod tests {
 
     /// new on double-bound function.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bound_new_double_bind() {
         assert_e2e_true(
             "function Ctor(a, b, c) { this.r = a + b + c; } \
@@ -83270,6 +83773,39 @@ mod tests {
              var B2 = B1.bind(null, 2); \
              var obj = new B2(3); \
              obj.r === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_bound_class_constructor_runs_class_fields() {
+        assert_e2e_true(
+            "class C { field = 7; constructor(x) { this.x = x; this.isC = new.target === C; } } \
+             var Bound = C.bind({ ignored: true }, 42); \
+             var obj = new Bound(); \
+             obj.field === 7 && obj.x === 42 && obj.isC && obj instanceof C",
+        );
+    }
+
+    #[test]
+    fn e2e_bound_derived_class_constructor_calls_super() {
+        assert_e2e_true(
+            "class Base { constructor(x) { this.base = x; } } \
+             class Derived extends Base { constructor(x, y) { super(x); this.own = y; } } \
+             var Bound = Derived.bind(null, 5); \
+             var obj = new Bound(6); \
+             obj.base === 5 && obj.own === 6 && obj instanceof Derived && obj instanceof Base",
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_construct_bound_class_preserves_explicit_new_target() {
+        assert_e2e_true(
+            "class Base { constructor() { this.isAlt = new.target === Alt; } } \
+             function Alt() {} \
+             Alt.prototype = { marker: true }; \
+             var Bound = Base.bind(null); \
+             var obj = Reflect.construct(Bound, [], Alt); \
+             obj.isAlt === true && Object.getPrototypeOf(obj) === Alt.prototype",
         );
     }
 
@@ -83349,7 +83885,6 @@ mod tests {
 
     /// Array: setting .length truncates elements.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_array_length_truncates() {
         assert_e2e_true(
             "var a = [1, 2, 3, 4, 5]; a.length = 2; a.length === 2 && a[2] === undefined",
@@ -83364,7 +83899,6 @@ mod tests {
 
     /// Array: setting .length to 0 clears array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_array_length_zero_clears() {
         assert_e2e_true("var a = [1, 2, 3]; a.length = 0; a.length === 0 && a[0] === undefined");
     }
@@ -83381,7 +83915,6 @@ mod tests {
 
     /// Proxy as prototype: get trap intercepts property access.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_as_prototype_get() {
         assert_e2e_true(
             "var handler = { get: function(t, p) { return p === 'x' ? 42 : undefined; } }; \
@@ -83393,7 +83926,6 @@ mod tests {
 
     /// Proxy as prototype: has trap intercepts 'in' operator.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_as_prototype_has() {
         assert_e2e_true(
             "var handler = { has: function(t, p) { return p === 'secret'; } }; \
@@ -83416,7 +83948,6 @@ mod tests {
 
     /// Proxy: apply trap for function proxy.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_proxy_apply_trap() {
         assert_e2e_true(
             "var p = new Proxy(function(x) { return x * 2; }, { \
@@ -83430,7 +83961,6 @@ mod tests {
 
     /// Revoked proxy: get throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_revoked_proxy_get_throws() {
         assert_e2e_true(
             "var r = Proxy.revocable({}, {}); r.revoke(); \
@@ -83467,7 +83997,6 @@ mod tests {
 
     /// Revoked proxy: ownKeys throws TypeError.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_revoked_proxy_ownkeys_throws() {
         assert_e2e_true(
             "var r = Proxy.revocable({}, {}); r.revoke(); \
@@ -83493,14 +84022,12 @@ mod tests {
 
     /// arguments.length reflects actual argument count, not formal params.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_length_actual_count() {
         assert_e2e_true("function f(a) { return arguments.length; } f(1, 2, 3) === 3");
     }
 
     /// arguments: extra args beyond params accessible.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_arguments_extra_args() {
         assert_e2e_true(
             "function f(a) { return arguments[1] + arguments[2]; } f(1, 10, 20) === 30",
@@ -83517,7 +84044,6 @@ mod tests {
 
     /// Bound function: bind of bind preserves .name chain.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w21f_bind_of_bind_name() {
         assert_e2e_true(
             r#"function bar() {} var b1 = bar.bind(null); var b2 = b1.bind(null); b2.name === "bound bound bar""#,
@@ -83697,7 +84223,6 @@ mod tests {
 
     /// try/finally: finally does NOT override the completion value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_finally_completion_value() {
         let result = global_eval("try { 1 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -83705,7 +84230,6 @@ mod tests {
 
     /// try/catch/finally: finally does NOT override completion value.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_catch_finally_completion() {
         let result = global_eval("try { 1 } catch(e) { 2 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(1));
@@ -83713,7 +84237,6 @@ mod tests {
 
     /// try/catch/finally with thrown error: catch value is kept, finally doesn't override.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_try_catch_finally_thrown() {
         let result = global_eval("try { throw 'err'; } catch(e) { 2 } finally { 3 }").unwrap();
         assert_eq!(result, JsValue::Smi(2));
@@ -83867,7 +84390,6 @@ mod tests {
 
     /// if without else: completion is undefined when false.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_if_no_else_false() {
         let result = global_eval("if (false) { 1 }").unwrap();
         assert_eq!(result, JsValue::Undefined);
@@ -83875,7 +84397,6 @@ mod tests {
 
     /// Empty statement: completion is undefined.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_w22h_empty_statement_completion() {
         let result = global_eval("if (true) ;").unwrap();
         assert_eq!(result, JsValue::Undefined);

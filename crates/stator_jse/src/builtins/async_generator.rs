@@ -20,7 +20,7 @@ use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{Interpreter, async_iterator_result_promise};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
-use crate::objects::value::{GeneratorStep, JsValue};
+use crate::objects::value::JsValue;
 
 // ── Helpers (local) ─────────────────────────────────────────────────────────
 
@@ -42,14 +42,6 @@ fn builtin_fn(
     props.insert("__call__".into(), JsValue::NativeFunction(Rc::new(f)));
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
-}
-
-/// Create a `{ value, done }` iterator result object.
-fn make_iter_result(value: JsValue, done: bool) -> JsValue {
-    let mut map = PropertyMap::new();
-    map.insert("value".to_string(), value);
-    map.insert("done".to_string(), JsValue::Boolean(done));
-    JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -90,12 +82,7 @@ pub fn make_async_generator_function() -> JsValue {
             let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             match this {
                 JsValue::Generator(gs) => {
-                    let result =
-                        Interpreter::run_generator_step(&gs, input).map(|step| match step {
-                            GeneratorStep::Yield(v) => make_iter_result(v, false),
-                            GeneratorStep::Return(v) => make_iter_result(v, true),
-                        });
-                    async_iterator_result_promise(result)
+                    async_iterator_result_promise(Interpreter::async_generator_next(&gs, input))
                 }
                 _ => Err(StatorError::TypeError(
                     "AsyncGenerator.prototype.next requires an async generator receiver".into(),

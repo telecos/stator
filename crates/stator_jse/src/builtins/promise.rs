@@ -30,16 +30,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::builtins::error::JsError;
+use crate::builtins::error::{JsError, capture_call_stack};
 use crate::error::StatorError;
-use crate::interpreter::{dispatch_call_with_this, dispatch_get_property_value};
+use crate::interpreter::{
+    Interpreter, current_global_env, dispatch_call_with_this, dispatch_get_property_value,
+};
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── Type aliases ───────────────────────────────────────────────────────────────
 
 /// The inner storage type for [`MicrotaskQueue`].
-type MicrotaskQueueInner = Rc<RefCell<VecDeque<Box<dyn FnOnce()>>>>;
+type MicrotaskQueueInner = Rc<RefCell<VecDeque<Microtask>>>;
 
 /// A handler closure used by [`promise_then`] and related functions.
 ///
@@ -63,6 +65,35 @@ thread_local! {
     static NEXT_PROMISE_ID: Cell<usize> = const { Cell::new(1) };
     static ACTIVE_REJECTION_EVENTS: RefCell<VecDeque<PromiseRejectionEvent>> =
         const { RefCell::new(VecDeque::new()) };
+    static ACTIVE_ASYNC_STACK: RefCell<Option<AsyncStackTrace>> = const { RefCell::new(None) };
+}
+
+/// Captured async parent stack for a queued microtask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncStackTrace {
+    /// CDP-style description of the async scheduling point.
+    pub description: String,
+    /// JavaScript function names captured when the task was scheduled.
+    pub frames: Vec<String>,
+    /// Parent async stack when this task was scheduled from another async task.
+    pub parent: Option<Box<AsyncStackTrace>>,
+}
+
+struct Microtask {
+    task: Box<dyn FnOnce()>,
+    async_stack: Option<AsyncStackTrace>,
+}
+
+struct AsyncStackGuard {
+    previous: Option<AsyncStackTrace>,
+}
+
+impl Drop for AsyncStackGuard {
+    fn drop(&mut self) {
+        ACTIVE_ASYNC_STACK.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
 }
 
 /// Install a [`MicrotaskQueue`] as the thread-local active queue.
@@ -83,10 +114,10 @@ pub fn drain_active_microtask_queue() -> usize {
         if let Some(q) = cell.borrow().as_ref() {
             let mut count = 0usize;
             loop {
-                let task = q.0.borrow_mut().pop_front();
-                match task {
-                    Some(t) => {
-                        t();
+                let microtask = q.0.borrow_mut().pop_front();
+                match microtask {
+                    Some(microtask) => {
+                        run_microtask(microtask);
                         count += 1;
                     }
                     None => break,
@@ -114,11 +145,48 @@ pub fn enqueue_active_microtask(task: Box<dyn FnOnce()>) -> bool {
     })
 }
 
+/// Return the thread-local active microtask queue, if one is installed.
+pub fn active_microtask_queue() -> Option<MicrotaskQueue> {
+    ACTIVE_MTQ.with(|cell| cell.borrow().clone())
+}
+
+/// Return the async parent stack for the currently running microtask.
+pub fn current_async_stack_trace() -> Option<AsyncStackTrace> {
+    ACTIVE_ASYNC_STACK.with(|cell| cell.borrow().clone())
+}
+
 /// Clear the thread-local active microtask queue reference.
 ///
 /// Call this when tearing down globals to avoid stale references.
 pub fn clear_active_microtask_queue() {
     ACTIVE_MTQ.with(|cell| *cell.borrow_mut() = None);
+    ACTIVE_ASYNC_STACK.with(|cell| *cell.borrow_mut() = None);
+}
+
+fn capture_async_stack_trace(description: &str) -> Option<AsyncStackTrace> {
+    let frames: Vec<String> = capture_call_stack()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let parent = ACTIVE_ASYNC_STACK.with(|cell| cell.borrow().clone().map(Box::new));
+    if frames.is_empty() && parent.is_none() {
+        return None;
+    }
+    Some(AsyncStackTrace {
+        description: description.to_string(),
+        frames,
+        parent,
+    })
+}
+
+fn enter_async_stack(async_stack: Option<AsyncStackTrace>) -> AsyncStackGuard {
+    let previous = ACTIVE_ASYNC_STACK.with(|cell| cell.replace(async_stack));
+    AsyncStackGuard { previous }
+}
+
+fn run_microtask(microtask: Microtask) {
+    let _guard = enter_async_stack(microtask.async_stack);
+    (microtask.task)();
 }
 
 /// Host-visible Promise rejection event kind.
@@ -234,7 +302,15 @@ impl MicrotaskQueue {
     /// The task will be run in FIFO order by the next call to
     /// [`drain`](Self::drain).
     pub fn enqueue(&self, task: Box<dyn FnOnce()>) {
-        self.0.borrow_mut().push_back(task);
+        self.enqueue_with_description("microtask", task);
+    }
+
+    /// Push a microtask with a host-visible async stack description.
+    pub fn enqueue_with_description(&self, description: &str, task: Box<dyn FnOnce()>) {
+        self.0.borrow_mut().push_back(Microtask {
+            task,
+            async_stack: capture_async_stack_trace(description),
+        });
     }
 
     /// Drain the queue: run all pending microtasks in FIFO order, including
@@ -252,9 +328,9 @@ impl MicrotaskQueue {
             if crate::interpreter::check_interrupt_flag() {
                 break;
             }
-            let task = self.0.borrow_mut().pop_front();
-            match task {
-                Some(t) => t(),
+            let microtask = self.0.borrow_mut().pop_front();
+            match microtask {
+                Some(microtask) => run_microtask(microtask),
                 None => break,
             }
         }
@@ -429,7 +505,7 @@ impl JsPromise {
     /// Transitions state from `Pending` to `Fulfilled(value)` and schedules
     /// all pending fulfillment reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
-    pub(crate) fn resolve(&self, value: JsValue, queue: &MicrotaskQueue) {
+    pub fn resolve(&self, value: JsValue, queue: &MicrotaskQueue) {
         if let JsValue::Promise(other) = &value {
             if Rc::ptr_eq(&self.0, &other.0) {
                 self.reject(
@@ -488,7 +564,7 @@ impl JsPromise {
                     Ok(JsValue::Undefined)
                 }));
 
-                match dispatch_call_with_this(
+                match call_thenable_method(
                     &then_fn,
                     then_value.clone(),
                     vec![resolve_fn, reject_fn],
@@ -530,7 +606,7 @@ impl JsPromise {
     /// Transitions state from `Pending` to `Rejected(reason)` and schedules
     /// all pending rejection reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
-    pub(crate) fn reject(&self, reason: JsValue, queue: &MicrotaskQueue) {
+    pub fn reject(&self, reason: JsValue, queue: &MicrotaskQueue) {
         let (promise_id, should_report_unhandled, reactions) = {
             let mut inner = self.0.borrow_mut();
             if !matches!(inner.state, PromiseStateInner::Pending { .. }) {
@@ -657,8 +733,22 @@ fn get_thenable_method(value: &JsValue) -> Result<Option<JsValue>, JsValue> {
     }
 }
 
+fn call_thenable_method(
+    then_fn: &JsValue,
+    this_value: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, StatorError> {
+    if let JsValue::NativeFunction(f) = then_fn
+        && current_global_env().is_none()
+    {
+        return f(args);
+    }
+    dispatch_call_with_this(then_fn, this_value, args)
+}
+
 fn rejection_reason_from_error(error: &StatorError) -> JsValue {
-    JsValue::String(error.to_string().into())
+    Interpreter::js_error_to_rejection_reason(error)
+        .unwrap_or_else(|| JsValue::String(error.to_string().into()))
 }
 
 // ── Constructor ────────────────────────────────────────────────────────────────
@@ -764,7 +854,8 @@ pub(crate) fn promise_reject_with_result(
     p_result
 }
 
-pub(crate) fn promise_pending() -> JsPromise {
+/// Create a fresh pending promise without exposing resolver callbacks.
+pub fn promise_pending() -> JsPromise {
     JsPromise::new_pending()
 }
 

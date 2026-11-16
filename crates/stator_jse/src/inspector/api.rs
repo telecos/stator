@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::inspector::cdp::{
     CdpDispatcher, DispatchOutcome, ExecutionContextDescription, default_execution_context,
 };
+use crate::inspector::debugger::{Debugger, PauseEvent};
 use crate::interpreter::GlobalEnv;
 
 /// One CDP session within an [`InProcessInspector`].
@@ -53,10 +54,13 @@ impl InProcessInspectorSession {
         id: u32,
         globals: Rc<RefCell<GlobalEnv>>,
         contexts: Vec<ExecutionContextDescription>,
+        debugger: Rc<RefCell<Debugger>>,
     ) -> Self {
+        let mut dispatcher = CdpDispatcher::with_globals_and_contexts(globals, contexts);
+        dispatcher.attach_debugger(debugger);
         Self {
             id,
-            dispatcher: CdpDispatcher::with_globals_and_contexts(globals, contexts),
+            dispatcher,
             cached: None,
         }
     }
@@ -105,6 +109,28 @@ impl InProcessInspectorSession {
     /// Returns `true` if this session's dispatcher has seen `Debugger.enable`.
     pub fn debugger_enabled(&self) -> bool {
         self.dispatcher.debugger_enabled()
+    }
+
+    /// Bridge an interpreter pause into this session by emitting a
+    /// `Debugger.paused` event derived from the attached interpreter
+    /// debugger's most recent pause. See
+    /// [`CdpDispatcher::notify_paused`].
+    pub fn notify_paused(&mut self) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_paused()
+    }
+
+    /// Emit a specific recorded pause event into this session's outbox.
+    pub fn notify_pause_event(&mut self, event: &PauseEvent) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_pause_event(event)
+    }
+
+    /// Emit a `Debugger.resumed` event into this session's outbox.
+    /// See [`CdpDispatcher::notify_resumed`].
+    pub fn notify_resumed(&mut self) -> bool {
+        self.cached = None;
+        self.dispatcher.notify_resumed()
     }
 
     /// Mutable access to the dispatcher.  Used by the parent inspector to
@@ -167,6 +193,11 @@ pub struct InProcessInspector {
     scripts: Vec<RegisteredScript>,
     /// Next script ID to assign; always non-zero.
     next_script_id: u32,
+    /// Single interpreter [`Debugger`] shared across every session this
+    /// inspector owns.  The interpreter only supports a single attached
+    /// debugger per thread, so sessions never own their own debugger; they
+    /// all observe pauses through this handle.
+    debugger: Rc<RefCell<Debugger>>,
 }
 
 impl InProcessInspector {
@@ -189,7 +220,78 @@ impl InProcessInspector {
             next_context_id: 2,
             scripts: Vec::new(),
             next_script_id: 1,
+            debugger: Rc::new(RefCell::new(Debugger::new())),
         }
+    }
+
+    /// Shared interpreter [`Debugger`] handle.  Embedders pass a clone of
+    /// this to [`crate::interpreter::attach_debugger`] before driving the
+    /// interpreter so that pause events surface through every connected
+    /// CDP session.
+    pub fn debugger(&self) -> Rc<RefCell<Debugger>> {
+        Rc::clone(&self.debugger)
+    }
+
+    /// Build a transport dispatcher that shares this inspector's embedder state.
+    ///
+    /// The returned dispatcher borrows the same globals, execution-context
+    /// snapshot, debugger handle, and registered script sources that in-process
+    /// sessions use. It is intended for single-threaded WebSocket serving via
+    /// [`CdpServer::accept_one_with_dispatcher`](crate::inspector::cdp::CdpServer::accept_one_with_dispatcher),
+    /// avoiding cross-thread movement of `Rc<RefCell<_>>` embedder state.
+    pub fn transport_dispatcher(&self) -> CdpDispatcher {
+        let mut dispatcher = CdpDispatcher::with_globals_and_contexts(
+            Rc::clone(&self.globals),
+            self.contexts.clone(),
+        );
+        dispatcher.attach_debugger(Rc::clone(&self.debugger));
+        for script in &self.scripts {
+            dispatcher.register_script_source(script.id, script.source.clone());
+        }
+        dispatcher
+    }
+
+    /// Emit a `Debugger.paused` event into every connected session whose
+    /// `Debugger` domain is enabled. Returns the number of sessions that
+    /// received an event.
+    ///
+    /// Embedders typically call this immediately after
+    /// [`crate::interpreter::Interpreter::run`] returns
+    /// [`crate::error::StatorError::DebuggerPaused`].
+    pub fn notify_paused(&mut self) -> usize {
+        let events = self.debugger.borrow_mut().take_pause_events();
+        if !events.is_empty() {
+            let mut emitted = 0;
+            for event in &events {
+                for session in &mut self.sessions {
+                    if session.notify_pause_event(event) {
+                        emitted += 1;
+                    }
+                }
+            }
+            return emitted;
+        }
+
+        let mut emitted = 0;
+        for session in &mut self.sessions {
+            if session.notify_paused() {
+                emitted += 1;
+            }
+        }
+        emitted
+    }
+
+    /// Emit a `Debugger.resumed` event into every connected session whose
+    /// `Debugger` domain is enabled.  Returns the number of sessions that
+    /// received an event.
+    pub fn notify_resumed(&mut self) -> usize {
+        let mut emitted = 0;
+        for session in &mut self.sessions {
+            if session.notify_resumed() {
+                emitted += 1;
+            }
+        }
+        emitted
     }
 
     /// Open a new session keyed by `session_id`.  The returned pointer is
@@ -197,11 +299,17 @@ impl InProcessInspector {
     /// [`InProcessInspector::disconnect`] is called for it or the inspector
     /// itself is dropped.
     pub fn connect(&mut self, session_id: u32) -> &mut InProcessInspectorSession {
-        let session = Box::new(InProcessInspectorSession::new(
+        let mut session = Box::new(InProcessInspectorSession::new(
             session_id,
             Rc::clone(&self.globals),
             self.contexts.clone(),
+            Rc::clone(&self.debugger),
         ));
+        for script in &self.scripts {
+            session
+                .dispatcher_mut()
+                .register_script_source(script.id, script.source.clone());
+        }
         self.sessions.push(session);
         // SAFETY: just pushed; the box is alive and uniquely owned.
         self.sessions.last_mut().expect("just pushed").as_mut()
@@ -374,6 +482,7 @@ impl InProcessInspector {
         };
         self.next_script_id = next_script_id;
 
+        let source_url = crate::inspector::cdp::registered_script_url(&source);
         let line_count = source.lines().count().max(1) as u32;
         let last_line_columns = source
             .lines()
@@ -391,13 +500,14 @@ impl InProcessInspector {
         // receive no notification, matching V8 inspector semantics.
         let params = json!({
             "scriptId": id.to_string(),
-            "url": "",
+            "url": source_url,
             "startLine": 0,
             "startColumn": 0,
             "endLine": line_count.saturating_sub(1),
             "endColumn": last_line_columns,
             "executionContextId": self.default_context_id(),
-            "hash": "",
+            "hash": crate::inspector::cdp::script_hash(&source),
+            "sourceMapURL": crate::inspector::cdp::registered_source_map_url(&source),
         });
         let event = json!({
             "method": "Debugger.scriptParsed",
@@ -405,6 +515,9 @@ impl InProcessInspector {
         });
         let serialised = event.to_string();
         for session in self.sessions.iter_mut() {
+            session
+                .dispatcher_mut()
+                .register_script_source(id, source.clone());
             if session.debugger_enabled() {
                 session.dispatcher_mut().push_raw(serialised.clone());
             }
@@ -450,6 +563,7 @@ impl InProcessInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::value::JsValue;
     use serde_json::Value;
 
     fn new_inspector() -> InProcessInspector {
@@ -462,6 +576,15 @@ mod tests {
             out.push(std::str::from_utf8(bytes).unwrap().to_string());
         }
         out
+    }
+
+    fn dispatch_direct(dispatcher: &mut CdpDispatcher, text: &str) -> Value {
+        assert_eq!(dispatcher.dispatch_json(text), DispatchOutcome::Ok);
+        let mut last = None;
+        while let Some(message) = dispatcher.take_next() {
+            last = Some(message);
+        }
+        serde_json::from_str(&last.expect("response")).expect("valid JSON")
     }
 
     #[test]
@@ -712,7 +835,10 @@ mod tests {
             let _s2 = inspector.connect(11);
         }
 
-        let id_a = inspector.register_script("var a = 1;\nvar b = 2;\n".to_string());
+        let id_a = inspector.register_script(
+            "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js\n//# sourceMappingURL=first.js.map"
+                .to_string(),
+        );
         let id_b = inspector.register_script("// second".to_string());
         assert_eq!(id_a, 1);
         assert_eq!(id_b, 2);
@@ -724,8 +850,17 @@ mod tests {
         let first: Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(first["method"], "Debugger.scriptParsed");
         assert_eq!(first["params"]["scriptId"], "1");
+        assert_eq!(first["params"]["url"], "stator://first.js");
+        assert_eq!(
+            first["params"]["hash"],
+            crate::inspector::cdp::script_hash(
+                "var a = 1;\nvar b = 2;\n//# sourceURL=stator://first.js\n//# sourceMappingURL=first.js.map"
+            )
+        );
+        assert_eq!(first["params"]["sourceMapURL"], "first.js.map");
         let second: Value = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(second["params"]["scriptId"], "2");
+        assert_eq!(second["params"]["sourceMapURL"], "");
 
         let s2 = inspector.session_by_id_mut(11).expect("s2");
         assert_eq!(
@@ -747,6 +882,108 @@ mod tests {
     }
 
     #[test]
+    fn registered_script_source_is_available_to_existing_and_late_sessions() {
+        let mut inspector = new_inspector();
+        let source = "let registered = 42;".to_string();
+        {
+            let session = inspector.connect(12);
+            drain_to_strings(session);
+        }
+
+        let script_id = inspector.register_script(source.clone());
+
+        {
+            let session = inspector.session_by_id_mut(12).expect("existing session");
+            assert_eq!(
+                session.dispatch_json(
+                    &json!({
+                        "id": 1,
+                        "method": "Debugger.getScriptSource",
+                        "params": { "scriptId": script_id.to_string() }
+                    })
+                    .to_string()
+                ),
+                DispatchOutcome::Ok
+            );
+            let messages = drain_to_strings(session);
+            let response: Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+            assert_eq!(response["result"]["scriptSource"], source);
+        }
+
+        {
+            let session = inspector.connect(13);
+            assert_eq!(
+                session.dispatch_json(
+                    &json!({
+                        "id": 2,
+                        "method": "Debugger.getScriptSource",
+                        "params": { "scriptId": script_id.to_string() }
+                    })
+                    .to_string()
+                ),
+                DispatchOutcome::Ok
+            );
+            let messages = drain_to_strings(session);
+            let response: Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+            assert_eq!(response["result"]["scriptSource"], "let registered = 42;");
+        }
+    }
+
+    #[test]
+    fn transport_dispatcher_shares_globals_contexts_debugger_and_scripts() {
+        let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+        globals
+            .borrow_mut()
+            .insert("shared".to_string(), JsValue::Smi(41));
+        let mut inspector = InProcessInspector::new(Rc::clone(&globals));
+        let group_id = inspector.create_context_group("https://edge.test", "edge");
+        let context_id = inspector.create_context(
+            group_id,
+            "https://edge.test",
+            "main",
+            json!({"frameId": "frame-1"}),
+        );
+        let source = "let registered = 42;\n//# sourceURL=stator://transport.js".to_string();
+        let script_id = inspector.register_script(source.clone());
+
+        let mut dispatcher = inspector.transport_dispatcher();
+        let eval = dispatch_direct(
+            &mut dispatcher,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"shared + 1"}}"#,
+        );
+        assert_eq!(eval["result"]["result"]["value"], 42);
+
+        let source_response = dispatch_direct(
+            &mut dispatcher,
+            &json!({
+                "id": 2,
+                "method": "Debugger.getScriptSource",
+                "params": { "scriptId": script_id.to_string() }
+            })
+            .to_string(),
+        );
+        assert_eq!(source_response["result"]["scriptSource"], source);
+
+        let targets = dispatch_direct(
+            &mut dispatcher,
+            r#"{"id":3,"method":"Target.getTargets","params":{}}"#,
+        );
+        let target_ids: Vec<_> = targets["result"]["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["targetId"].as_str().unwrap())
+            .collect();
+        let expected_target_id = format!("stator-{group_id}");
+        assert!(
+            target_ids
+                .iter()
+                .any(|target_id| *target_id == expected_target_id)
+        );
+        assert_ne!(context_id, 0);
+    }
+
+    #[test]
     fn disconnect_drops_session() {
         let mut inspector = new_inspector();
         let s1_ptr: *const InProcessInspectorSession = inspector.connect(20);
@@ -758,5 +995,124 @@ mod tests {
             !inspector.disconnect(s1_ptr),
             "double-disconnect is a no-op"
         );
+    }
+
+    #[test]
+    fn debugger_handle_is_shared_across_sessions() {
+        let mut inspector = new_inspector();
+        let dbg = inspector.debugger();
+        // The handle returned to the embedder must be the same Rc the
+        // sessions observe.
+        let _s = inspector.connect(30);
+        assert!(Rc::ptr_eq(&dbg, &inspector.debugger()));
+    }
+
+    #[test]
+    fn notify_paused_fans_out_to_debugger_enabled_sessions_only() {
+        let mut inspector = new_inspector();
+        inspector
+            .globals
+            .borrow_mut()
+            .insert("pausedGlobal".to_string(), JsValue::Smi(42));
+        let _ = inspector.connect(1);
+        let _ = inspector.connect(2);
+
+        // Enable Debugger only on session 1.
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        assert_eq!(
+            s1.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+            DispatchOutcome::Ok
+        );
+        // Drain the enable ack.
+        while s1.take_next_bytes().is_some() {}
+
+        // Drive a synthetic interpreter pause through the shared debugger.
+        let dbg = inspector.debugger();
+        let _ = dbg.borrow_mut().on_debugger_statement(99);
+
+        let emitted = inspector.notify_paused();
+        assert_eq!(emitted, 1, "only one session has Debugger.enable");
+
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        let msgs = drain_to_strings(s1);
+        assert_eq!(msgs.len(), 1);
+        let event: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Debugger.paused");
+        assert_eq!(event["params"]["reason"], "debuggerStatement");
+        let scope_object_id =
+            event["params"]["callFrames"][0]["scopeChain"][0]["object"]["objectId"]
+                .as_str()
+                .expect("global scope object id")
+                .to_string();
+        let props = dispatch_direct(
+            &mut s1.dispatcher,
+            &json!({
+                "id": 2,
+                "method": "Runtime.getProperties",
+                "params": { "objectId": scope_object_id }
+            })
+            .to_string(),
+        );
+        assert!(
+            props["result"]["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|property| property["name"] == "pausedGlobal"
+                    && property["value"]["value"] == 42)
+        );
+
+        let s2 = inspector.session_by_id_mut(2).unwrap();
+        let msgs2 = drain_to_strings(s2);
+        assert!(msgs2.is_empty(), "session 2 should receive nothing");
+    }
+
+    #[test]
+    fn notify_paused_fans_out_queued_pauses_to_every_enabled_session() {
+        let mut inspector = new_inspector();
+        for id in [1, 2] {
+            let session = inspector.connect(id);
+            assert_eq!(
+                session.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+                DispatchOutcome::Ok
+            );
+            drain_to_strings(session);
+        }
+
+        let dbg = inspector.debugger();
+        let _ = dbg.borrow_mut().on_debugger_statement(11);
+        let _ = dbg.borrow_mut().on_debugger_statement(22);
+
+        let emitted = inspector.notify_paused();
+        assert_eq!(emitted, 4, "two queued pauses fan out to two sessions");
+        for id in [1, 2] {
+            let session = inspector.session_by_id_mut(id).unwrap();
+            let messages = drain_to_strings(session);
+            assert_eq!(messages.len(), 2);
+            for message in messages {
+                let event: Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(event["method"], "Debugger.paused");
+                assert_eq!(event["params"]["reason"], "debuggerStatement");
+            }
+        }
+    }
+
+    #[test]
+    fn notify_resumed_only_targets_debugger_enabled_sessions() {
+        let mut inspector = new_inspector();
+        let _ = inspector.connect(1);
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        assert_eq!(
+            s1.dispatch_json(r#"{"id":1,"method":"Debugger.enable","params":{}}"#),
+            DispatchOutcome::Ok
+        );
+        while s1.take_next_bytes().is_some() {}
+
+        assert_eq!(inspector.notify_resumed(), 1);
+        let s1 = inspector.session_by_id_mut(1).unwrap();
+        let msgs = drain_to_strings(s1);
+        assert_eq!(msgs.len(), 1);
+        let event: Value = serde_json::from_str(&msgs[0]).unwrap();
+        assert_eq!(event["method"], "Debugger.resumed");
     }
 }

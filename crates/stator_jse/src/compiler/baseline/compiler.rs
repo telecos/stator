@@ -2064,7 +2064,11 @@ pub(crate) mod jit_runtime {
                         } else if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
                             let func_val = JsValue::Function(Rc::clone(ba));
                             let mut proto_map = PropertyMap::new();
-                            proto_map.insert("constructor".to_string(), func_val);
+                            proto_map.insert_with_attrs(
+                                "constructor".to_string(),
+                                func_val,
+                                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                            );
                             let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
                             crate::interpreter::fn_props_set(
                                 ba,
@@ -2536,7 +2540,7 @@ pub(crate) mod jit_runtime {
                 }
             }
 
-            // ── ThrowReferenceErrorIfHole ────────────────────────────────
+            // ── Runtime-catchable throw checks ────────────────────────────
             Opcode::ThrowReferenceErrorIfHole => {
                 let val = jit_i64_to_jsvalue(acc);
                 if matches!(val, JsValue::TheHole) {
@@ -2546,6 +2550,7 @@ pub(crate) mod jit_runtime {
                     Some(acc)
                 }
             }
+            Opcode::ThrowConstAssignmentTypeError => None,
 
             // ── LdaTheHole ──────────────────────────────────────────────
             Opcode::LdaTheHole => Some(jsvalue_to_jit_i64(JsValue::TheHole)),
@@ -3009,7 +3014,11 @@ pub(crate) mod jit_runtime {
                             // Lazy prototype creation (ES §10.2.5).
                             let func_val = JsValue::Function(Rc::clone(ba));
                             let mut proto_map = PropertyMap::new();
-                            proto_map.insert("constructor".to_string(), func_val);
+                            proto_map.insert_with_attrs(
+                                "constructor".to_string(),
+                                func_val,
+                                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                            );
                             let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
                             crate::interpreter::fn_props_set(
                                 ba,
@@ -3138,7 +3147,11 @@ pub(crate) mod jit_runtime {
                                 // Lazy prototype creation (ES §10.2.5).
                                 let func_val = JsValue::Function(Rc::clone(ba));
                                 let mut proto_map = PropertyMap::new();
-                                proto_map.insert("constructor".to_string(), func_val);
+                                proto_map.insert_with_attrs(
+                                    "constructor".to_string(),
+                                    func_val,
+                                    PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                                );
                                 let proto_obj =
                                     JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
                                 crate::interpreter::fn_props_set(
@@ -3259,7 +3272,11 @@ pub(crate) mod jit_runtime {
                     // Lazy prototype creation (ES §10.2.5).
                     let func_val = JsValue::Function(Rc::clone(ba));
                     let mut proto_map = PropertyMap::new();
-                    proto_map.insert("constructor".to_string(), func_val);
+                    proto_map.insert_with_attrs(
+                        "constructor".to_string(),
+                        func_val,
+                        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                    );
                     let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
                     crate::interpreter::fn_props_set(
                         ba,
@@ -3626,7 +3643,7 @@ pub(crate) mod jit_runtime {
                         store_slot = Some(*s as usize);
                     }
                 }
-                Opcode::LdaSmi => {
+                Opcode::LdaSmi | Opcode::LdaSmiStar => {
                     if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
                         pending_lda_smi = Some(*imm as i64);
                     }
@@ -3635,7 +3652,7 @@ pub(crate) mod jit_runtime {
                     has_return = true;
                 }
                 // Skip benign prefix/suffix instructions
-                Opcode::CreateMappedArguments | Opcode::Star => {}
+                Opcode::CreateMappedArguments | Opcode::Star | Opcode::Ldar => {}
                 // Any other opcode → not a simple increment pattern
                 _ => return None,
             }
@@ -8288,6 +8305,7 @@ pub(crate) mod jit_runtime {
         let ctx = JsContext {
             slots: vec![JsValue::Smi(0); 3],
             parent: None,
+            mapped_argument_aliases: Vec::new(),
         };
         let data_ptr = ctx.slots.as_ptr() as usize;
         let data_len = ctx.slots.len();
@@ -13531,6 +13549,7 @@ impl<'a> BaselineCompiler<'a> {
                 | Opcode::TestInstanceOf
                 | Opcode::TestIn
                 | Opcode::ThrowReferenceErrorIfHole
+                | Opcode::ThrowConstAssignmentTypeError
                 | Opcode::ToNumber
                 | Opcode::ToNumeric
                 | Opcode::CreateClosure
@@ -15899,17 +15918,12 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_runtime_stub(Opcode::TestIn, obj_flat, 0, bytecode_offset);
             }
 
-            // ── ThrowReferenceErrorIfHole runtime stub ──────────────────────
-            Opcode::ThrowReferenceErrorIfHole => {
+            // ── Runtime throw stubs ─────────────────────────────────────────
+            Opcode::ThrowReferenceErrorIfHole | Opcode::ThrowConstAssignmentTypeError => {
                 let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
-                    return Err(bad_operand("ThrowReferenceErrorIfHole", 0));
+                    return Err(bad_operand("runtime throw", 0));
                 };
-                self.emit_runtime_stub(
-                    Opcode::ThrowReferenceErrorIfHole,
-                    i64::from(name_idx),
-                    0,
-                    bytecode_offset,
-                );
+                self.emit_runtime_stub(instr.opcode, i64::from(name_idx), 0, bytecode_offset);
             }
 
             // ── LdaTheHole runtime stub ─────────────────────────────────────
@@ -15964,6 +15978,19 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 let reg_flat = self.reg_flat_index(v) as i64;
                 self.emit_runtime_stub(Opcode::PopContext, reg_flat, 0, bytecode_offset);
+            }
+
+            Opcode::ForwardMappedArgumentAlias => {
+                let Operand::Register(_) = *instr.operand(0) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 0));
+                };
+                let Operand::ConstantPoolIdx(_) = *instr.operand(1) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 1));
+                };
+                let Operand::ConstantPoolIdx(_) = *instr.operand(2) else {
+                    return Err(bad_operand("ForwardMappedArgumentAlias", 2));
+                };
+                self.emit_deopt(bytecode_offset);
             }
 
             // ── Div / Mod runtime stubs ─────────────────────────────────────

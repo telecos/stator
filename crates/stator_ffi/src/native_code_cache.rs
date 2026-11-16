@@ -59,7 +59,7 @@ impl StatorNativeCodeCacheTier {
 pub enum StatorNativeCodeCacheDiagnostic {
     /// Header classification accepted the fixed header shape.
     StatorNativeCodeCacheDiagnosticAccepted = 0,
-    /// A required pointer/length pair or output pointer was invalid.
+    /// A required input pointer/length pair or compatibility pointer was invalid.
     StatorNativeCodeCacheDiagnosticInvalidArgument = 1,
     /// Header structure, payload length, or payload digest was invalid.
     StatorNativeCodeCacheDiagnosticCorruptPayload = 2,
@@ -67,7 +67,10 @@ pub enum StatorNativeCodeCacheDiagnostic {
     StatorNativeCodeCacheDiagnosticRejectedArtifactType = 3,
     /// Engine crate or FFI ABI identity did not match.
     StatorNativeCodeCacheDiagnosticRejectedEngineVersion = 4,
-    /// Native artifact/header format version did not match.
+    /// Native artifact format version did not match.
+    ///
+    /// Unsupported fixed-header versions are treated as corrupt payloads because
+    /// the decoder only accepts `STATOR_NATIVE_CODE_CACHE_HEADER_VERSION`.
     StatorNativeCodeCacheDiagnosticRejectedFormatVersion = 5,
     /// Source key digest did not match the requested source artifact key.
     StatorNativeCodeCacheDiagnosticRejectedSourceIdentity = 6,
@@ -142,11 +145,28 @@ pub extern "C" fn stator_native_code_cache_header_size() -> usize {
 }
 
 /// Return a stable low-cardinality telemetry code string for a diagnostic.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_native_code_cache_diagnostic_name(
     diagnostic: StatorNativeCodeCacheDiagnostic,
 ) -> *const c_char {
     diagnostic_name_bytes(diagnostic).as_ptr().cast()
+}
+
+/// Return a stable telemetry code string for a raw diagnostic value.
+///
+/// Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+/// than requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_native_code_cache_diagnostic_name_u32(diagnostic: u32) -> *const c_char {
+    diagnostic_name_bytes_u32(diagnostic).as_ptr().cast()
 }
 
 /// Decode a native-tier artifact header without checking runtime compatibility.
@@ -156,8 +176,11 @@ pub extern "C" fn stator_native_code_cache_diagnostic_name(
 ///
 /// # Safety
 ///
-/// `bytes` must point to `len` readable bytes for the duration of the call.
-/// When `out_info` is non-null, it must be valid for one write.
+/// When `bytes` is non-null and `len > 0`, it must point to `len` readable
+/// bytes for the duration of the call. Null `bytes` or zero `len` returns
+/// `StatorNativeCodeCacheDiagnosticInvalidArgument`
+/// without dereferencing `bytes`. When `out_info` is non-null, it must be valid
+/// for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_native_code_cache_classify_header(
     bytes: *const u8,
@@ -185,9 +208,13 @@ pub unsafe extern "C" fn stator_native_code_cache_classify_header(
 ///
 /// # Safety
 ///
-/// `bytes` must point to `len` readable bytes for the duration of the call,
-/// `expected` must point to a valid compatibility struct, and `out_info` must be
-/// valid for one write when it is non-null.
+/// When `bytes` is non-null and `len > 0`, it must point to `len` readable
+/// bytes for the duration of the call. `expected` must either be null or point
+/// to a valid compatibility struct. Null `bytes`, zero `len`, or null
+/// `expected` returns
+/// `StatorNativeCodeCacheDiagnosticInvalidArgument`
+/// without dereferencing invalid inputs. When `out_info` is non-null, it must be
+/// valid for one write; null `out_info` is accepted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_native_code_cache_validate_header(
     bytes: *const u8,
@@ -396,40 +423,25 @@ fn sha256_digest(bytes: &[u8]) -> [u8; DIGEST_LEN] {
     Sha256::digest(bytes).into()
 }
 
-fn diagnostic_name_bytes(diagnostic: StatorNativeCodeCacheDiagnostic) -> &'static [u8] {
+fn diagnostic_name_bytes_u32(diagnostic: u32) -> &'static [u8] {
     match diagnostic {
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticAccepted => b"accepted\0",
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument => {
-            b"invalid_argument\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload => {
-            b"corrupt_payload\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType => {
-            b"rejected_artifact_type\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion => {
-            b"rejected_engine_version\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion => {
-            b"rejected_format_version\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedSourceIdentity => {
-            b"rejected_source_identity\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedPlatform => {
-            b"rejected_platform\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedBuildFeatures => {
-            b"rejected_build_features\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedCompilerFlags => {
-            b"rejected_compiler_flags\0"
-        }
-        StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticUnsupportedNativeCode => {
-            b"unsupported_native_code\0"
-        }
+        0 => b"accepted\0",
+        1 => b"invalid_argument\0",
+        2 => b"corrupt_payload\0",
+        3 => b"rejected_artifact_type\0",
+        4 => b"rejected_engine_version\0",
+        5 => b"rejected_format_version\0",
+        6 => b"rejected_source_identity\0",
+        7 => b"rejected_platform\0",
+        8 => b"rejected_build_features\0",
+        9 => b"rejected_compiler_flags\0",
+        10 => b"unsupported_native_code\0",
+        _ => b"unknown_diagnostic\0",
     }
+}
+
+fn diagnostic_name_bytes(diagnostic: StatorNativeCodeCacheDiagnostic) -> &'static [u8] {
+    diagnostic_name_bytes_u32(diagnostic as u32)
 }
 
 #[cfg(test)]
@@ -455,6 +467,34 @@ mod tests {
         let mut artifact = header.to_vec();
         artifact.extend_from_slice(payload);
         artifact
+    }
+
+    #[test]
+    fn test_header_size_accessor_matches_builder() {
+        let payload = b"native bytes";
+        let header = build_native_code_cache_header(&compatibility(), payload);
+        assert_eq!(
+            stator_native_code_cache_header_size(),
+            STATOR_NATIVE_CODE_CACHE_HEADER_SIZE
+        );
+        assert_eq!(header.len(), stator_native_code_cache_header_size());
+    }
+
+    fn sentinel_info() -> StatorNativeCodeCacheHeaderInfo {
+        StatorNativeCodeCacheHeaderInfo {
+            header_version: u32::MAX,
+            tier: StatorNativeCodeCacheTier::StatorNativeCodeCacheTierUnknown,
+            native_format_version: u32::MAX,
+            ffi_abi_version: u32::MAX,
+            engine_version_digest: [0xAA; DIGEST_LEN],
+            compiler_version_digest: [0xBB; DIGEST_LEN],
+            target_triple_digest: [0xCC; DIGEST_LEN],
+            cpu_feature_set_digest: [0xDD; DIGEST_LEN],
+            jit_flags_digest: [0xEE; DIGEST_LEN],
+            source_key_digest: [0x11; DIGEST_LEN],
+            payload_digest: [0x22; DIGEST_LEN],
+            payload_length_bytes: u64::MAX,
+        }
     }
 
     #[test]
@@ -502,6 +542,168 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_rejects_null_and_empty_input() {
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: null bytes are explicitly rejected before dereference; out pointer is valid.
+        let diagnostic =
+            unsafe { stator_native_code_cache_classify_header(std::ptr::null(), 1, &mut info) };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+
+        let bytes = b"";
+        // SAFETY: zero length is rejected before dereference; out pointer is valid.
+        let diagnostic =
+            unsafe { stator_native_code_cache_classify_header(bytes.as_ptr(), 0, &mut info) };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_classify_rejects_short_and_bad_magic_header() {
+        let mut info = sentinel_info();
+        let original = info;
+
+        let short = [0u8; STATOR_NATIVE_CODE_CACHE_HEADER_SIZE - 1];
+        // SAFETY: short buffer pointer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(short.as_ptr(), short.len(), &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+
+        let mut bad_magic = artifact(b"payload");
+        bad_magic[0] ^= 0xFF;
+        // SAFETY: artifact buffer pointer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(bad_magic.as_ptr(), bad_magic.len(), &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_classify_accepts_null_out_info() {
+        let artifact = artifact(b"payload");
+        // SAFETY: artifact bytes are valid for the duration of the call; null
+        // out_info is documented as accepted.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticAccepted
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_null_expected() {
+        let payload = b"payload";
+        let artifact = artifact(payload);
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: artifact bytes are valid; null expected is explicitly rejected before dereference.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                std::ptr::null(),
+                &mut info,
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_validate_rejects_null_and_empty_input() {
+        let expected = compatibility();
+        let mut info = sentinel_info();
+        let original = info;
+        // SAFETY: null bytes are explicitly rejected before dereference; pointers are otherwise valid.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(std::ptr::null(), 1, &expected, &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+
+        let bytes = b"";
+        // SAFETY: zero length is explicitly rejected before dereference; pointers are otherwise valid.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(bytes.as_ptr(), 0, &expected, &mut info)
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
+    fn test_validate_treats_header_version_mismatch_as_corrupt_payload() {
+        let expected = compatibility();
+        let mut artifact = artifact(b"payload");
+        artifact[8..12]
+            .copy_from_slice(&(STATOR_NATIVE_CODE_CACHE_HEADER_VERSION + 1).to_le_bytes());
+
+        // SAFETY: artifact and expected pointers are valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_validate_header(
+                artifact.as_ptr(),
+                artifact.len(),
+                &expected,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+    }
+
+    #[test]
+    fn test_classify_rejects_unknown_tier_as_corrupt_payload() {
+        let mut artifact = artifact(b"payload");
+        artifact[12..16].copy_from_slice(&99u32.to_le_bytes());
+
+        let mut info = sentinel_info();
+        let original = info;
+
+        // SAFETY: artifact buffer is valid for the duration of the call.
+        let diagnostic = unsafe {
+            stator_native_code_cache_classify_header(artifact.as_ptr(), artifact.len(), &mut info)
+        };
+
+        assert_eq!(
+            diagnostic,
+            StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload
+        );
+        assert_eq!(info, original);
+    }
+
+    #[test]
     fn test_validate_rejects_payload_digest_and_length_mismatch() {
         let payload = b"payload";
         let expected = compatibility();
@@ -543,6 +745,14 @@ mod tests {
         let payload = b"payload";
         let artifact = artifact(payload);
         let cases: &[(fn(&mut StatorNativeCodeCacheCompatibility), StatorNativeCodeCacheDiagnostic)] = &[
+            (
+                |c| c.tier = StatorNativeCodeCacheTier::StatorNativeCodeCacheTierMaglev,
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType,
+            ),
+            (
+                |c| c.native_format_version += 1,
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion,
+            ),
             (
                 |c| c.ffi_abi_version += 1,
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion,
@@ -612,12 +822,40 @@ mod tests {
                 "accepted",
             ),
             (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticInvalidArgument,
+                "invalid_argument",
+            ),
+            (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticCorruptPayload,
                 "corrupt_payload",
             ),
             (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedArtifactType,
+                "rejected_artifact_type",
+            ),
+            (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedEngineVersion,
                 "rejected_engine_version",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedFormatVersion,
+                "rejected_format_version",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedSourceIdentity,
+                "rejected_source_identity",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedPlatform,
+                "rejected_platform",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedBuildFeatures,
+                "rejected_build_features",
+            ),
+            (
+                StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticRejectedCompilerFlags,
+                "rejected_compiler_flags",
             ),
             (
                 StatorNativeCodeCacheDiagnostic::StatorNativeCodeCacheDiagnosticUnsupportedNativeCode,
@@ -626,9 +864,32 @@ mod tests {
         ];
         for (diagnostic, expected) in cases {
             let ptr = stator_native_code_cache_diagnostic_name(diagnostic);
+            assert!(
+                !ptr.is_null(),
+                "diagnostic name pointer must be non-null for {diagnostic:?}"
+            );
             // SAFETY: The function returns static NUL-terminated strings.
             let actual = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
             assert_eq!(actual, expected);
+
+            let raw_ptr = stator_native_code_cache_diagnostic_name_u32(diagnostic as u32);
+            assert!(
+                !raw_ptr.is_null(),
+                "raw diagnostic name pointer must be non-null for {diagnostic:?}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let raw_actual = unsafe { std::ffi::CStr::from_ptr(raw_ptr) }
+                .to_str()
+                .unwrap();
+            assert_eq!(raw_actual, expected);
         }
+
+        let unknown_ptr = stator_native_code_cache_diagnostic_name_u32(999);
+        assert!(!unknown_ptr.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        let unknown = unsafe { std::ffi::CStr::from_ptr(unknown_ptr) }
+            .to_str()
+            .unwrap();
+        assert_eq!(unknown, "unknown_diagnostic");
     }
 }

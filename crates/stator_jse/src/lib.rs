@@ -65,6 +65,10 @@ pub mod ic;
 pub mod inspector;
 /// Bytecode interpreter: fetch-decode-dispatch loop and activation frame.
 pub mod interpreter;
+/// Windows Control-Flow Guard / CET shadow-stack diagnostics for JIT
+/// executable pages.  Fail-closed per-tier counters plus a Windows process
+/// mitigation-policy probe.
+pub mod jit_mitigations;
 /// Windows x64 JIT unwind metadata registration (RtlAddFunctionTable wrapper)
 /// and fail-closed per-tier diagnostics.
 pub mod jit_unwind;

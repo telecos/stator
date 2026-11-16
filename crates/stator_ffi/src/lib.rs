@@ -22,10 +22,17 @@ use std::io::Write as _;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::ThreadId;
 
 use stator_jse::builtins::error::{ErrorKind, JsError};
-use stator_jse::builtins::promise::PromiseState;
+use stator_jse::builtins::promise::{
+    JsPromise, MicrotaskQueue, PromiseState, active_microtask_queue, install_active_microtask_queue,
+};
+use stator_jse::builtins::typed_array::{
+    JsArrayBuffer, JsDataView, JsTypedArray, TypedArrayKind, arraybuffer_new, dataview_new,
+    typed_array_new_from_buffer, typed_array_new_from_length,
+};
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
@@ -37,11 +44,12 @@ use stator_jse::compiler::deopt_counters::{self, DeoptReason, DeoptTier};
 use stator_jse::compiler::jit_memory::{self, JitMemoryTier};
 use stator_jse::compiler::osr_counters::{self, OsrExitReason, OsrTier};
 use stator_jse::dom::{
-    AccessCheckKey, AccessCheckOperation, DomClassIdRegistry, DomClassInfo, DomObjectWrap,
-    DomPropertyDefineResult, DomPropertyDescriptor, DomPropertyDescriptorResult,
+    AccessCheckKey, AccessCheckOperation, DomCallArgs, DomClassIdRegistry, DomClassInfo,
+    DomObjectWrap, DomPropertyDefineResult, DomPropertyDescriptor, DomPropertyDescriptorResult,
     IndexedPropertyHandlerConfig, IndexedPropertyHandlerFlags, NamedPropertyHandlerConfig,
     NamedPropertyHandlerFlags,
 };
+use stator_jse::error::{StatorError, StatorResult};
 use stator_jse::gc::heap::Heap;
 use stator_jse::host::{
     HostDynamicImportRequest, HostImportMeta, HostModuleLoader, HostModuleSourceMetadata,
@@ -49,11 +57,12 @@ use stator_jse::host::{
 use stator_jse::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, JitTier, TierRequestResult, TierRequestStatus,
+    decode_string_constant, dispatch_get_property_value, dispatch_set_property_value,
 };
+use stator_jse::jit_mitigations::{self, JitMitigationsTier};
 use stator_jse::jit_unwind;
-use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::map::PropertyAttributes;
-use stator_jse::objects::property_map::PropertyMap;
+use stator_jse::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use stator_jse::objects::value::{JsValue, ModuleBindingCell, NativeFn};
 use stator_jse::parser;
 use stator_jse::parser::ast::{
@@ -65,8 +74,8 @@ use stator_jse::snapshot::{
     load_globals_stwc, reinstall_globals_with_manifest, serialize_bytecode_array,
 };
 use stator_jse::wasm::{
-    HostFunc, HostFuncCallback, HostGlobal, HostMemory, HostVal, HostValKind, WasmEngine,
-    WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
+    HostFunc, HostFuncCallback, HostGlobal, HostMemory, HostVal, HostValKind, MemoryType,
+    SharedMemory, WasmEngine, WasmInstance, WasmModule, host_val_to_js_value, js_value_to_host_val,
 };
 
 // ── Stator FFI ABI version contract ──────────────────────────────────────────
@@ -92,7 +101,7 @@ pub const STATOR_FFI_ABI_VERSION_MAJOR: u32 = 1;
 /// Incremented for additive, backwards-compatible changes such as new
 /// exported functions or new enum variants appended at the end of an
 /// existing enum.
-pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 18;
+pub const STATOR_FFI_ABI_VERSION_MINOR: u32 = 39;
 
 /// Patch version of the Stator FFI C ABI.
 ///
@@ -103,16 +112,79 @@ pub const STATOR_FFI_ABI_VERSION_PATCH: u32 = 0;
 /// Packed Stator FFI ABI version: `(major << 16) | (minor << 8) | patch`.
 ///
 /// Embedders may compare this constant to the value returned by
-/// [`stator_ffi_abi_version`] to detect a header/library skew at runtime:
-///
-/// ```c
-/// if (stator_ffi_abi_version() != STATOR_FFI_ABI_VERSION) {
-///     /* header and shared library disagree — refuse to proceed. */
-/// }
-/// ```
+/// `stator_ffi_abi_version()` to detect a header/library skew at runtime. For
+/// example, if the returned value differs from `STATOR_FFI_ABI_VERSION`, the
+/// header and shared library disagree and the embedder should refuse to proceed.
 pub const STATOR_FFI_ABI_VERSION: u32 = (STATOR_FFI_ABI_VERSION_MAJOR << 16)
     | (STATOR_FFI_ABI_VERSION_MINOR << 8)
     | STATOR_FFI_ABI_VERSION_PATCH;
+
+/// C ABI representation of JavaScript typed-array element kinds.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorTypedArrayKind {
+    /// Not a typed-array value or an unknown future typed-array kind.
+    StatorTypedArrayKindInvalid = 0,
+    /// `Int8Array`.
+    StatorTypedArrayKindInt8 = 1,
+    /// `Uint8Array`.
+    StatorTypedArrayKindUint8 = 2,
+    /// `Uint8ClampedArray`.
+    StatorTypedArrayKindUint8Clamped = 3,
+    /// `Int16Array`.
+    StatorTypedArrayKindInt16 = 4,
+    /// `Uint16Array`.
+    StatorTypedArrayKindUint16 = 5,
+    /// `Int32Array`.
+    StatorTypedArrayKindInt32 = 6,
+    /// `Uint32Array`.
+    StatorTypedArrayKindUint32 = 7,
+    /// `Float32Array`.
+    StatorTypedArrayKindFloat32 = 8,
+    /// `Float64Array`.
+    StatorTypedArrayKindFloat64 = 9,
+    /// `BigInt64Array`.
+    StatorTypedArrayKindBigInt64 = 10,
+    /// `BigUint64Array`.
+    StatorTypedArrayKindBigUint64 = 11,
+}
+
+impl From<TypedArrayKind> for StatorTypedArrayKind {
+    fn from(kind: TypedArrayKind) -> Self {
+        match kind {
+            TypedArrayKind::Int8 => Self::StatorTypedArrayKindInt8,
+            TypedArrayKind::Uint8 => Self::StatorTypedArrayKindUint8,
+            TypedArrayKind::Uint8Clamped => Self::StatorTypedArrayKindUint8Clamped,
+            TypedArrayKind::Int16 => Self::StatorTypedArrayKindInt16,
+            TypedArrayKind::Uint16 => Self::StatorTypedArrayKindUint16,
+            TypedArrayKind::Int32 => Self::StatorTypedArrayKindInt32,
+            TypedArrayKind::Uint32 => Self::StatorTypedArrayKindUint32,
+            TypedArrayKind::Float32 => Self::StatorTypedArrayKindFloat32,
+            TypedArrayKind::Float64 => Self::StatorTypedArrayKindFloat64,
+            TypedArrayKind::BigInt64 => Self::StatorTypedArrayKindBigInt64,
+            TypedArrayKind::BigUint64 => Self::StatorTypedArrayKindBigUint64,
+        }
+    }
+}
+
+fn typed_array_kind_from_ffi(kind: StatorTypedArrayKind) -> Option<TypedArrayKind> {
+    match kind {
+        StatorTypedArrayKind::StatorTypedArrayKindInt8 => Some(TypedArrayKind::Int8),
+        StatorTypedArrayKind::StatorTypedArrayKindUint8 => Some(TypedArrayKind::Uint8),
+        StatorTypedArrayKind::StatorTypedArrayKindUint8Clamped => {
+            Some(TypedArrayKind::Uint8Clamped)
+        }
+        StatorTypedArrayKind::StatorTypedArrayKindInt16 => Some(TypedArrayKind::Int16),
+        StatorTypedArrayKind::StatorTypedArrayKindUint16 => Some(TypedArrayKind::Uint16),
+        StatorTypedArrayKind::StatorTypedArrayKindInt32 => Some(TypedArrayKind::Int32),
+        StatorTypedArrayKind::StatorTypedArrayKindUint32 => Some(TypedArrayKind::Uint32),
+        StatorTypedArrayKind::StatorTypedArrayKindFloat32 => Some(TypedArrayKind::Float32),
+        StatorTypedArrayKind::StatorTypedArrayKindFloat64 => Some(TypedArrayKind::Float64),
+        StatorTypedArrayKind::StatorTypedArrayKindBigInt64 => Some(TypedArrayKind::BigInt64),
+        StatorTypedArrayKind::StatorTypedArrayKindBigUint64 => Some(TypedArrayKind::BigUint64),
+        StatorTypedArrayKind::StatorTypedArrayKindInvalid => None,
+    }
+}
 
 /// Return the packed Stator FFI ABI version compiled into this library.
 ///
@@ -163,6 +235,8 @@ pub struct StatorIsolate {
     embedder_data: Vec<*mut c_void>,
     /// Number of times the isolate has been entered without a matching exit.
     enter_count: u32,
+    /// Thread that currently owns entered access to this isolate.
+    entered_thread: Option<ThreadId>,
     /// The context most recently set as current via [`stator_context_new`] or
     /// cleared via [`stator_context_destroy`].  Non-owning; the context is
     /// owned by the embedder and must outlive the isolate or be destroyed first.
@@ -288,6 +362,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         live_objects: 0,
         embedder_data: Vec::new(),
         enter_count: 0,
+        entered_thread: None,
         current_context: std::ptr::null_mut(),
         pending_exception: None,
         pending_exception_owned: false,
@@ -324,9 +399,10 @@ pub extern "C" fn stator_isolate_new() -> *mut StatorIsolate {
 /// After this call the pointer is invalid and must not be used.
 ///
 /// # Safety
-/// - `isolate` must be a non-null pointer returned by `stator_isolate_create`.
-/// - `isolate` must not be used again after this call.
-/// - This function must not be called more than once for the same pointer.
+/// - `isolate` must be null or a pointer returned by `stator_isolate_create`.
+/// - If non-null, `isolate` must not be used again after this call.
+/// - If non-null, this function must not be called more than once for the same pointer.
+/// - Passing null is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_destroy(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -341,43 +417,99 @@ pub unsafe extern "C" fn stator_isolate_destroy(isolate: *mut StatorIsolate) {
 /// Equivalent to [`stator_isolate_destroy`].
 ///
 /// # Safety
-/// - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
-/// - `isolate` must not be used again after this call.
-/// - This function must not be called more than once for the same pointer.
+/// - `isolate` must be null or a pointer returned by `stator_isolate_new`.
+/// - If non-null, `isolate` must not be used again after this call.
+/// - If non-null, this function must not be called more than once for the same pointer.
+/// - Passing null is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
     // SAFETY: same requirements as `stator_isolate_destroy`.
     unsafe { stator_isolate_destroy(isolate) };
 }
 
+fn enter_on_current_thread(owner: &mut Option<ThreadId>) -> bool {
+    let current = std::thread::current().id();
+    match owner.as_ref() {
+        None => {
+            *owner = Some(current);
+            true
+        }
+        Some(thread) if thread == &current => true,
+        Some(_) => false,
+    }
+}
+
+fn is_entered_on_current_thread(owner: &Option<ThreadId>) -> bool {
+    let current = std::thread::current().id();
+    owner.as_ref().is_some_and(|thread| thread == &current)
+}
+
 /// Mark `isolate` as entered on the current thread.
 ///
 /// Each call to `stator_isolate_enter` must be balanced by a corresponding
 /// call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+/// If another thread has already entered the isolate, this call fails closed:
+/// the enter count is not incremented and no isolate state is changed.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
-    if !isolate.is_null() {
-        // SAFETY: caller guarantees `isolate` is valid.
-        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_add(1) };
+    if isolate.is_null() {
+        return;
     }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if !enter_on_current_thread(&mut isolate_ref.entered_thread) {
+        return;
+    }
+    isolate_ref.enter_count = isolate_ref.enter_count.saturating_add(1);
 }
 
 /// Unmark `isolate` as entered on the current thread.
 ///
 /// Must be called once for every preceding [`stator_isolate_enter`] call.
-/// Does nothing when `isolate` is null.
+/// Does nothing when `isolate` is null.  If the isolate is currently entered on
+/// a different thread, this call fails closed and leaves the enter count intact.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
-    if !isolate.is_null() {
-        // SAFETY: caller guarantees `isolate` is valid.
-        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_sub(1) };
+    if isolate.is_null() {
+        return;
     }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if isolate_ref.enter_count == 0 {
+        isolate_ref.entered_thread = None;
+        return;
+    }
+    if !is_entered_on_current_thread(&isolate_ref.entered_thread) {
+        return;
+    }
+    isolate_ref.enter_count = isolate_ref.enter_count.saturating_sub(1);
+    if isolate_ref.enter_count == 0 {
+        isolate_ref.entered_thread = None;
+    }
+}
+
+/// Returns whether `isolate` is currently entered on the calling thread.
+///
+/// Returns `false` when `isolate` is null, not entered, or entered on a
+/// different thread.
+///
+/// # Safety
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_entered_on_current_thread(
+    isolate: *const StatorIsolate,
+) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    is_entered_on_current_thread(&unsafe { &*isolate }.entered_thread)
 }
 
 /// Store an opaque embedder-defined pointer at `slot` on the isolate.
@@ -386,7 +518,7 @@ pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
 /// equivalent to clearing it.  Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_set_data(
     isolate: *mut StatorIsolate,
@@ -410,7 +542,7 @@ pub unsafe extern "C" fn stator_isolate_set_data(
 /// Returns a null pointer when `isolate` is null or `slot` has not been set.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_get_data(
     isolate: *const StatorIsolate,
@@ -460,7 +592,7 @@ pub unsafe extern "C" fn stator_isolate_get_data(
 /// Does nothing when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut StatorIsolate) {
     if isolate.is_null() {
@@ -486,7 +618,7 @@ pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut Stator
 /// Safe to call from any thread.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut StatorIsolate) {
     if isolate.is_null() {
@@ -502,7 +634,7 @@ pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut
 /// Returns `false` when `isolate` is null.  Safe to call from any thread.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
     isolate: *const StatorIsolate,
@@ -523,7 +655,7 @@ pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
 /// raw pointer and does not free it.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 /// - `exception` must be either null or a valid, live [`StatorValue`] pointer
 ///   that outlives the pending-exception window.
 #[unsafe(no_mangle)]
@@ -542,7 +674,7 @@ pub unsafe extern "C" fn stator_isolate_throw_exception(
 /// most recent one was destroyed).
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_get_current_context(
     isolate: *const StatorIsolate,
@@ -559,7 +691,7 @@ pub unsafe extern "C" fn stator_isolate_get_current_context(
 /// Returns `false` when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_has_pending_exception(
     isolate: *const StatorIsolate,
@@ -578,7 +710,7 @@ pub unsafe extern "C" fn stator_isolate_has_pending_exception(
 /// [`stator_value_destroy`].
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_clear_pending_exception(
     isolate: *mut StatorIsolate,
@@ -807,10 +939,10 @@ pub unsafe extern "C" fn stator_isolate_reset_tiering_stats(_isolate: *mut Stato
     stator_jse::interpreter::reset_tiering_stats();
 }
 
-/// Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+/// Number of JIT tiers carried by `StatorDeoptHistogramStats`.
 pub const STATOR_DEOPT_TIER_COUNT: usize = 3;
 
-/// Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+/// Number of stable deopt reasons carried by `StatorDeoptReasonCounts`.
 pub const STATOR_DEOPT_REASON_COUNT: usize = 7;
 
 /// Per-reason deopt counters for one JIT tier.
@@ -928,13 +1060,13 @@ pub unsafe extern "C" fn stator_isolate_reset_deopt_histogram_stats(_isolate: *m
     deopt_counters::reset();
 }
 
-/// Number of execution tiers carried by [`StatorIcCountersStats`].
+/// Number of execution tiers carried by `StatorIcCountersStats`.
 pub const STATOR_IC_TIER_COUNT: usize = 4;
 
-/// Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+/// Number of inline-cache operation kinds carried by `StatorIcTierCounters`.
 pub const STATOR_IC_OP_COUNT: usize = 5;
 
-/// Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+/// Number of inline-cache event kinds carried by `StatorIcOpCounters`.
 pub const STATOR_IC_EVENT_COUNT: usize = 4;
 
 /// Per-event inline-cache counters for one (tier, op) cell.
@@ -1079,20 +1211,17 @@ pub unsafe extern "C" fn stator_isolate_reset_ic_counters_stats(_isolate: *mut S
     ic_counters::reset();
 }
 
-/// Number of histogram buckets carried by [`StatorTierLatencyTier`].
+/// Number of histogram buckets carried by `StatorTierLatencyTier`.
 ///
-/// This must match
-/// [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
-/// part of the C ABI contract.  Bumping this value is a breaking change.
+/// This mirrors the engine's fixed promotion-latency histogram bucket count and
+/// is part of the C ABI contract.  Bumping this value is a breaking change.
 pub const STATOR_TIER_LATENCY_BUCKET_COUNT: usize = 9;
 
 /// Per-tier portion of [`StatorTierLatencyStats`].
 ///
 /// All durations are expressed in **nanoseconds**.  Histogram bucket
-/// boundaries follow
-/// [`stator_jse::compiler::tier_latency::HISTOGRAM_BUCKETS_US`] (in
-/// microseconds), with the final bucket counting overflows above the
-/// last named upper bound.
+/// boundaries follow the engine's fixed microsecond promotion-latency buckets,
+/// with the final bucket counting overflows above the last named upper bound.
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct StatorTierLatencyTier {
@@ -1191,17 +1320,29 @@ pub unsafe extern "C" fn stator_isolate_reset_tier_latency_stats(_isolate: *mut 
     stator_jse::compiler::tier_latency::reset();
 }
 
-/// Number of execution tiers carried by [`StatorOsrCountersStats`].
+/// Number of execution tiers carried by `StatorOsrCountersStats`.
 pub const STATOR_OSR_TIER_COUNT: usize = 4;
 
-/// Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+/// Number of OSR exit reasons carried by `StatorOsrExitReasonCounts`.
 pub const STATOR_OSR_EXIT_REASON_COUNT: usize = 4;
 
-/// Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+/// Number of JIT tier rows carried by `StatorJitUnwindStats`.
 pub const STATOR_JIT_UNWIND_TIER_COUNT: usize = 4;
 
-/// Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+/// Number of JIT memory tier rows carried by `StatorJitMemoryStats`.
 pub const STATOR_JIT_MEMORY_TIER_COUNT: usize = 4;
+
+/// Number of JIT tier rows carried by `StatorJitMitigationsStats`.
+pub const STATOR_JIT_MITIGATIONS_TIER_COUNT: usize = 4;
+
+/// `UnsupportedPlatform` u32 encoding for the FFI mitigation snapshot.
+pub const STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM: u32 = 0;
+/// `Disabled` u32 encoding for the FFI mitigation snapshot.
+pub const STATOR_MITIGATION_STATUS_DISABLED: u32 = 1;
+/// `Enabled` u32 encoding for the FFI mitigation snapshot.
+pub const STATOR_MITIGATION_STATUS_ENABLED: u32 = 2;
+/// `Unknown` u32 encoding for the FFI mitigation snapshot.
+pub const STATOR_MITIGATION_STATUS_UNKNOWN: u32 = 3;
 
 /// Per-tier release-safe JIT code memory counters.
 #[repr(C)]
@@ -1563,8 +1704,8 @@ pub unsafe extern "C" fn stator_isolate_reset_osr_counters_stats(_isolate: *mut 
 
 // ── JIT unwind diagnostics ──────────────────────────────────────────────────
 
-/// Per-tier release-safe JIT unwind counters, mirroring
-/// [`stator_jse::jit_unwind::JitUnwindTierSnapshot`].
+/// Per-tier release-safe JIT unwind counters, mirroring the engine's internal
+/// unwind diagnostics snapshot.
 ///
 /// `unwind_supported` is `false` for every tier in this build; see
 /// `docs/edge_diagnostics.md` for the rationale and the conditions under
@@ -1659,6 +1800,133 @@ pub unsafe extern "C" fn stator_isolate_reset_jit_unwind_stats(_isolate: *mut St
     jit_unwind::reset();
 }
 
+// ── JIT CFG / CET mitigation diagnostics ───────────────────────────────────
+
+/// Per-tier release-safe CFG/CET counters, mirroring the engine's internal
+/// mitigation diagnostics snapshot.
+///
+/// `cfg_supported` / `cet_compatible` are `false` for every tier in this
+/// build; see `docs/edge_diagnostics.md` for the support matrix and the
+/// conditions under which a future tier flips the flag.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMitigationsTierStats {
+    /// Stable tier index (matches `JitMitigationsTier` discriminant).
+    pub tier: u32,
+    /// Whether this tier produces verified CFG call-target metadata.
+    pub cfg_supported: bool,
+    /// Whether this tier emits CET shadow-stack/IBT-compatible code.
+    pub cet_compatible: bool,
+    /// Number of CFG registration attempts (including unsupported/failed).
+    pub cfg_register_attempts: u64,
+    /// Number of CFG registrations that successfully delivered targets.
+    pub cfg_register_successes: u64,
+    /// Number of CFG registrations rejected by the OS after the
+    /// supported-tier check passed.
+    pub cfg_register_failures: u64,
+    /// Number of CFG registrations rejected because the tier or platform
+    /// does not yet produce safe call-target metadata.  Fail-closed
+    /// sentinel.
+    pub cfg_unsupported_tier_attempts: u64,
+    /// Total individual CFG call targets registered via successful
+    /// registrations.
+    pub cfg_targets_registered: u64,
+    /// JIT pages observed to be CET-compatible.  Stays at zero while
+    /// every tier reports `cet_compatible == false`.
+    pub cet_pages_marked_compatible: u64,
+    /// JIT pages observed to be CET-incompatible (fail-closed bucket).
+    pub cet_pages_marked_incompatible: u64,
+}
+
+/// Aggregate release-safe CFG/CET counter snapshot exposed to embedders.
+///
+/// `process_cfg_status` and the two `process_cet_*_status` fields are
+/// encoded using `STATOR_MITIGATION_STATUS_*` constants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatorJitMitigationsStats {
+    /// Whether the build target is a Windows target.
+    pub platform_supported: bool,
+    /// Process-level CFG status reported by Windows (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cfg_status: u32,
+    /// Process-level CET user shadow-stack status (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cet_shadow_stack_status: u32,
+    /// Process-level CET user shadow-stack *strict* mode status
+    /// (`STATOR_MITIGATION_STATUS_*`).
+    pub process_cet_user_shadow_stack_strict_status: u32,
+    /// Number of per-tier rows that follow.
+    pub tier_row_count: u32,
+    /// Per-tier counters, indexed by `JitMitigationsTier` discriminant.
+    pub tiers: [StatorJitMitigationsTierStats; STATOR_JIT_MITIGATIONS_TIER_COUNT],
+}
+
+impl StatorJitMitigationsStats {
+    fn from_engine_snapshot(snapshot: &jit_mitigations::JitMitigationsSnapshot) -> Self {
+        let mut tiers =
+            [StatorJitMitigationsTierStats::default(); STATOR_JIT_MITIGATIONS_TIER_COUNT];
+        for tier in JitMitigationsTier::all() {
+            let src = snapshot.tier(tier);
+            tiers[tier as usize] = StatorJitMitigationsTierStats {
+                tier: tier as u32,
+                cfg_supported: src.cfg_supported,
+                cet_compatible: src.cet_compatible,
+                cfg_register_attempts: src.cfg_register_attempts,
+                cfg_register_successes: src.cfg_register_successes,
+                cfg_register_failures: src.cfg_register_failures,
+                cfg_unsupported_tier_attempts: src.cfg_unsupported_tier_attempts,
+                cfg_targets_registered: src.cfg_targets_registered,
+                cet_pages_marked_compatible: src.cet_pages_marked_compatible,
+                cet_pages_marked_incompatible: src.cet_pages_marked_incompatible,
+            };
+        }
+        Self {
+            platform_supported: snapshot.platform_supported,
+            process_cfg_status: snapshot.process_cfg_status.as_u32(),
+            process_cet_shadow_stack_status: snapshot.process_cet_shadow_stack_status.as_u32(),
+            process_cet_user_shadow_stack_strict_status: snapshot
+                .process_cet_user_shadow_stack_strict_status
+                .as_u32(),
+            tier_row_count: STATOR_JIT_MITIGATIONS_TIER_COUNT as u32,
+            tiers,
+        }
+    }
+}
+
+/// Fill `*stats` with the current process-global JIT CFG/CET counters.
+///
+/// `isolate` may be null; the counters are process-global diagnostics
+/// rather than heap-owned state.  Does nothing when `stats` is null.
+///
+/// # Safety
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes of a `StatorJitMitigationsStats`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_jit_mitigations_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorJitMitigationsStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let snapshot = jit_mitigations::snapshot();
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorJitMitigationsStats::from_engine_snapshot(&snapshot);
+    }
+}
+
+/// Reset every JIT CFG/CET counter visible through
+/// [`stator_isolate_get_jit_mitigations_stats`].
+///
+/// `isolate` may be null; the counters are process-global.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_jit_mitigations_stats(_isolate: *mut StatorIsolate) {
+    jit_mitigations::reset();
+}
+
 /// Enable or disable JIT tiers for scripts run in `isolate`.
 ///
 /// Does nothing when `isolate` is null.
@@ -1696,12 +1964,14 @@ pub unsafe extern "C" fn stator_isolate_jit_disabled(isolate: *const StatorIsola
 /// An opaque context handle.
 ///
 /// A context represents an execution environment associated with an
-/// [`StatorIsolate`].  The caller must pass the returned pointer to
-/// [`stator_context_destroy`] when the context is no longer needed.
+/// `StatorIsolate`.  The caller must pass the returned pointer to
+/// `stator_context_destroy` when the context is no longer needed.
 pub struct StatorContext {
     _isolate: *mut StatorIsolate,
     /// Number of times the context has been entered without a matching exit.
     enter_count: u32,
+    /// Thread that currently owns entered access to this context.
+    entered_thread: Option<ThreadId>,
     /// The global object for this context.  Owned by the context; embedders
     /// receive a non-owning pointer via [`stator_context_global`] and must
     /// **not** call [`stator_object_destroy`] on it.
@@ -1734,6 +2004,8 @@ pub struct StatorContext {
     /// Optional host callback used to start dynamic `import()` work. The host
     /// later settles the request with a module namespace or structured error.
     dynamic_import_resolver: Option<StatorDynamicImportResolver>,
+    /// Linked module records retained by this context for browser module-graph reuse.
+    module_retention: HashSet<*mut StatorModule>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -1750,7 +2022,7 @@ unsafe impl Send for StatorContext {}
 /// [`stator_context_destroy`] clears the current-context slot when it matches.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be null or a valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut StatorContext {
     if isolate.is_null() {
@@ -1759,8 +2031,9 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
     let ctx = Box::into_raw(Box::new(StatorContext {
         _isolate: isolate,
         enter_count: 0,
+        entered_thread: None,
         global: StatorObject {
-            inner: Rc::new(RefCell::new(JsObject::new())),
+            inner: Rc::new(RefCell::new(PropertyMap::new())),
             isolate,
         },
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
@@ -1769,6 +2042,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
         module_url_resolver: None,
         import_meta_populator: None,
         dynamic_import_resolver: None,
+        module_retention: HashSet::new(),
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -1797,6 +2071,8 @@ pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
                 }
             }
         }
+        // SAFETY: caller guarantees `ctx` is valid and uniquely owned for destruction.
+        unsafe { release_context_module_retention(ctx) };
         // SAFETY: pointer was created by `Box::into_raw` in `stator_context_new`.
         drop(unsafe { Box::from_raw(ctx) });
     }
@@ -1807,6 +2083,8 @@ pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
 /// Each call to `stator_context_enter` must be balanced by a corresponding
 /// call to [`stator_context_exit`].  Entering a context also makes it the
 /// current context on its associated isolate.  Does nothing when `ctx` is null.
+/// If another thread has already entered the context, this call fails closed:
+/// the enter count is not incremented and no context or isolate state changes.
 ///
 /// # Safety
 /// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -1816,12 +2094,15 @@ pub unsafe extern "C" fn stator_context_enter(ctx: *mut StatorContext) {
         return;
     }
     // SAFETY: caller guarantees `ctx` is valid.
-    unsafe {
-        (*ctx).enter_count = (*ctx).enter_count.saturating_add(1);
-        let isolate = (*ctx)._isolate;
-        if !isolate.is_null() {
-            (*isolate).current_context = ctx;
-        }
+    let ctx_ref = unsafe { &mut *ctx };
+    if !enter_on_current_thread(&mut ctx_ref.entered_thread) {
+        return;
+    }
+    ctx_ref.enter_count = ctx_ref.enter_count.saturating_add(1);
+    let isolate = ctx_ref._isolate;
+    if !isolate.is_null() {
+        // SAFETY: context owns a valid isolate pointer by construction.
+        unsafe { (*isolate).current_context = ctx };
     }
 }
 
@@ -1830,6 +2111,8 @@ pub unsafe extern "C" fn stator_context_enter(ctx: *mut StatorContext) {
 /// Must be called once for every preceding [`stator_context_enter`] call.
 /// When the enter count reaches zero the context is no longer recorded as
 /// current on its associated isolate.  Does nothing when `ctx` is null.
+/// If the context is currently entered on a different thread, this call fails
+/// closed and leaves the enter count and current-context slot intact.
 ///
 /// # Safety
 /// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -1839,15 +2122,54 @@ pub unsafe extern "C" fn stator_context_exit(ctx: *mut StatorContext) {
         return;
     }
     // SAFETY: caller guarantees `ctx` is valid.
-    unsafe {
-        (*ctx).enter_count = (*ctx).enter_count.saturating_sub(1);
-        if (*ctx).enter_count == 0 {
-            let isolate = (*ctx)._isolate;
-            if !isolate.is_null() && (*isolate).current_context == ctx {
-                (*isolate).current_context = std::ptr::null_mut();
+    let ctx_ref = unsafe { &mut *ctx };
+    if ctx_ref.enter_count == 0 {
+        ctx_ref.entered_thread = None;
+        let isolate = ctx_ref._isolate;
+        if !isolate.is_null() {
+            // SAFETY: context owns a valid isolate pointer by construction.
+            unsafe {
+                if (*isolate).current_context == ctx {
+                    (*isolate).current_context = std::ptr::null_mut();
+                }
+            }
+        }
+        return;
+    }
+    if !is_entered_on_current_thread(&ctx_ref.entered_thread) {
+        return;
+    }
+    ctx_ref.enter_count = ctx_ref.enter_count.saturating_sub(1);
+    if ctx_ref.enter_count == 0 {
+        ctx_ref.entered_thread = None;
+        let isolate = ctx_ref._isolate;
+        if !isolate.is_null() {
+            // SAFETY: context owns a valid isolate pointer by construction.
+            unsafe {
+                if (*isolate).current_context == ctx {
+                    (*isolate).current_context = std::ptr::null_mut();
+                }
             }
         }
     }
+}
+
+/// Returns whether `ctx` is currently entered on the calling thread.
+///
+/// Returns `false` when `ctx` is null, not entered, or entered on a different
+/// thread.
+///
+/// # Safety
+/// `ctx` must be null or a valid pointer to a live `StatorContext`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_entered_on_current_thread(
+    ctx: *const StatorContext,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    is_entered_on_current_thread(&unsafe { &*ctx }.entered_thread)
 }
 
 /// Return a non-owning pointer to the global object of `ctx`.
@@ -2018,7 +2340,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 ///
 /// When installed, the callback is invoked before static module resolution,
 /// dynamic `import()`, and `import.meta.resolve`. It must return a canonical
-/// resolved URL or a structured [`StatorResolveStatus`] failure. Failures are
+/// resolved URL or a structured `StatorResolveStatus` failure. Failures are
 /// propagated without falling back to the raw specifier or invoking the module
 /// resolver.
 ///
@@ -2027,7 +2349,7 @@ pub unsafe extern "C" fn stator_context_set_module_resolver(
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_module_url_resolver(
     ctx: *mut StatorContext,
@@ -2077,14 +2399,14 @@ pub unsafe extern "C" fn stator_context_set_module_url_resolver(
 /// When installed, the callback runs before module evaluation exposes
 /// `import.meta`. Returning a non-`Ok` status fails evaluation closed and
 /// prevents default metadata fallback. Lifetime and cleanup rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 ///
 /// Returns `true` on successful registration or clear, and `false` for a null
 /// context or malformed clear request.
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`].
+/// `stator_context_set_module_resolver`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_import_meta_populator(
     ctx: *mut StatorContext,
@@ -2129,12 +2451,12 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
 ///
 /// When installed, module-evaluation dynamic `import()` calls invoke this
 /// callback after the URL resolver has canonicalised the specifier. The callback
-/// receives a [`StatorDynamicImportRequest`] handle and must return
-/// [`StatorResolveStatus::StatorResolveStatusOk`] or
-/// [`StatorResolveStatus::StatorResolveStatusPending`] after it has accepted
+/// receives a `StatorDynamicImportRequest` handle and must return
+/// `StatorResolveStatusOk` or
+/// `StatorResolveStatusPending` after it has accepted
 /// ownership of the request. It must later call either
-/// [`stator_dynamic_import_request_resolve_module`] or
-/// [`stator_dynamic_import_request_reject`]. Non-success statuses reject the
+/// `stator_dynamic_import_request_resolve_module` or
+/// `stator_dynamic_import_request_reject`. Non-success statuses reject the
 /// JavaScript promise immediately and Stator consumes the request.
 ///
 /// Returns `true` on successful registration or clear, and `false` for a null
@@ -2142,13 +2464,26 @@ pub unsafe extern "C" fn stator_context_set_import_meta_populator(
 ///
 /// # Safety
 /// The callback and `user_data` lifetime rules match
-/// [`stator_context_set_module_resolver`]. The callback must not settle or free
+/// `stator_context_set_module_resolver`. The callback must not settle or free
 /// the request before returning; request settlement is a later host action on
 /// the same serialized context/module thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_set_dynamic_import_resolver(
     ctx: *mut StatorContext,
-    callback: Option<StatorDynamicImportCallback>,
+    callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            request: *mut StatorDynamicImportRequest,
+            referrer: *const StatorModule,
+            origin: *const StatorModuleOrigin,
+            specifier: *const c_char,
+            specifier_len: usize,
+            attributes: *const StatorImportAttribute,
+            attributes_len: usize,
+            out_error: *mut *mut StatorString,
+        ) -> StatorResolveStatus,
+    >,
     user_data: *mut c_void,
     free_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> bool {
@@ -2198,13 +2533,13 @@ enum StatorValueInner {
     /// FFI round trips.  Use [`StatorValueInner::ObjectHandle`] (produced by
     /// [`stator_object_as_value`]) when identity must survive.
     Object,
-    /// A JavaScript object backed by a real, shared [`JsObject`] storage.
+    /// A JavaScript object backed by a shared [`PropertyMap`] storage.
     ///
     /// Produced by [`stator_object_as_value`].  Multiple [`StatorValue`] /
-    /// [`StatorObject`] handles that share the same `Rc<RefCell<JsObject>>`
+    /// [`StatorObject`] handles that share the same `Rc<RefCell<PropertyMap>>`
     /// observe one another's mutations and round-trip through
-    /// [`stator_value_as_object`] without identity loss.
-    ObjectHandle(Rc<RefCell<JsObject>>),
+    /// both the FFI value/object boundary and [`JsValue::PlainObject`] without identity loss.
+    ObjectHandle(Rc<RefCell<PropertyMap>>),
     /// A JavaScript object backed by a DOM wrapper materialized through the
     /// embedder FFI.
     DomWrapHandle {
@@ -2224,19 +2559,70 @@ enum StatorValueInner {
     Date,
     /// A JavaScript `RegExp` object.
     RegExp,
-    /// A JavaScript `Promise` object.
+    /// A tag-only JavaScript `Promise` object.
     Promise,
+    /// A JavaScript `Promise` backed by the engine's real shared-state handle.
+    PromiseHandle {
+        promise: JsPromise,
+        queue: MicrotaskQueue,
+    },
     /// A JavaScript `Map` object.
     Map,
     /// A JavaScript `Set` object.
     Set,
+    /// A JavaScript `ArrayBuffer` backed by engine-owned binary storage.
+    ArrayBuffer(Rc<RefCell<JsArrayBuffer>>),
+    /// A JavaScript `TypedArray` view backed by engine-owned binary storage.
+    TypedArray(Rc<RefCell<JsTypedArray>>),
+    /// A JavaScript `DataView` backed by engine-owned binary storage.
+    DataView(Rc<RefCell<JsDataView>>),
 }
 
 type MaterializedDomWrapRegistry = HashMap<usize, (*mut StatorDomObjectWrap, Rc<Cell<bool>>)>;
 
+static NEXT_FUNCTION_TEMPLATE_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
     static DOM_WRAP_MATERIALIZED_REGISTRY: RefCell<MaterializedDomWrapRegistry> =
         RefCell::new(HashMap::new());
+}
+
+fn next_function_template_id() -> u64 {
+    NEXT_FUNCTION_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn clone_stator_value_inner(inner: &StatorValueInner) -> StatorValueInner {
+    match inner {
+        StatorValueInner::Undefined => StatorValueInner::Undefined,
+        StatorValueInner::Null => StatorValueInner::Null,
+        StatorValueInner::Boolean(b) => StatorValueInner::Boolean(*b),
+        StatorValueInner::Number(n) => StatorValueInner::Number(*n),
+        StatorValueInner::Str(s) => StatorValueInner::Str(s.clone()),
+        StatorValueInner::Object => StatorValueInner::Object,
+        StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
+        StatorValueInner::DomWrapHandle { plain, wrap, alive } => StatorValueInner::DomWrapHandle {
+            plain: Rc::clone(plain),
+            wrap: *wrap,
+            alive: Rc::clone(alive),
+        },
+        StatorValueInner::Function => StatorValueInner::Function,
+        StatorValueInner::NativeFunctionValue(f) => {
+            StatorValueInner::NativeFunctionValue(Rc::clone(f))
+        }
+        StatorValueInner::Array => StatorValueInner::Array,
+        StatorValueInner::Date => StatorValueInner::Date,
+        StatorValueInner::RegExp => StatorValueInner::RegExp,
+        StatorValueInner::Promise => StatorValueInner::Promise,
+        StatorValueInner::PromiseHandle { promise, queue } => StatorValueInner::PromiseHandle {
+            promise: promise.clone(),
+            queue: queue.clone(),
+        },
+        StatorValueInner::Map => StatorValueInner::Map,
+        StatorValueInner::Set => StatorValueInner::Set,
+        StatorValueInner::ArrayBuffer(buffer) => StatorValueInner::ArrayBuffer(Rc::clone(buffer)),
+        StatorValueInner::TypedArray(array) => StatorValueInner::TypedArray(Rc::clone(array)),
+        StatorValueInner::DataView(view) => StatorValueInner::DataView(Rc::clone(view)),
+    }
 }
 
 fn dom_wrap_inner_for_plain_object(plain: &Rc<RefCell<PropertyMap>>) -> Option<StatorValueInner> {
@@ -2253,6 +2639,55 @@ fn dom_wrap_inner_for_plain_object(plain: &Rc<RefCell<PropertyMap>>) -> Option<S
             alive: Rc::clone(alive),
         })
     })
+}
+
+fn dom_wrap_ptr_for_plain_object(
+    plain: &Rc<RefCell<PropertyMap>>,
+) -> Option<*mut StatorDomObjectWrap> {
+    let key = Rc::as_ptr(plain) as usize;
+    DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let (wrap, alive) = registry.get(&key)?;
+        if wrap.is_null() || !alive.get() {
+            return None;
+        }
+        Some(*wrap)
+    })
+}
+
+fn dom_wrap_ptr_for_js_value(value: &JsValue) -> Option<*mut StatorDomObjectWrap> {
+    match value {
+        JsValue::PlainObject(plain) => dom_wrap_ptr_for_plain_object(plain),
+        _ => None,
+    }
+}
+
+fn dom_wrap_ptr_for_value_inner(inner: &StatorValueInner) -> Option<*mut StatorDomObjectWrap> {
+    match inner {
+        StatorValueInner::DomWrapHandle { wrap, alive, .. } if !wrap.is_null() && alive.get() => {
+            Some(*wrap)
+        }
+        _ => None,
+    }
+}
+
+fn dom_wrap_has_function_template_id(wrap: *mut StatorDomObjectWrap, template_id: u64) -> bool {
+    if wrap.is_null() {
+        return false;
+    }
+    // SAFETY: callers only pass live wrapper pointers recovered from FFI values
+    // or the materialized-wrapper registry.
+    let wrap_ref = unsafe { &*wrap };
+    wrap_ref.alive.get() && wrap_ref.function_template_ids.contains(&template_id)
+}
+
+fn function_template_instance_ids(tmpl: &StatorFunctionTemplate) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(tmpl.ancestor_template_ids.len() + 1);
+    ids.push(tmpl.template_id);
+    ids.extend(tmpl.ancestor_template_ids.iter().copied());
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// An opaque handle to a JavaScript value (number or string).
@@ -2302,7 +2737,7 @@ unsafe fn allocate_stator_value(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_number(
     isolate: *mut StatorIsolate,
@@ -2336,7 +2771,7 @@ pub unsafe extern "C" fn stator_value_new_number(
 /// pointer if `isolate` or `data` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `data` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_string(
@@ -2371,12 +2806,181 @@ pub unsafe extern "C" fn stator_value_new_string(
     val
 }
 
+/// Create a new zero-filled JavaScript `ArrayBuffer`.
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_array_buffer(
+    isolate: *mut StatorIsolate,
+    byte_length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let buffer = Rc::new(RefCell::new(arraybuffer_new(byte_length)));
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { allocate_stator_value(isolate, StatorValueInner::ArrayBuffer(buffer)) }
+}
+
+/// Create a new JavaScript `ArrayBuffer` by copying bytes from caller memory.
+///
+/// `data` is copied immediately; the caller retains ownership of the source
+/// memory. Returns a null pointer if `isolate` or `data` is null.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `data` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_array_buffer_copy(
+    isolate: *mut StatorIsolate,
+    data: *const u8,
+    len: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || data.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `data` is valid for `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let buffer = JsArrayBuffer {
+        shared: false,
+        max_byte_length: None,
+        detached: false,
+        data: bytes.to_vec(),
+    };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::ArrayBuffer(Rc::new(RefCell::new(buffer))),
+        )
+    }
+}
+
+/// Create a new zero-filled JavaScript `TypedArray`.
+///
+/// Returns a null pointer if `isolate` is null or `kind` is
+/// `StatorTypedArrayKindInvalid`.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_typed_array(
+    isolate: *mut StatorIsolate,
+    kind: StatorTypedArrayKind,
+    length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(kind) = typed_array_kind_from_ffi(kind) else {
+        return std::ptr::null_mut();
+    };
+    let typed_array = typed_array_new_from_length(kind, length);
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::TypedArray(Rc::new(RefCell::new(typed_array))),
+        )
+    }
+}
+
+/// Create a JavaScript `TypedArray` view over a JavaScript `ArrayBuffer`.
+///
+/// `byte_offset` and `length` are fixed-length view parameters. Returns a null
+/// pointer if `isolate` or `buffer` is null, `kind` is invalid, `buffer` is not
+/// an `ArrayBuffer` owned by `isolate`, or the requested view is unaligned,
+/// detached, or out of bounds.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `buffer` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_typed_array_from_array_buffer(
+    isolate: *mut StatorIsolate,
+    kind: StatorTypedArrayKind,
+    buffer: *const StatorValue,
+    byte_offset: usize,
+    length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || buffer.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(kind) = typed_array_kind_from_ffi(kind) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: caller guarantees `buffer` is valid.
+    let buffer_value = unsafe { &*buffer };
+    if buffer_value.isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    let StatorValueInner::ArrayBuffer(array_buffer) = &buffer_value.inner else {
+        return std::ptr::null_mut();
+    };
+    let typed_array =
+        match typed_array_new_from_buffer(kind, Rc::clone(array_buffer), byte_offset, Some(length))
+        {
+            Ok(array) => array,
+            Err(_) => return std::ptr::null_mut(),
+        };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::TypedArray(Rc::new(RefCell::new(typed_array))),
+        )
+    }
+}
+
+/// Create a JavaScript `DataView` over a JavaScript `ArrayBuffer`.
+///
+/// Returns a null pointer if `isolate` or `buffer` is null, `buffer` is not an
+/// `ArrayBuffer` owned by `isolate`, or the requested view is detached or out of
+/// bounds.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+/// - `buffer` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_data_view_from_array_buffer(
+    isolate: *mut StatorIsolate,
+    buffer: *const StatorValue,
+    byte_offset: usize,
+    byte_length: usize,
+) -> *mut StatorValue {
+    if isolate.is_null() || buffer.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `buffer` is valid.
+    let buffer_value = unsafe { &*buffer };
+    if buffer_value.isolate != isolate {
+        return std::ptr::null_mut();
+    }
+    let StatorValueInner::ArrayBuffer(array_buffer) = &buffer_value.inner else {
+        return std::ptr::null_mut();
+    };
+    let data_view = match dataview_new(Rc::clone(array_buffer), byte_offset, Some(byte_length)) {
+        Ok(view) => view,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        allocate_stator_value(
+            isolate,
+            StatorValueInner::DataView(Rc::new(RefCell::new(data_view))),
+        )
+    }
+}
+
 /// Create a new boolean value.
 ///
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_boolean(
     isolate: *mut StatorIsolate,
@@ -2408,7 +3012,7 @@ pub unsafe extern "C" fn stator_value_new_boolean(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_undefined(
     isolate: *mut StatorIsolate,
@@ -2439,7 +3043,7 @@ pub unsafe extern "C" fn stator_value_new_undefined(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_null(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2468,7 +3072,7 @@ pub unsafe extern "C" fn stator_value_new_null(isolate: *mut StatorIsolate) -> *
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_object(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2494,7 +3098,7 @@ pub unsafe extern "C" fn stator_value_new_object(isolate: *mut StatorIsolate) ->
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_function_tag(
     isolate: *mut StatorIsolate,
@@ -2522,7 +3126,7 @@ pub unsafe extern "C" fn stator_value_new_function_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_array_tag(
     isolate: *mut StatorIsolate,
@@ -2550,7 +3154,7 @@ pub unsafe extern "C" fn stator_value_new_array_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_date_tag(
     isolate: *mut StatorIsolate,
@@ -2578,7 +3182,7 @@ pub unsafe extern "C" fn stator_value_new_date_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_regexp_tag(
     isolate: *mut StatorIsolate,
@@ -2606,7 +3210,7 @@ pub unsafe extern "C" fn stator_value_new_regexp_tag(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_promise_tag(
     isolate: *mut StatorIsolate,
@@ -2629,12 +3233,178 @@ pub unsafe extern "C" fn stator_value_new_promise_tag(
     v
 }
 
+/// Observable settlement state for a real FFI Promise handle.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorPromiseState {
+    /// The promise has not been fulfilled or rejected yet.
+    StatorPromiseStatePending = 0,
+    /// The promise was fulfilled and has a fulfillment result.
+    StatorPromiseStateFulfilled = 1,
+    /// The promise was rejected and has a rejection reason.
+    StatorPromiseStateRejected = 2,
+    /// The argument was null or was not a real Promise handle.
+    StatorPromiseStateInvalid = 3,
+}
+
+fn active_or_new_microtask_queue() -> MicrotaskQueue {
+    active_microtask_queue().unwrap_or_else(|| {
+        let queue = MicrotaskQueue::new();
+        install_active_microtask_queue(&queue);
+        queue
+    })
+}
+
+/// Create a new pending JavaScript Promise backed by the real engine promise state.
+///
+/// The returned value is a normal [`StatorValue`] whose type is `"object"` and
+/// for which [`stator_value_is_promise`] returns `true`.  It must be released
+/// with [`stator_value_destroy`] (or an active handle scope).  Returns null when
+/// `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_new_pending(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let queue = active_or_new_microtask_queue();
+    let promise = stator_jse::builtins::promise::promise_pending();
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { allocate_stator_value(isolate, StatorValueInner::PromiseHandle { promise, queue }) }
+}
+
+/// Resolve a real FFI Promise handle with `value`.
+///
+/// A null `value` is treated as JavaScript `undefined`.  Settling an already
+/// settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+///
+/// # Safety
+/// - `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_resolve(
+    promise: *mut StatorValue,
+    value: *const StatorValue,
+) -> StatorStatus {
+    if promise.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let js_value = if value.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `value` is valid when non-null.
+        stator_value_inner_to_jsvalue(unsafe { &(*value).inner })
+    };
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, queue } => {
+            promise.resolve(js_value, queue);
+            StatorStatus::StatorStatusOk
+        }
+        StatorValueInner::Promise => StatorStatus::StatorStatusUnsupported,
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Reject a real FFI Promise handle with `reason`.
+///
+/// A null `reason` is treated as JavaScript `undefined`.  Settling an already
+/// settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+///
+/// # Safety
+/// - `promise` must be null or a valid, live [`StatorValue`] pointer.
+/// - `reason` must be null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_reject(
+    promise: *mut StatorValue,
+    reason: *const StatorValue,
+) -> StatorStatus {
+    if promise.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    let js_reason = if reason.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `reason` is valid when non-null.
+        stator_value_inner_to_jsvalue(unsafe { &(*reason).inner })
+    };
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, queue } => {
+            promise.reject(js_reason, queue);
+            StatorStatus::StatorStatusOk
+        }
+        StatorValueInner::Promise => StatorStatus::StatorStatusUnsupported,
+        _ => StatorStatus::StatorStatusFalse,
+    }
+}
+
+/// Return the observable state of a real FFI Promise handle.
+///
+/// Returns `StatorPromiseStateInvalid` when `promise` is
+/// null, is not a promise, or is only a tag-only promise placeholder.
+///
+/// # Safety
+/// `promise` must be null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_state(promise: *const StatorValue) -> StatorPromiseState {
+    if promise.is_null() {
+        return StatorPromiseState::StatorPromiseStateInvalid;
+    }
+    // SAFETY: caller guarantees `promise` is valid.
+    match unsafe { &(*promise).inner } {
+        StatorValueInner::PromiseHandle { promise, .. } => match promise.state() {
+            PromiseState::Pending => StatorPromiseState::StatorPromiseStatePending,
+            PromiseState::Fulfilled(_) => StatorPromiseState::StatorPromiseStateFulfilled,
+            PromiseState::Rejected(_) => StatorPromiseState::StatorPromiseStateRejected,
+        },
+        _ => StatorPromiseState::StatorPromiseStateInvalid,
+    }
+}
+
+/// Return the fulfillment value or rejection reason of a settled Promise handle.
+///
+/// Returns null when `promise` is null, is not a real Promise handle, is still
+/// pending, or has no owning isolate.  The caller owns the returned value and
+/// must release it with `stator_value_destroy` (or an active handle scope).
+///
+/// # Safety
+/// `promise` must be null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_promise_result(promise: *const StatorValue) -> *mut StatorValue {
+    if promise.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `promise` is valid.
+    let (isolate, result) = unsafe {
+        let value = &*promise;
+        let result = match &value.inner {
+            StatorValueInner::PromiseHandle { promise, .. } => match promise.state() {
+                PromiseState::Pending => return std::ptr::null_mut(),
+                PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => value,
+            },
+            _ => return std::ptr::null_mut(),
+        };
+        (value.isolate, result)
+    };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = jsvalue_to_stator_value_inner(&result);
+    // SAFETY: `isolate` is the owning isolate recorded on the promise handle.
+    unsafe { allocate_stator_value(isolate, inner) }
+}
+
 /// Create a new `Map`-tagged value.
 ///
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_map_tag(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2660,7 +3430,7 @@ pub unsafe extern "C" fn stator_value_new_map_tag(isolate: *mut StatorIsolate) -
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_new_set_tag(isolate: *mut StatorIsolate) -> *mut StatorValue {
     if isolate.is_null() {
@@ -2691,7 +3461,7 @@ pub unsafe extern "C" fn stator_value_new_set_tag(isolate: *mut StatorIsolate) -
 /// pointer if `isolate` or `data` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `data` must be valid for reads of `len` bytes and must point to valid
 ///   UTF-8 data.
 #[unsafe(no_mangle)]
@@ -2775,7 +3545,7 @@ pub unsafe extern "C" fn stator_string_write_utf8(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_number_new(
     isolate: *mut StatorIsolate,
@@ -2792,7 +3562,7 @@ pub unsafe extern "C" fn stator_number_new(
 /// null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_integer_new(
     isolate: *mut StatorIsolate,
@@ -2807,7 +3577,7 @@ pub unsafe extern "C" fn stator_integer_new(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_boolean_new(
     isolate: *mut StatorIsolate,
@@ -2822,7 +3592,7 @@ pub unsafe extern "C" fn stator_boolean_new(
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_undefined_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
     // SAFETY: delegated to `stator_value_new_undefined`.
@@ -2834,7 +3604,7 @@ pub unsafe extern "C" fn stator_undefined_new(isolate: *mut StatorIsolate) -> *m
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_null_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
     // SAFETY: delegated to `stator_value_new_null`.
@@ -2843,9 +3613,11 @@ pub unsafe extern "C" fn stator_null_new(isolate: *mut StatorIsolate) -> *mut St
 
 /// Destroy a value and decrement the isolate's live-object counter.
 ///
+/// Passing null is a no-op.
+///
 /// # Safety
-/// `val` must be a non-null pointer returned by any `stator_value_new_*`
-/// function and must not be used again after this call.
+/// `val` must be null or a pointer returned by any `stator_value_new_*`
+/// function. If non-null, it must not be used again after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_destroy(val: *mut StatorValue) {
     if !val.is_null() {
@@ -2890,8 +3662,12 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => c"object".as_ptr(),
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => c"object".as_ptr(),
     }
 }
 
@@ -2926,8 +3702,12 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => f64::NAN,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => f64::NAN,
     }
 }
 
@@ -2959,8 +3739,12 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => c"".as_ptr(),
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => c"".as_ptr(),
     }
 }
 
@@ -3035,8 +3819,8 @@ pub unsafe extern "C" fn stator_value_is_boolean(val: *const StatorValue) -> boo
 
 /// Returns `true` if `val` is a JavaScript object (excludes `null`).
 ///
-/// Arrays, dates, regexps, promises, maps, and sets are all objects in
-/// ECMAScript and therefore also return `true`.
+/// Arrays, dates, regexps, promises, maps, sets, ArrayBuffers, TypedArrays, and
+/// DataViews are all objects in ECMAScript and therefore also return `true`.
 ///
 /// # Safety
 /// `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -3055,8 +3839,12 @@ pub unsafe extern "C" fn stator_value_is_object(val: *const StatorValue) -> bool
             | StatorValueInner::Date
             | StatorValueInner::RegExp
             | StatorValueInner::Promise
+            | StatorValueInner::PromiseHandle { .. }
             | StatorValueInner::Map
             | StatorValueInner::Set
+            | StatorValueInner::ArrayBuffer(_)
+            | StatorValueInner::TypedArray(_)
+            | StatorValueInner::DataView(_)
     )
 }
 
@@ -3165,7 +3953,10 @@ pub unsafe extern "C" fn stator_value_is_promise(val: *const StatorValue) -> boo
         return false;
     }
     // SAFETY: caller guarantees `val` is valid.
-    matches!(unsafe { &(*val).inner }, StatorValueInner::Promise)
+    matches!(
+        unsafe { &(*val).inner },
+        StatorValueInner::Promise | StatorValueInner::PromiseHandle { .. }
+    )
 }
 
 /// Returns `true` if `val` is a JavaScript `Map` object.
@@ -3194,31 +3985,622 @@ pub unsafe extern "C" fn stator_value_is_set(val: *const StatorValue) -> bool {
     matches!(unsafe { &(*val).inner }, StatorValueInner::Set)
 }
 
+/// Returns `true` if `val` is a JavaScript `ArrayBuffer` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_array_buffer(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::ArrayBuffer(_))
+}
+
+/// Returns the byte length of a JavaScript `ArrayBuffer`.
+///
+/// Returns `0` when `val` is null, is not an `ArrayBuffer`, or the buffer is
+/// detached.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_byte_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => {
+            let buffer = buffer.borrow();
+            if buffer.detached {
+                0
+            } else {
+                buffer.data.len()
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Returns whether a JavaScript `ArrayBuffer` has been detached.
+///
+/// Returns `false` when `val` is null or is not an `ArrayBuffer`.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_is_detached(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow().detached,
+        _ => false,
+    }
+}
+
+/// Copy bytes out of a JavaScript `ArrayBuffer` into caller-owned memory.
+///
+/// Returns the number of bytes copied. Returns `0` when `val` is null, is not an
+/// `ArrayBuffer`, the buffer is detached, `dst` is null, `dst_len` is zero, or
+/// `src_offset` is outside the buffer.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+/// - The destination range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_copy_contents(
+    val: *const StatorValue,
+    dst: *mut u8,
+    dst_len: usize,
+    src_offset: usize,
+) -> usize {
+    if val.is_null() || dst.is_null() || dst_len == 0 {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let buffer = match unsafe { &(*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow(),
+        _ => return 0,
+    };
+    if buffer.detached || src_offset >= buffer.data.len() {
+        return 0;
+    }
+    let available = buffer.data.len() - src_offset;
+    let to_copy = available.min(dst_len);
+    // SAFETY: caller guarantees `dst` is valid for `dst_len` bytes and the
+    // destination does not overlap Stator-managed backing storage.
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.data.as_ptr().add(src_offset), dst, to_copy);
+    }
+    to_copy
+}
+
+/// Copy bytes from caller-owned memory into a JavaScript `ArrayBuffer`.
+///
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not
+/// an `ArrayBuffer`, the buffer is detached, `src` is null, `src_len` is zero,
+/// or `dst_offset` is outside the buffer.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_array_buffer_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() || src.is_null() || src_len == 0 {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let mut buffer = match unsafe { &mut (*val).inner } {
+        StatorValueInner::ArrayBuffer(buffer) => buffer.borrow_mut(),
+        _ => return 0,
+    };
+    if buffer.detached || dst_offset >= buffer.data.len() {
+        return 0;
+    }
+    let available = buffer.data.len() - dst_offset;
+    let to_write = available.min(src_len);
+    // SAFETY: caller guarantees `src` is valid for `src_len` bytes and the
+    // source does not overlap Stator-managed backing storage.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, buffer.data.as_mut_ptr().add(dst_offset), to_write);
+    }
+    to_write
+}
+
+/// Returns `true` if `val` is a JavaScript `TypedArray` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_typed_array(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::TypedArray(_))
+}
+
+/// Returns the element kind for a JavaScript `TypedArray`.
+///
+/// Returns `StatorTypedArrayKindInvalid` when `val` is
+/// null or is not a `TypedArray`.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_kind(
+    val: *const StatorValue,
+) -> StatorTypedArrayKind {
+    if val.is_null() {
+        return StatorTypedArrayKind::StatorTypedArrayKindInvalid;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::TypedArray(array) => array.borrow().kind.into(),
+        _ => StatorTypedArrayKind::StatorTypedArrayKindInvalid,
+    }
+}
+
+/// Returns the current byte offset of a JavaScript `TypedArray`.
+///
+/// Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+/// of bounds.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_byte_offset(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::TypedArray(array) => array.borrow().effective_byte_offset(),
+        _ => 0,
+    }
+}
+
+/// Returns the current element length of a JavaScript `TypedArray`.
+///
+/// Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+/// of bounds.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::TypedArray(array) => array.borrow().effective_length(),
+        _ => 0,
+    }
+}
+
+/// Returns the current byte length of a JavaScript `TypedArray`.
+///
+/// Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+/// of bounds.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_byte_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::TypedArray(array) => array.borrow().effective_byte_length(),
+        _ => 0,
+    }
+}
+
+fn copy_view_bytes(
+    data: &[u8],
+    byte_offset: usize,
+    byte_length: usize,
+    dst: *mut u8,
+    dst_len: usize,
+    src_offset: usize,
+) -> usize {
+    if dst.is_null() || dst_len == 0 || src_offset >= byte_length {
+        return 0;
+    }
+    let Some(range_end) = byte_offset.checked_add(byte_length) else {
+        return 0;
+    };
+    let Some(copy_start) = byte_offset.checked_add(src_offset) else {
+        return 0;
+    };
+    if range_end > data.len() || copy_start >= range_end {
+        return 0;
+    }
+    let to_copy = (byte_length - src_offset).min(dst_len);
+    // SAFETY: caller guarantees `dst` is valid for `dst_len` bytes and the
+    // destination does not overlap Stator-managed backing storage. Source bounds
+    // were verified against `data` above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr().add(copy_start), dst, to_copy);
+    }
+    to_copy
+}
+
+fn write_view_bytes(
+    data: &mut [u8],
+    byte_offset: usize,
+    byte_length: usize,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if src.is_null() || src_len == 0 || dst_offset >= byte_length {
+        return 0;
+    }
+    let Some(range_end) = byte_offset.checked_add(byte_length) else {
+        return 0;
+    };
+    let Some(write_start) = byte_offset.checked_add(dst_offset) else {
+        return 0;
+    };
+    if range_end > data.len() || write_start >= range_end {
+        return 0;
+    }
+    let to_write = (byte_length - dst_offset).min(src_len);
+    // SAFETY: caller guarantees `src` is valid for `src_len` bytes and the
+    // source does not overlap Stator-managed backing storage. Destination bounds
+    // were verified against `data` above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, data.as_mut_ptr().add(write_start), to_write);
+    }
+    to_write
+}
+
+/// Copy bytes out of a JavaScript `TypedArray` view into caller-owned memory.
+///
+/// `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+/// `TypedArray`, the view is detached or out of bounds, `dst` is null,
+/// `dst_len` is zero, or `src_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+/// - The destination range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_copy_contents(
+    val: *const StatorValue,
+    dst: *mut u8,
+    dst_len: usize,
+    src_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::TypedArray(array) => {
+            let array = array.borrow();
+            let byte_offset = array.effective_byte_offset();
+            let byte_length = array.effective_byte_length();
+            let buffer = array.buffer.borrow();
+            copy_view_bytes(
+                &buffer.data,
+                byte_offset,
+                byte_length,
+                dst,
+                dst_len,
+                src_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
+/// Copy bytes from caller-owned memory into a JavaScript `TypedArray` view.
+///
+/// `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not a
+/// `TypedArray`, the view is detached or out of bounds, `src` is null, `src_len`
+/// is zero, or `dst_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_typed_array_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &mut (*val).inner } {
+        StatorValueInner::TypedArray(array) => {
+            let array = array.borrow();
+            let byte_offset = array.effective_byte_offset();
+            let byte_length = array.effective_byte_length();
+            let mut buffer = array.buffer.borrow_mut();
+            write_view_bytes(
+                &mut buffer.data,
+                byte_offset,
+                byte_length,
+                src,
+                src_len,
+                dst_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
+/// Returns `true` if `val` is a JavaScript `DataView` object.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_data_view(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::DataView(_))
+}
+
+fn dataview_effective_range(view: &JsDataView) -> Option<(usize, usize)> {
+    let buffer = view.buffer.borrow();
+    if buffer.detached || view.byte_offset > buffer.data.len() {
+        return None;
+    }
+    let byte_length = if view.auto_length {
+        buffer.data.len() - view.byte_offset
+    } else {
+        let end = view.byte_offset.checked_add(view.byte_length)?;
+        if end > buffer.data.len() {
+            return None;
+        }
+        view.byte_length
+    };
+    Some((view.byte_offset, byte_length))
+}
+
+/// Returns the current byte offset of a JavaScript `DataView`.
+///
+/// Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+/// of bounds.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_data_view_byte_offset(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::DataView(view) => dataview_effective_range(&view.borrow())
+            .map(|(offset, _)| offset)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Returns the current byte length of a JavaScript `DataView`.
+///
+/// Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+/// of bounds.
+///
+/// # Safety
+/// `val` must be either null or a valid, live `StatorValue` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_data_view_byte_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::DataView(view) => dataview_effective_range(&view.borrow())
+            .map(|(_, length)| length)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Copy bytes out of a JavaScript `DataView` into caller-owned memory.
+///
+/// `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+/// `DataView`, the view is detached or out of bounds, `dst` is null, `dst_len`
+/// is zero, or `src_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+/// - The destination range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_data_view_copy_contents(
+    val: *const StatorValue,
+    dst: *mut u8,
+    dst_len: usize,
+    src_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::DataView(view) => {
+            let view = view.borrow();
+            let Some((byte_offset, byte_length)) = dataview_effective_range(&view) else {
+                return 0;
+            };
+            let buffer = view.buffer.borrow();
+            copy_view_bytes(
+                &buffer.data,
+                byte_offset,
+                byte_length,
+                dst,
+                dst_len,
+                src_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
+/// Copy bytes from caller-owned memory into a JavaScript `DataView`.
+///
+/// `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+/// Returns the number of bytes written. Returns `0` when `val` is null, is not a
+/// `DataView`, the view is detached or out of bounds, `src` is null, `src_len`
+/// is zero, or `dst_offset` is outside the view.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live `StatorValue` pointer.
+/// - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+/// - The source range must not overlap with Stator-managed backing storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_data_view_write_contents(
+    val: *mut StatorValue,
+    src: *const u8,
+    src_len: usize,
+    dst_offset: usize,
+) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &mut (*val).inner } {
+        StatorValueInner::DataView(view) => {
+            let view = view.borrow();
+            let Some((byte_offset, byte_length)) = dataview_effective_range(&view) else {
+                return 0;
+            };
+            let mut buffer = view.buffer.borrow_mut();
+            write_view_bytes(
+                &mut buffer.data,
+                byte_offset,
+                byte_length,
+                src,
+                src_len,
+                dst_offset,
+            )
+        }
+        _ => 0,
+    }
+}
+
 /// An opaque handle to a JavaScript object.
 ///
 /// Created by [`stator_object_new`] and destroyed by [`stator_object_destroy`].
 /// Named properties can be set and retrieved via [`stator_object_set`] and
 /// [`stator_object_get`].
 ///
-/// The underlying [`JsObject`] storage is reference-counted, allowing the
-/// same object identity to be exposed through multiple FFI handles via
-/// [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
-/// through one handle are observed through all other handles that share the
-/// same backing storage.
+/// The underlying [`PropertyMap`] storage is reference-counted, allowing the
+/// same object identity to be exposed through multiple FFI handles and through
+/// [`JsValue::PlainObject`] without materialising a fresh script object.
+/// Mutations through one handle are observed through all other handles that
+/// share the same backing storage.
 pub struct StatorObject {
-    inner: Rc<RefCell<JsObject>>,
+    inner: Rc<RefCell<PropertyMap>>,
     isolate: *mut StatorIsolate,
 }
 
 // SAFETY: `StatorObject` is single-threaded; see [`StatorValue`] rationale.
 unsafe impl Send for StatorObject {}
 
+fn plain_object_js_value(inner: &Rc<RefCell<PropertyMap>>) -> JsValue {
+    JsValue::PlainObject(Rc::clone(inner))
+}
+
+fn plain_object_property_key(key: &str) -> JsValue {
+    JsValue::String(key.to_owned().into())
+}
+
+fn plain_object_get_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> JsValue {
+    dispatch_get_property_value(
+        &plain_object_js_value(inner),
+        plain_object_property_key(key),
+    )
+    .unwrap_or(JsValue::Undefined)
+}
+
+fn plain_object_set_property(
+    inner: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    value: JsValue,
+) -> StatorResult<()> {
+    dispatch_set_property_value(
+        &plain_object_js_value(inner),
+        plain_object_property_key(key),
+        value,
+    )
+}
+
+fn plain_object_has_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
+    let mut current = Rc::clone(inner);
+    for _ in 0..256 {
+        let next = {
+            let borrowed = current.borrow();
+            if borrowed.contains_key(key) {
+                return true;
+            }
+            borrowed
+                .get(INTERNAL_PROTO_PROPERTY_KEY)
+                .cloned()
+                .or_else(|| borrowed.get("__proto__").cloned())
+        };
+        match next {
+            Some(JsValue::PlainObject(proto)) => current = proto,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn plain_object_delete_property(inner: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
+    let mut borrowed = inner.borrow_mut();
+    if !borrowed.contains_key(key) {
+        return true;
+    }
+    if !borrowed.is_configurable(key) {
+        return false;
+    }
+    borrowed.remove(key).is_some()
+}
+
+fn plain_object_own_property_keys(inner: &Rc<RefCell<PropertyMap>>) -> Vec<String> {
+    inner
+        .borrow()
+        .keys()
+        .filter(|key| key.as_ref() != INTERNAL_PROTO_PROPERTY_KEY)
+        .map(|key| key.to_string())
+        .collect()
+}
+
 /// Create a new, empty JavaScript object.
 ///
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_new(isolate: *mut StatorIsolate) -> *mut StatorObject {
     if isolate.is_null() {
@@ -3227,7 +4609,7 @@ pub unsafe extern "C" fn stator_object_new(isolate: *mut StatorIsolate) -> *mut 
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe { (*isolate).live_objects += 1 };
     Box::into_raw(Box::new(StatorObject {
-        inner: Rc::new(RefCell::new(JsObject::new())),
+        inner: Rc::new(RefCell::new(PropertyMap::new())),
         isolate,
     }))
 }
@@ -3275,7 +4657,8 @@ pub unsafe extern "C" fn stator_object_set(
     // SAFETY: caller guarantees `val` is valid.
     let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
     // SAFETY: caller guarantees `obj` is valid.
-    let _ = unsafe { (*obj).inner.borrow_mut().set_property(&key_str, js_val) };
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let _ = plain_object_set_property(&inner, key_str.as_ref(), js_val);
 }
 
 /// Get the named property `key` from `obj` as a new [`StatorValue`].
@@ -3298,31 +4681,14 @@ pub unsafe extern "C" fn stator_object_get(
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    let js_val = unsafe { (*obj).inner.borrow().get_property(&key_str) };
-    let inner = match js_val {
-        JsValue::HeapNumber(n) => StatorValueInner::Number(n),
-        JsValue::Smi(n) => StatorValueInner::Number(f64::from(n)),
-        JsValue::String(s) => {
-            // SAFETY: `s` contains no null bytes iff it came through our API;
-            // we truncate at the first null to be safe.
-            let valid_len = s.as_bytes().iter().position(|&b| b == 0).unwrap_or(s.len());
-            // SAFETY: `&s.as_bytes()[..valid_len]` has no null bytes.
-            unsafe {
-                StatorValueInner::Str(CString::from_vec_unchecked(
-                    s.as_bytes()[..valid_len].to_vec(),
-                ))
-            }
-        }
-        // Non-existent or non-primitive property → return null.
-        _ => return std::ptr::null_mut(),
-    };
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    if !plain_object_has_property(&inner, key_str.as_ref()) {
+        return std::ptr::null_mut();
+    }
+    let js_val = plain_object_get_property(&inner, key_str.as_ref());
     // SAFETY: caller guarantees `obj` is valid, so `isolate` is valid too.
     let isolate = unsafe { (*obj).isolate };
-    if !isolate.is_null() {
-        // SAFETY: `isolate` is valid for the lifetime of `obj`.
-        unsafe { (*isolate).live_objects += 1 };
-    }
-    Box::into_raw(Box::new(StatorValue { inner, isolate }))
+    js_value_to_owned_stator_value(isolate, &js_val)
 }
 
 /// Return `true` if `obj` has a property with the given `key` (own or
@@ -3341,7 +4707,8 @@ pub unsafe extern "C" fn stator_object_has(obj: *const StatorObject, key: *const
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    unsafe { (*obj).inner.borrow().has_property(&key_str) }
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    plain_object_has_property(&inner, key_str.as_ref())
 }
 
 /// Delete the named property `key` from `obj`.
@@ -3362,16 +4729,8 @@ pub unsafe extern "C" fn stator_object_delete(obj: *mut StatorObject, key: *cons
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `obj` is valid.
-    // `delete_own_property` returns `Ok(false)` when the property is
-    // non-configurable and `Err(_)` on internal engine errors; both cases
-    // map to `false` here, consistent with ECMAScript's [[Delete]] semantics.
-    unsafe {
-        (*obj)
-            .inner
-            .borrow_mut()
-            .delete_own_property(&key_str)
-            .unwrap_or(false)
-    }
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    plain_object_delete_property(&inner, key_str.as_ref())
 }
 
 /// An opaque snapshot of the own property names of a JavaScript object.
@@ -3400,7 +4759,7 @@ pub unsafe extern "C" fn stator_object_get_property_names(
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `obj` is valid.
-    let keys = unsafe { (*obj).inner.borrow().own_property_keys() };
+    let keys = plain_object_own_property_keys(&unsafe { &*obj }.inner);
     let names = keys
         .into_iter()
         .map(|k| {
@@ -3480,7 +4839,7 @@ pub unsafe extern "C" fn stator_property_names_destroy(names: *mut StatorPropert
 /// model; it is equivalent to [`stator_isolate_gc`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
     if !isolate.is_null() {
@@ -3504,7 +4863,7 @@ pub unsafe extern "C" fn stator_gc_collect(isolate: *mut StatorIsolate) {
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_live_object_count(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -3520,7 +4879,7 @@ pub unsafe extern "C" fn stator_live_object_count(isolate: *const StatorIsolate)
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_heap_used(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -3536,7 +4895,7 @@ pub unsafe extern "C" fn stator_heap_used(isolate: *const StatorIsolate) -> usiz
 /// Returns 0 when `isolate` is null.
 ///
 /// # Safety
-/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be either null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_heap_capacity(isolate: *const StatorIsolate) -> usize {
     if isolate.is_null() {
@@ -3560,20 +4919,174 @@ pub struct StatorScript {
     /// Human-readable error message, or `None` on success.
     error: Option<CString>,
     /// Structured classification of the compile error, or
-    /// [`StatorMessageKind::StatorMessageKindUnknown`] when the script compiled successfully
+    /// `StatorMessageKindUnknown` when the script compiled successfully
     /// or the error was not classified.  Parse/compile failures are
-    /// classified as [`StatorMessageKind::StatorMessageKindSyntax`].
+    /// classified as `StatorMessageKindSyntax`.
     error_kind: StatorMessageKind,
     /// Resource name (typically a filename or URL) supplied by the embedder
     /// via [`stator_script_set_origin`].  Mirrors `v8::ScriptOrigin::ResourceName`.
     /// Used by browser embedders to attribute stack frames to source files.
     resource_name: Option<CString>,
-    /// 1-based line offset of the script within `resource_name`.  Defaults to 0.
+    /// Zero-based line offset of the script within `resource_name`. Defaults to 0.
     /// Mirrors `v8::ScriptOrigin::ResourceLineOffset`.
     resource_line_offset: i32,
-    /// 1-based column offset of the script within `resource_name`.  Defaults
+    /// Zero-based column offset of the script within `resource_name`. Defaults
     /// to 0.  Mirrors `v8::ScriptOrigin::ResourceColumnOffset`.
     resource_column_offset: i32,
+}
+
+/// Compile options that participate in classic-script code-cache identity.
+///
+/// All pointer/length pairs are optional when their length is zero. Non-empty
+/// buffers are copied by Stator before cache production/consumption APIs return.
+/// `resource_name` is the stable URL/resource identity used by diagnostics and
+/// cache validation; source-map and origin metadata mirror browser script
+/// compilation metadata.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorScriptCompileOptions {
+    /// Pointer to `resource_name_len` bytes of the resource URL/name.
+    pub resource_name: *const c_char,
+    /// Number of bytes in `resource_name`.
+    pub resource_name_len: usize,
+    /// Zero-based line offset within the resource.
+    pub line_offset: i32,
+    /// Zero-based column offset within the resource.
+    pub column_offset: i32,
+    /// Optional source URL / sourceURL directive bytes.
+    pub source_url: *const c_char,
+    /// Number of bytes in `source_url`.
+    pub source_url_len: usize,
+    /// Optional browser origin URL bytes.
+    pub origin_url: *const c_char,
+    /// Number of bytes in `origin_url`.
+    pub origin_url_len: usize,
+    /// Optional source map URL bytes.
+    pub source_map_url: *const c_char,
+    /// Number of bytes in `source_map_url`.
+    pub source_map_url_len: usize,
+    /// Optional cache-policy token bytes.
+    pub cache_policy: *const c_char,
+    /// Number of bytes in `cache_policy`.
+    pub cache_policy_len: usize,
+}
+
+/// Status for classic-script code-cache operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorScriptCacheStatus {
+    /// Operation succeeded and produced a versioned classic-script cache blob.
+    StatorScriptCacheStatusProducedMetadata = 0,
+    /// Cache blob matched and restored executable bytecode directly.
+    StatorScriptCacheStatusAcceptedBytecodeRestored = 1,
+    /// Cache blob metadata matched but executable representation was rebuilt.
+    StatorScriptCacheStatusAcceptedValidatedRecompiled = 2,
+    /// A pointer/length pair or output argument was invalid.
+    StatorScriptCacheStatusInvalidArgument = 3,
+    /// The source script was not successfully compiled.
+    StatorScriptCacheStatusCompileError = 4,
+    /// Cache bytes were malformed or failed source/options validation.
+    StatorScriptCacheStatusRejected = 5,
+    /// Script code-cache production/consumption is unsupported by this build.
+    StatorScriptCacheStatusUnsupported = 6,
+    /// Cache payload checksum failed after the header and metadata matched.
+    StatorScriptCacheStatusCorruptPayload = 7,
+}
+
+/// Diagnostic reason for classic-script code-cache acceptance or rejection.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorScriptCacheDiagnostic {
+    /// No additional diagnostic; status is sufficient.
+    StatorScriptCacheDiagnosticNone = 0,
+    /// Cache magic was missing or did not identify a Stator script cache blob.
+    StatorScriptCacheDiagnosticMagicMismatch = 1,
+    /// Cache format version is unsupported by this engine.
+    StatorScriptCacheDiagnosticVersionMismatch = 2,
+    /// Source bytes or source digest did not match the cache metadata.
+    StatorScriptCacheDiagnosticSourceMismatch = 3,
+    /// Script compile options did not match the cache metadata.
+    StatorScriptCacheDiagnosticOptionsMismatch = 4,
+    /// Payload checksum failed after metadata validation succeeded.
+    StatorScriptCacheDiagnosticCorruptPayload = 5,
+    /// Source compiled with an error, so no cache can be produced/restored.
+    StatorScriptCacheDiagnosticCompileError = 6,
+    /// Operation is unsupported for this build or input shape.
+    StatorScriptCacheDiagnosticUnsupported = 7,
+}
+
+fn script_cache_status_name_bytes_u32(status: u32) -> &'static [u8] {
+    match status {
+        0 => b"produced_metadata\0",
+        1 => b"accepted_bytecode_restored\0",
+        2 => b"accepted_validated_recompiled\0",
+        3 => b"invalid_argument\0",
+        4 => b"compile_error\0",
+        5 => b"rejected\0",
+        6 => b"unsupported\0",
+        7 => b"corrupt_payload\0",
+        _ => b"unknown_status\0",
+    }
+}
+
+fn script_cache_diagnostic_name_bytes_u32(diagnostic: u32) -> &'static [u8] {
+    match diagnostic {
+        0 => b"none\0",
+        1 => b"magic_mismatch\0",
+        2 => b"version_mismatch\0",
+        3 => b"source_mismatch\0",
+        4 => b"options_mismatch\0",
+        5 => b"corrupt_payload\0",
+        6 => b"compile_error\0",
+        7 => b"unsupported\0",
+        _ => b"unknown_diagnostic\0",
+    }
+}
+
+/// Return a stable telemetry code string for a raw classic-script cache status.
+///
+/// Unknown or future status values return `"unknown_status"` rather than
+/// requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_script_cache_status_name_u32(status: u32) -> *const c_char {
+    script_cache_status_name_bytes_u32(status).as_ptr().cast()
+}
+
+/// Return a stable telemetry code string for a raw classic-script cache diagnostic.
+///
+/// Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+/// than requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_script_cache_diagnostic_name_u32(diagnostic: u32) -> *const c_char {
+    script_cache_diagnostic_name_bytes_u32(diagnostic)
+        .as_ptr()
+        .cast()
+}
+
+/// Telemetry returned by classic-script code-cache APIs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatorScriptCacheTelemetry {
+    /// High-level status of the cache operation.
+    pub status: StatorScriptCacheStatus,
+    /// Detailed diagnostic reason for status-specific logging.
+    pub diagnostic: StatorScriptCacheDiagnostic,
+    /// Size of the source input in bytes.
+    pub source_len: usize,
+    /// Size of the cache input in bytes, or zero for production APIs.
+    pub cache_input_len: usize,
+    /// Size of the produced cache blob in bytes, or zero when none was produced.
+    pub cache_output_len: usize,
+    /// Stable cache format version used or observed.
+    pub format_version: u32,
 }
 
 /// Owned UTF-8 string handle used by module resolver out-parameters.
@@ -3613,8 +5126,10 @@ pub unsafe extern "C" fn stator_string_new(data: *const c_char, len: usize) -> *
 
 /// Return a pointer to the UTF-8 bytes held by `string`.
 ///
-/// The returned pointer is valid until `string` is freed and is **not**
-/// guaranteed to be null-terminated. Returns null when `string` is null.
+/// The returned pointer is valid for `stator_string_len(string)` bytes or until
+/// `string` is freed, and is **not** guaranteed to be null-terminated. When the
+/// length is zero, the pointer is only a zero-length buffer and must not be
+/// dereferenced. Returns null when `string` is null.
 ///
 /// # Safety
 /// - `string` must be either null or a valid pointer to a live
@@ -3726,9 +5241,9 @@ pub struct StatorModule {
     error_kind: StatorMessageKind,
     /// Resource name (typically a URL) supplied by the embedder.
     resource_name: Option<CString>,
-    /// 1-based line offset of the module within `resource_name`. Defaults to 0.
+    /// Zero-based line offset of the module within `resource_name`. Defaults to 0.
     resource_line_offset: i32,
-    /// 1-based column offset of the module within `resource_name`. Defaults to 0.
+    /// Zero-based column offset of the module within `resource_name`. Defaults to 0.
     resource_column_offset: i32,
     /// Owned copy of the embedder-supplied base URL bytes, if any.
     base_url: Option<Vec<u8>>,
@@ -3782,6 +5297,12 @@ pub struct StatorModule {
     /// one step). The continuation is dropped on completion, rejection,
     /// or [`stator_module_free`].
     pending_eval: Option<stator_jse::interpreter::ModuleTopLevelContinuation>,
+    /// Internal strong-retain count held by contexts and module handles.
+    internal_retain_count: usize,
+    /// Whether the embedder has called `stator_module_free` on this record.
+    host_released: bool,
+    /// Shared liveness flag used by retained handles to fail closed after teardown.
+    lifetime: Rc<Cell<bool>>,
 }
 
 /// A single `export { local as exported } from "src"` indirect re-export.
@@ -3949,9 +5470,9 @@ pub enum StatorModuleType {
     /// Currently fail-closed unsupported. Stator has no CSS parser and no
     /// `CSSStyleSheet` object representation, so CSS module bodies cannot be
     /// parsed, evaluated, or restored from a code cache. Compilation always
-    /// returns an errored [`StatorModule`] tagged with this `source_type`,
+    /// returns an errored `StatorModule` tagged with this `source_type`,
     /// `stator_module_create_code_cache` reports
-    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`], and
+    /// `StatorModuleCacheStatusUnsupported`, and
     /// `stator_module_compile_cached` rejects CSS source with the same
     /// status. Resolving a request that carries `with { type: "css" }` to a
     /// non-CSS module is a type mismatch like every other typed import.
@@ -4034,9 +5555,9 @@ pub struct StatorModuleCompileOptions {
     pub resource_name: *const c_char,
     /// Number of bytes in `resource_name`.
     pub resource_name_len: usize,
-    /// 1-based line offset within the resource.
+    /// Zero-based line offset within the resource.
     pub line_offset: i32,
-    /// 1-based column offset within the resource.
+    /// Zero-based column offset within the resource.
     pub column_offset: i32,
     /// Pointer to `base_url_len` bytes of browser base URL metadata.
     pub base_url: *const c_char,
@@ -4106,7 +5627,7 @@ pub enum StatorModuleCacheStatus {
     /// payloads store validated source bytes plus parsed import/export metadata;
     /// until a safe compiled-artifact deserializer is available they are
     /// accepted with
-    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
+    /// `StatorModuleCacheStatusAcceptedValidatedRecompiled`.
     StatorModuleCacheStatusProducedMetadata = 0,
     /// Cache blob matched and its validation metadata was accepted, but this
     /// engine still had to recompile the executable representation. Currently
@@ -4130,7 +5651,7 @@ pub enum StatorModuleCacheStatus {
     /// checksum failed to verify. The bytes after the format-version field
     /// are corrupt, truncated, or were tampered with after production. The
     /// blob is fail-closed rejected. This status is distinct from
-    /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`], which
+    /// `StatorModuleCacheStatusRejected`, which
     /// covers source/options/metadata mismatches; embedders can use the
     /// distinction to decide whether to evict the blob from disk versus
     /// recompile under the new options.
@@ -4141,6 +5662,33 @@ pub enum StatorModuleCacheStatus {
     /// authenticity should wrap the cache blob in their own signed or
     /// HMAC'd envelope.
     StatorModuleCacheStatusCorruptPayload = 7,
+}
+
+fn module_cache_status_name_bytes_u32(status: u32) -> &'static [u8] {
+    match status {
+        0 => b"produced_metadata\0",
+        1 => b"accepted_validated_recompiled\0",
+        2 => b"invalid_argument\0",
+        3 => b"compile_error\0",
+        4 => b"rejected\0",
+        5 => b"unsupported\0",
+        6 => b"accepted_bytecode_restored\0",
+        7 => b"corrupt_payload\0",
+        _ => b"unknown_status\0",
+    }
+}
+
+/// Return a stable telemetry code string for a raw module code-cache status.
+///
+/// Unknown or future status values return `"unknown_status"` rather than
+/// requiring C callers to construct an invalid Rust enum value.
+///
+/// The returned pointer refers to a process-static, NUL-terminated string owned
+/// by Stator. Embedders must not free or mutate it; it remains valid for the
+/// lifetime of the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_module_cache_status_name_u32(status: u32) -> *const c_char {
+    module_cache_status_name_bytes_u32(status).as_ptr().cast()
 }
 
 /// Read-only view of the browser policy/origin metadata associated with a
@@ -4328,6 +5876,17 @@ pub struct StatorDynamicImportRequest {
     specifier: String,
 }
 
+/// Retained, queryable module-record handle.
+///
+/// The handle keeps a linked module record alive after the embedder releases its
+/// raw `StatorModule` pointer. Queries fail closed once the handle is released
+/// or the underlying module lifetime has ended.
+pub struct StatorModuleHandle {
+    module: *mut StatorModule,
+    lifetime: Rc<Cell<bool>>,
+    released: bool,
+}
+
 /// Host callback used to start async dynamic `import()` work.
 ///
 /// The callback receives the canonical specifier (after URL resolution, when a
@@ -4498,7 +6057,7 @@ impl Drop for StatorDynamicImportResolver {
     }
 }
 
-/// Link/evaluation state for a [`StatorModule`].
+/// Link/evaluation state for a `StatorModule`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatorModuleStatus {
@@ -4518,10 +6077,10 @@ pub enum StatorModuleStatus {
     /// promise has not yet settled after draining the local microtask
     /// queue. Exports are intentionally *not* published in this state; the
     /// embedder must drive evaluation forward by calling
-    /// [`stator_module_resume_evaluation`] (after settling the awaited
+    /// `stator_module_resume_evaluation` (after settling the awaited
     /// promise via host primitives or
-    /// [`stator_module_pending_evaluation_fulfill`] /
-    /// [`stator_module_pending_evaluation_reject`]) before the module's
+    /// `stator_module_pending_evaluation_fulfill` /
+    /// `stator_module_pending_evaluation_reject`) before the module's
     /// bindings become observable.
     StatorModuleStatusPendingAsyncEvaluation = 5,
 }
@@ -4585,10 +6144,10 @@ fn module_request_for(
     })
 }
 
-fn module_export_name_str(name: &ModuleExportName) -> &str {
+fn module_export_name_string(name: &ModuleExportName) -> String {
     match name {
-        ModuleExportName::Ident(id) => &id.name,
-        ModuleExportName::Str(s) => &s.value,
+        ModuleExportName::Ident(id) => id.name.clone(),
+        ModuleExportName::Str(s) => decode_string_constant(&s.value),
     }
 }
 
@@ -4658,7 +6217,7 @@ fn collect_module_requests(
                     .iter()
                     .map(|spec| match spec {
                         ImportSpecifier::Named(n) => {
-                            RequestedExport::Named(module_export_name_str(&n.imported).to_string())
+                            RequestedExport::Named(module_export_name_string(&n.imported))
                         }
                         ImportSpecifier::Default(_) => RequestedExport::Default,
                         ImportSpecifier::Namespace(_) => RequestedExport::Namespace,
@@ -4671,7 +6230,7 @@ fn collect_module_requests(
             }
             ProgramItem::ModuleDecl(ModuleDecl::ExportAll(decl)) => {
                 let imports = if let Some(name) = &decl.exported {
-                    exports.insert(module_export_name_str(name).to_string());
+                    exports.insert(module_export_name_string(name));
                     vec![RequestedExport::Namespace]
                 } else {
                     vec![RequestedExport::Star]
@@ -4687,8 +6246,8 @@ fn collect_module_requests(
                     let source_specifier =
                         module_request_specifier_value(&source.value).to_string();
                     for spec in &decl.specifiers {
-                        let local = module_export_name_str(&spec.local).to_string();
-                        let exported = module_export_name_str(&spec.exported).to_string();
+                        let local = module_export_name_string(&spec.local);
+                        let exported = module_export_name_string(&spec.exported);
                         imports.push(if local == "default" {
                             RequestedExport::Default
                         } else {
@@ -4707,7 +6266,7 @@ fn collect_module_requests(
                     }
                 } else {
                     for spec in &decl.specifiers {
-                        exports.insert(module_export_name_str(&spec.exported).to_string());
+                        exports.insert(module_export_name_string(&spec.exported));
                     }
                     if let Some(stmt) = &decl.declaration {
                         collect_decl_export_names(stmt, &mut exports);
@@ -4797,6 +6356,9 @@ fn module_error_record(
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     })
 }
 
@@ -4928,6 +6490,9 @@ fn compile_json_module_source(src: &str) -> Box<StatorModule> {
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(error) => module_error_record(
@@ -5027,6 +6592,9 @@ fn compile_wasm_module_source(bytes: &[u8]) -> Box<StatorModule> {
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(error) => module_error_record(
@@ -5433,7 +7001,21 @@ struct ModuleCacheRecord {
     edge_cache_metadata: Vec<u8>,
 }
 
+#[derive(PartialEq, Eq)]
+struct ScriptCacheRecord {
+    source_hash: u64,
+    source_len: u64,
+    line_offset: i32,
+    column_offset: i32,
+    resource_name: Vec<u8>,
+    source_url: Vec<u8>,
+    origin_url: Vec<u8>,
+    source_map_url: Vec<u8>,
+    cache_policy: Vec<u8>,
+}
+
 const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
+const SCRIPT_CACHE_MAGIC: &[u8] = b"STATOR_SCRIPT_CACHE\0";
 /// Bumped when the on-disk cache layout (validation record or payload encoding)
 /// changes in any incompatible way. Older blobs are rejected with
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
@@ -5458,6 +7040,7 @@ const MODULE_CACHE_MAGIC: &[u8] = b"STATOR_MODULE_CACHE\0";
 /// distinct from metadata/source/options mismatches which keep using
 /// [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`].
 const MODULE_CACHE_FORMAT_VERSION: u32 = 7;
+const SCRIPT_CACHE_FORMAT_VERSION: u32 = code_cache_key::SCRIPT_CACHE_FORMAT_VERSION;
 
 /// Byte offset, inside a serialized cache blob, at which the corruption
 /// checksum is written. Immediately follows the magic and format version
@@ -5466,6 +7049,8 @@ const MODULE_CACHE_FORMAT_VERSION: u32 = 7;
 const MODULE_CACHE_CHECKSUM_OFFSET: usize = MODULE_CACHE_MAGIC.len() + 4;
 /// Byte offset of the first byte covered by the integrity checksum.
 const MODULE_CACHE_CHECKSUM_END: usize = MODULE_CACHE_CHECKSUM_OFFSET + 8;
+const SCRIPT_CACHE_CHECKSUM_OFFSET: usize = SCRIPT_CACHE_MAGIC.len() + 4;
+const SCRIPT_CACHE_CHECKSUM_END: usize = SCRIPT_CACHE_CHECKSUM_OFFSET + 8;
 
 /// Tag bytes for [`RequestedExport`] inside a cache payload.
 const REQUESTED_EXPORT_TAG_DEFAULT: u8 = 0;
@@ -5594,6 +7179,30 @@ fn serialize_module_cache_record(record: &ModuleCacheRecord) -> Option<Vec<u8>> 
     Some(out)
 }
 
+fn serialize_script_cache_record(record: &ScriptCacheRecord) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SCRIPT_CACHE_MAGIC);
+    push_u32(&mut out, SCRIPT_CACHE_FORMAT_VERSION);
+    push_u64(&mut out, 0);
+    debug_assert_eq!(out.len(), SCRIPT_CACHE_CHECKSUM_END);
+    if !push_bytes(&mut out, env!("CARGO_PKG_VERSION").as_bytes()) {
+        return None;
+    }
+    push_u64(&mut out, record.source_hash);
+    push_u64(&mut out, record.source_len);
+    push_i32(&mut out, record.line_offset);
+    push_i32(&mut out, record.column_offset);
+    if !push_bytes(&mut out, &record.resource_name)
+        || !push_bytes(&mut out, &record.source_url)
+        || !push_bytes(&mut out, &record.origin_url)
+        || !push_bytes(&mut out, &record.source_map_url)
+        || !push_bytes(&mut out, &record.cache_policy)
+    {
+        return None;
+    }
+    Some(out)
+}
+
 /// Compute and write the corruption-detection checksum trailer for a fully
 /// assembled cache blob. Must be called exactly once after both the record
 /// header and the payload bytes have been appended. The checksum covers every
@@ -5603,6 +7212,13 @@ fn finalize_module_cache_blob(bytes: &mut [u8]) {
     debug_assert!(bytes.len() >= MODULE_CACHE_CHECKSUM_END);
     let checksum = fnv1a64(&bytes[MODULE_CACHE_CHECKSUM_END..]);
     bytes[MODULE_CACHE_CHECKSUM_OFFSET..MODULE_CACHE_CHECKSUM_END]
+        .copy_from_slice(&checksum.to_le_bytes());
+}
+
+fn finalize_script_cache_blob(bytes: &mut [u8]) {
+    debug_assert!(bytes.len() >= SCRIPT_CACHE_CHECKSUM_END);
+    let checksum = fnv1a64(&bytes[SCRIPT_CACHE_CHECKSUM_END..]);
+    bytes[SCRIPT_CACHE_CHECKSUM_OFFSET..SCRIPT_CACHE_CHECKSUM_END]
         .copy_from_slice(&checksum.to_le_bytes());
 }
 
@@ -6144,6 +7760,11 @@ enum ModuleCacheParseError {
     ChecksumMismatch,
 }
 
+enum ScriptCacheParseError {
+    Malformed,
+    ChecksumMismatch,
+}
+
 fn parse_module_cache_blob(
     bytes: &[u8],
 ) -> Result<(ModuleCacheRecord, ModuleCachePayload), ModuleCacheParseError> {
@@ -6251,6 +7872,64 @@ fn parse_module_cache_blob(
         },
         payload,
     ))
+}
+
+fn parse_script_cache_blob(
+    bytes: &[u8],
+) -> Result<(ScriptCacheRecord, Vec<u8>), ScriptCacheParseError> {
+    let mut reader = CacheReader::new(bytes);
+    if reader
+        .take(SCRIPT_CACHE_MAGIC.len())
+        .ok_or(ScriptCacheParseError::Malformed)?
+        != SCRIPT_CACHE_MAGIC
+    {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    if reader.read_u32().ok_or(ScriptCacheParseError::Malformed)? != SCRIPT_CACHE_FORMAT_VERSION {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    let stored_checksum = reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?;
+    debug_assert_eq!(reader.offset, SCRIPT_CACHE_CHECKSUM_END);
+    if bytes.len() < SCRIPT_CACHE_CHECKSUM_END {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    if fnv1a64(&bytes[SCRIPT_CACHE_CHECKSUM_END..]) != stored_checksum {
+        return Err(ScriptCacheParseError::ChecksumMismatch);
+    }
+    let engine_version = reader
+        .read_bytes()
+        .ok_or(ScriptCacheParseError::Malformed)?;
+    if engine_version != env!("CARGO_PKG_VERSION").as_bytes() {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    let record = ScriptCacheRecord {
+        source_hash: reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?,
+        source_len: reader.read_u64().ok_or(ScriptCacheParseError::Malformed)?,
+        line_offset: reader.read_i32().ok_or(ScriptCacheParseError::Malformed)?,
+        column_offset: reader.read_i32().ok_or(ScriptCacheParseError::Malformed)?,
+        resource_name: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        source_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        origin_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        source_map_url: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+        cache_policy: reader
+            .read_bytes()
+            .ok_or(ScriptCacheParseError::Malformed)?,
+    };
+    let bytecode = reader
+        .read_bytes()
+        .ok_or(ScriptCacheParseError::Malformed)?;
+    if !reader.is_finished() {
+        return Err(ScriptCacheParseError::Malformed);
+    }
+    Ok((record, bytecode))
 }
 
 fn module_cache_payload_from_module(
@@ -6456,6 +8135,9 @@ fn module_from_js_cache_payload(
         namespace: None,
         indirect_reexports,
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     }))
 }
 
@@ -6502,6 +8184,9 @@ fn module_from_json_cache_payload(payload: JsonModulePayload) -> Option<Box<Stat
         namespace: None,
         indirect_reexports: Vec::new(),
         pending_eval: None,
+        internal_retain_count: 0,
+        host_released: false,
+        lifetime: Rc::new(Cell::new(true)),
     }))
 }
 
@@ -6586,9 +8271,10 @@ fn module_from_wasm_cache_payload(
 unsafe fn module_cache_record_from_options(
     source: &[u8],
     options: *const StatorModuleCompileOptions,
+    metadata_v2: *const StatorModuleSourceMetadataV2,
 ) -> Option<ModuleCacheRecord> {
-    if options.is_null() {
-        return Some(ModuleCacheRecord {
+    let mut record = if options.is_null() {
+        ModuleCacheRecord {
             source_hash: fnv1a64(source),
             source_len: source.len() as u64,
             source_type: StatorModuleType::StatorModuleTypeJavaScript,
@@ -6607,14 +8293,106 @@ unsafe fn module_cache_record_from_options(
             source_map_digest: Vec::new(),
             cache_policy: Vec::new(),
             edge_cache_metadata: Vec::new(),
+        }
+    } else {
+        // SAFETY: caller guarantees `options` is valid.
+        let options_ref = unsafe { &*options };
+        ModuleCacheRecord {
+            source_hash: fnv1a64(source),
+            source_len: source.len() as u64,
+            source_type: options_ref.source_type,
+            line_offset: options_ref.line_offset,
+            column_offset: options_ref.column_offset,
+            // SAFETY: validates and copies option byte buffers.
+            resource_name: unsafe {
+                owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
+            },
+            // SAFETY: validates and copies option byte buffers.
+            base_url: unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len)? },
+            // SAFETY: validates and copies option byte buffers.
+            integrity_metadata: unsafe {
+                owned_ffi_bytes(
+                    options_ref.integrity_metadata,
+                    options_ref.integrity_metadata_len,
+                )?
+            },
+            credentials_mode: options_ref.credentials_mode,
+            referrer_policy: options_ref.referrer_policy,
+            parser_metadata: options_ref.parser_metadata,
+            source_url: Vec::new(),
+            origin_url: Vec::new(),
+            referrer_url: Vec::new(),
+            source_map_url: Vec::new(),
+            source_map_digest: Vec::new(),
+            cache_policy: Vec::new(),
+            edge_cache_metadata: Vec::new(),
+        }
+    };
+
+    if !metadata_v2.is_null() {
+        // SAFETY: caller guarantees `metadata_v2` is valid when non-null.
+        let metadata = unsafe { &*metadata_v2 };
+        if metadata.source_type != record.source_type {
+            return None;
+        }
+        // SAFETY: validates and copies metadata byte buffers.
+        record.source_url =
+            unsafe { owned_ffi_bytes(metadata.source_url, metadata.source_url_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.origin_url =
+            unsafe { owned_ffi_bytes(metadata.origin_url, metadata.origin_url_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.referrer_url =
+            unsafe { owned_ffi_bytes(metadata.referrer_url, metadata.referrer_url_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.source_map_url =
+            unsafe { owned_ffi_bytes(metadata.source_map_url, metadata.source_map_url_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.source_map_digest =
+            unsafe { owned_ffi_bytes(metadata.source_map_digest, metadata.source_map_digest_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.cache_policy =
+            unsafe { owned_ffi_bytes(metadata.cache_policy, metadata.cache_policy_len)? };
+        // SAFETY: validates and copies metadata byte buffers.
+        record.edge_cache_metadata = unsafe {
+            owned_ffi_bytes(
+                metadata.edge_cache_metadata,
+                metadata.edge_cache_metadata_len,
+            )?
+        };
+    }
+
+    Some(record)
+}
+
+unsafe fn script_cache_record_from_options(
+    source: &[u8],
+    script: &StatorScript,
+    options: *const StatorScriptCompileOptions,
+) -> Option<ScriptCacheRecord> {
+    if options.is_null() {
+        return Some(ScriptCacheRecord {
+            source_hash: fnv1a64(source),
+            source_len: source.len() as u64,
+            line_offset: script.resource_line_offset,
+            column_offset: script.resource_column_offset,
+            resource_name: script
+                .resource_name
+                .as_ref()
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_default(),
+            source_url: Vec::new(),
+            origin_url: Vec::new(),
+            source_map_url: Vec::new(),
+            cache_policy: Vec::new(),
         });
     }
-    // SAFETY: caller guarantees `options` is valid.
+
+    // SAFETY: caller guarantees `options` is readable when non-null.
     let options_ref = unsafe { &*options };
-    Some(ModuleCacheRecord {
+    Some(ScriptCacheRecord {
         source_hash: fnv1a64(source),
         source_len: source.len() as u64,
-        source_type: options_ref.source_type,
         line_offset: options_ref.line_offset,
         column_offset: options_ref.column_offset,
         // SAFETY: validates and copies option byte buffers.
@@ -6622,25 +8400,121 @@ unsafe fn module_cache_record_from_options(
             owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
         },
         // SAFETY: validates and copies option byte buffers.
-        base_url: unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len)? },
+        source_url: unsafe { owned_ffi_bytes(options_ref.source_url, options_ref.source_url_len)? },
         // SAFETY: validates and copies option byte buffers.
-        integrity_metadata: unsafe {
-            owned_ffi_bytes(
-                options_ref.integrity_metadata,
-                options_ref.integrity_metadata_len,
-            )?
+        origin_url: unsafe { owned_ffi_bytes(options_ref.origin_url, options_ref.origin_url_len)? },
+        // SAFETY: validates and copies option byte buffers.
+        source_map_url: unsafe {
+            owned_ffi_bytes(options_ref.source_map_url, options_ref.source_map_url_len)?
         },
-        credentials_mode: options_ref.credentials_mode,
-        referrer_policy: options_ref.referrer_policy,
-        parser_metadata: options_ref.parser_metadata,
-        source_url: Vec::new(),
-        origin_url: Vec::new(),
-        referrer_url: Vec::new(),
-        source_map_url: Vec::new(),
-        source_map_digest: Vec::new(),
-        cache_policy: Vec::new(),
-        edge_cache_metadata: Vec::new(),
+        // SAFETY: validates and copies option byte buffers.
+        cache_policy: unsafe {
+            owned_ffi_bytes(options_ref.cache_policy, options_ref.cache_policy_len)?
+        },
     })
+}
+
+fn script_cache_telemetry(
+    status: StatorScriptCacheStatus,
+    diagnostic: StatorScriptCacheDiagnostic,
+    source_len: usize,
+    cache_input_len: usize,
+    cache_output_len: usize,
+) -> StatorScriptCacheTelemetry {
+    StatorScriptCacheTelemetry {
+        status,
+        diagnostic,
+        source_len,
+        cache_input_len,
+        cache_output_len,
+        format_version: SCRIPT_CACHE_FORMAT_VERSION,
+    }
+}
+
+unsafe fn write_script_cache_telemetry(
+    out: *mut StatorScriptCacheTelemetry,
+    telemetry: StatorScriptCacheTelemetry,
+) {
+    if !out.is_null() {
+        // SAFETY: caller guarantees `out` is valid for one write when non-null.
+        unsafe { *out = telemetry };
+    }
+}
+
+fn script_cache_error_record(message: &str) -> *mut StatorScript {
+    let error = CString::new(message).unwrap_or_else(|_| c"script code-cache error".into());
+    Box::into_raw(Box::new(StatorScript {
+        bytecodes: None,
+        error: Some(error),
+        error_kind: StatorMessageKind::StatorMessageKindInternal,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+    }))
+}
+
+unsafe fn apply_script_compile_options(
+    script: *mut StatorScript,
+    options: *const StatorScriptCompileOptions,
+) -> bool {
+    if script.is_null() || options.is_null() {
+        return !script.is_null();
+    }
+    // SAFETY: caller guarantees `options` is readable when non-null.
+    let options_ref = unsafe { &*options };
+    // SAFETY: validates and copies option byte buffers.
+    let Some(resource_name) =
+        (unsafe { owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len) })
+    else {
+        return false;
+    };
+    let resource_name = if resource_name.is_empty() {
+        None
+    } else {
+        match CString::new(resource_name) {
+            Ok(name) => Some(name),
+            Err(_) => return false,
+        }
+    };
+    // Validate the remaining pointer/length pairs even though the classic
+    // script handle currently stores only the v8::ScriptOrigin resource name
+    // and offsets. Cache identity still depends on all of them.
+    // SAFETY: validates and copies option byte buffers.
+    if unsafe { owned_ffi_bytes(options_ref.source_url, options_ref.source_url_len) }.is_none()
+        || unsafe { owned_ffi_bytes(options_ref.origin_url, options_ref.origin_url_len) }.is_none()
+        || unsafe { owned_ffi_bytes(options_ref.source_map_url, options_ref.source_map_url_len) }
+            .is_none()
+        || unsafe { owned_ffi_bytes(options_ref.cache_policy, options_ref.cache_policy_len) }
+            .is_none()
+    {
+        return false;
+    }
+
+    // SAFETY: caller guarantees `script` is valid and uniquely mutable.
+    unsafe {
+        (*script).resource_name = resource_name;
+        (*script).resource_line_offset = options_ref.line_offset;
+        (*script).resource_column_offset = options_ref.column_offset;
+    }
+    true
+}
+
+unsafe fn compile_script_fallback(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    options: *const StatorScriptCompileOptions,
+) -> *mut StatorScript {
+    // SAFETY: caller has already validated the source pointer/length pair.
+    let script = unsafe { stator_script_compile(ctx, source, source_len) };
+    if !unsafe { apply_script_compile_options(script, options) } {
+        if !script.is_null() {
+            // SAFETY: script was returned by `stator_script_compile`.
+            unsafe { stator_script_free(script) };
+        }
+        return script_cache_error_record("invalid script compile options");
+    }
+    script
 }
 
 fn module_cache_record_from_module(source: &[u8], module: &StatorModule) -> ModuleCacheRecord {
@@ -6759,6 +8633,231 @@ pub unsafe extern "C" fn stator_script_compile(
     Box::into_raw(script)
 }
 
+/// Create an engine-owned classic-script code-cache blob for `script`.
+///
+/// The returned [`StatorString`] owns a versioned cache blob containing
+/// validation metadata (engine crate version, source hash/length, resource
+/// name/offsets, and browser source metadata) plus serialized bytecode. On
+/// success `out_telemetry`, when non-null, reports
+/// [`StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata`].
+///
+/// # Safety
+/// - `script` must be either null or a valid, live [`StatorScript`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes when non-null.
+/// - `options`, when non-null, must point to readable compile options.
+/// - `out_telemetry`, when non-null, must be valid for one telemetry write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_create_code_cache(
+    script: *const StatorScript,
+    source: *const c_char,
+    source_len: usize,
+    options: *const StatorScriptCompileOptions,
+    out_telemetry: *mut StatorScriptCacheTelemetry,
+) -> *mut StatorString {
+    let mut telemetry = script_cache_telemetry(
+        StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+        StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+        source_len,
+        0,
+        0,
+    );
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+
+    if script.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let script_ref = unsafe { &*script };
+    // SAFETY: validates the caller-provided source pointer/length pair.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return std::ptr::null_mut();
+    };
+    telemetry.source_len = source_bytes.len();
+
+    let Some(bytecodes) = script_ref.bytecodes.as_ref() else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCompileError;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+    if script_ref.error.is_some() {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCompileError;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: copies and validates option byte buffers.
+    let Some(record) =
+        (unsafe { script_cache_record_from_options(source_bytes, script_ref, options) })
+    else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+
+    let Some(mut bytes) = serialize_script_cache_record(&record) else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    };
+    let bytecode = serialize_bytecode_array(bytecodes);
+    if !push_bytes(&mut bytes, &bytecode) {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported;
+        telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        return std::ptr::null_mut();
+    }
+    finalize_script_cache_blob(&mut bytes);
+
+    telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata;
+    telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone;
+    telemetry.cache_output_len = bytes.len();
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+    Box::into_raw(Box::new(StatorString { bytes }))
+}
+
+/// Compile a classic script from `source` using a previously produced cache blob.
+///
+/// The cache is accepted only when its magic, format version, engine crate
+/// version, source length/hash, resource name, offsets, and source metadata
+/// match. On a clean match Stator restores bytecode from the cache and reports
+/// [`StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored`].
+/// Rejected, invalid, unsupported, or corrupt cache inputs never execute cached
+/// bytes; Stator falls back to normal source compilation and reports the cache
+/// status through `out_telemetry`.
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes.
+/// - `cache_data` must be valid for reads of `cache_len` bytes.
+/// - `options`, when non-null, must point to readable compile options.
+/// - `out_telemetry`, when non-null, must be valid for one telemetry write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_compile_cached(
+    ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    cache_data: *const c_char,
+    cache_len: usize,
+    options: *const StatorScriptCompileOptions,
+    out_telemetry: *mut StatorScriptCacheTelemetry,
+) -> *mut StatorScript {
+    let mut telemetry = script_cache_telemetry(
+        StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+        StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+        source_len,
+        cache_len,
+        0,
+    );
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+
+    // SAFETY: validates caller-provided source pointer/length pair.
+    let Some(source_bytes) = (unsafe { ffi_bytes(source, source_len) }) else {
+        return script_cache_error_record("invalid script source pointer");
+    };
+    telemetry.source_len = source_bytes.len();
+
+    let empty_script = StatorScript {
+        bytecodes: None,
+        error: None,
+        error_kind: StatorMessageKind::StatorMessageKindUnknown,
+        resource_name: None,
+        resource_line_offset: 0,
+        resource_column_offset: 0,
+    };
+    // SAFETY: copies and validates option byte buffers.
+    let Some(expected) =
+        (unsafe { script_cache_record_from_options(source_bytes, &empty_script, options) })
+    else {
+        return script_cache_error_record("invalid script compile options");
+    };
+
+    // SAFETY: validates caller-provided cache pointer/length pair.
+    let Some(cache_bytes) = (unsafe { ffi_bytes(cache_data, cache_len) }) else {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument;
+        telemetry.cache_input_len = cache_len;
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        // SAFETY: source was validated above.
+        return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+    };
+    telemetry.cache_input_len = cache_bytes.len();
+
+    let (actual, bytecode_payload) = match parse_script_cache_blob(cache_bytes) {
+        Ok(parsed) => parsed,
+        Err(ScriptCacheParseError::Malformed) => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusRejected;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticMagicMismatch;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+        Err(ScriptCacheParseError::ChecksumMismatch) => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+    };
+
+    if actual != expected {
+        telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusRejected;
+        telemetry.diagnostic = if actual.source_hash != expected.source_hash
+            || actual.source_len != expected.source_len
+        {
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch
+        } else {
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticOptionsMismatch
+        };
+        // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+        unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+        // SAFETY: source was validated above.
+        return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+    }
+
+    let mut cursor = 0usize;
+    let bytecodes = match deserialize_bytecode_array(&bytecode_payload, &mut cursor) {
+        Ok(bytecodes) if cursor == bytecode_payload.len() => bytecodes,
+        _ => {
+            telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload;
+            telemetry.diagnostic =
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload;
+            // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+            unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+            // SAFETY: source was validated above.
+            return unsafe { compile_script_fallback(ctx, source, source_len, options) };
+        }
+    };
+
+    telemetry.status = StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored;
+    telemetry.diagnostic = StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone;
+    // SAFETY: caller guarantees `out_telemetry` is valid when non-null.
+    unsafe { write_script_cache_telemetry(out_telemetry, telemetry) };
+    Box::into_raw(Box::new(StatorScript {
+        bytecodes: Some(Rc::new(bytecodes)),
+        error: None,
+        error_kind: StatorMessageKind::StatorMessageKindUnknown,
+        resource_name: CString::new(actual.resource_name).ok(),
+        resource_line_offset: actual.line_offset,
+        resource_column_offset: actual.column_offset,
+    }))
+}
+
 /// Compile `source` (a UTF-8 string of `source_len` bytes) as an ES module.
 ///
 /// Returns a non-null [`StatorModule`] pointer in all cases (even on error).
@@ -6815,6 +8914,9 @@ unsafe fn compile_module_source(
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
+            internal_retain_count: 0,
+            host_released: false,
+            lifetime: Rc::new(Cell::new(true)),
         });
         return Box::into_raw(module);
     }
@@ -6863,6 +8965,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             });
             return Box::into_raw(module);
         }
@@ -6916,6 +9021,9 @@ unsafe fn compile_module_source(
             namespace: None,
             indirect_reexports: Vec::new(),
             pending_eval: None,
+            internal_retain_count: 0,
+            host_released: false,
+            lifetime: Rc::new(Cell::new(true)),
         });
         return Box::into_raw(module);
     }
@@ -6972,6 +9080,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports,
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
         Err(e) => {
@@ -7012,6 +9123,9 @@ unsafe fn compile_module_source(
                 namespace: None,
                 indirect_reexports: Vec::new(),
                 pending_eval: None,
+                internal_retain_count: 0,
+                host_released: false,
+                lifetime: Rc::new(Cell::new(true)),
             })
         }
     };
@@ -7233,6 +9347,80 @@ pub unsafe extern "C" fn stator_module_compile_cached(
     options: *const StatorModuleCompileOptions,
     out_status: *mut StatorModuleCacheStatus,
 ) -> *mut StatorModule {
+    // SAFETY: forwards the caller-provided raw pointers to the shared
+    // compile-cached implementation without source metadata v2.
+    unsafe {
+        stator_module_compile_cached_inner(ModuleCompileCachedArgs {
+            source,
+            source_len,
+            cache_data,
+            cache_len,
+            options,
+            metadata_v2: std::ptr::null(),
+            out_status,
+        })
+    }
+}
+
+/// Compile a module from `source` using a cache blob and source metadata v2.
+///
+/// This is an opt-in variant of `stator_module_compile_cached` for embedders
+/// that produced a cache after calling `stator_module_set_source_metadata_v2`.
+/// The supplied metadata participates in cache identity and is restored onto
+/// the returned module on a cache hit. Null metadata keeps the legacy empty-v2
+/// behavior.
+///
+/// # Safety
+/// - Pointers follow `stator_module_compile_cached`.
+/// - `metadata_v2`, when non-null, must point to a readable
+///   `StatorModuleSourceMetadataV2` whose pointer/length fields are readable
+///   when their lengths are non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_compile_cached_with_source_metadata_v2(
+    _ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+    cache_data: *const c_char,
+    cache_len: usize,
+    options: *const StatorModuleCompileOptions,
+    metadata_v2: *const StatorModuleSourceMetadataV2,
+    out_status: *mut StatorModuleCacheStatus,
+) -> *mut StatorModule {
+    // SAFETY: forwards the caller-provided raw pointers to the shared
+    // compile-cached implementation.
+    unsafe {
+        stator_module_compile_cached_inner(ModuleCompileCachedArgs {
+            source,
+            source_len,
+            cache_data,
+            cache_len,
+            options,
+            metadata_v2,
+            out_status,
+        })
+    }
+}
+
+struct ModuleCompileCachedArgs {
+    source: *const c_char,
+    source_len: usize,
+    cache_data: *const c_char,
+    cache_len: usize,
+    options: *const StatorModuleCompileOptions,
+    metadata_v2: *const StatorModuleSourceMetadataV2,
+    out_status: *mut StatorModuleCacheStatus,
+}
+
+unsafe fn stator_module_compile_cached_inner(args: ModuleCompileCachedArgs) -> *mut StatorModule {
+    let ModuleCompileCachedArgs {
+        source,
+        source_len,
+        cache_data,
+        cache_len,
+        options,
+        metadata_v2,
+        out_status,
+    } = args;
     if !out_status.is_null() {
         // SAFETY: caller guarantees `out_status` is valid when non-null.
         unsafe { *out_status = StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument };
@@ -7264,7 +9452,8 @@ pub unsafe extern "C" fn stator_module_compile_cached(
         return module_cache_rejection_record(source_type, "invalid module cache pointer");
     };
     // SAFETY: copies and validates option byte buffers.
-    let Some(expected) = (unsafe { module_cache_record_from_options(source_bytes, options) })
+    let Some(expected) =
+        (unsafe { module_cache_record_from_options(source_bytes, options, metadata_v2) })
     else {
         return module_cache_rejection_record(source_type, "invalid module compile options");
     };
@@ -7326,6 +9515,13 @@ pub unsafe extern "C" fn stator_module_compile_cached(
         // SAFETY: `module` was allocated above by `Box::into_raw`.
         unsafe { stator_module_free(module) };
         return module_cache_rejection_record(source_type, "invalid module compile options");
+    }
+    if !metadata_v2.is_null()
+        && !unsafe { stator_module_set_source_metadata_v2(module, metadata_v2) }
+    {
+        // SAFETY: `module` was allocated above by `Box::into_raw`.
+        unsafe { stator_module_free(module) };
+        return module_cache_rejection_record(source_type, "invalid module source metadata v2");
     }
     if !out_status.is_null() {
         // SAFETY: caller guarantees `out_status` is valid when non-null.
@@ -7930,9 +10126,9 @@ pub unsafe extern "C" fn stator_module_get_error(module: *const StatorModule) ->
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `module`'s compile error.
+/// Return the structured `StatorMessageKind` of `module`'s compile error.
 ///
-/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+/// Returns `StatorMessageKindUnknown` when `module`
 /// compiled successfully or is null.
 ///
 /// # Safety
@@ -8605,6 +10801,130 @@ pub unsafe extern "C" fn stator_module_get_type(module: *const StatorModule) -> 
     unsafe { (*module).source_type }
 }
 
+/// Retain a module record and return a fail-closed handle for later queries.
+///
+/// The returned handle keeps `module` alive even if the embedder subsequently
+/// calls [`stator_module_free`] on the raw module pointer. Release it with
+/// [`stator_module_handle_release`] and then destroy the handle with
+/// [`stator_module_handle_destroy`].
+///
+/// # Safety
+/// `module` must be null or a valid, live [`StatorModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_retain(
+    module: *mut StatorModule,
+) -> *mut StatorModuleHandle {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid for this retain operation.
+    let module_ref = unsafe { &mut *module };
+    if !module_ref.lifetime.get() {
+        return std::ptr::null_mut();
+    }
+    module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_add(1);
+    Box::into_raw(Box::new(StatorModuleHandle {
+        module,
+        lifetime: Rc::clone(&module_ref.lifetime),
+        released: false,
+    }))
+}
+
+/// Return whether a retained module handle still refers to a live module.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_is_valid(handle: *const StatorModuleHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `handle` is valid when non-null.
+    let handle_ref = unsafe { &*handle };
+    !handle_ref.released && !handle_ref.module.is_null() && handle_ref.lifetime.get()
+}
+
+/// Return the retained raw module pointer, or null for a stale handle.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_get_module(
+    handle: *const StatorModuleHandle,
+) -> *mut StatorModule {
+    // SAFETY: forwards the same handle validity preconditions.
+    if unsafe { stator_module_handle_is_valid(handle) } {
+        // SAFETY: validity above checked `handle` is non-null.
+        unsafe { (*handle).module }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Query a retained module handle's current status.
+///
+/// Stale handles fail closed as [`StatorModuleStatus::StatorModuleStatusErrored`].
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_get_status(
+    handle: *const StatorModuleHandle,
+) -> StatorModuleStatus {
+    // SAFETY: forwards the same handle validity preconditions.
+    let module = unsafe { stator_module_handle_get_module(handle) };
+    if module.is_null() {
+        StatorModuleStatus::StatorModuleStatusErrored
+    } else {
+        // SAFETY: the handle validity check returned a live module pointer.
+        unsafe { (*module).status }
+    }
+}
+
+/// Release the module record retained by `handle`.
+///
+/// The handle remains allocated as a stale tombstone so subsequent queries fail
+/// closed. Call [`stator_module_handle_destroy`] to free the handle storage.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_release(handle: *mut StatorModuleHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `handle` is valid when non-null.
+    let handle_ref = unsafe { &mut *handle };
+    if handle_ref.released {
+        return false;
+    }
+    let module = handle_ref.module;
+    handle_ref.module = std::ptr::null_mut();
+    handle_ref.released = true;
+    if !module.is_null() && handle_ref.lifetime.get() {
+        // SAFETY: this handle owns one internal retain on `module`.
+        unsafe { release_module_record(module) };
+    }
+    true
+}
+
+/// Destroy a retained module handle.
+///
+/// If the handle was not released yet, this releases it first.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`stator_module_retain`] and
+/// must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_module_handle_destroy(handle: *mut StatorModuleHandle) {
+    if !handle.is_null() {
+        // SAFETY: `handle` is valid and may still own a retain.
+        let _ = unsafe { stator_module_handle_release(handle) };
+        // SAFETY: pointer was created by `Box::into_raw` in `stator_module_retain`.
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
 unsafe fn module_result_to_value(ctx: *mut StatorContext, val: &JsValue) -> *mut StatorValue {
     let isolate = if ctx.is_null() {
         std::ptr::null_mut()
@@ -8858,6 +11178,10 @@ pub unsafe extern "C" fn stator_dynamic_import_request_resolve_module(
         request.inner.reject(js_error_from_stator_error(error));
         return StatorResolveStatus::StatorResolveStatusTypeError;
     }
+    // SAFETY: the dynamic-import graph is now linked; retain it on the request
+    // context so delayed host settlement and browser graph reuse keep records
+    // and metadata alive until context teardown.
+    unsafe { retain_linked_module_graph(request.ctx, module) };
 
     // SAFETY: caller guarantees `module` is live for this settlement.
     let result = unsafe { stator_module_evaluate(module, request.ctx) };
@@ -8869,11 +11193,15 @@ pub unsafe extern "C" fn stator_dynamic_import_request_resolve_module(
     }
     // SAFETY: `stator_module_evaluate` returned a value owned by us.
     unsafe { stator_value_destroy(result) };
-    request
-        .inner
-        .resolve(JsValue::PlainObject(Rc::new(RefCell::new(
-            PropertyMap::new(),
-        ))));
+    let namespace = if request.ctx.is_null() {
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
+    } else {
+        // SAFETY: `request.ctx` and `module` are live for settlement.
+        let global_env = unsafe { &(*request.ctx).globals };
+        // SAFETY: module evaluation succeeded and export cells are populated.
+        unsafe { module_namespace_value(module, global_env) }
+    };
+    request.inner.resolve(namespace);
     StatorResolveStatus::StatorResolveStatusOk
 }
 
@@ -9416,6 +11744,79 @@ fn set_module_link_error(module: &mut StatorModule, error: &stator_jse::error::S
     module.last_result = None;
     module.error = Some(CString::new(error.to_string()).unwrap_or_else(|_| c"module error".into()));
     module.error_kind = message_kind_for_error(error, false);
+}
+
+unsafe fn retain_module_record(module: *mut StatorModule) {
+    if module.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `module` is a live module pointer.
+    let module_ref = unsafe { &mut *module };
+    if module_ref.lifetime.get() {
+        module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_add(1);
+    }
+}
+
+unsafe fn release_module_record(module: *mut StatorModule) {
+    if module.is_null() {
+        return;
+    }
+    // SAFETY: caller owns one internal retain on this live module pointer.
+    let module_ref = unsafe { &mut *module };
+    module_ref.internal_retain_count = module_ref.internal_retain_count.saturating_sub(1);
+    if module_ref.internal_retain_count == 0 && module_ref.host_released {
+        module_ref.lifetime.set(false);
+        // SAFETY: host ownership was already released and this was the final
+        // internal retain, so no context/handle can observe the record again.
+        drop(unsafe { Box::from_raw(module) });
+    }
+}
+
+unsafe fn release_context_module_retention(ctx: *mut StatorContext) {
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ctx` is valid and uniquely mutable.
+    let retained: Vec<*mut StatorModule> = unsafe { (*ctx).module_retention.drain().collect() };
+    for module in retained {
+        // SAFETY: every retained module pointer owns one context retain.
+        unsafe { release_module_record(module) };
+    }
+}
+
+unsafe fn collect_linked_module_graph(
+    module: *mut StatorModule,
+    out: &mut HashSet<*mut StatorModule>,
+) {
+    if module.is_null() || !out.insert(module) {
+        return;
+    }
+    // SAFETY: caller guarantees `module` is a live linked/evaluated module.
+    let module_ref = unsafe { &*module };
+    for request in &module_ref.module_requests {
+        let dep = request.resolved.get();
+        if !dep.is_null() {
+            // SAFETY: `dep` was populated by successful graph instantiation.
+            unsafe { collect_linked_module_graph(dep, out) };
+        }
+    }
+}
+
+unsafe fn retain_linked_module_graph(ctx: *mut StatorContext, root: *mut StatorModule) {
+    if ctx.is_null() || root.is_null() {
+        return;
+    }
+    let mut graph = HashSet::new();
+    // SAFETY: called only after successful link/validation.
+    unsafe { collect_linked_module_graph(root, &mut graph) };
+    // SAFETY: caller guarantees `ctx` is valid and serialized.
+    let retention = unsafe { &mut (*ctx).module_retention };
+    for module in graph {
+        if retention.insert(module) {
+            // SAFETY: context owns one retain for each newly inserted module.
+            unsafe { retain_module_record(module) };
+        }
+    }
 }
 
 fn module_stored_error(module: &StatorModule) -> stator_jse::error::StatorError {
@@ -9982,23 +12383,24 @@ unsafe fn collect_module_export_names_inner(
 ///   backed by read-through cells — the object is frozen via
 ///   [`PropertyMap::freeze`], which transitively makes assignments and `delete`
 ///   throw `TypeError` in strict code (modules are always strict).
-/// * Adding new properties throws because the object is non-extensible.
-fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCell<GlobalEnv>>) {
-    let dep = request.resolved.get();
-    if dep.is_null() {
-        return;
+unsafe fn module_namespace_value(
+    module: *mut StatorModule,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> JsValue {
+    if module.is_null() {
+        return JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
     }
     // SAFETY: `dep` is a borrowed pointer kept alive by the linked module
     // graph. We hold the only mutable borrow of the module record while
     // caching the namespace value below.
-    let dep_module = unsafe { &mut *dep };
-    let ns_value = if let Some(ns) = dep_module.namespace.as_ref() {
+    let dep_module = unsafe { &mut *module };
+    if let Some(ns) = dep_module.namespace.as_ref() {
         ns.cheap_clone()
     } else {
         // SAFETY: `dep` is a live module pointer; `collect_module_export_names`
         // only reads immutable metadata.
         let mut exports: Vec<String> =
-            unsafe { collect_module_export_names(dep).into_iter().collect() };
+            unsafe { collect_module_export_names(module).into_iter().collect() };
         // ES §10.4.6.12 (SortCompare on `[[OwnPropertyKeys]]`): sort export
         // names lexicographically by Unicode code-point order so the
         // observable enumeration order is deterministic and spec-compliant.
@@ -10007,7 +12409,8 @@ fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCe
         for name in exports {
             // SAFETY: `dep` is a live module pointer; `name` came from the
             // unambiguous namespace export set collected above.
-            let provider = unsafe { resolve_module_export_provider(dep, &name) }.unwrap_or(dep);
+            let provider =
+                unsafe { resolve_module_export_provider(module, &name) }.unwrap_or(module);
             let value_key = module_export_cell_key(provider, &name);
             let value = JsValue::ModuleBinding(Rc::new(ModuleBindingCell {
                 global_env: Rc::clone(global_env),
@@ -10019,7 +12422,17 @@ fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCe
         let ns_value = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
         dep_module.namespace = Some(ns_value.cheap_clone());
         ns_value
-    };
+    }
+}
+
+/// * Adding new properties throws because the object is non-extensible.
+fn publish_module_namespace(request: &StatorModuleRequest, global_env: &Rc<RefCell<GlobalEnv>>) {
+    let dep = request.resolved.get();
+    if dep.is_null() {
+        return;
+    }
+    // SAFETY: `dep` is a live linked module pointer retained by the graph.
+    let ns_value = unsafe { module_namespace_value(dep, global_env) };
     let specifier = request.specifier.to_string_lossy();
     let ns_key = format!("__mod_ns:{specifier}");
     global_env.borrow_mut().insert(ns_key, ns_value);
@@ -10124,7 +12537,12 @@ pub unsafe extern "C" fn stator_module_instantiate(
             let mut validated = HashSet::new();
             // SAFETY: `module` is a non-null, fully-linked module record.
             match unsafe { validate_module_graph_exports(module, &mut validated) } {
-                Ok(()) => true,
+                Ok(()) => {
+                    // SAFETY: the graph is fully linked and validated; the
+                    // context now retains each record for browser graph reuse.
+                    unsafe { retain_linked_module_graph(ctx, module) };
+                    true
+                }
                 Err(error) => {
                     // SAFETY: `module` is non-null and valid by function contract.
                     let module_ref = unsafe { &mut *module };
@@ -11205,9 +13623,18 @@ pub unsafe extern "C" fn stator_module_evaluate(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_module_free(module: *mut StatorModule) {
     if !module.is_null() {
-        // SAFETY: pointer was created by `Box::into_raw` in
-        // `stator_module_compile`.
-        drop(unsafe { Box::from_raw(module) });
+        // SAFETY: caller guarantees `module` is valid for this release.
+        let module_ref = unsafe { &mut *module };
+        if module_ref.host_released {
+            return;
+        }
+        module_ref.host_released = true;
+        if module_ref.internal_retain_count == 0 {
+            module_ref.lifetime.set(false);
+            // SAFETY: pointer was created by `Box::into_raw` in
+            // `stator_module_compile`, and no internal context/handle retains remain.
+            drop(unsafe { Box::from_raw(module) });
+        }
     }
 }
 
@@ -11397,7 +13824,7 @@ pub unsafe extern "C" fn stator_module_resume_evaluation(
 /// copied into the engine; ownership of `value` is retained by the caller.
 ///
 /// Return value and status transitions mirror
-/// [`stator_module_resume_evaluation`].
+/// `stator_module_resume_evaluation`.
 ///
 /// # Safety
 /// - `module` must be a non-null pointer returned by
@@ -11431,7 +13858,7 @@ pub unsafe extern "C" fn stator_module_pending_evaluation_fulfill(
 /// copied into the engine; ownership of `reason` is retained by the caller.
 ///
 /// Return value and status transitions mirror
-/// [`stator_module_resume_evaluation`].
+/// `stator_module_resume_evaluation`.
 ///
 /// # Safety
 /// - `module` must be a non-null pointer returned by
@@ -11938,7 +14365,7 @@ pub unsafe extern "C" fn stator_value_to_number(val: *const StatorValue) -> f64 
 /// Returns a null pointer if `isolate` is null.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `val` must be either null or a valid, live [`StatorValue`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_to_string(
@@ -12046,8 +14473,12 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => true,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => true,
     }
 }
 
@@ -12060,8 +14491,10 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
 /// - Numbers: `NaN !== NaN`; `+0 === -0`.
 /// - Strings: byte-for-byte equality.
 /// - Booleans: value equality.
-/// - Object / function / array / … : `false` (no shared identity in FFI
-///   handles; two distinct handles are never the same object).
+/// - Tag-only object / function / array / promise placeholders: `false`
+///   because they carry no shared identity in FFI handles.
+/// - Shared-storage object, DOM wrapper, Promise, and binary-view handles:
+///   identity equality based on the underlying shared engine handle.
 ///
 /// Both null pointers are treated as `undefined`.
 ///
@@ -12098,12 +14531,19 @@ pub unsafe extern "C" fn stator_value_strict_equals(
         }
         (StatorValueInner::Str(x), StatorValueInner::Str(y)) => x == y,
         // Two shared-storage object handles compare equal iff they point at
-        // the same underlying `Rc<RefCell<JsObject>>` (pointer identity).
+        // the same underlying `Rc<RefCell<PropertyMap>>` (pointer identity).
         (StatorValueInner::ObjectHandle(x), StatorValueInner::ObjectHandle(y)) => Rc::ptr_eq(x, y),
         (
             StatorValueInner::DomWrapHandle { plain: x, .. },
             StatorValueInner::DomWrapHandle { plain: y, .. },
         ) => Rc::ptr_eq(x, y),
+        (
+            StatorValueInner::PromiseHandle { promise: x, .. },
+            StatorValueInner::PromiseHandle { promise: y, .. },
+        ) => x == y,
+        (StatorValueInner::ArrayBuffer(x), StatorValueInner::ArrayBuffer(y)) => Rc::ptr_eq(x, y),
+        (StatorValueInner::TypedArray(x), StatorValueInner::TypedArray(y)) => Rc::ptr_eq(x, y),
+        (StatorValueInner::DataView(x), StatorValueInner::DataView(y)) => Rc::ptr_eq(x, y),
         // Object-like tags carry no identity in FFI handles → never equal.
         _ => false,
     }
@@ -12117,19 +14557,19 @@ pub unsafe extern "C" fn stator_value_strict_equals(
 /// reaching for out-of-band channels.
 ///
 /// Variants:
-/// * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
+/// * `StatorStatusOk` — the call succeeded; any
 ///   out-pointer was written.
-/// * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
+/// * `StatorStatusFalse` — the call succeeded with
 ///   a structural "no" answer (e.g. property missing, type mismatch on a
 ///   typed get).  Out-pointers are left untouched or zero-cleared, never
 ///   carrying a stale value.
-/// * [`StatorStatusException`][Self::StatorStatusException] — the operation
+/// * `StatorStatusException` — the operation
 ///   raised (or captured) a JavaScript exception.  When applicable, the
 ///   isolate's pending exception is populated and can be inspected through
-///   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
-/// * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
+///   `stator_isolate_peek_pending_message` / `stator_try_catch_*`.
+/// * `StatorStatusInvalidArg` — at least one
 ///   required argument was null or otherwise malformed; nothing was mutated.
-/// * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
+/// * `StatorStatusUnsupported` — the
 ///   operation is well-formed but not yet implemented for this kind of
 ///   value/object (e.g. calling a bytecode function via the FFI).  Reserved
 ///   discriminants are stable; embedders should treat unknown values as
@@ -12157,13 +14597,13 @@ pub enum StatorStatus {
 /// Read the boolean value of `val` into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript boolean.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusOk` when `val` holds a JavaScript boolean.
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   boolean.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_boolean(
@@ -12187,13 +14627,13 @@ pub unsafe extern "C" fn stator_value_get_boolean(
 /// Read the numeric value of `val` into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript number.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusOk` when `val` holds a JavaScript number.
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   number.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to an `f64`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_number(
@@ -12217,19 +14657,19 @@ pub unsafe extern "C" fn stator_value_get_number(
 /// Read `val` as a signed 32-bit integer into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+/// * `StatorStatusOk` when `val` is a finite integer in the
 ///   range `[−2³¹, 2³¹−1]`; `*out` is set to the exact value.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+/// * `StatorStatusFalse` when `val` is non-null but is not
 ///   exactly representable as an `i32` (non-number, fractional, ±Infinity,
 ///   `NaN`, or out of range).  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// Mirrors the semantics of `v8::Value::Int32Value` for the success case but
 /// without the implicit `ToNumber` coercion — embedders that want the lossy
-/// truncating conversion should call [`stator_value_to_int32`] instead.
+/// truncating conversion should call `stator_value_to_int32` instead.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to an `i32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_int32(
@@ -12256,14 +14696,14 @@ pub unsafe extern "C" fn stator_value_get_int32(
 /// Read `val` as an unsigned 32-bit integer into `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+/// * `StatorStatusOk` when `val` is a finite integer in the
 ///   range `[0, 2³²−1]`; `*out` is set to the exact value.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+/// * `StatorStatusFalse` when `val` is non-null but is not
 ///   exactly representable as a `u32`.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `u32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_uint32(
@@ -12291,17 +14731,17 @@ pub unsafe extern "C" fn stator_value_get_uint32(
 ///
 /// The returned length does **not** include a terminating null byte and is
 /// the count of raw UTF-8 bytes — sufficient for sizing a buffer passed to
-/// [`stator_value_write_string_utf8`].
+/// `stator_value_write_string_utf8`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when `val` is a string; `*out` is the
+/// * `StatorStatusOk` when `val` is a string; `*out` is the
 ///   byte length.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   string.  `*out` is left untouched.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+/// * `StatorStatusInvalidArg` when `val` or `out` is null.
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `out` must be either null or a valid pointer to a `usize`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_get_string_utf8_length(
@@ -12331,7 +14771,7 @@ pub unsafe extern "C" fn stator_value_get_string_utf8_length(
 ///
 /// At most `buf_size` bytes are written.  If `buf_size` is smaller than the
 /// string's byte length the output is truncated; callers can size their
-/// buffer with [`stator_value_get_string_utf8_length`] and inspect
+/// buffer with `stator_value_get_string_utf8_length` and inspect
 /// `*written` to detect truncation.
 ///
 /// On success, `*written` (if non-null) is set to the number of bytes
@@ -12339,15 +14779,15 @@ pub unsafe extern "C" fn stator_value_get_string_utf8_length(
 /// callers never see stale length information.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on a (possibly truncated) successful
+/// * `StatorStatusOk` on a (possibly truncated) successful
 ///   write.
-/// * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+/// * `StatorStatusFalse` when `val` is non-null but not a
 ///   string.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `buf` is null.
+/// * `StatorStatusInvalidArg` when `val` or `buf` is null.
 ///   A null `written` pointer is allowed (and simply discards the length).
 ///
 /// # Safety
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 /// * `buf` must be valid for writes of `buf_size` bytes (unless null).
 /// * `written` must be either null or a valid pointer to a `usize`.
 #[unsafe(no_mangle)]
@@ -12384,13 +14824,13 @@ pub unsafe extern "C" fn stator_value_write_string_utf8(
 // ── Object / value identity bridge ───────────────────────────────────────────
 
 /// Borrow the shared backing storage of an [`StatorObject`] handle so that
-/// the same `Rc<RefCell<JsObject>>` can be reused by both [`StatorObject`]
+/// the same `Rc<RefCell<PropertyMap>>` can be reused by both [`StatorObject`]
 /// and [`StatorValue`] handles created from it.  Returns `None` if the
 /// object's pointer is null.
 ///
 /// # Safety
 /// `obj` must be either null or a valid, live [`StatorObject`] pointer.
-unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCell<JsObject>>> {
+unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCell<PropertyMap>>> {
     if obj.is_null() {
         return None;
     }
@@ -12398,21 +14838,21 @@ unsafe fn stator_object_inner_clone(obj: *const StatorObject) -> Option<Rc<RefCe
     Some(Rc::clone(&unsafe { &*obj }.inner))
 }
 
-/// Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
-/// shares the same underlying `JsObject` storage.
+/// Wrap a `StatorObject` handle as a fresh `StatorValue` handle that
+/// shares the same underlying `PropertyMap` storage.
 ///
 /// The returned value's `typeof` is `"object"`; passing it to
-/// [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
+/// `stator_value_as_object` yields a new `StatorObject` handle whose
 /// property mutations are observed through `obj` and vice versa.  This is
 /// the FFI mechanism for round-tripping object identity across the
 /// value/object boundary.
 ///
 /// Returns a null pointer when `obj` is null.  The caller owns the returned
-/// value pointer and must release it with [`stator_value_destroy`] (or rely
+/// value pointer and must release it with `stator_value_destroy` (or rely
 /// on the active handle scope).
 ///
 /// # Safety
-/// `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// `obj` must be either null or a valid, live `StatorObject` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_as_value(obj: *const StatorObject) -> *mut StatorValue {
     if obj.is_null() {
@@ -12445,24 +14885,24 @@ pub unsafe extern "C" fn stator_object_as_value(obj: *const StatorObject) -> *mu
     val
 }
 
-/// Wrap a [`StatorValue`] holding an object-as-value handle as a fresh
-/// [`StatorObject`] handle that shares the same underlying `JsObject`
+/// Wrap a `StatorValue` holding an object-as-value handle as a fresh
+/// `StatorObject` handle that shares the same underlying `JsObject`
 /// storage.
 ///
 /// Identity is only preserved for values produced by
-/// [`stator_object_as_value`] (or by future FFI APIs that allocate the
+/// `stator_object_as_value` (or by future FFI APIs that allocate the
 /// shared-storage representation).  Tag-only object values created via
-/// [`stator_value_new_object`], `stator_value_new_array_tag`, and the other
+/// `stator_value_new_object`, `stator_value_new_array_tag`, and the other
 /// tag constructors carry no per-instance storage; passing such a value
 /// here returns a null pointer to make the limitation explicit at the call
 /// site rather than silently materialising a divergent empty object.
 ///
 /// Returns a null pointer when `val` is null, is not an object-like value,
 /// or is a tag-only object value.  The caller owns the returned object
-/// pointer and must release it with [`stator_object_destroy`].
+/// pointer and must release it with `stator_object_destroy`.
 ///
 /// # Safety
-/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// `val` must be either null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_as_object(val: *const StatorValue) -> *mut StatorObject {
     if val.is_null() {
@@ -12502,7 +14942,7 @@ unsafe fn decode_property_key<'a>(key: *const c_char, key_len: usize) -> Option<
 }
 
 /// Build a fresh owned [`StatorValue`] from a [`JsValue`] returned by an
-/// underlying [`JsObject`] property read.
+/// underlying [`PropertyMap`] property read.
 ///
 /// The new value is registered with the isolate's live-object counter and
 /// (if open) the innermost handle scope.  Returns a null pointer when
@@ -12529,26 +14969,26 @@ fn js_value_to_owned_stator_value(
 }
 
 /// Read the property named `(key, key_len)` from `obj` and, on success, write
-/// a freshly-allocated [`StatorValue`] handle to `*out_val`.
+/// a freshly-allocated `StatorValue` handle to `*out_val`.
 ///
 /// Maybe-style semantics:
-/// * [`StatorStatus::StatorStatusOk`] when the property exists.  The
+/// * `StatorStatusOk` when the property exists.  The
 ///   returned value mirrors the property value, including an explicit
 ///   `undefined` if that is what is stored.
-/// * [`StatorStatus::StatorStatusFalse`] when the property is missing from
+/// * `StatorStatusFalse` when the property is missing from
 ///   `obj` and its prototype chain.  `*out_val` is set to null.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or
 ///   `out_val` is null, when the key bytes are not valid UTF-8, or when the
 ///   object has no associated isolate.
 ///
-/// The caller owns the [`StatorValue`] handed back through `*out_val` and
-/// must release it with [`stator_value_destroy`] (or rely on the active
+/// The caller owns the `StatorValue` handed back through `*out_val` and
+/// must release it with `stator_value_destroy` (or rely on the active
 /// handle scope).
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
-/// * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+/// * `out_val` must be either null or a valid output slot for a `StatorValue*`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_get_property(
     obj: *const StatorObject,
@@ -12575,18 +15015,10 @@ pub unsafe extern "C" fn stator_object_get_property(
     if isolate.is_null() {
         return StatorStatus::StatorStatusInvalidArg;
     }
-    let (present, js_val) = {
-        let borrowed = inner_rc.borrow();
-        let present = borrowed.has_property(key_str);
-        if present {
-            (true, borrowed.get_property(key_str))
-        } else {
-            (false, JsValue::Undefined)
-        }
-    };
-    if !present {
+    if !plain_object_has_property(&inner_rc, key_str) {
         return StatorStatus::StatorStatusFalse;
     }
+    let js_val = plain_object_get_property(&inner_rc, key_str);
     let val = js_value_to_owned_stator_value(isolate, &js_val);
     if val.is_null() {
         return StatorStatus::StatorStatusInvalidArg;
@@ -12599,21 +15031,20 @@ pub unsafe extern "C" fn stator_object_get_property(
 /// Write `val` to the property named `(key, key_len)` on `obj`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when the property was created or
+/// * `StatorStatusOk` when the property was created or
 ///   updated.
-/// * [`StatorStatus::StatorStatusException`] when the underlying `[[Set]]`
+/// * `StatorStatusException` when the underlying `[[Set]]`
 ///   raised an error (e.g. assigning to a read-only property).  The
 ///   isolate's pending exception is populated with a stringified error and
-///   a structured [`StatorMessage`] classified as
-///   [`StatorMessageKind::StatorMessageKindType`].
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `val` is
+///   a structured `StatorMessage` classified as `StatorMessageKindType`.
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `val` is
 ///   null, when the key bytes are not valid UTF-8, or when the object has
 ///   no associated isolate.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
-/// * `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// * `val` must be either null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_set_property(
     obj: *mut StatorObject,
@@ -12633,7 +15064,7 @@ pub unsafe extern "C" fn stator_object_set_property(
     let inner_rc = Rc::clone(&unsafe { &*obj }.inner);
     // SAFETY: caller guarantees `val` is valid.
     let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
-    let result = inner_rc.borrow_mut().set_property(key_str, js_val);
+    let result = plain_object_set_property(&inner_rc, key_str, js_val);
     match result {
         Ok(()) => StatorStatus::StatorStatusOk,
         Err(err) => {
@@ -12673,13 +15104,13 @@ pub unsafe extern "C" fn stator_object_set_property(
 /// inherited).  The result is written to `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success; `*out` is `true` iff the
+/// * `StatorStatusOk` on success; `*out` is `true` iff the
 ///   property exists.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
 ///   null, or when the key bytes are not valid UTF-8.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]
@@ -12698,7 +15129,8 @@ pub unsafe extern "C" fn stator_object_has_property(
         None => return StatorStatus::StatorStatusInvalidArg,
     };
     // SAFETY: caller guarantees `obj` is valid.
-    let present = unsafe { &*obj }.inner.borrow().has_property(key_str);
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let present = plain_object_has_property(&inner, key_str);
     // SAFETY: caller guarantees `out` is valid.
     unsafe { *out = present };
     StatorStatus::StatorStatusOk
@@ -12708,15 +15140,15 @@ pub unsafe extern "C" fn stator_object_has_property(
 /// outcome of the underlying `[[Delete]]` is written to `*out`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.  `*out` is `true` when
+/// * `StatorStatusOk` on success.  `*out` is `true` when
 ///   the property no longer exists (either it was successfully deleted or
 ///   was already absent) and `false` when deletion was rejected (e.g. a
 ///   non-configurable own property).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+/// * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
 ///   null, or when the key bytes are not valid UTF-8.
 ///
 /// # Safety
-/// * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+/// * `obj` must be either null or a valid, live `StatorObject` pointer.
 /// * `key` must be valid for reads of `key_len` bytes (or null).
 /// * `out` must be either null or a valid pointer to a `bool`.
 #[unsafe(no_mangle)]
@@ -12735,11 +15167,8 @@ pub unsafe extern "C" fn stator_object_delete_property(
         None => return StatorStatus::StatorStatusInvalidArg,
     };
     // SAFETY: caller guarantees `obj` is valid.
-    let deleted = unsafe { &*obj }
-        .inner
-        .borrow_mut()
-        .delete_own_property(key_str)
-        .unwrap_or(false);
+    let inner = Rc::clone(&unsafe { &*obj }.inner);
+    let deleted = plain_object_delete_property(&inner, key_str);
     // SAFETY: caller guarantees `out` is valid.
     unsafe { *out = deleted };
     StatorStatus::StatorStatusOk
@@ -12747,27 +15176,26 @@ pub unsafe extern "C" fn stator_object_delete_property(
 
 // ── Native-function call bridge ──────────────────────────────────────────────
 
-/// Invoke a callable [`StatorValue`] with `argc` arguments and, on success,
+/// Invoke a callable `StatorValue` with `argc` arguments and, on success,
 /// write the returned value to `*out_val`.
 ///
 /// This first slice only supports native functions installed via
-/// [`stator_function_template_get_function`] or returned through the FFI by
-/// a native callback — i.e. values whose internal representation is a
-/// reference-counted [`NativeFn`].  Bytecode-backed function values
-/// ([`StatorValueInner::Function`]) cannot yet be invoked through this API
+/// `stator_function_template_get_function` or returned through the FFI by
+/// a native callback.  Bytecode-backed function values cannot yet be invoked
+/// through this API
 /// because the FFI does not yet model `new.target` or bytecode-function call
 /// frames for direct embedder calls; calling such a value returns
-/// [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
+/// `StatorStatusUnsupported`.  Construct semantics are
 /// likewise deferred.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when the native function ran to
+/// * `StatorStatusOk` when the native function ran to
 ///   completion; `*out_val` holds the (caller-owned) result.
-/// * [`StatorStatus::StatorStatusException`] when the native callback
+/// * `StatorStatusException` when the native callback
 ///   returned an `Err`.  The isolate's pending exception is populated.
-/// * [`StatorStatus::StatorStatusUnsupported`] when `callable` is not a
+/// * `StatorStatusUnsupported` when `callable` is not a
 ///   native function (e.g. bytecode function, plain object, primitive).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `callable`, or
+/// * `StatorStatusInvalidArg` when `ctx`, `callable`, or
 ///   `out_val` is null, when `argc` is negative, or when `args` is null
 ///   while `argc > 0`.
 ///
@@ -12775,13 +15203,13 @@ pub unsafe extern "C" fn stator_object_delete_property(
 /// treated as JavaScript `undefined`.
 ///
 /// # Safety
-/// * `ctx` must be a valid, live [`StatorContext`] pointer.
-/// * `callable` must be either null or a valid, live [`StatorValue`] pointer.
-/// * `recv` must be either null or a valid, live [`StatorValue`] pointer.
-/// * `args` must be valid for `argc` `*const StatorValue` reads when `argc > 0`
+/// * `ctx` must be a valid, live `StatorContext` pointer.
+/// * `callable` must be either null or a valid, live `StatorValue` pointer.
+/// * `recv` must be either null or a valid, live `StatorValue` pointer.
+/// * `args` must be valid for `argc` `StatorValue const*` reads when `argc > 0`
 ///   (or null when `argc == 0`).  Each non-null element must point at a
-///   valid, live [`StatorValue`].
-/// * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+///   valid, live `StatorValue`.
+/// * `out_val` must be either null or a valid output slot for a `StatorValue*`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_call(
     ctx: *mut StatorContext,
@@ -13121,12 +15549,17 @@ pub unsafe extern "C" fn stator_function_callback_info_get_isolate(
 /// An opaque function template handle.
 ///
 /// A function template associates a C callback with an isolate so that
-/// [`stator_function_template_get_function`] can produce a [`StatorValue`]
+/// `stator_function_template_get_function` can produce a `StatorValue`
 /// representing the function, which can then be installed into a context's
-/// global environment via [`stator_context_global_set`].
+/// global environment via `stator_context_global_set`.
 pub struct StatorFunctionTemplate {
     isolate: *mut StatorIsolate,
+    template_id: u64,
+    ancestor_template_ids: Vec<u64>,
+    signature_template_id: Option<u64>,
     callback: StatorFunctionTemplateCallback,
+    instance_template: Box<StatorObjectTemplate>,
+    prototype_template: Box<StatorObjectTemplate>,
 }
 
 // SAFETY: `StatorFunctionTemplate` contains raw pointer fields that are only
@@ -13140,7 +15573,7 @@ unsafe impl Send for StatorFunctionTemplate {}
 /// pass the returned pointer to [`stator_function_template_destroy`].
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `callback` must remain valid for the lifetime of the template.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_function_template_new(
@@ -13150,7 +15583,15 @@ pub unsafe extern "C" fn stator_function_template_new(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(StatorFunctionTemplate { isolate, callback }))
+    Box::into_raw(Box::new(StatorFunctionTemplate {
+        isolate,
+        template_id: next_function_template_id(),
+        ancestor_template_ids: Vec::new(),
+        signature_template_id: None,
+        callback,
+        instance_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
+        prototype_template: Box::new(StatorObjectTemplate::new_empty(isolate)),
+    }))
 }
 
 /// Destroy a function template previously created with
@@ -13167,6 +15608,181 @@ pub unsafe extern "C" fn stator_function_template_destroy(tmpl: *mut StatorFunct
         // SAFETY: pointer was created by `Box::into_raw`.
         drop(unsafe { Box::from_raw(tmpl) });
     }
+}
+
+/// Return the instance template associated with a function template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Properties set on it are installed
+/// as own properties when the function template is applied to a DOM wrapper.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_instance_template(
+    tmpl: *mut StatorFunctionTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).instance_template.as_mut() as *mut StatorObjectTemplate }
+}
+
+/// Return the prototype template associated with a function template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Properties set on it are installed
+/// on the DOM wrapper prototype object.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_prototype_template(
+    tmpl: *mut StatorFunctionTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).prototype_template.as_mut() as *mut StatorObjectTemplate }
+}
+
+/// Copy parent template inheritance metadata into `tmpl`.
+///
+/// Parent instance-template properties that do not already exist are copied as
+/// defaults. The child's prototype template receives a prototype-template link
+/// to a deep snapshot of the parent's prototype template, producing a predictable
+/// prototype chain for DOM wrapper instances.
+///
+/// # Safety
+/// `tmpl` and `parent` must be valid, live [`StatorFunctionTemplate`] pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_inherit(
+    tmpl: *mut StatorFunctionTemplate,
+    parent: *const StatorFunctionTemplate,
+) -> StatorStatus {
+    if tmpl.is_null() || parent.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let child = unsafe { &mut *tmpl };
+    let parent = unsafe { &*parent };
+    if child.isolate != parent.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    child
+        .instance_template
+        .merge_missing_properties_from(&parent.instance_template);
+    child.ancestor_template_ids = function_template_instance_ids(parent);
+    child.prototype_template.prototype_template =
+        Some(Box::new(parent.prototype_template.clone_deep()));
+    StatorStatus::StatorStatusOk
+}
+
+/// An opaque receiver signature for function-template callbacks.
+///
+/// Signatures snapshot the receiver template id when created. Assigning a
+/// signature to a function template makes callbacks fail closed with a
+/// `TypeError` unless their JavaScript receiver is a DOM wrapper that was
+/// created from the receiver template or one of its descendants.
+pub struct StatorSignature {
+    isolate: *mut StatorIsolate,
+    receiver_template_id: u64,
+}
+
+/// Create a signature requiring receivers created from `receiver`.
+///
+/// Returns null when `receiver` is null.
+///
+/// # Safety
+/// `receiver` must be either null or a valid, live `StatorFunctionTemplate`
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_signature_new(
+    receiver: *const StatorFunctionTemplate,
+) -> *mut StatorSignature {
+    if receiver.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `receiver` is valid.
+    let receiver = unsafe { &*receiver };
+    Box::into_raw(Box::new(StatorSignature {
+        isolate: receiver.isolate,
+        receiver_template_id: receiver.template_id,
+    }))
+}
+
+/// Destroy a signature created by `stator_signature_new`.
+///
+/// # Safety
+/// `signature` must be either null or a pointer returned by
+/// `stator_signature_new` that has not already been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_signature_destroy(signature: *mut StatorSignature) {
+    if !signature.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(signature) });
+    }
+}
+
+/// Attach a receiver signature to a function template.
+///
+/// The receiver template id is copied into `tmpl`, so the caller may destroy
+/// `signature` immediately after this call. Passing a null signature clears any
+/// existing signature. Cross-isolate signatures are rejected.
+///
+/// # Safety
+/// `tmpl` must be a valid, live `StatorFunctionTemplate` pointer. `signature`
+/// must be either null or a valid `StatorSignature` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_set_signature(
+    tmpl: *mut StatorFunctionTemplate,
+    signature: *const StatorSignature,
+) -> StatorStatus {
+    if tmpl.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let tmpl_ref = unsafe { &mut *tmpl };
+    if signature.is_null() {
+        tmpl_ref.signature_template_id = None;
+        return StatorStatus::StatorStatusOk;
+    }
+    // SAFETY: caller guarantees `signature` is valid.
+    let signature = unsafe { &*signature };
+    if tmpl_ref.isolate != signature.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    tmpl_ref.signature_template_id = Some(signature.receiver_template_id);
+    StatorStatus::StatorStatusOk
+}
+
+/// Test whether `value` is an instance of `tmpl`.
+///
+/// This checks DOM wrappers created by applying `tmpl` or a function template
+/// that inherited from `tmpl`. Non-wrapper values, null pointers, and invalidated
+/// wrappers return `false`.
+///
+/// # Safety
+/// `tmpl` and `value` must be either null or valid, live pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_has_instance(
+    tmpl: *const StatorFunctionTemplate,
+    value: *const StatorValue,
+) -> bool {
+    if tmpl.is_null() || value.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let tmpl_ref = unsafe { &*tmpl };
+    let value_ref = unsafe { &*value };
+    if tmpl_ref.isolate != value_ref.isolate {
+        return false;
+    }
+    dom_wrap_ptr_for_value_inner(&value_ref.inner)
+        .map(|wrap| dom_wrap_has_function_template_id(wrap, tmpl_ref.template_id))
+        .unwrap_or(false)
 }
 
 /// Produce a [`StatorValue`] representing the function described by `tmpl`.
@@ -13194,9 +15810,22 @@ pub unsafe extern "C" fn stator_function_template_get_function(
     // SAFETY: caller guarantees `tmpl` is valid.
     let isolate = unsafe { (*tmpl).isolate };
     let callback = unsafe { (*tmpl).callback };
+    let signature_template_id = unsafe { (*tmpl).signature_template_id };
 
     // Build a NativeFn closure that wraps the C callback.
     let native: NativeFn = Rc::new(move |args: Vec<JsValue>| {
+        if let Some(required_template_id) = signature_template_id {
+            let this = stator_jse::interpreter::current_this();
+            let allowed = this
+                .as_ref()
+                .and_then(dom_wrap_ptr_for_js_value)
+                .map(|wrap| dom_wrap_has_function_template_id(wrap, required_template_id))
+                .unwrap_or(false);
+            if !allowed {
+                return Err(StatorError::TypeError("Illegal invocation".to_string()));
+            }
+        }
+
         // Convert JsValue args into temporary StatorValue structs on the stack.
         let c_vals: Vec<StatorValue> = args
             .iter()
@@ -13347,16 +15976,124 @@ pub unsafe extern "C" fn stator_context_global_set(
     }
 }
 
+fn js_args_to_borrowed_stator_values(
+    args: &[JsValue],
+    isolate: *mut StatorIsolate,
+) -> (Vec<StatorValue>, Vec<*const StatorValue>) {
+    let borrowed: Vec<StatorValue> = args
+        .iter()
+        .map(|arg| StatorValue {
+            inner: jsvalue_to_stator_value_inner(arg),
+            isolate,
+        })
+        .collect();
+    let ptrs = borrowed
+        .iter()
+        .map(|arg| arg as *const StatorValue)
+        .collect();
+    (borrowed, ptrs)
+}
+
+unsafe fn take_callback_output(out: *mut StatorValue) -> JsValue {
+    if out.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: callback transferred ownership of `out` on success.
+        let js = stator_value_inner_to_jsvalue(unsafe { &(*out).inner });
+        // SAFETY: output is a Stator-owned value handle.
+        unsafe { stator_value_destroy(out) };
+        js
+    }
+}
+
+struct MaterializedDomProperty {
+    attrs: PropertyAttributes,
+    setter_allowed: bool,
+}
+
+fn default_materialized_dom_property() -> MaterializedDomProperty {
+    MaterializedDomProperty {
+        attrs: PropertyAttributes::WRITABLE
+            | PropertyAttributes::ENUMERABLE
+            | PropertyAttributes::CONFIGURABLE,
+        setter_allowed: true,
+    }
+}
+
+fn accessor_materialization_attrs(attrs: PropertyAttributes) -> PropertyAttributes {
+    attrs & (PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE)
+}
+
+unsafe fn dom_object_wrap_materialized_property(
+    wrap: *mut StatorDomObjectWrap,
+    name: &str,
+) -> Result<MaterializedDomProperty, StatorStatus> {
+    if wrap.is_null() {
+        return Ok(default_materialized_dom_property());
+    }
+    // SAFETY: caller guarantees `wrap` is a valid DOM wrapper pointer.
+    match unsafe { (*wrap).inner.get_property_descriptor(name) } {
+        DomPropertyDescriptorResult::Descriptor(descriptor) => {
+            let attrs = descriptor.attributes();
+            let setter_allowed = if descriptor.value().is_some() {
+                attrs.contains(PropertyAttributes::WRITABLE)
+            } else {
+                descriptor.set().is_some()
+            };
+            Ok(MaterializedDomProperty {
+                attrs,
+                setter_allowed,
+            })
+        }
+        DomPropertyDescriptorResult::Exception => Err(StatorStatus::StatorStatusException),
+        DomPropertyDescriptorResult::NotIntercepted | DomPropertyDescriptorResult::Rejected => {
+            Ok(unsafe {
+                (*wrap)
+                    .inner
+                    .get_property_attributes(name)
+                    .map(|attrs| MaterializedDomProperty {
+                        attrs,
+                        setter_allowed: attrs.contains(PropertyAttributes::WRITABLE),
+                    })
+                    .unwrap_or_else(default_materialized_dom_property)
+            })
+        }
+    }
+}
+
+fn status_to_dom_call_result(
+    status: StatorStatus,
+    out: *mut StatorValue,
+    isolate: *mut StatorIsolate,
+    message: &'static str,
+) -> StatorResult<JsValue> {
+    match status {
+        // SAFETY: `out` follows the DOM callback ownership contract.
+        StatorStatus::StatorStatusOk => Ok(unsafe { take_callback_output(out) }),
+        StatorStatus::StatorStatusException => {
+            // SAFETY: `isolate` is the wrapper's isolate pointer.
+            unsafe { ensure_pending_dom_interceptor_exception(isolate, message) };
+            Err(StatorError::TypeError(message.to_string()))
+        }
+        StatorStatus::StatorStatusFalse => Err(StatorError::TypeError(
+            "DOM callable callback rejected invocation".to_string(),
+        )),
+        StatorStatus::StatorStatusInvalidArg | StatorStatus::StatorStatusUnsupported => Err(
+            StatorError::TypeError("DOM callable callback failed".to_string()),
+        ),
+    }
+}
+
 fn dom_object_wrap_plain_object(
     wrap: *mut StatorDomObjectWrap,
-) -> Option<Rc<RefCell<PropertyMap>>> {
+) -> Result<Rc<RefCell<PropertyMap>>, StatorStatus> {
     if wrap.is_null() {
-        return None;
+        return Err(StatorStatus::StatorStatusInvalidArg);
     }
 
     // SAFETY: caller guarantees `wrap` is valid.
     if let Some(existing) = unsafe { (*wrap).materialized.borrow().as_ref().cloned() } {
-        return Some(existing);
+        return Ok(existing);
     }
 
     let wrap_addr = wrap as usize;
@@ -13369,6 +16106,68 @@ fn dom_object_wrap_plain_object(
     let mut object = PropertyMap::new();
     let mut installed_names: Vec<String> = Vec::new();
 
+    if unsafe { (*wrap).inner.is_callable() } {
+        let call_wrap_addr = wrap_addr;
+        let call_alive = Rc::clone(&alive);
+        object.insert_builtin(
+            "__call__".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                if !call_alive.get() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer callable".to_string(),
+                    ));
+                }
+                let wrap = call_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer callable".to_string(),
+                    ));
+                }
+                let receiver = match dom_object_wrap_js_value(wrap) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(StatorError::TypeError(
+                            "DOM wrapper materialization failed".to_string(),
+                        ));
+                    }
+                };
+                // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
+                unsafe { (*wrap).inner.call_as_function(receiver, args) }
+            })),
+        );
+    }
+
+    if unsafe { (*wrap).inner.is_constructible() } {
+        let construct_wrap_addr = wrap_addr;
+        let construct_alive = Rc::clone(&alive);
+        object.insert_builtin(
+            "__construct__".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                if !construct_alive.get() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer constructible".to_string(),
+                    ));
+                }
+                let wrap = construct_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Err(StatorError::TypeError(
+                        "DOM wrapper is no longer constructible".to_string(),
+                    ));
+                }
+                let new_target = match dom_object_wrap_js_value(wrap) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(StatorError::TypeError(
+                            "DOM wrapper materialization failed".to_string(),
+                        ));
+                    }
+                };
+                // SAFETY: the liveness flag is true, so the wrapper pointer is valid.
+                unsafe { (*wrap).inner.construct(new_target, args) }
+            })),
+        );
+    }
+
     for name in names {
         if name.starts_with("__get_")
             || name.starts_with("__set_")
@@ -13378,10 +16177,12 @@ fn dom_object_wrap_plain_object(
         }
         installed_names.push(name.clone());
 
+        let materialized = unsafe { dom_object_wrap_materialized_property(wrap, &name)? };
+        let accessor_attrs = accessor_materialization_attrs(materialized.attrs);
         let getter_name = name.clone();
         let getter_wrap_addr = wrap_addr;
         let getter_alive = Rc::clone(&alive);
-        object.insert_builtin(
+        object.insert_with_attrs(
             format!("__get_{name}__"),
             JsValue::NativeFunction(Rc::new(move |_args| {
                 if !getter_alive.get() {
@@ -13400,13 +16201,14 @@ fn dom_object_wrap_plain_object(
                 }
                 Ok(value)
             })),
+            accessor_attrs,
         );
 
-        if unsafe { (*wrap).has_named_setter } {
+        if materialized.setter_allowed && unsafe { (*wrap).has_named_setter } {
             let setter_name = name.clone();
             let setter_wrap_addr = wrap_addr;
             let setter_alive = Rc::clone(&alive);
-            object.insert_builtin(
+            object.insert_with_attrs(
                 format!("__set_{name}__"),
                 JsValue::NativeFunction(Rc::new(move |args| {
                     if !setter_alive.get() {
@@ -13427,10 +16229,61 @@ fn dom_object_wrap_plain_object(
                     }
                     Ok(JsValue::Undefined)
                 })),
+                accessor_attrs,
             );
         }
 
-        object.insert_with_attrs(name, JsValue::Undefined, PropertyAttributes::ENUMERABLE);
+        object.insert_with_attrs(name.clone(), JsValue::Undefined, accessor_attrs);
+        object.mark_accessor_property(name);
+    }
+
+    for index in unsafe { (*wrap).inner.indexed_property_keys() } {
+        let name = index.to_string();
+        if installed_names.iter().any(|installed| installed == &name) {
+            continue;
+        }
+        installed_names.push(name.clone());
+
+        let getter_wrap_addr = wrap_addr;
+        let getter_alive = Rc::clone(&alive);
+        object.insert_with_attrs(
+            format!("__get_{name}__"),
+            JsValue::NativeFunction(Rc::new(move |_args| {
+                if !getter_alive.get() {
+                    return Ok(JsValue::Undefined);
+                }
+                let wrap = getter_wrap_addr as *mut StatorDomObjectWrap;
+                if wrap.is_null() {
+                    return Ok(JsValue::Undefined);
+                }
+                // SAFETY: the embedder must keep the wrapper alive for as long
+                // as the installed global can be observed.
+                let value = unsafe { (*wrap).inner.get_indexed(index) };
+                // SAFETY: the wrapper owns the isolate pointer for this DOM object.
+                if let Some(error) = unsafe { pending_dom_interceptor_error((*wrap).isolate) } {
+                    return Err(error);
+                }
+                Ok(value)
+            })),
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        object.insert_with_attrs(
+            name.clone(),
+            JsValue::Undefined,
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        object.mark_accessor_property(name);
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(instance_template) = unsafe { (*wrap).instance_template.as_ref() } {
+        install_object_template_on_property_map(&mut object, instance_template);
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(prototype_template) = unsafe { (*wrap).prototype_template.as_ref() } {
+        let mut prototype_link = StatorObjectTemplate::new_empty(unsafe { (*wrap).isolate });
+        prototype_link.prototype_template = Some(Box::new(prototype_template.clone_deep()));
+        install_object_template_on_property_map(&mut object, &prototype_link);
     }
 
     object.extensible = false;
@@ -13442,10 +16295,10 @@ fn dom_object_wrap_plain_object(
     });
     // SAFETY: caller guarantees `wrap` is valid.
     unsafe { *(*wrap).materialized.borrow_mut() = Some(Rc::clone(&plain)) };
-    Some(plain)
+    Ok(plain)
 }
 
-fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Option<JsValue> {
+fn dom_object_wrap_js_value(wrap: *mut StatorDomObjectWrap) -> Result<JsValue, StatorStatus> {
     dom_object_wrap_plain_object(wrap).map(JsValue::PlainObject)
 }
 
@@ -13474,8 +16327,9 @@ pub unsafe extern "C" fn stator_dom_object_wrap_as_value(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    let Some(plain) = dom_object_wrap_plain_object(wrap) else {
-        return std::ptr::null_mut();
+    let plain = match dom_object_wrap_plain_object(wrap) {
+        Ok(plain) => plain,
+        Err(_) => return std::ptr::null_mut(),
     };
     // SAFETY: `isolate` is the wrapper's owning isolate and is live while the
     // wrapper is live.
@@ -13537,6 +16391,18 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invalidate(wrap: *mut StatorDomO
     }
 }
 
+unsafe fn stator_dom_object_wrap_drop_materialized_cache(wrap: *mut StatorDomObjectWrap) {
+    if wrap.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    if let Some(plain) = unsafe { (*wrap).materialized.borrow_mut().take() } {
+        DOM_WRAP_MATERIALIZED_REGISTRY.with(|registry| {
+            registry.borrow_mut().remove(&(Rc::as_ptr(&plain) as usize));
+        });
+    }
+}
+
 /// Install a DOM object wrapper as a named global on `ctx`.
 ///
 /// The installed value is backed by a Stator `PlainObject` whose enumerable
@@ -13552,6 +16418,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invalidate(wrap: *mut StatorDomO
 ///
 /// Returns:
 /// * [`StatorStatus::StatorStatusOk`] when the global was installed.
+/// * [`StatorStatus::StatorStatusException`] when materializing the wrapper's
+///   own properties triggers a descriptor callback exception.
 /// * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
 ///   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
 ///   different isolate than `ctx`.
@@ -13585,13 +16453,81 @@ pub unsafe extern "C" fn stator_context_global_set_dom_object_wrap(
         Err(_) => return StatorStatus::StatorStatusInvalidArg,
     };
 
-    let Some(js_value) = dom_object_wrap_js_value(wrap) else {
-        return StatorStatus::StatorStatusInvalidArg;
+    let js_value = match dom_object_wrap_js_value(wrap) {
+        Ok(value) => value,
+        Err(status) => return status,
     };
 
     // SAFETY: caller guarantees `ctx` is valid.
     let globals = unsafe { Rc::clone(&(*ctx).globals) };
     globals.borrow_mut().insert(name_str, js_value);
+    StatorStatus::StatorStatusOk
+}
+
+/// Apply a function template's instance/prototype templates to a DOM wrapper.
+///
+/// Instance-template properties are installed as own properties on the wrapper.
+/// Prototype-template properties are installed on an inherited prototype object.
+/// The template contents are snapshotted at call time so later template changes
+/// do not mutate already-applied wrappers.
+///
+/// Returns [`StatorStatus::StatorStatusInvalidArg`] for null pointers,
+/// cross-isolate templates, or invalidated wrappers.
+///
+/// # Safety
+/// `wrap` and `tmpl` must be valid, live pointers owned by the same isolate.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_apply_function_template(
+    wrap: *mut StatorDomObjectWrap,
+    tmpl: *const StatorFunctionTemplate,
+) -> StatorStatus {
+    if wrap.is_null() || tmpl.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let wrap_ref = unsafe { &mut *wrap };
+    let tmpl_ref = unsafe { &*tmpl };
+    if !wrap_ref.alive.get() || wrap_ref.isolate.is_null() || wrap_ref.isolate != tmpl_ref.isolate {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    wrap_ref.instance_template = Some(tmpl_ref.instance_template.clone_deep());
+    wrap_ref.prototype_template = Some(tmpl_ref.prototype_template.clone_deep());
+    wrap_ref.function_template_ids = function_template_instance_ids(tmpl_ref);
+
+    if let Some(handler) = wrap_ref
+        .instance_template
+        .as_ref()
+        .and_then(|template| template.named_handler)
+    {
+        let status = unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) };
+        if status != StatorStatus::StatorStatusOk {
+            return status;
+        }
+    }
+    if let Some(handler) = wrap_ref
+        .instance_template
+        .as_ref()
+        .and_then(|template| template.indexed_handler)
+    {
+        let status = unsafe { stator_dom_object_wrap_install_indexed_handler(wrap, &handler) };
+        if status != StatorStatus::StatorStatusOk {
+            return status;
+        }
+    }
+
+    if let Some(plain) = wrap_ref.materialized.borrow().as_ref().cloned() {
+        let mut map = plain.borrow_mut();
+        if let Some(instance_template) = wrap_ref.instance_template.as_ref() {
+            install_object_template_on_property_map(&mut map, instance_template);
+        }
+        if let Some(prototype_template) = wrap_ref.prototype_template.as_ref() {
+            let mut prototype_link = StatorObjectTemplate::new_empty(wrap_ref.isolate);
+            prototype_link.prototype_template = Some(Box::new(prototype_template.clone_deep()));
+            install_object_template_on_property_map(&mut map, &prototype_link);
+        }
+    }
+
     StatorStatus::StatorStatusOk
 }
 
@@ -13659,8 +16595,12 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
         | StatorValueInner::Date
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
+        | StatorValueInner::PromiseHandle { .. }
         | StatorValueInner::Map
-        | StatorValueInner::Set => f64::NAN,
+        | StatorValueInner::Set
+        | StatorValueInner::ArrayBuffer(_)
+        | StatorValueInner::TypedArray(_)
+        | StatorValueInner::DataView(_) => f64::NAN,
     }
 }
 
@@ -13696,9 +16636,14 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
         StatorValueInner::Array => "".to_owned(),
         StatorValueInner::Date => "[object Date]".to_owned(),
         StatorValueInner::RegExp => "(?:)".to_owned(),
-        StatorValueInner::Promise => "[object Promise]".to_owned(),
+        StatorValueInner::Promise | StatorValueInner::PromiseHandle { .. } => {
+            "[object Promise]".to_owned()
+        }
         StatorValueInner::Map => "[object Map]".to_owned(),
         StatorValueInner::Set => "[object Set]".to_owned(),
+        StatorValueInner::ArrayBuffer(_) => "[object ArrayBuffer]".to_owned(),
+        StatorValueInner::TypedArray(_) => "[object TypedArray]".to_owned(),
+        StatorValueInner::DataView(_) => "[object DataView]".to_owned(),
     }
 }
 
@@ -13730,17 +16675,12 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         | StatorValueInner::Promise
         | StatorValueInner::Map
         | StatorValueInner::Set => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
-        StatorValueInner::ObjectHandle(_) => {
-            // Identity-preserving bridge from `StatorValueInner::ObjectHandle`
-            // into the interpreter heap is not yet implemented.  Round-trips
-            // through this conversion (e.g. when an object handle is passed
-            // through a script-visible global) lose identity: a fresh empty
-            // `PlainObject` is materialised here.  FFI-level property reads
-            // and writes via `stator_object_*` APIs still observe shared
-            // state because they operate directly on the `Rc<RefCell<JsObject>>`.
-            JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
-        }
+        StatorValueInner::PromiseHandle { promise, .. } => JsValue::Promise(promise.clone()),
+        StatorValueInner::ObjectHandle(rc) => JsValue::PlainObject(Rc::clone(rc)),
         StatorValueInner::DomWrapHandle { plain, .. } => JsValue::PlainObject(Rc::clone(plain)),
+        StatorValueInner::ArrayBuffer(buffer) => JsValue::ArrayBuffer(Rc::clone(buffer)),
+        StatorValueInner::TypedArray(array) => JsValue::TypedArray(Rc::clone(array)),
+        StatorValueInner::DataView(view) => JsValue::DataView(Rc::clone(view)),
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))
@@ -13776,21 +16716,16 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         }
         JsValue::Function(_) | JsValue::NativeFunction(_) => StatorValueInner::Function,
         JsValue::Array(_) => StatorValueInner::Array,
-        JsValue::PlainObject(plain) => {
-            dom_wrap_inner_for_plain_object(plain).unwrap_or(StatorValueInner::Object)
+        JsValue::PlainObject(plain) => dom_wrap_inner_for_plain_object(plain)
+            .unwrap_or_else(|| StatorValueInner::ObjectHandle(Rc::clone(plain))),
+        JsValue::Promise(promise) => StatorValueInner::PromiseHandle {
+            promise: promise.clone(),
+            queue: active_or_new_microtask_queue(),
+        },
+        JsValue::Object(_) | JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => {
+            StatorValueInner::Object
         }
-        JsValue::Object(_)
-        | JsValue::Generator(_)
-        | JsValue::Iterator(_)
-        | JsValue::Error(_)
-        | JsValue::Promise(_) => StatorValueInner::Object,
-        JsValue::Symbol(_)
-        | JsValue::BigInt(_)
-        | JsValue::Context(_)
-        | JsValue::Proxy(_)
-        | JsValue::ArrayBuffer(_)
-        | JsValue::TypedArray(_)
-        | JsValue::DataView(_) => {
+        JsValue::Symbol(_) | JsValue::BigInt(_) | JsValue::Context(_) | JsValue::Proxy(_) => {
             // Symbols, BigInts, and Contexts are not yet representable in StatorValueInner;
             // fall back to a string representation so callers can inspect them.
             let s = v.to_js_string().unwrap_or_else(|_| "undefined".to_owned());
@@ -13802,6 +16737,9 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
                 ))
             }
         }
+        JsValue::ArrayBuffer(buffer) => StatorValueInner::ArrayBuffer(Rc::clone(buffer)),
+        JsValue::TypedArray(array) => StatorValueInner::TypedArray(Rc::clone(array)),
+        JsValue::DataView(view) => StatorValueInner::DataView(Rc::clone(view)),
     }
 }
 
@@ -13859,7 +16797,7 @@ pub struct StatorSnapshotBuildBinding {
     inner: StwcBuildBinding,
 }
 
-/// Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+/// Hash fields in `StatorSnapshotBuildBinding` that embedders can override.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatorSnapshotBuildHashField {
@@ -14173,7 +17111,7 @@ pub unsafe extern "C" fn stator_snapshot_manifest_register_native_function(
     ctx: *mut StatorContext,
     id: *const c_char,
     id_len: usize,
-    callback: Option<StatorFunctionTemplateCallback>,
+    callback: Option<unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue>,
 ) -> StatorStatus {
     if manifest.is_null() || id.is_null() || id_len == 0 {
         return StatorStatus::StatorStatusInvalidArg;
@@ -14765,13 +17703,13 @@ pub unsafe extern "C" fn stator_snapshot_report_applied_global_count(
 
 // ── HandleScope ───────────────────────────────────────────────────────────────
 
-/// An opaque handle scope that manages the lifetime of [`StatorValue`] handles
+/// An opaque handle scope that manages the lifetime of `StatorValue` handles
 /// created while the scope is open.
 ///
 /// When a handle scope is open on an isolate, any value created via
-/// [`stator_value_new_number`] or [`stator_value_new_string`] is automatically
+/// `stator_value_new_number` or `stator_value_new_string` is automatically
 /// registered with the innermost open scope.  Calling
-/// [`stator_handle_scope_close`] destroys all registered values and restores
+/// `stator_handle_scope_close` destroys all registered values and restores
 /// the previous scope.
 ///
 /// Handle scopes nest: opening a second scope while one is already open is
@@ -14779,7 +17717,7 @@ pub unsafe extern "C" fn stator_snapshot_report_applied_global_count(
 ///
 /// # Ownership
 /// Values registered with a scope are **owned by the scope**.  The embedder
-/// must **not** call [`stator_value_destroy`] on those values; doing so would
+/// must **not** call `stator_value_destroy` on those values; doing so would
 /// result in a double-free.
 pub struct StatorHandleScope {
     isolate: *mut StatorIsolate,
@@ -14804,7 +17742,7 @@ unsafe impl Send for StatorHandleScope {}
 /// pass the returned pointer to [`stator_handle_scope_close`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_handle_scope_new(
     isolate: *mut StatorIsolate,
@@ -14864,13 +17802,13 @@ pub unsafe extern "C" fn stator_handle_scope_close(scope: *mut StatorHandleScope
 
 /// An opaque escapable handle scope.
 ///
-/// Works like [`StatorHandleScope`] but allows a single value to be
+/// Works like `StatorHandleScope` but allows a single value to be
 /// *escaped* — promoted into the enclosing scope (or left as an embedder-owned
 /// handle if there is no enclosing scope) — via
-/// [`stator_escapable_handle_scope_escape`].
+/// `stator_escapable_handle_scope_escape`.
 ///
-/// Created by [`stator_escapable_handle_scope_new`] and closed (and its
-/// remaining values destroyed) by [`stator_escapable_handle_scope_close`].
+/// Created by `stator_escapable_handle_scope_new` and closed (and its
+/// remaining values destroyed) by `stator_escapable_handle_scope_close`.
 pub struct StatorEscapableHandleScope {
     /// Inner scope that manages handle tracking and nesting.
     inner: StatorHandleScope,
@@ -14885,7 +17823,7 @@ unsafe impl Send for StatorEscapableHandleScope {}
 /// pass the returned pointer to [`stator_escapable_handle_scope_close`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_escapable_handle_scope_new(
     isolate: *mut StatorIsolate,
@@ -14996,8 +17934,59 @@ pub struct StatorObjectTemplate {
     /// Named properties to install on each new instance.  Each entry maps a
     /// property name to a value that is cloned into every instance.
     properties: HashMap<String, StatorValueInner>,
+    /// Prototype template used for objects created from this template.
+    prototype_template: Option<Box<StatorObjectTemplate>>,
+    /// Named property handler installed on DOM wrappers created from this template.
+    named_handler: Option<StatorDomNamedHandler>,
+    /// Indexed property handler installed on DOM wrappers created from this template.
+    indexed_handler: Option<StatorDomIndexedHandler>,
     /// The number of internal fields reserved for embedder data.
     internal_field_count: i32,
+}
+
+impl StatorObjectTemplate {
+    fn new_empty(isolate: *mut StatorIsolate) -> Self {
+        Self {
+            isolate,
+            properties: HashMap::new(),
+            prototype_template: None,
+            named_handler: None,
+            indexed_handler: None,
+            internal_field_count: 0,
+        }
+    }
+
+    fn clone_deep(&self) -> Self {
+        Self {
+            isolate: self.isolate,
+            properties: self
+                .properties
+                .iter()
+                .map(|(key, value)| (key.clone(), clone_stator_value_inner(value)))
+                .collect(),
+            prototype_template: self
+                .prototype_template
+                .as_ref()
+                .map(|prototype| Box::new(prototype.clone_deep())),
+            named_handler: self.named_handler,
+            indexed_handler: self.indexed_handler,
+            internal_field_count: self.internal_field_count,
+        }
+    }
+
+    fn merge_missing_properties_from(&mut self, parent: &StatorObjectTemplate) {
+        for (key, value) in &parent.properties {
+            self.properties
+                .entry(key.clone())
+                .or_insert_with(|| clone_stator_value_inner(value));
+        }
+        if self.named_handler.is_none() {
+            self.named_handler = parent.named_handler;
+        }
+        if self.indexed_handler.is_none() {
+            self.indexed_handler = parent.indexed_handler;
+        }
+    }
 }
 
 // SAFETY: `StatorObjectTemplate` is single-threaded; same rationale as
@@ -15010,7 +17999,7 @@ unsafe impl Send for StatorObjectTemplate {}
 /// pass the returned pointer to [`stator_object_template_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_object_template_new(
     isolate: *mut StatorIsolate,
@@ -15018,11 +18007,7 @@ pub unsafe extern "C" fn stator_object_template_new(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(StatorObjectTemplate {
-        isolate,
-        properties: HashMap::new(),
-        internal_field_count: 0,
-    }))
+    Box::into_raw(Box::new(StatorObjectTemplate::new_empty(isolate)))
 }
 
 /// Destroy an object template previously created with
@@ -15064,31 +18049,79 @@ pub unsafe extern "C" fn stator_object_template_set(
     let key_str = unsafe { CStr::from_ptr(key) }
         .to_string_lossy()
         .into_owned();
-    let inner = match unsafe { &(*val).inner } {
-        StatorValueInner::Number(n) => StatorValueInner::Number(*n),
-        StatorValueInner::Boolean(b) => StatorValueInner::Boolean(*b),
-        StatorValueInner::Undefined => StatorValueInner::Undefined,
-        StatorValueInner::Null => StatorValueInner::Null,
-        StatorValueInner::Str(cs) => StatorValueInner::Str(cs.clone()),
-        StatorValueInner::Object => StatorValueInner::Object,
-        StatorValueInner::ObjectHandle(rc) => StatorValueInner::ObjectHandle(Rc::clone(rc)),
-        StatorValueInner::DomWrapHandle { plain, wrap, alive } => StatorValueInner::DomWrapHandle {
-            plain: Rc::clone(plain),
-            wrap: *wrap,
-            alive: Rc::clone(alive),
-        },
-        StatorValueInner::Function => StatorValueInner::Function,
-        StatorValueInner::NativeFunctionValue(f) => {
-            StatorValueInner::NativeFunctionValue(Rc::clone(f))
-        }
-        StatorValueInner::Array => StatorValueInner::Array,
-        StatorValueInner::Date => StatorValueInner::Date,
-        StatorValueInner::RegExp => StatorValueInner::RegExp,
-        StatorValueInner::Promise => StatorValueInner::Promise,
-        StatorValueInner::Map => StatorValueInner::Map,
-        StatorValueInner::Set => StatorValueInner::Set,
-    };
+    let inner = clone_stator_value_inner(unsafe { &(*val).inner });
     unsafe { (*tmpl).properties.insert(key_str, inner) };
+}
+
+fn named_handler_is_empty(handler: &StatorDomNamedHandler) -> bool {
+    handler.getter.is_none()
+        && handler.setter.is_none()
+        && handler.query.is_none()
+        && handler.deleter.is_none()
+        && handler.enumerator.is_none()
+}
+
+fn indexed_handler_is_empty(handler: &StatorDomIndexedHandler) -> bool {
+    handler.getter.is_none()
+        && handler.setter.is_none()
+        && handler.query.is_none()
+        && handler.length.is_none()
+        && handler.deleter.is_none()
+        && handler.enumerator.is_none()
+}
+
+/// Install an aggregated named-property handler on an object template.
+///
+/// Function templates snapshot this handler onto DOM wrappers when their
+/// instance template is applied. Returns InvalidArg for null pointers or an
+/// all-null handler.
+///
+/// # Safety
+/// - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+/// - `handler` must point to a readable [`StatorDomNamedHandler`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_install_named_handler(
+    tmpl: *mut StatorObjectTemplate,
+    handler: *const StatorDomNamedHandler,
+) -> StatorStatus {
+    if tmpl.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let handler = unsafe { *handler };
+    if named_handler_is_empty(&handler) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).named_handler = Some(handler) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Install an aggregated indexed-property handler on an object template.
+///
+/// Function templates snapshot this handler onto DOM wrappers when their
+/// instance template is applied. Returns InvalidArg for null pointers or an
+/// all-null handler.
+///
+/// # Safety
+/// - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+/// - `handler` must point to a readable [`StatorDomIndexedHandler`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_install_indexed_handler(
+    tmpl: *mut StatorObjectTemplate,
+    handler: *const StatorDomIndexedHandler,
+) -> StatorStatus {
+    if tmpl.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let handler = unsafe { *handler };
+    if indexed_handler_is_empty(&handler) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).indexed_handler = Some(handler) };
+    StatorStatus::StatorStatusOk
 }
 
 /// Set the number of internal fields on objects created from this template.
@@ -15126,6 +18159,61 @@ pub unsafe extern "C" fn stator_object_template_internal_field_count(
     unsafe { (*tmpl).internal_field_count }
 }
 
+/// Return this object template's mutable prototype template.
+///
+/// The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+/// it to [`stator_object_template_destroy`]. Returns null when `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_prototype_template(
+    tmpl: *mut StatorObjectTemplate,
+) -> *mut StatorObjectTemplate {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let tmpl_ref = unsafe { &mut *tmpl };
+    let isolate = tmpl_ref.isolate;
+    tmpl_ref
+        .prototype_template
+        .get_or_insert_with(|| Box::new(StatorObjectTemplate::new_empty(isolate)))
+        .as_mut() as *mut StatorObjectTemplate
+}
+
+fn install_object_template_on_property_map(map: &mut PropertyMap, tmpl: &StatorObjectTemplate) {
+    let default_attrs = PropertyAttributes::from_bits_truncate(
+        PropertyAttributes::WRITABLE.bits()
+            | PropertyAttributes::ENUMERABLE.bits()
+            | PropertyAttributes::CONFIGURABLE.bits(),
+    );
+    let prototype_attrs = PropertyAttributes::from_bits_truncate(
+        PropertyAttributes::WRITABLE.bits() | PropertyAttributes::CONFIGURABLE.bits(),
+    );
+    for (key, val_inner) in &tmpl.properties {
+        map.insert_with_attrs(
+            key.clone(),
+            stator_value_inner_to_jsvalue(val_inner),
+            default_attrs,
+        );
+    }
+    if let Some(prototype) = &tmpl.prototype_template {
+        let prototype = object_template_to_property_map(prototype);
+        map.insert_with_attrs(
+            INTERNAL_PROTO_PROPERTY_KEY.to_string(),
+            JsValue::PlainObject(prototype),
+            prototype_attrs,
+        );
+    }
+}
+
+fn object_template_to_property_map(tmpl: &StatorObjectTemplate) -> Rc<RefCell<PropertyMap>> {
+    let mut map = PropertyMap::new();
+    install_object_template_on_property_map(&mut map, tmpl);
+    Rc::new(RefCell::new(map))
+}
+
 /// Create a new [`StatorObject`] instance from an object template.
 ///
 /// The returned object has all properties defined on the template pre-installed.
@@ -15146,19 +18234,11 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    let mut obj = JsObject::new();
-    // Install template properties onto the new object.
     // SAFETY: `tmpl` is valid.
-    for (key, val_inner) in unsafe { &(*tmpl).properties } {
-        let js_val = stator_value_inner_to_jsvalue(val_inner);
-        let _ = obj.set_property(key, js_val);
-    }
+    let inner = object_template_to_property_map(unsafe { &*tmpl });
     // SAFETY: isolate is valid.
     unsafe { (*isolate).live_objects += 1 };
-    Box::into_raw(Box::new(StatorObject {
-        inner: Rc::new(RefCell::new(obj)),
-        isolate,
-    }))
+    Box::into_raw(Box::new(StatorObject { inner, isolate }))
 }
 
 // ── Structured messages ──────────────────────────────────────────────────────
@@ -15171,7 +18251,7 @@ pub unsafe extern "C" fn stator_object_template_new_instance(
 /// the C ABI and can be compared by value from C/C++.
 ///
 /// New variants may be appended in future versions; embedders should treat
-/// unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+/// unknown values as `StatorMessageKindUnknown`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatorMessageKind {
@@ -15190,8 +18270,8 @@ pub enum StatorMessageKind {
     StatorMessageKindURI = 5,
     /// WebAssembly compilation, instantiation, or execution failure.
     StatorMessageKindWasm = 6,
-    /// An internal engine error (`stator_jse::error::StatorError::Internal`)
-    /// or a programmer-induced FFI misuse (e.g. null source pointer).
+    /// An internal engine error or a programmer-induced FFI misuse
+    /// (e.g. null source pointer).
     StatorMessageKindInternal = 7,
     /// Script execution was interrupted by an explicit termination request
     /// (`stator_isolate_terminate_execution` or equivalent).
@@ -15203,19 +18283,19 @@ pub enum StatorMessageKind {
     StatorMessageKindOutOfMemory = 10,
     /// A sandbox bounds-check violation.
     StatorMessageKindSandboxViolation = 11,
-    /// The module's [`StatorModuleType`] is recognised but not executable by
+    /// The module's `StatorModuleType` is recognised but not executable by
     /// Stator itself and requires host integration before it can be compiled,
     /// evaluated, or restored from a code cache.
     ///
     /// Currently emitted for CSS module bodies (see
-    /// [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+    /// `StatorModuleTypeCss`): Stator has no CSS parser
     /// and no `CSSStyleSheet` representation, so the engine fails closed and
     /// tags the error with this stable kind so embedders like the Edge host
     /// can detect "unsupported module type, route through host integration"
     /// purely by enum value without text-matching the diagnostic.
     ///
-    /// Always paired with an errored [`StatorModule`] whose
-    /// [`stator_module_get_error`] message names the missing host primitive,
+    /// Always paired with an errored `StatorModule` whose
+    /// `stator_module_get_error` message names the missing host primitive,
     /// and — when a typed import resolves to such a module — propagates to
     /// the importer's link-time error so the same enum value surfaces on the
     /// graph root.
@@ -15235,7 +18315,7 @@ pub enum StatorMessageKind {
 ///   populated by the engine; getters return `false` so callers can detect
 ///   the missing data rather than treat a zero as truthful.
 /// - **terminated** — `true` when the message was raised because execution
-///   was being terminated (see [`StatorMessageKind::StatorMessageKindTermination`]).
+///   was being terminated (see `StatorMessageKindTermination`).
 ///
 /// Created internally by the engine and exposed via:
 /// - [`stator_isolate_take_pending_message`] (ownership transfer)
@@ -15302,9 +18382,9 @@ fn message_kind_for_error(
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `msg`.
+/// Return the structured `StatorMessageKind` of `msg`.
 ///
-/// Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+/// Returns `StatorMessageKindUnknown` when `msg` is null.
 ///
 /// # Safety
 /// `msg` must be either null or a valid pointer to a live [`StatorMessage`].
@@ -15457,7 +18537,7 @@ pub unsafe extern "C" fn stator_message_destroy(msg: *mut StatorMessage) {
 ///
 /// # Safety
 /// `isolate` must be either null or a valid pointer to a live
-/// [`StatorIsolate`].
+/// `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_peek_pending_message(
     isolate: *const StatorIsolate,
@@ -15485,7 +18565,7 @@ pub unsafe extern "C" fn stator_isolate_peek_pending_message(
 ///
 /// # Safety
 /// `isolate` must be either null or a valid pointer to a live
-/// [`StatorIsolate`].
+/// `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_isolate_take_pending_message(
     isolate: *mut StatorIsolate,
@@ -15500,12 +18580,12 @@ pub unsafe extern "C" fn stator_isolate_take_pending_message(
     }
 }
 
-/// Return the structured [`StatorMessageKind`] of `script`'s compile error,
-/// or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+/// Return the structured `StatorMessageKind` of `script`'s compile error,
+/// or `StatorMessageKindUnknown` when `script` compiled successfully or
 /// is null.
 ///
 /// Parse and bytecode-generator failures are classified as
-/// [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+/// `StatorMessageKindSyntax`; FFI misuse such as a null source pointer
 /// is classified as [`StatorMessageKind::StatorMessageKindInternal`].
 ///
 /// # Safety
@@ -15557,7 +18637,7 @@ unsafe impl Send for StatorTryCatch {}
 /// pass the returned pointer to [`stator_try_catch_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_try_catch_new(isolate: *mut StatorIsolate) -> *mut StatorTryCatch {
     if isolate.is_null() {
@@ -15926,6 +19006,686 @@ pub struct StatorWasmInstance {
 // for synchronisation if passed across threads.
 unsafe impl Send for StatorWasmInstance {}
 
+/// Opaque handle to a host-owned shared WebAssembly memory.
+///
+/// Shared memories can be supplied as imports to [`stator_wasm_instantiate_with_memory_imports`].
+/// They are created against a module's Wasm engine so Wasmtime can safely bind
+/// them into instances of that module.
+pub struct StatorWasmSharedMemory {
+    memory: SharedMemory,
+}
+
+// SAFETY: `SharedMemory` is Wasmtime's thread-safe shared linear memory handle.
+unsafe impl Send for StatorWasmSharedMemory {}
+
+/// Create a shared WebAssembly memory compatible with `module`'s engine.
+///
+/// Returns null if `module` is null, `maximum_pages < minimum_pages`, or
+/// Wasmtime rejects the shared memory type.
+///
+/// # Safety
+/// `module` must be either null or a valid, live [`StatorWasmModule`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_new(
+    module: *const StatorWasmModule,
+    minimum_pages: u32,
+    maximum_pages: u32,
+) -> *mut StatorWasmSharedMemory {
+    if module.is_null() || maximum_pages < minimum_pages {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let module = unsafe { &*module };
+    let ty = MemoryType::shared(minimum_pages, maximum_pages);
+    match SharedMemory::new(module.engine.inner(), ty) {
+        Ok(memory) => Box::into_raw(Box::new(StatorWasmSharedMemory { memory })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Destroy a shared WebAssembly memory handle.
+///
+/// # Safety
+/// `memory` must be either null or a pointer returned by
+/// [`stator_wasm_shared_memory_new`] that has not already been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_destroy(memory: *mut StatorWasmSharedMemory) {
+    if !memory.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(memory) });
+    }
+}
+
+/// Return the current shared-memory byte length.
+///
+/// Returns 0 for null memory handles.
+///
+/// # Safety
+/// `memory` must be either null or a valid, live [`StatorWasmSharedMemory`]
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_byte_length(
+    memory: *const StatorWasmSharedMemory,
+) -> usize {
+    if memory.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    unsafe { (*memory).memory.data().len() }
+}
+
+/// Copy bytes out of a shared WebAssembly memory.
+///
+/// Returns `false` for null pointers or out-of-bounds ranges.
+///
+/// # Safety
+/// - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+/// - `out` must be writable for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_read(
+    memory: *const StatorWasmSharedMemory,
+    offset: usize,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    if memory.is_null() || (out.is_null() && len != 0) {
+        return false;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    let data = unsafe { (*memory).memory.data() };
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    if end > data.len() {
+        return false;
+    }
+    for idx in 0..len {
+        // SAFETY: range and output pointer were validated above.
+        unsafe { *out.add(idx) = *data[offset + idx].get() };
+    }
+    true
+}
+
+/// Copy bytes into a shared WebAssembly memory.
+///
+/// Returns `false` for null pointers or out-of-bounds ranges.
+///
+/// # Safety
+/// - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+/// - `data` must be readable for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_shared_memory_write(
+    memory: *mut StatorWasmSharedMemory,
+    offset: usize,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    if memory.is_null() || (data.is_null() && len != 0) {
+        return false;
+    }
+    // SAFETY: caller guarantees `memory` is valid.
+    let mem_data = unsafe { (*memory).memory.data() };
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    if end > mem_data.len() {
+        return false;
+    }
+    for idx in 0..len {
+        // SAFETY: range and input pointer were validated above.
+        unsafe { *mem_data[offset + idx].get() = *data.add(idx) };
+    }
+    true
+}
+
+/// Host-controlled WebAssembly streaming operation kind.
+///
+/// Stator does not fetch network responses or pretend to incrementally compile
+/// partial bytes. The embedder owns response/body streaming and completes one
+/// of these operations only after it has an authoritative final byte buffer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorWasmStreamingOperationKind {
+    /// `WebAssembly.compileStreaming`-style compile settlement.
+    StatorWasmStreamingOperationKindCompile = 0,
+    /// `WebAssembly.instantiateStreaming`-style compile plus instantiate/evaluate settlement.
+    StatorWasmStreamingOperationKindInstantiate = 1,
+}
+
+/// Settlement state for a host-controlled WebAssembly streaming operation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorWasmStreamingOperationStatus {
+    /// The host has started the operation but has not completed or cancelled it.
+    StatorWasmStreamingOperationStatusPending = 0,
+    /// The host or isolate termination cancelled the operation before settlement.
+    StatorWasmStreamingOperationStatusCancelled = 1,
+    /// The operation completed successfully and owns a result module.
+    StatorWasmStreamingOperationStatusCompleted = 2,
+    /// The operation failed closed; query the diagnostic string for details.
+    StatorWasmStreamingOperationStatusErrored = 3,
+}
+
+#[derive(Clone)]
+struct OwnedModuleCompileOptions {
+    resource_name: Vec<u8>,
+    line_offset: i32,
+    column_offset: i32,
+    base_url: Vec<u8>,
+    credentials_mode: StatorCredentialsMode,
+    integrity_metadata: Vec<u8>,
+    referrer_policy: StatorReferrerPolicy,
+    parser_metadata: StatorParserMetadata,
+}
+
+impl Default for OwnedModuleCompileOptions {
+    fn default() -> Self {
+        Self {
+            resource_name: Vec::new(),
+            line_offset: 0,
+            column_offset: 0,
+            base_url: Vec::new(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: Vec::new(),
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        }
+    }
+}
+
+impl OwnedModuleCompileOptions {
+    fn as_ffi(&self) -> StatorModuleCompileOptions {
+        StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: bytes_or_null(&self.resource_name),
+            resource_name_len: self.resource_name.len(),
+            line_offset: self.line_offset,
+            column_offset: self.column_offset,
+            base_url: bytes_or_null(&self.base_url),
+            base_url_len: self.base_url.len(),
+            credentials_mode: self.credentials_mode,
+            integrity_metadata: bytes_or_null(&self.integrity_metadata),
+            integrity_metadata_len: self.integrity_metadata.len(),
+            referrer_policy: self.referrer_policy,
+            parser_metadata: self.parser_metadata,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct OwnedSourceMetadataV2 {
+    source_url: Option<Vec<u8>>,
+    origin_url: Option<Vec<u8>>,
+    referrer_url: Option<Vec<u8>>,
+    source_map_url: Option<Vec<u8>>,
+    source_map_digest: Option<Vec<u8>>,
+    cache_policy: Option<Vec<u8>>,
+    edge_cache_metadata: Option<Vec<u8>>,
+}
+
+impl OwnedSourceMetadataV2 {
+    fn as_ffi(&self) -> StatorModuleSourceMetadataV2 {
+        let (source_url, source_url_len) = optional_bytes_ptr(self.source_url.as_ref());
+        let (origin_url, origin_url_len) = optional_bytes_ptr(self.origin_url.as_ref());
+        let (referrer_url, referrer_url_len) = optional_bytes_ptr(self.referrer_url.as_ref());
+        let (source_map_url, source_map_url_len) = optional_bytes_ptr(self.source_map_url.as_ref());
+        let (source_map_digest, source_map_digest_len) =
+            optional_bytes_ptr(self.source_map_digest.as_ref());
+        let (cache_policy, cache_policy_len) = optional_bytes_ptr(self.cache_policy.as_ref());
+        let (edge_cache_metadata, edge_cache_metadata_len) =
+            optional_bytes_ptr(self.edge_cache_metadata.as_ref());
+        StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            source_url,
+            source_url_len,
+            origin_url,
+            origin_url_len,
+            referrer_url,
+            referrer_url_len,
+            source_map_url,
+            source_map_url_len,
+            source_map_digest,
+            source_map_digest_len,
+            cache_policy,
+            cache_policy_len,
+            edge_cache_metadata,
+            edge_cache_metadata_len,
+        }
+    }
+}
+
+/// Opaque host-controlled compileStreaming/instantiateStreaming operation.
+pub struct StatorWasmStreamingOperation {
+    ctx: *mut StatorContext,
+    kind: StatorWasmStreamingOperationKind,
+    status: StatorWasmStreamingOperationStatus,
+    module: *mut StatorModule,
+    error: Option<CString>,
+    options: OwnedModuleCompileOptions,
+    source_metadata: Option<OwnedSourceMetadataV2>,
+}
+
+fn bytes_or_null(bytes: &[u8]) -> *const c_char {
+    if bytes.is_empty() {
+        std::ptr::null()
+    } else {
+        bytes.as_ptr() as *const c_char
+    }
+}
+
+fn streaming_error(message: impl AsRef<str>) -> CString {
+    CString::new(message.as_ref())
+        .unwrap_or_else(|_| c"WebAssembly streaming operation error".into())
+}
+
+unsafe fn copy_streaming_options(
+    options: *const StatorModuleCompileOptions,
+) -> Option<OwnedModuleCompileOptions> {
+    if options.is_null() {
+        return Some(OwnedModuleCompileOptions::default());
+    }
+    // SAFETY: caller guarantees `options` points to a readable options struct.
+    let options_ref = unsafe { &*options };
+    if options_ref.source_type != StatorModuleType::StatorModuleTypeWebAssembly {
+        return None;
+    }
+    Some(OwnedModuleCompileOptions {
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        resource_name: unsafe {
+            owned_ffi_bytes(options_ref.resource_name, options_ref.resource_name_len)?
+        },
+        line_offset: options_ref.line_offset,
+        column_offset: options_ref.column_offset,
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        base_url: unsafe { owned_ffi_bytes(options_ref.base_url, options_ref.base_url_len)? },
+        credentials_mode: options_ref.credentials_mode,
+        // SAFETY: validates and copies the pointer/length pairs before returning.
+        integrity_metadata: unsafe {
+            owned_ffi_bytes(
+                options_ref.integrity_metadata,
+                options_ref.integrity_metadata_len,
+            )?
+        },
+        referrer_policy: options_ref.referrer_policy,
+        parser_metadata: options_ref.parser_metadata,
+    })
+}
+
+unsafe fn copy_streaming_source_metadata(
+    metadata: *const StatorModuleSourceMetadataV2,
+) -> Option<Option<OwnedSourceMetadataV2>> {
+    if metadata.is_null() {
+        return Some(None);
+    }
+    // SAFETY: caller guarantees `metadata` points to a readable metadata struct.
+    let metadata_ref = unsafe { &*metadata };
+    if metadata_ref.source_type != StatorModuleType::StatorModuleTypeWebAssembly {
+        return None;
+    }
+    Some(Some(OwnedSourceMetadataV2 {
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_url: unsafe {
+            metadata_field(metadata_ref.source_url, metadata_ref.source_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        origin_url: unsafe {
+            metadata_field(metadata_ref.origin_url, metadata_ref.origin_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        referrer_url: unsafe {
+            metadata_field(metadata_ref.referrer_url, metadata_ref.referrer_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_map_url: unsafe {
+            metadata_field(metadata_ref.source_map_url, metadata_ref.source_map_url_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        source_map_digest: unsafe {
+            metadata_field(
+                metadata_ref.source_map_digest,
+                metadata_ref.source_map_digest_len,
+            )?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        cache_policy: unsafe {
+            metadata_field(metadata_ref.cache_policy, metadata_ref.cache_policy_len)?
+        },
+        // SAFETY: validates and copies each pointer/length pair before returning.
+        edge_cache_metadata: unsafe {
+            metadata_field(
+                metadata_ref.edge_cache_metadata,
+                metadata_ref.edge_cache_metadata_len,
+            )?
+        },
+    }))
+}
+
+unsafe fn stator_wasm_streaming_begin(
+    ctx: *mut StatorContext,
+    kind: StatorWasmStreamingOperationKind,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    let options = match unsafe { copy_streaming_options(options) } {
+        Some(options) => options,
+        None => return std::ptr::null_mut(),
+    };
+    let source_metadata = match unsafe { copy_streaming_source_metadata(source_metadata) } {
+        Some(metadata) => metadata,
+        None => return std::ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(StatorWasmStreamingOperation {
+        ctx,
+        kind,
+        status: StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending,
+        module: std::ptr::null_mut(),
+        error: None,
+        options,
+        source_metadata,
+    }))
+}
+
+/// Begin a host-controlled `WebAssembly.compileStreaming`-style operation.
+///
+/// The returned operation starts pending. Stator does not fetch or buffer a
+/// response body; the host must call [`stator_wasm_streaming_complete`] exactly
+/// when it has final Wasm bytes, or [`stator_wasm_streaming_cancel`] when the
+/// browser fetch/response pipeline aborts.
+///
+/// `options`, when non-null, must have `source_type == WebAssembly`; pointer
+/// fields are copied immediately. `source_metadata`, when non-null, is also
+/// copied immediately and must be tagged as WebAssembly.
+///
+/// # Safety
+/// - `ctx` may be null, or a valid live context used for termination checks.
+/// - `options` and `source_metadata`, when non-null, must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_compile_begin(
+    ctx: *mut StatorContext,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    // SAFETY: forwards caller-provided readable option pointers to the shared begin helper.
+    unsafe {
+        stator_wasm_streaming_begin(
+            ctx,
+            StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindCompile,
+            options,
+            source_metadata,
+        )
+    }
+}
+
+/// Begin a host-controlled `WebAssembly.instantiateStreaming`-style operation.
+///
+/// Completion compiles the final bytes as a WebAssembly module, links via the
+/// existing module resolver when imports are present, and evaluates the module
+/// so exported functions are materialised. It does not invent network,
+/// `Response`, or fake Promise behaviour.
+///
+/// # Safety
+/// Same pointer requirements as [`stator_wasm_streaming_compile_begin`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_instantiate_begin(
+    ctx: *mut StatorContext,
+    options: *const StatorModuleCompileOptions,
+    source_metadata: *const StatorModuleSourceMetadataV2,
+) -> *mut StatorWasmStreamingOperation {
+    // SAFETY: forwards caller-provided readable option pointers to the shared begin helper.
+    unsafe {
+        stator_wasm_streaming_begin(
+            ctx,
+            StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindInstantiate,
+            options,
+            source_metadata,
+        )
+    }
+}
+
+fn module_error_message(module: *const StatorModule) -> Option<String> {
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: caller passes a live module pointer.
+    unsafe {
+        (*module)
+            .error
+            .as_ref()
+            .map(|error| error.to_string_lossy().into_owned())
+    }
+}
+
+fn fail_streaming_operation(op: &mut StatorWasmStreamingOperation, message: impl AsRef<str>) {
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored;
+    op.error = Some(streaming_error(message));
+}
+
+/// Complete a pending host-controlled Wasm streaming operation with final bytes.
+///
+/// This is a settlement hook, not a network-streaming implementation: Stator
+/// compiles only the complete byte slice supplied by the host. If isolate
+/// termination is already requested, the operation is cancelled before any
+/// compile/evaluate work starts.
+///
+/// # Safety
+/// - `operation` must be a live pointer returned by a `_begin` function.
+/// - `source` must be valid for reads of `source_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_complete(
+    operation: *mut StatorWasmStreamingOperation,
+    source: *const c_char,
+    source_len: usize,
+) -> bool {
+    if operation.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending {
+        return false;
+    }
+    if unsafe { context_is_execution_terminating(op.ctx) } {
+        op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled;
+        op.error = Some(streaming_error(
+            "WebAssembly streaming operation cancelled because execution is terminating",
+        ));
+        return false;
+    }
+    if source.is_null() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation completed with null source",
+        );
+        return false;
+    }
+    // SAFETY: caller guarantees `source` is valid for `source_len` bytes.
+    let source_bytes = unsafe { std::slice::from_raw_parts(source as *const u8, source_len) };
+    let options = op.options.as_ffi();
+    // SAFETY: the local options struct points into `op.options`, which remains
+    // live throughout the call.
+    let module = unsafe {
+        stator_module_compile_with_options(op.ctx, source as *const c_char, source_len, &options)
+    };
+    if module.is_null() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation could not allocate module",
+        );
+        return false;
+    }
+    op.module = module;
+
+    if let Some(metadata) = &op.source_metadata {
+        let metadata = metadata.as_ffi();
+        // SAFETY: `module` is live and the local metadata borrows from `op`.
+        if !unsafe { stator_module_set_source_metadata_v2(module, &metadata) } {
+            fail_streaming_operation(op, "WebAssembly streaming source metadata was rejected");
+            return false;
+        }
+    }
+
+    if let Some(message) = module_error_message(module) {
+        fail_streaming_operation(op, message);
+        return false;
+    }
+    if source_bytes.is_empty() {
+        fail_streaming_operation(
+            op,
+            "WebAssembly streaming operation completed with empty source",
+        );
+        return false;
+    }
+
+    if op.kind == StatorWasmStreamingOperationKind::StatorWasmStreamingOperationKindInstantiate {
+        // SAFETY: `module` is the live module produced above.
+        if !unsafe { stator_module_instantiate(op.ctx, module) } {
+            fail_streaming_operation(
+                op,
+                module_error_message(module)
+                    .unwrap_or_else(|| "WebAssembly streaming instantiate failed".to_string()),
+            );
+            return false;
+        }
+        // SAFETY: `module` is linked; the returned namespace value is only used
+        // to drive settlement and is immediately released.
+        let value = unsafe { stator_module_evaluate(module, op.ctx) };
+        if value.is_null() {
+            fail_streaming_operation(
+                op,
+                module_error_message(module)
+                    .unwrap_or_else(|| "WebAssembly streaming evaluate failed".to_string()),
+            );
+            return false;
+        }
+        // SAFETY: `value` was returned by `stator_module_evaluate` above.
+        unsafe { stator_value_destroy(value) };
+        if let Some(message) = module_error_message(module) {
+            fail_streaming_operation(op, message);
+            return false;
+        }
+    }
+
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted;
+    true
+}
+
+/// Cancel a pending host-controlled Wasm streaming operation.
+///
+/// Cancellation is fail-closed and terminal. It records a diagnostic but does
+/// not compile or instantiate any bytes.
+///
+/// # Safety
+/// - `operation` must be a live pointer returned by a `_begin` function.
+/// - `reason`, when non-null, must be valid for reads of `reason_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_cancel(
+    operation: *mut StatorWasmStreamingOperation,
+    reason: *const c_char,
+    reason_len: usize,
+) -> bool {
+    if operation.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending {
+        return false;
+    }
+    let reason = if reason.is_null() {
+        "WebAssembly streaming operation cancelled by host".to_string()
+    } else {
+        // SAFETY: caller guarantees `reason` is valid for `reason_len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(reason as *const u8, reason_len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    op.status = StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled;
+    op.error = Some(streaming_error(reason));
+    true
+}
+
+/// Return the current status of a Wasm streaming operation.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_get_status(
+    operation: *const StatorWasmStreamingOperation,
+) -> StatorWasmStreamingOperationStatus {
+    if operation.is_null() {
+        return StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored;
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    unsafe { (*operation).status }
+}
+
+/// Return the terminal diagnostic for a failed/cancelled operation, or null.
+///
+/// The returned pointer is borrowed from `operation` and remains valid until
+/// the operation is destroyed.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_get_error(
+    operation: *const StatorWasmStreamingOperation,
+) -> *const c_char {
+    if operation.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    unsafe {
+        (*operation)
+            .error
+            .as_ref()
+            .map_or(std::ptr::null(), |error| error.as_ptr())
+    }
+}
+
+/// Transfer the compiled/evaluated module result out of a completed operation.
+///
+/// Returns null unless the operation completed successfully and still owns its
+/// module. The caller becomes responsible for eventually calling
+/// [`stator_module_free`] on the returned module.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_take_module(
+    operation: *mut StatorWasmStreamingOperation,
+) -> *mut StatorModule {
+    if operation.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `operation` is valid.
+    let op = unsafe { &mut *operation };
+    if op.status != StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted
+    {
+        return std::ptr::null_mut();
+    }
+    let module = op.module;
+    op.module = std::ptr::null_mut();
+    module
+}
+
+/// Destroy a Wasm streaming operation and any unclaimed module it owns.
+///
+/// # Safety
+/// `operation` must be null or a live pointer returned by a `_begin` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_streaming_destroy(
+    operation: *mut StatorWasmStreamingOperation,
+) {
+    if operation.is_null() {
+        return;
+    }
+    // SAFETY: caller transfers ownership of the operation back to Stator.
+    let op = unsafe { Box::from_raw(operation) };
+    if !op.module.is_null() {
+        // SAFETY: unclaimed module is still owned by the operation.
+        unsafe { stator_module_free(op.module) };
+    }
+}
+
 /// Compile a WebAssembly binary into a [`StatorWasmModule`].
 ///
 /// Returns a null pointer if `isolate` or `bytes` is null, `len` is zero, or
@@ -15935,7 +19695,7 @@ unsafe impl Send for StatorWasmInstance {}
 /// [`stator_wasm_module_destroy`] to free all associated resources.
 ///
 /// # Safety
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `bytes` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_wasm_compile(
@@ -15986,9 +19746,9 @@ pub enum StatorWasmValueKind {
     StatorWasmValueKindF64 = 3,
 }
 
-/// C-ABI union payload of a [`StatorWasmValue`].
+/// C-ABI union payload of a `StatorWasmValue`.
 ///
-/// Only the variant indicated by the containing [`StatorWasmValue::kind`] is
+/// Only the variant indicated by the containing `StatorWasmValue.kind` is
 /// well-defined; reading any other variant is undefined behavior.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -16022,17 +19782,17 @@ pub struct StatorWasmValue {
 ///
 /// Invoked synchronously on the thread running the Wasm caller.  Returns
 /// `true` after writing exactly `results_len` typed results into `results`.
-/// Result kinds must match the declaration in [`StatorWasmHostFunc::results`].
+/// Result kinds must match the declaration in `StatorWasmHostFunc.results`.
 /// Returning `false` or a mismatched result kind traps the running Wasm call:
 /// the enclosing
-/// [`stator_wasm_instance_call`] then returns null.
+/// `stator_wasm_instance_call` then returns null.
 ///
 /// # Safety
 /// - `args` is a valid pointer for reads of `args_len` consecutive
-///   [`StatorWasmValue`]s.
+///   `StatorWasmValue`s.
 /// - `results` is a valid pointer for writes of `results_len` consecutive
-///   [`StatorWasmValue`]s.  Each slot must be initialised by the callback
-///   with the kind declared in [`StatorWasmHostFunc::results`].
+///   `StatorWasmValue`s.  Each slot must be initialised by the callback
+///   with the kind declared in `StatorWasmHostFunc.results`.
 /// - `ctx` and `user_data` are the values supplied at instantiate time and
 ///   must remain live for the duration of the call.
 pub type StatorWasmHostFuncCallback = unsafe extern "C" fn(
@@ -16097,6 +19857,18 @@ pub struct StatorWasmImports {
     pub funcs_len: usize,
 }
 
+/// A host shared-memory import passed to
+/// [`stator_wasm_instantiate_with_memory_imports`].
+#[repr(C)]
+pub struct StatorWasmMemoryImport {
+    /// Import module name as a null-terminated UTF-8 string.
+    pub module_name: *const c_char,
+    /// Import field name as a null-terminated UTF-8 string.
+    pub field_name: *const c_char,
+    /// Shared memory handle to bind to this import.
+    pub memory: *const StatorWasmSharedMemory,
+}
+
 /// Instantiate a compiled [`StatorWasmModule`] into a live
 /// [`StatorWasmInstance`].
 ///
@@ -16148,6 +19920,56 @@ pub unsafe extern "C" fn stator_wasm_instantiate(
     };
 
     match WasmInstance::new_with_imports(&m.engine, &m.module, host_imports) {
+        Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Instantiate a compiled module with host functions and shared-memory imports.
+///
+/// This additive entry point keeps [`StatorWasmImports`] ABI-stable while
+/// allowing embedders to bind real shared linear memories. Non-shared memories
+/// remain unsupported because Wasmtime cannot safely share them across stores.
+///
+/// # Safety
+/// - `module`, `ctx`, and `imports` follow [`stator_wasm_instantiate`]'s
+///   contract.
+/// - `memories` must point to `memories_len` readable
+///   [`StatorWasmMemoryImport`] elements when `memories_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instantiate_with_memory_imports(
+    module: *mut StatorWasmModule,
+    ctx: *mut StatorContext,
+    imports: *const StatorWasmImports,
+    memories: *const StatorWasmMemoryImport,
+    memories_len: usize,
+) -> *mut StatorWasmInstance {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let m = unsafe { &*module };
+    let host_imports = if imports.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees `imports` is valid for one read.
+        match unsafe { build_host_imports(ctx, imports) } {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let host_memories = match unsafe { build_host_memory_imports(memories, memories_len) } {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+
+    match WasmInstance::new_with_extern_imports_full(
+        &m.engine,
+        &m.module,
+        host_imports,
+        Vec::new(),
+        host_memories,
+    ) {
         Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -16274,6 +20096,44 @@ unsafe fn build_host_imports(
             params,
             results,
             callback,
+        });
+    }
+    Some(out)
+}
+
+unsafe fn build_host_memory_imports(
+    memories: *const StatorWasmMemoryImport,
+    memories_len: usize,
+) -> Option<Vec<HostMemory>> {
+    if memories_len == 0 {
+        return Some(Vec::new());
+    }
+    if memories.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the slice is valid for `memories_len` reads.
+    let memories = unsafe { std::slice::from_raw_parts(memories, memories_len) };
+    let mut out = Vec::with_capacity(memories.len());
+    for memory in memories {
+        if memory.module_name.is_null() || memory.field_name.is_null() || memory.memory.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees strings are valid C strings.
+        let module_name = match unsafe { CStr::from_ptr(memory.module_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        // SAFETY: caller guarantees strings are valid C strings.
+        let field_name = match unsafe { CStr::from_ptr(memory.field_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        // SAFETY: caller guarantees the memory handle is valid.
+        let shared_memory = unsafe { (*memory.memory).memory.clone() };
+        out.push(HostMemory {
+            module: module_name,
+            name: field_name,
+            memory: shared_memory,
         });
     }
     Some(out)
@@ -16445,7 +20305,7 @@ pub unsafe extern "C" fn stator_wasm_exports_destroy(exports: *mut *mut c_char) 
 /// # Safety
 /// - `instance` must be a non-null, valid pointer to a live
 ///   [`StatorWasmInstance`].
-/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 /// - `name` must be a valid, null-terminated C string.
 /// - `args` must be valid for reads of `args_len` pointers; each non-null
 ///   element must be a valid, live [`StatorValue`] pointer.
@@ -16503,8 +20363,8 @@ use stator_jse::inspector::debugger::{DebugAction, Debugger};
 use stator_jse::interpreter::{attach_debugger, detach_debugger};
 /// An opaque handle to a CDP WebSocket server.
 ///
-/// Created with [`stator_cdp_server_create`] and freed with
-/// [`stator_cdp_server_destroy`].
+/// Created with `stator_cdp_server_create` and freed with
+/// `stator_cdp_server_destroy`.
 pub struct StatorCdpServer {
     server: CdpServer,
 }
@@ -16591,19 +20451,19 @@ pub unsafe extern "C" fn stator_cdp_server_destroy(server: *mut StatorCdpServer)
 
 /// An opaque handle to an interactive debugging session.
 ///
-/// A debug session owns both the compiled [`InterpreterFrame`] and an attached
-/// [`Debugger`], allowing the host to:
+/// A debug session owns both the compiled interpreter frame and an attached
+/// debugger, allowing the host to:
 ///
 /// 1. Set breakpoints before execution starts.
-/// 2. Start execution with [`stator_debug_session_run`] — the call returns
+/// 2. Start execution with `stator_debug_session_run` — the call returns
 ///    `true` when a breakpoint is hit, leaving the session in a paused state.
-/// 3. Inspect global variables with [`stator_debug_session_get_global_string`].
-/// 4. Resume with [`stator_debug_session_resume`].
+/// 3. Inspect global variables with `stator_debug_session_get_global_string`.
+/// 4. Resume with `stator_debug_session_resume`.
 /// 5. Repeat until `run` / `resume` return `false` (execution completed).
-/// 6. Retrieve the final result with [`stator_debug_session_result`].
+/// 6. Retrieve the final result with `stator_debug_session_result`.
 ///
-/// Created with [`stator_debug_session_create`] and freed with
-/// [`stator_debug_session_destroy`].
+/// Created with `stator_debug_session_create` and freed with
+/// `stator_debug_session_destroy`.
 pub struct StatorDebugSession {
     frame: InterpreterFrame,
     dbg: Rc<RefCell<Debugger>>,
@@ -16927,8 +20787,8 @@ type StatorDomWeakCb = unsafe extern "C" fn(data: *mut c_void);
 
 /// An opaque handle to a DOM object wrapper.
 ///
-/// Created by [`stator_dom_object_wrap_new`] and freed by
-/// [`stator_dom_object_wrap_destroy`].  Stores opaque embedder pointers in
+/// Created by `stator_dom_object_wrap_new` and freed by
+/// `stator_dom_object_wrap_destroy`.  Stores opaque embedder pointers in
 /// *internal fields* and routes property access through optional interceptors.
 ///
 /// In addition to the engine-level wrapper state, the FFI layer tracks two
@@ -16961,6 +20821,12 @@ pub struct StatorDomObjectWrap {
     /// stale JS aliases observe `undefined` instead of dereferencing a wrapper
     /// after the embedder invalidates or destroys it.
     alive: Rc<Cell<bool>>,
+    /// FunctionTemplate instance template snapshotted onto this wrapper.
+    instance_template: Option<StatorObjectTemplate>,
+    /// FunctionTemplate prototype template snapshotted onto this wrapper.
+    prototype_template: Option<StatorObjectTemplate>,
+    /// FunctionTemplate ids whose instances this DOM wrapper should match.
+    function_template_ids: Vec<u64>,
 }
 
 // SAFETY: `StatorDomObjectWrap` is single-threaded; see [`StatorValue`].
@@ -16973,7 +20839,7 @@ unsafe impl Send for StatorDomObjectWrap {}
 /// the returned pointer to [`stator_dom_object_wrap_destroy`].
 ///
 /// # Safety
-/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_new(
     isolate: *mut StatorIsolate,
@@ -16993,6 +20859,9 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
         outgoing_traced_edges: Vec::new(),
         materialized: RefCell::new(None),
         alive: Rc::new(Cell::new(true)),
+        instance_template: None,
+        prototype_template: None,
+        function_template_ids: Vec::new(),
     }))
 }
 
@@ -17276,16 +21145,16 @@ struct StatorDomWeakSlot {
 
 /// An opaque handle to a DOM wrapper weak reference.
 ///
-/// Created by [`stator_dom_weak_ref_new`] and freed by
-/// [`stator_dom_weak_ref_destroy`].  The reference does **not** keep the
+/// Created by `stator_dom_weak_ref_new` and freed by
+/// `stator_dom_weak_ref_destroy`.  The reference does **not** keep the
 /// associated DOM wrapper (or its materialized JS value) alive; the embedder
 /// callback registered at creation time fires exactly once when the engine
 /// proves the wrapper unreachable from JS, when the wrapper is invalidated,
 /// or when the wrapper is destroyed.
 ///
-/// Dispatch is driven by the GC: every call to [`stator_isolate_gc`] (or
-/// [`stator_gc_collect`]) walks the isolate's DOM weak table and fires every
-/// eligible slot exactly once.  The legacy [`stator_dom_weak_ref_invoke`]
+/// Dispatch is driven by the GC: every call to `stator_isolate_gc` (or
+/// `stator_gc_collect`) walks the isolate's DOM weak table and fires every
+/// eligible slot exactly once.  The legacy `stator_dom_weak_ref_invoke`
 /// helper still works for embedders that want to drive the callback
 /// directly, but the GC-driven path is now authoritative.
 ///
@@ -17314,7 +21183,7 @@ unsafe impl Send for StatorDomWeakRef {}
 /// `clear`, `destroy`) are therefore safe.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn dispatch_dom_weak_callbacks(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
@@ -17731,7 +21600,7 @@ fn dom_class_registry_matches(
 /// [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `name` must point to `name_len` bytes when `name_len > 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_register(
@@ -17778,7 +21647,7 @@ pub unsafe extern "C" fn stator_dom_class_id_register(
 /// registered child, and `InvalidArg` for null isolate or class id 0.
 ///
 /// # Safety
-/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_unregister(
     isolate: *mut StatorIsolate,
@@ -17800,7 +21669,7 @@ pub unsafe extern "C" fn stator_dom_class_id_unregister(
 /// output is zero-cleared so callers cannot observe stale pointers.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `out_info` must be null or valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_class_id_query(
@@ -17867,7 +21736,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_is_class(
 /// values whose wrapper has already been destroyed.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// - `value` must be null or a valid, live [`StatorValue`] pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_value_is_dom_object_wrap_class(
@@ -17940,9 +21809,9 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_native_ptr(
 /// invalidated, or the traced slot belongs to a different isolate.
 ///
 /// # Safety
-/// - `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
-/// - `traced` must be null or a valid, live [`StatorTraced`] pointer that has
-///   not yet been passed to [`stator_traced_dispose`].
+/// - `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
+/// - `traced` must be null or a valid, live `StatorTraced` pointer that has
+///   not yet been passed to `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_add_traced_edge(
     wrap: *mut StatorDomObjectWrap,
@@ -17974,7 +21843,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_add_traced_edge(
 /// or when the edge was not registered on `wrap`.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_remove_traced_edge(
     wrap: *mut StatorDomObjectWrap,
@@ -17998,7 +21867,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_remove_traced_edge(
 /// Returns the number of edges removed. Passing null removes nothing.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_clear_traced_edges(
     wrap: *mut StatorDomObjectWrap,
@@ -18017,11 +21886,11 @@ pub unsafe extern "C" fn stator_dom_object_wrap_clear_traced_edges(
 /// Return the number of outgoing traced edges currently registered on `wrap`.
 ///
 /// Empty traced slots may still be present until the embedder removes or clears
-/// them; [`stator_traced_visit_outgoing`] filters empty slots at visitation time.
+/// them; `stator_traced_visit_outgoing` filters empty slots at visitation time.
 /// Passing null returns zero.
 ///
 /// # Safety
-/// `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_traced_edge_count(
     wrap: *const StatorDomObjectWrap,
@@ -18111,6 +21980,10 @@ pub enum StatorDomAccessCheckOperation {
     StatorDomAccessCheckOperationIndexedDefine = 13,
     /// Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
     StatorDomAccessCheckOperationIndexedDescriptor = 14,
+    /// DOM wrapper call-as-function invocation.
+    StatorDomAccessCheckOperationCallAsFunction = 15,
+    /// DOM wrapper constructor invocation.
+    StatorDomAccessCheckOperationConstruct = 16,
 }
 
 /// C-callable access-check (security) callback for a DOM wrapper.
@@ -18191,6 +22064,12 @@ fn access_op_to_ffi(op: AccessCheckOperation) -> StatorDomAccessCheckOperation {
         }
         AccessCheckOperation::IndexedDescriptor => {
             StatorDomAccessCheckOperation::StatorDomAccessCheckOperationIndexedDescriptor
+        }
+        AccessCheckOperation::CallAsFunction => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationCallAsFunction
+        }
+        AccessCheckOperation::Construct => {
+            StatorDomAccessCheckOperation::StatorDomAccessCheckOperationConstruct
         }
     }
 }
@@ -18333,22 +22212,22 @@ pub unsafe extern "C" fn stator_dom_object_wrap_has_access_check(
 /// `(name_utf8, name_len)` — it is **not** required to be null-terminated.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] — the interceptor handled the read and
-///   wrote a non-null [`StatorValue`] pointer into `*out`.  Ownership of the
+/// * `StatorStatusOk` — the interceptor handled the read and
+///   wrote a non-null `StatorValue` pointer into `*out`.  Ownership of the
 ///   value transfers to Stator, which will destroy it once consumed.
-/// * [`StatorStatus::StatorStatusFalse`] — the interceptor did not handle the
+/// * `StatorStatusFalse` — the interceptor did not handle the
 ///   read; the engine falls through to the wrapper's own properties.  `*out`
 ///   is ignored.
-/// * [`StatorStatus::StatorStatusException`] — the embedder raised an
+/// * `StatorStatusException` — the embedder raised an
 ///   exception.  If the callback did not populate the isolate's pending
-///   exception via [`stator_isolate_throw_exception`], the FFI bridge records a
+///   exception via `stator_isolate_throw_exception`, the FFI bridge records a
 ///   generic DOM-interceptor exception before the wrapper-backed global
 ///   accessor thunk fails script execution.
 /// * Any other status is treated as fall-through.
 ///
 /// # Safety
 /// - `name_utf8` must be valid for `name_len` bytes.
-/// - `out` must be a writable `*mut StatorValue` slot if [`StatorStatus::StatorStatusOk`]
+/// - `out` must be a writable `StatorValue**` slot if `StatorStatusOk`
 ///   is returned.
 pub type StatorDomNamedGetterCbV2 = unsafe extern "C" fn(
     name_utf8: *const c_char,
@@ -18359,15 +22238,15 @@ pub type StatorDomNamedGetterCbV2 = unsafe extern "C" fn(
 
 /// V2 named-property **setter** callback.
 ///
-/// Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
+/// Returns `StatorStatusOk` to indicate the write was handled
 /// (engine will not fall through to the wrapper's own properties),
-/// [`StatorStatus::StatorStatusFalse`] for fall-through, or
-/// [`StatorStatus::StatorStatusException`] to fail wrapper-backed global
+/// `StatorStatusFalse` for fall-through, or
+/// `StatorStatusException` to fail wrapper-backed global
 /// access with a pending exception.
 ///
 /// # Safety
 /// `name_utf8` must be valid for `name_len` bytes; `value` must be either
-/// null or a valid, live [`StatorValue`] pointer borrowed for the call.
+/// null or a valid, live `StatorValue` pointer borrowed for the call.
 pub type StatorDomNamedSetterCbV2 = unsafe extern "C" fn(
     name_utf8: *const c_char,
     name_len: usize,
@@ -18377,14 +22256,14 @@ pub type StatorDomNamedSetterCbV2 = unsafe extern "C" fn(
 
 /// V2 named-property **query** callback.
 ///
-/// Returns [`StatorStatus::StatorStatusOk`] when the property exists (writing
+/// Returns `StatorStatusOk` when the property exists (writing
 /// `v8::PropertyAttribute` flags into `*out_attrs`; `0` = `None`),
-/// [`StatorStatus::StatorStatusFalse`] when it does not exist, or
-/// [`StatorStatus::StatorStatusException`] (treated as missing).
+/// `StatorStatusFalse` when it does not exist, or
+/// `StatorStatusException` (treated as missing).
 ///
 /// # Safety
 /// `name_utf8` must be valid for `name_len` bytes; `out_attrs` must be a
-/// writable `*mut u32` slot if [`StatorStatus::StatorStatusOk`] is returned.
+/// writable `uint32_t *` slot if `StatorStatusOk` is returned.
 pub type StatorDomNamedQueryCb = unsafe extern "C" fn(
     name_utf8: *const c_char,
     name_len: usize,
@@ -18394,16 +22273,16 @@ pub type StatorDomNamedQueryCb = unsafe extern "C" fn(
 
 /// V2 named-property **deleter** callback.
 ///
-/// Returns [`StatorStatus::StatorStatusOk`] to indicate the interceptor
+/// Returns `StatorStatusOk` to indicate the interceptor
 /// handled the delete and wrote the JS-visible "deleted" result into
 /// `*out_deleted` (`true` for successful delete, `false` for non-configurable
-/// / refused).  [`StatorStatus::StatorStatusFalse`] falls through to the
-/// wrapper's own properties.  [`StatorStatus::StatorStatusException`] is
+/// / refused).  `StatorStatusFalse` falls through to the
+/// wrapper's own properties.  `StatorStatusException` is
 /// treated as fall-through.
 ///
 /// # Safety
 /// `name_utf8` must be valid for `name_len` bytes; `out_deleted` must be a
-/// writable `*mut bool` slot if [`StatorStatus::StatorStatusOk`] is returned.
+/// writable `bool *` slot if `StatorStatusOk` is returned.
 pub type StatorDomNamedDeleterCb = unsafe extern "C" fn(
     name_utf8: *const c_char,
     name_len: usize,
@@ -18413,9 +22292,11 @@ pub type StatorDomNamedDeleterCb = unsafe extern "C" fn(
 
 /// V2 named-property **enumerator** callback.
 ///
-/// The callback should push each enumerable name into `buf` via
-/// [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
-/// on success.  Any other status is treated as "no names produced".
+/// The callback should push each materializable own string name into `buf` via
+/// `stator_dom_name_buffer_push` and return `StatorStatusOk`
+/// on success.  Query or descriptor callbacks provide attributes that determine
+/// which returned names are enumerable.  Any other status is treated as
+/// "no names produced".
 ///
 /// # Safety
 /// `buf` must be the non-null pointer the FFI bridge passed in and must not
@@ -18425,77 +22306,74 @@ pub type StatorDomNamedEnumeratorCb =
 
 /// V2 indexed-property **getter** callback.
 ///
-/// Semantics mirror [`StatorDomNamedGetterCbV2`] but the property key is a
+/// Semantics mirror `StatorDomNamedGetterCbV2` but the property key is a
 /// numeric `u32` index.
 ///
 /// # Safety
-/// `out` must be a writable `*mut StatorValue` slot if
-/// [`StatorStatus::StatorStatusOk`] is returned.
+/// `out` must be a writable `StatorValue**` slot if
+/// `StatorStatusOk` is returned.
 pub type StatorDomIndexedGetterCbV2 =
     unsafe extern "C" fn(index: u32, data: *mut c_void, out: *mut *mut StatorValue) -> StatorStatus;
 
 /// V2 indexed-property **setter** callback.
 ///
-/// Semantics mirror [`StatorDomNamedSetterCbV2`] for indexed access.
+/// Semantics mirror `StatorDomNamedSetterCbV2` for indexed access.
 ///
 /// # Safety
-/// `value` must be either null or a valid, live [`StatorValue`] pointer
+/// `value` must be either null or a valid, live `StatorValue` pointer
 /// borrowed for the call.
 pub type StatorDomIndexedSetterCbV2 =
     unsafe extern "C" fn(index: u32, value: *const StatorValue, data: *mut c_void) -> StatorStatus;
 
 /// V2 indexed-property **query** callback.
 ///
-/// Semantics mirror [`StatorDomNamedQueryCb`] for indexed access.
+/// Semantics mirror `StatorDomNamedQueryCb` for indexed access.
 ///
 /// # Safety
-/// `out_attrs` must be a writable `*mut u32` slot if
-/// [`StatorStatus::StatorStatusOk`] is returned.
+/// `out_attrs` must be a writable `uint32_t *` slot if
+/// `StatorStatusOk` is returned.
 pub type StatorDomIndexedQueryCb =
     unsafe extern "C" fn(index: u32, data: *mut c_void, out_attrs: *mut u32) -> StatorStatus;
 
 /// V2 indexed-collection **length** callback.
 ///
-/// Returns [`StatorStatus::StatorStatusOk`] with the collection length
+/// Returns `StatorStatusOk` with the collection length
 /// written into `*out_len`.  Any other status is treated as "length unknown"
 /// and the engine observes `0` — embedders should therefore reserve other
 /// statuses for genuine error conditions, never for ordinary length queries.
 ///
 /// # Safety
-/// `out_len` must be a writable `*mut u32` slot if
-/// [`StatorStatus::StatorStatusOk`] is returned.
+/// `out_len` must be a writable `uint32_t *` slot if
+/// `StatorStatusOk` is returned.
 pub type StatorDomIndexedLengthCb =
     unsafe extern "C" fn(data: *mut c_void, out_len: *mut u32) -> StatorStatus;
 
 /// V2 indexed-property **deleter** callback.
 ///
-/// Encodes the three-way [`stator_jse::dom::IndexedDeleterResult`]
-/// outcome through the [`StatorStatus`] / `*out_deleted` channel:
+/// Encodes the three-way indexed delete outcome through the `StatorStatus` /
+/// `*out_deleted` channel:
 ///
 /// | Return                                  | Engine effect                                         |
 /// |-----------------------------------------|-------------------------------------------------------|
-/// | [`StatorStatusOk`] with `*out = true`   | Index was deleted; `delete` reports success.          |
-/// | [`StatorStatusOk`] with `*out = false`  | Interceptor handled the delete but refused.           |
-/// | [`StatorStatusFalse`]                   | No-intercept; engine treats the index as not-deleted. |
+/// | `StatorStatusOk` with `*out = true`     | Index was deleted; `delete` reports success.          |
+/// | `StatorStatusOk` with `*out = false`    | Interceptor handled the delete but refused.           |
+/// | `StatorStatusFalse`                     | No-intercept; engine treats the index as not-deleted. |
 /// | Any other status (incl. `Exception`)    | Treated fail-closed as no-intercept (not deleted).    |
 ///
 /// `*out_deleted` is read only when the callback returns
-/// [`StatorStatusOk`].
-///
-/// [`StatorStatusOk`]: StatorStatus::StatorStatusOk
-/// [`StatorStatusFalse`]: StatorStatus::StatorStatusFalse
+/// `StatorStatusOk`.
 ///
 /// # Safety
-/// `out_deleted` must be a writable `*mut bool` slot when the callback
-/// returns [`StatorStatus::StatorStatusOk`].
+/// `out_deleted` must be a writable `bool *` slot when the callback
+/// returns `StatorStatusOk`.
 pub type StatorDomIndexedDeleterCb =
     unsafe extern "C" fn(index: u32, data: *mut c_void, out_deleted: *mut bool) -> StatorStatus;
 
 /// V2 indexed-property **enumerator** callback.
 ///
 /// The callback pushes indices onto `buf` via
-/// [`stator_dom_index_buffer_push`] and returns
-/// [`StatorStatus::StatorStatusOk`] on success.  Any other status is
+/// `stator_dom_index_buffer_push` and returns
+/// `StatorStatusOk` on success.  Any other status is
 /// treated as "no indices produced" and the engine observes an empty
 /// list — the indices already pushed are discarded.
 ///
@@ -18510,7 +22388,7 @@ pub type StatorDomIndexedEnumeratorCb =
     unsafe extern "C" fn(buf: *mut StatorDomIndexBuffer, data: *mut c_void) -> StatorStatus;
 
 /// POD bundle of named-property interceptors, installed in one call by
-/// [`stator_dom_object_wrap_install_named_handler`].
+/// `stator_dom_object_wrap_install_named_handler`.
 ///
 /// Each callback field is optional: pass `NULL` from C (or `None` from Rust)
 /// to leave a particular interceptor uninstalled.  At least one callback
@@ -18609,6 +22487,63 @@ pub struct StatorDomIndexedHandler {
         unsafe extern "C" fn(buf: *mut StatorDomIndexBuffer, data: *mut c_void) -> StatorStatus,
     >,
     /// Opaque embedder data passed to every callback.
+    pub data: *mut c_void,
+}
+
+/// DOM wrapper call-as-function callback.
+///
+/// `receiver` is the JS receiver for ordinary calls (or null when invoked
+/// directly through FFI without one). `args` is a borrowed array of
+/// `arg_count` borrowed `StatorValue` pointers and may be null when
+/// `arg_count == 0`. Returning `StatorStatusOk` transfers
+/// ownership of `*out` to Stator when it is non-null; a null `*out` means the
+/// JavaScript result is `undefined`.
+pub type StatorDomCallAsFunctionCb = unsafe extern "C" fn(
+    receiver: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// DOM wrapper constructor callback.
+///
+/// `new_target` is the constructor value for script `new wrapper(...)` calls
+/// (or null for direct FFI invocations that do not supply one). Argument and
+/// result ownership semantics match `StatorDomCallAsFunctionCb`.
+pub type StatorDomConstructCb = unsafe extern "C" fn(
+    new_target: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    data: *mut c_void,
+    out: *mut *mut StatorValue,
+) -> StatorStatus;
+
+/// Additive callable/constructible handler bundle for a DOM wrapper.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorDomCallableHandler {
+    /// Call-as-function callback, or null to leave ordinary calls unsupported.
+    pub call: Option<
+        unsafe extern "C" fn(
+            receiver: *const StatorValue,
+            args: *const *const StatorValue,
+            arg_count: usize,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
+    /// Construct callback, or null to leave `new wrapper(...)` unsupported.
+    pub construct: Option<
+        unsafe extern "C" fn(
+            new_target: *const StatorValue,
+            args: *const *const StatorValue,
+            arg_count: usize,
+            data: *mut c_void,
+            out: *mut *mut StatorValue,
+        ) -> StatorStatus,
+    >,
+    /// Opaque embedder data passed to both callbacks.
     pub data: *mut c_void,
 }
 
@@ -18729,13 +22664,39 @@ pub type StatorDomIndexedDescriptorCb = unsafe extern "C" fn(
 #[derive(Copy, Clone)]
 pub struct StatorDomNamedDefinerDescriptorHandler {
     /// String-keyed definer, or null.
-    pub definer: Option<StatorDomNamedDefinerCb>,
+    pub definer: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// String-keyed descriptor callback, or null.
-    pub descriptor: Option<StatorDomNamedDescriptorCb>,
+    pub descriptor: Option<
+        unsafe extern "C" fn(
+            name_utf8: *const c_char,
+            name_len: usize,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Symbol-keyed definer, or null.
-    pub symbol_definer: Option<StatorDomNamedSymbolDefinerCb>,
+    pub symbol_definer: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Symbol-keyed descriptor callback, or null.
-    pub symbol_descriptor: Option<StatorDomNamedSymbolDescriptorCb>,
+    pub symbol_descriptor: Option<
+        unsafe extern "C" fn(
+            key: *const StatorDomSymbolKey,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }
@@ -18745,9 +22706,21 @@ pub struct StatorDomNamedDefinerDescriptorHandler {
 #[derive(Copy, Clone)]
 pub struct StatorDomIndexedDefinerDescriptorHandler {
     /// Indexed definer, or null.
-    pub definer: Option<StatorDomIndexedDefinerCb>,
+    pub definer: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            descriptor: *const StatorDomPropertyDescriptor,
+            data: *mut c_void,
+        ) -> StatorStatus,
+    >,
     /// Indexed descriptor callback, or null.
-    pub descriptor: Option<StatorDomIndexedDescriptorCb>,
+    pub descriptor: Option<
+        unsafe extern "C" fn(
+            index: u32,
+            data: *mut c_void,
+            out_descriptor: *mut StatorDomPropertyDescriptor,
+        ) -> StatorStatus,
+    >,
     /// Opaque embedder data passed to every callback.
     pub data: *mut c_void,
 }
@@ -18947,18 +22920,17 @@ pub unsafe extern "C" fn stator_dom_property_descriptor_clear(
     }
     *d = StatorDomPropertyDescriptor::default();
 }
-/// Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
+/// Opaque index buffer passed to a `StatorDomIndexedEnumeratorCb`
 /// callback.  The callback fills it by repeatedly calling
-/// [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
-/// bridge for the duration of the callback and must not outlive it.
+/// `stator_dom_index_buffer_push`.  The buffer is owned by the FFI bridge for
+/// the duration of the callback and must not outlive it.
 ///
 /// Embedders that want to drive the indexed enumerator directly from C
 /// (rather than through an installed handler) can allocate a buffer with
-/// [`stator_dom_index_buffer_new`], pass it to
-/// [`stator_dom_object_wrap_invoke_indexed_enumerate_into`], inspect the
-/// contents via [`stator_dom_index_buffer_len`] /
-/// [`stator_dom_index_buffer_get`], and release it with
-/// [`stator_dom_index_buffer_destroy`].
+/// `stator_dom_index_buffer_new`, pass it to
+/// `stator_dom_object_wrap_invoke_indexed_enumerate_into`, inspect the
+/// contents via `stator_dom_index_buffer_len` / `stator_dom_index_buffer_get`,
+/// and release it with `stator_dom_index_buffer_destroy`.
 pub struct StatorDomIndexBuffer {
     indices: Vec<u32>,
 }
@@ -18967,12 +22939,12 @@ pub struct StatorDomIndexBuffer {
 // on the owning thread during a single callback invocation.
 unsafe impl Send for StatorDomIndexBuffer {}
 
-/// Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
-/// [`stator_dom_index_buffer_destroy`].
+/// Allocate a fresh, empty `StatorDomIndexBuffer`.  Free with
+/// `stator_dom_index_buffer_destroy`.
 ///
 /// # Safety
 /// The returned pointer must be released exactly once via
-/// [`stator_dom_index_buffer_destroy`].
+/// `stator_dom_index_buffer_destroy`.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_dom_index_buffer_new() -> *mut StatorDomIndexBuffer {
     Box::into_raw(Box::new(StatorDomIndexBuffer {
@@ -18980,11 +22952,11 @@ pub extern "C" fn stator_dom_index_buffer_new() -> *mut StatorDomIndexBuffer {
     }))
 }
 
-/// Free a [`StatorDomIndexBuffer`].  Does nothing when `buf` is null.
+/// Free a `StatorDomIndexBuffer`.  Does nothing when `buf` is null.
 ///
 /// # Safety
 /// `buf` must be either null or a pointer returned by
-/// [`stator_dom_index_buffer_new`], not previously destroyed.
+/// `stator_dom_index_buffer_new`, not previously destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_destroy(buf: *mut StatorDomIndexBuffer) {
     if !buf.is_null() {
@@ -19010,13 +22982,13 @@ pub unsafe extern "C" fn stator_dom_index_buffer_len(buf: *const StatorDomIndexB
 /// Read the entry at `index` from `buf` into `*out_index`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` or `out_index`
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` or `out_index`
 ///   is null, or when `index` is out of range.
 ///
 /// # Safety
 /// - `buf` must be either null or a valid buffer pointer.
-/// - `out_index` must be either null or a writable `*mut u32`.
+/// - `out_index` must be either null or a writable `uint32_t *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_get(
     buf: *const StatorDomIndexBuffer,
@@ -19036,17 +23008,17 @@ pub unsafe extern "C" fn stator_dom_index_buffer_get(
     StatorStatus::StatorStatusOk
 }
 
-/// Append an index to a [`StatorDomIndexBuffer`].
+/// Append an index to a `StatorDomIndexBuffer`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null.
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` is null.
 ///
 /// # Safety
 /// `buf` must be either null or a valid pointer to a
-/// [`StatorDomIndexBuffer`] currently borrowed by an enumerator callback
+/// `StatorDomIndexBuffer` currently borrowed by an enumerator callback
 /// (or owned by the caller between
-/// [`stator_dom_index_buffer_new`]/[`stator_dom_index_buffer_destroy`]).
+/// `stator_dom_index_buffer_new` / `stator_dom_index_buffer_destroy`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_index_buffer_push(
     buf: *mut StatorDomIndexBuffer,
@@ -19060,10 +23032,10 @@ pub unsafe extern "C" fn stator_dom_index_buffer_push(
     StatorStatus::StatorStatusOk
 }
 
-/// Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
+/// Opaque name buffer passed to a `StatorDomNamedEnumeratorCb` callback.
 ///
 /// The callback fills the buffer by repeatedly calling
-/// [`stator_dom_name_buffer_push`].  The buffer is owned by the FFI bridge
+/// `stator_dom_name_buffer_push`.  The buffer is owned by the FFI bridge
 /// and must not outlive the callback invocation.
 pub struct StatorDomNameBuffer {
     names: Vec<String>,
@@ -19073,16 +23045,16 @@ pub struct StatorDomNameBuffer {
 // accessed on the owning thread during a single callback invocation.
 unsafe impl Send for StatorDomNameBuffer {}
 
-/// Append a UTF-8 name to a [`StatorDomNameBuffer`].
+/// Append a UTF-8 name to a `StatorDomNameBuffer`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` is null, when
 ///   `name_utf8` is null while `name_len` is non-zero, or when the byte
 ///   range is not valid UTF-8.
 ///
 /// # Safety
-/// - `buf` must be either null or a valid pointer to a [`StatorDomNameBuffer`]
+/// - `buf` must be either null or a valid pointer to a `StatorDomNameBuffer`
 ///   that is currently borrowed by an enumerator callback.
 /// - `name_utf8` must point to at least `name_len` valid bytes when
 ///   `name_len > 0`.
@@ -19390,13 +23362,233 @@ pub unsafe extern "C" fn stator_dom_object_wrap_install_indexed_handler(
     StatorStatus::StatorStatusOk
 }
 
+/// Install call-as-function and/or construct callbacks on a DOM wrapper.
+///
+/// This is additive with property handlers: installing callable handlers does
+/// not disturb named, symbol, indexed, definer, descriptor, class-id, access
+/// check, weak, or traced-edge state. Passing both callback fields as null is
+/// invalid; wrappers are non-callable and non-constructible by default.
+///
+/// # Safety
+/// - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `handler` must point to a readable [`StatorDomCallableHandler`].
+/// - Callback function pointers must remain valid for the wrapper lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_install_callable_handler(
+    wrap: *mut StatorDomObjectWrap,
+    handler: *const StatorDomCallableHandler,
+) -> StatorStatus {
+    if wrap.is_null() || handler.is_null() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `handler` is readable.
+    let h = unsafe { *handler };
+    if h.call.is_none() && h.construct.is_none() {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+
+    let user_data_addr = h.data as usize;
+    // SAFETY: caller guarantees `wrap` is valid.
+    let isolate_addr = unsafe { (*wrap).isolate as usize };
+
+    // SAFETY: caller guarantees `wrap` is valid and uniquely mutable here.
+    let inner = unsafe { &mut (*wrap).inner };
+    if let Some(cb) = h.call {
+        inner.set_call_as_function_handler(move |payload: &DomCallArgs, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let receiver_value = StatorValue {
+                inner: jsvalue_to_stator_value_inner(payload.receiver()),
+                isolate,
+            };
+            let (_borrowed_args, arg_ptrs) =
+                js_args_to_borrowed_stator_values(payload.args(), isolate);
+            let args_ptr = if arg_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                arg_ptrs.as_ptr()
+            };
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&receiver_value, args_ptr, arg_ptrs.len(), data, &mut out) };
+            status_to_dom_call_result(status, out, isolate, "DOM call-as-function exception")
+        });
+    } else {
+        inner.clear_call_as_function_handler();
+    }
+
+    if let Some(cb) = h.construct {
+        inner.set_construct_handler(move |payload: &DomCallArgs, _data_field0| {
+            let data = user_data_addr as *mut c_void;
+            let isolate = isolate_addr as *mut StatorIsolate;
+            let new_target_value = StatorValue {
+                inner: jsvalue_to_stator_value_inner(payload.new_target()),
+                isolate,
+            };
+            let (_borrowed_args, arg_ptrs) =
+                js_args_to_borrowed_stator_values(payload.args(), isolate);
+            let args_ptr = if arg_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                arg_ptrs.as_ptr()
+            };
+            let mut out: *mut StatorValue = std::ptr::null_mut();
+            // SAFETY: `cb` is a C fn pointer the embedder guarantees valid.
+            let status = unsafe { cb(&new_target_value, args_ptr, arg_ptrs.len(), data, &mut out) };
+            status_to_dom_call_result(status, out, isolate, "DOM construct exception")
+        });
+    } else {
+        inner.clear_construct_handler();
+    }
+
+    // SAFETY: caller guarantees `wrap` is valid; drop stale materialization so
+    // future conversions include the new callable builtins.
+    unsafe { stator_dom_object_wrap_drop_materialized_cache(wrap) };
+    StatorStatus::StatorStatusOk
+}
+
+/// Invoke a DOM wrapper's call-as-function handler directly through FFI.
+///
+/// Returns [`StatorStatus::StatorStatusUnsupported`] when no call handler is
+/// installed, [`StatorStatus::StatorStatusFalse`] when the wrapper was
+/// invalidated or an access check denies the call, and `Ok` with an owned
+/// `*out` result on success. A successful `undefined` result is represented by
+/// an owned undefined [`StatorValue`].
+///
+/// # Safety
+/// `wrap`, `receiver`, `args`, and `out` must follow the callback contract
+/// documented on [`StatorDomCallAsFunctionCb`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_call_as_function(
+    wrap: *mut StatorDomObjectWrap,
+    receiver: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    out: *mut *mut StatorValue,
+) -> StatorStatus {
+    if wrap.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let wrap_ref = unsafe { &*wrap };
+    if !wrap_ref.alive.get() {
+        return StatorStatus::StatorStatusFalse;
+    }
+    if !wrap_ref.inner.is_callable() {
+        return StatorStatus::StatorStatusUnsupported;
+    }
+    let receiver_js = if receiver.is_null() {
+        match dom_object_wrap_js_value(wrap) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    } else {
+        // SAFETY: caller guarantees `receiver` is valid.
+        stator_value_inner_to_jsvalue(unsafe { &(*receiver).inner })
+    };
+    let mut js_args = Vec::with_capacity(arg_count);
+    for idx in 0..arg_count {
+        // SAFETY: caller guarantees `args` points to `arg_count` entries.
+        let arg = unsafe { *args.add(idx) };
+        if arg.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        // SAFETY: caller guarantees each argument pointer is valid.
+        js_args.push(stator_value_inner_to_jsvalue(unsafe { &(*arg).inner }));
+    }
+    match wrap_ref.inner.call_as_function(receiver_js, js_args) {
+        Ok(value) => {
+            let inner = jsvalue_to_stator_value_inner(&value);
+            // SAFETY: `out` is writable and `wrap_ref.isolate` owns the result.
+            unsafe { *out = allocate_stator_value(wrap_ref.isolate, inner) };
+            StatorStatus::StatorStatusOk
+        }
+        Err(_) => {
+            // SAFETY: `out` is writable.
+            unsafe { *out = std::ptr::null_mut() };
+            if !wrap_ref.isolate.is_null()
+                // SAFETY: isolate belongs to the live wrapper.
+                && unsafe { (*wrap_ref.isolate).pending_exception.is_some() }
+            {
+                StatorStatus::StatorStatusException
+            } else {
+                StatorStatus::StatorStatusFalse
+            }
+        }
+    }
+}
+
+/// Invoke a DOM wrapper's construct handler directly through FFI.
+///
+/// # Safety
+/// Arguments follow [`StatorDomConstructCb`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_dom_object_wrap_invoke_construct(
+    wrap: *mut StatorDomObjectWrap,
+    new_target: *const StatorValue,
+    args: *const *const StatorValue,
+    arg_count: usize,
+    out: *mut *mut StatorValue,
+) -> StatorStatus {
+    if wrap.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+        return StatorStatus::StatorStatusInvalidArg;
+    }
+    // SAFETY: caller guarantees `wrap` is valid.
+    let wrap_ref = unsafe { &*wrap };
+    if !wrap_ref.alive.get() {
+        return StatorStatus::StatorStatusFalse;
+    }
+    if !wrap_ref.inner.is_constructible() {
+        return StatorStatus::StatorStatusUnsupported;
+    }
+    let new_target_js = if new_target.is_null() {
+        match dom_object_wrap_js_value(wrap) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    } else {
+        // SAFETY: caller guarantees `new_target` is valid.
+        stator_value_inner_to_jsvalue(unsafe { &(*new_target).inner })
+    };
+    let mut js_args = Vec::with_capacity(arg_count);
+    for idx in 0..arg_count {
+        // SAFETY: caller guarantees `args` points to `arg_count` entries.
+        let arg = unsafe { *args.add(idx) };
+        if arg.is_null() {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        // SAFETY: caller guarantees each argument pointer is valid.
+        js_args.push(stator_value_inner_to_jsvalue(unsafe { &(*arg).inner }));
+    }
+    match wrap_ref.inner.construct(new_target_js, js_args) {
+        Ok(value) => {
+            let inner = jsvalue_to_stator_value_inner(&value);
+            // SAFETY: `out` is writable and `wrap_ref.isolate` owns the result.
+            unsafe { *out = allocate_stator_value(wrap_ref.isolate, inner) };
+            StatorStatus::StatorStatusOk
+        }
+        Err(_) => {
+            // SAFETY: `out` is writable.
+            unsafe { *out = std::ptr::null_mut() };
+            if !wrap_ref.isolate.is_null()
+                // SAFETY: isolate belongs to the live wrapper.
+                && unsafe { (*wrap_ref.isolate).pending_exception.is_some() }
+            {
+                StatorStatus::StatorStatusException
+            } else {
+                StatorStatus::StatorStatusFalse
+            }
+        }
+    }
+}
+
 // ── Symbol-keyed named-handler FFI ──────────────────────────────────────────
 
 /// POD descriptor for a symbol property key passed across the FFI
-/// boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
-/// without ever coercing the symbol to a string: `symbol_id` carries the
-/// engine-assigned identity verbatim, and `description_utf8`/`description_len`
-/// carry the optional description for diagnostics only.
+/// boundary.  Mirrors the engine's internal symbol-key representation without
+/// ever coercing the symbol to a string: `symbol_id` carries the engine-assigned
+/// identity verbatim, and `description_utf8`/`description_len` carry the
+/// optional description for diagnostics only.
 ///
 /// `description_utf8` may be `NULL` (with `description_len == 0`) when the
 /// symbol has no description.  The pointer is borrowed for the duration of
@@ -19446,9 +23638,9 @@ pub type StatorDomNamedSymbolDeleterCb = unsafe extern "C" fn(
     out_deleted: *mut bool,
 ) -> StatorStatus;
 
-/// Opaque buffer passed to a [`StatorDomNamedSymbolEnumeratorCb`] callback.
+/// Opaque buffer passed to a `StatorDomNamedSymbolEnumeratorCb` callback.
 /// The callback pushes symbol identities by repeatedly invoking
-/// [`stator_dom_symbol_buffer_push`].  The buffer is owned by the FFI
+/// `stator_dom_symbol_buffer_push`.  The buffer is owned by the FFI
 /// bridge and must not outlive the callback invocation.
 pub struct StatorDomSymbolBuffer {
     keys: Vec<stator_jse::dom::SymbolKey>,
@@ -19458,16 +23650,16 @@ pub struct StatorDomSymbolBuffer {
 // accessed on the owning thread during a single callback invocation.
 unsafe impl Send for StatorDomSymbolBuffer {}
 
-/// Append a symbol identity to a [`StatorDomSymbolBuffer`].
+/// Append a symbol identity to a `StatorDomSymbolBuffer`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+/// * `StatorStatusOk` on success.
+/// * `StatorStatusInvalidArg` when `buf` is null, when
 ///   `description_utf8` is null while `description_len` is non-zero, or
 ///   when the description byte range is not valid UTF-8.
 ///
 /// # Safety
-/// - `buf` must be a valid pointer to a [`StatorDomSymbolBuffer`] currently
+/// - `buf` must be a valid pointer to a `StatorDomSymbolBuffer` currently
 ///   borrowed by an enumerator callback.
 /// - `description_utf8` must point to at least `description_len` valid
 ///   bytes when `description_len > 0`.
@@ -19596,7 +23788,7 @@ fn with_symbol_ffi_key<R>(
 /// named handler is installed yet, an empty one is created so the
 /// symbol callbacks have a home.  The installation **does not** set the
 /// `INTERCEPT_SYMBOLS` flag automatically — the embedder must call
-/// [`stator_dom_object_wrap_set_named_handler_flags`] to opt in.
+/// `stator_dom_object_wrap_set_named_handler_flags` to opt in.
 /// Without that flag the symbol callbacks remain dormant (fail-closed),
 /// matching V8/Blink semantics and preventing accidental stringification.
 ///
@@ -19929,8 +24121,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_enumerate_into(
 /// Invoke the wrapper's indexed-property **deleter** path.
 ///
 /// Mirrors `delete nodeList[index]`.  The result is encoded through
-/// [`StatorStatus`] / `*out_deleted` to expose the three-way
-/// [`stator_jse::dom::IndexedDeleterResult`] outcome to embedders:
+/// `StatorStatus` / `*out_deleted` to expose the three-way indexed-delete
+/// outcome to embedders:
 ///
 /// | Wrapper outcome                                         | Status                | `*out_deleted` |
 /// |---------------------------------------------------------|-----------------------|----------------|
@@ -19941,14 +24133,14 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_symbol_enumerate_into(
 /// | Access-check denied / wrapper invalidated (fail-closed) | `StatorStatusOk`      | `false`        |
 ///
 /// `*out_deleted` is always written when this function returns
-/// [`StatorStatus::StatorStatusOk`].  This function only reports a
+/// `StatorStatusOk`.  This function only reports a
 /// non-`Ok` status when its FFI arguments are themselves invalid (null
 /// `wrap`/`out_deleted`, or a stale wrapper pointer), in which case
 /// `*out_deleted` is left untouched.
 ///
 /// # Safety
-/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
-/// - `out_deleted` must be either null or a writable `*mut bool`.
+/// - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
+/// - `out_deleted` must be either null or a writable `bool *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
     wrap: *mut StatorDomObjectWrap,
@@ -19976,8 +24168,8 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
 
 /// Collect the indices reported by the wrapper's indexed-property
 /// enumerator into `buf`.  The buffer is owned by the caller, created
-/// with [`stator_dom_index_buffer_new`] and released with
-/// [`stator_dom_index_buffer_destroy`].
+/// with `stator_dom_index_buffer_new` and released with
+/// `stator_dom_index_buffer_destroy`.
 ///
 /// The enumerator is invoked with the wrapper's `IndexedEnumerate`
 /// access-check gate; on denial (or when the wrapper has been
@@ -19986,15 +24178,15 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_deleter(
 /// Stator does not reorder or de-duplicate them.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] on success (including the empty
+/// * `StatorStatusOk` on success (including the empty
 ///   no-handler / denied / invalidated cases).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `buf` is
+/// * `StatorStatusInvalidArg` when `wrap` or `buf` is
 ///   null.
 ///
 /// # Safety
-/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+/// - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
 /// - `buf` must be either null or a valid buffer pointer returned by
-///   [`stator_dom_index_buffer_new`] that has not been destroyed.
+///   `stator_dom_index_buffer_new` that has not been destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_enumerate_into(
     wrap: *mut StatorDomObjectWrap,
@@ -20015,22 +24207,22 @@ pub unsafe extern "C" fn stator_dom_object_wrap_invoke_indexed_enumerate_into(
     StatorStatus::StatorStatusOk
 }
 
-/// Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with
-/// [`stator_dom_symbol_buffer_destroy`].
+/// Allocate a fresh, empty `StatorDomSymbolBuffer`.  Free with
+/// `stator_dom_symbol_buffer_destroy`.
 ///
 /// # Safety
 /// The returned pointer must be released exactly once via
-/// [`stator_dom_symbol_buffer_destroy`].
+/// `stator_dom_symbol_buffer_destroy`.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_dom_symbol_buffer_new() -> *mut StatorDomSymbolBuffer {
     Box::into_raw(Box::new(StatorDomSymbolBuffer { keys: Vec::new() }))
 }
 
-/// Free a [`StatorDomSymbolBuffer`].  Does nothing when `buf` is null.
+/// Free a `StatorDomSymbolBuffer`.  Does nothing when `buf` is null.
 ///
 /// # Safety
 /// `buf` must be either null or a pointer returned by
-/// [`stator_dom_symbol_buffer_new`], not previously destroyed.
+/// `stator_dom_symbol_buffer_new`, not previously destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_symbol_buffer_destroy(buf: *mut StatorDomSymbolBuffer) {
     if !buf.is_null() {
@@ -20058,9 +24250,9 @@ pub unsafe extern "C" fn stator_dom_symbol_buffer_len(buf: *const StatorDomSymbo
 /// The borrowed `description_utf8` pointer remains valid until `buf` is
 /// mutated (pushed to, cleared, or destroyed).
 ///
-/// Returns [`StatorStatus::StatorStatusInvalidArg`] when `buf` or
+/// Returns `StatorStatusInvalidArg` when `buf` or
 /// `out_key` is null or `index` is out of range; otherwise
-/// [`StatorStatus::StatorStatusOk`].
+/// `StatorStatusOk`.
 ///
 /// # Safety
 /// `buf` and `out_key` must be valid pointers; see lifetime note above.
@@ -20626,7 +24818,7 @@ pub const STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS: u32 = 1 << 3;
 pub const STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT: u32 = 1 << 4;
 /// Bitmask of every named-handler flag recognised by this Stator build.
 /// Any bit outside this mask is rejected by
-/// [`stator_dom_object_wrap_set_named_handler_flags`].
+/// `stator_dom_object_wrap_set_named_handler_flags`.
 pub const STATOR_DOM_NAMED_HANDLER_FLAG_ALL: u32 = STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ
     | STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING
     | STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS
@@ -20651,23 +24843,23 @@ pub const STATOR_DOM_INDEXED_HANDLER_FLAG_ALL: u32 = STATOR_DOM_INDEXED_HANDLER_
     | STATOR_DOM_INDEXED_HANDLER_FLAG_NON_MASKING
     | STATOR_DOM_INDEXED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT;
 
-/// Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+/// Replace the `StatorDomNamedHandler` flag bitmask on `wrap`.
 ///
 /// The flag set is validated against
-/// [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`] and rejected if any unknown bit
+/// `STATOR_DOM_NAMED_HANDLER_FLAG_ALL` and rejected if any unknown bit
 /// is set — this is the fail-closed behaviour that prevents an embedder
 /// from silently activating semantics this Stator build does not
 /// understand.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when the flags were stored.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+/// * `StatorStatusOk` when the flags were stored.
+/// * `StatorStatusInvalidArg` when `wrap` is null, when
 ///   no named handler is currently installed (install one with
-///   [`stator_dom_object_wrap_install_named_handler`] first), or when
-///   `flags` contains a bit outside [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`].
+///   `stator_dom_object_wrap_install_named_handler` first), or when
+///   `flags` contains a bit outside `STATOR_DOM_NAMED_HANDLER_FLAG_ALL`.
 ///
 /// # Safety
-/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_set_named_handler_flags(
     wrap: *mut StatorDomObjectWrap,
@@ -20688,19 +24880,19 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_named_handler_flags(
     }
 }
 
-/// Read the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+/// Read the `StatorDomNamedHandler` flag bitmask on `wrap`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+/// * `StatorStatusOk` with `*out_flags` set to the
 ///   currently-installed flag bitmask (always `0` when no named handler
 ///   is installed).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+/// * `StatorStatusInvalidArg` when `wrap` or `out_flags`
 ///   is null.
 ///
 /// # Safety
-/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
 /// - `out_flags` must be a writable `*mut u32` slot on
-///   [`StatorStatus::StatorStatusOk`] return.
+///   `StatorStatusOk` return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_get_named_handler_flags(
     wrap: *const StatorDomObjectWrap,
@@ -20716,20 +24908,20 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_named_handler_flags(
     StatorStatus::StatorStatusOk
 }
 
-/// Replace the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+/// Replace the `StatorDomIndexedHandler` flag bitmask on `wrap`.
 ///
 /// The flag set is validated against
-/// [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`] and rejected if any unknown
+/// `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL` and rejected if any unknown
 /// bit is set.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] when the flags were stored.
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+/// * `StatorStatusOk` when the flags were stored.
+/// * `StatorStatusInvalidArg` when `wrap` is null, when
 ///   no indexed handler is currently installed, or when `flags` contains
-///   a bit outside [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`].
+///   a bit outside `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`.
 ///
 /// # Safety
-/// `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_set_indexed_handler_flags(
     wrap: *mut StatorDomObjectWrap,
@@ -20750,19 +24942,19 @@ pub unsafe extern "C" fn stator_dom_object_wrap_set_indexed_handler_flags(
     }
 }
 
-/// Read the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+/// Read the `StatorDomIndexedHandler` flag bitmask on `wrap`.
 ///
 /// Returns:
-/// * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+/// * `StatorStatusOk` with `*out_flags` set to the
 ///   currently-installed flag bitmask (always `0` when no indexed
 ///   handler is installed).
-/// * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+/// * `StatorStatusInvalidArg` when `wrap` or `out_flags`
 ///   is null.
 ///
 /// # Safety
-/// - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+/// - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
 /// - `out_flags` must be a writable `*mut u32` slot on
-///   [`StatorStatus::StatorStatusOk`] return.
+///   `StatorStatusOk` return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_dom_object_wrap_get_indexed_handler_flags(
     wrap: *const StatorDomObjectWrap,
@@ -20781,8 +24973,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_get_indexed_handler_flags(
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
 
 use stator_jse::builtins::promise::{
-    MicrotaskQueue, PromiseRejectionEventKind, drain_active_microtask_queue,
-    drain_active_promise_rejection_events,
+    PromiseRejectionEventKind, drain_active_microtask_queue, drain_active_promise_rejection_events,
 };
 use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
 
@@ -20795,6 +24986,44 @@ use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, Tim
 /// the current thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_drain_active_microtask_queue() -> usize {
+    drain_active_microtask_queue()
+}
+
+/// Perform a microtask checkpoint for the active thread-local queue of `ctx`.
+///
+/// The current FFI architecture stores Promise microtasks in the thread-local
+/// queue installed by the context's Promise globals.  This context-shaped entry
+/// point validates `ctx` and then drains that active queue, returning the number
+/// of microtasks run.  Returns 0 when `ctx` is null or no queue is active.
+///
+/// # Safety
+/// `ctx` must be null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_perform_microtask_checkpoint(
+    ctx: *mut StatorContext,
+) -> usize {
+    if ctx.is_null() {
+        return 0;
+    }
+    drain_active_microtask_queue()
+}
+
+/// Perform a microtask checkpoint for the active thread-local queue of `isolate`.
+///
+/// This isolate-shaped entry point mirrors
+/// [`stator_context_perform_microtask_checkpoint`] for embedders that schedule
+/// checkpoints at isolate boundaries.  Returns 0 when `isolate` is null or no
+/// queue is active.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_perform_microtask_checkpoint(
+    isolate: *mut StatorIsolate,
+) -> usize {
+    if isolate.is_null() {
+        return 0;
+    }
     drain_active_microtask_queue()
 }
 
@@ -21563,11 +25792,11 @@ pub struct StatorPersistent {
     _opaque: [u8; 0],
 }
 
-/// Internal storage backing a [`StatorPersistent`] slot.
+/// Internal storage backing a `StatorPersistent` slot.
 ///
 /// Owned by the isolate's `persistent_slots` table; the slot's heap address
 /// is what the embedder sees as a `*mut StatorPersistent`.  The slot owns a
-/// cloned [`StatorValueInner`] which, for `Rc`-backed JS values, transitively
+/// cloned `StatorValueInner` which, for `Rc`-backed JS values, transitively
 /// keeps the underlying object alive.
 struct StatorPersistentSlot {
     /// The cloned value, or `None` after [`stator_persistent_reset`].
@@ -21608,26 +25837,33 @@ impl StatorValueInner {
             Self::Date => Self::Date,
             Self::RegExp => Self::RegExp,
             Self::Promise => Self::Promise,
+            Self::PromiseHandle { promise, queue } => Self::PromiseHandle {
+                promise: promise.clone(),
+                queue: queue.clone(),
+            },
             Self::Map => Self::Map,
             Self::Set => Self::Set,
+            Self::ArrayBuffer(buffer) => Self::ArrayBuffer(Rc::clone(buffer)),
+            Self::TypedArray(array) => Self::TypedArray(Rc::clone(array)),
+            Self::DataView(view) => Self::DataView(Rc::clone(view)),
         }
     }
 }
 
 /// Create a new persistent (embedder-rooted) handle that keeps `value` alive
-/// independently of any open [`StatorHandleScope`].
+/// independently of any open `StatorHandleScope`.
 ///
 /// The persistent's underlying storage is owned by `ctx`'s parent isolate
-/// and survives both [`stator_handle_scope_close`] and any number of
-/// [`stator_isolate_gc`] calls.  The slot is released by
-/// [`stator_persistent_dispose`].
+/// and survives both `stator_handle_scope_close` and any number of
+/// `stator_isolate_gc` calls.  The slot is released by
+/// `stator_persistent_dispose`.
 ///
 /// Returns null if either argument is null, or if `value` was created on a
 /// different isolate than `ctx`'s parent.
 ///
 /// # Safety
-/// - `ctx` must be null or a valid, live [`StatorContext`] pointer.
-/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+/// - `ctx` must be null or a valid, live `StatorContext` pointer.
+/// - `value` must be null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_persistent_new(
     ctx: *mut StatorContext,
@@ -21689,8 +25925,8 @@ pub unsafe extern "C" fn stator_persistent_new(
 ///
 /// # Safety
 /// `persistent` must be null or a slot pointer returned by
-/// [`stator_persistent_new`] that has not yet been passed to
-/// [`stator_persistent_dispose`].
+/// `stator_persistent_new` that has not yet been passed to
+/// `stator_persistent_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_persistent_reset(persistent: *mut StatorPersistent) {
     if persistent.is_null() {
@@ -21704,12 +25940,12 @@ pub unsafe extern "C" fn stator_persistent_reset(persistent: *mut StatorPersiste
 }
 
 /// Return `true` if `persistent` is null or has been cleared via
-/// [`stator_persistent_reset`].
+/// `stator_persistent_reset`.
 ///
 /// # Safety
 /// `persistent` must be null or a slot pointer returned by
-/// [`stator_persistent_new`] that has not yet been passed to
-/// [`stator_persistent_dispose`].
+/// `stator_persistent_new` that has not yet been passed to
+/// `stator_persistent_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_persistent_is_empty(persistent: *const StatorPersistent) -> bool {
     if persistent.is_null() {
@@ -21720,7 +25956,7 @@ pub unsafe extern "C" fn stator_persistent_is_empty(persistent: *const StatorPer
     unsafe { (*slot).inner.is_none() }
 }
 
-/// Materialise a fresh [`StatorValue`] from the value stored in `persistent`.
+/// Materialise a fresh `StatorValue` from the value stored in `persistent`.
 ///
 /// The returned value is allocated on the embedder side and, if a handle
 /// scope is open on the persistent's isolate, registered with that scope so
@@ -21729,8 +25965,8 @@ pub unsafe extern "C" fn stator_persistent_is_empty(persistent: *const StatorPer
 ///
 /// # Safety
 /// `persistent` must be null or a slot pointer returned by
-/// [`stator_persistent_new`] that has not yet been passed to
-/// [`stator_persistent_dispose`].
+/// `stator_persistent_new` that has not yet been passed to
+/// `stator_persistent_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_persistent_get(
     persistent: *const StatorPersistent,
@@ -21768,7 +26004,7 @@ pub unsafe extern "C" fn stator_persistent_get(
 ///
 /// # Safety
 /// `persistent` must be null or a slot pointer returned by
-/// [`stator_persistent_new`].  After this call returns, the embedder must
+/// `stator_persistent_new`.  After this call returns, the embedder must
 /// treat the pointer as invalid (it must not be passed to any other
 /// `stator_persistent_*` function except as a redundant `dispose`).
 #[unsafe(no_mangle)]
@@ -21852,7 +26088,7 @@ pub struct StatorWeak {
     _opaque: [u8; 0],
 }
 
-/// Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+/// Selects what the embedder receives in the `StatorWeakCallbackInfo` when
 /// the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
 /// `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
 /// can recover embedder fields without re-dereferencing the dead object.
@@ -21860,10 +26096,10 @@ pub struct StatorWeak {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatorWeakParameterKind {
     /// The callback only needs the opaque `parameter` pointer captured at
-    /// [`stator_weak_new`] time.  `internal_fields` are zeroed.
+    /// `stator_weak_new` time.  `internal_fields` are zeroed.
     Opaque = 0,
     /// The callback expects the first two internal fields of the referent
-    /// to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+    /// to be snapshotted into `StatorWeakCallbackInfo::internal_fields` at
     /// slot-creation time.  This is the kind Blink uses to break C++ side
     /// pointers from inside the weak callback without touching the (dead)
     /// JS wrapper.
@@ -21880,9 +26116,8 @@ pub struct StatorWeakCallbackInfo {
     /// The opaque pointer registered with [`stator_weak_new`].
     pub parameter: *mut c_void,
     /// First two internal-field pointers snapshotted at slot creation when
-    /// the weak slot was registered with
-    /// [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
-    /// [`StatorWeakParameterKind::Opaque`] slots.
+    /// the weak slot was registered with `InternalFields` parameter mode.
+    /// Always zeroed for `Opaque` parameter-mode slots.
     pub internal_fields: [*mut c_void; 2],
     /// The isolate that owns the slot — typically used to schedule
     /// follow-up embedder work.  The callback must **not** call back into
@@ -21937,7 +26172,7 @@ struct StatorWeakSlot {
 /// cannot keep the referent alive.
 enum WeakRef {
     /// Weak handle to an [`StatorValueInner::ObjectHandle`].
-    Object(std::rc::Weak<RefCell<JsObject>>),
+    Object(std::rc::Weak<RefCell<PropertyMap>>),
     /// Weak handle to an [`StatorValueInner::DomWrapHandle`].  The `wrap`
     /// pointer is **not** owned by the weak slot; it is only used by
     /// [`stator_weak_upgrade`] to reconstitute the original handle if the
@@ -22006,7 +26241,7 @@ impl WeakRef {
 /// receives as a `*mut StatorWeak`.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn install_weak_slot(
     isolate: *mut StatorIsolate,
@@ -22053,7 +26288,7 @@ unsafe fn install_weak_slot(
 /// skipped — guaranteeing the one-shot contract from `docs/handles.md` §2.3.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by the
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by the
 /// current thread.
 unsafe fn dispatch_weak_callbacks(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned by this thread.
@@ -22357,8 +26592,8 @@ pub unsafe extern "C" fn stator_weak_dispose(weak: *mut StatorWeak) {
 ///
 /// # Safety
 /// `persistent` must be null or a slot pointer returned by
-/// [`stator_persistent_new`] that has not yet been passed to
-/// [`stator_persistent_dispose`].
+/// `stator_persistent_new` that has not yet been passed to
+/// `stator_persistent_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_persistent_make_weak(
     persistent: *mut StatorPersistent,
@@ -22450,8 +26685,8 @@ pub struct StatorTraced {
 /// Opaque traced-root visitor token passed to the embedder root visitor.
 ///
 /// The pointer is only valid for the duration of a single
-/// [`StatorTracedRootVisitor`] invocation; storing it across calls or
-/// passing it to [`stator_traced_visitor_visit`] from another thread is
+/// `StatorTracedRootVisitor` invocation; storing it across calls or
+/// passing it to `stator_traced_visitor_visit` from another thread is
 /// undefined behaviour.  All `stator_traced_visitor_*` functions check
 /// for a null token and fail closed.
 #[repr(C)]
@@ -22473,30 +26708,30 @@ pub type StatorTracedRootVisitor =
     Option<unsafe extern "C" fn(userdata: *mut c_void, visitor: *mut StatorTracedVisitor)>;
 
 /// Embedder edge callback: invoked once per outgoing `TracedReference`
-/// edge during a call to [`stator_traced_visit_outgoing`].  The `edge`
+/// edge during a call to `stator_traced_visit_outgoing`.  The `edge`
 /// pointer is borrowed for the duration of the call; the embedder must
 /// not dispose or reset it (those operations belong to the slot's
 /// owner).
 pub type StatorTracedEdgeCallback =
     Option<unsafe extern "C" fn(userdata: *mut c_void, edge: *mut StatorTraced)>;
 
-/// Internal storage backing a [`StatorTraced`] slot.
+/// Internal storage backing a `StatorTraced` slot.
 struct StatorTracedSlot {
     /// Strong clone of the value, populated between GC cycles in which
     /// the embedder reports this slot.  Cleared at the start of every GC
-    /// cycle and reinstated only if [`stator_traced_visitor_visit`] is
+    /// cycle and reinstated only if `stator_traced_visitor_visit` is
     /// called for this slot before the cycle ends.
     strong: Option<StatorValueInner>,
     /// Weak (non-rooting) handle to the referent's `Rc`-backed payload,
     /// kept across cycles so visiting the slot can resurrect the strong
     /// clone even when the cycle's initial sweep cleared it.  `None` for
     /// primitive payloads (which have no GC identity) and after
-    /// [`stator_traced_reset`].
+    /// `stator_traced_reset`.
     weak: Option<WeakRef>,
     /// The isolate that owns this slot.
     isolate: *mut StatorIsolate,
     /// Index into the isolate's `traced_slots` table; stable for the
-    /// slot's lifetime and used by [`stator_traced_dispose`] to free it.
+    /// slot's lifetime and used by `stator_traced_dispose` to free it.
     index: usize,
     /// Engine-side root-registry index parallel to `index`, used to mark
     /// the slot visited during the embedder visitor phase.
@@ -22520,18 +26755,18 @@ struct TracedVisitorState {
 /// - `value`'s payload is not a reference-counted (object/wrapper/native
 ///   function) variant — primitives carry no GC identity, so a traced
 ///   handle would be meaningless.  This rejection is the same as
-///   [`stator_weak_new`].
+///   `stator_weak_new`.
 ///
 /// The newly created slot is allocated in the **stale** state: it does
 /// not count as a live root until the embedder reports it via
-/// [`stator_traced_visitor_visit`] during a GC cycle.  Between cycles it
+/// `stator_traced_visitor_visit` during a GC cycle.  Between cycles it
 /// transparently keeps the referent alive via its strong clone, so
 /// embedders that need rooting *before* the first GC can simply call
-/// [`stator_traced_get`] to materialise the value as needed.
+/// `stator_traced_get` to materialise the value as needed.
 ///
 /// # Safety
-/// - `ctx` must be null or a valid, live [`StatorContext`] pointer.
-/// - `value` must be null or a valid, live [`StatorValue`] pointer.
+/// - `ctx` must be null or a valid, live `StatorContext` pointer.
+/// - `value` must be null or a valid, live `StatorValue` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_new(
     ctx: *mut StatorContext,
@@ -22600,8 +26835,8 @@ pub unsafe extern "C" fn stator_traced_new(
 ///
 /// # Safety
 /// `traced` must be null or a slot pointer returned by
-/// [`stator_traced_new`] that has not yet been passed to
-/// [`stator_traced_dispose`].
+/// `stator_traced_new` that has not yet been passed to
+/// `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_reset(traced: *mut StatorTraced) {
     if traced.is_null() {
@@ -22620,8 +26855,8 @@ pub unsafe extern "C" fn stator_traced_reset(traced: *mut StatorTraced) {
 ///
 /// # Safety
 /// `traced` must be null or a slot pointer returned by
-/// [`stator_traced_new`] that has not yet been passed to
-/// [`stator_traced_dispose`].
+/// `stator_traced_new` that has not yet been passed to
+/// `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_is_empty(traced: *const StatorTraced) -> bool {
     if traced.is_null() {
@@ -22640,7 +26875,7 @@ pub unsafe extern "C" fn stator_traced_is_empty(traced: *const StatorTraced) -> 
     }
 }
 
-/// Materialise a fresh [`StatorValue`] from the value stored in `traced`.
+/// Materialise a fresh `StatorValue` from the value stored in `traced`.
 ///
 /// Returns null when the slot is null, has been reset, or its referent
 /// has been collected.  When a strong clone is currently held the value
@@ -22649,8 +26884,8 @@ pub unsafe extern "C" fn stator_traced_is_empty(traced: *const StatorTraced) -> 
 ///
 /// # Safety
 /// `traced` must be null or a slot pointer returned by
-/// [`stator_traced_new`] that has not yet been passed to
-/// [`stator_traced_dispose`].
+/// `stator_traced_new` that has not yet been passed to
+/// `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_get(traced: *const StatorTraced) -> *mut StatorValue {
     if traced.is_null() {
@@ -22727,16 +26962,16 @@ pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
 
 /// Register the embedder traced-root visitor on `isolate`.
 ///
-/// Passing a `None` callback clears any previously registered visitor;
+/// Passing a null callback clears any previously registered visitor;
 /// subsequent GC cycles will treat every traced slot as unvisited and
 /// therefore unreachable from the embedder.  The callback runs on the
 /// owning thread at the start of every GC cycle driven by
-/// [`stator_isolate_gc`] / [`stator_gc_collect`].
+/// `stator_isolate_gc` / `stator_gc_collect`.
 ///
 /// Null-tolerant: passing null `isolate` is a no-op.
 ///
 /// # Safety
-/// `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
 /// The supplied `userdata` is passed verbatim to the callback; its
 /// lifetime is entirely the embedder's responsibility and must outlive
 /// the registration.
@@ -22756,7 +26991,7 @@ pub unsafe extern "C" fn stator_isolate_set_traced_root_visitor(
 
 /// Mark `traced` as visited in the current GC cycle.
 ///
-/// Only valid to call from inside a [`StatorTracedRootVisitor`]
+/// Only valid to call from inside a `StatorTracedRootVisitor`
 /// invocation; the `visitor` token is the one supplied to the visitor
 /// callback by the engine.  Fails closed (no-op) when `visitor` or
 /// `traced` is null, when the visitor's epoch does not match the current
@@ -22767,8 +27002,8 @@ pub unsafe extern "C" fn stator_isolate_set_traced_root_visitor(
 /// - `visitor` must be null or the live token supplied to the current
 ///   visitor callback invocation on `traced`'s isolate.
 /// - `traced` must be null or a slot pointer returned by
-///   [`stator_traced_new`] that has not yet been passed to
-///   [`stator_traced_dispose`].
+///   `stator_traced_new` that has not yet been passed to
+///   `stator_traced_dispose`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_visitor_visit(
     visitor: *mut StatorTracedVisitor,
@@ -22802,8 +27037,8 @@ pub unsafe extern "C" fn stator_traced_visitor_visit(
 /// This is the JS→C++ direction of the cross-heap tracing protocol: it lets an
 /// embedder (typically Oilpan) discover every live traced edge a JS host object
 /// holds without poking at engine internals. DOM wrapper values created by
-/// [`stator_dom_object_wrap_as_value`] expose the borrowed edges registered via
-/// [`stator_dom_object_wrap_add_traced_edge`]. Ordinary JS values, invalidated
+/// `stator_dom_object_wrap_as_value` expose the borrowed edges registered via
+/// `stator_dom_object_wrap_add_traced_edge`. Ordinary JS values, invalidated
 /// wrappers, cross-isolate values, null arguments, and empty traced slots fail
 /// closed by reporting zero edges.
 ///
@@ -22811,9 +27046,9 @@ pub unsafe extern "C" fn stator_traced_visitor_visit(
 /// call and must not reset or dispose it.
 ///
 /// # Safety
-/// - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
-/// - `host` must be null or a valid, live [`StatorValue`] pointer.
-/// - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
+/// - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+/// - `host` must be null or a valid, live `StatorValue` pointer.
+/// - `callback` (if non-null) and `userdata` lifetimes are entirely the
 ///   embedder's responsibility.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_visit_outgoing(
@@ -22886,7 +27121,7 @@ fn mark_traced_visitor_root(
 /// `Rc` strong count is already zero are skipped.
 ///
 /// # Safety
-/// `isolate` must be a valid, live [`StatorIsolate`] pointer owned by
+/// `isolate` must be a valid, live `StatorIsolate` pointer owned by
 /// the current thread.
 unsafe fn dispatch_traced_visitor(isolate: *mut StatorIsolate) {
     // SAFETY: caller guarantees `isolate` is valid and owned here.
@@ -22955,6 +27190,15 @@ mod traced_internal_tests {
 mod tests {
     use super::*;
 
+    static FFI_OSR_COUNTERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_ffi_osr_counters() -> std::sync::MutexGuard<'static, ()> {
+        match FFI_OSR_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
     /// Helper: create an isolate and automatically destroy it after the test.
     struct IsolateGuard(*mut StatorIsolate);
 
@@ -22988,6 +27232,533 @@ mod tests {
     }
 
     #[test]
+    fn test_script_code_cache_ffi_status_discriminants_are_stable() {
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata as u32,
+            0
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored as u32,
+            1
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedValidatedRecompiled as u32,
+            2
+        );
+        assert_eq!(
+            StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload as u32,
+            7
+        );
+        assert_eq!(
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone as u32,
+            0
+        );
+        assert_eq!(
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported as u32,
+            7
+        );
+    }
+
+    #[test]
+    fn test_script_code_cache_stable_status_and_diagnostic_name_mapping() {
+        let statuses = [
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata as u32,
+                "produced_metadata",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored as u32,
+                "accepted_bytecode_restored",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedValidatedRecompiled as u32,
+                "accepted_validated_recompiled",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument as u32,
+                "invalid_argument",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusRejected as u32,
+                "rejected",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported as u32,
+                "unsupported",
+            ),
+            (
+                StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+        ];
+        for (status, expected) in statuses {
+            let ptr = stator_script_cache_status_name_u32(status);
+            assert!(
+                !ptr.is_null(),
+                "status name pointer must be non-null for {status}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown_status = stator_script_cache_status_name_u32(999);
+        assert!(!unknown_status.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown_status) }.to_str().unwrap(),
+            "unknown_status"
+        );
+
+        let diagnostics = [
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone as u32,
+                "none",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticMagicMismatch as u32,
+                "magic_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticVersionMismatch as u32,
+                "version_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch as u32,
+                "source_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticOptionsMismatch as u32,
+                "options_mismatch",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported as u32,
+                "unsupported",
+            ),
+        ];
+        for (diagnostic, expected) in diagnostics {
+            let ptr = stator_script_cache_diagnostic_name_u32(diagnostic);
+            assert!(
+                !ptr.is_null(),
+                "diagnostic name pointer must be non-null for {diagnostic}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown_diagnostic = stator_script_cache_diagnostic_name_u32(999);
+        assert!(!unknown_diagnostic.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown_diagnostic) }
+                .to_str()
+                .unwrap(),
+            "unknown_diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_module_code_cache_stable_status_name_mapping() {
+        let statuses = [
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata as u32,
+                "produced_metadata",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled as u32,
+                "accepted_validated_recompiled",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument as u32,
+                "invalid_argument",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusCompileError as u32,
+                "compile_error",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusRejected as u32,
+                "rejected",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported as u32,
+                "unsupported",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored as u32,
+                "accepted_bytecode_restored",
+            ),
+            (
+                StatorModuleCacheStatus::StatorModuleCacheStatusCorruptPayload as u32,
+                "corrupt_payload",
+            ),
+        ];
+        for (status, expected) in statuses {
+            let ptr = stator_module_cache_status_name_u32(status);
+            assert!(
+                !ptr.is_null(),
+                "module status name pointer must be non-null for {status}"
+            );
+            // SAFETY: The function returns static NUL-terminated strings.
+            let actual = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+        let unknown = stator_module_cache_status_name_u32(999);
+        assert!(!unknown.is_null());
+        // SAFETY: The function returns static NUL-terminated strings.
+        assert_eq!(
+            unsafe { CStr::from_ptr(unknown) }.to_str().unwrap(),
+            "unknown_status"
+        );
+    }
+
+    #[test]
+    fn test_script_code_cache_ffi_structs_are_plain_c_abi_values() {
+        let options = StatorScriptCompileOptions {
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 1,
+            column_offset: 1,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+        };
+        assert_eq!(options.line_offset, 1);
+        assert_eq!(options.column_offset, 1);
+
+        let telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticUnsupported,
+            source_len: 10,
+            cache_input_len: 20,
+            cache_output_len: 0,
+            format_version: 1,
+        };
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusUnsupported
+        );
+        assert_eq!(telemetry.source_len, 10);
+        assert_eq!(telemetry.cache_input_len, 20);
+    }
+
+    #[test]
+    fn test_script_create_code_cache_produces_blob_and_telemetry() {
+        let source = b"var x = 1 + 2; x";
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, and telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone
+        );
+        assert_eq!(telemetry.source_len, source.len());
+        assert_eq!(telemetry.cache_input_len, 0);
+        assert!(telemetry.cache_output_len > source.len());
+        assert_eq!(
+            telemetry.format_version,
+            code_cache_key::SCRIPT_CACHE_FORMAT_VERSION
+        );
+
+        // SAFETY: cache is live and returned by Stator.
+        let cache_len = unsafe { stator_string_len(cache) };
+        // SAFETY: cache is live and returned by Stator.
+        let cache_data = unsafe { stator_string_data(cache) };
+        assert_eq!(cache_len, telemetry.cache_output_len);
+        assert!(!cache_data.is_null());
+        // SAFETY: cache_data/cache_len are valid for the live cache handle.
+        let cache_bytes = unsafe { std::slice::from_raw_parts(cache_data as *const u8, cache_len) };
+        assert!(cache_bytes.starts_with(SCRIPT_CACHE_MAGIC));
+
+        // SAFETY: both handles were returned by Stator constructors.
+        unsafe {
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_create_code_cache_compile_error_reports_status() {
+        let source = b"var =";
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, and telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusCompileError
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCompileError
+        );
+        assert_eq!(telemetry.source_len, source.len());
+        assert_eq!(telemetry.cache_output_len, 0);
+
+        // SAFETY: script was returned by Stator.
+        unsafe { stator_script_free(script) };
+    }
+
+    fn make_script_cache(source: &[u8]) -> (*mut StatorScript, *mut StatorString) {
+        // SAFETY: source points to a valid UTF-8 script buffer.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+            )
+        };
+        assert!(!script.is_null());
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: script is live, source is readable, telemetry is writable.
+        let cache = unsafe {
+            stator_script_create_code_cache(
+                script,
+                source.as_ptr() as *const c_char,
+                source.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata
+        );
+        (script, cache)
+    }
+
+    fn cache_bytes(cache: *const StatorString) -> Vec<u8> {
+        // SAFETY: cache is live and returned by Stator.
+        let len = unsafe { stator_string_len(cache) };
+        // SAFETY: cache is live and returned by Stator.
+        let data = unsafe { stator_string_data(cache) };
+        assert!(!data.is_null());
+        // SAFETY: data/len are valid for the live cache handle.
+        unsafe { std::slice::from_raw_parts(data as *const u8, len).to_vec() }
+    }
+
+    #[test]
+    fn test_script_compile_cached_restores_bytecode_on_hit() {
+        let source = b"var x = 1 + 2; x";
+        let (script, cache) = make_script_cache(source);
+        let bytes = cache_bytes(cache);
+        let expected_count = unsafe { stator_script_bytecode_count(script) };
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: source/cache buffers are readable and telemetry is writable.
+        let restored = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!restored.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone
+        );
+        assert_eq!(
+            unsafe { stator_script_bytecode_count(restored) },
+            expected_count
+        );
+        assert!(unsafe { stator_script_get_error(restored) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(restored);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_cached_stale_source_falls_back_to_compile() {
+        let source = b"var x = 1 + 2; x";
+        let stale = b"var y = 4; y";
+        let (script, cache) = make_script_cache(source);
+        let bytes = cache_bytes(cache);
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: stale/cache buffers are readable and telemetry is writable.
+        let fallback = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                stale.as_ptr() as *const c_char,
+                stale.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!fallback.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusRejected
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticSourceMismatch
+        );
+        assert!(unsafe { stator_script_get_error(fallback) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(fallback);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_cached_corrupt_payload_falls_back_to_compile() {
+        let source = b"var x = 1 + 2; x";
+        let (script, cache) = make_script_cache(source);
+        let mut bytes = cache_bytes(cache);
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x5a;
+
+        let mut telemetry = StatorScriptCacheTelemetry {
+            status: StatorScriptCacheStatus::StatorScriptCacheStatusInvalidArgument,
+            diagnostic: StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticNone,
+            source_len: 0,
+            cache_input_len: 0,
+            cache_output_len: 0,
+            format_version: 0,
+        };
+        // SAFETY: source/cache buffers are readable and telemetry is writable.
+        let fallback = unsafe {
+            stator_script_compile_cached(
+                std::ptr::null_mut(),
+                source.as_ptr() as *const c_char,
+                source.len(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                std::ptr::null(),
+                &mut telemetry,
+            )
+        };
+        assert!(!fallback.is_null());
+        assert_eq!(
+            telemetry.status,
+            StatorScriptCacheStatus::StatorScriptCacheStatusCorruptPayload
+        );
+        assert_eq!(
+            telemetry.diagnostic,
+            StatorScriptCacheDiagnostic::StatorScriptCacheDiagnosticCorruptPayload
+        );
+        assert!(unsafe { stator_script_get_error(fallback) }.is_null());
+
+        // SAFETY: handles were returned by Stator.
+        unsafe {
+            stator_script_free(fallback);
+            stator_string_free(cache);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
     fn test_value_new_number_roundtrip() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is non-null and live.
@@ -22998,6 +27769,12 @@ mod tests {
         assert!((n - 3.14).abs() < f64::EPSILON);
         // SAFETY: `val` is non-null and live.
         unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_destroy_null_is_safe() {
+        // SAFETY: passing null is documented as a no-op.
+        unsafe { stator_value_destroy(std::ptr::null_mut()) };
     }
 
     #[test]
@@ -23014,6 +27791,322 @@ mod tests {
         assert_eq!(got, "hello");
         // SAFETY: `val` is non-null and live.
         unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_zero_filled_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is non-null and live.
+        let val = unsafe { stator_value_new_array_buffer(iso.as_ptr(), 4) };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 4);
+
+        let mut out = [9u8; 4];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            4
+        );
+        assert_eq!(out, [0, 0, 0, 0]);
+
+        // SAFETY: `val` is non-null and live.
+        let js_value = unsafe { stator_value_inner_to_jsvalue(&(*val).inner) };
+        let JsValue::ArrayBuffer(buffer) = js_value else {
+            panic!("ArrayBuffer constructor must produce JsValue::ArrayBuffer");
+        };
+        assert_eq!(buffer.borrow().data, [0, 0, 0, 0]);
+        assert!(!buffer.borrow().shared);
+        assert!(!buffer.borrow().detached);
+        assert_eq!(buffer.borrow().max_byte_length, None);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_copy_copies_embedder_bytes() {
+        let iso = IsolateGuard::new();
+        let mut source = [1u8, 2, 3, 4, 5];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let val = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 5);
+
+        source.fill(9);
+        let mut out = [0u8; 5];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            5
+        );
+        assert_eq!(out, [1, 2, 3, 4, 5]);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_constructors_reject_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe { stator_value_new_array_buffer(std::ptr::null_mut(), 4) }.is_null()
+        );
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe {
+                stator_value_new_array_buffer_copy(
+                    std::ptr::null_mut(),
+                    c"x".as_ptr() as *const u8,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: null data is documented to return null.
+            unsafe { stator_value_new_array_buffer_copy(iso.as_ptr(), std::ptr::null(), 1) }
+                .is_null()
+        );
+
+        // SAFETY: `iso` is non-null and live; `empty` is readable for zero bytes.
+        let empty = unsafe { stator_value_new_array_buffer(iso.as_ptr(), 0) };
+        assert!(!empty.is_null());
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(empty) }, 0);
+
+        // SAFETY: `empty` is non-null and live.
+        unsafe { stator_value_destroy(empty) };
+    }
+
+    #[test]
+    fn test_value_new_typed_array_zero_filled_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is non-null and live.
+        let val = unsafe {
+            stator_value_new_typed_array(
+                iso.as_ptr(),
+                StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                3,
+            )
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_typed_array(val) });
+        assert_eq!(
+            unsafe { stator_value_typed_array_kind(val) },
+            StatorTypedArrayKind::StatorTypedArrayKindUint16
+        );
+        assert_eq!(unsafe { stator_value_typed_array_length(val) }, 3);
+        assert_eq!(unsafe { stator_value_typed_array_byte_length(val) }, 6);
+
+        let mut out = [9u8; 6];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable.
+            unsafe { stator_value_typed_array_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            6
+        );
+        assert_eq!(out, [0, 0, 0, 0, 0, 0]);
+
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_array_buffer_backed_typed_array_and_data_view() {
+        let iso = IsolateGuard::new();
+        let source = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let buffer = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!buffer.is_null());
+
+        // SAFETY: `buffer` is a live ArrayBuffer value owned by `iso`.
+        let typed = unsafe {
+            stator_value_new_typed_array_from_array_buffer(
+                iso.as_ptr(),
+                StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                buffer,
+                2,
+                2,
+            )
+        };
+        assert!(!typed.is_null());
+        assert_eq!(unsafe { stator_value_typed_array_byte_offset(typed) }, 2);
+        assert_eq!(unsafe { stator_value_typed_array_byte_length(typed) }, 4);
+        let mut typed_out = [0u8; 4];
+        assert_eq!(
+            // SAFETY: `typed` is live and `typed_out` is writable.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    typed,
+                    typed_out.as_mut_ptr(),
+                    typed_out.len(),
+                    0,
+                )
+            },
+            4
+        );
+        assert_eq!(typed_out, [2, 3, 4, 5]);
+
+        // SAFETY: `buffer` is a live ArrayBuffer value owned by `iso`.
+        let view =
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 3, 4) };
+        assert!(!view.is_null());
+        assert_eq!(unsafe { stator_value_data_view_byte_offset(view) }, 3);
+        assert_eq!(unsafe { stator_value_data_view_byte_length(view) }, 4);
+        let mut view_out = [0u8; 4];
+        assert_eq!(
+            // SAFETY: `view` is live and `view_out` is writable.
+            unsafe {
+                stator_value_data_view_copy_contents(view, view_out.as_mut_ptr(), view_out.len(), 0)
+            },
+            4
+        );
+        assert_eq!(view_out, [3, 4, 5, 6]);
+
+        // SAFETY: values are non-null and live.
+        unsafe {
+            let JsValue::ArrayBuffer(backing) = stator_value_inner_to_jsvalue(&(*buffer).inner)
+            else {
+                panic!("expected ArrayBuffer backing");
+            };
+            let JsValue::TypedArray(returned_typed) =
+                stator_value_inner_to_jsvalue(&(*typed).inner)
+            else {
+                panic!("expected TypedArray");
+            };
+            let JsValue::DataView(returned_view) = stator_value_inner_to_jsvalue(&(*view).inner)
+            else {
+                panic!("expected DataView");
+            };
+            assert!(Rc::ptr_eq(&returned_typed.borrow().buffer, &backing));
+            assert!(Rc::ptr_eq(&returned_view.borrow().buffer, &backing));
+        }
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(view);
+            stator_value_destroy(typed);
+            stator_value_destroy(buffer);
+        }
+    }
+
+    #[test]
+    fn test_value_new_typed_array_and_data_view_constructors_reject_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other_iso = IsolateGuard::new();
+        let source = [0u8, 1, 2, 3];
+        // SAFETY: `iso` is non-null and live; `source` is readable.
+        let buffer = unsafe {
+            stator_value_new_array_buffer_copy(iso.as_ptr(), source.as_ptr(), source.len())
+        };
+        assert!(!buffer.is_null());
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+
+        assert!(
+            // SAFETY: null isolate is documented to return null.
+            unsafe {
+                stator_value_new_typed_array(
+                    std::ptr::null_mut(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: invalid kind is documented to return null.
+            unsafe {
+                stator_value_new_typed_array(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindInvalid,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: null buffer is documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    std::ptr::null(),
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: non-buffer value is live and documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    non_buffer,
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: cross-isolate buffers are documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    other_iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint8,
+                    buffer,
+                    0,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: unaligned Uint16 byte offset is documented to return null.
+            unsafe {
+                stator_value_new_typed_array_from_array_buffer(
+                    iso.as_ptr(),
+                    StatorTypedArrayKind::StatorTypedArrayKindUint16,
+                    buffer,
+                    1,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert!(
+            // SAFETY: out-of-bounds view is documented to return null.
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 3, 2) }
+                .is_null()
+        );
+
+        // SAFETY: `buffer` is live and points to an ArrayBuffer value.
+        unsafe {
+            let JsValue::ArrayBuffer(backing) = stator_value_inner_to_jsvalue(&(*buffer).inner)
+            else {
+                panic!("expected ArrayBuffer backing");
+            };
+            backing.borrow_mut().detached = true;
+        }
+        assert!(
+            // SAFETY: detached backing stores are documented to return null.
+            unsafe { stator_value_new_data_view_from_array_buffer(iso.as_ptr(), buffer, 0, 1) }
+                .is_null()
+        );
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_buffer);
+            stator_value_destroy(buffer);
+        }
     }
 
     #[test]
@@ -23072,6 +28165,1040 @@ mod tests {
         // SAFETY: null isolate is documented to return null.
         let val = unsafe { stator_value_new_number(std::ptr::null_mut(), 1.0) };
         assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_value_preserves_array_buffer_handle_roundtrip() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4],
+        }));
+
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+        assert!(unsafe { stator_value_is_object(val) });
+        assert!(unsafe { stator_value_is_array_buffer(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+
+        // SAFETY: `val` is non-null and live.
+        let cloned =
+            unsafe { allocate_stator_value(iso.as_ptr(), clone_stator_value_inner(&(*val).inner)) };
+        assert!(unsafe { stator_value_strict_equals(val, cloned) });
+
+        // SAFETY: `cloned` is non-null and live.
+        let roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*cloned).inner) };
+        let JsValue::ArrayBuffer(returned) = roundtrip else {
+            panic!("ArrayBuffer StatorValue must round-trip as JsValue::ArrayBuffer");
+        };
+        assert!(Rc::ptr_eq(&returned, &buffer));
+        returned.borrow_mut().data[0] = 9;
+        assert_eq!(buffer.borrow().data[0], 9);
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(cloned);
+            stator_value_destroy(val);
+        }
+    }
+
+    #[test]
+    fn test_value_array_buffer_read_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4, 5],
+        }));
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+
+        // SAFETY: `val` is non-null and live.
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 5);
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(val) });
+
+        let mut out = [0u8; 3];
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable for its full length.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 1) },
+            3
+        );
+        assert_eq!(out, [2, 3, 4]);
+
+        let mut tail = [0u8; 8];
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(val, tail.as_mut_ptr(), tail.len(), 3)
+            },
+            2
+        );
+        assert_eq!(&tail[..2], &[4, 5]);
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(val, tail.as_mut_ptr(), tail.len(), 5)
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: `val` is live; null destination is documented to return 0.
+            unsafe { stator_value_array_buffer_copy_contents(val, std::ptr::null_mut(), 1, 0) },
+            0
+        );
+
+        buffer.borrow_mut().detached = true;
+        // SAFETY: `val` is non-null and live.
+        assert_eq!(unsafe { stator_value_array_buffer_byte_length(val) }, 0);
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_array_buffer_is_detached(val) });
+        assert_eq!(
+            // SAFETY: `val` is live and `out` is writable for its full length.
+            unsafe { stator_value_array_buffer_copy_contents(val, out.as_mut_ptr(), out.len(), 0) },
+            0
+        );
+
+        // SAFETY: `val` was allocated by Stator.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_array_buffer_read_accessors_reject_invalid_values() {
+        let iso = IsolateGuard::new();
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe { stator_value_array_buffer_byte_length(std::ptr::null()) },
+            0
+        );
+        // SAFETY: null values are documented to return false.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(std::ptr::null()) });
+        let mut out = [9u8; 2];
+        assert_eq!(
+            // SAFETY: null values are documented to return 0 without writing.
+            unsafe {
+                stator_value_array_buffer_copy_contents(
+                    std::ptr::null(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(out, [9, 9]);
+
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!non_buffer.is_null());
+        assert_eq!(
+            // SAFETY: `non_buffer` is non-null and live.
+            unsafe { stator_value_array_buffer_byte_length(non_buffer) },
+            0
+        );
+        // SAFETY: `non_buffer` is non-null and live.
+        assert!(!unsafe { stator_value_array_buffer_is_detached(non_buffer) });
+        assert_eq!(
+            // SAFETY: `non_buffer` is live and `out` is writable for its full length.
+            unsafe {
+                stator_value_array_buffer_copy_contents(non_buffer, out.as_mut_ptr(), out.len(), 0)
+            },
+            0
+        );
+        assert_eq!(out, [9, 9]);
+
+        // SAFETY: `non_buffer` was allocated by Stator.
+        unsafe { stator_value_destroy(non_buffer) };
+    }
+
+    #[test]
+    fn test_value_array_buffer_write_accessor() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(8),
+            detached: false,
+            data: vec![1, 2, 3, 4, 5],
+        }));
+        // SAFETY: `iso` is valid and the value is owned by this test.
+        let val = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::ArrayBuffer(Rc::clone(&buffer))),
+            )
+        };
+        assert!(!val.is_null());
+
+        let patch = [9u8, 8, 7];
+        assert_eq!(
+            // SAFETY: `val` is live and `patch` is readable.
+            unsafe {
+                stator_value_array_buffer_write_contents(val, patch.as_ptr(), patch.len(), 1)
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 5]);
+
+        let tail = [6u8, 5, 4];
+        assert_eq!(
+            // SAFETY: `val` is live and `tail` is readable.
+            unsafe { stator_value_array_buffer_write_contents(val, tail.as_ptr(), tail.len(), 4) },
+            1
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+        assert_eq!(
+            // SAFETY: source offsets outside the buffer are documented to return 0.
+            unsafe { stator_value_array_buffer_write_contents(val, tail.as_ptr(), tail.len(), 5) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: null source is documented to return 0.
+            unsafe { stator_value_array_buffer_write_contents(val, std::ptr::null(), 1, 0) },
+            0
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+
+        buffer.borrow_mut().detached = true;
+        assert_eq!(
+            // SAFETY: detached buffers are documented to return 0.
+            unsafe {
+                stator_value_array_buffer_write_contents(val, patch.as_ptr(), patch.len(), 0)
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, [1, 9, 8, 7, 6]);
+
+        // SAFETY: `val` was allocated by Stator.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_array_buffer_write_accessor_rejects_invalid_values() {
+        let iso = IsolateGuard::new();
+        let patch = [1u8, 2];
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe {
+                stator_value_array_buffer_write_contents(
+                    std::ptr::null_mut(),
+                    patch.as_ptr(),
+                    patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+
+        // SAFETY: `iso` is valid.
+        let non_buffer = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!non_buffer.is_null());
+        assert_eq!(
+            // SAFETY: `non_buffer` is non-null and live.
+            unsafe {
+                stator_value_array_buffer_write_contents(non_buffer, patch.as_ptr(), patch.len(), 0)
+            },
+            0
+        );
+
+        // SAFETY: `non_buffer` was allocated by Stator.
+        unsafe { stator_value_destroy(non_buffer) };
+    }
+
+    #[test]
+    fn test_value_preserves_typed_array_and_data_view_handles() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: None,
+            detached: false,
+            data: vec![10, 20, 30, 40],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint8,
+            byte_offset: 1,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 1,
+            byte_length: 2,
+            auto_length: false,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+
+        assert!(unsafe { stator_value_is_object(typed_value) });
+        assert!(unsafe { stator_value_is_typed_array(typed_value) });
+        assert!(!unsafe { stator_value_is_array_buffer(typed_value) });
+        assert!(unsafe { stator_value_is_object(view_value) });
+        assert!(unsafe { stator_value_is_data_view(view_value) });
+        assert!(!unsafe { stator_value_strict_equals(typed_value, view_value) });
+
+        // SAFETY: both values are non-null and live.
+        let typed_roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*typed_value).inner) };
+        let JsValue::TypedArray(returned_typed_array) = typed_roundtrip else {
+            panic!("TypedArray StatorValue must round-trip as JsValue::TypedArray");
+        };
+        assert!(Rc::ptr_eq(&returned_typed_array, &typed_array));
+        assert!(Rc::ptr_eq(&returned_typed_array.borrow().buffer, &buffer));
+
+        // SAFETY: `view_value` is non-null and live.
+        let view_roundtrip = unsafe { stator_value_inner_to_jsvalue(&(*view_value).inner) };
+        let JsValue::DataView(returned_data_view) = view_roundtrip else {
+            panic!("DataView StatorValue must round-trip as JsValue::DataView");
+        };
+        assert!(Rc::ptr_eq(&returned_data_view, &data_view));
+        assert!(Rc::ptr_eq(&returned_data_view.borrow().buffer, &buffer));
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(view_value);
+            stator_value_destroy(typed_value);
+        }
+    }
+
+    #[test]
+    fn test_value_typed_array_and_data_view_metadata_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(16),
+            detached: false,
+            data: vec![0, 1, 2, 3, 4, 5, 6, 7],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint16,
+            byte_offset: 2,
+            length: 2,
+            auto_length: false,
+        }));
+        let auto_typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint16,
+            byte_offset: 4,
+            length: 0,
+            auto_length: true,
+        }));
+        let out_of_bounds_typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint32,
+            byte_offset: 6,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 3,
+            byte_length: 4,
+            auto_length: false,
+        }));
+        let auto_data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 5,
+            byte_length: 0,
+            auto_length: true,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let auto_typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&auto_typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let out_of_bounds_typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(
+                    &out_of_bounds_typed_array,
+                ))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let auto_view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&auto_data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid.
+        let non_view_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+
+        // SAFETY: all values are non-null and live.
+        unsafe {
+            assert_eq!(
+                stator_value_typed_array_kind(typed_value),
+                StatorTypedArrayKind::StatorTypedArrayKindUint16
+            );
+            assert_eq!(stator_value_typed_array_byte_offset(typed_value), 2);
+            assert_eq!(stator_value_typed_array_length(typed_value), 2);
+            assert_eq!(stator_value_typed_array_byte_length(typed_value), 4);
+            assert_eq!(stator_value_typed_array_byte_offset(auto_typed_value), 4);
+            assert_eq!(stator_value_typed_array_length(auto_typed_value), 2);
+            assert_eq!(stator_value_typed_array_byte_length(auto_typed_value), 4);
+            assert_eq!(
+                stator_value_typed_array_kind(out_of_bounds_typed_value),
+                StatorTypedArrayKind::StatorTypedArrayKindUint32
+            );
+            assert_eq!(
+                stator_value_typed_array_byte_offset(out_of_bounds_typed_value),
+                0
+            );
+            assert_eq!(
+                stator_value_typed_array_length(out_of_bounds_typed_value),
+                0
+            );
+            assert_eq!(
+                stator_value_typed_array_byte_length(out_of_bounds_typed_value),
+                0
+            );
+            assert_eq!(
+                stator_value_typed_array_kind(non_view_value),
+                StatorTypedArrayKind::StatorTypedArrayKindInvalid
+            );
+            assert_eq!(stator_value_typed_array_length(non_view_value), 0);
+
+            assert_eq!(stator_value_data_view_byte_offset(view_value), 3);
+            assert_eq!(stator_value_data_view_byte_length(view_value), 4);
+            assert_eq!(stator_value_data_view_byte_offset(auto_view_value), 5);
+            assert_eq!(stator_value_data_view_byte_length(auto_view_value), 3);
+            assert_eq!(stator_value_data_view_byte_offset(non_view_value), 0);
+            assert_eq!(stator_value_data_view_byte_length(non_view_value), 0);
+            assert_eq!(
+                stator_value_typed_array_kind(std::ptr::null()),
+                StatorTypedArrayKind::StatorTypedArrayKindInvalid
+            );
+            assert_eq!(stator_value_typed_array_byte_length(std::ptr::null()), 0);
+            assert_eq!(stator_value_data_view_byte_length(std::ptr::null()), 0);
+        }
+
+        buffer.borrow_mut().detached = true;
+        // SAFETY: values are non-null and live.
+        unsafe {
+            assert_eq!(stator_value_typed_array_byte_offset(typed_value), 0);
+            assert_eq!(stator_value_typed_array_length(typed_value), 0);
+            assert_eq!(stator_value_typed_array_byte_length(typed_value), 0);
+            assert_eq!(stator_value_data_view_byte_offset(view_value), 0);
+            assert_eq!(stator_value_data_view_byte_length(view_value), 0);
+        }
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_view_value);
+            stator_value_destroy(auto_view_value);
+            stator_value_destroy(view_value);
+            stator_value_destroy(out_of_bounds_typed_value);
+            stator_value_destroy(auto_typed_value);
+            stator_value_destroy(typed_value);
+        }
+    }
+
+    #[test]
+    fn test_value_typed_array_and_data_view_copy_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(16),
+            detached: false,
+            data: vec![0, 1, 2, 3, 4, 5, 6, 7],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint16,
+            byte_offset: 2,
+            length: 2,
+            auto_length: false,
+        }));
+        let out_of_bounds_typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint32,
+            byte_offset: 6,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 3,
+            byte_length: 4,
+            auto_length: false,
+        }));
+        let auto_data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 5,
+            byte_length: 0,
+            auto_length: true,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let out_of_bounds_typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(
+                    &out_of_bounds_typed_array,
+                ))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let auto_view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&auto_data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid.
+        let non_view_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+
+        let mut typed_out = [0u8; 8];
+        assert_eq!(
+            // SAFETY: `typed_value` is live and `typed_out` is writable.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    typed_value,
+                    typed_out.as_mut_ptr(),
+                    typed_out.len(),
+                    0,
+                )
+            },
+            4
+        );
+        assert_eq!(&typed_out[..4], &[2, 3, 4, 5]);
+        assert_eq!(
+            // SAFETY: `typed_value` is live and `typed_out` is writable.
+            unsafe {
+                stator_value_typed_array_copy_contents(typed_value, typed_out.as_mut_ptr(), 2, 3)
+            },
+            1
+        );
+        assert_eq!(&typed_out[..2], &[5, 3]);
+
+        let mut view_out = [0u8; 8];
+        assert_eq!(
+            // SAFETY: `view_value` is live and `view_out` is writable.
+            unsafe {
+                stator_value_data_view_copy_contents(
+                    view_value,
+                    view_out.as_mut_ptr(),
+                    view_out.len(),
+                    1,
+                )
+            },
+            3
+        );
+        assert_eq!(&view_out[..3], &[4, 5, 6]);
+        assert_eq!(
+            // SAFETY: `auto_view_value` is live and `view_out` is writable.
+            unsafe {
+                stator_value_data_view_copy_contents(auto_view_value, view_out.as_mut_ptr(), 8, 0)
+            },
+            3
+        );
+        assert_eq!(&view_out[..3], &[5, 6, 7]);
+
+        let mut unchanged = [9u8; 2];
+        assert_eq!(
+            // SAFETY: null values are documented to return 0 without writing.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    std::ptr::null(),
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(unchanged, [9, 9]);
+        assert_eq!(
+            // SAFETY: non-view values are documented to return 0 without writing.
+            unsafe {
+                stator_value_data_view_copy_contents(
+                    non_view_value,
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(unchanged, [9, 9]);
+        assert_eq!(
+            // SAFETY: out-of-bounds views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    out_of_bounds_typed_value,
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: null destination is documented to return 0.
+            unsafe { stator_value_data_view_copy_contents(view_value, std::ptr::null_mut(), 1, 0) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: source offsets outside the view are documented to return 0.
+            unsafe {
+                stator_value_data_view_copy_contents(
+                    view_value,
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    4,
+                )
+            },
+            0
+        );
+
+        buffer.borrow_mut().detached = true;
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_copy_contents(
+                    typed_value,
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_data_view_copy_contents(
+                    view_value,
+                    unchanged.as_mut_ptr(),
+                    unchanged.len(),
+                    0,
+                )
+            },
+            0
+        );
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_view_value);
+            stator_value_destroy(auto_view_value);
+            stator_value_destroy(view_value);
+            stator_value_destroy(out_of_bounds_typed_value);
+            stator_value_destroy(typed_value);
+        }
+    }
+
+    #[test]
+    fn test_value_typed_array_and_data_view_write_accessors() {
+        let iso = IsolateGuard::new();
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(16),
+            detached: false,
+            data: vec![0, 1, 2, 3, 4, 5, 6, 7],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint16,
+            byte_offset: 2,
+            length: 2,
+            auto_length: false,
+        }));
+        let out_of_bounds_typed_array = Rc::new(RefCell::new(JsTypedArray {
+            buffer: Rc::clone(&buffer),
+            kind: TypedArrayKind::Uint32,
+            byte_offset: 6,
+            length: 2,
+            auto_length: false,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 3,
+            byte_length: 4,
+            auto_length: false,
+        }));
+        let auto_data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 5,
+            byte_length: 0,
+            auto_length: true,
+        }));
+
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(&typed_array))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let out_of_bounds_typed_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::TypedArray(Rc::clone(
+                    &out_of_bounds_typed_array,
+                ))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid and the values are owned by this test.
+        let auto_view_value = unsafe {
+            allocate_stator_value(
+                iso.as_ptr(),
+                jsvalue_to_stator_value_inner(&JsValue::DataView(Rc::clone(&auto_data_view))),
+            )
+        };
+        // SAFETY: `iso` is valid.
+        let non_view_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+
+        let typed_patch = [9u8, 8, 7];
+        assert_eq!(
+            // SAFETY: `typed_value` is live and `typed_patch` is readable.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    typed_value,
+                    typed_patch.as_ptr(),
+                    typed_patch.len(),
+                    1,
+                )
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 7, 6, 7]);
+
+        let view_patch = [6u8, 5, 4, 3];
+        assert_eq!(
+            // SAFETY: `view_value` is live and `view_patch` is readable.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    2,
+                )
+            },
+            2
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 6, 5, 7]);
+
+        assert_eq!(
+            // SAFETY: `auto_view_value` is live and `view_patch` is readable.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    auto_view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            3
+        );
+        assert_eq!(buffer.borrow().data, [0, 1, 2, 9, 8, 6, 5, 4]);
+
+        let unchanged = buffer.borrow().data.clone();
+        assert_eq!(
+            // SAFETY: null values are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    std::ptr::null_mut(),
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: non-view values are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    non_view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: out-of-bounds views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    out_of_bounds_typed_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: null sources are documented to return 0.
+            unsafe { stator_value_data_view_write_contents(view_value, std::ptr::null(), 1, 0) },
+            0
+        );
+        assert_eq!(
+            // SAFETY: destination offsets outside the view are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    4,
+                )
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, unchanged);
+
+        buffer.borrow_mut().detached = true;
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_typed_array_write_contents(
+                    typed_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            // SAFETY: detached views are documented to return 0.
+            unsafe {
+                stator_value_data_view_write_contents(
+                    view_value,
+                    view_patch.as_ptr(),
+                    view_patch.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(buffer.borrow().data, unchanged);
+
+        // SAFETY: values were allocated by Stator.
+        unsafe {
+            stator_value_destroy(non_view_value);
+            stator_value_destroy(auto_view_value);
+            stator_value_destroy(view_value);
+            stator_value_destroy(out_of_bounds_typed_value);
+            stator_value_destroy(typed_value);
+        }
+    }
+
+    #[test]
+    fn test_promise_new_pending_resolve_result() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        assert!(!promise.is_null());
+        assert!(unsafe { stator_value_is_promise(promise) });
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStatePending
+        );
+        assert!(unsafe { stator_promise_result(promise) }.is_null());
+
+        // SAFETY: `iso` is valid.
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert_eq!(
+            unsafe { stator_promise_resolve(promise, value) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+        // SAFETY: `promise` is a live fulfilled promise handle.
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 42.0);
+
+        // A later reject is a no-op because promises settle only once.
+        assert_eq!(
+            unsafe { stator_promise_reject(promise, std::ptr::null()) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+
+        // SAFETY: values are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_value_destroy(value);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
+    fn test_promise_reject_and_invalid_arguments() {
+        let iso = IsolateGuard::new();
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        let reason = unsafe { stator_value_new_string(iso.as_ptr(), c"fail".as_ptr(), 4) };
+        assert_eq!(
+            unsafe { stator_promise_reject(promise, reason) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateRejected
+        );
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        let got = unsafe { CStr::from_ptr(stator_value_as_string(result)) }
+            .to_str()
+            .unwrap();
+        assert_eq!(got, "fail");
+
+        let number = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        assert_eq!(
+            unsafe { stator_promise_resolve(number, std::ptr::null()) },
+            StatorStatus::StatorStatusFalse
+        );
+        assert_eq!(
+            unsafe { stator_promise_resolve(std::ptr::null_mut(), std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(number) },
+            StatorPromiseState::StatorPromiseStateInvalid
+        );
+
+        let tag = unsafe { stator_value_new_promise_tag(iso.as_ptr()) };
+        assert!(unsafe { stator_value_is_promise(tag) });
+        assert_eq!(
+            unsafe { stator_promise_resolve(tag, std::ptr::null()) },
+            StatorStatus::StatorStatusUnsupported
+        );
+        assert_eq!(
+            unsafe { stator_promise_state(tag) },
+            StatorPromiseState::StatorPromiseStateInvalid
+        );
+
+        unsafe {
+            stator_value_destroy(tag);
+            stator_value_destroy(number);
+            stator_value_destroy(result);
+            stator_value_destroy(reason);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
+    fn test_script_returned_promise_settles_on_context_microtask_checkpoint() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let source = b"Promise.resolve(1).then(function(v) { return v + 1; })";
+        let script =
+            unsafe { stator_script_compile(ctx, source.as_ptr() as *const c_char, source.len()) };
+        assert!(!script.is_null());
+        assert!(unsafe { stator_script_get_error(script) }.is_null());
+
+        let promise = unsafe { stator_script_run(script, ctx) };
+        assert!(!promise.is_null());
+        assert!(unsafe { stator_value_is_promise(promise) });
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStatePending
+        );
+
+        let drained = unsafe { stator_context_perform_microtask_checkpoint(ctx) };
+        assert!(drained >= 1);
+        assert_eq!(
+            unsafe { stator_promise_state(promise) },
+            StatorPromiseState::StatorPromiseStateFulfilled
+        );
+        let result = unsafe { stator_promise_result(promise) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 2.0);
+        assert_eq!(
+            unsafe { stator_isolate_perform_microtask_checkpoint(iso.as_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { stator_context_perform_microtask_checkpoint(std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { stator_isolate_perform_microtask_checkpoint(std::ptr::null_mut()) },
+            0
+        );
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_value_destroy(promise);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
     }
 
     #[test]
@@ -23778,6 +29905,45 @@ mod tests {
     }
 
     #[test]
+    fn test_isolate_enter_exit_fail_closed_across_threads() {
+        let iso = IsolateGuard::new();
+        let isolate_addr = iso.as_ptr() as usize;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let isolate = isolate_addr as *mut StatorIsolate;
+            // SAFETY: the main thread keeps the isolate alive until this worker exits.
+            unsafe { stator_isolate_enter(isolate) };
+            assert!(unsafe { stator_isolate_entered_on_current_thread(isolate) });
+            entered_tx.send(()).unwrap();
+            exit_rx.recv().unwrap();
+            // SAFETY: this worker owns the active enter.
+            unsafe { stator_isolate_exit(isolate) };
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(!unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+        // SAFETY: cross-thread calls must fail closed while the worker owns the enter.
+        unsafe {
+            stator_isolate_enter(iso.as_ptr());
+            stator_isolate_exit(iso.as_ptr());
+        }
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 1);
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 0);
+        assert!(!unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+
+        // SAFETY: after the worker exits, ownership can move to the main thread.
+        unsafe { stator_isolate_enter(iso.as_ptr()) };
+        assert!(unsafe { stator_isolate_entered_on_current_thread(iso.as_ptr()) });
+        // SAFETY: main owns the active enter.
+        unsafe { stator_isolate_exit(iso.as_ptr()) };
+        assert_eq!(unsafe { (*iso.as_ptr()).enter_count }, 0);
+    }
+
+    #[test]
     fn test_isolate_set_get_data_roundtrip() {
         let iso = IsolateGuard::new();
         let sentinel = 0xDEAD_BEEFusize as *mut c_void;
@@ -23991,6 +30157,64 @@ mod tests {
         // SAFETY: `ctx` is valid.
         unsafe { stator_context_exit(ctx) };
         unsafe { stator_context_exit(ctx) };
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_enter_exit_fail_closed_across_threads() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: clear the current-context slot created by `context_new`.
+        unsafe { stator_context_exit(ctx) };
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
+        let ctx_addr = ctx as usize;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let ctx = ctx_addr as *mut StatorContext;
+            // SAFETY: the main thread keeps the context alive until this worker exits.
+            unsafe { stator_context_enter(ctx) };
+            assert!(unsafe { stator_context_entered_on_current_thread(ctx) });
+            entered_tx.send(()).unwrap();
+            exit_rx.recv().unwrap();
+            // SAFETY: this worker owns the active enter.
+            unsafe { stator_context_exit(ctx) };
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(!unsafe { stator_context_entered_on_current_thread(ctx) });
+        assert_eq!(unsafe { (*ctx).enter_count }, 1);
+        // SAFETY: cross-thread calls must fail closed while the worker owns the enter.
+        unsafe {
+            stator_context_enter(ctx);
+            stator_context_exit(ctx);
+        }
+        assert_eq!(unsafe { (*ctx).enter_count }, 1);
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+
+        exit_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(unsafe { (*ctx).enter_count }, 0);
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
+        // SAFETY: after the worker exits, ownership can move to the main thread.
+        unsafe { stator_context_enter(ctx) };
+        assert!(unsafe { stator_context_entered_on_current_thread(ctx) });
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+        // SAFETY: main owns the active enter.
+        unsafe { stator_context_exit(ctx) };
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
         // SAFETY: `ctx` is non-null and live.
         unsafe { stator_context_destroy(ctx) };
     }
@@ -24382,6 +30606,35 @@ mod tests {
         }
     }
 
+    fn module_source_metadata_v2(
+        source_type: StatorModuleType,
+        source_url: &[u8],
+        origin_url: &[u8],
+        referrer_url: &[u8],
+        source_map_url: &[u8],
+        source_map_digest: &[u8],
+        cache_policy: &[u8],
+        edge_cache_metadata: &[u8],
+    ) -> StatorModuleSourceMetadataV2 {
+        StatorModuleSourceMetadataV2 {
+            source_type,
+            source_url: source_url.as_ptr() as *const c_char,
+            source_url_len: source_url.len(),
+            origin_url: origin_url.as_ptr() as *const c_char,
+            origin_url_len: origin_url.len(),
+            referrer_url: referrer_url.as_ptr() as *const c_char,
+            referrer_url_len: referrer_url.len(),
+            source_map_url: source_map_url.as_ptr() as *const c_char,
+            source_map_url_len: source_map_url.len(),
+            source_map_digest: source_map_digest.as_ptr() as *const c_char,
+            source_map_digest_len: source_map_digest.len(),
+            cache_policy: cache_policy.as_ptr() as *const c_char,
+            cache_policy_len: cache_policy.len(),
+            edge_cache_metadata: edge_cache_metadata.as_ptr() as *const c_char,
+            edge_cache_metadata_len: edge_cache_metadata.len(),
+        }
+    }
+
     struct TestGraphResolverData {
         modules: HashMap<String, *mut StatorModule>,
         status: StatorResolveStatus,
@@ -24484,6 +30737,73 @@ mod tests {
         // SAFETY: tests pass a valid mutable `TestGraphResolverData` pointer.
         let data = unsafe { &mut *(user_data as *mut TestGraphResolverData) };
         data.cleanup_calls += 1;
+    }
+
+    #[test]
+    fn test_module_retain_handle_keeps_record_until_release_and_fails_closed() {
+        let module = compile_module_src("export const value = 1;");
+        // SAFETY: `module` is a live module pointer.
+        let handle = unsafe { stator_module_retain(module) };
+        assert!(!handle.is_null());
+        // SAFETY: `handle` is live.
+        assert!(unsafe { stator_module_handle_is_valid(handle) });
+        // SAFETY: retained handle keeps the module alive after host release.
+        unsafe { stator_module_free(module) };
+        // SAFETY: `handle` is still live and owns a retain.
+        assert!(unsafe { stator_module_handle_is_valid(handle) });
+        assert_eq!(
+            // SAFETY: `handle` is live.
+            unsafe { stator_module_handle_get_status(handle) },
+            StatorModuleStatus::StatorModuleStatusUnlinked
+        );
+        // SAFETY: release invalidates the handle without freeing its tombstone.
+        assert!(unsafe { stator_module_handle_release(handle) });
+        // SAFETY: stale handle queries fail closed.
+        assert!(!unsafe { stator_module_handle_is_valid(handle) });
+        // SAFETY: stale handle returns a null module pointer.
+        assert!(unsafe { stator_module_handle_get_module(handle) }.is_null());
+        // SAFETY: destroys the stale handle allocation.
+        unsafe { stator_module_handle_destroy(handle) };
+    }
+
+    #[test]
+    fn test_linked_context_retains_dependency_after_host_release() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let root = compile_module_src("import { value } from './dep.js'; value + 1;");
+        let dep = compile_module_src("export const value = 41;");
+        let mut modules = HashMap::new();
+        modules.insert("./dep.js".to_string(), dep);
+        let mut data = TestGraphResolverData {
+            modules,
+            status: StatorResolveStatus::StatorResolveStatusOk,
+            calls: Vec::new(),
+            attributes: Vec::new(),
+            cleanup_calls: 0,
+        };
+        // SAFETY: callback and user data remain live for this test.
+        assert!(unsafe {
+            stator_context_set_module_resolver(
+                ctx,
+                Some(test_graph_resolver_cb),
+                &mut data as *mut TestGraphResolverData as *mut c_void,
+                None,
+            )
+        });
+
+        // SAFETY: pointers are non-null and live; instantiation retains the graph on `ctx`.
+        unsafe {
+            assert!(stator_module_instantiate(ctx, root));
+            let dep = data.modules.remove("./dep.js").unwrap();
+            stator_module_free(dep);
+            let result = stator_module_evaluate(root, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_to_number(result), 42.0);
+            stator_value_destroy(result);
+            stator_module_free(root);
+            stator_context_destroy(ctx);
+        }
     }
 
     struct TestDetailResolverData {
@@ -27430,6 +33750,26 @@ mod tests {
     }
 
     #[test]
+    fn test_module_request_collection_decodes_string_literal_export_names() {
+        let program = parser::parse_module(
+            "import { \"not an id\" as local } from './dep.js';
+             export { local as \"local name\" };
+             export { \"dep name\" as \"exported dep name\" } from './dep.js';",
+        )
+        .unwrap();
+        let (requests, exports, indirect_reexports) = collect_module_requests(&program);
+
+        assert!(matches!(
+            requests[0].imports.as_slice(),
+            [RequestedExport::Named(name)] if name == "not an id"
+        ));
+        assert!(exports.contains("local name"));
+        assert_eq!(indirect_reexports.len(), 1);
+        assert_eq!(indirect_reexports[0].local_name, "dep name");
+        assert_eq!(indirect_reexports[0].exported_name, "exported dep name");
+    }
+
+    #[test]
     fn test_module_request_enumeration_reports_import_attributes() {
         let module = compile_module_src(
             "import data from './data.json' with { type: 'json', mode: 'strict' };
@@ -28427,6 +34767,18 @@ mod tests {
         0x01, 0x67, 0x03, 0x6f, 0x00,
     ];
 
+    const WASM_IMPORT_MEMORY64_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem64" (memory i64 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory (i64) 1 2)))"#,
+        r#"(module (import "env" "mem64" (memory64 1 2)))"#,
+    ];
+
+    const WASM_IMPORT_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES: &[&str] = &[
+        r#"(module (import "env" "mem" (memory (page_size_log2 12) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory (pagesize 4096) 1 2)))"#,
+        r#"(module (import "env" "mem" (memory 1 2 (page_size_log2 12))))"#,
+    ];
+
     const WASM_IMPORT_ADD_RUN: &[u8] = &[
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f,
         0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x61,
@@ -28816,6 +35168,49 @@ mod tests {
                 assert!(err.contains(term), "missing '{term}' in: {err}");
             }
             stator_module_free(module);
+        }
+    }
+
+    fn assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+        candidates: &[&str],
+        expected_terms: &[&str],
+    ) {
+        for wat in candidates {
+            let Ok(bytes) = wat::parse_str(wat) else {
+                continue;
+            };
+            let module =
+                compile_typed_module_bytes(&bytes, StatorModuleType::StatorModuleTypeWebAssembly);
+            // SAFETY: `module` is non-null and live.
+            unsafe {
+                let status = stator_module_get_status(module);
+                let error_ptr = stator_module_get_error(module);
+                if status != StatorModuleStatus::StatorModuleStatusErrored {
+                    stator_module_free(module);
+                    panic!("unsupported Wasm import unexpectedly compiled: {wat}");
+                }
+                if error_ptr.is_null() {
+                    stator_module_free(module);
+                    panic!("unsupported Wasm import failed without a diagnostic: {wat}");
+                }
+                let err = CStr::from_ptr(error_ptr).to_str().unwrap();
+                let looks_like_stator_import_diagnostic = err.contains("runtime/FFI primitive")
+                    || expected_terms.iter().all(|term| err.contains(term));
+                if !looks_like_stator_import_diagnostic {
+                    stator_module_free(module);
+                    continue;
+                }
+                assert!(err.contains("unsupported"), "missing unsupported: {err}");
+                assert!(
+                    err.contains("runtime/FFI primitive"),
+                    "missing primitive blocker: {err}"
+                );
+                for term in expected_terms {
+                    assert!(err.contains(term), "missing '{term}' in: {err}");
+                }
+                stator_module_free(module);
+                return;
+            }
         }
     }
 
@@ -29238,7 +35633,31 @@ mod tests {
     fn test_module_wasm_unsupported_memory_import_fails_compilation() {
         assert_wasm_unsupported_import_kind_fails_compilation(
             WASM_IMPORT_MEMORY,
-            &["env.mem", "memory", "min=1", "max=none", "memory64=false"],
+            &[
+                "env.mem",
+                "memory",
+                "min=1",
+                "max=none",
+                "memory64=false",
+                "shared=false",
+                "page_size_log2=16",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_memory64_import_fails_compilation_if_supported() {
+        assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+            WASM_IMPORT_MEMORY64_WAT_CANDIDATES,
+            &["env.mem64", "memory", "memory64=true"],
+        );
+    }
+
+    #[test]
+    fn test_module_wasm_unsupported_custom_page_memory_import_fails_compilation_if_supported() {
+        assert_wasm_unsupported_import_wat_fails_compilation_if_supported(
+            WASM_IMPORT_CUSTOM_PAGE_MEMORY_WAT_CANDIDATES,
+            &["env.mem", "memory", "page_size_log2=12"],
         );
     }
 
@@ -30025,6 +36444,15 @@ mod tests {
         // SAFETY: null pointer with non-zero length is invalid by contract.
         let s = unsafe { stator_string_new(std::ptr::null(), 4) };
         assert!(s.is_null());
+    }
+
+    #[test]
+    fn test_stator_string_accessors_accept_null() {
+        // SAFETY: null string handles are documented inputs for both accessors.
+        unsafe {
+            assert!(stator_string_data(std::ptr::null()).is_null());
+            assert_eq!(stator_string_len(std::ptr::null()), 0);
+        }
     }
 
     #[test]
@@ -31761,6 +38189,182 @@ mod tests {
     }
 
     #[test]
+    fn test_module_code_cache_roundtrip_with_source_metadata_v2() {
+        let source = "import.meta.url;";
+        let resource = b"https://edge.example.test/app/root-v2.mjs";
+        let base_url = b"https://edge.example.test/app/";
+        let integrity = b"sha384-root-v2";
+        let source_url = b"https://edge.example.test/app/root-v2.mjs#source";
+        let origin_url = b"https://edge.example.test";
+        let referrer_url = b"https://referrer.example.test/page";
+        let source_map_url = b"https://edge.example.test/app/root-v2.mjs.map";
+        let digest = b"digest-v2";
+        let cache_policy = b"http-cache;max-age=60";
+        let edge_cache = b"edge-cache-bucket=v2";
+        let options = module_compile_options(resource, base_url, integrity);
+        let metadata = module_source_metadata_v2(
+            StatorModuleType::StatorModuleTypeJavaScript,
+            source_url,
+            origin_url,
+            referrer_url,
+            source_map_url,
+            digest,
+            cache_policy,
+            edge_cache,
+        );
+        let bytes = source.as_bytes();
+
+        // SAFETY: source and options point to live buffers.
+        let module = unsafe {
+            stator_module_compile_with_options(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &options,
+            )
+        };
+        assert!(!module.is_null());
+        assert!(unsafe { stator_module_set_source_metadata_v2(module, &metadata) });
+
+        let mut status = StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported;
+        // SAFETY: module and source are live; status is a valid out pointer.
+        let cache = unsafe {
+            stator_module_create_code_cache(
+                module,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                &mut status,
+            )
+        };
+        assert!(!cache.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusProducedMetadata
+        );
+
+        // Legacy restore does not receive v2 metadata, so it rejects the blob
+        // instead of silently dropping source-map/cache identity fields.
+        let legacy = unsafe {
+            stator_module_compile_cached(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &mut status,
+            )
+        };
+        assert!(!legacy.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        unsafe { stator_module_free(legacy) };
+
+        // Supplying the same metadata lets the cache restore and round-trip
+        // the metadata onto the returned module.
+        let cached = unsafe {
+            stator_module_compile_cached_with_source_metadata_v2(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &metadata,
+                &mut status,
+            )
+        };
+        assert!(!cached.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedBytecodeRestored
+        );
+        let mut queried = module_source_metadata_v2(
+            StatorModuleType::StatorModuleTypeCss,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(unsafe { stator_module_get_source_metadata_v2(cached, &mut queried) });
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.source_map_digest, queried.source_map_digest_len) },
+            digest
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.edge_cache_metadata, queried.edge_cache_metadata_len) },
+            edge_cache
+        );
+        unsafe { stator_module_free(cached) };
+
+        // A changed v2 field is part of cache identity and rejects fail-closed.
+        let changed_digest = b"digest-v3";
+        let changed_metadata = module_source_metadata_v2(
+            StatorModuleType::StatorModuleTypeJavaScript,
+            source_url,
+            origin_url,
+            referrer_url,
+            source_map_url,
+            changed_digest,
+            cache_policy,
+            edge_cache,
+        );
+        let rejected = unsafe {
+            stator_module_compile_cached_with_source_metadata_v2(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &changed_metadata,
+                &mut status,
+            )
+        };
+        assert!(!rejected.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusRejected
+        );
+        unsafe { stator_module_free(rejected) };
+
+        // Invalid metadata pointers fail closed before cache acceptance.
+        let bad_metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: std::ptr::null(),
+            source_url_len: 1,
+            ..metadata
+        };
+        let invalid = unsafe {
+            stator_module_compile_cached_with_source_metadata_v2(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+                stator_string_data(cache),
+                stator_string_len(cache),
+                &options,
+                &bad_metadata,
+                &mut status,
+            )
+        };
+        assert!(!invalid.is_null());
+        assert_eq!(
+            status,
+            StatorModuleCacheStatus::StatorModuleCacheStatusInvalidArgument
+        );
+        unsafe {
+            stator_module_free(invalid);
+            stator_string_free(cache);
+            stator_module_free(module);
+        }
+    }
+
+    #[test]
     fn test_module_code_cache_rejects_stale_source_or_options() {
         let source = "export const value = 1;";
         let stale_source = "export const value = 2;";
@@ -32615,6 +39219,8 @@ mod tests {
 
     #[test]
     fn test_tiering_stats_null_safety() {
+        let _g = lock_ffi_tiering_stats();
+
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -32898,6 +39504,7 @@ mod tests {
 
     #[test]
     fn test_osr_counters_stats_null_safety() {
+        let _g = lock_ffi_osr_counters();
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_osr_counters_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -32923,12 +39530,7 @@ mod tests {
 
     #[test]
     fn test_osr_counters_snapshot_roundtrip_via_ffi() {
-        use std::sync::Mutex;
-        static FFI_OSR_COUNTERS_LOCK: Mutex<()> = Mutex::new(());
-        let _g = match FFI_OSR_COUNTERS_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _g = lock_ffi_osr_counters();
 
         // SAFETY: null isolate is accepted; we reset before recording.
         unsafe { stator_isolate_reset_osr_counters_stats(std::ptr::null_mut()) };
@@ -33029,6 +39631,127 @@ mod tests {
         for tier_idx in 0..jit_unwind::JitTier::COUNT {
             assert_eq!(zeroed.tiers[tier_idx].register_attempts, 0);
             assert_eq!(zeroed.tiers[tier_idx].unsupported_tier_attempts, 0);
+        }
+    }
+
+    #[test]
+    fn test_jit_mitigations_stats_null_safety_and_fail_closed() {
+        use std::sync::Mutex;
+        static FFI_JIT_MITIGATIONS_LOCK: Mutex<()> = Mutex::new(());
+        let _g = match FFI_JIT_MITIGATIONS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_mitigations_stats(std::ptr::null_mut()) };
+
+        assert_eq!(
+            STATOR_JIT_MITIGATIONS_TIER_COUNT,
+            jit_mitigations::JitMitigationsTier::COUNT
+        );
+        assert_eq!(STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM, 0);
+        assert_eq!(STATOR_MITIGATION_STATUS_DISABLED, 1);
+        assert_eq!(STATOR_MITIGATION_STATUS_ENABLED, 2);
+        assert_eq!(STATOR_MITIGATION_STATUS_UNKNOWN, 3);
+
+        let mut stats = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `stats` is valid for writes; null isolate is accepted.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut stats) };
+        assert_eq!(
+            stats.tier_row_count,
+            jit_mitigations::JitMitigationsTier::COUNT as u32
+        );
+        assert_eq!(stats.platform_supported, cfg!(windows));
+        // Off Windows every status must be `UnsupportedPlatform`.
+        if !cfg!(windows) {
+            assert_eq!(
+                stats.process_cfg_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+            assert_eq!(
+                stats.process_cet_shadow_stack_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+            assert_eq!(
+                stats.process_cet_user_shadow_stack_strict_status,
+                STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM
+            );
+        } else {
+            for status in [
+                stats.process_cfg_status,
+                stats.process_cet_shadow_stack_status,
+                stats.process_cet_user_shadow_stack_strict_status,
+            ] {
+                assert!(
+                    status == STATOR_MITIGATION_STATUS_ENABLED
+                        || status == STATOR_MITIGATION_STATUS_DISABLED
+                        || status == STATOR_MITIGATION_STATUS_UNKNOWN,
+                    "unexpected status {status}"
+                );
+            }
+        }
+
+        for (idx, tier) in jit_mitigations::JitMitigationsTier::all()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(stats.tiers[idx].tier, *tier as u32);
+            assert!(!stats.tiers[idx].cfg_supported);
+            assert!(!stats.tiers[idx].cet_compatible);
+            assert_eq!(stats.tiers[idx].cfg_register_attempts, 0);
+            assert_eq!(stats.tiers[idx].cfg_register_successes, 0);
+            assert_eq!(stats.tiers[idx].cfg_targets_registered, 0);
+            assert_eq!(stats.tiers[idx].cet_pages_marked_compatible, 0);
+            assert_eq!(stats.tiers[idx].cet_pages_marked_incompatible, 0);
+        }
+
+        // A fail-closed registration attempt bumps the unsupported counter
+        // without producing a success.
+        let buf = [0u8; 16];
+        let err = jit_mitigations::record_cfg_registration(
+            jit_mitigations::JitMitigationsTier::Maglev,
+            buf.as_ptr(),
+            buf.len(),
+            2,
+        )
+        .expect_err("no tier is cfg_supported yet");
+        if cfg!(windows) {
+            assert_eq!(
+                err,
+                jit_mitigations::MitigationError::UnsupportedTier(
+                    jit_mitigations::JitMitigationsTier::Maglev
+                )
+            );
+        } else {
+            assert_eq!(err, jit_mitigations::MitigationError::UnsupportedPlatform);
+        }
+        // A claimed-compatible CET page still lands in the incompatible bucket.
+        jit_mitigations::record_cet_page(jit_mitigations::JitMitigationsTier::Maglev, true);
+
+        let mut after = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `after` is valid for writes.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut after) };
+        let mag = &after.tiers[jit_mitigations::JitMitigationsTier::Maglev as usize];
+        assert_eq!(mag.cfg_register_attempts, 1);
+        assert_eq!(mag.cfg_register_successes, 0);
+        assert_eq!(mag.cfg_unsupported_tier_attempts, 1);
+        assert_eq!(mag.cfg_targets_registered, 0);
+        assert_eq!(mag.cet_pages_marked_compatible, 0);
+        assert_eq!(mag.cet_pages_marked_incompatible, 1);
+
+        // Reset zeroes everything again.
+        // SAFETY: null isolate is accepted for resetting process diagnostics.
+        unsafe { stator_isolate_reset_jit_mitigations_stats(std::ptr::null_mut()) };
+        let mut zeroed = unsafe { std::mem::zeroed::<StatorJitMitigationsStats>() };
+        // SAFETY: `zeroed` is valid for writes.
+        unsafe { stator_isolate_get_jit_mitigations_stats(std::ptr::null(), &mut zeroed) };
+        for tier_idx in 0..jit_mitigations::JitMitigationsTier::COUNT {
+            assert_eq!(zeroed.tiers[tier_idx].cfg_register_attempts, 0);
+            assert_eq!(zeroed.tiers[tier_idx].cfg_unsupported_tier_attempts, 0);
+            assert_eq!(zeroed.tiers[tier_idx].cet_pages_marked_incompatible, 0);
         }
     }
 
@@ -34715,6 +41438,67 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_equals_object_handles_compare_by_identity() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        // SAFETY: `obj` is non-null and live.
+        let value = unsafe { stator_object_as_value(obj) };
+        // SAFETY: `value` is a live ObjectHandle value.
+        let same_obj = unsafe { stator_value_as_object(value) };
+        // SAFETY: `iso` is valid.
+        let other_obj = unsafe { stator_object_new(iso.as_ptr()) };
+        assert!(!same_obj.is_null());
+        // SAFETY: `same_obj` and `other_obj` are non-null and live.
+        let same_value = unsafe { stator_object_as_value(same_obj) };
+        let other_value = unsafe { stator_object_as_value(other_obj) };
+
+        // SAFETY: all values are non-null and live.
+        assert!(unsafe { stator_value_strict_equals(value, same_value) });
+        assert!(!unsafe { stator_value_strict_equals(value, other_value) });
+
+        // SAFETY: all handles are non-null and live.
+        unsafe {
+            stator_value_destroy(value);
+            stator_value_destroy(same_value);
+            stator_value_destroy(other_value);
+            stator_object_destroy(obj);
+            stator_object_destroy(same_obj);
+            stator_object_destroy(other_obj);
+        }
+    }
+
+    #[test]
+    fn test_strict_equals_promise_handles_compare_by_identity() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        assert!(!promise.is_null());
+        // SAFETY: `promise` is non-null and live; cloning preserves the shared
+        // PromiseHandle identity for this internal FFI test.
+        let same_promise = unsafe {
+            allocate_stator_value(iso.as_ptr(), clone_stator_value_inner(&(*promise).inner))
+        };
+        // SAFETY: `iso` is valid.
+        let other_promise = unsafe { stator_promise_new_pending(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        let tag_only_promise = unsafe { stator_value_new_promise_tag(iso.as_ptr()) };
+
+        // SAFETY: all values are non-null and live.
+        assert!(unsafe { stator_value_strict_equals(promise, same_promise) });
+        assert!(!unsafe { stator_value_strict_equals(promise, other_promise) });
+        assert!(!unsafe { stator_value_strict_equals(promise, tag_only_promise) });
+
+        // SAFETY: all values are non-null and live.
+        unsafe {
+            stator_value_destroy(tag_only_promise);
+            stator_value_destroy(other_promise);
+            stator_value_destroy(same_promise);
+            stator_value_destroy(promise);
+        }
+    }
+
+    #[test]
     fn test_strict_equals_null_ptr_treated_as_undefined() {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -34990,6 +41774,430 @@ mod tests {
         unsafe {
             stator_value_destroy(fn_val);
             stator_function_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_function_template_instance_and_prototype_templates_apply_to_dom_wrapper() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let instance = unsafe { stator_function_template_instance_template(tmpl) };
+        let prototype = unsafe { stator_function_template_prototype_template(tmpl) };
+        assert!(!instance.is_null());
+        assert!(!prototype.is_null());
+
+        let own = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let proto = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        unsafe {
+            stator_object_template_set(instance, c"own".as_ptr(), own);
+            stator_object_template_set(prototype, c"proto".as_ptr(), proto);
+        }
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let preexisting_value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        assert!(!preexisting_value.is_null());
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"node.own + node.proto";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 3.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(preexisting_value);
+            stator_value_destroy(own);
+            stator_value_destroy(proto);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_object_template_install_handlers_reject_null_and_empty_inputs() {
+        let iso = IsolateGuard::new();
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        let empty_named = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+        let empty_indexed = StatorDomIndexedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            length: None,
+            deleter: None,
+            enumerator: None,
+            data: std::ptr::null_mut(),
+        };
+
+        assert_eq!(
+            unsafe {
+                stator_object_template_install_named_handler(std::ptr::null_mut(), &empty_named)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(tmpl, &empty_named) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe {
+                stator_object_template_install_indexed_handler(std::ptr::null_mut(), &empty_indexed)
+            },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(tmpl, &empty_indexed) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        unsafe { stator_object_template_destroy(tmpl) };
+    }
+
+    #[test]
+    fn test_function_template_instance_template_handlers_apply_to_dom_wrapper() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let instance = unsafe { stator_function_template_instance_template(tmpl) };
+
+        let named = StatorDomNamedHandler {
+            getter: Some(named_get_id_only),
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_id),
+            data: std::ptr::null_mut(),
+        };
+        let indexed = StatorDomIndexedHandler {
+            getter: Some(indexed_get_zero),
+            setter: None,
+            query: None,
+            length: Some(indexed_length_three),
+            deleter: None,
+            enumerator: Some(indexed_enumerate_zero),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_object_template_install_named_handler(instance, &named) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_object_template_install_indexed_handler(instance, &indexed) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { (*wrap).inner.property_names() },
+            vec!["id".to_string()]
+        );
+        assert_eq!(unsafe { (*wrap).inner.indexed_property_keys() }, vec![0]);
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let src = b"node.id + node[0]";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 106.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_inherit_links_dom_prototype_chain() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let parent = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let child = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+
+        let parent_proto = unsafe { stator_function_template_prototype_template(parent) };
+        let base_value = unsafe { stator_value_new_number(iso.as_ptr(), 5.0) };
+        unsafe { stator_object_template_set(parent_proto, c"base".as_ptr(), base_value) };
+
+        let child_instance = unsafe { stator_function_template_instance_template(child) };
+        let own_value = unsafe { stator_value_new_number(iso.as_ptr(), 11.0) };
+        unsafe { stator_object_template_set(child_instance, c"own".as_ptr(), own_value) };
+
+        assert_eq!(
+            unsafe { stator_function_template_inherit(child, parent) },
+            StatorStatus::StatorStatusOk
+        );
+        let child_proto = unsafe { stator_function_template_prototype_template(child) };
+        let child_value = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        unsafe { stator_object_template_set(child_proto, c"child".as_ptr(), child_value) };
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, child) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = b"node.own + node.child + node.base";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(result) }, 23.0);
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_value_destroy(base_value);
+            stator_value_destroy(own_value);
+            stator_value_destroy(child_value);
+            stator_function_template_destroy(child);
+            stator_function_template_destroy(parent);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_has_instance_exact_and_inherited_dom_wrappers() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let parent = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let child = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        assert_eq!(
+            unsafe { stator_function_template_inherit(child, parent) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, child) },
+            StatorStatus::StatorStatusOk
+        );
+        let value = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let number = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+
+        assert!(unsafe { stator_function_template_has_instance(child, value) });
+        assert!(unsafe { stator_function_template_has_instance(parent, value) });
+        assert!(!unsafe { stator_function_template_has_instance(other, value) });
+        assert!(!unsafe { stator_function_template_has_instance(parent, number) });
+        assert!(!unsafe { stator_function_template_has_instance(std::ptr::null(), value) });
+        assert!(!unsafe { stator_function_template_has_instance(parent, std::ptr::null()) });
+
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert!(!unsafe { stator_function_template_has_instance(child, value) });
+
+        unsafe {
+            stator_value_destroy(number);
+            stator_value_destroy(value);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(other);
+            stator_function_template_destroy(child);
+            stator_function_template_destroy(parent);
+        }
+    }
+
+    #[test]
+    fn test_function_template_signature_rejects_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+
+        assert!(unsafe { stator_signature_new(std::ptr::null()) }.is_null());
+        unsafe { stator_signature_destroy(std::ptr::null_mut()) };
+
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let receiver = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other_receiver = unsafe { stator_function_template_new(other.as_ptr(), noop) };
+        let signature = unsafe { stator_signature_new(receiver) };
+        let other_signature = unsafe { stator_signature_new(other_receiver) };
+
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(std::ptr::null_mut(), signature) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, other_signature) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, signature) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(tmpl, std::ptr::null()) },
+            StatorStatus::StatorStatusOk
+        );
+
+        unsafe {
+            stator_signature_destroy(other_signature);
+            stator_signature_destroy(signature);
+            stator_function_template_destroy(other_receiver);
+            stator_function_template_destroy(receiver);
+            stator_function_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_function_template_signature_restricts_callback_receiver() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        static SIGNATURE_CALLS: AtomicI32 = AtomicI32::new(0);
+
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn signed_callback(
+            info: *const StatorFunctionCallbackInfo,
+        ) -> *mut StatorValue {
+            SIGNATURE_CALLS.fetch_add(1, Ordering::SeqCst);
+            let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+            unsafe { stator_value_new_number(isolate, 123.0) }
+        }
+
+        SIGNATURE_CALLS.store(0, Ordering::SeqCst);
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let receiver_tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let method_tmpl = unsafe { stator_function_template_new(iso.as_ptr(), signed_callback) };
+        let signature = unsafe { stator_signature_new(receiver_tmpl) };
+        assert!(!signature.is_null());
+        assert_eq!(
+            unsafe { stator_function_template_set_signature(method_tmpl, signature) },
+            StatorStatus::StatorStatusOk
+        );
+        unsafe { stator_signature_destroy(signature) };
+        let fn_val = unsafe { stator_function_template_get_function(method_tmpl, ctx) };
+        let instance = unsafe { stator_function_template_instance_template(receiver_tmpl) };
+        unsafe { stator_object_template_set(instance, c"method".as_ptr(), fn_val) };
+        unsafe { stator_value_destroy(fn_val) };
+
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, receiver_tmpl) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"node".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let ok_src = b"node.method()";
+        let ok_script =
+            unsafe { stator_script_compile(ctx, ok_src.as_ptr() as *const c_char, ok_src.len()) };
+        let ok_result = unsafe { stator_script_run(ok_script, ctx) };
+        assert!(!ok_result.is_null());
+        assert_eq!(unsafe { stator_value_as_number(ok_result) }, 123.0);
+        assert_eq!(SIGNATURE_CALLS.load(Ordering::SeqCst), 1);
+
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let bad_src = b"var method = node.method; method()";
+        let bad_script =
+            unsafe { stator_script_compile(ctx, bad_src.as_ptr() as *const c_char, bad_src.len()) };
+        let bad_result = unsafe { stator_script_run(bad_script, ctx) };
+        assert!(bad_result.is_null());
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        assert_eq!(SIGNATURE_CALLS.load(Ordering::SeqCst), 1);
+
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_script_free(bad_script);
+            stator_value_destroy(ok_result);
+            stator_script_free(ok_script);
+            stator_dom_object_wrap_destroy(wrap);
+            stator_function_template_destroy(method_tmpl);
+            stator_function_template_destroy(receiver_tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_dom_function_template_apply_fails_closed_for_invalid_inputs() {
+        let iso = IsolateGuard::new();
+        let other = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        let other_tmpl = unsafe { stator_function_template_new(other.as_ptr(), noop) };
+
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(std::ptr::null_mut(), tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, other_tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_apply_function_template(wrap, tmpl) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+
+        unsafe {
+            stator_function_template_destroy(other_tmpl);
+            stator_function_template_destroy(tmpl);
+            stator_dom_object_wrap_destroy(wrap);
         }
     }
 
@@ -35630,6 +42838,224 @@ mod tests {
     }
 
     #[test]
+    fn test_wasm_streaming_compile_settles_with_metadata() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let resource = b"https://example.test/mod.wasm";
+        let base = b"https://example.test/";
+        let source_url = b"https://example.test/mod.wasm#source";
+        let origin_url = b"https://example.test";
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: resource.as_ptr() as *const c_char,
+            resource_name_len: resource.len(),
+            line_offset: 7,
+            column_offset: 3,
+            base_url: base.as_ptr() as *const c_char,
+            base_url_len: base.len(),
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeSameOrigin,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyStrictOrigin,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataParserInserted,
+        };
+        let metadata = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            source_url: source_url.as_ptr() as *const c_char,
+            source_url_len: source_url.len(),
+            origin_url: origin_url.as_ptr() as *const c_char,
+            origin_url_len: origin_url.len(),
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        let op = unsafe { stator_wasm_streaming_compile_begin(ctx, &options, &metadata) };
+        assert!(!op.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusPending
+        );
+        assert!(unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCompleted
+        );
+        let module = unsafe { stator_wasm_streaming_take_module(op) };
+        assert!(!module.is_null());
+        let resource_name = unsafe { CStr::from_ptr(stator_module_get_resource_name(module)) };
+        assert_eq!(resource_name.to_bytes(), resource);
+        assert_eq!(unsafe { stator_module_get_line_offset(module) }, 7);
+        let mut queried = StatorModuleSourceMetadataV2 {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            source_url: std::ptr::null(),
+            source_url_len: 0,
+            origin_url: std::ptr::null(),
+            origin_url_len: 0,
+            referrer_url: std::ptr::null(),
+            referrer_url_len: 0,
+            source_map_url: std::ptr::null(),
+            source_map_url_len: 0,
+            source_map_digest: std::ptr::null(),
+            source_map_digest_len: 0,
+            cache_policy: std::ptr::null(),
+            cache_policy_len: 0,
+            edge_cache_metadata: std::ptr::null(),
+            edge_cache_metadata_len: 0,
+        };
+        assert!(unsafe { stator_module_get_source_metadata_v2(module, &mut queried) });
+        assert_eq!(
+            queried.source_type,
+            StatorModuleType::StatorModuleTypeWebAssembly
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.source_url, queried.source_url_len) },
+            source_url
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(queried.origin_url, queried.origin_url_len) },
+            origin_url
+        );
+        unsafe {
+            stator_module_free(module);
+            stator_wasm_streaming_destroy(op);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_instantiate_settles_evaluated_module() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeWebAssembly,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let op =
+            unsafe { stator_wasm_streaming_instantiate_begin(ctx, &options, std::ptr::null()) };
+        assert!(!op.is_null());
+        assert!(unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        let module = unsafe { stator_wasm_streaming_take_module(op) };
+        assert!(!module.is_null());
+        assert_eq!(
+            unsafe { stator_module_get_status(module) },
+            StatorModuleStatus::StatorModuleStatusEvaluated
+        );
+        unsafe {
+            stator_module_free(module);
+            stator_wasm_streaming_destroy(op);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_cancel_and_termination_fail_closed() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let op =
+            unsafe { stator_wasm_streaming_compile_begin(ctx, std::ptr::null(), std::ptr::null()) };
+        assert!(!op.is_null());
+        let reason = b"fetch aborted";
+        assert!(unsafe {
+            stator_wasm_streaming_cancel(op, reason.as_ptr() as *const c_char, reason.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled
+        );
+        let error = unsafe { CStr::from_ptr(stator_wasm_streaming_get_error(op)) };
+        assert!(error.to_string_lossy().contains("fetch aborted"));
+        unsafe { stator_wasm_streaming_destroy(op) };
+
+        let op =
+            unsafe { stator_wasm_streaming_compile_begin(ctx, std::ptr::null(), std::ptr::null()) };
+        assert!(!op.is_null());
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        unsafe { stator_isolate_terminate_execution(iso.as_ptr()) };
+        assert!(!unsafe {
+            stator_wasm_streaming_complete(op, bytes.as_ptr() as *const c_char, bytes.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusCancelled
+        );
+        assert!(unsafe { stator_wasm_streaming_take_module(op) }.is_null());
+        unsafe {
+            stator_wasm_streaming_destroy(op);
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_wasm_streaming_rejects_non_wasm_metadata_and_invalid_bytes() {
+        let bad_options = StatorModuleCompileOptions {
+            source_type: StatorModuleType::StatorModuleTypeJavaScript,
+            resource_name: std::ptr::null(),
+            resource_name_len: 0,
+            line_offset: 0,
+            column_offset: 0,
+            base_url: std::ptr::null(),
+            base_url_len: 0,
+            credentials_mode: StatorCredentialsMode::StatorCredentialsModeDefault,
+            integrity_metadata: std::ptr::null(),
+            integrity_metadata_len: 0,
+            referrer_policy: StatorReferrerPolicy::StatorReferrerPolicyDefault,
+            parser_metadata: StatorParserMetadata::StatorParserMetadataNotParserInserted,
+        };
+        let op = unsafe {
+            stator_wasm_streaming_compile_begin(
+                std::ptr::null_mut(),
+                &bad_options,
+                std::ptr::null(),
+            )
+        };
+        assert!(op.is_null());
+
+        let op = unsafe {
+            stator_wasm_streaming_compile_begin(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!op.is_null());
+        let bad = b"not wasm";
+        assert!(!unsafe {
+            stator_wasm_streaming_complete(op, bad.as_ptr() as *const c_char, bad.len())
+        });
+        assert_eq!(
+            unsafe { stator_wasm_streaming_get_status(op) },
+            StatorWasmStreamingOperationStatus::StatorWasmStreamingOperationStatusErrored
+        );
+        let error = unsafe { CStr::from_ptr(stator_wasm_streaming_get_error(op)) };
+        assert!(error.to_string_lossy().contains("binary Wasm"));
+        unsafe { stator_wasm_streaming_destroy(op) };
+    }
+
+    #[test]
     fn test_wasm_instance_destroy_null_is_safe() {
         // SAFETY: null is documented as a no-op.
         unsafe { stator_wasm_instance_destroy(std::ptr::null_mut()) };
@@ -35899,6 +43325,135 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_ffi_wasm_shared_memory_import_roundtrips_through_handle() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "mem" (memory 1 1 shared))
+                (func (export "store") (param i32 i32)
+                    local.get 0
+                    local.get 1
+                    i32.store)
+                (func (export "load") (param i32) (result i32)
+                    local.get 0
+                    i32.load))
+        "#;
+        let module = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!module.is_null());
+        let memory = unsafe { stator_wasm_shared_memory_new(module, 1, 1) };
+        assert!(!memory.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_shared_memory_byte_length(memory) },
+            65_536
+        );
+        let memory_import = StatorWasmMemoryImport {
+            module_name: c"env".as_ptr(),
+            field_name: c"mem".as_ptr(),
+            memory,
+        };
+        let instance = unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &memory_import,
+                1,
+            )
+        };
+        assert!(!instance.is_null());
+
+        let offset = unsafe { stator_value_new_number(iso.as_ptr(), 0.0) };
+        let value = unsafe { stator_value_new_number(iso.as_ptr(), 0x12345678 as f64) };
+        let argv: [*const StatorValue; 2] = [offset, value];
+        let store_result = unsafe {
+            stator_wasm_instance_call(instance, iso.as_ptr(), c"store".as_ptr(), argv.as_ptr(), 2)
+        };
+        assert!(!store_result.is_null());
+        let mut bytes = [0u8; 4];
+        assert!(unsafe { stator_wasm_shared_memory_read(memory, 0, bytes.as_mut_ptr(), 4) });
+        assert_eq!(u32::from_le_bytes(bytes), 0x12345678);
+
+        let patch = 0x11223344u32.to_le_bytes();
+        assert!(unsafe { stator_wasm_shared_memory_write(memory, 4, patch.as_ptr(), patch.len()) });
+        let load_offset = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let load_argv: [*const StatorValue; 1] = [load_offset];
+        let load_result = unsafe {
+            stator_wasm_instance_call(
+                instance,
+                iso.as_ptr(),
+                c"load".as_ptr(),
+                load_argv.as_ptr(),
+                load_argv.len(),
+            )
+        };
+        assert!(!load_result.is_null());
+        assert_eq!(
+            unsafe { stator_value_as_number(load_result) },
+            0x11223344 as f64
+        );
+
+        assert!(!unsafe { stator_wasm_shared_memory_read(memory, 65_535, bytes.as_mut_ptr(), 4) });
+        assert!(!unsafe { stator_wasm_shared_memory_write(memory, 65_535, patch.as_ptr(), 4) });
+
+        unsafe {
+            stator_value_destroy(load_result);
+            stator_value_destroy(load_offset);
+            stator_value_destroy(store_result);
+            stator_value_destroy(value);
+            stator_value_destroy(offset);
+            stator_wasm_instance_destroy(instance);
+            stator_wasm_shared_memory_destroy(memory);
+            stator_wasm_module_destroy(module);
+        }
+    }
+
+    #[test]
+    fn test_ffi_wasm_shared_memory_import_rejects_malformed_inputs() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "mem" (memory 1 1 shared)))
+        "#;
+        let module = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!module.is_null());
+        assert!(unsafe { stator_wasm_shared_memory_new(module, 2, 1) }.is_null());
+        assert_eq!(
+            unsafe { stator_wasm_shared_memory_byte_length(std::ptr::null()) },
+            0
+        );
+
+        let malformed = StatorWasmMemoryImport {
+            module_name: c"env".as_ptr(),
+            field_name: c"mem".as_ptr(),
+            memory: std::ptr::null(),
+        };
+        let instance = unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &malformed,
+                1,
+            )
+        };
+        assert!(instance.is_null());
+        assert!(unsafe {
+            stator_wasm_instantiate_with_memory_imports(
+                module,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+            .is_null()
+        });
+        unsafe {
+            stator_wasm_shared_memory_destroy(std::ptr::null_mut());
+            stator_wasm_module_destroy(module);
+        }
+    }
+
     /// Host callback returning `false` traps the Wasm caller and the FFI call
     /// returns null.
     #[test]
@@ -36154,6 +43709,38 @@ mod tests {
             stator_value_destroy(got);
             stator_object_destroy(obj);
             stator_value_destroy(val);
+            stator_object_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_object_template_prototype_template_installs_inherited_properties() {
+        let iso = IsolateGuard::new();
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        let proto_tmpl = unsafe { stator_object_template_prototype_template(tmpl) };
+        assert!(!proto_tmpl.is_null());
+        let own = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let proto = unsafe { stator_value_new_number(iso.as_ptr(), 6.0) };
+        unsafe {
+            stator_object_template_set(tmpl, c"own".as_ptr(), own);
+            stator_object_template_set(proto_tmpl, c"proto".as_ptr(), proto);
+        }
+
+        let obj = unsafe { stator_object_template_new_instance(tmpl) };
+        assert!(!obj.is_null());
+        let got_own = unsafe { stator_object_get(obj, c"own".as_ptr()) };
+        let got_proto = unsafe { stator_object_get(obj, c"proto".as_ptr()) };
+        assert!(!got_own.is_null());
+        assert!(!got_proto.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got_own) }, 4.0);
+        assert_eq!(unsafe { stator_value_as_number(got_proto) }, 6.0);
+
+        unsafe {
+            stator_value_destroy(got_proto);
+            stator_value_destroy(got_own);
+            stator_object_destroy(obj);
+            stator_value_destroy(proto);
+            stator_value_destroy(own);
             stator_object_template_destroy(tmpl);
         }
     }
@@ -36998,6 +44585,31 @@ mod tests {
         }
     }
 
+    const V8_TEST_PROPERTY_ATTRIBUTE_READ_ONLY: u32 = 1 << 0;
+    const V8_TEST_PROPERTY_ATTRIBUTE_DONT_ENUM: u32 = 1 << 1;
+    const V8_TEST_PROPERTY_ATTRIBUTE_DONT_DELETE: u32 = 1 << 2;
+
+    unsafe extern "C" fn named_query_document_attrs(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        out_attrs: *mut u32,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        let attrs = match key {
+            "title" => 0,
+            "URL" => {
+                V8_TEST_PROPERTY_ATTRIBUTE_READ_ONLY
+                    | V8_TEST_PROPERTY_ATTRIBUTE_DONT_ENUM
+                    | V8_TEST_PROPERTY_ATTRIBUTE_DONT_DELETE
+            }
+            _ => return StatorStatus::StatorStatusFalse,
+        };
+        unsafe { *out_attrs = attrs };
+        StatorStatus::StatorStatusOk
+    }
+
     unsafe extern "C" fn named_delete_id(
         name: *const c_char,
         name_len: usize,
@@ -37025,6 +44637,14 @@ mod tests {
         let s2 = unsafe { stator_dom_name_buffer_push(buf, b.as_ptr() as *const c_char, b.len()) };
         assert_eq!(s2, StatorStatus::StatorStatusOk);
         StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn named_enumerate_id(
+        buf: *mut StatorDomNameBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        let name = b"id";
+        unsafe { stator_dom_name_buffer_push(buf, name.as_ptr() as *const c_char, name.len()) }
     }
 
     unsafe extern "C" fn named_get_document_property(
@@ -37185,6 +44805,21 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn named_descriptor_status_exception(
+        name: *const c_char,
+        name_len: usize,
+        _data: *mut c_void,
+        _out: *mut StatorDomPropertyDescriptor,
+    ) -> StatorStatus {
+        let slice = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+        let key = std::str::from_utf8(slice).unwrap();
+        if key == "boom" {
+            StatorStatus::StatorStatusException
+        } else {
+            StatorStatus::StatorStatusFalse
+        }
+    }
+
     unsafe extern "C" fn named_set_document_property(
         name: *const c_char,
         name_len: usize,
@@ -37294,6 +44929,75 @@ mod tests {
     ) -> StatorStatus {
         unsafe { *out_len = 3 };
         StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn indexed_enumerate_zero(
+        buf: *mut StatorDomIndexBuffer,
+        _data: *mut c_void,
+    ) -> StatorStatus {
+        unsafe { stator_dom_index_buffer_push(buf, 0) }
+    }
+
+    unsafe extern "C" fn dom_call_sum(
+        receiver: *const StatorValue,
+        args: *const *const StatorValue,
+        arg_count: usize,
+        data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        if receiver.is_null() || out.is_null() || (arg_count > 0 && args.is_null()) {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let mut total = data as usize as f64;
+        for idx in 0..arg_count {
+            // SAFETY: callback contract supplies `arg_count` readable entries.
+            let arg = unsafe { *args.add(idx) };
+            if arg.is_null() {
+                return StatorStatus::StatorStatusInvalidArg;
+            }
+            // SAFETY: pointer was validated above.
+            total += unsafe { stator_value_as_number(arg) };
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        // SAFETY: `out` is writable and result ownership transfers to Stator.
+        unsafe { *out = stator_value_new_number(iso, total) };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn dom_construct_product(
+        _new_target: *const StatorValue,
+        args: *const *const StatorValue,
+        arg_count: usize,
+        _data: *mut c_void,
+        out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        if out.is_null() || (arg_count > 0 && args.is_null()) {
+            return StatorStatus::StatorStatusInvalidArg;
+        }
+        let mut product = 1.0;
+        for idx in 0..arg_count {
+            // SAFETY: callback contract supplies `arg_count` readable entries.
+            let arg = unsafe { *args.add(idx) };
+            if arg.is_null() {
+                return StatorStatus::StatorStatusInvalidArg;
+            }
+            // SAFETY: pointer was validated above.
+            product *= unsafe { stator_value_as_number(arg) };
+        }
+        let iso = ACTIVE_ISO.with(|c| c.get());
+        // SAFETY: `out` is writable and result ownership transfers to Stator.
+        unsafe { *out = stator_value_new_number(iso, product) };
+        StatorStatus::StatorStatusOk
+    }
+
+    unsafe extern "C" fn dom_callable_exception(
+        _receiver: *const StatorValue,
+        _args: *const *const StatorValue,
+        _arg_count: usize,
+        _data: *mut c_void,
+        _out: *mut *mut StatorValue,
+    ) -> StatorStatus {
+        StatorStatus::StatorStatusException
     }
 
     thread_local! {
@@ -37489,6 +45193,84 @@ mod tests {
     }
 
     #[test]
+    fn test_context_global_set_dom_object_wrap_preserves_query_attrs() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| *title.borrow_mut() = "Initial".to_string());
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomNamedHandler {
+            getter: Some(named_get_document_property),
+            setter: Some(named_set_document_property),
+            query: Some(named_query_document_attrs),
+            deleter: None,
+            enumerator: Some(named_enumerate_document),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let src = br#"
+            var titleDesc = Object.getOwnPropertyDescriptor(document, 'title');
+            var urlDesc = Object.getOwnPropertyDescriptor(document, 'URL');
+            var beforeUrl = document.URL;
+            document.URL = 'https://spoof.invalid/';
+            var deletedUrl = delete document.URL;
+            var keys = Object.keys(document).join(',');
+            var reflectSetTitle = Reflect.set(document, 'title', 'Reflect Title');
+            var afterReflectSet = document.title;
+            var deletedTitle = delete document.title;
+            [
+                titleDesc.enumerable,
+                titleDesc.configurable,
+                typeof titleDesc.set,
+                urlDesc.enumerable,
+                urlDesc.configurable,
+                typeof urlDesc.set,
+                beforeUrl === document.URL,
+                deletedUrl,
+                keys.indexOf('URL') === -1,
+                keys.indexOf('title') !== -1,
+                reflectSetTitle,
+                afterReflectSet,
+                deletedTitle,
+                typeof document.title
+            ].join('|')
+        "#;
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let ptr = unsafe { stator_value_as_string(result) };
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(
+            actual,
+            "true|true|function|false|false|undefined|true|false|true|true|true|Reflect Title|true|undefined"
+        );
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+        ACTIVE_DOCUMENT_TITLE.with(|title| title.borrow_mut().clear());
+    }
+
+    #[test]
     fn test_dom_object_wrap_as_value_round_trips_identity() {
         let iso = IsolateGuard::new();
         let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
@@ -37496,10 +45278,15 @@ mod tests {
 
         let first = unsafe { stator_dom_object_wrap_as_value(wrap) };
         let second = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let second_wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let third = unsafe { stator_dom_object_wrap_as_value(second_wrap) };
         assert!(!first.is_null());
         assert!(!second.is_null());
+        assert!(!second_wrap.is_null());
+        assert!(!third.is_null());
         assert!(unsafe { stator_value_is_object(first) });
         assert!(unsafe { stator_value_strict_equals(first, second) });
+        assert!(!unsafe { stator_value_strict_equals(first, third) });
         assert_eq!(unsafe { stator_value_as_dom_object_wrap(first) }, wrap);
 
         let plain = unsafe { stator_value_new_object(iso.as_ptr()) };
@@ -37512,6 +45299,8 @@ mod tests {
             stator_value_destroy(plain);
             stator_value_destroy(first);
             stator_value_destroy(second);
+            stator_value_destroy(third);
+            stator_dom_object_wrap_destroy(second_wrap);
             stator_dom_object_wrap_destroy(wrap);
         }
     }
@@ -37694,6 +45483,185 @@ mod tests {
     }
 
     #[test]
+    fn test_dom_callable_handler_direct_call_and_construct_success() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_call_sum),
+            construct: Some(dom_construct_product),
+            data: 10usize as *mut c_void,
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+
+        let arg1 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        let arg2 = unsafe { stator_value_new_number(iso.as_ptr(), 3.0) };
+        let args = [arg1 as *const StatorValue, arg2 as *const StatorValue];
+        let receiver = unsafe { stator_dom_object_wrap_as_value(wrap) };
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    receiver,
+                    args.as_ptr(),
+                    args.len(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_value_as_number(out) }, 15.0);
+        unsafe { stator_value_destroy(out) };
+
+        out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_construct(
+                    wrap,
+                    receiver,
+                    args.as_ptr(),
+                    args.len(),
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(unsafe { stator_value_as_number(out) }, 6.0);
+
+        unsafe {
+            stator_value_destroy(out);
+            stator_value_destroy(receiver);
+            stator_value_destroy(arg1);
+            stator_value_destroy(arg2);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_script_call_and_construct() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_call_sum),
+            construct: Some(dom_construct_product),
+            data: 1usize as *mut c_void,
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"host".as_ptr(), wrap) },
+            StatorStatus::StatorStatusOk
+        );
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                b"host(4, 5) + ':' + typeof new host(2, 3)".as_ptr() as *const c_char,
+                b"host(4, 5) + ':' + typeof new host(2, 3)".len(),
+            )
+        };
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        let actual = unsafe { CStr::from_ptr(stator_value_as_string(result)) }.to_string_lossy();
+        assert_eq!(actual, "10:object");
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_rejects_null_invalid_and_non_callable() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, std::ptr::null()) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let empty = StatorDomCallableHandler {
+            call: None,
+            construct: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &empty) },
+            StatorStatus::StatorStatusInvalidArg
+        );
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusUnsupported
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_dom_callable_handler_callback_error_and_invalidated_fail_closed() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let handler = StatorDomCallableHandler {
+            call: Some(dom_callable_exception),
+            construct: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_callable_handler(wrap, &handler) },
+            StatorStatus::StatorStatusOk
+        );
+        let mut out: *mut StatorValue = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusException
+        );
+        unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        unsafe { stator_dom_object_wrap_invalidate(wrap) };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_invoke_call_as_function(
+                    wrap,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                )
+            },
+            StatorStatus::StatorStatusFalse
+        );
+        unsafe { stator_dom_object_wrap_destroy(wrap) };
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
     fn test_context_global_dom_named_getter_exception_fails_script() {
         let iso = IsolateGuard::new();
         ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
@@ -37854,6 +45822,57 @@ mod tests {
             stator_script_free(followup_script);
             stator_value_destroy(result);
             stator_script_free(script);
+            stator_context_destroy(ctx);
+            stator_dom_object_wrap_destroy(wrap);
+        }
+        ACTIVE_ISO.with(|c| c.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_context_global_dom_named_descriptor_exception_fails_materialization() {
+        let iso = IsolateGuard::new();
+        ACTIVE_ISO.with(|c| c.set(iso.as_ptr()));
+
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let wrap = unsafe { stator_dom_object_wrap_new(iso.as_ptr(), 0) };
+        let named = StatorDomNamedHandler {
+            getter: None,
+            setter: None,
+            query: None,
+            deleter: None,
+            enumerator: Some(named_enumerate_boom),
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { stator_dom_object_wrap_install_named_handler(wrap, &named) },
+            StatorStatus::StatorStatusOk
+        );
+        let descriptors = StatorDomNamedDefinerDescriptorHandler {
+            definer: None,
+            descriptor: Some(named_descriptor_status_exception),
+            symbol_definer: None,
+            symbol_descriptor: None,
+            data: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe {
+                stator_dom_object_wrap_install_named_definer_descriptor_handler(wrap, &descriptors)
+            },
+            StatorStatus::StatorStatusOk
+        );
+
+        assert_eq!(
+            unsafe { stator_context_global_set_dom_object_wrap(ctx, c"document".as_ptr(), wrap) },
+            StatorStatus::StatorStatusException
+        );
+        let exception = unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        assert!(!exception.is_null());
+        let ptr = unsafe { stator_value_as_string(exception) };
+        let message = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert_eq!(message, "DOM named descriptor exception");
+
+        unsafe {
+            stator_value_destroy(exception);
             stator_context_destroy(ctx);
             stator_dom_object_wrap_destroy(wrap);
         }
@@ -38840,6 +46859,14 @@ mod tests {
         stats
     }
 
+    fn lock_ffi_tiering_stats() -> std::sync::MutexGuard<'static, ()> {
+        static FFI_TIERING_STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        match FFI_TIERING_STATS_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Run an Edge-proof shaped workload (compile once, warmup + measured)
     /// against `source` and return `(final_number_result, stats)`.
     ///
@@ -38850,6 +46877,7 @@ mod tests {
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     fn run_edge_proof_compiled(source: &[u8]) -> (f64, StatorTieringStats) {
+        let _g = lock_ffi_tiering_stats();
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
@@ -38973,6 +47001,7 @@ mod tests {
         source: &[u8],
         measured: usize,
     ) -> (u128, u128, u128, u128, f64, StatorTieringStats) {
+        let _g = lock_ffi_tiering_stats();
         let iso = IsolateGuard::new();
         let ctx = unsafe { stator_context_new(iso.as_ptr()) };
         unsafe { stator_isolate_reset_tiering_stats(iso.as_ptr()) };
@@ -39021,17 +47050,13 @@ mod tests {
         (median, mean, min, max, last, stats)
     }
 
-    /// Print release-mode timings for the three Edge perf-proof scripts
-    /// using exactly the FFI pattern Edge times.  Ignored by default so it
-    /// does not slow down `cargo test`; run with:
-    ///   `cargo test -p stator_jse_ffi --release \
-    ///        edge_pattern_timing_release -- --ignored --nocapture`
+    /// Print timings for the three Edge perf-proof scripts using exactly the
+    /// FFI pattern Edge times.
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     #[test]
-    #[ignore]
     fn edge_pattern_timing_release() {
         let scripts: &[(&str, &[u8], f64)] = &[
             (
@@ -40164,6 +48189,89 @@ mod tests {
     }
 
     #[test]
+    fn test_object_handle_jsvalue_bridge_reuses_plain_object() {
+        let iso = IsolateGuard::new();
+        let obj = make_object_with_key_42(iso.as_ptr());
+        let val = unsafe { stator_object_as_value(obj) };
+
+        let first = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
+        let second = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
+        assert!(first.is_strictly_equal(&second));
+        assert_eq!(
+            dispatch_get_property_value(&first, JsValue::String("key".into())).unwrap(),
+            JsValue::Smi(42)
+        );
+
+        dispatch_set_property_value(&first, JsValue::String("from_js".into()), JsValue::Smi(7))
+            .unwrap();
+        let got = unsafe { stator_object_get(obj, c"from_js".as_ptr()) };
+        assert!(!got.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got) }, 7.0);
+
+        let round_trip =
+            unsafe { allocate_stator_value(iso.as_ptr(), jsvalue_to_stator_value_inner(&first)) };
+        let obj2 = unsafe { stator_value_as_object(round_trip) };
+        assert!(!obj2.is_null());
+        let val2 = unsafe { stator_object_as_value(obj2) };
+        assert!(unsafe { stator_value_strict_equals(val, val2) });
+
+        unsafe {
+            stator_value_destroy(got);
+            stator_value_destroy(round_trip);
+            stator_value_destroy(val2);
+            stator_object_destroy(obj2);
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_context_global_set_object_handle_preserves_script_identity() {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let obj = make_object_with_key_42(iso.as_ptr());
+        let val = unsafe { stator_object_as_value(obj) };
+        unsafe { stator_context_global_set(ctx, c"host".as_ptr(), val) };
+
+        let src = b"host.fromScript = 7; host === host;";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        assert!(unsafe { stator_value_to_boolean(result) });
+
+        let got = unsafe { stator_object_get(obj, c"fromScript".as_ptr()) };
+        assert!(!got.is_null());
+        assert_eq!(unsafe { stator_value_as_number(got) }, 7.0);
+
+        let return_src = b"host;";
+        let return_script = unsafe {
+            stator_script_compile(ctx, return_src.as_ptr() as *const c_char, return_src.len())
+        };
+        assert!(!return_script.is_null());
+        let returned = unsafe { stator_script_run(return_script, ctx) };
+        assert!(!returned.is_null());
+        let returned_obj = unsafe { stator_value_as_object(returned) };
+        assert!(!returned_obj.is_null());
+        let returned_val = unsafe { stator_object_as_value(returned_obj) };
+        assert!(unsafe { stator_value_strict_equals(val, returned_val) });
+
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_value_destroy(got);
+            stator_value_destroy(returned_val);
+            stator_object_destroy(returned_obj);
+            stator_value_destroy(returned);
+            stator_script_free(return_script);
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn test_value_as_object_returns_null_for_tag_only() {
         let iso = IsolateGuard::new();
         let val = unsafe { stator_value_new_object(iso.as_ptr()) };
@@ -41011,7 +49119,7 @@ mod tests {
         assert!(!persistent.is_null());
         assert!(!unsafe { stator_persistent_is_empty(persistent) });
         // Destroy the originating object handle now; the persistent should
-        // still keep the underlying JsObject alive.
+        // still keep the underlying plain object alive.
         unsafe { stator_object_destroy(obj) };
         unsafe { stator_handle_scope_close(scope) };
 

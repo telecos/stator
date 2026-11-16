@@ -410,9 +410,8 @@ mod tests {
     // ── Misc: nullish coalescing chain ──────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: nullish coalescing chain regression
     fn e2e_nullish_coalescing_chain() {
-        assert_eval_true("null ?? undefined ?? 0 ?? 42 === 0");
+        assert_eval_true("(null ?? undefined ?? 0 ?? 42) === 0");
     }
 
     // ── Misc: void side effects still evaluated ─────────────────────────────

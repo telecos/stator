@@ -34,7 +34,8 @@ use std::{
 };
 
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, SourcePosition,
+    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MappedArgumentAlias, MappedArgumentTarget,
+    SourcePosition, SuspendKind,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
 use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
@@ -79,6 +80,13 @@ fn to_reg_op(reg: Register) -> Operand {
 /// stays consistent with the runtime string-constant decoder.
 fn prop_key_name_from_str_lit(s: &crate::parser::ast::StringLit) -> String {
     crate::interpreter::decode_string_constant(&s.value)
+}
+
+fn module_export_name_string(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(id) => id.name.clone(),
+        ModuleExportName::Str(s) => prop_key_name_from_str_lit(s),
+    }
 }
 
 /// Minimum number of bytes required to encode `op` as a single operand field.
@@ -188,6 +196,7 @@ struct PrivateNameBinding {
 #[derive(Default)]
 struct FunctionCompileOptions {
     self_name: Option<String>,
+    class_static_name: Option<String>,
     private_names: HashMap<String, PrivateNameBinding>,
     source_text: Option<Rc<str>>,
     source_span: Option<SourceLocation>,
@@ -195,10 +204,15 @@ struct FunctionCompileOptions {
     /// parent compiler so the inner function can emit context-slot operations
     /// instead of global loads/stores.  Maps variable name → context slot index.
     closure_captures: HashMap<String, u32>,
+    /// Active dynamic `with` scopes inherited from the enclosing compile site.
+    with_depth: usize,
     is_module: bool,
     module_variables: HashMap<String, (u32, i32)>,
     /// Local imported binding name → `(source, imported_name)`.
     imported_module_bindings: HashMap<String, (String, String)>,
+    /// Namespace-import local binding names. These are read from local slots but
+    /// remain immutable imported bindings for assignment validation.
+    imported_namespace_bindings: HashSet<String>,
     exported_module_bindings: HashSet<String>,
     /// Local-name → exported-alias map propagated to inner function bodies so
     /// stores into a captured module-exported binding write through to every
@@ -272,6 +286,8 @@ struct FunctionCompiler {
     /// Counter used to generate unique `suspend_id` immediates for each
     /// [`Opcode::SuspendGenerator`] instruction in this function.
     yield_suspend_id: u32,
+    /// Suspension metadata keyed by `SuspendGenerator` suspend id.
+    suspend_kinds: Vec<SuspendKind>,
     /// `true` when compiling the top-level program body (as opposed to a
     /// nested function).  Top-level function declarations are also stored
     /// as globals via `StaGlobal` so that recursive calls can find them.
@@ -292,6 +308,8 @@ struct FunctionCompiler {
     module_variables: HashMap<String, (u32, i32)>,
     /// Local imported binding name → `(source, imported_name)` for live reads.
     imported_module_bindings: HashMap<String, (String, String)>,
+    /// Namespace-import local binding names.
+    imported_namespace_bindings: HashSet<String>,
     /// Local binding names directly exported by this module.
     ///
     /// Assignments to these names write through to the corresponding module
@@ -379,11 +397,13 @@ impl FunctionCompiler {
             is_generator: false,
             is_async: false,
             yield_suspend_id: 0,
+            suspend_kinds: Vec::new(),
             is_program: false,
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -986,9 +1006,12 @@ impl FunctionCompiler {
     /// `try-finally` has its finally body executed before control
     /// transfers away.
     fn inline_pending_finally_blocks(&mut self) -> StatorResult<()> {
-        let blocks: Vec<_> = self.finally_stack.clone();
-        for block in blocks.iter().rev() {
-            self.compile_block(block)?;
+        let blocks = self.finally_stack.clone();
+        for i in (0..blocks.len()).rev() {
+            let saved_stack = std::mem::replace(&mut self.finally_stack, blocks[..i].to_vec());
+            let result = self.compile_block(&blocks[i]);
+            self.finally_stack = saved_stack;
+            result?;
         }
         Ok(())
     }
@@ -1676,7 +1699,7 @@ impl FunctionCompiler {
     ) -> StatorResult<Option<Register>> {
         match &declarator.id {
             Pat::Ident(ident) => {
-                if self.is_eval_scope {
+                if self.is_eval_scope && is_var {
                     // Eval scope: var declarations are hoisted into the
                     // caller's global environment via StaGlobal so they
                     // survive after the eval frame completes.
@@ -1689,7 +1712,7 @@ impl FunctionCompiler {
                     }
                     self.compile_ident_store(&ident.name)?;
                     Ok(None)
-                } else if self.is_program && is_var && !self.is_module {
+                } else if self.is_program && is_var && !self.is_module && !self.is_strict {
                     // Program-level `var`: store exclusively via StaGlobal
                     // so that nested callbacks (which also use StaGlobal /
                     // LdaGlobal) share the same storage.  Without this,
@@ -1792,17 +1815,20 @@ impl FunctionCompiler {
             &decl.body,
             decl.is_generator,
             decl.is_async,
-            decl.is_strict,
+            decl.is_strict || self.is_strict,
             false,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(decl.loc),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -1824,9 +1850,16 @@ impl FunctionCompiler {
                 self.define_local(&id.name)
             };
             self.emit_star(reg);
+            if let Some(slot) = self.context_bindings.get(&id.name).copied() {
+                self.emit_ldar(reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(slot)],
+                ));
+            }
             // Top-level script function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
-            if self.is_program && !self.is_module {
+            if self.is_program && !self.is_module && !self.is_strict {
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
                 // Re-load the value from the local register first so the
@@ -1935,6 +1968,7 @@ impl FunctionCompiler {
                 false,
                 false,
                 ctor.value.is_strict,
+                None,
                 self.private_names.clone(),
             )?
         } else if super_class.is_some() {
@@ -2017,7 +2051,7 @@ impl FunctionCompiler {
                     self.compile_class_static_property(class_reg, p)?;
                 }
                 ClassMember::StaticBlock(sb) => {
-                    self.compile_class_static_block(class_reg, sb)?;
+                    self.compile_class_static_block(id.map(|id| id.name.as_str()), class_reg, sb)?;
                 }
                 ClassMember::Property(p) => {
                     let computed_key_name = match &p.key {
@@ -2399,6 +2433,7 @@ impl FunctionCompiler {
 
     fn compile_class_static_block(
         &mut self,
+        class_name: Option<&str>,
         class_reg: Register,
         block: &crate::parser::ast::StaticBlock,
     ) -> StatorResult<()> {
@@ -2412,6 +2447,7 @@ impl FunctionCompiler {
             false,
             false,
             true,
+            class_name,
             self.private_names.clone(),
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(block_array)));
@@ -2469,6 +2505,7 @@ impl FunctionCompiler {
             false,
             false,
             true,
+            None,
             self.private_names.clone(),
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(value_array)));
@@ -2545,12 +2582,14 @@ impl FunctionCompiler {
             handler_table: Vec::new(),
             is_generator: false,
             yield_suspend_id: 0,
+            suspend_kinds: Vec::new(),
             is_program: false,
             is_async: false,
             is_eval_scope: false,
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
             in_tail_position: false,
@@ -2671,9 +2710,6 @@ impl FunctionCompiler {
                     ));
                     let key_reg = ic.allocator.allocate_temporary();
                     ic.emit_star(key_reg);
-                    ic.allocator
-                        .release_temporary(owner_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                     if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
@@ -2689,8 +2725,12 @@ impl FunctionCompiler {
                             slot,
                         ],
                     ));
+                    // Release in LIFO order: key_reg was allocated after owner_reg.
                     ic.allocator
                         .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    ic.allocator
+                        .release_temporary(owner_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
                 PropKey::Private(id) => {
@@ -2864,9 +2904,8 @@ impl FunctionCompiler {
     fn compile_return(&mut self, s: &crate::parser::ast::ReturnStmt) -> StatorResult<()> {
         if let Some(arg) = &s.argument {
             // Disable tail calls when inside a finally scope — the finally
-            // block must run before the frame is replaced.  Proper tail calls
-            // are only enabled for strict-mode callers.
-            self.in_tail_position = self.is_strict && self.finally_stack.is_empty();
+            // block must run before the frame is replaced.
+            self.in_tail_position = self.finally_stack.is_empty();
             self.compile_expr(arg)?;
             self.in_tail_position = false;
         } else {
@@ -3065,8 +3104,18 @@ impl FunctionCompiler {
 
         // Evaluate the discriminant once and save it.
         self.compile_expr(&s.discriminant)?;
-        let disc_reg = self.allocator.allocate_temporary();
+        let disc_reg = self.allocator.new_local();
         self.emit_star(disc_reg);
+
+        // Open the switch block scope before evaluating case tests. Lexical
+        // declarations in any case are in TDZ throughout the entire CaseBlock.
+        self.push_scope();
+        let switch_body_stmts: Vec<Stmt> = s
+            .cases
+            .iter()
+            .flat_map(|case| case.consequent.iter().cloned())
+            .collect();
+        self.hoist_lexical_decls(&switch_body_stmts);
 
         // Build a label for each case clause.
         let case_labels: Vec<usize> = s.cases.iter().map(|_| self.new_label()).collect();
@@ -3109,10 +3158,6 @@ impl FunctionCompiler {
 
         self.loop_stack.push((end_label, break_label));
 
-        // Open a block scope for the switch body so that `let`/`const`
-        // declarations in case clauses are properly scoped.
-        self.push_scope();
-
         // Emit case bodies.
         for (i, case) in s.cases.iter().enumerate() {
             self.bind_label(case_labels[i]);
@@ -3125,9 +3170,6 @@ impl FunctionCompiler {
         self.loop_stack.pop();
 
         self.bind_label(end_label);
-        self.allocator
-            .release_temporary(disc_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -3191,8 +3233,9 @@ impl FunctionCompiler {
         // Compile try block.
         self.compile_block(&s.block)?;
 
-        // Pop the finalizer — normal-path finally is compiled explicitly below.
-        if s.finalizer.is_some() {
+        // Pop the finalizer for try/finally. For try/catch/finally, keep it
+        // pending while compiling catch so returns in catch also run finally.
+        if s.finalizer.is_some() && s.handler.is_none() {
             self.finally_stack.pop();
         }
 
@@ -3227,6 +3270,9 @@ impl FunctionCompiler {
                 }
             }
             self.compile_block(&handler.body)?;
+            if s.finalizer.is_some() {
+                self.finally_stack.pop();
+            }
             self.pop_scope();
             let catch_end = self.instructions.len() as u32;
 
@@ -3245,7 +3291,13 @@ impl FunctionCompiler {
             // covers the catch block so that finally executes even if the catch
             // body throws.
             if let Some(finalizer) = &s.finalizer {
+                let save_reg = self.allocator.allocate_temporary();
+                self.emit_star(save_reg);
                 self.compile_block(finalizer)?;
+                self.emit_ldar(save_reg);
+                self.allocator
+                    .release_temporary(save_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
 
                 // Exception-path handler for exceptions thrown inside catch.
                 let after_ex_handler_label = self.new_label();
@@ -3278,7 +3330,13 @@ impl FunctionCompiler {
             // run finally, then re-throw.
 
             // Normal path: inline finally.
+            let save_reg = self.allocator.allocate_temporary();
+            self.emit_star(save_reg);
             self.compile_block(finalizer)?;
+            self.emit_ldar(save_reg);
+            self.allocator
+                .release_temporary(save_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
 
             // Jump past exception-path handler.
             let after_ex_handler_label = self.new_label();
@@ -3421,7 +3479,9 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::This(_) => {
-                    if let Some(binding) = self.lookup_var("this") {
+                    if self.is_program && self.is_module {
+                        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    } else if let Some(binding) = self.lookup_var("this") {
                         self.emit_ldar(binding.reg);
                     } else {
                         let name_idx = self.add_string("this");
@@ -3648,9 +3708,10 @@ impl FunctionCompiler {
 
     /// Store the accumulator to the variable named `name`.
     ///
-    /// Returns an error if the variable is a `const` binding.
-    /// If the binding is still in the TDZ, emits a runtime
-    /// `ThrowReferenceErrorIfHole` check before the store.
+    /// If the variable is a `const` binding, emits a runtime TypeError so
+    /// enclosing JavaScript `try`/`catch` blocks can observe it. If the binding
+    /// is still in the TDZ, emits a runtime `ThrowReferenceErrorIfHole` check
+    /// before the store.
     fn compile_ident_store(&mut self, name: &str) -> StatorResult<()> {
         // Closure captures: inner function writing to an outer variable.
         if let Some(&slot) = self.closure_captures.get(name) {
@@ -3670,11 +3731,24 @@ impl FunctionCompiler {
             self.emit_exported_module_write_through(name);
             return Ok(());
         }
+        if self.imported_module_bindings.contains_key(name) {
+            return Err(StatorError::TypeError(format!(
+                "Assignment to constant variable '{name}'"
+            )));
+        }
+        if self.imported_namespace_bindings.contains(name) {
+            return Err(StatorError::TypeError(format!(
+                "Assignment to constant variable '{name}'"
+            )));
+        }
         if let Some(binding) = self.lookup_var(name) {
             if binding.is_const {
-                return Err(StatorError::TypeError(format!(
-                    "Assignment to constant variable '{name}'"
-                )));
+                let name_idx = self.add_string(name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowConstAssignmentTypeError,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+                return Ok(());
             }
             if binding.needs_tdz_check {
                 // Save the value being assigned, check TDZ, then store.
@@ -3865,8 +3939,8 @@ impl FunctionCompiler {
 
     /// Compile a binary expression.
     ///
-    /// The pattern is: evaluate RHS → temporary, evaluate LHS → accumulator,
-    /// apply operator.  This works for all non-commutative ops.
+    /// The pattern is: evaluate LHS → temporary, evaluate RHS → temporary,
+    /// reload LHS → accumulator, apply operator.
     fn compile_binary(&mut self, b: &crate::parser::ast::BinaryExpr) -> StatorResult<()> {
         // `#x in obj` — private brand check.
         if b.op == BinaryOp::In
@@ -3896,13 +3970,17 @@ impl FunctionCompiler {
             return Ok(());
         }
 
-        // Evaluate RHS first, save to temporary.
+        // Evaluate operands left-to-right, then reload the LHS so existing
+        // binary opcodes still receive `accumulator op register`.
+        self.compile_expr(&b.left)?;
+        let lhs_reg = self.allocator.allocate_temporary();
+        self.emit_star(lhs_reg);
+
         self.compile_expr(&b.right)?;
         let rhs_reg = self.allocator.allocate_temporary();
         self.emit_star(rhs_reg);
 
-        // Evaluate LHS into accumulator.
-        self.compile_expr(&b.left)?;
+        self.emit_ldar(lhs_reg);
 
         let (op, slot_kind): (Opcode, FeedbackSlotKind) = match b.op {
             BinaryOp::Add => (Opcode::Add, FeedbackSlotKind::BinaryOp),
@@ -3930,6 +4008,9 @@ impl FunctionCompiler {
                 self.allocator
                     .release_temporary(rhs_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(lhs_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
                 self.emit(Instruction::new_unchecked(Opcode::LogicalNot, vec![]));
                 return Ok(());
             }
@@ -3947,6 +4028,9 @@ impl FunctionCompiler {
         ));
         self.allocator
             .release_temporary(rhs_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(lhs_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -5212,13 +5296,16 @@ impl FunctionCompiler {
             false,
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5261,13 +5348,16 @@ impl FunctionCompiler {
             false,
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5315,13 +5405,16 @@ impl FunctionCompiler {
             true,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -5401,13 +5494,16 @@ impl FunctionCompiler {
             true,
             FunctionCompileOptions {
                 self_name: None,
+                class_static_name: None,
                 private_names: self.private_names.clone(),
                 source_text: self.source_text.clone(),
                 source_span: Some(source_span),
                 closure_captures: self.context_bindings.clone(),
+                with_depth: self.with_depth,
                 is_module: self.is_module,
                 module_variables: self.module_variables.clone(),
                 imported_module_bindings: self.imported_module_bindings.clone(),
+                imported_namespace_bindings: self.imported_namespace_bindings.clone(),
                 exported_module_bindings: self.exported_module_bindings.clone(),
                 local_export_aliases: self.local_export_aliases.clone(),
             },
@@ -6046,8 +6142,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
 
         // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -6068,6 +6163,14 @@ impl FunctionCompiler {
         Ok(())
     }
 
+    fn allocate_suspend_id(&mut self, kind: SuspendKind) -> u32 {
+        let suspend_id = self.yield_suspend_id;
+        self.yield_suspend_id += 1;
+        debug_assert_eq!(self.suspend_kinds.len(), suspend_id as usize);
+        self.suspend_kinds.push(kind);
+        suspend_id
+    }
+
     /// Compile an `await expr` expression inside an async (generator) function.
     ///
     /// Uses the same suspend/resume mechanism as `yield` so the runtime can
@@ -6079,8 +6182,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
 
         // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Await);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -6195,8 +6297,7 @@ impl FunctionCompiler {
             self.emit_ldar(value_reg);
 
             self.bind_label(yield_resume_lbl);
-            let suspend_id = self.yield_suspend_id;
-            self.yield_suspend_id += 1;
+            let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
             self.emit(Instruction::new_unchecked(
                 Opcode::SuspendGenerator,
                 vec![
@@ -6408,8 +6509,7 @@ impl FunctionCompiler {
         let dummy = Operand::Register(0);
         self.emit_ldar(val_reg);
 
-        let suspend_id = self.yield_suspend_id;
-        self.yield_suspend_id += 1;
+        let suspend_id = self.allocate_suspend_id(SuspendKind::Yield);
         self.emit(Instruction::new_unchecked(
             Opcode::SuspendGenerator,
             vec![
@@ -6944,15 +7044,13 @@ impl FunctionCompiler {
         for spec in &decl.specifiers {
             match spec {
                 ImportSpecifier::Named(named) => {
-                    let imported_name = match &named.imported {
-                        ModuleExportName::Ident(id) => id.name.as_str(),
-                        ModuleExportName::Str(s) => s.value.as_str(),
-                    };
+                    let imported_name = module_export_name_string(&named.imported);
                     self.imported_module_bindings.insert(
                         named.local.name.clone(),
-                        (source.to_string(), imported_name.to_string()),
+                        (source.to_string(), imported_name.clone()),
                     );
-                    let (req_idx, cell) = self.get_or_create_module_variable(source, imported_name);
+                    let (req_idx, cell) =
+                        self.get_or_create_module_variable(source, &imported_name);
                     // Emit the load so the local binding is initialized.
                     self.emit(Instruction::new_unchecked(
                         Opcode::LdaModuleVariable,
@@ -6975,6 +7073,8 @@ impl FunctionCompiler {
                     self.emit_star(reg);
                 }
                 ImportSpecifier::Namespace(ns) => {
+                    self.imported_namespace_bindings
+                        .insert(ns.local.name.clone());
                     let req_idx = self.add_string(source);
                     self.emit(Instruction::new_unchecked(
                         Opcode::GetModuleNamespace,
@@ -7029,20 +7129,14 @@ impl FunctionCompiler {
 
         // Local re-export: `export { x, y as z }`
         for spec in &decl.specifiers {
-            let local_name = match &spec.local {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            if let Some(binding) = self.lookup_var(local_name) {
+            let local_name = module_export_name_string(&spec.local);
+            if let Some(binding) = self.lookup_var(&local_name) {
                 self.emit_ldar(binding.reg);
             } else {
-                self.compile_ident_load(local_name);
+                self.compile_ident_load(&local_name);
             }
-            let exported_name = match &spec.exported {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            let (req_idx, cell) = self.get_or_create_module_variable("", exported_name);
+            let exported_name = module_export_name_string(&spec.exported);
+            let (req_idx, cell) = self.get_or_create_module_variable("", &exported_name);
             self.emit(Instruction::new_unchecked(
                 Opcode::StaModuleVariable,
                 vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
@@ -7078,11 +7172,8 @@ impl FunctionCompiler {
         ));
         if let Some(ref exported) = decl.exported {
             // `export * as ns from "source"`
-            let name = match exported {
-                ModuleExportName::Ident(id) => id.name.as_str(),
-                ModuleExportName::Str(s) => s.value.as_str(),
-            };
-            let (out_req, out_cell) = self.get_or_create_module_variable("", name);
+            let name = module_export_name_string(exported);
+            let (out_req, out_cell) = self.get_or_create_module_variable("", &name);
             self.emit(Instruction::new_unchecked(
                 Opcode::StaModuleVariable,
                 vec![
@@ -7174,7 +7265,7 @@ impl FunctionCompiler {
                 };
                 let exported_name = match &spec.exported {
                     ModuleExportName::Ident(id) => id.name.clone(),
-                    ModuleExportName::Str(s) => s.value.clone(),
+                    ModuleExportName::Str(_) => module_export_name_string(&spec.exported),
                 };
                 add(local_id.name.clone(), exported_name, &mut aliases);
             }
@@ -7252,7 +7343,9 @@ impl FunctionCompiler {
             .with_module_flag(self.is_module)
             .with_strict_flag(self.is_strict)
             .with_top_level_flag(self.is_program)
-            .with_binding_registers(binding_registers))
+            .with_binding_registers(binding_registers)
+            .with_context_bindings(self.context_bindings)
+            .with_suspend_kinds(self.suspend_kinds))
     }
 }
 
@@ -7345,6 +7438,7 @@ fn compile_function_with_private_names(
     is_generator: bool,
     is_async: bool,
     is_strict: bool,
+    class_static_name: Option<&str>,
     private_names: HashMap<String, PrivateNameBinding>,
 ) -> StatorResult<BytecodeArray> {
     compile_function_inner(
@@ -7356,13 +7450,16 @@ fn compile_function_with_private_names(
         false,
         FunctionCompileOptions {
             self_name: None,
+            class_static_name: class_static_name.map(str::to_owned),
             private_names,
             source_text: None,
             source_span: None,
             closure_captures: HashMap::new(),
+            with_depth: 0,
             is_module: false,
             module_variables: HashMap::new(),
             imported_module_bindings: HashMap::new(),
+            imported_namespace_bindings: HashSet::new(),
             exported_module_bindings: HashSet::new(),
             local_export_aliases: HashMap::new(),
         },
@@ -7377,10 +7474,14 @@ fn collect_function_scope_names(
     params: &[Param],
     stmts: &[Stmt],
     self_name: Option<&str>,
+    include_implicit_arguments: bool,
 ) -> HashSet<String> {
     let mut names = HashSet::new();
     if let Some(name) = self_name {
         names.insert(name.to_string());
+    }
+    if include_implicit_arguments {
+        names.insert("arguments".to_string());
     }
     for p in params {
         collect_pat_binding_names(&p.pat, &mut names);
@@ -7546,7 +7647,7 @@ fn collect_function_free_refs(
     stmts: &[Stmt],
     self_name: Option<&str>,
 ) -> HashSet<String> {
-    let function_scope = collect_function_scope_names(params, stmts, self_name);
+    let function_scope = collect_function_scope_names(params, stmts, self_name, true);
     let mut scopes = vec![function_scope];
     let mut free_refs = HashSet::new();
     collect_free_refs_in_params(params, &scopes, &mut free_refs);
@@ -7555,7 +7656,12 @@ fn collect_function_free_refs(
 }
 
 fn collect_arrow_free_refs(arrow: &ArrowExpr) -> HashSet<String> {
-    let mut scopes = vec![collect_function_scope_names(&arrow.params, &[], None)];
+    let mut scopes = vec![collect_function_scope_names(
+        &arrow.params,
+        &[],
+        None,
+        false,
+    )];
     let mut free_refs = HashSet::new();
     collect_free_refs_in_params(&arrow.params, &scopes, &mut free_refs);
     match &arrow.body {
@@ -7694,8 +7800,7 @@ fn collect_free_refs_in_stmt(
             collect_free_refs_in_stmt(&w.body, scopes, free_refs);
         }
         Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            let nested_free_refs = collect_function_free_refs(&f.params, &f.body.body, self_name);
+            let nested_free_refs = collect_function_free_refs(&f.params, &f.body.body, None);
             for name in nested_free_refs {
                 record_free_ref(&name, scopes, free_refs);
             }
@@ -8089,8 +8194,7 @@ fn walk_stmt_for_inner_refs(stmt: &Stmt, out: &mut HashSet<String>) {
             walk_stmt_for_inner_refs(&w.body, out);
         }
         Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            for n in collect_function_free_refs(&f.params, &f.body.body, self_name) {
+            for n in collect_function_free_refs(&f.params, &f.body.body, None) {
                 out.insert(n);
             }
         }
@@ -8215,8 +8319,13 @@ fn walk_expr_for_inner_refs(expr: &Expr, out: &mut HashSet<String>) {
 }
 
 /// Find all captured variables: locals referenced by nested functions.
-fn find_captured_vars(outer_params: &[Param], body: &BlockStmt) -> HashSet<String> {
-    let function_scope = collect_function_scope_names(outer_params, &body.body, None);
+fn find_captured_vars(
+    outer_params: &[Param],
+    body: &BlockStmt,
+    include_implicit_arguments: bool,
+) -> HashSet<String> {
+    let function_scope =
+        collect_function_scope_names(outer_params, &body.body, None, include_implicit_arguments);
     let mut scopes = vec![function_scope];
     let mut captured = HashSet::new();
     find_captures_in_params(outer_params, &mut scopes, &mut captured);
@@ -8350,14 +8459,11 @@ fn find_captures_in_stmt(
             find_captures_in_expr(&w.object, scopes, captured);
             find_captures_in_stmt(&w.body, scopes, captured);
         }
-        Stmt::FnDecl(f) => {
-            let self_name = f.id.as_ref().map(|id| id.name.as_str());
-            capture_visible_free_refs(
-                collect_function_free_refs(&f.params, &f.body.body, self_name),
-                scopes,
-                captured,
-            );
-        }
+        Stmt::FnDecl(f) => capture_visible_free_refs(
+            collect_function_free_refs(&f.params, &f.body.body, None),
+            scopes,
+            captured,
+        ),
         _ => {}
     }
 }
@@ -8562,6 +8668,57 @@ fn find_captures_in_pat_exprs(
     }
 }
 
+fn simple_parameter_identifier(param: &Param) -> Option<&str> {
+    if let Pat::Ident(ident) = &param.pat
+        && param.default.is_none()
+    {
+        Some(&ident.name)
+    } else {
+        None
+    }
+}
+
+fn has_simple_parameter_list(params: &[Param]) -> bool {
+    params
+        .iter()
+        .all(|param| simple_parameter_identifier(param).is_some())
+}
+
+fn mapped_arguments_aliases_for_params(
+    params: &[Param],
+    is_strict: bool,
+    context_bindings: &HashMap<String, u32>,
+) -> Vec<MappedArgumentAlias> {
+    if is_strict || !has_simple_parameter_list(params) {
+        return Vec::new();
+    }
+
+    let mut last_simple_formal_by_name = HashMap::new();
+    for (index, param) in params.iter().enumerate() {
+        let name = simple_parameter_identifier(param).expect("validated simple parameter list");
+        last_simple_formal_by_name.insert(name.to_owned(), index);
+    }
+
+    let mut aliases = Vec::new();
+    for (index, param) in params.iter().enumerate() {
+        let name = simple_parameter_identifier(param).expect("validated simple parameter list");
+        if last_simple_formal_by_name.get(name).copied() != Some(index) {
+            continue;
+        }
+        let argument_index = index as u32;
+        let target = context_bindings
+            .get(name)
+            .copied()
+            .map(MappedArgumentTarget::CurrentContextSlot)
+            .unwrap_or(MappedArgumentTarget::Register(argument_index));
+        aliases.push(MappedArgumentAlias {
+            argument_index,
+            target,
+        });
+    }
+    aliases
+}
+
 /// Core function compiler.  `is_arrow` controls whether an `arguments`
 /// binding is emitted (arrow functions inherit the enclosing `arguments`).
 /// `self_name` enables named function expression scoping — the name is
@@ -8581,23 +8738,28 @@ fn compile_function_inner(
     compiler.is_strict = is_strict;
     let FunctionCompileOptions {
         self_name,
+        class_static_name,
         private_names,
         source_text,
         source_span,
         closure_captures,
+        with_depth,
         is_module,
         module_variables,
         imported_module_bindings,
+        imported_namespace_bindings,
         exported_module_bindings,
         local_export_aliases,
     } = options;
     compiler.private_names = private_names;
     compiler.source_text = source_text;
     compiler.closure_captures = closure_captures;
+    compiler.with_depth = with_depth;
     compiler.is_module = is_module;
     let _ = module_variables;
     compiler.module_variables = HashMap::new();
     compiler.imported_module_bindings = imported_module_bindings;
+    compiler.imported_namespace_bindings = imported_namespace_bindings;
     compiler.exported_module_bindings = exported_module_bindings;
     compiler.local_export_aliases = local_export_aliases;
 
@@ -8611,18 +8773,17 @@ fn compile_function_inner(
         ));
     }
 
-    // Emit default-value and destructuring prologue for parameters.
-    compiler.emit_param_prologue(params)?;
-
     // Arrow functions do NOT get their own `arguments` object — they
     // inherit the enclosing function's `arguments` (ES §15.3.4).
+    let use_mapped_arguments = !is_strict && has_simple_parameter_list(params);
     if !is_arrow {
-        // Create the `arguments` object and bind it as a local variable.
+        // Create the `arguments` object before parameter initializers so
+        // defaults can reference the function's own arguments binding.
         compiler.emit(Instruction::new_unchecked(
-            if is_strict {
-                Opcode::CreateUnmappedArguments
-            } else {
+            if use_mapped_arguments {
                 Opcode::CreateMappedArguments
+            } else {
+                Opcode::CreateUnmappedArguments
             },
             vec![],
         ));
@@ -8630,14 +8791,15 @@ fn compile_function_inner(
         compiler.emit_star(args_reg);
     }
 
+    // Emit default-value and destructuring prologue for parameters.
+    compiler.emit_param_prologue(params)?;
+
     // Named function expression self-reference: allocate a register so the
     // function body can reference the function by its own name (ES §15.2.4).
     // The register is initialised to `undefined` here; the interpreter
     // writes the actual function value at call time.
     let self_name_reg = if let Some(name) = self_name.as_deref() {
         let reg = compiler.define_local(name);
-        compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-        compiler.emit_star(reg);
         Some(reg)
     } else {
         None
@@ -8651,6 +8813,23 @@ fn compile_function_inner(
     // Annex B: in non-strict mode, function declarations inside
     // blocks also create var-like bindings in the function scope.
     compiler.hoist_annex_b_fn_declarations(&body.body);
+
+    // Function-body lexical declarations are in TDZ from the start of the
+    // function body, not only once their declaration statement is reached.
+    compiler.hoist_lexical_decls(&body.body);
+
+    if let Some(name) = class_static_name.as_deref()
+        && compiler.lookup_var(name).is_none()
+    {
+        let reg = compiler.define_const_local(name);
+        let name_idx = compiler.add_string("this");
+        let slot = compiler.alloc_slot(FeedbackSlotKind::LoadGlobal);
+        compiler.emit(Instruction::new_unchecked(
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(name_idx), slot],
+        ));
+        compiler.emit_star(reg);
+    }
 
     // ── Closure capture analysis ──────────────────────────────────────────
     // Determine which local variables are captured by inner function/arrow
@@ -8669,7 +8848,7 @@ fn compile_function_inner(
     // itself reference the variable would silently fail to propagate it
     // (the inner function would see `undefined`), and any sibling inherited
     // binding could be mis-resolved to a freshly allocated slot.
-    let captured = find_captured_vars(params, body);
+    let captured = find_captured_vars(params, body, !is_arrow);
     let inner_free_refs = collect_inner_function_free_refs_in_block(body);
     let needs_forward = compiler
         .closure_captures
@@ -8679,9 +8858,10 @@ fn compile_function_inner(
 
     if must_push_context {
         let mut slot_idx = 0u32;
-        // Sort own captured names for deterministic slot assignment.
+        // Sort own context-backed names for deterministic slot assignment.
         let mut owned: Vec<_> = captured.into_iter().collect();
         owned.sort();
+        owned.dedup();
         for name in &owned {
             compiler.context_bindings.insert(name.clone(), slot_idx);
             slot_idx += 1;
@@ -8724,8 +8904,8 @@ fn compile_function_inner(
             vec![to_reg_op(saved_ctx_reg)],
         ));
 
-        // Copy own parameter values that are captured from their registers
-        // into the newly created context slots.
+        // Copy own parameter values that are context-backed from their
+        // registers into the newly created context slots.
         for name in &owned {
             if let Some(binding) = compiler.scopes[0].get(name) {
                 let slot = compiler.context_bindings[name];
@@ -8754,12 +8934,22 @@ fn compile_function_inner(
                 Opcode::StaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(new_slot)],
             ));
+            compiler.emit(Instruction::new_unchecked(
+                Opcode::ForwardMappedArgumentAlias,
+                vec![
+                    to_reg_op(saved_ctx_reg),
+                    Operand::ConstantPoolIdx(*parent_slot),
+                    Operand::ConstantPoolIdx(new_slot),
+                ],
+            ));
         }
     }
     // If we do NOT push a context, the inherited `closure_captures` map is
     // left in place.  Each `LdaCurrentContextSlot(slot)` then reads from the
     // parent's context (which is still the current context for this frame),
     // so the original slot indices remain valid.
+    let mapped_arguments_aliases =
+        mapped_arguments_aliases_for_params(params, is_strict, &compiler.context_bindings);
 
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
@@ -8780,6 +8970,7 @@ fn compile_function_inner(
             .take_while(|param| param.default.is_none() && !matches!(param.pat, Pat::Rest(_)))
             .count() as u32,
     );
+    ba = ba.with_mapped_arguments_aliases(mapped_arguments_aliases);
     if let Some(reg) = self_name_reg {
         ba = ba.with_self_name_register(reg.0);
     }
@@ -8895,7 +9086,7 @@ impl BytecodeGenerator {
 
         // Hoist `var` declarations. Scripts use the global env; modules keep
         // top-level `var` module-scoped so exports can write through cells.
-        if is_module {
+        if is_module || compiler.is_strict {
             compiler.hoist_var_declarations(&stmts_owned);
         } else {
             compiler.hoist_var_declarations_global(&stmts_owned);
@@ -9503,6 +9694,38 @@ mod tests {
         let instrs = inner.instructions().unwrap();
         assert!(instrs.iter().any(|i| i.opcode == Opcode::Add));
         assert_eq!(instrs.last().unwrap().opcode, Opcode::Return);
+    }
+
+    #[test]
+    fn test_named_function_expression_records_self_name_register() {
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("f")))],
+        };
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Fn(Box::new(FnExpr {
+                loc: span(),
+                id: Some(ident("f")),
+                is_async: false,
+                is_generator: false,
+                params: vec![],
+                body,
+                is_strict: false,
+            }))),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let nested = arr
+            .get_constant(0)
+            .and_then(|entry| match entry {
+                ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("function expression should compile into a function constant");
+        assert!(
+            nested.self_name_register().is_some(),
+            "named function expressions must record their self-reference register"
+        );
     }
 
     #[test]
@@ -10336,10 +10559,9 @@ mod tests {
     // ── yield delegation (yield*) ─────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_yield_star_compiles() {
         // `function* outer() { yield* inner; }` — verify compilation emits
-        // GetIterator + IteratorNext + SuspendGenerator in the inner bytecode.
+        // GetIterator + next() call + SuspendGenerator in the inner bytecode.
         use crate::parser::ast::{FnDecl, YieldExpr};
         let decl = FnDecl {
             loc: span(),
@@ -10378,8 +10600,8 @@ mod tests {
             assert!(
                 inner_instrs
                     .iter()
-                    .any(|i| i.opcode == Opcode::IteratorNext),
-                "yield* must emit IteratorNext"
+                    .any(|i| i.opcode == Opcode::CallProperty1),
+                "yield* must call the delegated iterator's next method"
             );
             assert!(
                 inner_instrs
@@ -10756,6 +10978,11 @@ mod tests {
         if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
             assert!(ba.is_generator(), "must be marked as generator");
             assert!(ba.is_async(), "must be marked as async");
+            assert_eq!(
+                ba.suspend_kinds(),
+                &[SuspendKind::Yield, SuspendKind::Yield],
+                "async generator yield suspensions must be user-visible"
+            );
             let inner_instrs = ba.instructions().unwrap();
             assert_eq!(
                 inner_instrs[0].opcode,
@@ -10788,6 +11015,11 @@ mod tests {
         let pool = arr.constant_pool();
         if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
             assert!(ba.is_async(), "must be marked as async");
+            assert_eq!(
+                ba.suspend_kinds(),
+                &[SuspendKind::Await, SuspendKind::Yield],
+                "await suspensions must not be exposed as user-visible yields"
+            );
             let inner_instrs = ba.instructions().unwrap();
             // The body should have two SuspendGenerator instructions: one for
             // await (suspend/resume) and one for yield.
@@ -10805,7 +11037,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_async_generator_expr_compiles() {
         // `var f = async function*() { yield 1; };`
         use crate::parser::ast::FnExpr;
@@ -10824,12 +11055,15 @@ mod tests {
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let pool = arr.constant_pool();
-        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
-            assert!(ba.is_generator(), "must be marked as generator");
-            assert!(ba.is_async(), "must be marked as async");
-        } else {
-            panic!("constant pool[0] should be a Function");
-        }
+        let ba = pool
+            .iter()
+            .find_map(|entry| match entry {
+                crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("expected a Function entry in the constant pool");
+        assert!(ba.is_generator(), "must be marked as generator");
+        assert!(ba.is_async(), "must be marked as async");
     }
 
     #[test]
@@ -10961,7 +11195,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_method_emits_define_named_own() {
         // `class Foo { bar() {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -10974,13 +11207,12 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty),
-            "expected DefineNamedOwnProperty for method"
+                .any(|i| i.opcode == Opcode::DefineClassNamedOwnProperty),
+            "expected DefineClassNamedOwnProperty for method"
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_method() {
         // `class Foo { static bar() {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -10993,12 +11225,11 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty)
+                .any(|i| i.opcode == Opcode::DefineClassNamedOwnProperty)
         );
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_getter_setter() {
         // `class Foo { get x() {} set x(v) {} }`
         let prog = make_program(vec![class_decl_stmt(
@@ -11014,12 +11245,12 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineGetterProperty)
+                .any(|i| i.opcode == Opcode::DefineClassGetterProperty)
         );
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineSetterProperty)
+                .any(|i| i.opcode == Opcode::DefineClassSetterProperty)
         );
     }
 
@@ -11074,7 +11305,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_expression() {
         // `var C = class {};`
         let prog = make_program(vec![var_decl_stmt(
@@ -11112,7 +11342,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_method() {
         // `class Foo { [k]() {} }` (k declared beforehand)
         let prog = make_program(vec![
@@ -11135,8 +11364,8 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
-            "expected DefineKeyedOwnProperty for computed method"
+                .any(|i| i.opcode == Opcode::DefineClassKeyedOwnProperty),
+            "expected DefineClassKeyedOwnProperty for computed method"
         );
     }
 
@@ -11208,7 +11437,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_async_function_expr_compiles() {
         // `var f = async function() { await 1; };`
         use crate::parser::ast::FnExpr;
@@ -11227,16 +11455,18 @@ mod tests {
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let pool = arr.constant_pool();
-        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
-            assert!(ba.is_async(), "must be marked as async");
-            assert!(!ba.is_generator(), "must NOT be marked as generator");
-        } else {
-            panic!("constant pool[0] should be a Function");
-        }
+        let ba = pool
+            .iter()
+            .find_map(|entry| match entry {
+                crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("expected a Function entry in the constant pool");
+        assert!(ba.is_async(), "must be marked as async");
+        assert!(!ba.is_generator(), "must NOT be marked as generator");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_async_arrow_compiles() {
         // `var f = async () => { await 1; };`
         use crate::parser::ast::ArrowExpr;
@@ -11253,11 +11483,14 @@ mod tests {
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(arrow))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let pool = arr.constant_pool();
-        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
-            assert!(ba.is_async(), "must be marked as async");
-        } else {
-            panic!("constant pool[0] should be a Function");
-        }
+        let ba = pool
+            .iter()
+            .find_map(|entry| match entry {
+                crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) => Some(ba),
+                _ => None,
+            })
+            .expect("expected a Function entry in the constant pool");
+        assert!(ba.is_async(), "must be marked as async");
     }
 
     // ── Optional catch binding ────────────────────────────────────────────────
@@ -11684,6 +11917,16 @@ mod tests {
             loc: span(),
             value: s.to_owned(),
         }
+    }
+
+    #[test]
+    fn test_module_export_name_string_decodes_string_literals() {
+        use crate::parser::ast::ModuleExportName;
+
+        assert_eq!(
+            module_export_name_string(&ModuleExportName::Str(string_lit("'not an id'"))),
+            "not an id"
+        );
     }
 
     #[test]
@@ -12778,9 +13021,8 @@ mod tests {
     // ── 6. Computed property names in classes ────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_computed_class_method_bytecode() {
-        // `class C { [k]() {} }` should emit DefineKeyedOwnProperty.
+        // `class C { [k]() {} }` should emit DefineClassKeyedOwnProperty.
         let prog = make_program(vec![
             var_decl_stmt(VarKind::Let, "k", Some(str_expr("myMethod"))),
             class_decl_stmt(
@@ -12801,8 +13043,8 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
-            "computed class method must emit DefineKeyedOwnProperty"
+                .any(|i| i.opcode == Opcode::DefineClassKeyedOwnProperty),
+            "computed class method must emit DefineClassKeyedOwnProperty"
         );
     }
 
@@ -13185,7 +13427,6 @@ mod tests {
     // ── Block scoping ────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_let_block_scoped() {
         // After the block, x should not be visible → ReferenceError.
         let result = crate::builtins::global::global_eval("{ let x = 1; } x");
@@ -13193,14 +13434,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_const_block_scoped() {
         let result = crate::builtins::global::global_eval("{ const x = 1; } x");
         assert!(result.is_err(), "const should be block scoped");
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_let_in_for_block_scoped() {
         let result = crate::builtins::global::global_eval("for (let i = 0; i < 3; i++) {} i");
         assert!(result.is_err(), "let in for-loop should be block scoped");
@@ -13298,7 +13537,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_switch_block_scoping_let() {
         let result = crate::builtins::global::global_eval(
             "var r; switch(1) { case 1: let v = 42; r = v; break; } r",
@@ -13391,7 +13629,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: hangs in CI – finally/return interaction
     fn test_finally_overrides_return() {
         let result = crate::builtins::global::global_eval(
             "(function() { try { return 1; } finally { return 2; } })()",

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
+use crate::error::{StatorError, StatorResult};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
@@ -56,7 +57,31 @@ pub type NamedQueryCallback = Box<dyn Fn(&str, *mut c_void) -> Option<u32>>;
 pub type NamedDeleterCallback = Box<dyn Fn(&str, *mut c_void) -> bool>;
 
 /// Callback that enumerates intercepted named properties.
+///
+/// The returned names are the wrapper's materializable own string names.
+/// Query or descriptor callbacks provide the attributes that determine which
+/// of those names are enumerable.
 pub type NamedEnumeratorCallback = Box<dyn Fn(*mut c_void) -> Vec<String>>;
+
+const V8_PROPERTY_ATTRIBUTE_READ_ONLY: u32 = 1 << 0;
+const V8_PROPERTY_ATTRIBUTE_DONT_ENUM: u32 = 1 << 1;
+const V8_PROPERTY_ATTRIBUTE_DONT_DELETE: u32 = 1 << 2;
+
+fn property_attrs_from_v8_query_bits(bits: u32) -> PropertyAttributes {
+    let mut attrs = PropertyAttributes::WRITABLE
+        | PropertyAttributes::ENUMERABLE
+        | PropertyAttributes::CONFIGURABLE;
+    if bits & V8_PROPERTY_ATTRIBUTE_READ_ONLY != 0 {
+        attrs.remove(PropertyAttributes::WRITABLE);
+    }
+    if bits & V8_PROPERTY_ATTRIBUTE_DONT_ENUM != 0 {
+        attrs.remove(PropertyAttributes::ENUMERABLE);
+    }
+    if bits & V8_PROPERTY_ATTRIBUTE_DONT_DELETE != 0 {
+        attrs.remove(PropertyAttributes::CONFIGURABLE);
+    }
+    attrs
+}
 
 // ── Symbol-keyed named handler callbacks ────────────────────────────────────
 
@@ -259,6 +284,54 @@ pub type NamedSymbolDefinerCallback =
 /// Callback for intercepting symbol-keyed named-property descriptors.
 pub type NamedSymbolDescriptorCallback =
     Box<dyn Fn(&SymbolKey, *mut c_void) -> DomPropertyDescriptorResult>;
+
+/// Arguments passed to a DOM wrapper call-as-function callback.
+#[derive(Debug, Clone)]
+pub struct DomCallArgs {
+    receiver: JsValue,
+    new_target: JsValue,
+    args: Vec<JsValue>,
+}
+
+impl DomCallArgs {
+    /// Construct a call payload from the receiver, new target, and arguments.
+    pub fn new(receiver: JsValue, new_target: JsValue, args: Vec<JsValue>) -> Self {
+        Self {
+            receiver,
+            new_target,
+            args,
+        }
+    }
+
+    /// Receiver (`this`) observed by the host callback.
+    pub fn receiver(&self) -> &JsValue {
+        &self.receiver
+    }
+
+    /// Constructor new-target, or [`JsValue::Undefined`] for ordinary calls.
+    pub fn new_target(&self) -> &JsValue {
+        &self.new_target
+    }
+
+    /// Positional arguments.
+    pub fn args(&self) -> &[JsValue] {
+        &self.args
+    }
+}
+
+/// Callback for invoking a DOM wrapper as a function.
+pub type DomCallAsFunctionCallback =
+    Box<dyn Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue>>;
+
+/// Callback for invoking a DOM wrapper as a constructor.
+pub type DomConstructCallback = Box<dyn Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue>>;
+
+/// Borrowed call-as-function callback reference.
+type DomCallAsFunctionRef<'a> =
+    Option<&'a dyn Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue>>;
+
+/// Borrowed construct callback reference.
+type DomConstructRef<'a> = Option<&'a dyn Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue>>;
 
 /// Borrowed symbol-keyed getter reference.
 type NamedSymbolGetterRef<'a> = Option<&'a dyn Fn(&SymbolKey, *mut c_void) -> NamedGetterResult>;
@@ -1176,14 +1249,16 @@ pub enum AccessCheckOperation {
     IndexedDefine,
     /// Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
     IndexedDescriptor,
+    /// Invocation of the wrapper's call-as-function handler.
+    CallAsFunction,
+    /// Invocation of the wrapper's construct handler.
+    Construct,
 }
 
 /// Key associated with an [`AccessCheckOperation`].
 #[derive(Debug, Clone, Copy)]
 pub enum AccessCheckKey<'a> {
-    /// No specific key — used for [`AccessCheckOperation::NamedEnumerate`],
-    /// [`AccessCheckOperation::IndexedEnumerate`], and
-    /// [`AccessCheckOperation::IndexedLength`].
+    /// No specific key — used for enumerate, length, call, and construct operations.
     None,
     /// A named property key.
     Named(&'a str),
@@ -1425,6 +1500,12 @@ pub struct DomObjectWrap {
     /// `undefined`, writes/deletes/queries report failure, enumeration
     /// yields the empty list).
     access_check: Option<AccessCheckCallback>,
+    /// Optional call-as-function callback.  Wrappers remain non-callable until
+    /// embedders explicitly install this handler.
+    call_as_function: Option<DomCallAsFunctionCallback>,
+    /// Optional constructor callback.  Wrappers remain non-constructible until
+    /// embedders explicitly install this handler.
+    construct: Option<DomConstructCallback>,
 }
 
 // SAFETY: `DomObjectWrap` holds raw `*mut c_void` pointers in
@@ -1451,6 +1532,8 @@ impl DomObjectWrap {
             named_handler: None,
             indexed_handler: None,
             access_check: None,
+            call_as_function: None,
+            construct: None,
         }
     }
 
@@ -1503,6 +1586,84 @@ impl DomObjectWrap {
             Some(cb) => cb(op, key, self.data_ptr()),
             None => true,
         }
+    }
+
+    /// Install a call-as-function handler.
+    pub fn set_call_as_function_handler(
+        &mut self,
+        cb: impl Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue> + 'static,
+    ) {
+        self.call_as_function = Some(Box::new(cb));
+    }
+
+    /// Clear any installed call-as-function handler.
+    pub fn clear_call_as_function_handler(&mut self) {
+        self.call_as_function = None;
+    }
+
+    /// Return the installed call-as-function handler, if any.
+    pub fn call_as_function_handler(&self) -> DomCallAsFunctionRef<'_> {
+        self.call_as_function.as_deref()
+    }
+
+    /// Install a construct handler.
+    pub fn set_construct_handler(
+        &mut self,
+        cb: impl Fn(&DomCallArgs, *mut c_void) -> StatorResult<JsValue> + 'static,
+    ) {
+        self.construct = Some(Box::new(cb));
+    }
+
+    /// Clear any installed construct handler.
+    pub fn clear_construct_handler(&mut self) {
+        self.construct = None;
+    }
+
+    /// Return the installed construct handler, if any.
+    pub fn construct_handler(&self) -> DomConstructRef<'_> {
+        self.construct.as_deref()
+    }
+
+    /// Return `true` when this wrapper has an explicit call-as-function handler.
+    pub fn is_callable(&self) -> bool {
+        self.call_as_function.is_some()
+    }
+
+    /// Return `true` when this wrapper has an explicit construct handler.
+    pub fn is_constructible(&self) -> bool {
+        self.construct.is_some()
+    }
+
+    /// Invoke the installed call-as-function handler.
+    pub fn call_as_function(&self, receiver: JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+        if !self.check_access(AccessCheckOperation::CallAsFunction, AccessCheckKey::None) {
+            return Err(StatorError::TypeError(
+                "DOM wrapper call denied by access check".to_string(),
+            ));
+        }
+        let Some(cb) = self.call_as_function.as_deref() else {
+            return Err(StatorError::TypeError(
+                "DOM wrapper is not callable".to_string(),
+            ));
+        };
+        let payload = DomCallArgs::new(receiver, JsValue::Undefined, args);
+        cb(&payload, self.data_ptr())
+    }
+
+    /// Invoke the installed construct handler.
+    pub fn construct(&self, new_target: JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+        if !self.check_access(AccessCheckOperation::Construct, AccessCheckKey::None) {
+            return Err(StatorError::TypeError(
+                "DOM wrapper construct denied by access check".to_string(),
+            ));
+        }
+        let Some(cb) = self.construct.as_deref() else {
+            return Err(StatorError::TypeError(
+                "DOM wrapper is not constructible".to_string(),
+            ));
+        };
+        let payload = DomCallArgs::new(JsValue::Undefined, new_target, args);
+        cb(&payload, self.data_ptr())
     }
 
     /// Read a named property, consulting the access-check callback first,
@@ -1643,6 +1804,37 @@ impl DomObjectWrap {
         self.properties.borrow().contains_key(key)
     }
 
+    /// Return named property attributes from the query interceptor or own map.
+    ///
+    /// Named query callbacks report V8-style negative attributes
+    /// (`ReadOnly`, `DontEnum`, `DontDelete`).  This API converts them to
+    /// Stator's positive descriptor flags (`WRITABLE`, `ENUMERABLE`,
+    /// `CONFIGURABLE`) so DOM wrapper materialization and descriptor reporting
+    /// can share one attribute representation.
+    pub fn get_property_attributes(&self, key: &str) -> Option<PropertyAttributes> {
+        let allowed =
+            self.check_access(AccessCheckOperation::NamedQuery, AccessCheckKey::Named(key));
+        let flags = self
+            .named_handler
+            .as_ref()
+            .map(|c| c.flags())
+            .unwrap_or(NamedPropertyHandlerFlags::NONE);
+        let all_can_read = flags.contains(NamedPropertyHandlerFlags::ALL_CAN_READ);
+        let non_masking = flags.contains(NamedPropertyHandlerFlags::NON_MASKING);
+        if let Some(cfg) = &self.named_handler
+            && let Some(query) = cfg.query()
+            && (allowed || all_can_read)
+            && (!non_masking || !self.properties.borrow().contains_key(key))
+            && let Some(bits) = query(key, self.data_ptr())
+        {
+            return Some(property_attrs_from_v8_query_bits(bits));
+        }
+        if !allowed {
+            return None;
+        }
+        self.properties.borrow().attrs(key)
+    }
+
     /// Define a named property through the definer interceptor.
     ///
     /// Access-check denial fails closed as [`DomPropertyDefineResult::Rejected`].
@@ -1698,14 +1890,11 @@ impl DomObjectWrap {
         }
         self.properties
             .borrow()
-            .get(key)
-            .cloned()
-            .map(|value| {
+            .get_with_attrs(key)
+            .map(|(value, attrs)| {
                 DomPropertyDescriptorResult::Descriptor(DomPropertyDescriptor::data(
-                    value,
-                    PropertyAttributes::WRITABLE
-                        | PropertyAttributes::ENUMERABLE
-                        | PropertyAttributes::CONFIGURABLE,
+                    value.clone(),
+                    attrs,
                 ))
             })
             .unwrap_or(DomPropertyDescriptorResult::NotIntercepted)
@@ -2243,6 +2432,8 @@ impl std::fmt::Debug for DomObjectWrap {
             .field("has_named_handler", &self.named_handler.is_some())
             .field("has_indexed_handler", &self.indexed_handler.is_some())
             .field("has_access_check", &self.access_check.is_some())
+            .field("has_call_as_function", &self.call_as_function.is_some())
+            .field("has_construct", &self.construct.is_some())
             .finish()
     }
 }
@@ -3720,6 +3911,58 @@ mod tests {
     }
 
     #[test]
+    fn test_named_query_attributes_convert_v8_bits() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_named_handler(
+            NamedPropertyHandlerConfig::builder()
+                .query(|name, _| match name {
+                    "roHiddenFixed" => Some(
+                        V8_PROPERTY_ATTRIBUTE_READ_ONLY
+                            | V8_PROPERTY_ATTRIBUTE_DONT_ENUM
+                            | V8_PROPERTY_ATTRIBUTE_DONT_DELETE,
+                    ),
+                    "normal" => Some(0),
+                    _ => None,
+                })
+                .build(),
+        );
+
+        let attrs = wrap
+            .get_property_attributes("roHiddenFixed")
+            .expect("query should report property attrs");
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(!attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!attrs.contains(PropertyAttributes::CONFIGURABLE));
+
+        let normal = wrap
+            .get_property_attributes("normal")
+            .expect("zero v8 attrs should mean default attrs");
+        assert!(normal.contains(PropertyAttributes::WRITABLE));
+        assert!(normal.contains(PropertyAttributes::ENUMERABLE));
+        assert!(normal.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_named_descriptor_fallback_preserves_own_property_attrs() {
+        let wrap = DomObjectWrap::new(1);
+        wrap.properties.borrow_mut().insert_with_attrs(
+            "hidden".to_string(),
+            JsValue::Smi(9),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
+        match wrap.get_property_descriptor("hidden") {
+            DomPropertyDescriptorResult::Descriptor(desc) => {
+                assert_eq!(desc.value(), Some(&JsValue::Smi(9)));
+                assert!(!desc.attributes().contains(PropertyAttributes::WRITABLE));
+                assert!(!desc.attributes().contains(PropertyAttributes::ENUMERABLE));
+                assert!(desc.attributes().contains(PropertyAttributes::CONFIGURABLE));
+            }
+            other => panic!("unexpected descriptor result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_named_symbol_descriptor_requires_flag() {
         let mut wrap = DomObjectWrap::new(1);
         wrap.set_named_handler(
@@ -3808,6 +4051,82 @@ mod tests {
                 &DomPropertyDescriptor::data(JsValue::Smi(1), PropertyAttributes::empty())
             ),
             DomPropertyDefineResult::Rejected
+        );
+    }
+
+    #[test]
+    fn test_dom_call_as_function_success_and_args() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_call_as_function_handler(|payload, _| {
+            assert_eq!(payload.receiver(), &JsValue::String("recv".into()));
+            assert_eq!(payload.args(), &[JsValue::Smi(2), JsValue::Smi(3)]);
+            Ok(JsValue::Smi(5))
+        });
+        assert!(wrap.is_callable());
+        assert_eq!(
+            wrap.call_as_function(
+                JsValue::String("recv".into()),
+                vec![JsValue::Smi(2), JsValue::Smi(3)]
+            )
+            .unwrap(),
+            JsValue::Smi(5)
+        );
+    }
+
+    #[test]
+    fn test_dom_construct_success_and_new_target() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_construct_handler(|payload, _| {
+            assert_eq!(payload.new_target(), &JsValue::String("ctor".into()));
+            assert_eq!(payload.args(), &[JsValue::Smi(9)]);
+            Ok(JsValue::String("constructed".into()))
+        });
+        assert!(wrap.is_constructible());
+        assert_eq!(
+            wrap.construct(JsValue::String("ctor".into()), vec![JsValue::Smi(9)])
+                .unwrap(),
+            JsValue::String("constructed".into())
+        );
+    }
+
+    #[test]
+    fn test_dom_call_and_construct_default_non_callable() {
+        let wrap = DomObjectWrap::new(1);
+        assert!(!wrap.is_callable());
+        assert!(!wrap.is_constructible());
+        assert!(
+            wrap.call_as_function(JsValue::Undefined, Vec::new())
+                .is_err()
+        );
+        assert!(wrap.construct(JsValue::Undefined, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn test_dom_callable_access_check_denial_skips_callback() {
+        let calls = Rc::new(RefCell::new(0));
+        let call_count = Rc::clone(&calls);
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_call_as_function_handler(move |_, _| {
+            *call_count.borrow_mut() += 1;
+            Ok(JsValue::Smi(1))
+        });
+        wrap.set_access_check(Box::new(|op, _, _| {
+            !matches!(op, AccessCheckOperation::CallAsFunction)
+        }));
+        assert!(
+            wrap.call_as_function(JsValue::Undefined, Vec::new())
+                .is_err()
+        );
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn test_dom_callable_callback_error_propagates() {
+        let mut wrap = DomObjectWrap::new(1);
+        wrap.set_call_as_function_handler(|_, _| Err(StatorError::TypeError("boom".to_string())));
+        assert!(
+            wrap.call_as_function(JsValue::Undefined, Vec::new())
+                .is_err()
         );
     }
 }

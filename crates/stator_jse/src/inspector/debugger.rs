@@ -60,11 +60,16 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::builtins::error::call_stack_depth;
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::StatorError;
+use crate::interpreter::InterpreterFrame;
+use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -86,6 +91,223 @@ pub enum PauseReason {
     Step,
     /// An exception was thrown and `pause_on_exceptions` is enabled.
     Exception,
+}
+
+/// A single pause event recorded by the interpreter debugger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseEvent {
+    /// Reason for the pause.
+    pub reason: PauseReason,
+    /// Bytecode byte offset where the pause happened.
+    pub bytecode_offset: u32,
+    /// Best-effort 1-based source line for the pause.
+    pub line: u32,
+}
+
+/// Snapshot of the top interpreter frame at a pause site.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PauseFrameSnapshot {
+    /// Declared parameter register count.
+    pub parameter_count: u32,
+    /// Local/temporary register count.
+    pub frame_size: u32,
+    /// Flat register snapshot: `[params..., locals...]`.
+    pub registers: Vec<JsValue>,
+    /// Captured context-slot chains, inner scope first.
+    pub context_slots: Vec<Vec<JsValue>>,
+    /// Accumulator value at the pause site.
+    pub accumulator: JsValue,
+}
+
+impl PauseFrameSnapshot {
+    /// Capture an interpreter frame using `accumulator`, which may be newer
+    /// than `frame.accumulator` in the hot dispatch loop.
+    pub fn from_frame(frame: &InterpreterFrame, accumulator: &JsValue) -> Self {
+        Self {
+            parameter_count: frame.bytecode_array.parameter_count(),
+            frame_size: frame.bytecode_array.frame_size(),
+            registers: frame.registers.iter().map(JsValue::cheap_clone).collect(),
+            context_slots: capture_context_slots(frame.context.as_ref()),
+            accumulator: accumulator.cheap_clone(),
+        }
+    }
+}
+
+fn capture_context_slots(context: Option<&JsValue>) -> Vec<Vec<JsValue>> {
+    let mut scopes = Vec::new();
+    let mut next = match context {
+        Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+        _ => None,
+    };
+    while let Some(context) = next {
+        let borrowed = context.borrow();
+        scopes.push(borrowed.slots.iter().map(JsValue::cheap_clone).collect());
+        next = borrowed.parent.as_ref().map(Rc::clone);
+    }
+    scopes
+}
+
+fn frame_context_at(
+    frame: &InterpreterFrame,
+    context_index: usize,
+) -> Option<Rc<RefCell<crate::objects::value::JsContext>>> {
+    let mut next = match frame.context.as_ref() {
+        Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+        _ => None,
+    };
+    for _ in 0..context_index {
+        let context = next?;
+        next = context.borrow().parent.as_ref().map(Rc::clone);
+    }
+    next
+}
+
+/// Cross-thread pause/resume bridge for a debugger attached to an interpreter.
+///
+/// The interpreter thread publishes a [`PauseEvent`] and blocks in
+/// [`DebuggerPauseBridge::publish_and_wait`] until a CDP transport thread calls
+/// [`DebuggerPauseBridge::resume`].  This lets a WebSocket session deliver
+/// `Debugger.paused` and `Debugger.resume` without moving the interpreter's
+/// non-`Send` state across threads.
+#[derive(Debug, Clone)]
+pub struct DebuggerPauseBridge {
+    inner: Arc<DebuggerPauseBridgeInner>,
+}
+
+#[derive(Debug)]
+struct DebuggerPauseBridgeInner {
+    state: Mutex<DebuggerPauseBridgeState>,
+    resumed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DebuggerPauseBridgeState {
+    events: VecDeque<PauseEvent>,
+    paused: bool,
+    resume_action: Option<DebugAction>,
+    pause_requested: bool,
+    disconnected: bool,
+}
+
+impl Default for DebuggerPauseBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DebuggerPauseBridge {
+    /// Create a new pause bridge with no pending pause.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DebuggerPauseBridgeInner {
+                state: Mutex::new(DebuggerPauseBridgeState::default()),
+                resumed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// Returns `true` while an interpreter thread is blocked in a pause.
+    pub fn is_paused(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned")
+            .paused
+    }
+
+    /// Drain queued pause events in FIFO order.
+    pub fn take_pause_events(&self) -> Vec<PauseEvent> {
+        self.inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned")
+            .events
+            .drain(..)
+            .collect()
+    }
+
+    /// Resume a currently blocked interpreter pause.
+    ///
+    /// Returns `false` when there is no active pause, avoiding stale resume
+    /// actions being consumed by a future pause.
+    pub fn resume(&self, action: DebugAction) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if !state.paused {
+            return false;
+        }
+        state.resume_action = Some(action);
+        state.paused = false;
+        self.inner.resumed.notify_all();
+        true
+    }
+
+    /// Request that the interpreter pause at its next debugger poll.
+    pub fn request_pause(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if !state.disconnected {
+            state.pause_requested = true;
+        }
+    }
+
+    fn take_pause_request(&self) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if state.disconnected {
+            return false;
+        }
+        let requested = state.pause_requested;
+        state.pause_requested = false;
+        requested
+    }
+
+    /// Wake any blocked interpreter and prevent future waits.
+    pub fn disconnect(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        state.disconnected = true;
+        state.paused = false;
+        state.pause_requested = false;
+        state.resume_action = Some(DebugAction::Continue);
+        state.events.clear();
+        self.inner.resumed.notify_all();
+    }
+
+    fn publish_and_wait(&self, event: PauseEvent) -> DebugAction {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("debugger pause bridge mutex poisoned");
+        if state.disconnected {
+            return DebugAction::Continue;
+        }
+        state.events.push_back(event);
+        state.paused = true;
+        state.resume_action = None;
+        self.inner.resumed.notify_all();
+        while state.paused && !state.disconnected {
+            state = self
+                .inner
+                .resumed
+                .wait(state)
+                .expect("debugger pause bridge mutex poisoned");
+        }
+        state.resume_action.take().unwrap_or(DebugAction::Continue)
+    }
 }
 
 /// What to do after handling a pause.
@@ -150,6 +372,37 @@ enum StepMode {
     Out { depth: usize },
 }
 
+fn synthetic_register_binding_index(
+    name: &str,
+    parameter_count: usize,
+    register_len: usize,
+) -> Option<usize> {
+    if let Some(index) = name
+        .strip_prefix("$param")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+        .filter(|index| *index < parameter_count)
+    {
+        return (index < register_len).then_some(index);
+    }
+    if let Some(local_index) = name
+        .strip_prefix("$local")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+    {
+        let index = parameter_count.checked_add(local_index)?;
+        return (index < register_len).then_some(index);
+    }
+    None
+}
+
+fn synthetic_context_binding_index(name: &str) -> Option<(usize, usize)> {
+    let suffix = name.strip_prefix("$context")?;
+    let (context_index, slot_suffix) = suffix.split_once("_slot")?;
+    Some((
+        context_index.parse::<usize>().ok()?,
+        slot_suffix.parse::<usize>().ok()?,
+    ))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Debugger
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,11 +425,17 @@ enum StepMode {
 pub struct Debugger {
     /// Active breakpoints, keyed by bytecode byte offset.
     breakpoints: HashMap<u32, Breakpoint>,
+    /// Breakpoints that remove themselves after the first pause.
+    one_shot_breakpoints: HashSet<BreakpointId>,
+    /// Whether user-installed breakpoints are allowed to pause execution.
+    breakpoints_active: bool,
     /// Monotonically increasing breakpoint ID counter.
     next_id: BreakpointId,
     /// When `true`, any `Throw` instruction causes a pause before the
     /// exception propagates.
     pub pause_on_exceptions: bool,
+    /// When `true`, all pause sources are ignored until cleared.
+    skip_all_pauses: bool,
     /// Current stepping state.
     step_mode: StepMode,
     /// When `true`, the next call to [`Self::check_pause_at`] is skipped
@@ -191,6 +450,18 @@ pub struct Debugger {
     last_pause_reason: Option<PauseReason>,
     /// Cached bytecode offset from the most recent pause.
     last_pause_offset: u32,
+    /// FIFO pause events waiting for inspector fan-out.
+    pause_events: VecDeque<PauseEvent>,
+    /// Optional cross-thread bridge used by transport-backed CDP sessions.
+    pause_bridge: Option<DebuggerPauseBridge>,
+    /// One-shot request from `Debugger.pause`.
+    pause_requested: bool,
+    /// Snapshot of the top frame at the most recent pause, when available.
+    last_pause_frame: Option<PauseFrameSnapshot>,
+    /// Mutations requested for the current paused frame, applied on resume.
+    pending_frame_mutations: Vec<(String, JsValue)>,
+    /// Context-slot mutations requested for the current paused frame.
+    pending_context_mutations: Vec<(usize, usize, JsValue)>,
 }
 
 impl Default for Debugger {
@@ -205,13 +476,22 @@ impl Debugger {
     pub fn new() -> Self {
         Self {
             breakpoints: HashMap::new(),
+            one_shot_breakpoints: HashSet::new(),
+            breakpoints_active: true,
             next_id: 1,
             pause_on_exceptions: false,
+            skip_all_pauses: false,
             step_mode: StepMode::None,
             skip_next: false,
             exception_resume: false,
             last_pause_reason: None,
             last_pause_offset: 0,
+            pause_events: VecDeque::new(),
+            pause_bridge: None,
+            pause_requested: false,
+            last_pause_frame: None,
+            pending_frame_mutations: Vec::new(),
+            pending_context_mutations: Vec::new(),
         }
     }
 
@@ -240,6 +520,20 @@ impl Debugger {
         id
     }
 
+    /// Install a breakpoint that removes itself after its first pause.
+    ///
+    /// Returns the new breakpoint's [`BreakpointId`].
+    pub fn set_one_shot_breakpoint_at_offset(
+        &mut self,
+        offset: u32,
+        line: u32,
+        column: u32,
+    ) -> BreakpointId {
+        let id = self.set_breakpoint_at_offset(offset, line, column);
+        self.one_shot_breakpoints.insert(id);
+        id
+    }
+
     /// Install a breakpoint at the first bytecode position that maps to
     /// `line` in the source-position table of `bytecodes`.
     ///
@@ -264,12 +558,23 @@ impl Debugger {
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> bool {
         let before = self.breakpoints.len();
         self.breakpoints.retain(|_, bp| bp.id != id);
+        self.one_shot_breakpoints.remove(&id);
         self.breakpoints.len() < before
     }
 
     /// Return an iterator over all currently installed [`Breakpoint`]s.
     pub fn breakpoints(&self) -> impl Iterator<Item = &Breakpoint> {
         self.breakpoints.values()
+    }
+
+    /// Enable or disable user-installed breakpoints without removing them.
+    pub fn set_breakpoints_active(&mut self, active: bool) {
+        self.breakpoints_active = active;
+    }
+
+    /// Return whether user-installed breakpoints are currently active.
+    pub fn breakpoints_active(&self) -> bool {
+        self.breakpoints_active
     }
 
     // ── Source map ───────────────────────────────────────────────────────────
@@ -303,6 +608,16 @@ impl Debugger {
         self.pause_on_exceptions = enable;
     }
 
+    /// Enable or disable the global "skip all pauses" state.
+    pub fn set_skip_all_pauses(&mut self, skip: bool) {
+        self.skip_all_pauses = skip;
+    }
+
+    /// Return whether every pause source is currently suppressed.
+    pub fn skip_all_pauses(&self) -> bool {
+        self.skip_all_pauses
+    }
+
     // ── Last pause information ───────────────────────────────────────────────
 
     /// The reason for the most recent pause, or `None` if execution has not
@@ -325,6 +640,141 @@ impl Debugger {
             .unwrap_or(0)
     }
 
+    /// Drain recorded pause events in FIFO order.
+    pub fn take_pause_events(&mut self) -> Vec<PauseEvent> {
+        self.pause_events.drain(..).collect()
+    }
+
+    /// Snapshot captured for the most recent pause, if that pause came from a
+    /// path that can observe the interpreter frame.
+    pub fn last_pause_frame_snapshot(&self) -> Option<&PauseFrameSnapshot> {
+        self.last_pause_frame.as_ref()
+    }
+
+    /// Clear the currently active pause after execution is resumed.
+    ///
+    /// Pending frame mutations are intentionally kept: the interpreter applies
+    /// them on the next debug hook before executing resumed bytecode.
+    pub fn clear_last_pause(&mut self) {
+        self.last_pause_reason = None;
+        self.last_pause_frame = None;
+        self.pause_events.clear();
+    }
+
+    /// Mutate a synthetic paused-frame local binding.
+    ///
+    /// The visible snapshot is updated immediately so follow-up
+    /// `evaluateOnCallFrame` calls observe the new value.  The live
+    /// interpreter frame is updated later by
+    /// [`Self::apply_pending_frame_mutations`] when execution resumes.
+    pub fn set_paused_frame_binding(
+        &mut self,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), StatorError> {
+        let Some(snapshot) = self.last_pause_frame.as_mut() else {
+            return Err(StatorError::Internal(
+                "Debugger.setVariableValue: no paused frame snapshot is available".to_string(),
+            ));
+        };
+        let stored_value = value.cheap_clone();
+        if name == "$accumulator" {
+            snapshot.accumulator = stored_value;
+            self.pending_frame_mutations.push((name.to_string(), value));
+            return Ok(());
+        }
+        let Some(index) = synthetic_register_binding_index(
+            name,
+            snapshot.parameter_count as usize,
+            snapshot.registers.len(),
+        ) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown paused-frame binding `{name}`"
+            )));
+        };
+        snapshot.registers[index] = stored_value;
+        self.pending_frame_mutations.push((name.to_string(), value));
+        Ok(())
+    }
+
+    /// Mutate a synthetic paused closure-context binding.
+    pub fn set_paused_context_binding(
+        &mut self,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), StatorError> {
+        let Some(snapshot) = self.last_pause_frame.as_mut() else {
+            return Err(StatorError::Internal(
+                "Debugger.setVariableValue: no paused frame snapshot is available".to_string(),
+            ));
+        };
+        let Some((context_index, slot_index)) = synthetic_context_binding_index(name) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown paused closure binding `{name}`"
+            )));
+        };
+        let Some(slots) = snapshot.context_slots.get_mut(context_index) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown context scope `{context_index}`"
+            )));
+        };
+        let Some(slot) = slots.get_mut(slot_index) else {
+            return Err(StatorError::Internal(format!(
+                "Debugger.setVariableValue: unknown context slot `{name}`"
+            )));
+        };
+        *slot = value.cheap_clone();
+        self.pending_context_mutations
+            .push((context_index, slot_index, value));
+        Ok(())
+    }
+
+    /// Apply pending paused-frame mutations to the live interpreter frame.
+    pub fn apply_pending_frame_mutations(
+        &mut self,
+        frame: &mut InterpreterFrame,
+        accumulator: &mut JsValue,
+    ) {
+        if self.pending_frame_mutations.is_empty() && self.pending_context_mutations.is_empty() {
+            return;
+        }
+        let parameter_count = frame.bytecode_array.parameter_count() as usize;
+        let register_len = frame.registers.len();
+        for (name, value) in self.pending_frame_mutations.drain(..) {
+            if name == "$accumulator" {
+                *accumulator = value.cheap_clone();
+                frame.accumulator = value;
+            } else if let Some(index) =
+                synthetic_register_binding_index(&name, parameter_count, register_len)
+            {
+                frame.registers[index] = value;
+            }
+        }
+        for (context_index, slot_index, value) in self.pending_context_mutations.drain(..) {
+            if let Some(context) = frame_context_at(frame, context_index) {
+                let mut context = context.borrow_mut();
+                if slot_index < context.slots.len() {
+                    context.slots[slot_index] = value;
+                }
+            }
+        }
+    }
+
+    /// Attach an opt-in cross-thread pause bridge.
+    ///
+    /// When attached, pause sites block until the bridge receives a resume or
+    /// step action.  Without a bridge, the historical in-process behaviour is
+    /// preserved: pause sites return [`StatorError::DebuggerPaused`] and the
+    /// embedder re-enters the interpreter manually.
+    pub fn set_pause_bridge(&mut self, bridge: DebuggerPauseBridge) {
+        self.pause_bridge = Some(bridge);
+    }
+
+    /// Request a pause at the next debugger poll.
+    pub fn request_pause(&mut self) {
+        self.pause_requested = true;
+    }
+
     // ── Interpreter callbacks ────────────────────────────────────────────────
 
     /// Called by the interpreter **before** each instruction is fetched and
@@ -338,6 +788,28 @@ impl Debugger {
     /// re-pausing at the same offset immediately after resuming from a
     /// breakpoint or step pause.
     pub fn check_pause_at(&mut self, offset: u32) -> Option<StatorError> {
+        let (reason, hit_breakpoint_id) = self.pause_reason_at(offset)?;
+        self.finish_pause(reason, offset, hit_breakpoint_id, None)
+    }
+
+    /// Like [`Self::check_pause_at`], but captures a frame snapshot only when
+    /// the offset actually pauses.
+    pub fn check_pause_at_with_frame<F>(
+        &mut self,
+        offset: u32,
+        frame_snapshot: F,
+    ) -> Option<StatorError>
+    where
+        F: FnOnce() -> PauseFrameSnapshot,
+    {
+        let (reason, hit_breakpoint_id) = self.pause_reason_at(offset)?;
+        self.finish_pause(reason, offset, hit_breakpoint_id, Some(frame_snapshot()))
+    }
+
+    fn pause_reason_at(&mut self, offset: u32) -> Option<(PauseReason, Option<BreakpointId>)> {
+        if self.skip_all_pauses {
+            return None;
+        }
         // After a breakpoint or step pause, skip once to avoid re-pausing at
         // the same instruction when the interpreter is re-entered.
         if self.skip_next {
@@ -345,8 +817,23 @@ impl Debugger {
             return None;
         }
 
-        let reason = if let Some(bp) = self.breakpoints.get(&offset) {
-            PauseReason::Breakpoint(bp.id)
+        if self.pause_requested
+            || self
+                .pause_bridge
+                .as_ref()
+                .is_some_and(DebuggerPauseBridge::take_pause_request)
+        {
+            self.pause_requested = false;
+            return Some((PauseReason::Step, None));
+        }
+
+        let hit_breakpoint_id = if self.breakpoints_active {
+            self.breakpoints.get(&offset).map(|bp| bp.id)
+        } else {
+            None
+        };
+        let reason = if let Some(id) = hit_breakpoint_id {
+            PauseReason::Breakpoint(id)
         } else {
             let depth = call_stack_depth();
             match self.step_mode {
@@ -357,8 +844,27 @@ impl Debugger {
                 _ => return None,
             }
         };
+        Some((reason, hit_breakpoint_id))
+    }
 
-        self.record_pause(reason, offset);
+    fn finish_pause(
+        &mut self,
+        reason: PauseReason,
+        offset: u32,
+        hit_breakpoint_id: Option<BreakpointId>,
+        frame_snapshot: Option<PauseFrameSnapshot>,
+    ) -> Option<StatorError> {
+        self.last_pause_frame = frame_snapshot;
+        let bridge_action = self.record_pause(reason, offset);
+        if let Some(id) = hit_breakpoint_id
+            && self.one_shot_breakpoints.remove(&id)
+        {
+            self.breakpoints.remove(&offset);
+        }
+        if let Some(action) = bridge_action {
+            self.apply_blocking_resume_action(action);
+            return None;
+        }
         Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
         })
@@ -366,33 +872,60 @@ impl Debugger {
 
     /// Called by the interpreter when a `debugger;` statement is executed.
     ///
-    /// Always returns `StatorError::DebuggerPaused` (the debugger is only
-    /// called when the hook is active).
-    pub fn on_debugger_statement(&mut self, offset: u32) -> StatorError {
-        self.record_pause(PauseReason::DebuggerStatement, offset);
+    /// Returns `Some(StatorError::DebuggerPaused)` for the historical
+    /// in-process pause path, or `None` after an attached cross-thread bridge
+    /// has synchronously resumed execution.
+    pub fn on_debugger_statement(&mut self, offset: u32) -> Option<StatorError> {
+        self.on_debugger_statement_with_frame(offset, None)
+    }
+
+    /// Like [`Self::on_debugger_statement`], with a captured top-frame snapshot.
+    pub fn on_debugger_statement_with_frame(
+        &mut self,
+        offset: u32,
+        frame_snapshot: Option<PauseFrameSnapshot>,
+    ) -> Option<StatorError> {
+        self.last_pause_frame = frame_snapshot;
+        if let Some(action) = self.record_pause(PauseReason::DebuggerStatement, offset) {
+            self.apply_blocking_resume_action(action);
+            return None;
+        }
         // Debugger statements do not need skip_next: the program counter is
         // already past the statement when the pause fires.
-        StatorError::DebuggerPaused {
+        Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
-        }
+        })
     }
 
     /// Called by the interpreter when a `Throw` instruction is about to
     /// execute and `pause_on_exceptions` is `true`.
     ///
-    /// Returns `StatorError::DebuggerPaused`.  The program counter will have
-    /// been backed up to the `Throw` instruction so that resuming with
-    /// [`DebugAction::Continue`] allows the exception to propagate.
-    pub fn on_exception(&mut self, offset: u32) -> StatorError {
+    /// Returns `Some(StatorError::DebuggerPaused)` for the historical
+    /// in-process pause path, or `None` after an attached cross-thread bridge
+    /// has synchronously resumed execution.
+    pub fn on_exception(&mut self, offset: u32) -> Option<StatorError> {
+        self.on_exception_with_frame(offset, None)
+    }
+
+    /// Like [`Self::on_exception`], with a captured top-frame snapshot.
+    pub fn on_exception_with_frame(
+        &mut self,
+        offset: u32,
+        frame_snapshot: Option<PauseFrameSnapshot>,
+    ) -> Option<StatorError> {
+        self.last_pause_frame = frame_snapshot;
+        if let Some(action) = self.record_pause(PauseReason::Exception, offset) {
+            self.apply_blocking_resume_action(action);
+            return None;
+        }
         // skip_next is set so that the pre-fetch check skips the Throw
         // instruction when execution is resumed.  exception_resume prevents
         // the Throw handler from re-pausing on the second execution.
         self.skip_next = true;
         self.exception_resume = true;
-        self.record_pause(PauseReason::Exception, offset);
-        StatorError::DebuggerPaused {
+        Some(StatorError::DebuggerPaused {
             bytecode_offset: offset,
-        }
+        })
     }
 
     /// Query whether the current `Throw` execution is a *resume* after an
@@ -433,16 +966,44 @@ impl Debugger {
         };
     }
 
+    fn apply_blocking_resume_action(&mut self, action: DebugAction) {
+        let depth = call_stack_depth();
+        self.step_mode = match action {
+            DebugAction::Continue => StepMode::None,
+            DebugAction::StepInto => StepMode::Into,
+            DebugAction::StepOver => StepMode::Over { depth },
+            DebugAction::StepOut => StepMode::Out { depth },
+        };
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Record a pause event (updates `last_pause_reason` and
     /// `last_pause_offset`).  Resets the step mode to `None` so that a fresh
     /// [`apply_action`](Self::apply_action) call is required to set the next
     /// step direction.
-    fn record_pause(&mut self, reason: PauseReason, offset: u32) {
+    fn record_pause(&mut self, reason: PauseReason, offset: u32) -> Option<DebugAction> {
+        self.pending_frame_mutations.clear();
+        self.pending_context_mutations.clear();
         self.last_pause_reason = Some(reason);
         self.last_pause_offset = offset;
         self.step_mode = StepMode::None;
+        let line = self.last_pause_line();
+        let reason = self
+            .last_pause_reason
+            .as_ref()
+            .expect("just stored pause reason")
+            .clone();
+        let event = PauseEvent {
+            reason,
+            bytecode_offset: offset,
+            line,
+        };
+        if let Some(bridge) = &self.pause_bridge {
+            return Some(bridge.publish_and_wait(event));
+        }
+        self.pause_events.push_back(event);
+        None
     }
 }
 
@@ -454,17 +1015,32 @@ impl Debugger {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use crate::bytecode::bytecode_array::{BytecodeArray, SourcePosition};
     use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
     use crate::bytecode::feedback::FeedbackMetadata;
     use crate::error::StatorError;
     use crate::interpreter::{Interpreter, InterpreterFrame, attach_debugger, detach_debugger};
-    use crate::objects::value::JsValue;
+    use crate::objects::value::{JsContext, JsValue};
 
     use super::*;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn wait_until_paused(bridge: &DebuggerPauseBridge) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if bridge.is_paused() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        bridge.disconnect();
+        panic!("debugger pause bridge did not enter paused state");
+    }
 
     /// Build a `BytecodeArray` from a list of instructions, with source
     /// positions mapping instruction index N → line N+1.
@@ -490,6 +1066,169 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         )
+    }
+
+    #[test]
+    fn test_pause_bridge_blocks_until_resume() {
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut dbg = Debugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 7, 1);
+            tx.send(()).unwrap();
+            assert!(dbg.check_pause_at(0).is_none());
+            dbg.last_pause_reason().cloned()
+        });
+
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until_paused(&bridge);
+        let events = bridge.take_pause_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, PauseReason::Breakpoint(1));
+        assert_eq!(events[0].line, 7);
+        assert!(bridge.resume(DebugAction::Continue));
+        assert_eq!(handle.join().unwrap(), Some(PauseReason::Breakpoint(1)));
+    }
+
+    #[test]
+    fn test_pause_bridge_resume_without_pause_is_noop() {
+        let bridge = DebuggerPauseBridge::new();
+        assert!(!bridge.resume(DebugAction::Continue));
+    }
+
+    #[test]
+    fn test_pause_bridge_disconnect_unblocks_interpreter() {
+        let bridge = DebuggerPauseBridge::new();
+        let worker_bridge = bridge.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut dbg = Debugger::new();
+            dbg.set_pause_bridge(worker_bridge);
+            dbg.set_breakpoint_at_offset(0, 1, 1);
+            tx.send(()).unwrap();
+            dbg.check_pause_at(0).is_none()
+        });
+
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until_paused(&bridge);
+        bridge.disconnect();
+        assert!(handle.join().unwrap());
+        assert!(!bridge.is_paused());
+    }
+
+    #[test]
+    fn test_pause_request_pauses_at_next_offset() {
+        let mut dbg = Debugger::new();
+        dbg.request_pause();
+        assert!(
+            dbg.check_pause_at_with_frame(0, || PauseFrameSnapshot {
+                parameter_count: 0,
+                frame_size: 0,
+                registers: vec![],
+                context_slots: vec![],
+                accumulator: JsValue::Smi(1),
+            })
+            .is_some()
+        );
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Step));
+        assert_eq!(dbg.last_pause_offset(), 0);
+        assert!(dbg.last_pause_frame_snapshot().is_some());
+    }
+
+    #[test]
+    fn test_pause_frame_snapshot_captured_on_breakpoint_pause() {
+        let ba = Rc::new(make_bytecodes_with_positions(vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]));
+        let mut frame = InterpreterFrame::new(Rc::clone(&ba), vec![]);
+        frame.registers[0] = JsValue::Smi(41);
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+
+        assert!(
+            dbg.check_pause_at_with_frame(0, || {
+                PauseFrameSnapshot::from_frame(&frame, &JsValue::Smi(9))
+            })
+            .is_some()
+        );
+        let snapshot = dbg.last_pause_frame_snapshot().unwrap();
+        assert_eq!(snapshot.parameter_count, 0);
+        assert_eq!(snapshot.frame_size, 1);
+        assert_eq!(snapshot.registers[0], JsValue::Smi(41));
+        assert_eq!(snapshot.accumulator, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_paused_frame_binding_mutation_applies_on_resume() {
+        let ba = Rc::new(make_bytecodes_with_positions(vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]));
+        let mut frame = InterpreterFrame::new(Rc::clone(&ba), vec![]);
+        frame.registers[0] = JsValue::Smi(41);
+        let mut accumulator = JsValue::Smi(1);
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .check_pause_at_with_frame(0, || PauseFrameSnapshot::from_frame(&frame, &accumulator));
+
+        dbg.set_paused_frame_binding("$local0", JsValue::Smi(99))
+            .unwrap();
+        dbg.set_paused_frame_binding("$accumulator", JsValue::Smi(7))
+            .unwrap();
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().registers[0],
+            JsValue::Smi(99)
+        );
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().accumulator,
+            JsValue::Smi(7)
+        );
+
+        dbg.apply_pending_frame_mutations(&mut frame, &mut accumulator);
+        assert_eq!(frame.registers[0], JsValue::Smi(99));
+        assert_eq!(accumulator, JsValue::Smi(7));
+        assert_eq!(frame.accumulator, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_paused_context_binding_mutation_applies_on_resume() {
+        let ba = Rc::new(make_bytecodes_with_positions(vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]));
+        let parent_context = JsContext::new(1, None);
+        parent_context.borrow_mut().slots[0] = JsValue::Smi(11);
+        let inner_context = JsContext::new(1, Some(Rc::clone(&parent_context)));
+        inner_context.borrow_mut().slots[0] = JsValue::Smi(7);
+
+        let mut frame = InterpreterFrame::new(Rc::clone(&ba), vec![]);
+        frame.context = Some(JsValue::Context(Rc::clone(&inner_context)));
+        let mut accumulator = JsValue::Undefined;
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        let _ = dbg
+            .check_pause_at_with_frame(0, || PauseFrameSnapshot::from_frame(&frame, &accumulator));
+
+        dbg.set_paused_context_binding("$context0_slot0", JsValue::Smi(70))
+            .unwrap();
+        dbg.set_paused_context_binding("$context1_slot0", JsValue::Smi(110))
+            .unwrap();
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().context_slots[0][0],
+            JsValue::Smi(70)
+        );
+        assert_eq!(
+            dbg.last_pause_frame_snapshot().unwrap().context_slots[1][0],
+            JsValue::Smi(110)
+        );
+
+        dbg.apply_pending_frame_mutations(&mut frame, &mut accumulator);
+        assert_eq!(inner_context.borrow().slots[0], JsValue::Smi(70));
+        assert_eq!(parent_context.borrow().slots[0], JsValue::Smi(110));
     }
 
     // ── Breakpoint management ─────────────────────────────────────────────────
@@ -533,6 +1272,64 @@ mod tests {
 
         let mut dbg = Debugger::new();
         assert!(dbg.set_breakpoint_at_line(&ba, 99).is_none());
+    }
+
+    #[test]
+    fn test_breakpoints_active_suppresses_breakpoint_without_removing_it() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_breakpoint_at_offset(0, 1, 1);
+        dbg.set_breakpoints_active(false);
+
+        assert!(!dbg.breakpoints_active());
+        assert!(dbg.check_pause_at(0).is_none());
+        assert!(dbg.breakpoints().any(|bp| bp.id == id));
+
+        dbg.set_breakpoints_active(true);
+        assert!(dbg.check_pause_at(0).is_some());
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
+    }
+
+    #[test]
+    fn test_one_shot_breakpoint_removes_itself_after_pause() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_one_shot_breakpoint_at_offset(0, 1, 1);
+
+        assert!(dbg.check_pause_at(0).is_some());
+        assert_eq!(dbg.last_pause_reason(), Some(&PauseReason::Breakpoint(id)));
+        assert!(!dbg.breakpoints().any(|bp| bp.id == id));
+        assert!(dbg.check_pause_at(0).is_none());
+    }
+
+    #[test]
+    fn test_pause_events_drain_in_fifo_order() {
+        let mut dbg = Debugger::new();
+        let id = dbg.set_breakpoint_at_offset(0, 3, 1);
+
+        assert!(dbg.check_pause_at(0).is_some());
+        let _ = dbg.on_debugger_statement(9);
+
+        let events = dbg.take_pause_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].reason, PauseReason::Breakpoint(id));
+        assert_eq!(events[0].bytecode_offset, 0);
+        assert_eq!(events[0].line, 3);
+        assert_eq!(events[1].reason, PauseReason::DebuggerStatement);
+        assert!(dbg.take_pause_events().is_empty());
+    }
+
+    #[test]
+    fn test_skip_all_pauses_suppresses_breakpoints_and_steps() {
+        let mut dbg = Debugger::new();
+        dbg.set_breakpoint_at_offset(0, 1, 1);
+        dbg.apply_action(DebugAction::StepInto);
+        dbg.set_skip_all_pauses(true);
+
+        assert!(dbg.skip_all_pauses());
+        assert!(dbg.check_pause_at(0).is_none());
+        assert!(dbg.check_pause_at(1).is_none());
+
+        dbg.set_skip_all_pauses(false);
+        assert!(dbg.check_pause_at(0).is_some());
     }
 
     // ── Source map ────────────────────────────────────────────────────────────

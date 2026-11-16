@@ -19,14 +19,16 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use stator_jse::builtins::error::clear_call_stack;
+use stator_jse::builtins::error::{JsError, clear_call_stack};
 use stator_jse::builtins::install_globals::install_globals;
 use stator_jse::builtins::promise::drain_active_microtask_queue;
+use stator_jse::builtins::typed_array::{JsArrayBuffer, JsDataView, JsTypedArray};
+use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::error::StatorError;
 use stator_jse::interpreter::{
@@ -34,7 +36,7 @@ use stator_jse::interpreter::{
 };
 use stator_jse::objects::property_map::PropertyMap;
 use stator_jse::objects::string_intern::clear_intern_pool;
-use stator_jse::objects::value::JsValue;
+use stator_jse::objects::value::{JsContext, JsContextMappedArgumentAlias, JsValue};
 use stator_jse::parser;
 
 // ─── Guarded global allocator ────────────────────────────────────────────────
@@ -151,6 +153,323 @@ enum TestOutcome {
     Pass,
     Fail(String),
     Skip(String),
+}
+
+#[derive(Default)]
+struct Test262TemplateGlobalCloner {
+    plain_objects: HashMap<usize, Rc<RefCell<PropertyMap>>>,
+    arrays: HashMap<usize, Rc<RefCell<Vec<JsValue>>>>,
+    contexts: HashMap<usize, Rc<RefCell<JsContext>>>,
+    errors: HashMap<usize, Rc<JsError>>,
+    functions: HashMap<usize, Rc<BytecodeArray>>,
+    array_buffers: HashMap<usize, Rc<RefCell<JsArrayBuffer>>>,
+    typed_arrays: HashMap<usize, Rc<RefCell<JsTypedArray>>>,
+    data_views: HashMap<usize, Rc<RefCell<JsDataView>>>,
+    mapped_argument_liveness: HashMap<usize, Rc<Cell<bool>>>,
+    errors_in_progress: HashSet<usize>,
+    functions_in_progress: HashSet<usize>,
+}
+
+impl Test262TemplateGlobalCloner {
+    fn clone_globals(
+        globals: &HashMap<String, JsValue>,
+    ) -> Result<HashMap<String, JsValue>, String> {
+        let mut cloner = Self::default();
+        globals
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), cloner.clone_value(value)?)))
+            .collect()
+    }
+
+    fn clone_value(&mut self, value: &JsValue) -> Result<JsValue, String> {
+        Ok(match value {
+            JsValue::Undefined => JsValue::Undefined,
+            JsValue::Null => JsValue::Null,
+            JsValue::TheHole => JsValue::TheHole,
+            JsValue::Boolean(value) => JsValue::Boolean(*value),
+            JsValue::Smi(value) => JsValue::Smi(*value),
+            JsValue::HeapNumber(value) => JsValue::HeapNumber(*value),
+            JsValue::String(value) => JsValue::String(Rc::clone(value)),
+            JsValue::Symbol(value) => JsValue::Symbol(*value),
+            JsValue::BigInt(value) => JsValue::BigInt(value.clone()),
+            JsValue::Function(function) => JsValue::Function(self.clone_function(function)?),
+            JsValue::Array(array) => JsValue::Array(self.clone_array(array)?),
+            JsValue::Error(error) => JsValue::Error(self.clone_error(error)?),
+            JsValue::NativeFunction(function) => JsValue::NativeFunction(Rc::clone(function)),
+            JsValue::PlainObject(object) => JsValue::PlainObject(self.clone_plain_object(object)?),
+            JsValue::Context(context) => JsValue::Context(self.clone_context(context)?),
+            JsValue::ArrayBuffer(buffer) => JsValue::ArrayBuffer(self.clone_array_buffer(buffer)?),
+            JsValue::TypedArray(array) => JsValue::TypedArray(self.clone_typed_array(array)?),
+            JsValue::DataView(view) => JsValue::DataView(self.clone_data_view(view)?),
+            JsValue::Object(_) => return Err("unsupported runtime-only Object value".to_string()),
+            JsValue::Promise(_) => {
+                return Err("unsupported runtime-only Promise value".to_string());
+            }
+            JsValue::Proxy(_) => return Err("unsupported runtime-only Proxy value".to_string()),
+            JsValue::Generator(_) => {
+                return Err("unsupported runtime-only Generator value".to_string());
+            }
+            JsValue::Iterator(_) => {
+                return Err("unsupported runtime-only Iterator value".to_string());
+            }
+            JsValue::ModuleBinding(_) => {
+                return Err("unsupported runtime-only ModuleBinding value".to_string());
+            }
+        })
+    }
+
+    fn clone_plain_object(
+        &mut self,
+        object: &Rc<RefCell<PropertyMap>>,
+    ) -> Result<Rc<RefCell<PropertyMap>>, String> {
+        let key = rc_key(object);
+        if let Some(cloned) = self.plain_objects.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let cloned = Rc::new(RefCell::new(PropertyMap::new()));
+        self.plain_objects.insert(key, Rc::clone(&cloned));
+
+        let cloned_map = self.clone_property_map(&object.borrow())?;
+        *cloned.borrow_mut() = cloned_map;
+
+        Ok(cloned)
+    }
+
+    fn clone_property_map(&mut self, source: &PropertyMap) -> Result<PropertyMap, String> {
+        let entries = source
+            .iter_with_attrs()
+            .map(|(name, value, attrs)| (Rc::clone(name), value.clone(), attrs))
+            .collect::<Vec<_>>();
+        let accessor_names = source
+            .accessor_property_names()
+            .map(Rc::<str>::from)
+            .collect::<Vec<_>>();
+        let extensible = source.extensible;
+
+        let mut cloned = PropertyMap::new();
+        for (name, value, attrs) in entries {
+            cloned.insert_with_attrs_rc(name, self.clone_value(&value)?, attrs);
+        }
+        for name in accessor_names {
+            cloned.mark_accessor_property(name);
+        }
+        cloned.extensible = extensible;
+        Ok(cloned)
+    }
+
+    fn clone_array(
+        &mut self,
+        array: &Rc<RefCell<Vec<JsValue>>>,
+    ) -> Result<Rc<RefCell<Vec<JsValue>>>, String> {
+        let key = rc_key(array);
+        if let Some(cloned) = self.arrays.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let cloned = Rc::new(RefCell::new(Vec::new()));
+        self.arrays.insert(key, Rc::clone(&cloned));
+
+        let values = array.borrow().clone();
+        let mut cloned_values = Vec::with_capacity(values.len());
+        for value in values {
+            cloned_values.push(self.clone_value(&value)?);
+        }
+        *cloned.borrow_mut() = cloned_values;
+
+        Ok(cloned)
+    }
+
+    fn clone_context(
+        &mut self,
+        context: &Rc<RefCell<JsContext>>,
+    ) -> Result<Rc<RefCell<JsContext>>, String> {
+        let key = rc_key(context);
+        if let Some(cloned) = self.contexts.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let cloned = Rc::new(RefCell::new(JsContext {
+            slots: Vec::new(),
+            parent: None,
+            mapped_argument_aliases: Vec::new(),
+        }));
+        self.contexts.insert(key, Rc::clone(&cloned));
+
+        let (slots, parent, mapped_argument_aliases) = {
+            let context = context.borrow();
+            (
+                context.slots.clone(),
+                context.parent.clone(),
+                context.mapped_argument_aliases.clone(),
+            )
+        };
+
+        let mut cloned_slots = Vec::with_capacity(slots.len());
+        for value in slots {
+            cloned_slots.push(self.clone_value(&value)?);
+        }
+
+        let cloned_parent = parent
+            .as_ref()
+            .map(|parent| self.clone_context(parent))
+            .transpose()?;
+
+        let mut cloned_aliases = Vec::with_capacity(mapped_argument_aliases.len());
+        for alias in mapped_argument_aliases {
+            cloned_aliases.push(JsContextMappedArgumentAlias {
+                slot_index: alias.slot_index,
+                argument_index: alias.argument_index,
+                object: self.clone_plain_object(&alias.object)?,
+                live: self.clone_mapped_argument_liveness(&alias.live),
+            });
+        }
+
+        *cloned.borrow_mut() = JsContext {
+            slots: cloned_slots,
+            parent: cloned_parent,
+            mapped_argument_aliases: cloned_aliases,
+        };
+
+        Ok(cloned)
+    }
+
+    fn clone_mapped_argument_liveness(&mut self, live: &Rc<Cell<bool>>) -> Rc<Cell<bool>> {
+        let key = rc_key(live);
+        if let Some(cloned) = self.mapped_argument_liveness.get(&key) {
+            return Rc::clone(cloned);
+        }
+
+        let cloned = Rc::new(Cell::new(live.get()));
+        self.mapped_argument_liveness
+            .insert(key, Rc::clone(&cloned));
+        cloned
+    }
+
+    fn clone_error(&mut self, error: &Rc<JsError>) -> Result<Rc<JsError>, String> {
+        let key = rc_key(error);
+        if let Some(cloned) = self.errors.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+        if !self.errors_in_progress.insert(key) {
+            return Err("cyclic Error values are not supported in Test262 template globals".into());
+        }
+
+        let cloned: Result<Rc<JsError>, String> = (|| {
+            let cloned_errors = error
+                .errors
+                .iter()
+                .map(|nested| self.clone_value(nested))
+                .collect::<Result<Vec<_>, _>>()?;
+            let cloned_cause = error
+                .cause
+                .as_ref()
+                .map(|cause| self.clone_value(cause))
+                .transpose()?;
+            let cloned_props = self.clone_property_map(&error.props.borrow())?;
+
+            Ok(Rc::new(JsError {
+                kind: error.kind,
+                message: error.message.clone(),
+                stack: error.stack.clone(),
+                errors: cloned_errors,
+                cause: cloned_cause,
+                props: RefCell::new(cloned_props),
+            }))
+        })();
+        self.errors_in_progress.remove(&key);
+        let cloned = cloned?;
+        self.errors.insert(key, Rc::clone(&cloned));
+        Ok(cloned)
+    }
+
+    fn clone_function(
+        &mut self,
+        function: &Rc<BytecodeArray>,
+    ) -> Result<Rc<BytecodeArray>, String> {
+        let key = rc_key(function);
+        if let Some(cloned) = self.functions.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+        if !self.functions_in_progress.insert(key) {
+            return Err(
+                "cyclic Function/Context values are not supported in Test262 template globals"
+                    .into(),
+            );
+        }
+
+        let cloned_context = function
+            .closure_context()
+            .map(|context| self.clone_context(context))
+            .transpose();
+        self.functions_in_progress.remove(&key);
+        let cloned_context = cloned_context?;
+        if let Some(cloned) = self.functions.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+        let cloned = Rc::new(function.clone_for_closure(cloned_context));
+        self.functions.insert(key, Rc::clone(&cloned));
+        Ok(cloned)
+    }
+
+    fn clone_array_buffer(
+        &mut self,
+        buffer: &Rc<RefCell<JsArrayBuffer>>,
+    ) -> Result<Rc<RefCell<JsArrayBuffer>>, String> {
+        let key = rc_key(buffer);
+        if let Some(cloned) = self.array_buffers.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let cloned = Rc::new(RefCell::new(buffer.borrow().clone()));
+        self.array_buffers.insert(key, Rc::clone(&cloned));
+        Ok(cloned)
+    }
+
+    fn clone_typed_array(
+        &mut self,
+        array: &Rc<RefCell<JsTypedArray>>,
+    ) -> Result<Rc<RefCell<JsTypedArray>>, String> {
+        let key = rc_key(array);
+        if let Some(cloned) = self.typed_arrays.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let array = array.borrow();
+        let cloned = Rc::new(RefCell::new(JsTypedArray {
+            kind: array.kind,
+            buffer: self.clone_array_buffer(&array.buffer)?,
+            byte_offset: array.byte_offset,
+            length: array.length,
+            auto_length: array.auto_length,
+        }));
+        self.typed_arrays.insert(key, Rc::clone(&cloned));
+        Ok(cloned)
+    }
+
+    fn clone_data_view(
+        &mut self,
+        view: &Rc<RefCell<JsDataView>>,
+    ) -> Result<Rc<RefCell<JsDataView>>, String> {
+        let key = rc_key(view);
+        if let Some(cloned) = self.data_views.get(&key) {
+            return Ok(Rc::clone(cloned));
+        }
+
+        let view = view.borrow();
+        let cloned = Rc::new(RefCell::new(JsDataView {
+            buffer: self.clone_array_buffer(&view.buffer)?,
+            byte_offset: view.byte_offset,
+            byte_length: view.byte_length,
+            auto_length: view.auto_length,
+        }));
+        self.data_views.insert(key, Rc::clone(&cloned));
+        Ok(cloned)
+    }
+}
+
+fn rc_key<T>(value: &Rc<T>) -> usize {
+    Rc::as_ptr(value) as usize
 }
 
 // ─── YAML frontmatter parser ─────────────────────────────────────────────────
@@ -370,12 +689,6 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Resizable ArrayBuffer — not yet implemented
-    "resizable-arraybuffer",
-    // Module features that need runtime module loader
-    "arbitrary-module-namespace-names",
-    "import-assertions",
-    "import-attributes",
     // TC39 Stage 3 / new built-ins not yet implemented
     "Temporal",
     "decorators",
@@ -390,16 +703,12 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "explicit-resource-management",
     // Atomics.waitAsync — promise integration not implemented
     "Atomics.waitAsync",
-    // ArrayBuffer.prototype.transfer not implemented
-    "arraybuffer-transfer",
     // Float16Array typed array not implemented
     "Float16Array",
     // Tail-call optimisation not implemented in the interpreter
     "tail-call-optimization",
     // cross-realm — requires full realm support
     "cross-realm",
-    // Symbol.species — defined but constructor integration incomplete
-    "Symbol.species",
     // Intl not implemented
     "Intl-enumeration",
     "Intl.DateTimeFormat-datetimestyle",
@@ -444,27 +753,183 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
     "built-ins/AggregateError/",
 ];
 
+/// Individual tests under otherwise-skipped path prefixes that are supported.
+const SKIPPED_PATH_ALLOWLIST: &[&str] = &[
+    "annexB/built-ins/Date/prototype/toGMTString/prop-desc.js",
+    "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js",
+    "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js",
+    "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js",
+    "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js",
+    "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js",
+    "annexB/built-ins/RegExp/RegExp-leading-escape.js",
+    "annexB/built-ins/RegExp/RegExp-trailing-escape.js",
+    "annexB/built-ins/escape/argument_types.js",
+    "annexB/built-ins/escape/empty-string.js",
+    "annexB/built-ins/escape/unmodified.js",
+    "annexB/built-ins/escape/escape-below.js",
+    "annexB/built-ins/escape/length.js",
+    "annexB/built-ins/escape/name.js",
+    "annexB/built-ins/escape/prop-desc.js",
+    "annexB/built-ins/escape/to-primitive-observe.js",
+    "annexB/built-ins/escape/to-string-err.js",
+    "annexB/built-ins/escape/to-string-err-symbol.js",
+    "annexB/built-ins/escape/to-string-observe.js",
+    "annexB/built-ins/unescape/argument_types.js",
+    "annexB/built-ins/unescape/empty-string.js",
+    "annexB/built-ins/unescape/two.js",
+    "annexB/built-ins/unescape/four.js",
+    "annexB/built-ins/unescape/two-ignore-non-hex.js",
+    "annexB/built-ins/unescape/four-ignore-bad-u.js",
+    "annexB/built-ins/unescape/length.js",
+    "annexB/built-ins/unescape/name.js",
+    "annexB/built-ins/unescape/prop-desc.js",
+    "annexB/built-ins/unescape/to-primitive-observe.js",
+    "annexB/built-ins/unescape/to-string-err.js",
+    "annexB/built-ins/unescape/to-string-observe.js",
+    "annexB/built-ins/String/prototype/anchor/B.2.3.2.js",
+    "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js",
+    "annexB/built-ins/String/prototype/anchor/length.js",
+    "annexB/built-ins/String/prototype/anchor/name.js",
+    "annexB/built-ins/String/prototype/anchor/prop-desc.js",
+    "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/big/B.2.3.3.js",
+    "annexB/built-ins/String/prototype/big/length.js",
+    "annexB/built-ins/String/prototype/big/name.js",
+    "annexB/built-ins/String/prototype/big/prop-desc.js",
+    "annexB/built-ins/String/prototype/big/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/blink/B.2.3.4.js",
+    "annexB/built-ins/String/prototype/blink/length.js",
+    "annexB/built-ins/String/prototype/blink/name.js",
+    "annexB/built-ins/String/prototype/blink/prop-desc.js",
+    "annexB/built-ins/String/prototype/blink/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/bold/B.2.3.5.js",
+    "annexB/built-ins/String/prototype/bold/length.js",
+    "annexB/built-ins/String/prototype/bold/name.js",
+    "annexB/built-ins/String/prototype/bold/prop-desc.js",
+    "annexB/built-ins/String/prototype/bold/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/fixed/B.2.3.6.js",
+    "annexB/built-ins/String/prototype/fixed/length.js",
+    "annexB/built-ins/String/prototype/fixed/name.js",
+    "annexB/built-ins/String/prototype/fixed/prop-desc.js",
+    "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js",
+    "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js",
+    "annexB/built-ins/String/prototype/fontcolor/length.js",
+    "annexB/built-ins/String/prototype/fontcolor/name.js",
+    "annexB/built-ins/String/prototype/fontcolor/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js",
+    "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js",
+    "annexB/built-ins/String/prototype/fontsize/length.js",
+    "annexB/built-ins/String/prototype/fontsize/name.js",
+    "annexB/built-ins/String/prototype/fontsize/prop-desc.js",
+    "annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/italics/B.2.3.9.js",
+    "annexB/built-ins/String/prototype/italics/length.js",
+    "annexB/built-ins/String/prototype/italics/name.js",
+    "annexB/built-ins/String/prototype/italics/prop-desc.js",
+    "annexB/built-ins/String/prototype/italics/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/link/B.2.3.10.js",
+    "annexB/built-ins/String/prototype/link/attr-tostring-err.js",
+    "annexB/built-ins/String/prototype/link/length.js",
+    "annexB/built-ins/String/prototype/link/name.js",
+    "annexB/built-ins/String/prototype/link/prop-desc.js",
+    "annexB/built-ins/String/prototype/link/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/small/B.2.3.11.js",
+    "annexB/built-ins/String/prototype/small/length.js",
+    "annexB/built-ins/String/prototype/small/name.js",
+    "annexB/built-ins/String/prototype/small/prop-desc.js",
+    "annexB/built-ins/String/prototype/small/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/strike/B.2.3.12.js",
+    "annexB/built-ins/String/prototype/strike/length.js",
+    "annexB/built-ins/String/prototype/strike/name.js",
+    "annexB/built-ins/String/prototype/strike/prop-desc.js",
+    "annexB/built-ins/String/prototype/strike/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/sub/B.2.3.13.js",
+    "annexB/built-ins/String/prototype/sub/length.js",
+    "annexB/built-ins/String/prototype/sub/name.js",
+    "annexB/built-ins/String/prototype/sub/prop-desc.js",
+    "annexB/built-ins/String/prototype/sub/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/sup/B.2.3.14.js",
+    "annexB/built-ins/String/prototype/sup/length.js",
+    "annexB/built-ins/String/prototype/sup/name.js",
+    "annexB/built-ins/String/prototype/sup/prop-desc.js",
+    "annexB/built-ins/String/prototype/sup/this-val-tostring-err.js",
+    "annexB/built-ins/String/prototype/substr/B.2.3.js",
+    "annexB/built-ins/String/prototype/substr/length.js",
+    "annexB/built-ins/String/prototype/substr/length-falsey.js",
+    "annexB/built-ins/String/prototype/substr/length-negative.js",
+    "annexB/built-ins/String/prototype/substr/length-positive.js",
+    "annexB/built-ins/String/prototype/substr/name.js",
+    "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
+    "annexB/built-ins/String/prototype/substr/this-to-str-err.js",
+    "annexB/built-ins/String/prototype/substr/start-negative.js",
+    "annexB/built-ins/String/prototype/trimLeft/length.js",
+    "annexB/built-ins/String/prototype/trimLeft/name.js",
+    "annexB/built-ins/String/prototype/trimLeft/prop-desc.js",
+    "annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js",
+    "annexB/built-ins/String/prototype/trimRight/length.js",
+    "annexB/built-ins/String/prototype/trimRight/name.js",
+    "annexB/built-ins/String/prototype/trimRight/prop-desc.js",
+    "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js",
+    "built-ins/AsyncGeneratorFunction/extensibility.js",
+    "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
+    "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
+    "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
+    "built-ins/AsyncFunction/AsyncFunction.js",
+    "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
+    "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+    "built-ins/AsyncFunction/is-not-a-global.js",
+    "built-ins/AggregateError/is-a-constructor.js",
+    "built-ins/AggregateError/cause-property.js",
+    "built-ins/AggregateError/length.js",
+    "built-ins/AggregateError/message-method-prop-cast.js",
+    "built-ins/AggregateError/message-method-prop.js",
+    "built-ins/AggregateError/name.js",
+    "built-ins/AggregateError/newtarget-is-undefined.js",
+    "built-ins/AggregateError/newtarget-proto-custom.js",
+    "built-ins/AggregateError/newtarget-proto.js",
+    "built-ins/AggregateError/prop-desc.js",
+    "built-ins/AggregateError/proto.js",
+    "built-ins/AggregateError/prototype/constructor.js",
+    "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
+    "built-ins/AggregateError/prototype/message.js",
+    "built-ins/AggregateError/prototype/name.js",
+    "built-ins/AggregateError/prototype/prop-desc.js",
+    "built-ins/AggregateError/prototype/proto.js",
+    "built-ins/AggregateError/message-tostring-abrupt.js",
+    "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
+    "built-ins/AggregateError/message-undefined-no-prop.js",
+];
+
 /// Individual test files (relative to the `test/` directory, forward-slash
 /// separated) that are known to hang due to catastrophic backtracking or
 /// other pathological behaviour.
 const SKIPPED_TEST_FILES: &[&str] = &[
     // Catastrophic backtracking: ((.*\n?)*?) in a body-matching regex.
     "built-ins/RegExp/S15.10.2.8_A3_T17.js",
-    // Slow catastrophic backtracking (35+ seconds).
-    "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
     // Slow regex quantifier tests that exceed the per-test deadline.
     "built-ins/RegExp/S15.10.2.8_A3_T15.js",
     "built-ins/RegExp/S15.10.2.8_A3_T16.js",
-    "built-ins/RegExp/S15.10.2.8_A3_T18.js",
 ];
 
 /// Returns `true` when `rel_path` starts with any of the [`SKIPPED_PATH_PREFIXES`]
 /// or exactly matches a [`SKIPPED_TEST_FILES`] entry.
 fn is_skipped_path(rel_path: &str) -> bool {
-    SKIPPED_PATH_PREFIXES
+    !SKIPPED_PATH_ALLOWLIST.contains(&rel_path)
+        && (SKIPPED_PATH_PREFIXES
+            .iter()
+            .any(|prefix| rel_path.starts_with(prefix))
+            || SKIPPED_TEST_FILES.contains(&rel_path))
+}
+
+fn skipped_path_has_allowlisted_descendant(rel_path_with_slash: &str) -> bool {
+    SKIPPED_PATH_ALLOWLIST
         .iter()
-        .any(|prefix| rel_path.starts_with(prefix))
-        || SKIPPED_TEST_FILES.contains(&rel_path)
+        .any(|path| path.starts_with(rel_path_with_slash))
 }
 
 // ─── Test execution ──────────────────────────────────────────────────────────
@@ -1014,7 +1479,12 @@ fn run_test(
     // the $DONE callback into this clone; for sync tests the clone is
     // passed straight through to the interpreter.  Either way, only ONE
     // clone is made per test (previously async tests were cloned twice).
-    let mut test_globals = template_globals.clone();
+    let mut test_globals = match Test262TemplateGlobalCloner::clone_globals(template_globals) {
+        Ok(globals) => globals,
+        Err(error) => {
+            return TestOutcome::Fail(format!("failed to clone Test262 template globals: {error}"));
+        }
+    };
 
     if is_async {
         let dc = done_called.clone();
@@ -1193,11 +1663,20 @@ fn collect_tests(dir: &Path, test_root: &Path, out: &mut Vec<PathBuf>) -> io::Re
             if SKIPPED_PATH_PREFIXES
                 .iter()
                 .any(|prefix| rel_with_slash.starts_with(prefix))
+                && !skipped_path_has_allowlisted_descendant(&rel_with_slash)
             {
                 continue;
             }
             collect_tests(&path, test_root, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            let rel = path
+                .strip_prefix(test_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_skipped_path(&rel) {
+                continue;
+            }
             // Skip _FIXTURE.js files — they are included by other tests via
             // the harness mechanism and are not runnable on their own.
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
@@ -1655,6 +2134,312 @@ fn main_inner() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stator_jse::builtins::error::ErrorKind;
+    use stator_jse::builtins::typed_array::TypedArrayKind;
+    use stator_jse::objects::map::PropertyAttributes;
+
+    // ── Template global cloning ───────────────────────────────────────────────
+
+    #[test]
+    fn template_global_cloner_preserves_cross_global_identity_and_isolates_state() {
+        let shared = Rc::new(RefCell::new(PropertyMap::new()));
+        shared.borrow_mut().insert("value".into(), JsValue::Smi(7));
+
+        let mut globals = HashMap::new();
+        globals.insert("first".into(), JsValue::PlainObject(Rc::clone(&shared)));
+        globals.insert("second".into(), JsValue::PlainObject(Rc::clone(&shared)));
+
+        let cloned = Test262TemplateGlobalCloner::clone_globals(&globals).unwrap();
+        let first = match cloned.get("first").unwrap() {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected cloned plain object, got {value:?}"),
+        };
+        let second = match cloned.get("second").unwrap() {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected cloned plain object, got {value:?}"),
+        };
+
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(!Rc::ptr_eq(&first, &shared));
+
+        shared.borrow_mut().insert("value".into(), JsValue::Smi(9));
+        assert_eq!(first.borrow().get("value"), Some(&JsValue::Smi(7)));
+    }
+
+    #[test]
+    fn template_global_cloner_preserves_graph_identity_inside_arrays() {
+        let shared = Rc::new(RefCell::new(PropertyMap::new()));
+        shared.borrow_mut().insert("name".into(), JsValue::Smi(1));
+
+        let array = Rc::new(RefCell::new(vec![
+            JsValue::PlainObject(Rc::clone(&shared)),
+            JsValue::PlainObject(Rc::clone(&shared)),
+        ]));
+        let mut root = PropertyMap::new();
+        root.insert("child".into(), JsValue::PlainObject(Rc::clone(&shared)));
+        root.insert("array".into(), JsValue::Array(Rc::clone(&array)));
+
+        let cloned = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::PlainObject(Rc::new(RefCell::new(root))))
+            .unwrap();
+        let root = match cloned {
+            JsValue::PlainObject(object) => object,
+            value => panic!("expected cloned plain object, got {value:?}"),
+        };
+        let cloned_child = match root.borrow().get("child").unwrap() {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected cloned child object, got {value:?}"),
+        };
+        let cloned_array = match root.borrow().get("array").unwrap() {
+            JsValue::Array(array) => Rc::clone(array),
+            value => panic!("expected cloned array, got {value:?}"),
+        };
+
+        let first_array_child = match &cloned_array.borrow()[0] {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected first array child object, got {value:?}"),
+        };
+        let second_array_child = match &cloned_array.borrow()[1] {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected second array child object, got {value:?}"),
+        };
+
+        assert!(Rc::ptr_eq(&cloned_child, &first_array_child));
+        assert!(Rc::ptr_eq(&first_array_child, &second_array_child));
+        assert!(!Rc::ptr_eq(&cloned_child, &shared));
+
+        shared.borrow_mut().insert("name".into(), JsValue::Smi(2));
+        assert_eq!(cloned_child.borrow().get("name"), Some(&JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn template_global_cloner_preserves_property_attributes_and_accessor_markers() {
+        let mut source = PropertyMap::new();
+        source.insert_with_attrs(
+            "visible".into(),
+            JsValue::Smi(1),
+            PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
+        );
+        source.insert("__get_visible__".into(), JsValue::Smi(2));
+        source.insert("__set_visible__".into(), JsValue::Smi(3));
+        source.insert("__get_ordinary__".into(), JsValue::Smi(4));
+        source.mark_accessor_property("visible");
+        source.seal();
+
+        let cloned = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::PlainObject(Rc::new(RefCell::new(source))))
+            .unwrap();
+        let cloned = match cloned {
+            JsValue::PlainObject(object) => object,
+            value => panic!("expected cloned plain object, got {value:?}"),
+        };
+        let cloned = cloned.borrow();
+        let (_, visible_attrs) = cloned.get_with_attrs("visible").unwrap();
+        let (_, getter_attrs) = cloned.get_with_attrs("__get_visible__").unwrap();
+
+        assert!(!visible_attrs.contains(PropertyAttributes::CONFIGURABLE));
+        assert!(!getter_attrs.contains(PropertyAttributes::CONFIGURABLE));
+        assert!(cloned.is_sealed());
+        assert!(cloned.is_accessor_property("visible"));
+        assert!(!cloned.is_accessor_property("__get_ordinary__"));
+    }
+
+    #[test]
+    fn template_global_cloner_clones_contexts_and_mapped_argument_aliases() {
+        let parent = JsContext::new(1, None);
+        parent.borrow_mut().slots[0] = JsValue::String(Rc::from("parent"));
+
+        let context = JsContext::new(2, Some(Rc::clone(&parent)));
+        context.borrow_mut().slots[0] = JsValue::String(Rc::from("local"));
+        context.borrow_mut().slots[1] = JsValue::Smi(11);
+
+        let arguments = Rc::new(RefCell::new(PropertyMap::new()));
+        arguments.borrow_mut().insert("0".into(), JsValue::Smi(11));
+        let live = Rc::new(Cell::new(true));
+        context
+            .borrow_mut()
+            .mapped_argument_aliases
+            .extend_from_slice(&[
+                JsContextMappedArgumentAlias {
+                    slot_index: 1,
+                    argument_index: 0,
+                    object: Rc::clone(&arguments),
+                    live: Rc::clone(&live),
+                },
+                JsContextMappedArgumentAlias {
+                    slot_index: 1,
+                    argument_index: 1,
+                    object: Rc::clone(&arguments),
+                    live: Rc::clone(&live),
+                },
+            ]);
+
+        let cloned = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::Context(Rc::clone(&context)))
+            .unwrap();
+        let cloned = match cloned {
+            JsValue::Context(context) => context,
+            value => panic!("expected cloned context, got {value:?}"),
+        };
+        let cloned_context = cloned.borrow();
+        let cloned_parent = cloned_context.parent.as_ref().unwrap();
+        let aliases = &cloned_context.mapped_argument_aliases;
+
+        assert!(!Rc::ptr_eq(&cloned, &context));
+        assert!(!Rc::ptr_eq(cloned_parent, &parent));
+        assert_eq!(cloned_context.slots[1], JsValue::Smi(11));
+        assert!(Rc::ptr_eq(&aliases[0].object, &aliases[1].object));
+        assert!(Rc::ptr_eq(&aliases[0].live, &aliases[1].live));
+        assert!(!Rc::ptr_eq(&aliases[0].object, &arguments));
+        assert!(!Rc::ptr_eq(&aliases[0].live, &live));
+
+        live.set(false);
+        assert!(aliases[0].live.get());
+    }
+
+    #[test]
+    fn template_global_cloner_clones_typed_views_with_shared_cloned_backing() {
+        let buffer = Rc::new(RefCell::new(JsArrayBuffer {
+            shared: false,
+            max_byte_length: Some(16),
+            detached: false,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        }));
+        let typed_array = Rc::new(RefCell::new(JsTypedArray {
+            kind: TypedArrayKind::Uint16,
+            buffer: Rc::clone(&buffer),
+            byte_offset: 2,
+            length: 3,
+            auto_length: true,
+        }));
+        let data_view = Rc::new(RefCell::new(JsDataView {
+            buffer: Rc::clone(&buffer),
+            byte_offset: 1,
+            byte_length: 5,
+            auto_length: true,
+        }));
+        let values = Rc::new(RefCell::new(vec![
+            JsValue::TypedArray(Rc::clone(&typed_array)),
+            JsValue::DataView(Rc::clone(&data_view)),
+            JsValue::ArrayBuffer(Rc::clone(&buffer)),
+        ]));
+
+        let cloned = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::Array(values))
+            .unwrap();
+        let cloned_values = match cloned {
+            JsValue::Array(values) => values,
+            value => panic!("expected cloned array, got {value:?}"),
+        };
+        let cloned_typed_array = match &cloned_values.borrow()[0] {
+            JsValue::TypedArray(array) => Rc::clone(array),
+            value => panic!("expected cloned typed array, got {value:?}"),
+        };
+        let cloned_data_view = match &cloned_values.borrow()[1] {
+            JsValue::DataView(view) => Rc::clone(view),
+            value => panic!("expected cloned data view, got {value:?}"),
+        };
+        let cloned_buffer = match &cloned_values.borrow()[2] {
+            JsValue::ArrayBuffer(buffer) => Rc::clone(buffer),
+            value => panic!("expected cloned array buffer, got {value:?}"),
+        };
+
+        assert!(Rc::ptr_eq(
+            &cloned_typed_array.borrow().buffer,
+            &cloned_buffer
+        ));
+        assert!(Rc::ptr_eq(
+            &cloned_data_view.borrow().buffer,
+            &cloned_buffer
+        ));
+        assert!(!Rc::ptr_eq(&cloned_buffer, &buffer));
+        assert_eq!(cloned_typed_array.borrow().kind, TypedArrayKind::Uint16);
+        assert_eq!(cloned_typed_array.borrow().byte_offset, 2);
+        assert_eq!(cloned_typed_array.borrow().length, 3);
+        assert!(cloned_typed_array.borrow().auto_length);
+        assert_eq!(cloned_data_view.borrow().byte_offset, 1);
+        assert_eq!(cloned_data_view.borrow().byte_length, 5);
+        assert!(cloned_data_view.borrow().auto_length);
+
+        buffer.borrow_mut().data[2] = 99;
+        assert_eq!(cloned_buffer.borrow().data[2], 3);
+        cloned_buffer.borrow_mut().data[3] = 42;
+        assert_eq!(cloned_typed_array.borrow().buffer.borrow().data[3], 42);
+        assert_eq!(cloned_data_view.borrow().buffer.borrow().data[3], 42);
+    }
+
+    #[test]
+    fn template_global_cloner_clones_nested_errors_and_rejects_cycles() {
+        let nested_object = Rc::new(RefCell::new(PropertyMap::new()));
+        nested_object
+            .borrow_mut()
+            .insert("marker".into(), JsValue::Smi(5));
+        let inner = Rc::new(JsError {
+            kind: ErrorKind::TypeError,
+            message: "inner".into(),
+            stack: "inner stack".into(),
+            errors: Vec::new(),
+            cause: None,
+            props: RefCell::new(PropertyMap::new()),
+        });
+        let outer = Rc::new(JsError {
+            kind: ErrorKind::AggregateError,
+            message: "outer".into(),
+            stack: "outer stack".into(),
+            errors: vec![JsValue::PlainObject(Rc::clone(&nested_object))],
+            cause: Some(JsValue::Error(Rc::clone(&inner))),
+            props: RefCell::new(PropertyMap::new()),
+        });
+
+        let cloned = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::Error(Rc::clone(&outer)))
+            .unwrap();
+        let cloned = match cloned {
+            JsValue::Error(error) => error,
+            value => panic!("expected cloned error, got {value:?}"),
+        };
+
+        assert!(!Rc::ptr_eq(&cloned, &outer));
+        assert_eq!(cloned.kind, ErrorKind::AggregateError);
+        let cloned_nested_object = match &cloned.errors[0] {
+            JsValue::PlainObject(object) => Rc::clone(object),
+            value => panic!("expected cloned nested object, got {value:?}"),
+        };
+        assert!(!Rc::ptr_eq(&cloned_nested_object, &nested_object));
+        match cloned.cause.as_ref().unwrap() {
+            JsValue::Error(error) => {
+                assert!(!Rc::ptr_eq(error, &inner));
+                assert_eq!(error.message, "inner");
+            }
+            value => panic!("expected cloned error cause, got {value:?}"),
+        }
+
+        let cyclic = Rc::new(JsError {
+            kind: ErrorKind::Error,
+            message: "cycle".into(),
+            stack: String::new(),
+            errors: Vec::new(),
+            cause: None,
+            props: RefCell::new(PropertyMap::new()),
+        });
+        cyclic
+            .props
+            .borrow_mut()
+            .insert("self".into(), JsValue::Error(Rc::clone(&cyclic)));
+
+        let error = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::Error(cyclic))
+            .unwrap_err();
+        assert!(error.contains("cyclic Error values"));
+    }
+
+    #[test]
+    fn template_global_cloner_rejects_runtime_only_values() {
+        let error = Test262TemplateGlobalCloner::default()
+            .clone_value(&JsValue::Object(std::ptr::null_mut()))
+            .unwrap_err();
+        assert!(error.contains("unsupported runtime-only Object value"));
+    }
 
     // ── Frontmatter extraction ────────────────────────────────────────────────
 
@@ -1822,7 +2607,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_symbol() {
         assert!(has_unsupported_feature(&[
-            "resizable-arraybuffer".to_string(),
+            "Temporal".to_string(),
             "other".to_string()
         ]));
     }
@@ -1837,6 +2622,446 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_empty() {
         assert!(!has_unsupported_feature(&[]));
+    }
+
+    #[test]
+    fn test_annex_b_escape_allowlist_not_skipped() {
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/input/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/named-groups/non-unicode-malformed.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/length.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/name.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/prototype/compile/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-leading-escape.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-trailing-escape.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/argument_types.js"
+        ));
+        assert!(!is_skipped_path("annexB/built-ins/escape/empty-string.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/unmodified.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/escape-below.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/length.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/name.js"));
+        assert!(!is_skipped_path("annexB/built-ins/escape/prop-desc.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/to-primitive-observe.js"
+        ));
+        assert!(!is_skipped_path("annexB/built-ins/escape/to-string-err.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/to-string-err-symbol.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/escape/to-string-observe.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/B.2.3.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-falsey.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-negative.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/length-positive.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/name.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/this-to-str-err.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/empty-string.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/argument_types.js"
+        ));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/two.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/four.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/two-ignore-non-hex.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/four-ignore-bad-u.js"
+        ));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/length.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/name.js"));
+        assert!(!is_skipped_path("annexB/built-ins/unescape/prop-desc.js"));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/to-primitive-observe.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/to-string-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/unescape/to-string-observe.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/B.2.3.2.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/this-val-tostring-err.js"
+        ));
+        for method in ["anchor", "trimLeft", "trimRight"] {
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/length.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/name.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/prop-desc.js"
+            )));
+        }
+        assert!(is_skipped_path(
+            "annexB/built-ins/String/prototype/anchor/not-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/trimLeft/reference-trimStart.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/trimRight/reference-trimEnd.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/B.2.3.3.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/length.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/name.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/big/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/blink/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/bold/this-val-tostring-err.js"
+        ));
+        for method in [
+            "blink",
+            "bold",
+            "fixed",
+            "fontcolor",
+            "fontsize",
+            "italics",
+            "link",
+            "small",
+            "strike",
+            "sub",
+            "sup",
+        ] {
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/length.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/name.js"
+            )));
+            assert!(!is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/prop-desc.js"
+            )));
+            assert!(is_skipped_path(&format!(
+                "annexB/built-ins/String/prototype/{method}/not-a-constructor.js"
+            )));
+        }
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/blink/B.2.3.4.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/bold/B.2.3.5.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fixed/B.2.3.6.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fixed/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/B.2.3.7.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontcolor/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/B.2.3.8.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/fontsize/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/italics/B.2.3.9.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/italics/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/link/B.2.3.10.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/link/attr-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/link/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/small/B.2.3.11.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/small/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/strike/B.2.3.12.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/strike/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sub/B.2.3.13.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sub/this-val-tostring-err.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sup/B.2.3.14.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/sup/this-val-tostring-err.js"
+        ));
+        assert!(is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/not-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "annexB/built-ins/String/prototype/substr/start-negative.js"
+        ));
+        assert!(is_skipped_path("annexB/built-ins/unescape/other.js"));
+    }
+
+    #[test]
+    fn test_aggregate_error_allowlist_not_skipped() {
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/cause-property.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-method-prop.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-method-prop-cast.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-tostring-abrupt.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-tostring-abrupt-symbol.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/message-undefined-no-prop.js"
+        ));
+        assert!(!is_skipped_path("built-ins/AggregateError/name.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/length.js"));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/is-a-constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-is-undefined.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto-custom.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto-fallback.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/newtarget-proto.js"
+        ));
+        assert!(!is_skipped_path("built-ins/AggregateError/prop-desc.js"));
+        assert!(!is_skipped_path("built-ins/AggregateError/proto.js"));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/errors-absent-on-prototype.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/name.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/message.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/constructor.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/prop-desc.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AggregateError/prototype/proto.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AggregateError/errors-iterabletolist.js"
+        ));
+    }
+
+    #[test]
+    fn test_async_function_allowlist_not_skipped() {
+        assert!(is_skipped_path(
+            "built-ins/AsyncFunction/instance-length.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncFunction/instance-has-name.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncFunction/instance-prototype-property.js"
+        ));
+        assert!(!is_skipped_path("built-ins/AsyncFunction/AsyncFunction.js"));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunction-is-extensible.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncFunction/is-not-a-global.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncFunction/AsyncFunction-name.js"
+        ));
+    }
+
+    #[test]
+    fn test_async_generator_function_allowlist_not_skipped() {
+        assert!(is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/instance-length.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/extensibility.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js"
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
+        ));
+        assert!(!is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-name.js"
+        ));
+        assert!(is_skipped_path(
+            "built-ins/AsyncGeneratorFunction/prototype/constructor.js"
+        ));
+    }
+
+    #[test]
+    fn test_array_from_async_skips_known_failing_tests() {
+        assert!(is_skipped_path("built-ins/Array/fromAsync/length.js"));
+        assert!(is_skipped_path("built-ins/Array/fromAsync/name.js"));
+        assert!(is_skipped_path("built-ins/Array/fromAsync/prop-desc.js"));
+        assert!(is_skipped_path(
+            "built-ins/Array/fromAsync/async-iterable.js"
+        ));
+    }
+
+    #[test]
+    fn test_regexp_file_skips_keep_only_blocked_cases() {
+        assert!(!is_skipped_path(
+            "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js"
+        ));
+        assert!(!is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T18.js"));
+
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T17.js"));
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T15.js"));
+        assert!(is_skipped_path("built-ins/RegExp/S15.10.2.8_A3_T16.js"));
+    }
+
+    #[test]
+    fn test_skipped_path_descendant_allowlist() {
+        assert!(skipped_path_has_allowlisted_descendant("annexB/"));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/escape/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/unescape/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/String/prototype/substr/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/AggregateError/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/AsyncFunction/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "built-ins/AsyncGeneratorFunction/"
+        ));
+        assert!(skipped_path_has_allowlisted_descendant(
+            "annexB/built-ins/Date/"
+        ));
     }
 
     // ── Error type matching ───────────────────────────────────────────────────
@@ -1975,6 +3200,567 @@ mod tests {
         collect_tests(&tmp, &tmp, &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("a.js"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_reenabled_regexp_files() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_regexp_file_collect_test");
+        let regexp_dir = tmp.join("built-ins").join("RegExp");
+        let exec_dir = regexp_dir.join("prototype").join("exec");
+        let _ = std::fs::create_dir_all(&exec_dir);
+        std::fs::write(exec_dir.join("S15.10.6.2_A3_T7.js"), "/(a*)/.exec('aaa')").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T15.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T16.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T17.js"), "/a*/").unwrap();
+        std::fs::write(regexp_dir.join("S15.10.2.8_A3_T18.js"), "/a*/").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/RegExp/S15.10.2.8_A3_T18.js",
+                "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_escape_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_escape_collect_test");
+        let escape_dir = tmp.join("annexB").join("built-ins").join("escape");
+        let substr_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("String")
+            .join("prototype")
+            .join("substr");
+        let unescape_dir = tmp.join("annexB").join("built-ins").join("unescape");
+        let _ = std::fs::create_dir_all(&escape_dir);
+        let _ = std::fs::create_dir_all(&substr_dir);
+        let _ = std::fs::create_dir_all(&unescape_dir);
+        std::fs::write(escape_dir.join("empty-string.js"), "escape('')").unwrap();
+        std::fs::write(escape_dir.join("unmodified.js"), "escape('@')").unwrap();
+        std::fs::write(escape_dir.join("escape-below.js"), "escape('\\0')").unwrap();
+        std::fs::write(escape_dir.join("length.js"), "escape.length").unwrap();
+        std::fs::write(escape_dir.join("name.js"), "escape.name").unwrap();
+        std::fs::write(escape_dir.join("prop-desc.js"), "escape").unwrap();
+        std::fs::write(substr_dir.join("B.2.3.js"), "''.substr(0)").unwrap();
+        std::fs::write(
+            substr_dir.join("length.js"),
+            "String.prototype.substr.length",
+        )
+        .unwrap();
+        std::fs::write(substr_dir.join("length-falsey.js"), "''.substr(0, false)").unwrap();
+        std::fs::write(substr_dir.join("length-negative.js"), "''.substr(0, -1)").unwrap();
+        std::fs::write(substr_dir.join("length-positive.js"), "'abc'.substr(0, 2)").unwrap();
+        std::fs::write(substr_dir.join("name.js"), "String.prototype.substr.name").unwrap();
+        std::fs::write(
+            substr_dir.join("this-non-obj-coerce.js"),
+            "String.prototype.substr.call(null)",
+        )
+        .unwrap();
+        std::fs::write(substr_dir.join("start-negative.js"), "'abc'.substr(-1)").unwrap();
+        std::fs::write(substr_dir.join("not-a-constructor.js"), "isConstructor").unwrap();
+        std::fs::write(unescape_dir.join("empty-string.js"), "unescape('')").unwrap();
+        std::fs::write(unescape_dir.join("two.js"), "unescape('%20')").unwrap();
+        std::fs::write(unescape_dir.join("four.js"), "unescape('%u0020')").unwrap();
+        std::fs::write(
+            unescape_dir.join("two-ignore-non-hex.js"),
+            "unescape('%xz')",
+        )
+        .unwrap();
+        std::fs::write(
+            unescape_dir.join("four-ignore-bad-u.js"),
+            "unescape('%uxxxx')",
+        )
+        .unwrap();
+        std::fs::write(unescape_dir.join("length.js"), "unescape.length").unwrap();
+        std::fs::write(unescape_dir.join("name.js"), "unescape.name").unwrap();
+        std::fs::write(unescape_dir.join("prop-desc.js"), "unescape").unwrap();
+        std::fs::write(unescape_dir.join("other.js"), "unescape('%2f')").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/String/prototype/substr/B.2.3.js",
+                "annexB/built-ins/String/prototype/substr/length-falsey.js",
+                "annexB/built-ins/String/prototype/substr/length-negative.js",
+                "annexB/built-ins/String/prototype/substr/length-positive.js",
+                "annexB/built-ins/String/prototype/substr/length.js",
+                "annexB/built-ins/String/prototype/substr/name.js",
+                "annexB/built-ins/String/prototype/substr/start-negative.js",
+                "annexB/built-ins/String/prototype/substr/this-non-obj-coerce.js",
+                "annexB/built-ins/escape/empty-string.js",
+                "annexB/built-ins/escape/escape-below.js",
+                "annexB/built-ins/escape/length.js",
+                "annexB/built-ins/escape/name.js",
+                "annexB/built-ins/escape/prop-desc.js",
+                "annexB/built-ins/escape/unmodified.js",
+                "annexB/built-ins/unescape/empty-string.js",
+                "annexB/built-ins/unescape/four-ignore-bad-u.js",
+                "annexB/built-ins/unescape/four.js",
+                "annexB/built-ins/unescape/length.js",
+                "annexB/built-ins/unescape/name.js",
+                "annexB/built-ins/unescape/prop-desc.js",
+                "annexB/built-ins/unescape/two-ignore-non-hex.js",
+                "annexB/built-ins/unescape/two.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_compile_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_compile_collect_test");
+        let compile_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("RegExp")
+            .join("prototype")
+            .join("compile");
+        let _ = std::fs::create_dir_all(&compile_dir);
+        std::fs::write(
+            compile_dir.join("B.RegExp.prototype.compile.js"),
+            "RegExp.prototype.compile",
+        )
+        .unwrap();
+        std::fs::write(
+            compile_dir.join("length.js"),
+            "RegExp.prototype.compile.length",
+        )
+        .unwrap();
+        std::fs::write(compile_dir.join("name.js"), "RegExp.prototype.compile.name").unwrap();
+        std::fs::write(compile_dir.join("prop-desc.js"), "RegExp.prototype.compile").unwrap();
+        std::fs::write(
+            compile_dir.join("not-a-constructor.js"),
+            "new RegExp.prototype.compile()",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec!["annexB/built-ins/RegExp/prototype/compile/B.RegExp.prototype.compile.js"]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_legacy_accessors_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_accessors_collect_test");
+        let accessors_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("RegExp")
+            .join("legacy-accessors");
+        for name in [
+            "index",
+            "input",
+            "lastMatch",
+            "lastParen",
+            "leftContext",
+            "rightContext",
+        ] {
+            let dir = accessors_dir.join(name);
+            let _ = std::fs::create_dir_all(&dir);
+            std::fs::write(dir.join("prop-desc.js"), "RegExp legacy accessor").unwrap();
+            std::fs::write(dir.join("this-not-regexp-constructor.js"), "RegExp").unwrap();
+        }
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/RegExp/legacy-accessors/index/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/lastMatch/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/lastParen/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/leftContext/prop-desc.js",
+                "annexB/built-ins/RegExp/legacy-accessors/rightContext/prop-desc.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_regexp_syntax_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_annex_b_regexp_syntax_collect_test");
+        let regexp_dir = tmp.join("annexB").join("built-ins").join("RegExp");
+        let _ = std::fs::create_dir_all(&regexp_dir);
+        std::fs::write(
+            regexp_dir.join("incomplete_hex_unicode_escape.js"),
+            "RegExp",
+        )
+        .unwrap();
+        std::fs::write(regexp_dir.join("RegExp-leading-escape.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-leading-escape-BMP.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-trailing-escape.js"), "RegExp").unwrap();
+        std::fs::write(regexp_dir.join("RegExp-trailing-escape-BMP.js"), "RegExp").unwrap();
+        let named_groups_dir = regexp_dir.join("named-groups");
+        let _ = std::fs::create_dir_all(&named_groups_dir);
+        std::fs::write(
+            named_groups_dir.join("non-unicode-malformed-lookbehind.js"),
+            "RegExp",
+        )
+        .unwrap();
+        std::fs::write(named_groups_dir.join("non-unicode-malformed.js"), "RegExp").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "annexB/built-ins/RegExp/RegExp-leading-escape.js",
+                "annexB/built-ins/RegExp/RegExp-trailing-escape.js",
+                "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js",
+                "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_annex_b_date_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_annex_b_date_collect_test");
+        let date_dir = tmp
+            .join("annexB")
+            .join("built-ins")
+            .join("Date")
+            .join("prototype")
+            .join("toGMTString");
+        let _ = std::fs::create_dir_all(&date_dir);
+        std::fs::write(date_dir.join("prop-desc.js"), "Date.prototype.toGMTString").unwrap();
+        std::fs::write(date_dir.join("value.js"), "Date.prototype.toGMTString").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec!["annexB/built-ins/Date/prototype/toGMTString/prop-desc.js"]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_aggregate_error_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_aggregate_error_collect_test");
+        let aggregate_dir = tmp.join("built-ins").join("AggregateError");
+        let _ = std::fs::create_dir_all(&aggregate_dir);
+        std::fs::write(aggregate_dir.join("cause-property.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-method-prop.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-method-prop-cast.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(aggregate_dir.join("length.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-tostring-abrupt.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-tostring-abrupt-symbol.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("message-undefined-no-prop.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(aggregate_dir.join("is-a-constructor.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("newtarget-is-undefined.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(
+            aggregate_dir.join("newtarget-proto-custom.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(aggregate_dir.join("newtarget-proto.js"), "AggregateError").unwrap();
+        std::fs::write(aggregate_dir.join("name.js"), "AggregateError").unwrap();
+        std::fs::write(aggregate_dir.join("prop-desc.js"), "AggregateError").unwrap();
+        std::fs::write(aggregate_dir.join("proto.js"), "AggregateError").unwrap();
+        std::fs::write(
+            aggregate_dir.join("errors-iterabletolist.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        let prototype_dir = aggregate_dir.join("prototype");
+        let _ = std::fs::create_dir_all(&prototype_dir);
+        std::fs::write(
+            prototype_dir.join("errors-absent-on-prototype.js"),
+            "AggregateError",
+        )
+        .unwrap();
+        std::fs::write(prototype_dir.join("name.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("message.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("constructor.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("not-a-constructor.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("prop-desc.js"), "AggregateError").unwrap();
+        std::fs::write(prototype_dir.join("proto.js"), "AggregateError").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/AggregateError/cause-property.js",
+                "built-ins/AggregateError/is-a-constructor.js",
+                "built-ins/AggregateError/length.js",
+                "built-ins/AggregateError/message-method-prop-cast.js",
+                "built-ins/AggregateError/message-method-prop.js",
+                "built-ins/AggregateError/message-tostring-abrupt-symbol.js",
+                "built-ins/AggregateError/message-tostring-abrupt.js",
+                "built-ins/AggregateError/message-undefined-no-prop.js",
+                "built-ins/AggregateError/name.js",
+                "built-ins/AggregateError/newtarget-is-undefined.js",
+                "built-ins/AggregateError/newtarget-proto-custom.js",
+                "built-ins/AggregateError/newtarget-proto.js",
+                "built-ins/AggregateError/prop-desc.js",
+                "built-ins/AggregateError/proto.js",
+                "built-ins/AggregateError/prototype/constructor.js",
+                "built-ins/AggregateError/prototype/errors-absent-on-prototype.js",
+                "built-ins/AggregateError/prototype/message.js",
+                "built-ins/AggregateError/prototype/name.js",
+                "built-ins/AggregateError/prototype/prop-desc.js",
+                "built-ins/AggregateError/prototype/proto.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_async_function_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_async_function_collect_test");
+        let async_dir = tmp.join("built-ins").join("AsyncFunction");
+        let _ = std::fs::create_dir_all(&async_dir);
+        std::fs::write(async_dir.join("instance-length.js"), "AsyncFunction").unwrap();
+        std::fs::write(async_dir.join("instance-has-name.js"), "AsyncFunction").unwrap();
+        std::fs::write(
+            async_dir.join("instance-prototype-property.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
+        std::fs::write(async_dir.join("AsyncFunction.js"), "AsyncFunction").unwrap();
+        std::fs::write(
+            async_dir.join("AsyncFunction-is-extensible.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_dir.join("AsyncFunctionPrototype-is-extensible.js"),
+            "AsyncFunction",
+        )
+        .unwrap();
+        std::fs::write(async_dir.join("is-not-a-global.js"), "AsyncFunction").unwrap();
+        std::fs::write(async_dir.join("AsyncFunction-name.js"), "AsyncFunction").unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
+                "built-ins/AsyncFunction/AsyncFunction.js",
+                "built-ins/AsyncFunction/AsyncFunctionPrototype-is-extensible.js",
+                "built-ins/AsyncFunction/is-not-a-global.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_keeps_async_generator_function_allowlist() {
+        let tmp =
+            std::env::temp_dir().join("stator_jse_test262_async_generator_function_collect_test");
+        let async_gen_dir = tmp.join("built-ins").join("AsyncGeneratorFunction");
+        let async_gen_proto_dir = async_gen_dir.join("prototype");
+        let _ = std::fs::create_dir_all(&async_gen_dir);
+        let _ = std::fs::create_dir_all(&async_gen_proto_dir);
+        std::fs::write(
+            async_gen_dir.join("instance-length.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_dir.join("extensibility.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_dir.join("AsyncGeneratorFunction-is-extensible.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_dir.join("AsyncGeneratorFunctionPrototype-is-extensible.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_proto_dir.join("extensibility.js"),
+            "AsyncGeneratorFunction.prototype",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_dir.join("AsyncGeneratorFunction-name.js"),
+            "AsyncGeneratorFunction",
+        )
+        .unwrap();
+        std::fs::write(
+            async_gen_proto_dir.join("constructor.js"),
+            "AsyncGeneratorFunction.prototype.constructor",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(
+            rel,
+            vec![
+                "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunction-is-extensible.js",
+                "built-ins/AsyncGeneratorFunction/AsyncGeneratorFunctionPrototype-is-extensible.js",
+                "built-ins/AsyncGeneratorFunction/extensibility.js",
+                "built-ins/AsyncGeneratorFunction/prototype/extensibility.js",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_collect_tests_skips_array_from_async_prefix_without_allowlist() {
+        let tmp = std::env::temp_dir().join("stator_jse_test262_array_from_async_collect_test");
+        let from_async_dir = tmp.join("built-ins").join("Array").join("fromAsync");
+        let _ = std::fs::create_dir_all(&from_async_dir);
+        std::fs::write(from_async_dir.join("length.js"), "Array.fromAsync.length").unwrap();
+        std::fs::write(from_async_dir.join("name.js"), "Array.fromAsync.name").unwrap();
+        std::fs::write(from_async_dir.join("prop-desc.js"), "Array.fromAsync").unwrap();
+        std::fs::write(
+            from_async_dir.join("async-iterable.js"),
+            "Array.fromAsync(async function*(){}())",
+        )
+        .unwrap();
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
+        let mut rel: Vec<String> = out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        rel.sort();
+        assert_eq!(rel, Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

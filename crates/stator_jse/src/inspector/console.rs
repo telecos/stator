@@ -64,6 +64,24 @@ pub struct ConsoleMessage {
     pub text: String,
 }
 
+/// CDP profiler console event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileEventKind {
+    /// `console.profile()` started a profile.
+    Started,
+    /// `console.profileEnd()` finished a profile.
+    Finished,
+}
+
+/// A profiler event produced by `console.profile` / `console.profileEnd`.
+#[derive(Debug, Clone)]
+pub struct ProfileEvent {
+    /// Start or finish event kind.
+    pub kind: ProfileEventKind,
+    /// Profile title / identifier.
+    pub id: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Thread-local message buffer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +89,9 @@ pub struct ConsoleMessage {
 thread_local! {
     /// Buffered console messages waiting to be forwarded to a CDP client.
     static MESSAGES: RefCell<Vec<ConsoleMessage>> = const { RefCell::new(Vec::new()) };
+
+    /// Buffered profile events waiting to be forwarded to a CDP client.
+    static PROFILE_EVENTS: RefCell<Vec<ProfileEvent>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Push a console message into the thread-local buffer.
@@ -86,6 +107,16 @@ pub fn push_console_message(msg: ConsoleMessage) {
 /// The internal buffer is left empty after this call.
 pub fn drain_messages() -> Vec<ConsoleMessage> {
     MESSAGES.with(|m| m.borrow_mut().drain(..).collect())
+}
+
+/// Push a profiler event into the thread-local buffer.
+pub fn push_profile_event(event: ProfileEvent) {
+    PROFILE_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+/// Drain buffered profiler events in insertion order.
+pub fn drain_profile_events() -> Vec<ProfileEvent> {
+    PROFILE_EVENTS.with(|events| events.borrow_mut().drain(..).collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +170,25 @@ mod tests {
         let _ = drain_messages();
         let msgs = drain_messages();
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_profile_events_push_and_drain() {
+        let _ = drain_profile_events();
+        push_profile_event(ProfileEvent {
+            kind: ProfileEventKind::Started,
+            id: "profile".to_string(),
+        });
+        push_profile_event(ProfileEvent {
+            kind: ProfileEventKind::Finished,
+            id: "profile".to_string(),
+        });
+
+        let events = drain_profile_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, ProfileEventKind::Started);
+        assert_eq!(events[1].kind, ProfileEventKind::Finished);
+        assert!(drain_profile_events().is_empty());
     }
 
     #[test]

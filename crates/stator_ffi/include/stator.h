@@ -27,7 +27,7 @@
  * exported functions or new enum variants appended at the end of an
  * existing enum.
  */
-#define STATOR_FFI_ABI_VERSION_MINOR 18
+#define STATOR_FFI_ABI_VERSION_MINOR 39
 
 /**
  * Patch version of the Stator FFI C ABI.
@@ -41,69 +41,89 @@
  * Packed Stator FFI ABI version: `(major << 16) | (minor << 8) | patch`.
  *
  * Embedders may compare this constant to the value returned by
- * [`stator_ffi_abi_version`] to detect a header/library skew at runtime:
- *
- * ```c
- * if (stator_ffi_abi_version() != STATOR_FFI_ABI_VERSION) {
- *     /* header and shared library disagree — refuse to proceed. */
- * }
- * ```
+ * `stator_ffi_abi_version()` to detect a header/library skew at runtime. For
+ * example, if the returned value differs from `STATOR_FFI_ABI_VERSION`, the
+ * header and shared library disagree and the embedder should refuse to proceed.
  */
 #define STATOR_FFI_ABI_VERSION (((STATOR_FFI_ABI_VERSION_MAJOR << 16) | (STATOR_FFI_ABI_VERSION_MINOR << 8)) | STATOR_FFI_ABI_VERSION_PATCH)
 
 /**
- * Number of JIT tiers carried by [`StatorDeoptHistogramStats`].
+ * Number of JIT tiers carried by `StatorDeoptHistogramStats`.
  */
 #define STATOR_DEOPT_TIER_COUNT 3
 
 /**
- * Number of stable deopt reasons carried by [`StatorDeoptReasonCounts`].
+ * Number of stable deopt reasons carried by `StatorDeoptReasonCounts`.
  */
 #define STATOR_DEOPT_REASON_COUNT 7
 
 /**
- * Number of execution tiers carried by [`StatorIcCountersStats`].
+ * Number of execution tiers carried by `StatorIcCountersStats`.
  */
 #define STATOR_IC_TIER_COUNT 4
 
 /**
- * Number of inline-cache operation kinds carried by [`StatorIcTierCounters`].
+ * Number of inline-cache operation kinds carried by `StatorIcTierCounters`.
  */
 #define STATOR_IC_OP_COUNT 5
 
 /**
- * Number of inline-cache event kinds carried by [`StatorIcOpCounters`].
+ * Number of inline-cache event kinds carried by `StatorIcOpCounters`.
  */
 #define STATOR_IC_EVENT_COUNT 4
 
 /**
- * Number of histogram buckets carried by [`StatorTierLatencyTier`].
+ * Number of histogram buckets carried by `StatorTierLatencyTier`.
  *
- * This must match
- * [`stator_jse::compiler::tier_latency::NUM_HISTOGRAM_BUCKETS`] and is
- * part of the C ABI contract.  Bumping this value is a breaking change.
+ * This mirrors the engine's fixed promotion-latency histogram bucket count and
+ * is part of the C ABI contract.  Bumping this value is a breaking change.
  */
 #define STATOR_TIER_LATENCY_BUCKET_COUNT 9
 
 /**
- * Number of execution tiers carried by [`StatorOsrCountersStats`].
+ * Number of execution tiers carried by `StatorOsrCountersStats`.
  */
 #define STATOR_OSR_TIER_COUNT 4
 
 /**
- * Number of OSR exit reasons carried by [`StatorOsrExitReasonCounts`].
+ * Number of OSR exit reasons carried by `StatorOsrExitReasonCounts`.
  */
 #define STATOR_OSR_EXIT_REASON_COUNT 4
 
 /**
- * Number of JIT tier rows carried by [`StatorJitUnwindStats`].
+ * Number of JIT tier rows carried by `StatorJitUnwindStats`.
  */
 #define STATOR_JIT_UNWIND_TIER_COUNT 4
 
 /**
- * Number of JIT memory tier rows carried by [`StatorJitMemoryStats`].
+ * Number of JIT memory tier rows carried by `StatorJitMemoryStats`.
  */
 #define STATOR_JIT_MEMORY_TIER_COUNT 4
+
+/**
+ * Number of JIT tier rows carried by `StatorJitMitigationsStats`.
+ */
+#define STATOR_JIT_MITIGATIONS_TIER_COUNT 4
+
+/**
+ * `UnsupportedPlatform` u32 encoding for the FFI mitigation snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM 0
+
+/**
+ * `Disabled` u32 encoding for the FFI mitigation snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_DISABLED 1
+
+/**
+ * `Enabled` u32 encoding for the FFI mitigation snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_ENABLED 2
+
+/**
+ * `Unknown` u32 encoding for the FFI mitigation snapshot.
+ */
+#define STATOR_MITIGATION_STATUS_UNKNOWN 3
 
 /**
  * DOM property descriptor flag for writable data properties.
@@ -166,7 +186,7 @@
 /**
  * Bitmask of every named-handler flag recognised by this Stator build.
  * Any bit outside this mask is rejected by
- * [`stator_dom_object_wrap_set_named_handler_flags`].
+ * `stator_dom_object_wrap_set_named_handler_flags`.
  */
 #define STATOR_DOM_NAMED_HANDLER_FLAG_ALL ((((STATOR_DOM_NAMED_HANDLER_FLAG_ALL_CAN_READ | STATOR_DOM_NAMED_HANDLER_FLAG_NON_MASKING) | STATOR_DOM_NAMED_HANDLER_FLAG_ONLY_INTERCEPT_STRINGS) | STATOR_DOM_NAMED_HANDLER_FLAG_INTERCEPT_SYMBOLS) | STATOR_DOM_NAMED_HANDLER_FLAG_HAS_NO_SIDE_EFFECT)
 
@@ -327,6 +347,211 @@ typedef enum StatorParserMetadata {
 } StatorParserMetadata;
 
 /**
+ * C ABI representation of JavaScript typed-array element kinds.
+ */
+typedef enum StatorTypedArrayKind {
+  /**
+   * Not a typed-array value or an unknown future typed-array kind.
+   */
+  StatorTypedArrayKindInvalid = 0,
+  /**
+   * `Int8Array`.
+   */
+  StatorTypedArrayKindInt8 = 1,
+  /**
+   * `Uint8Array`.
+   */
+  StatorTypedArrayKindUint8 = 2,
+  /**
+   * `Uint8ClampedArray`.
+   */
+  StatorTypedArrayKindUint8Clamped = 3,
+  /**
+   * `Int16Array`.
+   */
+  StatorTypedArrayKindInt16 = 4,
+  /**
+   * `Uint16Array`.
+   */
+  StatorTypedArrayKindUint16 = 5,
+  /**
+   * `Int32Array`.
+   */
+  StatorTypedArrayKindInt32 = 6,
+  /**
+   * `Uint32Array`.
+   */
+  StatorTypedArrayKindUint32 = 7,
+  /**
+   * `Float32Array`.
+   */
+  StatorTypedArrayKindFloat32 = 8,
+  /**
+   * `Float64Array`.
+   */
+  StatorTypedArrayKindFloat64 = 9,
+  /**
+   * `BigInt64Array`.
+   */
+  StatorTypedArrayKindBigInt64 = 10,
+  /**
+   * `BigUint64Array`.
+   */
+  StatorTypedArrayKindBigUint64 = 11,
+} StatorTypedArrayKind;
+
+/**
+ * Stable status code returned by typed-accessor and Maybe-style FFI entry
+ * points so that C callers can distinguish a missing value, an invalid
+ * argument, an unsupported operation, and a JavaScript exception without
+ * reaching for out-of-band channels.
+ *
+ * Variants:
+ * * `StatorStatusOk` — the call succeeded; any
+ *   out-pointer was written.
+ * * `StatorStatusFalse` — the call succeeded with
+ *   a structural "no" answer (e.g. property missing, type mismatch on a
+ *   typed get).  Out-pointers are left untouched or zero-cleared, never
+ *   carrying a stale value.
+ * * `StatorStatusException` — the operation
+ *   raised (or captured) a JavaScript exception.  When applicable, the
+ *   isolate's pending exception is populated and can be inspected through
+ *   `stator_isolate_peek_pending_message` / `stator_try_catch_*`.
+ * * `StatorStatusInvalidArg` — at least one
+ *   required argument was null or otherwise malformed; nothing was mutated.
+ * * `StatorStatusUnsupported` — the
+ *   operation is well-formed but not yet implemented for this kind of
+ *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
+ *   discriminants are stable; embedders should treat unknown values as
+ *   `StatorStatusUnsupported`.
+ *
+ * Backed by a C `int`-shaped enum so the discriminants are stable across
+ * the C ABI and can be compared by value from C/C++.
+ */
+typedef enum StatorStatus {
+  /**
+   * Operation succeeded.
+   */
+  StatorStatusOk = 0,
+  /**
+   * Operation succeeded with a structural "no" answer (missing property,
+   * type mismatch on a typed accessor).
+   */
+  StatorStatusFalse = 1,
+  /**
+   * A JavaScript exception was raised or captured.  The isolate's pending
+   * exception is set when this is returned by a Maybe-style API.
+   */
+  StatorStatusException = 2,
+  /**
+   * At least one argument was null or malformed.
+   */
+  StatorStatusInvalidArg = 3,
+  /**
+   * The operation is not supported for this value/object kind.
+   */
+  StatorStatusUnsupported = 4,
+} StatorStatus;
+
+/**
+ * Observable settlement state for a real FFI Promise handle.
+ */
+typedef enum StatorPromiseState {
+  /**
+   * The promise has not been fulfilled or rejected yet.
+   */
+  StatorPromiseStatePending = 0,
+  /**
+   * The promise was fulfilled and has a fulfillment result.
+   */
+  StatorPromiseStateFulfilled = 1,
+  /**
+   * The promise was rejected and has a rejection reason.
+   */
+  StatorPromiseStateRejected = 2,
+  /**
+   * The argument was null or was not a real Promise handle.
+   */
+  StatorPromiseStateInvalid = 3,
+} StatorPromiseState;
+
+/**
+ * Status for classic-script code-cache operations.
+ */
+typedef enum StatorScriptCacheStatus {
+  /**
+   * Operation succeeded and produced a versioned classic-script cache blob.
+   */
+  StatorScriptCacheStatusProducedMetadata = 0,
+  /**
+   * Cache blob matched and restored executable bytecode directly.
+   */
+  StatorScriptCacheStatusAcceptedBytecodeRestored = 1,
+  /**
+   * Cache blob metadata matched but executable representation was rebuilt.
+   */
+  StatorScriptCacheStatusAcceptedValidatedRecompiled = 2,
+  /**
+   * A pointer/length pair or output argument was invalid.
+   */
+  StatorScriptCacheStatusInvalidArgument = 3,
+  /**
+   * The source script was not successfully compiled.
+   */
+  StatorScriptCacheStatusCompileError = 4,
+  /**
+   * Cache bytes were malformed or failed source/options validation.
+   */
+  StatorScriptCacheStatusRejected = 5,
+  /**
+   * Script code-cache production/consumption is unsupported by this build.
+   */
+  StatorScriptCacheStatusUnsupported = 6,
+  /**
+   * Cache payload checksum failed after the header and metadata matched.
+   */
+  StatorScriptCacheStatusCorruptPayload = 7,
+} StatorScriptCacheStatus;
+
+/**
+ * Diagnostic reason for classic-script code-cache acceptance or rejection.
+ */
+typedef enum StatorScriptCacheDiagnostic {
+  /**
+   * No additional diagnostic; status is sufficient.
+   */
+  StatorScriptCacheDiagnosticNone = 0,
+  /**
+   * Cache magic was missing or did not identify a Stator script cache blob.
+   */
+  StatorScriptCacheDiagnosticMagicMismatch = 1,
+  /**
+   * Cache format version is unsupported by this engine.
+   */
+  StatorScriptCacheDiagnosticVersionMismatch = 2,
+  /**
+   * Source bytes or source digest did not match the cache metadata.
+   */
+  StatorScriptCacheDiagnosticSourceMismatch = 3,
+  /**
+   * Script compile options did not match the cache metadata.
+   */
+  StatorScriptCacheDiagnosticOptionsMismatch = 4,
+  /**
+   * Payload checksum failed after metadata validation succeeded.
+   */
+  StatorScriptCacheDiagnosticCorruptPayload = 5,
+  /**
+   * Source compiled with an error, so no cache can be produced/restored.
+   */
+  StatorScriptCacheDiagnosticCompileError = 6,
+  /**
+   * Operation is unsupported for this build or input shape.
+   */
+  StatorScriptCacheDiagnosticUnsupported = 7,
+} StatorScriptCacheDiagnostic;
+
+/**
  * Host-visible source kind for a compiled module record.
  *
  * JavaScript and JSON modules are executable by Stator today. WebAssembly
@@ -352,9 +577,9 @@ typedef enum StatorModuleType {
    * Currently fail-closed unsupported. Stator has no CSS parser and no
    * `CSSStyleSheet` object representation, so CSS module bodies cannot be
    * parsed, evaluated, or restored from a code cache. Compilation always
-   * returns an errored [`StatorModule`] tagged with this `source_type`,
+   * returns an errored `StatorModule` tagged with this `source_type`,
    * `stator_module_create_code_cache` reports
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusUnsupported`], and
+   * `StatorModuleCacheStatusUnsupported`, and
    * `stator_module_compile_cached` rejects CSS source with the same
    * status. Resolving a request that carries `with { type: "css" }` to a
    * non-CSS module is a type mismatch like every other typed import.
@@ -378,7 +603,7 @@ typedef enum StatorModuleCacheStatus {
    * payloads store validated source bytes plus parsed import/export metadata;
    * until a safe compiled-artifact deserializer is available they are
    * accepted with
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusAcceptedValidatedRecompiled`].
+   * `StatorModuleCacheStatusAcceptedValidatedRecompiled`.
    */
   StatorModuleCacheStatusProducedMetadata = 0,
   /**
@@ -416,7 +641,7 @@ typedef enum StatorModuleCacheStatus {
    * checksum failed to verify. The bytes after the format-version field
    * are corrupt, truncated, or were tampered with after production. The
    * blob is fail-closed rejected. This status is distinct from
-   * [`StatorModuleCacheStatus::StatorModuleCacheStatusRejected`], which
+   * `StatorModuleCacheStatusRejected`, which
    * covers source/options/metadata mismatches; embedders can use the
    * distinction to decide whether to evict the blob from disk versus
    * recompile under the new options.
@@ -511,7 +736,7 @@ typedef enum StatorTierRequestStatus {
  * the C ABI and can be compared by value from C/C++.
  *
  * New variants may be appended in future versions; embedders should treat
- * unknown values as [`StatorMessageKind::StatorMessageKindUnknown`].
+ * unknown values as `StatorMessageKindUnknown`.
  */
 typedef enum StatorMessageKind {
   /**
@@ -544,8 +769,8 @@ typedef enum StatorMessageKind {
    */
   StatorMessageKindWasm = 6,
   /**
-   * An internal engine error (`stator_jse::error::StatorError::Internal`)
-   * or a programmer-induced FFI misuse (e.g. null source pointer).
+   * An internal engine error or a programmer-induced FFI misuse
+   * (e.g. null source pointer).
    */
   StatorMessageKindInternal = 7,
   /**
@@ -567,19 +792,19 @@ typedef enum StatorMessageKind {
    */
   StatorMessageKindSandboxViolation = 11,
   /**
-   * The module's [`StatorModuleType`] is recognised but not executable by
+   * The module's `StatorModuleType` is recognised but not executable by
    * Stator itself and requires host integration before it can be compiled,
    * evaluated, or restored from a code cache.
    *
    * Currently emitted for CSS module bodies (see
-   * [`StatorModuleType::StatorModuleTypeCss`]): Stator has no CSS parser
+   * `StatorModuleTypeCss`): Stator has no CSS parser
    * and no `CSSStyleSheet` representation, so the engine fails closed and
    * tags the error with this stable kind so embedders like the Edge host
    * can detect "unsupported module type, route through host integration"
    * purely by enum value without text-matching the diagnostic.
    *
-   * Always paired with an errored [`StatorModule`] whose
-   * [`stator_module_get_error`] message names the missing host primitive,
+   * Always paired with an errored `StatorModule` whose
+   * `stator_module_get_error` message names the missing host primitive,
    * and — when a typed import resolves to such a module — propagates to
    * the importer's link-time error so the same enum value surfaces on the
    * graph root.
@@ -588,7 +813,7 @@ typedef enum StatorMessageKind {
 } StatorMessageKind;
 
 /**
- * Link/evaluation state for a [`StatorModule`].
+ * Link/evaluation state for a `StatorModule`.
  */
 typedef enum StatorModuleStatus {
   /**
@@ -620,70 +845,17 @@ typedef enum StatorModuleStatus {
    * promise has not yet settled after draining the local microtask
    * queue. Exports are intentionally *not* published in this state; the
    * embedder must drive evaluation forward by calling
-   * [`stator_module_resume_evaluation`] (after settling the awaited
+   * `stator_module_resume_evaluation` (after settling the awaited
    * promise via host primitives or
-   * [`stator_module_pending_evaluation_fulfill`] /
-   * [`stator_module_pending_evaluation_reject`]) before the module's
+   * `stator_module_pending_evaluation_fulfill` /
+   * `stator_module_pending_evaluation_reject`) before the module's
    * bindings become observable.
    */
   StatorModuleStatusPendingAsyncEvaluation = 5,
 } StatorModuleStatus;
 
 /**
- * Stable status code returned by typed-accessor and Maybe-style FFI entry
- * points so that C callers can distinguish a missing value, an invalid
- * argument, an unsupported operation, and a JavaScript exception without
- * reaching for out-of-band channels.
- *
- * Variants:
- * * [`StatorStatusOk`][Self::StatorStatusOk] — the call succeeded; any
- *   out-pointer was written.
- * * [`StatorStatusFalse`][Self::StatorStatusFalse] — the call succeeded with
- *   a structural "no" answer (e.g. property missing, type mismatch on a
- *   typed get).  Out-pointers are left untouched or zero-cleared, never
- *   carrying a stale value.
- * * [`StatorStatusException`][Self::StatorStatusException] — the operation
- *   raised (or captured) a JavaScript exception.  When applicable, the
- *   isolate's pending exception is populated and can be inspected through
- *   [`stator_isolate_peek_pending_message`] / `stator_try_catch_*`.
- * * [`StatorStatusInvalidArg`][Self::StatorStatusInvalidArg] — at least one
- *   required argument was null or otherwise malformed; nothing was mutated.
- * * [`StatorStatusUnsupported`][Self::StatorStatusUnsupported] — the
- *   operation is well-formed but not yet implemented for this kind of
- *   value/object (e.g. calling a bytecode function via the FFI).  Reserved
- *   discriminants are stable; embedders should treat unknown values as
- *   `StatorStatusUnsupported`.
- *
- * Backed by a C `int`-shaped enum so the discriminants are stable across
- * the C ABI and can be compared by value from C/C++.
- */
-typedef enum StatorStatus {
-  /**
-   * Operation succeeded.
-   */
-  StatorStatusOk = 0,
-  /**
-   * Operation succeeded with a structural "no" answer (missing property,
-   * type mismatch on a typed accessor).
-   */
-  StatorStatusFalse = 1,
-  /**
-   * A JavaScript exception was raised or captured.  The isolate's pending
-   * exception is set when this is returned by a Maybe-style API.
-   */
-  StatorStatusException = 2,
-  /**
-   * At least one argument was null or malformed.
-   */
-  StatorStatusInvalidArg = 3,
-  /**
-   * The operation is not supported for this value/object kind.
-   */
-  StatorStatusUnsupported = 4,
-} StatorStatus;
-
-/**
- * Hash fields in [`StatorSnapshotBuildBinding`] that embedders can override.
+ * Hash fields in `StatorSnapshotBuildBinding` that embedders can override.
  */
 typedef enum StatorSnapshotBuildHashField {
   /**
@@ -781,6 +953,28 @@ typedef enum StatorSnapshotErrorKind {
 } StatorSnapshotErrorKind;
 
 /**
+ * Settlement state for a host-controlled WebAssembly streaming operation.
+ */
+typedef enum StatorWasmStreamingOperationStatus {
+  /**
+   * The host has started the operation but has not completed or cancelled it.
+   */
+  StatorWasmStreamingOperationStatusPending = 0,
+  /**
+   * The host or isolate termination cancelled the operation before settlement.
+   */
+  StatorWasmStreamingOperationStatusCancelled = 1,
+  /**
+   * The operation completed successfully and owns a result module.
+   */
+  StatorWasmStreamingOperationStatusCompleted = 2,
+  /**
+   * The operation failed closed; query the diagnostic string for details.
+   */
+  StatorWasmStreamingOperationStatusErrored = 3,
+} StatorWasmStreamingOperationStatus;
+
+/**
  * C-ABI Wasm value kind used by host-import marshalling.
  *
  * Discriminants are stable and embedders may rely on them.
@@ -876,6 +1070,14 @@ typedef enum StatorDomAccessCheckOperation {
    * Indexed-property descriptor lookup (`Object.getOwnPropertyDescriptor`).
    */
   StatorDomAccessCheckOperationIndexedDescriptor = 14,
+  /**
+   * DOM wrapper call-as-function invocation.
+   */
+  StatorDomAccessCheckOperationCallAsFunction = 15,
+  /**
+   * DOM wrapper constructor invocation.
+   */
+  StatorDomAccessCheckOperationConstruct = 16,
 } StatorDomAccessCheckOperation;
 
 /**
@@ -915,7 +1117,7 @@ typedef enum StatorPromiseRejectionEventKind {
 } StatorPromiseRejectionEventKind;
 
 /**
- * Selects what the embedder receives in the [`StatorWeakCallbackInfo`] when
+ * Selects what the embedder receives in the `StatorWeakCallbackInfo` when
  * the callback fires.  Mirrors V8's `WeakCallbackType::kParameter` vs
  * `WeakCallbackType::kInternalFields` distinction so Blink-style wrappers
  * can recover embedder fields without re-dereferencing the dead object.
@@ -923,12 +1125,12 @@ typedef enum StatorPromiseRejectionEventKind {
 typedef enum StatorWeakParameterKind {
   /**
    * The callback only needs the opaque `parameter` pointer captured at
-   * [`stator_weak_new`] time.  `internal_fields` are zeroed.
+   * `stator_weak_new` time.  `internal_fields` are zeroed.
    */
   Opaque = 0,
   /**
    * The callback expects the first two internal fields of the referent
-   * to be snapshotted into [`StatorWeakCallbackInfo::internal_fields`] at
+   * to be snapshotted into `StatorWeakCallbackInfo::internal_fields` at
    * slot-creation time.  This is the kind Blink uses to break C++ side
    * pointers from inside the weak callback without touching the (dead)
    * JS wrapper.
@@ -945,7 +1147,7 @@ typedef enum StatorNativeCodeCacheDiagnostic {
    */
   StatorNativeCodeCacheDiagnosticAccepted = 0,
   /**
-   * A required pointer/length pair or output pointer was invalid.
+   * A required input pointer/length pair or compatibility pointer was invalid.
    */
   StatorNativeCodeCacheDiagnosticInvalidArgument = 1,
   /**
@@ -961,7 +1163,10 @@ typedef enum StatorNativeCodeCacheDiagnostic {
    */
   StatorNativeCodeCacheDiagnosticRejectedEngineVersion = 4,
   /**
-   * Native artifact/header format version did not match.
+   * Native artifact format version did not match.
+   *
+   * Unsupported fixed-header versions are treated as corrupt payloads because
+   * the decoder only accepts `STATOR_NATIVE_CODE_CACHE_HEADER_VERSION`.
    */
   StatorNativeCodeCacheDiagnosticRejectedFormatVersion = 5,
   /**
@@ -1008,27 +1213,11 @@ typedef enum StatorNativeCodeCacheTier {
   StatorNativeCodeCacheTierTurbofan = 3,
 } StatorNativeCodeCacheTier;
 
-typedef struct Option_StatorDomIndexedDefinerCb Option_StatorDomIndexedDefinerCb;
-
-typedef struct Option_StatorDomIndexedDescriptorCb Option_StatorDomIndexedDescriptorCb;
-
-typedef struct Option_StatorDomNamedDefinerCb Option_StatorDomNamedDefinerCb;
-
-typedef struct Option_StatorDomNamedDescriptorCb Option_StatorDomNamedDescriptorCb;
-
-typedef struct Option_StatorDomNamedSymbolDefinerCb Option_StatorDomNamedSymbolDefinerCb;
-
-typedef struct Option_StatorDomNamedSymbolDescriptorCb Option_StatorDomNamedSymbolDescriptorCb;
-
-typedef struct Option_StatorDynamicImportCallback Option_StatorDynamicImportCallback;
-
-typedef struct Option_StatorFunctionTemplateCallback Option_StatorFunctionTemplateCallback;
-
 /**
  * An opaque handle to a CDP WebSocket server.
  *
- * Created with [`stator_cdp_server_create`] and freed with
- * [`stator_cdp_server_destroy`].
+ * Created with `stator_cdp_server_create` and freed with
+ * `stator_cdp_server_destroy`.
  */
 typedef struct StatorCdpServer StatorCdpServer;
 
@@ -1036,51 +1225,50 @@ typedef struct StatorCdpServer StatorCdpServer;
  * An opaque context handle.
  *
  * A context represents an execution environment associated with an
- * [`StatorIsolate`].  The caller must pass the returned pointer to
- * [`stator_context_destroy`] when the context is no longer needed.
+ * `StatorIsolate`.  The caller must pass the returned pointer to
+ * `stator_context_destroy` when the context is no longer needed.
  */
 typedef struct StatorContext StatorContext;
 
 /**
  * An opaque handle to an interactive debugging session.
  *
- * A debug session owns both the compiled [`InterpreterFrame`] and an attached
- * [`Debugger`], allowing the host to:
+ * A debug session owns both the compiled interpreter frame and an attached
+ * debugger, allowing the host to:
  *
  * 1. Set breakpoints before execution starts.
- * 2. Start execution with [`stator_debug_session_run`] — the call returns
+ * 2. Start execution with `stator_debug_session_run` — the call returns
  *    `true` when a breakpoint is hit, leaving the session in a paused state.
- * 3. Inspect global variables with [`stator_debug_session_get_global_string`].
- * 4. Resume with [`stator_debug_session_resume`].
+ * 3. Inspect global variables with `stator_debug_session_get_global_string`.
+ * 4. Resume with `stator_debug_session_resume`.
  * 5. Repeat until `run` / `resume` return `false` (execution completed).
- * 6. Retrieve the final result with [`stator_debug_session_result`].
+ * 6. Retrieve the final result with `stator_debug_session_result`.
  *
- * Created with [`stator_debug_session_create`] and freed with
- * [`stator_debug_session_destroy`].
+ * Created with `stator_debug_session_create` and freed with
+ * `stator_debug_session_destroy`.
  */
 typedef struct StatorDebugSession StatorDebugSession;
 
 /**
- * Opaque index buffer passed to a [`StatorDomIndexedEnumeratorCb`]
+ * Opaque index buffer passed to a `StatorDomIndexedEnumeratorCb`
  * callback.  The callback fills it by repeatedly calling
- * [`stator_dom_index_buffer_push`].  The buffer is owned by the FFI
- * bridge for the duration of the callback and must not outlive it.
+ * `stator_dom_index_buffer_push`.  The buffer is owned by the FFI bridge for
+ * the duration of the callback and must not outlive it.
  *
  * Embedders that want to drive the indexed enumerator directly from C
  * (rather than through an installed handler) can allocate a buffer with
- * [`stator_dom_index_buffer_new`], pass it to
- * [`stator_dom_object_wrap_invoke_indexed_enumerate_into`], inspect the
- * contents via [`stator_dom_index_buffer_len`] /
- * [`stator_dom_index_buffer_get`], and release it with
- * [`stator_dom_index_buffer_destroy`].
+ * `stator_dom_index_buffer_new`, pass it to
+ * `stator_dom_object_wrap_invoke_indexed_enumerate_into`, inspect the
+ * contents via `stator_dom_index_buffer_len` / `stator_dom_index_buffer_get`,
+ * and release it with `stator_dom_index_buffer_destroy`.
  */
 typedef struct StatorDomIndexBuffer StatorDomIndexBuffer;
 
 /**
- * Opaque name buffer passed to a [`StatorDomNamedEnumeratorCb`] callback.
+ * Opaque name buffer passed to a `StatorDomNamedEnumeratorCb` callback.
  *
  * The callback fills the buffer by repeatedly calling
- * [`stator_dom_name_buffer_push`].  The buffer is owned by the FFI bridge
+ * `stator_dom_name_buffer_push`.  The buffer is owned by the FFI bridge
  * and must not outlive the callback invocation.
  */
 typedef struct StatorDomNameBuffer StatorDomNameBuffer;
@@ -1088,8 +1276,8 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
 /**
  * An opaque handle to a DOM object wrapper.
  *
- * Created by [`stator_dom_object_wrap_new`] and freed by
- * [`stator_dom_object_wrap_destroy`].  Stores opaque embedder pointers in
+ * Created by `stator_dom_object_wrap_new` and freed by
+ * `stator_dom_object_wrap_destroy`.  Stores opaque embedder pointers in
  * *internal fields* and routes property access through optional interceptors.
  *
  * In addition to the engine-level wrapper state, the FFI layer tracks two
@@ -1102,9 +1290,9 @@ typedef struct StatorDomNameBuffer StatorDomNameBuffer;
 typedef struct StatorDomObjectWrap StatorDomObjectWrap;
 
 /**
- * Opaque buffer passed to a [`StatorDomNamedSymbolEnumeratorCb`] callback.
+ * Opaque buffer passed to a `StatorDomNamedSymbolEnumeratorCb` callback.
  * The callback pushes symbol identities by repeatedly invoking
- * [`stator_dom_symbol_buffer_push`].  The buffer is owned by the FFI
+ * `stator_dom_symbol_buffer_push`.  The buffer is owned by the FFI
  * bridge and must not outlive the callback invocation.
  */
 typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
@@ -1112,16 +1300,16 @@ typedef struct StatorDomSymbolBuffer StatorDomSymbolBuffer;
 /**
  * An opaque handle to a DOM wrapper weak reference.
  *
- * Created by [`stator_dom_weak_ref_new`] and freed by
- * [`stator_dom_weak_ref_destroy`].  The reference does **not** keep the
+ * Created by `stator_dom_weak_ref_new` and freed by
+ * `stator_dom_weak_ref_destroy`.  The reference does **not** keep the
  * associated DOM wrapper (or its materialized JS value) alive; the embedder
  * callback registered at creation time fires exactly once when the engine
  * proves the wrapper unreachable from JS, when the wrapper is invalidated,
  * or when the wrapper is destroyed.
  *
- * Dispatch is driven by the GC: every call to [`stator_isolate_gc`] (or
- * [`stator_gc_collect`]) walks the isolate's DOM weak table and fires every
- * eligible slot exactly once.  The legacy [`stator_dom_weak_ref_invoke`]
+ * Dispatch is driven by the GC: every call to `stator_isolate_gc` (or
+ * `stator_gc_collect`) walks the isolate's DOM weak table and fires every
+ * eligible slot exactly once.  The legacy `stator_dom_weak_ref_invoke`
  * helper still works for embedders that want to drive the callback
  * directly, but the GC-driven path is now authoritative.
  *
@@ -1143,13 +1331,13 @@ typedef struct StatorDynamicImportRequest StatorDynamicImportRequest;
 /**
  * An opaque escapable handle scope.
  *
- * Works like [`StatorHandleScope`] but allows a single value to be
+ * Works like `StatorHandleScope` but allows a single value to be
  * *escaped* — promoted into the enclosing scope (or left as an embedder-owned
  * handle if there is no enclosing scope) — via
- * [`stator_escapable_handle_scope_escape`].
+ * `stator_escapable_handle_scope_escape`.
  *
- * Created by [`stator_escapable_handle_scope_new`] and closed (and its
- * remaining values destroyed) by [`stator_escapable_handle_scope_close`].
+ * Created by `stator_escapable_handle_scope_new` and closed (and its
+ * remaining values destroyed) by `stator_escapable_handle_scope_close`.
  */
 typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
 
@@ -1171,20 +1359,20 @@ typedef struct StatorFunctionCallbackInfo StatorFunctionCallbackInfo;
  * An opaque function template handle.
  *
  * A function template associates a C callback with an isolate so that
- * [`stator_function_template_get_function`] can produce a [`StatorValue`]
+ * `stator_function_template_get_function` can produce a `StatorValue`
  * representing the function, which can then be installed into a context's
- * global environment via [`stator_context_global_set`].
+ * global environment via `stator_context_global_set`.
  */
 typedef struct StatorFunctionTemplate StatorFunctionTemplate;
 
 /**
- * An opaque handle scope that manages the lifetime of [`StatorValue`] handles
+ * An opaque handle scope that manages the lifetime of `StatorValue` handles
  * created while the scope is open.
  *
  * When a handle scope is open on an isolate, any value created via
- * [`stator_value_new_number`] or [`stator_value_new_string`] is automatically
+ * `stator_value_new_number` or `stator_value_new_string` is automatically
  * registered with the innermost open scope.  Calling
- * [`stator_handle_scope_close`] destroys all registered values and restores
+ * `stator_handle_scope_close` destroys all registered values and restores
  * the previous scope.
  *
  * Handle scopes nest: opening a second scope while one is already open is
@@ -1192,7 +1380,7 @@ typedef struct StatorFunctionTemplate StatorFunctionTemplate;
  *
  * # Ownership
  * Values registered with a scope are **owned by the scope**.  The embedder
- * must **not** call [`stator_value_destroy`] on those values; doing so would
+ * must **not** call `stator_value_destroy` on those values; doing so would
  * result in a double-free.
  */
 typedef struct StatorHandleScope StatorHandleScope;
@@ -1234,7 +1422,7 @@ typedef struct StatorIsolate StatorIsolate;
  *   populated by the engine; getters return `false` so callers can detect
  *   the missing data rather than treat a zero as truthful.
  * - **terminated** — `true` when the message was raised because execution
- *   was being terminated (see [`StatorMessageKind::StatorMessageKindTermination`]).
+ *   was being terminated (see `StatorMessageKindTermination`).
  *
  * Created internally by the engine and exposed via:
  * - [`stator_isolate_take_pending_message`] (ownership transfer)
@@ -1257,17 +1445,26 @@ typedef struct StatorMessage StatorMessage;
 typedef struct StatorModule StatorModule;
 
 /**
+ * Retained, queryable module-record handle.
+ *
+ * The handle keeps a linked module record alive after the embedder releases its
+ * raw `StatorModule` pointer. Queries fail closed once the handle is released
+ * or the underlying module lifetime has ended.
+ */
+typedef struct StatorModuleHandle StatorModuleHandle;
+
+/**
  * An opaque handle to a JavaScript object.
  *
  * Created by [`stator_object_new`] and destroyed by [`stator_object_destroy`].
  * Named properties can be set and retrieved via [`stator_object_set`] and
  * [`stator_object_get`].
  *
- * The underlying [`JsObject`] storage is reference-counted, allowing the
- * same object identity to be exposed through multiple FFI handles via
- * [`stator_value_as_object`] / [`stator_object_as_value`].  Mutations
- * through one handle are observed through all other handles that share the
- * same backing storage.
+ * The underlying [`PropertyMap`] storage is reference-counted, allowing the
+ * same object identity to be exposed through multiple FFI handles and through
+ * [`JsValue::PlainObject`] without materialising a fresh script object.
+ * Mutations through one handle are observed through all other handles that
+ * share the same backing storage.
  */
 typedef struct StatorObject StatorObject;
 
@@ -1306,6 +1503,16 @@ typedef struct StatorPropertyNames StatorPropertyNames;
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
  */
 typedef struct StatorScript StatorScript;
+
+/**
+ * An opaque receiver signature for function-template callbacks.
+ *
+ * Signatures snapshot the receiver template id when created. Assigning a
+ * signature to a function template makes callbacks fail closed with a
+ * `TypeError` unless their JavaScript receiver is a DOM wrapper that was
+ * created from the receiver template or one of its descendants.
+ */
+typedef struct StatorSignature StatorSignature;
 
 /**
  * STWC build/ABI binding used to fail closed on incompatible warm-context blobs.
@@ -1369,6 +1576,20 @@ typedef struct StatorWasmInstance StatorWasmInstance;
  * [`stator_wasm_module_destroy`].
  */
 typedef struct StatorWasmModule StatorWasmModule;
+
+/**
+ * Opaque handle to a host-owned shared WebAssembly memory.
+ *
+ * Shared memories can be supplied as imports to [`stator_wasm_instantiate_with_memory_imports`].
+ * They are created against a module's Wasm engine so Wasmtime can safely bind
+ * them into instances of that module.
+ */
+typedef struct StatorWasmSharedMemory StatorWasmSharedMemory;
+
+/**
+ * Opaque host-controlled compileStreaming/instantiateStreaming operation.
+ */
+typedef struct StatorWasmStreamingOperation StatorWasmStreamingOperation;
 
 /**
  * Compilation tier statistics for an isolate.
@@ -1631,10 +1852,8 @@ typedef struct StatorIcCountersStats {
  * Per-tier portion of [`StatorTierLatencyStats`].
  *
  * All durations are expressed in **nanoseconds**.  Histogram bucket
- * boundaries follow
- * [`stator_jse::compiler::tier_latency::HISTOGRAM_BUCKETS_US`] (in
- * microseconds), with the final bucket counting overflows above the
- * last named upper bound.
+ * boundaries follow the engine's fixed microsecond promotion-latency buckets,
+ * with the final bucket counting overflows above the last named upper bound.
  */
 typedef struct StatorTierLatencyTier {
   /**
@@ -1895,8 +2114,8 @@ typedef struct StatorOsrCountersStats {
 } StatorOsrCountersStats;
 
 /**
- * Per-tier release-safe JIT unwind counters, mirroring
- * [`stator_jse::jit_unwind::JitUnwindTierSnapshot`].
+ * Per-tier release-safe JIT unwind counters, mirroring the engine's internal
+ * unwind diagnostics snapshot.
  *
  * `unwind_supported` is `false` for every tier in this build; see
  * `docs/edge_diagnostics.md` for the rationale and the conditions under
@@ -1952,6 +2171,96 @@ typedef struct StatorJitUnwindStats {
    */
   struct StatorJitUnwindTierStats tiers[STATOR_JIT_UNWIND_TIER_COUNT];
 } StatorJitUnwindStats;
+
+/**
+ * Per-tier release-safe CFG/CET counters, mirroring the engine's internal
+ * mitigation diagnostics snapshot.
+ *
+ * `cfg_supported` / `cet_compatible` are `false` for every tier in this
+ * build; see `docs/edge_diagnostics.md` for the support matrix and the
+ * conditions under which a future tier flips the flag.
+ */
+typedef struct StatorJitMitigationsTierStats {
+  /**
+   * Stable tier index (matches `JitMitigationsTier` discriminant).
+   */
+  uint32_t tier;
+  /**
+   * Whether this tier produces verified CFG call-target metadata.
+   */
+  bool cfg_supported;
+  /**
+   * Whether this tier emits CET shadow-stack/IBT-compatible code.
+   */
+  bool cet_compatible;
+  /**
+   * Number of CFG registration attempts (including unsupported/failed).
+   */
+  uint64_t cfg_register_attempts;
+  /**
+   * Number of CFG registrations that successfully delivered targets.
+   */
+  uint64_t cfg_register_successes;
+  /**
+   * Number of CFG registrations rejected by the OS after the
+   * supported-tier check passed.
+   */
+  uint64_t cfg_register_failures;
+  /**
+   * Number of CFG registrations rejected because the tier or platform
+   * does not yet produce safe call-target metadata.  Fail-closed
+   * sentinel.
+   */
+  uint64_t cfg_unsupported_tier_attempts;
+  /**
+   * Total individual CFG call targets registered via successful
+   * registrations.
+   */
+  uint64_t cfg_targets_registered;
+  /**
+   * JIT pages observed to be CET-compatible.  Stays at zero while
+   * every tier reports `cet_compatible == false`.
+   */
+  uint64_t cet_pages_marked_compatible;
+  /**
+   * JIT pages observed to be CET-incompatible (fail-closed bucket).
+   */
+  uint64_t cet_pages_marked_incompatible;
+} StatorJitMitigationsTierStats;
+
+/**
+ * Aggregate release-safe CFG/CET counter snapshot exposed to embedders.
+ *
+ * `process_cfg_status` and the two `process_cet_*_status` fields are
+ * encoded using `STATOR_MITIGATION_STATUS_*` constants.
+ */
+typedef struct StatorJitMitigationsStats {
+  /**
+   * Whether the build target is a Windows target.
+   */
+  bool platform_supported;
+  /**
+   * Process-level CFG status reported by Windows (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cfg_status;
+  /**
+   * Process-level CET user shadow-stack status (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cet_shadow_stack_status;
+  /**
+   * Process-level CET user shadow-stack *strict* mode status
+   * (`STATOR_MITIGATION_STATUS_*`).
+   */
+  uint32_t process_cet_user_shadow_stack_strict_status;
+  /**
+   * Number of per-tier rows that follow.
+   */
+  uint32_t tier_row_count;
+  /**
+   * Per-tier counters, indexed by `JitMitigationsTier` discriminant.
+   */
+  struct StatorJitMitigationsTierStats tiers[STATOR_JIT_MITIGATIONS_TIER_COUNT];
+} StatorJitMitigationsStats;
 
 /**
  * Read-only view of the browser policy/origin metadata associated with a
@@ -2150,6 +2459,96 @@ typedef struct StatorImportMetaProperties {
 } StatorImportMetaProperties;
 
 /**
+ * Compile options that participate in classic-script code-cache identity.
+ *
+ * All pointer/length pairs are optional when their length is zero. Non-empty
+ * buffers are copied by Stator before cache production/consumption APIs return.
+ * `resource_name` is the stable URL/resource identity used by diagnostics and
+ * cache validation; source-map and origin metadata mirror browser script
+ * compilation metadata.
+ */
+typedef struct StatorScriptCompileOptions {
+  /**
+   * Pointer to `resource_name_len` bytes of the resource URL/name.
+   */
+  const char *resource_name;
+  /**
+   * Number of bytes in `resource_name`.
+   */
+  size_t resource_name_len;
+  /**
+   * Zero-based line offset within the resource.
+   */
+  int32_t line_offset;
+  /**
+   * Zero-based column offset within the resource.
+   */
+  int32_t column_offset;
+  /**
+   * Optional source URL / sourceURL directive bytes.
+   */
+  const char *source_url;
+  /**
+   * Number of bytes in `source_url`.
+   */
+  size_t source_url_len;
+  /**
+   * Optional browser origin URL bytes.
+   */
+  const char *origin_url;
+  /**
+   * Number of bytes in `origin_url`.
+   */
+  size_t origin_url_len;
+  /**
+   * Optional source map URL bytes.
+   */
+  const char *source_map_url;
+  /**
+   * Number of bytes in `source_map_url`.
+   */
+  size_t source_map_url_len;
+  /**
+   * Optional cache-policy token bytes.
+   */
+  const char *cache_policy;
+  /**
+   * Number of bytes in `cache_policy`.
+   */
+  size_t cache_policy_len;
+} StatorScriptCompileOptions;
+
+/**
+ * Telemetry returned by classic-script code-cache APIs.
+ */
+typedef struct StatorScriptCacheTelemetry {
+  /**
+   * High-level status of the cache operation.
+   */
+  enum StatorScriptCacheStatus status;
+  /**
+   * Detailed diagnostic reason for status-specific logging.
+   */
+  enum StatorScriptCacheDiagnostic diagnostic;
+  /**
+   * Size of the source input in bytes.
+   */
+  size_t source_len;
+  /**
+   * Size of the cache input in bytes, or zero for production APIs.
+   */
+  size_t cache_input_len;
+  /**
+   * Size of the produced cache blob in bytes, or zero when none was produced.
+   */
+  size_t cache_output_len;
+  /**
+   * Stable cache format version used or observed.
+   */
+  uint32_t format_version;
+} StatorScriptCacheTelemetry;
+
+/**
  * Browser-facing source identity and policy options for module compilation.
  *
  * All pointer/length pairs are optional when their length is zero. Non-empty
@@ -2173,11 +2572,11 @@ typedef struct StatorModuleCompileOptions {
    */
   size_t resource_name_len;
   /**
-   * 1-based line offset within the resource.
+   * Zero-based line offset within the resource.
    */
   int32_t line_offset;
   /**
-   * 1-based column offset within the resource.
+   * Zero-based column offset within the resource.
    */
   int32_t column_offset;
   /**
@@ -2209,70 +2608,6 @@ typedef struct StatorModuleCompileOptions {
    */
   enum StatorParserMetadata parser_metadata;
 } StatorModuleCompileOptions;
-
-/**
- * Per-script tiering state visible to embedders.
- */
-typedef struct StatorScriptTierStatus {
-  /**
-   * Number of bytecode instructions in the script.
-   */
-  size_t bytecode_count;
-  /**
-   * Number of times the script/function has been invoked.
-   */
-  uint32_t invocation_count;
-  /**
-   * Whether baseline JIT code is cached.
-   */
-  bool baseline_jit_compiled;
-  /**
-   * Whether Maglev JIT code is cached.
-   */
-  bool maglev_jit_compiled;
-  /**
-   * Whether an executable Maglev entry is cached.
-   */
-  bool maglev_executable_cached;
-  /**
-   * Whether Maglev compilation has been attempted.
-   */
-  bool maglev_compile_attempted;
-  /**
-   * Number of Maglev deopts recorded for this script.
-   */
-  uint32_t maglev_deopt_count;
-  /**
-   * Invocation count at which Maglev may be retried.
-   */
-  uint32_t maglev_next_try_at;
-  /**
-   * Whether Turbofan JIT code is cached.
-   */
-  bool turbofan_jit_compiled;
-  /**
-   * Whether this script is blocked from JIT tier execution.
-   */
-  bool jit_disabled;
-} StatorScriptTierStatus;
-
-/**
- * Result record filled by deterministic force/wait tier APIs.
- */
-typedef struct StatorTierRequestResult {
-  /**
-   * Tier requested by the caller.
-   */
-  enum StatorJitTier requested_tier;
-  /**
-   * Final status of the request/observation.
-   */
-  enum StatorTierRequestStatus status;
-  /**
-   * Whether the requested tier is observable as ready now.
-   */
-  bool ready;
-} StatorTierRequestResult;
 
 /**
  * Stable browser-facing source metadata v2 for compiled modules.
@@ -2346,6 +2681,70 @@ typedef struct StatorModuleSourceMetadataV2 {
 } StatorModuleSourceMetadataV2;
 
 /**
+ * Per-script tiering state visible to embedders.
+ */
+typedef struct StatorScriptTierStatus {
+  /**
+   * Number of bytecode instructions in the script.
+   */
+  size_t bytecode_count;
+  /**
+   * Number of times the script/function has been invoked.
+   */
+  uint32_t invocation_count;
+  /**
+   * Whether baseline JIT code is cached.
+   */
+  bool baseline_jit_compiled;
+  /**
+   * Whether Maglev JIT code is cached.
+   */
+  bool maglev_jit_compiled;
+  /**
+   * Whether an executable Maglev entry is cached.
+   */
+  bool maglev_executable_cached;
+  /**
+   * Whether Maglev compilation has been attempted.
+   */
+  bool maglev_compile_attempted;
+  /**
+   * Number of Maglev deopts recorded for this script.
+   */
+  uint32_t maglev_deopt_count;
+  /**
+   * Invocation count at which Maglev may be retried.
+   */
+  uint32_t maglev_next_try_at;
+  /**
+   * Whether Turbofan JIT code is cached.
+   */
+  bool turbofan_jit_compiled;
+  /**
+   * Whether this script is blocked from JIT tier execution.
+   */
+  bool jit_disabled;
+} StatorScriptTierStatus;
+
+/**
+ * Result record filled by deterministic force/wait tier APIs.
+ */
+typedef struct StatorTierRequestResult {
+  /**
+   * Tier requested by the caller.
+   */
+  enum StatorJitTier requested_tier;
+  /**
+   * Final status of the request/observation.
+   */
+  enum StatorTierRequestStatus status;
+  /**
+   * Whether the requested tier is observable as ready now.
+   */
+  bool ready;
+} StatorTierRequestResult;
+
+/**
  * C-callable native-function signature.
  *
  * The callback receives the active context, an array of `argc` argument
@@ -2369,6 +2768,93 @@ typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
  * execution fails).
  */
 typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct StatorFunctionCallbackInfo*);
+
+/**
+ * POD bundle of named-property interceptors, installed in one call by
+ * `stator_dom_object_wrap_install_named_handler`.
+ *
+ * Each callback field is optional: pass `NULL` from C (or `None` from Rust)
+ * to leave a particular interceptor uninstalled.  At least one callback
+ * must be non-null for the install call to succeed.
+ *
+ * `data` is an opaque embedder pointer passed verbatim to each callback;
+ * the engine never dereferences it.  It is independent of internal-field 0
+ * (which the legacy `set_named_getter` family uses for `data`).
+ */
+typedef struct StatorDomNamedHandler {
+  /**
+   * Named-property getter, or null.
+   */
+  enum StatorStatus (*getter)(const char *name_utf8,
+                              size_t name_len,
+                              void *data,
+                              struct StatorValue **out);
+  /**
+   * Named-property setter, or null.
+   */
+  enum StatorStatus (*setter)(const char *name_utf8,
+                              size_t name_len,
+                              const struct StatorValue *value,
+                              void *data);
+  /**
+   * Named-property `in`/query callback, or null.
+   */
+  enum StatorStatus (*query)(const char *name_utf8, size_t name_len, void *data, uint32_t *out_attrs);
+  /**
+   * Named-property `delete` callback, or null.
+   */
+  enum StatorStatus (*deleter)(const char *name_utf8, size_t name_len, void *data, bool *out_deleted);
+  /**
+   * Named-property enumerator callback, or null.
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomNameBuffer *buf, void *data);
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomNamedHandler;
+
+/**
+ * POD bundle of indexed-property interceptors, installed in one call by
+ * [`stator_dom_object_wrap_install_indexed_handler`].
+ *
+ * Each callback field is optional (`NULL` to skip).  At least one callback
+ * must be non-null for the install call to succeed.
+ */
+typedef struct StatorDomIndexedHandler {
+  /**
+   * Indexed-property getter, or null.
+   */
+  enum StatorStatus (*getter)(uint32_t index, void *data, struct StatorValue **out);
+  /**
+   * Indexed-property setter, or null.
+   */
+  enum StatorStatus (*setter)(uint32_t index, const struct StatorValue *value, void *data);
+  /**
+   * Indexed-property query callback, or null.
+   */
+  enum StatorStatus (*query)(uint32_t index, void *data, uint32_t *out_attrs);
+  /**
+   * Indexed-collection length callback, or null.
+   */
+  enum StatorStatus (*length)(void *data, uint32_t *out_len);
+  /**
+   * Indexed-property `delete` callback, or null.  See
+   * [`StatorDomIndexedDeleterCb`] for the three-way result encoding
+   * (deleted / explicitly-refused / no-intercept).
+   */
+  enum StatorStatus (*deleter)(uint32_t index, void *data, bool *out_deleted);
+  /**
+   * Indexed-property enumerator callback, or null.  Pushes onto a
+   * caller-borrowed [`StatorDomIndexBuffer`] via
+   * [`stator_dom_index_buffer_push`].
+   */
+  enum StatorStatus (*enumerator)(struct StatorDomIndexBuffer *buf, void *data);
+  /**
+   * Opaque embedder data passed to every callback.
+   */
+  void *data;
+} StatorDomIndexedHandler;
 
 /**
  * C-compatible vtable that embedders fill in to customise engine behaviour.
@@ -2411,9 +2897,9 @@ typedef struct StatorPlatformVTable {
 } StatorPlatformVTable;
 
 /**
- * C-ABI union payload of a [`StatorWasmValue`].
+ * C-ABI union payload of a `StatorWasmValue`.
  *
- * Only the variant indicated by the containing [`StatorWasmValue::kind`] is
+ * Only the variant indicated by the containing `StatorWasmValue.kind` is
  * well-defined; reading any other variant is undefined behavior.
  */
 typedef union StatorWasmValuePayload {
@@ -2524,6 +3010,25 @@ typedef struct StatorWasmImports {
    */
   size_t funcs_len;
 } StatorWasmImports;
+
+/**
+ * A host shared-memory import passed to
+ * [`stator_wasm_instantiate_with_memory_imports`].
+ */
+typedef struct StatorWasmMemoryImport {
+  /**
+   * Import module name as a null-terminated UTF-8 string.
+   */
+  const char *module_name;
+  /**
+   * Import field name as a null-terminated UTF-8 string.
+   */
+  const char *field_name;
+  /**
+   * Shared memory handle to bind to this import.
+   */
+  const struct StatorWasmSharedMemory *memory;
+} StatorWasmMemoryImport;
 
 /**
  * C-callable named-property getter callback.
@@ -2652,98 +3157,37 @@ typedef struct StatorDomPropertyDescriptor {
 } StatorDomPropertyDescriptor;
 
 /**
- * POD bundle of named-property interceptors, installed in one call by
- * [`stator_dom_object_wrap_install_named_handler`].
- *
- * Each callback field is optional: pass `NULL` from C (or `None` from Rust)
- * to leave a particular interceptor uninstalled.  At least one callback
- * must be non-null for the install call to succeed.
- *
- * `data` is an opaque embedder pointer passed verbatim to each callback;
- * the engine never dereferences it.  It is independent of internal-field 0
- * (which the legacy `set_named_getter` family uses for `data`).
+ * Additive callable/constructible handler bundle for a DOM wrapper.
  */
-typedef struct StatorDomNamedHandler {
+typedef struct StatorDomCallableHandler {
   /**
-   * Named-property getter, or null.
+   * Call-as-function callback, or null to leave ordinary calls unsupported.
    */
-  enum StatorStatus (*getter)(const char *name_utf8,
-                              size_t name_len,
-                              void *data,
-                              struct StatorValue **out);
+  enum StatorStatus (*call)(const struct StatorValue *receiver,
+                            const struct StatorValue *const *args,
+                            size_t arg_count,
+                            void *data,
+                            struct StatorValue **out);
   /**
-   * Named-property setter, or null.
+   * Construct callback, or null to leave `new wrapper(...)` unsupported.
    */
-  enum StatorStatus (*setter)(const char *name_utf8,
-                              size_t name_len,
-                              const struct StatorValue *value,
-                              void *data);
+  enum StatorStatus (*construct)(const struct StatorValue *new_target,
+                                 const struct StatorValue *const *args,
+                                 size_t arg_count,
+                                 void *data,
+                                 struct StatorValue **out);
   /**
-   * Named-property `in`/query callback, or null.
-   */
-  enum StatorStatus (*query)(const char *name_utf8, size_t name_len, void *data, uint32_t *out_attrs);
-  /**
-   * Named-property `delete` callback, or null.
-   */
-  enum StatorStatus (*deleter)(const char *name_utf8, size_t name_len, void *data, bool *out_deleted);
-  /**
-   * Named-property enumerator callback, or null.
-   */
-  enum StatorStatus (*enumerator)(struct StatorDomNameBuffer *buf, void *data);
-  /**
-   * Opaque embedder data passed to every callback.
+   * Opaque embedder data passed to both callbacks.
    */
   void *data;
-} StatorDomNamedHandler;
-
-/**
- * POD bundle of indexed-property interceptors, installed in one call by
- * [`stator_dom_object_wrap_install_indexed_handler`].
- *
- * Each callback field is optional (`NULL` to skip).  At least one callback
- * must be non-null for the install call to succeed.
- */
-typedef struct StatorDomIndexedHandler {
-  /**
-   * Indexed-property getter, or null.
-   */
-  enum StatorStatus (*getter)(uint32_t index, void *data, struct StatorValue **out);
-  /**
-   * Indexed-property setter, or null.
-   */
-  enum StatorStatus (*setter)(uint32_t index, const struct StatorValue *value, void *data);
-  /**
-   * Indexed-property query callback, or null.
-   */
-  enum StatorStatus (*query)(uint32_t index, void *data, uint32_t *out_attrs);
-  /**
-   * Indexed-collection length callback, or null.
-   */
-  enum StatorStatus (*length)(void *data, uint32_t *out_len);
-  /**
-   * Indexed-property `delete` callback, or null.  See
-   * [`StatorDomIndexedDeleterCb`] for the three-way result encoding
-   * (deleted / explicitly-refused / no-intercept).
-   */
-  enum StatorStatus (*deleter)(uint32_t index, void *data, bool *out_deleted);
-  /**
-   * Indexed-property enumerator callback, or null.  Pushes onto a
-   * caller-borrowed [`StatorDomIndexBuffer`] via
-   * [`stator_dom_index_buffer_push`].
-   */
-  enum StatorStatus (*enumerator)(struct StatorDomIndexBuffer *buf, void *data);
-  /**
-   * Opaque embedder data passed to every callback.
-   */
-  void *data;
-} StatorDomIndexedHandler;
+} StatorDomCallableHandler;
 
 /**
  * POD descriptor for a symbol property key passed across the FFI
- * boundary.  Mirrors the engine's [`SymbolKey`][stator_jse::dom::SymbolKey]
- * without ever coercing the symbol to a string: `symbol_id` carries the
- * engine-assigned identity verbatim, and `description_utf8`/`description_len`
- * carry the optional description for diagnostics only.
+ * boundary.  Mirrors the engine's internal symbol-key representation without
+ * ever coercing the symbol to a string: `symbol_id` carries the engine-assigned
+ * identity verbatim, and `description_utf8`/`description_len` carry the
+ * optional description for diagnostics only.
  *
  * `description_utf8` may be `NULL` (with `description_len == 0`) when the
  * symbol has no description.  The pointer is borrowed for the duration of
@@ -2819,19 +3263,29 @@ typedef struct StatorDomNamedDefinerDescriptorHandler {
   /**
    * String-keyed definer, or null.
    */
-  struct Option_StatorDomNamedDefinerCb definer;
+  enum StatorStatus (*definer)(const char *name_utf8,
+                               size_t name_len,
+                               const struct StatorDomPropertyDescriptor *descriptor,
+                               void *data);
   /**
    * String-keyed descriptor callback, or null.
    */
-  struct Option_StatorDomNamedDescriptorCb descriptor;
+  enum StatorStatus (*descriptor)(const char *name_utf8,
+                                  size_t name_len,
+                                  void *data,
+                                  struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Symbol-keyed definer, or null.
    */
-  struct Option_StatorDomNamedSymbolDefinerCb symbol_definer;
+  enum StatorStatus (*symbol_definer)(const struct StatorDomSymbolKey *key,
+                                      const struct StatorDomPropertyDescriptor *descriptor,
+                                      void *data);
   /**
    * Symbol-keyed descriptor callback, or null.
    */
-  struct Option_StatorDomNamedSymbolDescriptorCb symbol_descriptor;
+  enum StatorStatus (*symbol_descriptor)(const struct StatorDomSymbolKey *key,
+                                         void *data,
+                                         struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Opaque embedder data passed to every callback.
    */
@@ -2845,11 +3299,15 @@ typedef struct StatorDomIndexedDefinerDescriptorHandler {
   /**
    * Indexed definer, or null.
    */
-  struct Option_StatorDomIndexedDefinerCb definer;
+  enum StatorStatus (*definer)(uint32_t index,
+                               const struct StatorDomPropertyDescriptor *descriptor,
+                               void *data);
   /**
    * Indexed descriptor callback, or null.
    */
-  struct Option_StatorDomIndexedDescriptorCb descriptor;
+  enum StatorStatus (*descriptor)(uint32_t index,
+                                  void *data,
+                                  struct StatorDomPropertyDescriptor *out_descriptor);
   /**
    * Opaque embedder data passed to every callback.
    */
@@ -2940,9 +3398,8 @@ typedef struct StatorWeakCallbackInfo {
   void *parameter;
   /**
    * First two internal-field pointers snapshotted at slot creation when
-   * the weak slot was registered with
-   * [`StatorWeakParameterKind::InternalFields`].  Always zeroed for
-   * [`StatorWeakParameterKind::Opaque`] slots.
+   * the weak slot was registered with `InternalFields` parameter mode.
+   * Always zeroed for `Opaque` parameter-mode slots.
    */
   void *internal_fields[2];
   /**
@@ -2968,8 +3425,8 @@ typedef void (*StatorWeakCallback)(const struct StatorWeakCallbackInfo *info);
  * Opaque traced-root visitor token passed to the embedder root visitor.
  *
  * The pointer is only valid for the duration of a single
- * [`StatorTracedRootVisitor`] invocation; storing it across calls or
- * passing it to [`stator_traced_visitor_visit`] from another thread is
+ * `StatorTracedRootVisitor` invocation; storing it across calls or
+ * passing it to `stator_traced_visitor_visit` from another thread is
  * undefined behaviour.  All `stator_traced_visitor_*` functions check
  * for a null token and fail closed.
  */
@@ -2993,7 +3450,7 @@ typedef void (*StatorTracedRootVisitor)(void *userdata, struct StatorTracedVisit
 
 /**
  * Embedder edge callback: invoked once per outgoing `TracedReference`
- * edge during a call to [`stator_traced_visit_outgoing`].  The `edge`
+ * edge during a call to `stator_traced_visit_outgoing`.  The `edge`
  * pointer is borrowed for the duration of the call; the embedder must
  * not dispose or reset it (those operations belong to the slot's
  * owner).
@@ -3217,17 +3674,17 @@ typedef enum StatorResolveStatus (*StatorImportMetaPopulateCallback)(struct Stat
  *
  * Invoked synchronously on the thread running the Wasm caller.  Returns
  * `true` after writing exactly `results_len` typed results into `results`.
- * Result kinds must match the declaration in [`StatorWasmHostFunc::results`].
+ * Result kinds must match the declaration in `StatorWasmHostFunc.results`.
  * Returning `false` or a mismatched result kind traps the running Wasm call:
  * the enclosing
- * [`stator_wasm_instance_call`] then returns null.
+ * `stator_wasm_instance_call` then returns null.
  *
  * # Safety
  * - `args` is a valid pointer for reads of `args_len` consecutive
- *   [`StatorWasmValue`]s.
+ *   `StatorWasmValue`s.
  * - `results` is a valid pointer for writes of `results_len` consecutive
- *   [`StatorWasmValue`]s.  Each slot must be initialised by the callback
- *   with the kind declared in [`StatorWasmHostFunc::results`].
+ *   `StatorWasmValue`s.  Each slot must be initialised by the callback
+ *   with the kind declared in `StatorWasmHostFunc.results`.
  * - `ctx` and `user_data` are the values supplied at instantiate time and
  *   must remain live for the duration of the call.
  */
@@ -3239,28 +3696,57 @@ typedef bool (*StatorWasmHostFuncCallback)(struct StatorContext *ctx,
                                            size_t results_len);
 
 /**
+ * DOM wrapper call-as-function callback.
+ *
+ * `receiver` is the JS receiver for ordinary calls (or null when invoked
+ * directly through FFI without one). `args` is a borrowed array of
+ * `arg_count` borrowed `StatorValue` pointers and may be null when
+ * `arg_count == 0`. Returning `StatorStatusOk` transfers
+ * ownership of `*out` to Stator when it is non-null; a null `*out` means the
+ * JavaScript result is `undefined`.
+ */
+typedef enum StatorStatus (*StatorDomCallAsFunctionCb)(const struct StatorValue *receiver,
+                                                       const struct StatorValue *const *args,
+                                                       size_t arg_count,
+                                                       void *data,
+                                                       struct StatorValue **out);
+
+/**
+ * DOM wrapper constructor callback.
+ *
+ * `new_target` is the constructor value for script `new wrapper(...)` calls
+ * (or null for direct FFI invocations that do not supply one). Argument and
+ * result ownership semantics match `StatorDomCallAsFunctionCb`.
+ */
+typedef enum StatorStatus (*StatorDomConstructCb)(const struct StatorValue *new_target,
+                                                  const struct StatorValue *const *args,
+                                                  size_t arg_count,
+                                                  void *data,
+                                                  struct StatorValue **out);
+
+/**
  * V2 named-property **getter** callback.
  *
  * The property name is passed as a UTF-8 byte range
  * `(name_utf8, name_len)` — it is **not** required to be null-terminated.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] — the interceptor handled the read and
- *   wrote a non-null [`StatorValue`] pointer into `*out`.  Ownership of the
+ * * `StatorStatusOk` — the interceptor handled the read and
+ *   wrote a non-null `StatorValue` pointer into `*out`.  Ownership of the
  *   value transfers to Stator, which will destroy it once consumed.
- * * [`StatorStatus::StatorStatusFalse`] — the interceptor did not handle the
+ * * `StatorStatusFalse` — the interceptor did not handle the
  *   read; the engine falls through to the wrapper's own properties.  `*out`
  *   is ignored.
- * * [`StatorStatus::StatorStatusException`] — the embedder raised an
+ * * `StatorStatusException` — the embedder raised an
  *   exception.  If the callback did not populate the isolate's pending
- *   exception via [`stator_isolate_throw_exception`], the FFI bridge records a
+ *   exception via `stator_isolate_throw_exception`, the FFI bridge records a
  *   generic DOM-interceptor exception before the wrapper-backed global
  *   accessor thunk fails script execution.
  * * Any other status is treated as fall-through.
  *
  * # Safety
  * - `name_utf8` must be valid for `name_len` bytes.
- * - `out` must be a writable `*mut StatorValue` slot if [`StatorStatus::StatorStatusOk`]
+ * - `out` must be a writable `StatorValue**` slot if `StatorStatusOk`
  *   is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedGetterCbV2)(const char *name_utf8,
@@ -3271,15 +3757,15 @@ typedef enum StatorStatus (*StatorDomNamedGetterCbV2)(const char *name_utf8,
 /**
  * V2 named-property **setter** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] to indicate the write was handled
+ * Returns `StatorStatusOk` to indicate the write was handled
  * (engine will not fall through to the wrapper's own properties),
- * [`StatorStatus::StatorStatusFalse`] for fall-through, or
- * [`StatorStatus::StatorStatusException`] to fail wrapper-backed global
+ * `StatorStatusFalse` for fall-through, or
+ * `StatorStatusException` to fail wrapper-backed global
  * access with a pending exception.
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `value` must be either
- * null or a valid, live [`StatorValue`] pointer borrowed for the call.
+ * null or a valid, live `StatorValue` pointer borrowed for the call.
  */
 typedef enum StatorStatus (*StatorDomNamedSetterCbV2)(const char *name_utf8,
                                                       size_t name_len,
@@ -3289,14 +3775,14 @@ typedef enum StatorStatus (*StatorDomNamedSetterCbV2)(const char *name_utf8,
 /**
  * V2 named-property **query** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] when the property exists (writing
+ * Returns `StatorStatusOk` when the property exists (writing
  * `v8::PropertyAttribute` flags into `*out_attrs`; `0` = `None`),
- * [`StatorStatus::StatorStatusFalse`] when it does not exist, or
- * [`StatorStatus::StatorStatusException`] (treated as missing).
+ * `StatorStatusFalse` when it does not exist, or
+ * `StatorStatusException` (treated as missing).
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `out_attrs` must be a
- * writable `*mut u32` slot if [`StatorStatus::StatorStatusOk`] is returned.
+ * writable `uint32_t *` slot if `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedQueryCb)(const char *name_utf8,
                                                    size_t name_len,
@@ -3306,16 +3792,16 @@ typedef enum StatorStatus (*StatorDomNamedQueryCb)(const char *name_utf8,
 /**
  * V2 named-property **deleter** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] to indicate the interceptor
+ * Returns `StatorStatusOk` to indicate the interceptor
  * handled the delete and wrote the JS-visible "deleted" result into
  * `*out_deleted` (`true` for successful delete, `false` for non-configurable
- * / refused).  [`StatorStatus::StatorStatusFalse`] falls through to the
- * wrapper's own properties.  [`StatorStatus::StatorStatusException`] is
+ * / refused).  `StatorStatusFalse` falls through to the
+ * wrapper's own properties.  `StatorStatusException` is
  * treated as fall-through.
  *
  * # Safety
  * `name_utf8` must be valid for `name_len` bytes; `out_deleted` must be a
- * writable `*mut bool` slot if [`StatorStatus::StatorStatusOk`] is returned.
+ * writable `bool *` slot if `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomNamedDeleterCb)(const char *name_utf8,
                                                      size_t name_len,
@@ -3325,9 +3811,11 @@ typedef enum StatorStatus (*StatorDomNamedDeleterCb)(const char *name_utf8,
 /**
  * V2 named-property **enumerator** callback.
  *
- * The callback should push each enumerable name into `buf` via
- * [`stator_dom_name_buffer_push`] and return [`StatorStatus::StatorStatusOk`]
- * on success.  Any other status is treated as "no names produced".
+ * The callback should push each materializable own string name into `buf` via
+ * `stator_dom_name_buffer_push` and return `StatorStatusOk`
+ * on success.  Query or descriptor callbacks provide attributes that determine
+ * which returned names are enumerable.  Any other status is treated as
+ * "no names produced".
  *
  * # Safety
  * `buf` must be the non-null pointer the FFI bridge passed in and must not
@@ -3338,12 +3826,12 @@ typedef enum StatorStatus (*StatorDomNamedEnumeratorCb)(struct StatorDomNameBuff
 /**
  * V2 indexed-property **getter** callback.
  *
- * Semantics mirror [`StatorDomNamedGetterCbV2`] but the property key is a
+ * Semantics mirror `StatorDomNamedGetterCbV2` but the property key is a
  * numeric `u32` index.
  *
  * # Safety
- * `out` must be a writable `*mut StatorValue` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out` must be a writable `StatorValue**` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedGetterCbV2)(uint32_t index,
                                                         void *data,
@@ -3352,10 +3840,10 @@ typedef enum StatorStatus (*StatorDomIndexedGetterCbV2)(uint32_t index,
 /**
  * V2 indexed-property **setter** callback.
  *
- * Semantics mirror [`StatorDomNamedSetterCbV2`] for indexed access.
+ * Semantics mirror `StatorDomNamedSetterCbV2` for indexed access.
  *
  * # Safety
- * `value` must be either null or a valid, live [`StatorValue`] pointer
+ * `value` must be either null or a valid, live `StatorValue` pointer
  * borrowed for the call.
  */
 typedef enum StatorStatus (*StatorDomIndexedSetterCbV2)(uint32_t index,
@@ -3365,25 +3853,25 @@ typedef enum StatorStatus (*StatorDomIndexedSetterCbV2)(uint32_t index,
 /**
  * V2 indexed-property **query** callback.
  *
- * Semantics mirror [`StatorDomNamedQueryCb`] for indexed access.
+ * Semantics mirror `StatorDomNamedQueryCb` for indexed access.
  *
  * # Safety
- * `out_attrs` must be a writable `*mut u32` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out_attrs` must be a writable `uint32_t *` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedQueryCb)(uint32_t index, void *data, uint32_t *out_attrs);
 
 /**
  * V2 indexed-collection **length** callback.
  *
- * Returns [`StatorStatus::StatorStatusOk`] with the collection length
+ * Returns `StatorStatusOk` with the collection length
  * written into `*out_len`.  Any other status is treated as "length unknown"
  * and the engine observes `0` — embedders should therefore reserve other
  * statuses for genuine error conditions, never for ordinary length queries.
  *
  * # Safety
- * `out_len` must be a writable `*mut u32` slot if
- * [`StatorStatus::StatorStatusOk`] is returned.
+ * `out_len` must be a writable `uint32_t *` slot if
+ * `StatorStatusOk` is returned.
  */
 typedef enum StatorStatus (*StatorDomIndexedLengthCb)(void *data, uint32_t *out_len);
 
@@ -3444,9 +3932,10 @@ struct StatorIsolate *stator_isolate_new(void);
  * After this call the pointer is invalid and must not be used.
  *
  * # Safety
- * - `isolate` must be a non-null pointer returned by `stator_isolate_create`.
- * - `isolate` must not be used again after this call.
- * - This function must not be called more than once for the same pointer.
+ * - `isolate` must be null or a pointer returned by `stator_isolate_create`.
+ * - If non-null, `isolate` must not be used again after this call.
+ * - If non-null, this function must not be called more than once for the same pointer.
+ * - Passing null is a no-op.
  */
 void stator_isolate_destroy(struct StatorIsolate *isolate);
 
@@ -3457,9 +3946,10 @@ void stator_isolate_destroy(struct StatorIsolate *isolate);
  * Equivalent to [`stator_isolate_destroy`].
  *
  * # Safety
- * - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
- * - `isolate` must not be used again after this call.
- * - This function must not be called more than once for the same pointer.
+ * - `isolate` must be null or a pointer returned by `stator_isolate_new`.
+ * - If non-null, `isolate` must not be used again after this call.
+ * - If non-null, this function must not be called more than once for the same pointer.
+ * - Passing null is a no-op.
  */
 void stator_isolate_dispose(struct StatorIsolate *isolate);
 
@@ -3468,9 +3958,11 @@ void stator_isolate_dispose(struct StatorIsolate *isolate);
  *
  * Each call to `stator_isolate_enter` must be balanced by a corresponding
  * call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+ * If another thread has already entered the isolate, this call fails closed:
+ * the enter count is not incremented and no isolate state is changed.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_enter(struct StatorIsolate *isolate);
 
@@ -3478,12 +3970,24 @@ void stator_isolate_enter(struct StatorIsolate *isolate);
  * Unmark `isolate` as entered on the current thread.
  *
  * Must be called once for every preceding [`stator_isolate_enter`] call.
- * Does nothing when `isolate` is null.
+ * Does nothing when `isolate` is null.  If the isolate is currently entered on
+ * a different thread, this call fails closed and leaves the enter count intact.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_exit(struct StatorIsolate *isolate);
+
+/**
+ * Returns whether `isolate` is currently entered on the calling thread.
+ *
+ * Returns `false` when `isolate` is null, not entered, or entered on a
+ * different thread.
+ *
+ * # Safety
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
+ */
+bool stator_isolate_entered_on_current_thread(const struct StatorIsolate *isolate);
 
 /**
  * Store an opaque embedder-defined pointer at `slot` on the isolate.
@@ -3492,7 +3996,7 @@ void stator_isolate_exit(struct StatorIsolate *isolate);
  * equivalent to clearing it.  Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void *data);
 
@@ -3502,7 +4006,7 @@ void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void 
  * Returns a null pointer when `isolate` is null or `slot` has not been set.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot);
 
@@ -3538,7 +4042,7 @@ void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot
  * Does nothing when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
 
@@ -3552,7 +4056,7 @@ void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
  * Safe to call from any thread.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
 
@@ -3563,7 +4067,7 @@ void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
  * Returns `false` when `isolate` is null.  Safe to call from any thread.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate);
 
@@ -3577,7 +4081,7 @@ bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate
  * raw pointer and does not free it.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  * - `exception` must be either null or a valid, live [`StatorValue`] pointer
  *   that outlives the pending-exception window.
  */
@@ -3591,7 +4095,7 @@ void stator_isolate_throw_exception(struct StatorIsolate *isolate, struct Stator
  * most recent one was destroyed).
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 struct StatorContext *stator_isolate_get_current_context(const struct StatorIsolate *isolate);
 
@@ -3601,7 +4105,7 @@ struct StatorContext *stator_isolate_get_current_context(const struct StatorIsol
  * Returns `false` when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 bool stator_isolate_has_pending_exception(const struct StatorIsolate *isolate);
 
@@ -3613,7 +4117,7 @@ bool stator_isolate_has_pending_exception(const struct StatorIsolate *isolate);
  * [`stator_value_destroy`].
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 struct StatorValue *stator_isolate_clear_pending_exception(struct StatorIsolate *isolate);
 
@@ -3815,6 +4319,30 @@ void stator_isolate_get_jit_unwind_stats(const struct StatorIsolate *_isolate,
 void stator_isolate_reset_jit_unwind_stats(struct StatorIsolate *_isolate);
 
 /**
+ * Fill `*stats` with the current process-global JIT CFG/CET counters.
+ *
+ * `isolate` may be null; the counters are process-global diagnostics
+ * rather than heap-owned state.  Does nothing when `stats` is null.
+ *
+ * # Safety
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes of a `StatorJitMitigationsStats`.
+ */
+void stator_isolate_get_jit_mitigations_stats(const struct StatorIsolate *_isolate,
+                                              struct StatorJitMitigationsStats *stats);
+
+/**
+ * Reset every JIT CFG/CET counter visible through
+ * [`stator_isolate_get_jit_mitigations_stats`].
+ *
+ * `isolate` may be null; the counters are process-global.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_jit_mitigations_stats(struct StatorIsolate *_isolate);
+
+/**
  * Enable or disable JIT tiers for scripts run in `isolate`.
  *
  * Does nothing when `isolate` is null.
@@ -3845,7 +4373,7 @@ bool stator_isolate_jit_disabled(const struct StatorIsolate *isolate);
  * [`stator_context_destroy`] clears the current-context slot when it matches.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be null or a valid pointer to a live `StatorIsolate`.
  */
 struct StatorContext *stator_context_new(struct StatorIsolate *isolate);
 
@@ -3867,6 +4395,8 @@ void stator_context_destroy(struct StatorContext *ctx);
  * Each call to `stator_context_enter` must be balanced by a corresponding
  * call to [`stator_context_exit`].  Entering a context also makes it the
  * current context on its associated isolate.  Does nothing when `ctx` is null.
+ * If another thread has already entered the context, this call fails closed:
+ * the enter count is not incremented and no context or isolate state changes.
  *
  * # Safety
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
@@ -3879,11 +4409,24 @@ void stator_context_enter(struct StatorContext *ctx);
  * Must be called once for every preceding [`stator_context_enter`] call.
  * When the enter count reaches zero the context is no longer recorded as
  * current on its associated isolate.  Does nothing when `ctx` is null.
+ * If the context is currently entered on a different thread, this call fails
+ * closed and leaves the enter count and current-context slot intact.
  *
  * # Safety
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
  */
 void stator_context_exit(struct StatorContext *ctx);
+
+/**
+ * Returns whether `ctx` is currently entered on the calling thread.
+ *
+ * Returns `false` when `ctx` is null, not entered, or entered on a different
+ * thread.
+ *
+ * # Safety
+ * `ctx` must be null or a valid pointer to a live `StatorContext`.
+ */
+bool stator_context_entered_on_current_thread(const struct StatorContext *ctx);
 
 /**
  * Return a non-owning pointer to the global object of `ctx`.
@@ -3992,7 +4535,7 @@ bool stator_context_set_module_resolver(struct StatorContext *ctx,
  *
  * When installed, the callback is invoked before static module resolution,
  * dynamic `import()`, and `import.meta.resolve`. It must return a canonical
- * resolved URL or a structured [`StatorResolveStatus`] failure. Failures are
+ * resolved URL or a structured `StatorResolveStatus` failure. Failures are
  * propagated without falling back to the raw specifier or invoking the module
  * resolver.
  *
@@ -4001,7 +4544,7 @@ bool stator_context_set_module_resolver(struct StatorContext *ctx,
  *
  * # Safety
  * The callback and `user_data` lifetime rules match
- * [`stator_context_set_module_resolver`].
+ * `stator_context_set_module_resolver`.
  */
 bool stator_context_set_module_url_resolver(struct StatorContext *ctx,
                                             enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
@@ -4023,14 +4566,14 @@ bool stator_context_set_module_url_resolver(struct StatorContext *ctx,
  * When installed, the callback runs before module evaluation exposes
  * `import.meta`. Returning a non-`Ok` status fails evaluation closed and
  * prevents default metadata fallback. Lifetime and cleanup rules match
- * [`stator_context_set_module_resolver`].
+ * `stator_context_set_module_resolver`.
  *
  * Returns `true` on successful registration or clear, and `false` for a null
  * context or malformed clear request.
  *
  * # Safety
  * The callback and `user_data` lifetime rules match
- * [`stator_context_set_module_resolver`].
+ * `stator_context_set_module_resolver`.
  */
 bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
                                               enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
@@ -4047,12 +4590,12 @@ bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
  *
  * When installed, module-evaluation dynamic `import()` calls invoke this
  * callback after the URL resolver has canonicalised the specifier. The callback
- * receives a [`StatorDynamicImportRequest`] handle and must return
- * [`StatorResolveStatus::StatorResolveStatusOk`] or
- * [`StatorResolveStatus::StatorResolveStatusPending`] after it has accepted
+ * receives a `StatorDynamicImportRequest` handle and must return
+ * `StatorResolveStatusOk` or
+ * `StatorResolveStatusPending` after it has accepted
  * ownership of the request. It must later call either
- * [`stator_dynamic_import_request_resolve_module`] or
- * [`stator_dynamic_import_request_reject`]. Non-success statuses reject the
+ * `stator_dynamic_import_request_resolve_module` or
+ * `stator_dynamic_import_request_reject`. Non-success statuses reject the
  * JavaScript promise immediately and Stator consumes the request.
  *
  * Returns `true` on successful registration or clear, and `false` for a null
@@ -4060,12 +4603,21 @@ bool stator_context_set_import_meta_populator(struct StatorContext *ctx,
  *
  * # Safety
  * The callback and `user_data` lifetime rules match
- * [`stator_context_set_module_resolver`]. The callback must not settle or free
+ * `stator_context_set_module_resolver`. The callback must not settle or free
  * the request before returning; request settlement is a later host action on
  * the same serialized context/module thread.
  */
 bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,
-                                                struct Option_StatorDynamicImportCallback callback,
+                                                enum StatorResolveStatus (*callback)(struct StatorContext *ctx,
+                                                                                     void *user_data,
+                                                                                     struct StatorDynamicImportRequest *request,
+                                                                                     const struct StatorModule *referrer,
+                                                                                     const struct StatorModuleOrigin *origin,
+                                                                                     const char *specifier,
+                                                                                     size_t specifier_len,
+                                                                                     const struct StatorImportAttribute *attributes,
+                                                                                     size_t attributes_len,
+                                                                                     struct StatorString **out_error),
                                                 void *user_data,
                                                 void (*free_user_data)(void *user_data));
 
@@ -4075,7 +4627,7 @@ bool stator_context_set_dynamic_import_resolver(struct StatorContext *ctx,
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_number(struct StatorIsolate *isolate, double val);
 
@@ -4087,7 +4639,7 @@ struct StatorValue *stator_value_new_number(struct StatorIsolate *isolate, doubl
  * pointer if `isolate` or `data` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `data` must be valid for reads of `len` bytes.
  */
 struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
@@ -4095,12 +4647,84 @@ struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
                                             size_t len);
 
 /**
+ * Create a new zero-filled JavaScript `ArrayBuffer`.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ */
+struct StatorValue *stator_value_new_array_buffer(struct StatorIsolate *isolate,
+                                                  size_t byte_length);
+
+/**
+ * Create a new JavaScript `ArrayBuffer` by copying bytes from caller memory.
+ *
+ * `data` is copied immediately; the caller retains ownership of the source
+ * memory. Returns a null pointer if `isolate` or `data` is null.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `data` must be valid for reads of `len` bytes.
+ */
+struct StatorValue *stator_value_new_array_buffer_copy(struct StatorIsolate *isolate,
+                                                       const uint8_t *data,
+                                                       size_t len);
+
+/**
+ * Create a new zero-filled JavaScript `TypedArray`.
+ *
+ * Returns a null pointer if `isolate` is null or `kind` is
+ * `StatorTypedArrayKindInvalid`.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ */
+struct StatorValue *stator_value_new_typed_array(struct StatorIsolate *isolate,
+                                                 enum StatorTypedArrayKind kind,
+                                                 size_t length);
+
+/**
+ * Create a JavaScript `TypedArray` view over a JavaScript `ArrayBuffer`.
+ *
+ * `byte_offset` and `length` are fixed-length view parameters. Returns a null
+ * pointer if `isolate` or `buffer` is null, `kind` is invalid, `buffer` is not
+ * an `ArrayBuffer` owned by `isolate`, or the requested view is unaligned,
+ * detached, or out of bounds.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `buffer` must be either null or a valid, live `StatorValue` pointer.
+ */
+struct StatorValue *stator_value_new_typed_array_from_array_buffer(struct StatorIsolate *isolate,
+                                                                   enum StatorTypedArrayKind kind,
+                                                                   const struct StatorValue *buffer,
+                                                                   size_t byte_offset,
+                                                                   size_t length);
+
+/**
+ * Create a JavaScript `DataView` over a JavaScript `ArrayBuffer`.
+ *
+ * Returns a null pointer if `isolate` or `buffer` is null, `buffer` is not an
+ * `ArrayBuffer` owned by `isolate`, or the requested view is detached or out of
+ * bounds.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ * - `buffer` must be either null or a valid, live `StatorValue` pointer.
+ */
+struct StatorValue *stator_value_new_data_view_from_array_buffer(struct StatorIsolate *isolate,
+                                                                 const struct StatorValue *buffer,
+                                                                 size_t byte_offset,
+                                                                 size_t byte_length);
+
+/**
  * Create a new boolean value.
  *
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool val);
 
@@ -4110,7 +4734,7 @@ struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
 
@@ -4120,7 +4744,7 @@ struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
 
@@ -4130,7 +4754,7 @@ struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_object(struct StatorIsolate *isolate);
 
@@ -4140,7 +4764,7 @@ struct StatorValue *stator_value_new_object(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_function_tag(struct StatorIsolate *isolate);
 
@@ -4150,7 +4774,7 @@ struct StatorValue *stator_value_new_function_tag(struct StatorIsolate *isolate)
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_array_tag(struct StatorIsolate *isolate);
 
@@ -4160,7 +4784,7 @@ struct StatorValue *stator_value_new_array_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_date_tag(struct StatorIsolate *isolate);
 
@@ -4170,7 +4794,7 @@ struct StatorValue *stator_value_new_date_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
 
@@ -4180,9 +4804,71 @@ struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new pending JavaScript Promise backed by the real engine promise state.
+ *
+ * The returned value is a normal [`StatorValue`] whose type is `"object"` and
+ * for which [`stator_value_is_promise`] returns `true`.  It must be released
+ * with [`stator_value_destroy`] (or an active handle scope).  Returns null when
+ * `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
+ */
+struct StatorValue *stator_promise_new_pending(struct StatorIsolate *isolate);
+
+/**
+ * Resolve a real FFI Promise handle with `value`.
+ *
+ * A null `value` is treated as JavaScript `undefined`.  Settling an already
+ * settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+ *
+ * # Safety
+ * - `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorStatus stator_promise_resolve(struct StatorValue *promise,
+                                         const struct StatorValue *value);
+
+/**
+ * Reject a real FFI Promise handle with `reason`.
+ *
+ * A null `reason` is treated as JavaScript `undefined`.  Settling an already
+ * settled promise is a no-op and still returns [`StatorStatus::StatorStatusOk`].
+ *
+ * # Safety
+ * - `promise` must be null or a valid, live [`StatorValue`] pointer.
+ * - `reason` must be null or a valid, live [`StatorValue`] pointer.
+ */
+enum StatorStatus stator_promise_reject(struct StatorValue *promise,
+                                        const struct StatorValue *reason);
+
+/**
+ * Return the observable state of a real FFI Promise handle.
+ *
+ * Returns `StatorPromiseStateInvalid` when `promise` is
+ * null, is not a promise, or is only a tag-only promise placeholder.
+ *
+ * # Safety
+ * `promise` must be null or a valid, live `StatorValue` pointer.
+ */
+enum StatorPromiseState stator_promise_state(const struct StatorValue *promise);
+
+/**
+ * Return the fulfillment value or rejection reason of a settled Promise handle.
+ *
+ * Returns null when `promise` is null, is not a real Promise handle, is still
+ * pending, or has no owning isolate.  The caller owns the returned value and
+ * must release it with `stator_value_destroy` (or an active handle scope).
+ *
+ * # Safety
+ * `promise` must be null or a valid, live `StatorValue` pointer.
+ */
+struct StatorValue *stator_promise_result(const struct StatorValue *promise);
 
 /**
  * Create a new `Map`-tagged value.
@@ -4190,7 +4876,7 @@ struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
 
@@ -4200,7 +4886,7 @@ struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
 
@@ -4213,7 +4899,7 @@ struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
  * pointer if `isolate` or `data` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `data` must be valid for reads of `len` bytes and must point to valid
  *   UTF-8 data.
  */
@@ -4257,7 +4943,7 @@ size_t stator_string_write_utf8(const struct StatorValue *val,
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_number_new(struct StatorIsolate *isolate, double val);
 
@@ -4269,7 +4955,7 @@ struct StatorValue *stator_number_new(struct StatorIsolate *isolate, double val)
  * null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_integer_new(struct StatorIsolate *isolate, int64_t val);
 
@@ -4279,7 +4965,7 @@ struct StatorValue *stator_integer_new(struct StatorIsolate *isolate, int64_t va
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_boolean_new(struct StatorIsolate *isolate, bool val);
 
@@ -4289,7 +4975,7 @@ struct StatorValue *stator_boolean_new(struct StatorIsolate *isolate, bool val);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_undefined_new(struct StatorIsolate *isolate);
 
@@ -4299,16 +4985,18 @@ struct StatorValue *stator_undefined_new(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorValue *stator_null_new(struct StatorIsolate *isolate);
 
 /**
  * Destroy a value and decrement the isolate's live-object counter.
  *
+ * Passing null is a no-op.
+ *
  * # Safety
- * `val` must be a non-null pointer returned by any `stator_value_new_*`
- * function and must not be used again after this call.
+ * `val` must be null or a pointer returned by any `stator_value_new_*`
+ * function. If non-null, it must not be used again after this call.
  */
 void stator_value_destroy(struct StatorValue *val);
 
@@ -4389,8 +5077,8 @@ bool stator_value_is_boolean(const struct StatorValue *val);
 /**
  * Returns `true` if `val` is a JavaScript object (excludes `null`).
  *
- * Arrays, dates, regexps, promises, maps, and sets are all objects in
- * ECMAScript and therefore also return `true`.
+ * Arrays, dates, regexps, promises, maps, sets, ArrayBuffers, TypedArrays, and
+ * DataViews are all objects in ECMAScript and therefore also return `true`.
  *
  * # Safety
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -4476,12 +5164,229 @@ bool stator_value_is_map(const struct StatorValue *val);
 bool stator_value_is_set(const struct StatorValue *val);
 
 /**
+ * Returns `true` if `val` is a JavaScript `ArrayBuffer` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_array_buffer(const struct StatorValue *val);
+
+/**
+ * Returns the byte length of a JavaScript `ArrayBuffer`.
+ *
+ * Returns `0` when `val` is null, is not an `ArrayBuffer`, or the buffer is
+ * detached.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+size_t stator_value_array_buffer_byte_length(const struct StatorValue *val);
+
+/**
+ * Returns whether a JavaScript `ArrayBuffer` has been detached.
+ *
+ * Returns `false` when `val` is null or is not an `ArrayBuffer`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_array_buffer_is_detached(const struct StatorValue *val);
+
+/**
+ * Copy bytes out of a JavaScript `ArrayBuffer` into caller-owned memory.
+ *
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not an
+ * `ArrayBuffer`, the buffer is detached, `dst` is null, `dst_len` is zero, or
+ * `src_offset` is outside the buffer.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_array_buffer_copy_contents(const struct StatorValue *val,
+                                               uint8_t *dst,
+                                               size_t dst_len,
+                                               size_t src_offset);
+
+/**
+ * Copy bytes from caller-owned memory into a JavaScript `ArrayBuffer`.
+ *
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not
+ * an `ArrayBuffer`, the buffer is detached, `src` is null, `src_len` is zero,
+ * or `dst_offset` is outside the buffer.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_array_buffer_write_contents(struct StatorValue *val,
+                                                const uint8_t *src,
+                                                size_t src_len,
+                                                size_t dst_offset);
+
+/**
+ * Returns `true` if `val` is a JavaScript `TypedArray` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_typed_array(const struct StatorValue *val);
+
+/**
+ * Returns the element kind for a JavaScript `TypedArray`.
+ *
+ * Returns `StatorTypedArrayKindInvalid` when `val` is
+ * null or is not a `TypedArray`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+enum StatorTypedArrayKind stator_value_typed_array_kind(const struct StatorValue *val);
+
+/**
+ * Returns the current byte offset of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_byte_offset(const struct StatorValue *val);
+
+/**
+ * Returns the current element length of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_length(const struct StatorValue *val);
+
+/**
+ * Returns the current byte length of a JavaScript `TypedArray`.
+ *
+ * Returns `0` when `val` is null, is not a `TypedArray`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_typed_array_byte_length(const struct StatorValue *val);
+
+/**
+ * Copy bytes out of a JavaScript `TypedArray` view into caller-owned memory.
+ *
+ * `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+ * `TypedArray`, the view is detached or out of bounds, `dst` is null,
+ * `dst_len` is zero, or `src_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_typed_array_copy_contents(const struct StatorValue *val,
+                                              uint8_t *dst,
+                                              size_t dst_len,
+                                              size_t src_offset);
+
+/**
+ * Copy bytes from caller-owned memory into a JavaScript `TypedArray` view.
+ *
+ * `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not a
+ * `TypedArray`, the view is detached or out of bounds, `src` is null, `src_len`
+ * is zero, or `dst_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_typed_array_write_contents(struct StatorValue *val,
+                                               const uint8_t *src,
+                                               size_t src_len,
+                                               size_t dst_offset);
+
+/**
+ * Returns `true` if `val` is a JavaScript `DataView` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+bool stator_value_is_data_view(const struct StatorValue *val);
+
+/**
+ * Returns the current byte offset of a JavaScript `DataView`.
+ *
+ * Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_data_view_byte_offset(const struct StatorValue *val);
+
+/**
+ * Returns the current byte length of a JavaScript `DataView`.
+ *
+ * Returns `0` when `val` is null, is not a `DataView`, is detached, or is out
+ * of bounds.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live `StatorValue` pointer.
+ */
+size_t stator_value_data_view_byte_length(const struct StatorValue *val);
+
+/**
+ * Copy bytes out of a JavaScript `DataView` into caller-owned memory.
+ *
+ * `src_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes copied. Returns `0` when `val` is null, is not a
+ * `DataView`, the view is detached or out of bounds, `dst` is null, `dst_len`
+ * is zero, or `src_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `dst_len > 0`, `dst` must be valid for writes of `dst_len` bytes.
+ * - The destination range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_data_view_copy_contents(const struct StatorValue *val,
+                                            uint8_t *dst,
+                                            size_t dst_len,
+                                            size_t src_offset);
+
+/**
+ * Copy bytes from caller-owned memory into a JavaScript `DataView`.
+ *
+ * `dst_offset` is relative to the current view, not the backing `ArrayBuffer`.
+ * Returns the number of bytes written. Returns `0` when `val` is null, is not a
+ * `DataView`, the view is detached or out of bounds, `src` is null, `src_len`
+ * is zero, or `dst_offset` is outside the view.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live `StatorValue` pointer.
+ * - When `src_len > 0`, `src` must be valid for reads of `src_len` bytes.
+ * - The source range must not overlap with Stator-managed backing storage.
+ */
+size_t stator_value_data_view_write_contents(struct StatorValue *val,
+                                             const uint8_t *src,
+                                             size_t src_len,
+                                             size_t dst_offset);
+
+/**
  * Create a new, empty JavaScript object.
  *
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorObject *stator_object_new(struct StatorIsolate *isolate);
 
@@ -4602,7 +5507,7 @@ void stator_property_names_destroy(struct StatorPropertyNames *names);
  * model; it is equivalent to [`stator_isolate_gc`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 void stator_gc_collect(struct StatorIsolate *isolate);
 
@@ -4616,7 +5521,7 @@ void stator_gc_collect(struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_live_object_count(const struct StatorIsolate *isolate);
 
@@ -4627,7 +5532,7 @@ size_t stator_live_object_count(const struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_heap_used(const struct StatorIsolate *isolate);
 
@@ -4638,9 +5543,33 @@ size_t stator_heap_used(const struct StatorIsolate *isolate);
  * Returns 0 when `isolate` is null.
  *
  * # Safety
- * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be either null or a valid, live `StatorIsolate` pointer.
  */
 size_t stator_heap_capacity(const struct StatorIsolate *isolate);
+
+/**
+ * Return a stable telemetry code string for a raw classic-script cache status.
+ *
+ * Unknown or future status values return `"unknown_status"` rather than
+ * requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_script_cache_status_name_u32(uint32_t status);
+
+/**
+ * Return a stable telemetry code string for a raw classic-script cache diagnostic.
+ *
+ * Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+ * than requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_script_cache_diagnostic_name_u32(uint32_t diagnostic);
 
 /**
  * Allocate a new owned [`StatorString`] from `len` UTF-8 bytes at `data`.
@@ -4659,8 +5588,10 @@ struct StatorString *stator_string_new(const char *data, size_t len);
 /**
  * Return a pointer to the UTF-8 bytes held by `string`.
  *
- * The returned pointer is valid until `string` is freed and is **not**
- * guaranteed to be null-terminated. Returns null when `string` is null.
+ * The returned pointer is valid for `stator_string_len(string)` bytes or until
+ * `string` is freed, and is **not** guaranteed to be null-terminated. When the
+ * length is zero, the pointer is only a zero-length buffer and must not be
+ * dereferenced. Returns null when `string` is null.
  *
  * # Safety
  * - `string` must be either null or a valid pointer to a live
@@ -4692,6 +5623,18 @@ size_t stator_string_len(const struct StatorString *string);
 void stator_string_free(struct StatorString *string);
 
 /**
+ * Return a stable telemetry code string for a raw module code-cache status.
+ *
+ * Unknown or future status values return `"unknown_status"` rather than
+ * requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_module_cache_status_name_u32(uint32_t status);
+
+/**
  * Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
  *
  * Returns a non-null [`StatorScript`] pointer in all cases (even on error).
@@ -4710,6 +5653,53 @@ void stator_string_free(struct StatorString *string);
 struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
                                            const char *source,
                                            size_t source_len);
+
+/**
+ * Create an engine-owned classic-script code-cache blob for `script`.
+ *
+ * The returned [`StatorString`] owns a versioned cache blob containing
+ * validation metadata (engine crate version, source hash/length, resource
+ * name/offsets, and browser source metadata) plus serialized bytecode. On
+ * success `out_telemetry`, when non-null, reports
+ * [`StatorScriptCacheStatus::StatorScriptCacheStatusProducedMetadata`].
+ *
+ * # Safety
+ * - `script` must be either null or a valid, live [`StatorScript`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes when non-null.
+ * - `options`, when non-null, must point to readable compile options.
+ * - `out_telemetry`, when non-null, must be valid for one telemetry write.
+ */
+struct StatorString *stator_script_create_code_cache(const struct StatorScript *script,
+                                                     const char *source,
+                                                     size_t source_len,
+                                                     const struct StatorScriptCompileOptions *options,
+                                                     struct StatorScriptCacheTelemetry *out_telemetry);
+
+/**
+ * Compile a classic script from `source` using a previously produced cache blob.
+ *
+ * The cache is accepted only when its magic, format version, engine crate
+ * version, source length/hash, resource name, offsets, and source metadata
+ * match. On a clean match Stator restores bytecode from the cache and reports
+ * [`StatorScriptCacheStatus::StatorScriptCacheStatusAcceptedBytecodeRestored`].
+ * Rejected, invalid, unsupported, or corrupt cache inputs never execute cached
+ * bytes; Stator falls back to normal source compilation and reports the cache
+ * status through `out_telemetry`.
+ *
+ * # Safety
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `source` must be valid for reads of `source_len` bytes.
+ * - `cache_data` must be valid for reads of `cache_len` bytes.
+ * - `options`, when non-null, must point to readable compile options.
+ * - `out_telemetry`, when non-null, must be valid for one telemetry write.
+ */
+struct StatorScript *stator_script_compile_cached(struct StatorContext *ctx,
+                                                  const char *source,
+                                                  size_t source_len,
+                                                  const char *cache_data,
+                                                  size_t cache_len,
+                                                  const struct StatorScriptCompileOptions *options,
+                                                  struct StatorScriptCacheTelemetry *out_telemetry);
 
 /**
  * Compile `source` (a UTF-8 string of `source_len` bytes) as a JavaScript ES module.
@@ -4822,6 +5812,30 @@ struct StatorModule *stator_module_compile_cached(struct StatorContext *_ctx,
                                                   size_t cache_len,
                                                   const struct StatorModuleCompileOptions *options,
                                                   enum StatorModuleCacheStatus *out_status);
+
+/**
+ * Compile a module from `source` using a cache blob and source metadata v2.
+ *
+ * This is an opt-in variant of `stator_module_compile_cached` for embedders
+ * that produced a cache after calling `stator_module_set_source_metadata_v2`.
+ * The supplied metadata participates in cache identity and is restored onto
+ * the returned module on a cache hit. Null metadata keeps the legacy empty-v2
+ * behavior.
+ *
+ * # Safety
+ * - Pointers follow `stator_module_compile_cached`.
+ * - `metadata_v2`, when non-null, must point to a readable
+ *   `StatorModuleSourceMetadataV2` whose pointer/length fields are readable
+ *   when their lengths are non-zero.
+ */
+struct StatorModule *stator_module_compile_cached_with_source_metadata_v2(struct StatorContext *_ctx,
+                                                                          const char *source,
+                                                                          size_t source_len,
+                                                                          const char *cache_data,
+                                                                          size_t cache_len,
+                                                                          const struct StatorModuleCompileOptions *options,
+                                                                          const struct StatorModuleSourceMetadataV2 *metadata_v2,
+                                                                          enum StatorModuleCacheStatus *out_status);
 
 /**
  * Return a null-terminated error message if `script` compiled with an error.
@@ -5017,9 +6031,9 @@ void stator_script_free(struct StatorScript *script);
 const char *stator_module_get_error(const struct StatorModule *module);
 
 /**
- * Return the structured [`StatorMessageKind`] of `module`'s compile error.
+ * Return the structured `StatorMessageKind` of `module`'s compile error.
  *
- * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `module`
+ * Returns `StatorMessageKindUnknown` when `module`
  * compiled successfully or is null.
  *
  * # Safety
@@ -5305,6 +6319,67 @@ enum StatorModuleStatus stator_module_get_status(const struct StatorModule *modu
 enum StatorModuleType stator_module_get_type(const struct StatorModule *module);
 
 /**
+ * Retain a module record and return a fail-closed handle for later queries.
+ *
+ * The returned handle keeps `module` alive even if the embedder subsequently
+ * calls [`stator_module_free`] on the raw module pointer. Release it with
+ * [`stator_module_handle_release`] and then destroy the handle with
+ * [`stator_module_handle_destroy`].
+ *
+ * # Safety
+ * `module` must be null or a valid, live [`StatorModule`] pointer.
+ */
+struct StatorModuleHandle *stator_module_retain(struct StatorModule *module);
+
+/**
+ * Return whether a retained module handle still refers to a live module.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+bool stator_module_handle_is_valid(const struct StatorModuleHandle *handle);
+
+/**
+ * Return the retained raw module pointer, or null for a stale handle.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+struct StatorModule *stator_module_handle_get_module(const struct StatorModuleHandle *handle);
+
+/**
+ * Query a retained module handle's current status.
+ *
+ * Stale handles fail closed as [`StatorModuleStatus::StatorModuleStatusErrored`].
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+enum StatorModuleStatus stator_module_handle_get_status(const struct StatorModuleHandle *handle);
+
+/**
+ * Release the module record retained by `handle`.
+ *
+ * The handle remains allocated as a stale tombstone so subsequent queries fail
+ * closed. Call [`stator_module_handle_destroy`] to free the handle storage.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`].
+ */
+bool stator_module_handle_release(struct StatorModuleHandle *handle);
+
+/**
+ * Destroy a retained module handle.
+ *
+ * If the handle was not released yet, this releases it first.
+ *
+ * # Safety
+ * `handle` must be null or a pointer returned by [`stator_module_retain`] and
+ * must not be used again after this call.
+ */
+void stator_module_handle_destroy(struct StatorModuleHandle *handle);
+
+/**
  * Resolve and consume a dynamic-import request with a compiled module.
  *
  * Stator instantiates and evaluates `module` using the request's original
@@ -5453,7 +6528,7 @@ struct StatorValue *stator_module_resume_evaluation(struct StatorModule *module,
  * copied into the engine; ownership of `value` is retained by the caller.
  *
  * Return value and status transitions mirror
- * [`stator_module_resume_evaluation`].
+ * `stator_module_resume_evaluation`.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by
@@ -5477,7 +6552,7 @@ struct StatorValue *stator_module_pending_evaluation_fulfill(struct StatorModule
  * copied into the engine; ownership of `reason` is retained by the caller.
  *
  * Return value and status transitions mirror
- * [`stator_module_resume_evaluation`].
+ * `stator_module_resume_evaluation`.
  *
  * # Safety
  * - `module` must be a non-null pointer returned by
@@ -5565,7 +6640,7 @@ double stator_value_to_number(const struct StatorValue *val);
  * Returns a null pointer if `isolate` is null.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 struct StatorValue *stator_value_to_string(struct StatorIsolate *isolate,
@@ -5621,8 +6696,10 @@ bool stator_value_to_boolean(const struct StatorValue *val);
  * - Numbers: `NaN !== NaN`; `+0 === -0`.
  * - Strings: byte-for-byte equality.
  * - Booleans: value equality.
- * - Object / function / array / … : `false` (no shared identity in FFI
- *   handles; two distinct handles are never the same object).
+ * - Tag-only object / function / array / promise placeholders: `false`
+ *   because they carry no shared identity in FFI handles.
+ * - Shared-storage object, DOM wrapper, Promise, and binary-view handles:
+ *   identity equality based on the underlying shared engine handle.
  *
  * Both null pointers are treated as `undefined`.
  *
@@ -5636,13 +6713,13 @@ bool stator_value_strict_equals(const struct StatorValue *a, const struct Stator
  * Read the boolean value of `val` into `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript boolean.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ * * `StatorStatusOk` when `val` holds a JavaScript boolean.
+ * * `StatorStatusFalse` when `val` is non-null but not a
  *   boolean.  `*out` is left untouched.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ * * `StatorStatusInvalidArg` when `val` or `out` is null.
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `out` must be either null or a valid pointer to a `bool`.
  */
 enum StatorStatus stator_value_get_boolean(const struct StatorValue *val, bool *out);
@@ -5651,13 +6728,13 @@ enum StatorStatus stator_value_get_boolean(const struct StatorValue *val, bool *
  * Read the numeric value of `val` into `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when `val` holds a JavaScript number.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ * * `StatorStatusOk` when `val` holds a JavaScript number.
+ * * `StatorStatusFalse` when `val` is non-null but not a
  *   number.  `*out` is left untouched.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ * * `StatorStatusInvalidArg` when `val` or `out` is null.
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `out` must be either null or a valid pointer to an `f64`.
  */
 enum StatorStatus stator_value_get_number(const struct StatorValue *val, double *out);
@@ -5666,19 +6743,19 @@ enum StatorStatus stator_value_get_number(const struct StatorValue *val, double 
  * Read `val` as a signed 32-bit integer into `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+ * * `StatorStatusOk` when `val` is a finite integer in the
  *   range `[−2³¹, 2³¹−1]`; `*out` is set to the exact value.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+ * * `StatorStatusFalse` when `val` is non-null but is not
  *   exactly representable as an `i32` (non-number, fractional, ±Infinity,
  *   `NaN`, or out of range).  `*out` is left untouched.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ * * `StatorStatusInvalidArg` when `val` or `out` is null.
  *
  * Mirrors the semantics of `v8::Value::Int32Value` for the success case but
  * without the implicit `ToNumber` coercion — embedders that want the lossy
- * truncating conversion should call [`stator_value_to_int32`] instead.
+ * truncating conversion should call `stator_value_to_int32` instead.
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `out` must be either null or a valid pointer to an `i32`.
  */
 enum StatorStatus stator_value_get_int32(const struct StatorValue *val, int32_t *out);
@@ -5687,14 +6764,14 @@ enum StatorStatus stator_value_get_int32(const struct StatorValue *val, int32_t 
  * Read `val` as an unsigned 32-bit integer into `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when `val` is a finite integer in the
+ * * `StatorStatusOk` when `val` is a finite integer in the
  *   range `[0, 2³²−1]`; `*out` is set to the exact value.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but is not
+ * * `StatorStatusFalse` when `val` is non-null but is not
  *   exactly representable as a `u32`.  `*out` is left untouched.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ * * `StatorStatusInvalidArg` when `val` or `out` is null.
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `out` must be either null or a valid pointer to a `u32`.
  */
 enum StatorStatus stator_value_get_uint32(const struct StatorValue *val, uint32_t *out);
@@ -5704,17 +6781,17 @@ enum StatorStatus stator_value_get_uint32(const struct StatorValue *val, uint32_
  *
  * The returned length does **not** include a terminating null byte and is
  * the count of raw UTF-8 bytes — sufficient for sizing a buffer passed to
- * [`stator_value_write_string_utf8`].
+ * `stator_value_write_string_utf8`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when `val` is a string; `*out` is the
+ * * `StatorStatusOk` when `val` is a string; `*out` is the
  *   byte length.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ * * `StatorStatusFalse` when `val` is non-null but not a
  *   string.  `*out` is left untouched.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `out` is null.
+ * * `StatorStatusInvalidArg` when `val` or `out` is null.
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `out` must be either null or a valid pointer to a `usize`.
  */
 enum StatorStatus stator_value_get_string_utf8_length(const struct StatorValue *val, size_t *out);
@@ -5729,7 +6806,7 @@ enum StatorStatus stator_value_get_string_utf8_length(const struct StatorValue *
  *
  * At most `buf_size` bytes are written.  If `buf_size` is smaller than the
  * string's byte length the output is truncated; callers can size their
- * buffer with [`stator_value_get_string_utf8_length`] and inspect
+ * buffer with `stator_value_get_string_utf8_length` and inspect
  * `*written` to detect truncation.
  *
  * On success, `*written` (if non-null) is set to the number of bytes
@@ -5737,15 +6814,15 @@ enum StatorStatus stator_value_get_string_utf8_length(const struct StatorValue *
  * callers never see stale length information.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on a (possibly truncated) successful
+ * * `StatorStatusOk` on a (possibly truncated) successful
  *   write.
- * * [`StatorStatus::StatorStatusFalse`] when `val` is non-null but not a
+ * * `StatorStatusFalse` when `val` is non-null but not a
  *   string.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `val` or `buf` is null.
+ * * `StatorStatusInvalidArg` when `val` or `buf` is null.
  *   A null `written` pointer is allowed (and simply discards the length).
  *
  * # Safety
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  * * `buf` must be valid for writes of `buf_size` bytes (unless null).
  * * `written` must be either null or a valid pointer to a `usize`.
  */
@@ -5755,68 +6832,68 @@ enum StatorStatus stator_value_write_string_utf8(const struct StatorValue *val,
                                                  size_t *written);
 
 /**
- * Wrap a [`StatorObject`] handle as a fresh [`StatorValue`] handle that
- * shares the same underlying `JsObject` storage.
+ * Wrap a `StatorObject` handle as a fresh `StatorValue` handle that
+ * shares the same underlying `PropertyMap` storage.
  *
  * The returned value's `typeof` is `"object"`; passing it to
- * [`stator_value_as_object`] yields a new [`StatorObject`] handle whose
+ * `stator_value_as_object` yields a new `StatorObject` handle whose
  * property mutations are observed through `obj` and vice versa.  This is
  * the FFI mechanism for round-tripping object identity across the
  * value/object boundary.
  *
  * Returns a null pointer when `obj` is null.  The caller owns the returned
- * value pointer and must release it with [`stator_value_destroy`] (or rely
+ * value pointer and must release it with `stator_value_destroy` (or rely
  * on the active handle scope).
  *
  * # Safety
- * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * `obj` must be either null or a valid, live `StatorObject` pointer.
  */
 struct StatorValue *stator_object_as_value(const struct StatorObject *obj);
 
 /**
- * Wrap a [`StatorValue`] holding an object-as-value handle as a fresh
- * [`StatorObject`] handle that shares the same underlying `JsObject`
+ * Wrap a `StatorValue` holding an object-as-value handle as a fresh
+ * `StatorObject` handle that shares the same underlying `JsObject`
  * storage.
  *
  * Identity is only preserved for values produced by
- * [`stator_object_as_value`] (or by future FFI APIs that allocate the
+ * `stator_object_as_value` (or by future FFI APIs that allocate the
  * shared-storage representation).  Tag-only object values created via
- * [`stator_value_new_object`], `stator_value_new_array_tag`, and the other
+ * `stator_value_new_object`, `stator_value_new_array_tag`, and the other
  * tag constructors carry no per-instance storage; passing such a value
  * here returns a null pointer to make the limitation explicit at the call
  * site rather than silently materialising a divergent empty object.
  *
  * Returns a null pointer when `val` is null, is not an object-like value,
  * or is a tag-only object value.  The caller owns the returned object
- * pointer and must release it with [`stator_object_destroy`].
+ * pointer and must release it with `stator_object_destroy`.
  *
  * # Safety
- * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * `val` must be either null or a valid, live `StatorValue` pointer.
  */
 struct StatorObject *stator_value_as_object(const struct StatorValue *val);
 
 /**
  * Read the property named `(key, key_len)` from `obj` and, on success, write
- * a freshly-allocated [`StatorValue`] handle to `*out_val`.
+ * a freshly-allocated `StatorValue` handle to `*out_val`.
  *
  * Maybe-style semantics:
- * * [`StatorStatus::StatorStatusOk`] when the property exists.  The
+ * * `StatorStatusOk` when the property exists.  The
  *   returned value mirrors the property value, including an explicit
  *   `undefined` if that is what is stored.
- * * [`StatorStatus::StatorStatusFalse`] when the property is missing from
+ * * `StatorStatusFalse` when the property is missing from
  *   `obj` and its prototype chain.  `*out_val` is set to null.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or
+ * * `StatorStatusInvalidArg` when `obj`, `key`, or
  *   `out_val` is null, when the key bytes are not valid UTF-8, or when the
  *   object has no associated isolate.
  *
- * The caller owns the [`StatorValue`] handed back through `*out_val` and
- * must release it with [`stator_value_destroy`] (or rely on the active
+ * The caller owns the `StatorValue` handed back through `*out_val` and
+ * must release it with `stator_value_destroy` (or rely on the active
  * handle scope).
  *
  * # Safety
- * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `obj` must be either null or a valid, live `StatorObject` pointer.
  * * `key` must be valid for reads of `key_len` bytes (or null).
- * * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+ * * `out_val` must be either null or a valid output slot for a `StatorValue*`.
  */
 enum StatorStatus stator_object_get_property(const struct StatorObject *obj,
                                              const char *key,
@@ -5827,21 +6904,20 @@ enum StatorStatus stator_object_get_property(const struct StatorObject *obj,
  * Write `val` to the property named `(key, key_len)` on `obj`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the property was created or
+ * * `StatorStatusOk` when the property was created or
  *   updated.
- * * [`StatorStatus::StatorStatusException`] when the underlying `[[Set]]`
+ * * `StatorStatusException` when the underlying `[[Set]]`
  *   raised an error (e.g. assigning to a read-only property).  The
  *   isolate's pending exception is populated with a stringified error and
- *   a structured [`StatorMessage`] classified as
- *   [`StatorMessageKind::StatorMessageKindType`].
- * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `val` is
+ *   a structured `StatorMessage` classified as `StatorMessageKindType`.
+ * * `StatorStatusInvalidArg` when `obj`, `key`, or `val` is
  *   null, when the key bytes are not valid UTF-8, or when the object has
  *   no associated isolate.
  *
  * # Safety
- * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `obj` must be either null or a valid, live `StatorObject` pointer.
  * * `key` must be valid for reads of `key_len` bytes (or null).
- * * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * * `val` must be either null or a valid, live `StatorValue` pointer.
  */
 enum StatorStatus stator_object_set_property(struct StatorObject *obj,
                                              const char *key,
@@ -5853,13 +6929,13 @@ enum StatorStatus stator_object_set_property(struct StatorObject *obj,
  * inherited).  The result is written to `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success; `*out` is `true` iff the
+ * * `StatorStatusOk` on success; `*out` is `true` iff the
  *   property exists.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+ * * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
  *   null, or when the key bytes are not valid UTF-8.
  *
  * # Safety
- * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `obj` must be either null or a valid, live `StatorObject` pointer.
  * * `key` must be valid for reads of `key_len` bytes (or null).
  * * `out` must be either null or a valid pointer to a `bool`.
  */
@@ -5873,15 +6949,15 @@ enum StatorStatus stator_object_has_property(const struct StatorObject *obj,
  * outcome of the underlying `[[Delete]]` is written to `*out`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.  `*out` is `true` when
+ * * `StatorStatusOk` on success.  `*out` is `true` when
  *   the property no longer exists (either it was successfully deleted or
  *   was already absent) and `false` when deletion was rejected (e.g. a
  *   non-configurable own property).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `obj`, `key`, or `out` is
+ * * `StatorStatusInvalidArg` when `obj`, `key`, or `out` is
  *   null, or when the key bytes are not valid UTF-8.
  *
  * # Safety
- * * `obj` must be either null or a valid, live [`StatorObject`] pointer.
+ * * `obj` must be either null or a valid, live `StatorObject` pointer.
  * * `key` must be valid for reads of `key_len` bytes (or null).
  * * `out` must be either null or a valid pointer to a `bool`.
  */
@@ -5891,27 +6967,26 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
                                                 bool *out);
 
 /**
- * Invoke a callable [`StatorValue`] with `argc` arguments and, on success,
+ * Invoke a callable `StatorValue` with `argc` arguments and, on success,
  * write the returned value to `*out_val`.
  *
  * This first slice only supports native functions installed via
- * [`stator_function_template_get_function`] or returned through the FFI by
- * a native callback — i.e. values whose internal representation is a
- * reference-counted [`NativeFn`].  Bytecode-backed function values
- * ([`StatorValueInner::Function`]) cannot yet be invoked through this API
+ * `stator_function_template_get_function` or returned through the FFI by
+ * a native callback.  Bytecode-backed function values cannot yet be invoked
+ * through this API
  * because the FFI does not yet model `new.target` or bytecode-function call
  * frames for direct embedder calls; calling such a value returns
- * [`StatorStatus::StatorStatusUnsupported`].  Construct semantics are
+ * `StatorStatusUnsupported`.  Construct semantics are
  * likewise deferred.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the native function ran to
+ * * `StatorStatusOk` when the native function ran to
  *   completion; `*out_val` holds the (caller-owned) result.
- * * [`StatorStatus::StatorStatusException`] when the native callback
+ * * `StatorStatusException` when the native callback
  *   returned an `Err`.  The isolate's pending exception is populated.
- * * [`StatorStatus::StatorStatusUnsupported`] when `callable` is not a
+ * * `StatorStatusUnsupported` when `callable` is not a
  *   native function (e.g. bytecode function, plain object, primitive).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `callable`, or
+ * * `StatorStatusInvalidArg` when `ctx`, `callable`, or
  *   `out_val` is null, when `argc` is negative, or when `args` is null
  *   while `argc > 0`.
  *
@@ -5919,13 +6994,13 @@ enum StatorStatus stator_object_delete_property(struct StatorObject *obj,
  * treated as JavaScript `undefined`.
  *
  * # Safety
- * * `ctx` must be a valid, live [`StatorContext`] pointer.
- * * `callable` must be either null or a valid, live [`StatorValue`] pointer.
- * * `recv` must be either null or a valid, live [`StatorValue`] pointer.
- * * `args` must be valid for `argc` `*const StatorValue` reads when `argc > 0`
+ * * `ctx` must be a valid, live `StatorContext` pointer.
+ * * `callable` must be either null or a valid, live `StatorValue` pointer.
+ * * `recv` must be either null or a valid, live `StatorValue` pointer.
+ * * `args` must be valid for `argc` `StatorValue const*` reads when `argc > 0`
  *   (or null when `argc == 0`).  Each non-null element must point at a
- *   valid, live [`StatorValue`].
- * * `out_val` must be either null or a valid pointer to a `*mut StatorValue`.
+ *   valid, live `StatorValue`.
+ * * `out_val` must be either null or a valid output slot for a `StatorValue*`.
  */
 enum StatorStatus stator_value_call(struct StatorContext *ctx,
                                     const struct StatorValue *callable,
@@ -6013,7 +7088,7 @@ struct StatorIsolate *stator_function_callback_info_get_isolate(const struct Sta
  * pass the returned pointer to [`stator_function_template_destroy`].
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `callback` must remain valid for the lifetime of the template.
  */
 struct StatorFunctionTemplate *stator_function_template_new(struct StatorIsolate *isolate,
@@ -6030,6 +7105,91 @@ struct StatorFunctionTemplate *stator_function_template_new(struct StatorIsolate
  * [`stator_function_template_new`] and must not be used again after this call.
  */
 void stator_function_template_destroy(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Return the instance template associated with a function template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Properties set on it are installed
+ * as own properties when the function template is applied to a DOM wrapper.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_function_template_instance_template(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Return the prototype template associated with a function template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Properties set on it are installed
+ * on the DOM wrapper prototype object.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_function_template_prototype_template(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Copy parent template inheritance metadata into `tmpl`.
+ *
+ * Parent instance-template properties that do not already exist are copied as
+ * defaults. The child's prototype template receives a prototype-template link
+ * to a deep snapshot of the parent's prototype template, producing a predictable
+ * prototype chain for DOM wrapper instances.
+ *
+ * # Safety
+ * `tmpl` and `parent` must be valid, live [`StatorFunctionTemplate`] pointers.
+ */
+enum StatorStatus stator_function_template_inherit(struct StatorFunctionTemplate *tmpl,
+                                                   const struct StatorFunctionTemplate *parent);
+
+/**
+ * Create a signature requiring receivers created from `receiver`.
+ *
+ * Returns null when `receiver` is null.
+ *
+ * # Safety
+ * `receiver` must be either null or a valid, live `StatorFunctionTemplate`
+ * pointer.
+ */
+struct StatorSignature *stator_signature_new(const struct StatorFunctionTemplate *receiver);
+
+/**
+ * Destroy a signature created by `stator_signature_new`.
+ *
+ * # Safety
+ * `signature` must be either null or a pointer returned by
+ * `stator_signature_new` that has not already been destroyed.
+ */
+void stator_signature_destroy(struct StatorSignature *signature);
+
+/**
+ * Attach a receiver signature to a function template.
+ *
+ * The receiver template id is copied into `tmpl`, so the caller may destroy
+ * `signature` immediately after this call. Passing a null signature clears any
+ * existing signature. Cross-isolate signatures are rejected.
+ *
+ * # Safety
+ * `tmpl` must be a valid, live `StatorFunctionTemplate` pointer. `signature`
+ * must be either null or a valid `StatorSignature` pointer.
+ */
+enum StatorStatus stator_function_template_set_signature(struct StatorFunctionTemplate *tmpl,
+                                                         const struct StatorSignature *signature);
+
+/**
+ * Test whether `value` is an instance of `tmpl`.
+ *
+ * This checks DOM wrappers created by applying `tmpl` or a function template
+ * that inherited from `tmpl`. Non-wrapper values, null pointers, and invalidated
+ * wrappers return `false`.
+ *
+ * # Safety
+ * `tmpl` and `value` must be either null or valid, live pointers.
+ */
+bool stator_function_template_has_instance(const struct StatorFunctionTemplate *tmpl,
+                                           const struct StatorValue *value);
 
 /**
  * Produce a [`StatorValue`] representing the function described by `tmpl`.
@@ -6128,6 +7288,8 @@ void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
  *
  * Returns:
  * * [`StatorStatus::StatorStatusOk`] when the global was installed.
+ * * [`StatorStatus::StatorStatusException`] when materializing the wrapper's
+ *   own properties triggers a descriptor callback exception.
  * * [`StatorStatus::StatorStatusInvalidArg`] when `ctx`, `name`, or `wrap` is
  *   null, when `name` is not valid UTF-8, or when `wrap` belongs to a
  *   different isolate than `ctx`.
@@ -6142,6 +7304,23 @@ void stator_dom_object_wrap_invalidate(struct StatorDomObjectWrap *wrap);
 enum StatorStatus stator_context_global_set_dom_object_wrap(struct StatorContext *ctx,
                                                             const char *name,
                                                             struct StatorDomObjectWrap *wrap);
+
+/**
+ * Apply a function template's instance/prototype templates to a DOM wrapper.
+ *
+ * Instance-template properties are installed as own properties on the wrapper.
+ * Prototype-template properties are installed on an inherited prototype object.
+ * The template contents are snapshotted at call time so later template changes
+ * do not mutate already-applied wrappers.
+ *
+ * Returns [`StatorStatus::StatorStatusInvalidArg`] for null pointers,
+ * cross-isolate templates, or invalidated wrappers.
+ *
+ * # Safety
+ * `wrap` and `tmpl` must be valid, live pointers owned by the same isolate.
+ */
+enum StatorStatus stator_dom_object_wrap_apply_function_template(struct StatorDomObjectWrap *wrap,
+                                                                 const struct StatorFunctionTemplate *tmpl);
 
 /**
  * Create an empty snapshot callback manifest.
@@ -6171,7 +7350,7 @@ enum StatorStatus stator_snapshot_manifest_register_native_function(struct Stato
                                                                     struct StatorContext *ctx,
                                                                     const char *id,
                                                                     size_t id_len,
-                                                                    struct Option_StatorFunctionTemplateCallback callback);
+                                                                    struct StatorValue *(*callback)(const struct StatorFunctionCallbackInfo*));
 
 /**
  * Return the number of ids registered in `manifest`.
@@ -6366,7 +7545,7 @@ size_t stator_snapshot_report_applied_global_count(const struct StatorSnapshotRe
  * pass the returned pointer to [`stator_handle_scope_close`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorHandleScope *stator_handle_scope_new(struct StatorIsolate *isolate);
 
@@ -6394,7 +7573,7 @@ void stator_handle_scope_close(struct StatorHandleScope *scope);
  * pass the returned pointer to [`stator_escapable_handle_scope_close`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorEscapableHandleScope *stator_escapable_handle_scope_new(struct StatorIsolate *isolate);
 
@@ -6440,7 +7619,7 @@ void stator_escapable_handle_scope_close(struct StatorEscapableHandleScope *scop
  * pass the returned pointer to [`stator_object_template_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorObjectTemplate *stator_object_template_new(struct StatorIsolate *isolate);
 
@@ -6473,6 +7652,34 @@ void stator_object_template_set(struct StatorObjectTemplate *tmpl,
                                 const struct StatorValue *val);
 
 /**
+ * Install an aggregated named-property handler on an object template.
+ *
+ * Function templates snapshot this handler onto DOM wrappers when their
+ * instance template is applied. Returns InvalidArg for null pointers or an
+ * all-null handler.
+ *
+ * # Safety
+ * - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ * - `handler` must point to a readable [`StatorDomNamedHandler`].
+ */
+enum StatorStatus stator_object_template_install_named_handler(struct StatorObjectTemplate *tmpl,
+                                                               const struct StatorDomNamedHandler *handler);
+
+/**
+ * Install an aggregated indexed-property handler on an object template.
+ *
+ * Function templates snapshot this handler onto DOM wrappers when their
+ * instance template is applied. Returns InvalidArg for null pointers or an
+ * all-null handler.
+ *
+ * # Safety
+ * - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ * - `handler` must point to a readable [`StatorDomIndexedHandler`].
+ */
+enum StatorStatus stator_object_template_install_indexed_handler(struct StatorObjectTemplate *tmpl,
+                                                                 const struct StatorDomIndexedHandler *handler);
+
+/**
  * Set the number of internal fields on objects created from this template.
  *
  * Internal fields are opaque embedder-owned slots (similar to V8's
@@ -6495,6 +7702,17 @@ void stator_object_template_set_internal_field_count(struct StatorObjectTemplate
 int32_t stator_object_template_internal_field_count(const struct StatorObjectTemplate *tmpl);
 
 /**
+ * Return this object template's mutable prototype template.
+ *
+ * The returned pointer is borrowed and owned by `tmpl`; callers must not pass
+ * it to [`stator_object_template_destroy`]. Returns null when `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+ */
+struct StatorObjectTemplate *stator_object_template_prototype_template(struct StatorObjectTemplate *tmpl);
+
+/**
  * Create a new [`StatorObject`] instance from an object template.
  *
  * The returned object has all properties defined on the template pre-installed.
@@ -6507,9 +7725,9 @@ int32_t stator_object_template_internal_field_count(const struct StatorObjectTem
 struct StatorObject *stator_object_template_new_instance(const struct StatorObjectTemplate *tmpl);
 
 /**
- * Return the structured [`StatorMessageKind`] of `msg`.
+ * Return the structured `StatorMessageKind` of `msg`.
  *
- * Returns [`StatorMessageKind::StatorMessageKindUnknown`] when `msg` is null.
+ * Returns `StatorMessageKindUnknown` when `msg` is null.
  *
  * # Safety
  * `msg` must be either null or a valid pointer to a live [`StatorMessage`].
@@ -6605,7 +7823,7 @@ void stator_message_destroy(struct StatorMessage *msg);
  *
  * # Safety
  * `isolate` must be either null or a valid pointer to a live
- * [`StatorIsolate`].
+ * `StatorIsolate`.
  */
 const struct StatorMessage *stator_isolate_peek_pending_message(const struct StatorIsolate *isolate);
 
@@ -6623,17 +7841,17 @@ const struct StatorMessage *stator_isolate_peek_pending_message(const struct Sta
  *
  * # Safety
  * `isolate` must be either null or a valid pointer to a live
- * [`StatorIsolate`].
+ * `StatorIsolate`.
  */
 struct StatorMessage *stator_isolate_take_pending_message(struct StatorIsolate *isolate);
 
 /**
- * Return the structured [`StatorMessageKind`] of `script`'s compile error,
- * or [`StatorMessageKind::StatorMessageKindUnknown`] when `script` compiled successfully or
+ * Return the structured `StatorMessageKind` of `script`'s compile error,
+ * or `StatorMessageKindUnknown` when `script` compiled successfully or
  * is null.
  *
  * Parse and bytecode-generator failures are classified as
- * [`StatorMessageKind::StatorMessageKindSyntax`]; FFI misuse such as a null source pointer
+ * `StatorMessageKindSyntax`; FFI misuse such as a null source pointer
  * is classified as [`StatorMessageKind::StatorMessageKindInternal`].
  *
  * # Safety
@@ -6649,7 +7867,7 @@ enum StatorMessageKind stator_script_error_kind(const struct StatorScript *scrip
  * pass the returned pointer to [`stator_try_catch_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorTryCatch *stator_try_catch_new(struct StatorIsolate *isolate);
 
@@ -6789,6 +8007,171 @@ double stator_platform_monotonically_increasing_time(const struct StatorPlatform
 double stator_platform_current_clock_time_millis(const struct StatorPlatform *platform);
 
 /**
+ * Create a shared WebAssembly memory compatible with `module`'s engine.
+ *
+ * Returns null if `module` is null, `maximum_pages < minimum_pages`, or
+ * Wasmtime rejects the shared memory type.
+ *
+ * # Safety
+ * `module` must be either null or a valid, live [`StatorWasmModule`] pointer.
+ */
+struct StatorWasmSharedMemory *stator_wasm_shared_memory_new(const struct StatorWasmModule *module,
+                                                             uint32_t minimum_pages,
+                                                             uint32_t maximum_pages);
+
+/**
+ * Destroy a shared WebAssembly memory handle.
+ *
+ * # Safety
+ * `memory` must be either null or a pointer returned by
+ * [`stator_wasm_shared_memory_new`] that has not already been destroyed.
+ */
+void stator_wasm_shared_memory_destroy(struct StatorWasmSharedMemory *memory);
+
+/**
+ * Return the current shared-memory byte length.
+ *
+ * Returns 0 for null memory handles.
+ *
+ * # Safety
+ * `memory` must be either null or a valid, live [`StatorWasmSharedMemory`]
+ * pointer.
+ */
+size_t stator_wasm_shared_memory_byte_length(const struct StatorWasmSharedMemory *memory);
+
+/**
+ * Copy bytes out of a shared WebAssembly memory.
+ *
+ * Returns `false` for null pointers or out-of-bounds ranges.
+ *
+ * # Safety
+ * - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+ * - `out` must be writable for `len` bytes when `len > 0`.
+ */
+bool stator_wasm_shared_memory_read(const struct StatorWasmSharedMemory *memory,
+                                    size_t offset,
+                                    uint8_t *out,
+                                    size_t len);
+
+/**
+ * Copy bytes into a shared WebAssembly memory.
+ *
+ * Returns `false` for null pointers or out-of-bounds ranges.
+ *
+ * # Safety
+ * - `memory` must be a valid, live [`StatorWasmSharedMemory`] pointer.
+ * - `data` must be readable for `len` bytes when `len > 0`.
+ */
+bool stator_wasm_shared_memory_write(struct StatorWasmSharedMemory *memory,
+                                     size_t offset,
+                                     const uint8_t *data,
+                                     size_t len);
+
+/**
+ * Begin a host-controlled `WebAssembly.compileStreaming`-style operation.
+ *
+ * The returned operation starts pending. Stator does not fetch or buffer a
+ * response body; the host must call [`stator_wasm_streaming_complete`] exactly
+ * when it has final Wasm bytes, or [`stator_wasm_streaming_cancel`] when the
+ * browser fetch/response pipeline aborts.
+ *
+ * `options`, when non-null, must have `source_type == WebAssembly`; pointer
+ * fields are copied immediately. `source_metadata`, when non-null, is also
+ * copied immediately and must be tagged as WebAssembly.
+ *
+ * # Safety
+ * - `ctx` may be null, or a valid live context used for termination checks.
+ * - `options` and `source_metadata`, when non-null, must be readable.
+ */
+struct StatorWasmStreamingOperation *stator_wasm_streaming_compile_begin(struct StatorContext *ctx,
+                                                                         const struct StatorModuleCompileOptions *options,
+                                                                         const struct StatorModuleSourceMetadataV2 *source_metadata);
+
+/**
+ * Begin a host-controlled `WebAssembly.instantiateStreaming`-style operation.
+ *
+ * Completion compiles the final bytes as a WebAssembly module, links via the
+ * existing module resolver when imports are present, and evaluates the module
+ * so exported functions are materialised. It does not invent network,
+ * `Response`, or fake Promise behaviour.
+ *
+ * # Safety
+ * Same pointer requirements as [`stator_wasm_streaming_compile_begin`].
+ */
+struct StatorWasmStreamingOperation *stator_wasm_streaming_instantiate_begin(struct StatorContext *ctx,
+                                                                             const struct StatorModuleCompileOptions *options,
+                                                                             const struct StatorModuleSourceMetadataV2 *source_metadata);
+
+/**
+ * Complete a pending host-controlled Wasm streaming operation with final bytes.
+ *
+ * This is a settlement hook, not a network-streaming implementation: Stator
+ * compiles only the complete byte slice supplied by the host. If isolate
+ * termination is already requested, the operation is cancelled before any
+ * compile/evaluate work starts.
+ *
+ * # Safety
+ * - `operation` must be a live pointer returned by a `_begin` function.
+ * - `source` must be valid for reads of `source_len` bytes.
+ */
+bool stator_wasm_streaming_complete(struct StatorWasmStreamingOperation *operation,
+                                    const char *source,
+                                    size_t source_len);
+
+/**
+ * Cancel a pending host-controlled Wasm streaming operation.
+ *
+ * Cancellation is fail-closed and terminal. It records a diagnostic but does
+ * not compile or instantiate any bytes.
+ *
+ * # Safety
+ * - `operation` must be a live pointer returned by a `_begin` function.
+ * - `reason`, when non-null, must be valid for reads of `reason_len` bytes.
+ */
+bool stator_wasm_streaming_cancel(struct StatorWasmStreamingOperation *operation,
+                                  const char *reason,
+                                  size_t reason_len);
+
+/**
+ * Return the current status of a Wasm streaming operation.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+enum StatorWasmStreamingOperationStatus stator_wasm_streaming_get_status(const struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Return the terminal diagnostic for a failed/cancelled operation, or null.
+ *
+ * The returned pointer is borrowed from `operation` and remains valid until
+ * the operation is destroyed.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+const char *stator_wasm_streaming_get_error(const struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Transfer the compiled/evaluated module result out of a completed operation.
+ *
+ * Returns null unless the operation completed successfully and still owns its
+ * module. The caller becomes responsible for eventually calling
+ * [`stator_module_free`] on the returned module.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+struct StatorModule *stator_wasm_streaming_take_module(struct StatorWasmStreamingOperation *operation);
+
+/**
+ * Destroy a Wasm streaming operation and any unclaimed module it owns.
+ *
+ * # Safety
+ * `operation` must be null or a live pointer returned by a `_begin` function.
+ */
+void stator_wasm_streaming_destroy(struct StatorWasmStreamingOperation *operation);
+
+/**
  * Compile a WebAssembly binary into a [`StatorWasmModule`].
  *
  * Returns a null pointer if `isolate` or `bytes` is null, `len` is zero, or
@@ -6798,7 +8181,7 @@ double stator_platform_current_clock_time_millis(const struct StatorPlatform *pl
  * [`stator_wasm_module_destroy`] to free all associated resources.
  *
  * # Safety
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `bytes` must be valid for reads of `len` bytes.
  */
 struct StatorWasmModule *stator_wasm_compile(struct StatorIsolate *isolate,
@@ -6849,6 +8232,25 @@ void stator_wasm_module_destroy(struct StatorWasmModule *module);
 struct StatorWasmInstance *stator_wasm_instantiate(struct StatorWasmModule *module,
                                                    struct StatorContext *ctx,
                                                    const struct StatorWasmImports *imports);
+
+/**
+ * Instantiate a compiled module with host functions and shared-memory imports.
+ *
+ * This additive entry point keeps [`StatorWasmImports`] ABI-stable while
+ * allowing embedders to bind real shared linear memories. Non-shared memories
+ * remain unsupported because Wasmtime cannot safely share them across stores.
+ *
+ * # Safety
+ * - `module`, `ctx`, and `imports` follow [`stator_wasm_instantiate`]'s
+ *   contract.
+ * - `memories` must point to `memories_len` readable
+ *   [`StatorWasmMemoryImport`] elements when `memories_len > 0`.
+ */
+struct StatorWasmInstance *stator_wasm_instantiate_with_memory_imports(struct StatorWasmModule *module,
+                                                                       struct StatorContext *ctx,
+                                                                       const struct StatorWasmImports *imports,
+                                                                       const struct StatorWasmMemoryImport *memories,
+                                                                       size_t memories_len);
 
 /**
  * Free a [`StatorWasmInstance`] previously returned by
@@ -6905,7 +8307,7 @@ void stator_wasm_exports_destroy(char **exports);
  * # Safety
  * - `instance` must be a non-null, valid pointer to a live
  *   [`StatorWasmInstance`].
- * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  * - `name` must be a valid, null-terminated C string.
  * - `args` must be valid for reads of `args_len` pointers; each non-null
  *   element must be a valid, live [`StatorValue`] pointer.
@@ -7097,7 +8499,7 @@ void stator_debug_session_destroy(struct StatorDebugSession *session);
  * the returned pointer to [`stator_dom_object_wrap_destroy`].
  *
  * # Safety
- * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 struct StatorDomObjectWrap *stator_dom_object_wrap_new(struct StatorIsolate *isolate,
                                                        uint32_t field_count);
@@ -7321,7 +8723,7 @@ uint32_t stator_dom_object_wrap_get_class_id(const struct StatorDomObjectWrap *w
  * [`StatorStatus::StatorStatusInvalidArg`] for null/malformed inputs.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `name` must point to `name_len` bytes when `name_len > 0`.
  */
 enum StatorStatus stator_dom_class_id_register(struct StatorIsolate *isolate,
@@ -7338,7 +8740,7 @@ enum StatorStatus stator_dom_class_id_register(struct StatorIsolate *isolate,
  * registered child, and `InvalidArg` for null isolate or class id 0.
  *
  * # Safety
- * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  */
 enum StatorStatus stator_dom_class_id_unregister(struct StatorIsolate *isolate, uint32_t class_id);
 
@@ -7349,7 +8751,7 @@ enum StatorStatus stator_dom_class_id_unregister(struct StatorIsolate *isolate, 
  * output is zero-cleared so callers cannot observe stale pointers.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `out_info` must be null or valid for writes.
  */
 enum StatorStatus stator_dom_class_id_query(const struct StatorIsolate *isolate,
@@ -7377,7 +8779,7 @@ bool stator_dom_object_wrap_is_class(const struct StatorDomObjectWrap *wrap,
  * values whose wrapper has already been destroyed.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * - `value` must be null or a valid, live [`StatorValue`] pointer.
  */
 bool stator_value_is_dom_object_wrap_class(const struct StatorIsolate *isolate,
@@ -7418,9 +8820,9 @@ void *stator_dom_object_wrap_get_native_ptr(const struct StatorDomObjectWrap *wr
  * invalidated, or the traced slot belongs to a different isolate.
  *
  * # Safety
- * - `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
- * - `traced` must be null or a valid, live [`StatorTraced`] pointer that has
- *   not yet been passed to [`stator_traced_dispose`].
+ * - `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
+ * - `traced` must be null or a valid, live `StatorTraced` pointer that has
+ *   not yet been passed to `stator_traced_dispose`.
  */
 bool stator_dom_object_wrap_add_traced_edge(struct StatorDomObjectWrap *wrap,
                                             struct StatorTraced *traced);
@@ -7432,7 +8834,7 @@ bool stator_dom_object_wrap_add_traced_edge(struct StatorDomObjectWrap *wrap,
  * or when the edge was not registered on `wrap`.
  *
  * # Safety
- * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
  */
 bool stator_dom_object_wrap_remove_traced_edge(struct StatorDomObjectWrap *wrap,
                                                struct StatorTraced *traced);
@@ -7443,7 +8845,7 @@ bool stator_dom_object_wrap_remove_traced_edge(struct StatorDomObjectWrap *wrap,
  * Returns the number of edges removed. Passing null removes nothing.
  *
  * # Safety
- * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
  */
 size_t stator_dom_object_wrap_clear_traced_edges(struct StatorDomObjectWrap *wrap);
 
@@ -7451,11 +8853,11 @@ size_t stator_dom_object_wrap_clear_traced_edges(struct StatorDomObjectWrap *wra
  * Return the number of outgoing traced edges currently registered on `wrap`.
  *
  * Empty traced slots may still be present until the embedder removes or clears
- * them; [`stator_traced_visit_outgoing`] filters empty slots at visitation time.
+ * them; `stator_traced_visit_outgoing` filters empty slots at visitation time.
  * Passing null returns zero.
  *
  * # Safety
- * `wrap` must be null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be null or a valid, live `StatorDomObjectWrap` pointer.
  */
 size_t stator_dom_object_wrap_traced_edge_count(const struct StatorDomObjectWrap *wrap);
 
@@ -7526,21 +8928,21 @@ bool stator_dom_object_wrap_has_access_check(const struct StatorDomObjectWrap *w
 void stator_dom_property_descriptor_clear(struct StatorDomPropertyDescriptor *descriptor);
 
 /**
- * Allocate a fresh, empty [`StatorDomIndexBuffer`].  Free with
- * [`stator_dom_index_buffer_destroy`].
+ * Allocate a fresh, empty `StatorDomIndexBuffer`.  Free with
+ * `stator_dom_index_buffer_destroy`.
  *
  * # Safety
  * The returned pointer must be released exactly once via
- * [`stator_dom_index_buffer_destroy`].
+ * `stator_dom_index_buffer_destroy`.
  */
 struct StatorDomIndexBuffer *stator_dom_index_buffer_new(void);
 
 /**
- * Free a [`StatorDomIndexBuffer`].  Does nothing when `buf` is null.
+ * Free a `StatorDomIndexBuffer`.  Does nothing when `buf` is null.
  *
  * # Safety
  * `buf` must be either null or a pointer returned by
- * [`stator_dom_index_buffer_new`], not previously destroyed.
+ * `stator_dom_index_buffer_new`, not previously destroyed.
  */
 void stator_dom_index_buffer_destroy(struct StatorDomIndexBuffer *buf);
 
@@ -7557,44 +8959,44 @@ size_t stator_dom_index_buffer_len(const struct StatorDomIndexBuffer *buf);
  * Read the entry at `index` from `buf` into `*out_index`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` or `out_index`
+ * * `StatorStatusOk` on success.
+ * * `StatorStatusInvalidArg` when `buf` or `out_index`
  *   is null, or when `index` is out of range.
  *
  * # Safety
  * - `buf` must be either null or a valid buffer pointer.
- * - `out_index` must be either null or a writable `*mut u32`.
+ * - `out_index` must be either null or a writable `uint32_t *`.
  */
 enum StatorStatus stator_dom_index_buffer_get(const struct StatorDomIndexBuffer *buf,
                                               size_t index,
                                               uint32_t *out_index);
 
 /**
- * Append an index to a [`StatorDomIndexBuffer`].
+ * Append an index to a `StatorDomIndexBuffer`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null.
+ * * `StatorStatusOk` on success.
+ * * `StatorStatusInvalidArg` when `buf` is null.
  *
  * # Safety
  * `buf` must be either null or a valid pointer to a
- * [`StatorDomIndexBuffer`] currently borrowed by an enumerator callback
+ * `StatorDomIndexBuffer` currently borrowed by an enumerator callback
  * (or owned by the caller between
- * [`stator_dom_index_buffer_new`]/[`stator_dom_index_buffer_destroy`]).
+ * `stator_dom_index_buffer_new` / `stator_dom_index_buffer_destroy`).
  */
 enum StatorStatus stator_dom_index_buffer_push(struct StatorDomIndexBuffer *buf, uint32_t index);
 
 /**
- * Append a UTF-8 name to a [`StatorDomNameBuffer`].
+ * Append a UTF-8 name to a `StatorDomNameBuffer`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+ * * `StatorStatusOk` on success.
+ * * `StatorStatusInvalidArg` when `buf` is null, when
  *   `name_utf8` is null while `name_len` is non-zero, or when the byte
  *   range is not valid UTF-8.
  *
  * # Safety
- * - `buf` must be either null or a valid pointer to a [`StatorDomNameBuffer`]
+ * - `buf` must be either null or a valid pointer to a `StatorDomNameBuffer`
  *   that is currently borrowed by an enumerator callback.
  * - `name_utf8` must point to at least `name_len` valid bytes when
  *   `name_len > 0`.
@@ -7652,16 +9054,63 @@ enum StatorStatus stator_dom_object_wrap_install_indexed_handler(struct StatorDo
                                                                  const struct StatorDomIndexedHandler *handler);
 
 /**
- * Append a symbol identity to a [`StatorDomSymbolBuffer`].
+ * Install call-as-function and/or construct callbacks on a DOM wrapper.
+ *
+ * This is additive with property handlers: installing callable handlers does
+ * not disturb named, symbol, indexed, definer, descriptor, class-id, access
+ * check, weak, or traced-edge state. Passing both callback fields as null is
+ * invalid; wrappers are non-callable and non-constructible by default.
+ *
+ * # Safety
+ * - `wrap` must be a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `handler` must point to a readable [`StatorDomCallableHandler`].
+ * - Callback function pointers must remain valid for the wrapper lifetime.
+ */
+enum StatorStatus stator_dom_object_wrap_install_callable_handler(struct StatorDomObjectWrap *wrap,
+                                                                  const struct StatorDomCallableHandler *handler);
+
+/**
+ * Invoke a DOM wrapper's call-as-function handler directly through FFI.
+ *
+ * Returns [`StatorStatus::StatorStatusUnsupported`] when no call handler is
+ * installed, [`StatorStatus::StatorStatusFalse`] when the wrapper was
+ * invalidated or an access check denies the call, and `Ok` with an owned
+ * `*out` result on success. A successful `undefined` result is represented by
+ * an owned undefined [`StatorValue`].
+ *
+ * # Safety
+ * `wrap`, `receiver`, `args`, and `out` must follow the callback contract
+ * documented on [`StatorDomCallAsFunctionCb`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_call_as_function(struct StatorDomObjectWrap *wrap,
+                                                                 const struct StatorValue *receiver,
+                                                                 const struct StatorValue *const *args,
+                                                                 size_t arg_count,
+                                                                 struct StatorValue **out);
+
+/**
+ * Invoke a DOM wrapper's construct handler directly through FFI.
+ *
+ * # Safety
+ * Arguments follow [`StatorDomConstructCb`].
+ */
+enum StatorStatus stator_dom_object_wrap_invoke_construct(struct StatorDomObjectWrap *wrap,
+                                                          const struct StatorValue *new_target,
+                                                          const struct StatorValue *const *args,
+                                                          size_t arg_count,
+                                                          struct StatorValue **out);
+
+/**
+ * Append a symbol identity to a `StatorDomSymbolBuffer`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `buf` is null, when
+ * * `StatorStatusOk` on success.
+ * * `StatorStatusInvalidArg` when `buf` is null, when
  *   `description_utf8` is null while `description_len` is non-zero, or
  *   when the description byte range is not valid UTF-8.
  *
  * # Safety
- * - `buf` must be a valid pointer to a [`StatorDomSymbolBuffer`] currently
+ * - `buf` must be a valid pointer to a `StatorDomSymbolBuffer` currently
  *   borrowed by an enumerator callback.
  * - `description_utf8` must point to at least `description_len` valid
  *   bytes when `description_len > 0`.
@@ -7680,7 +9129,7 @@ enum StatorStatus stator_dom_symbol_buffer_push(struct StatorDomSymbolBuffer *bu
  * named handler is installed yet, an empty one is created so the
  * symbol callbacks have a home.  The installation **does not** set the
  * `INTERCEPT_SYMBOLS` flag automatically — the embedder must call
- * [`stator_dom_object_wrap_set_named_handler_flags`] to opt in.
+ * `stator_dom_object_wrap_set_named_handler_flags` to opt in.
  * Without that flag the symbol callbacks remain dormant (fail-closed),
  * matching V8/Blink semantics and preventing accidental stringification.
  *
@@ -7797,8 +9246,8 @@ enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct Sta
  * Invoke the wrapper's indexed-property **deleter** path.
  *
  * Mirrors `delete nodeList[index]`.  The result is encoded through
- * [`StatorStatus`] / `*out_deleted` to expose the three-way
- * [`stator_jse::dom::IndexedDeleterResult`] outcome to embedders:
+ * `StatorStatus` / `*out_deleted` to expose the three-way indexed-delete
+ * outcome to embedders:
  *
  * | Wrapper outcome                                         | Status                | `*out_deleted` |
  * |---------------------------------------------------------|-----------------------|----------------|
@@ -7809,14 +9258,14 @@ enum StatorStatus stator_dom_object_wrap_invoke_symbol_enumerate_into(struct Sta
  * | Access-check denied / wrapper invalidated (fail-closed) | `StatorStatusOk`      | `false`        |
  *
  * `*out_deleted` is always written when this function returns
- * [`StatorStatus::StatorStatusOk`].  This function only reports a
+ * `StatorStatusOk`.  This function only reports a
  * non-`Ok` status when its FFI arguments are themselves invalid (null
  * `wrap`/`out_deleted`, or a stale wrapper pointer), in which case
  * `*out_deleted` is left untouched.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
- * - `out_deleted` must be either null or a writable `*mut bool`.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
+ * - `out_deleted` must be either null or a writable `bool *`.
  */
 enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDomObjectWrap *wrap,
                                                                 uint32_t index,
@@ -7825,8 +9274,8 @@ enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDom
 /**
  * Collect the indices reported by the wrapper's indexed-property
  * enumerator into `buf`.  The buffer is owned by the caller, created
- * with [`stator_dom_index_buffer_new`] and released with
- * [`stator_dom_index_buffer_destroy`].
+ * with `stator_dom_index_buffer_new` and released with
+ * `stator_dom_index_buffer_destroy`.
  *
  * The enumerator is invoked with the wrapper's `IndexedEnumerate`
  * access-check gate; on denial (or when the wrapper has been
@@ -7835,35 +9284,35 @@ enum StatorStatus stator_dom_object_wrap_invoke_indexed_deleter(struct StatorDom
  * Stator does not reorder or de-duplicate them.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] on success (including the empty
+ * * `StatorStatusOk` on success (including the empty
  *   no-handler / denied / invalidated cases).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `buf` is
+ * * `StatorStatusInvalidArg` when `wrap` or `buf` is
  *   null.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`].
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap`.
  * - `buf` must be either null or a valid buffer pointer returned by
- *   [`stator_dom_index_buffer_new`] that has not been destroyed.
+ *   `stator_dom_index_buffer_new` that has not been destroyed.
  */
 enum StatorStatus stator_dom_object_wrap_invoke_indexed_enumerate_into(struct StatorDomObjectWrap *wrap,
                                                                        struct StatorDomIndexBuffer *buf);
 
 /**
- * Allocate a fresh, empty [`StatorDomSymbolBuffer`].  Free with
- * [`stator_dom_symbol_buffer_destroy`].
+ * Allocate a fresh, empty `StatorDomSymbolBuffer`.  Free with
+ * `stator_dom_symbol_buffer_destroy`.
  *
  * # Safety
  * The returned pointer must be released exactly once via
- * [`stator_dom_symbol_buffer_destroy`].
+ * `stator_dom_symbol_buffer_destroy`.
  */
 struct StatorDomSymbolBuffer *stator_dom_symbol_buffer_new(void);
 
 /**
- * Free a [`StatorDomSymbolBuffer`].  Does nothing when `buf` is null.
+ * Free a `StatorDomSymbolBuffer`.  Does nothing when `buf` is null.
  *
  * # Safety
  * `buf` must be either null or a pointer returned by
- * [`stator_dom_symbol_buffer_new`], not previously destroyed.
+ * `stator_dom_symbol_buffer_new`, not previously destroyed.
  */
 void stator_dom_symbol_buffer_destroy(struct StatorDomSymbolBuffer *buf);
 
@@ -7882,9 +9331,9 @@ size_t stator_dom_symbol_buffer_len(const struct StatorDomSymbolBuffer *buf);
  * The borrowed `description_utf8` pointer remains valid until `buf` is
  * mutated (pushed to, cleared, or destroyed).
  *
- * Returns [`StatorStatus::StatorStatusInvalidArg`] when `buf` or
+ * Returns `StatorStatusInvalidArg` when `buf` or
  * `out_key` is null or `index` is out of range; otherwise
- * [`StatorStatus::StatorStatusOk`].
+ * `StatorStatusOk`.
  *
  * # Safety
  * `buf` and `out_key` must be valid pointers; see lifetime note above.
@@ -7995,78 +9444,78 @@ enum StatorStatus stator_dom_object_wrap_invoke_indexed_descriptor(struct Stator
                                                                    struct StatorDomPropertyDescriptor *out_descriptor);
 
 /**
- * Replace the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+ * Replace the `StatorDomNamedHandler` flag bitmask on `wrap`.
  *
  * The flag set is validated against
- * [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`] and rejected if any unknown bit
+ * `STATOR_DOM_NAMED_HANDLER_FLAG_ALL` and rejected if any unknown bit
  * is set — this is the fail-closed behaviour that prevents an embedder
  * from silently activating semantics this Stator build does not
  * understand.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the flags were stored.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+ * * `StatorStatusOk` when the flags were stored.
+ * * `StatorStatusInvalidArg` when `wrap` is null, when
  *   no named handler is currently installed (install one with
- *   [`stator_dom_object_wrap_install_named_handler`] first), or when
- *   `flags` contains a bit outside [`STATOR_DOM_NAMED_HANDLER_FLAG_ALL`].
+ *   `stator_dom_object_wrap_install_named_handler` first), or when
+ *   `flags` contains a bit outside `STATOR_DOM_NAMED_HANDLER_FLAG_ALL`.
  *
  * # Safety
- * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  */
 enum StatorStatus stator_dom_object_wrap_set_named_handler_flags(struct StatorDomObjectWrap *wrap,
                                                                  uint32_t flags);
 
 /**
- * Read the [`StatorDomNamedHandler`] flag bitmask on `wrap`.
+ * Read the `StatorDomNamedHandler` flag bitmask on `wrap`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+ * * `StatorStatusOk` with `*out_flags` set to the
  *   currently-installed flag bitmask (always `0` when no named handler
  *   is installed).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+ * * `StatorStatusInvalidArg` when `wrap` or `out_flags`
  *   is null.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  * - `out_flags` must be a writable `*mut u32` slot on
- *   [`StatorStatus::StatorStatusOk`] return.
+ *   `StatorStatusOk` return.
  */
 enum StatorStatus stator_dom_object_wrap_get_named_handler_flags(const struct StatorDomObjectWrap *wrap,
                                                                  uint32_t *out_flags);
 
 /**
- * Replace the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+ * Replace the `StatorDomIndexedHandler` flag bitmask on `wrap`.
  *
  * The flag set is validated against
- * [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`] and rejected if any unknown
+ * `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL` and rejected if any unknown
  * bit is set.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] when the flags were stored.
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` is null, when
+ * * `StatorStatusOk` when the flags were stored.
+ * * `StatorStatusInvalidArg` when `wrap` is null, when
  *   no indexed handler is currently installed, or when `flags` contains
- *   a bit outside [`STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`].
+ *   a bit outside `STATOR_DOM_INDEXED_HANDLER_FLAG_ALL`.
  *
  * # Safety
- * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  */
 enum StatorStatus stator_dom_object_wrap_set_indexed_handler_flags(struct StatorDomObjectWrap *wrap,
                                                                    uint32_t flags);
 
 /**
- * Read the [`StatorDomIndexedHandler`] flag bitmask on `wrap`.
+ * Read the `StatorDomIndexedHandler` flag bitmask on `wrap`.
  *
  * Returns:
- * * [`StatorStatus::StatorStatusOk`] with `*out_flags` set to the
+ * * `StatorStatusOk` with `*out_flags` set to the
  *   currently-installed flag bitmask (always `0` when no indexed
  *   handler is installed).
- * * [`StatorStatus::StatorStatusInvalidArg`] when `wrap` or `out_flags`
+ * * `StatorStatusInvalidArg` when `wrap` or `out_flags`
  *   is null.
  *
  * # Safety
- * - `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ * - `wrap` must be either null or a valid, live `StatorDomObjectWrap` pointer.
  * - `out_flags` must be a writable `*mut u32` slot on
- *   [`StatorStatus::StatorStatusOk`] return.
+ *   `StatorStatusOk` return.
  */
 enum StatorStatus stator_dom_object_wrap_get_indexed_handler_flags(const struct StatorDomObjectWrap *wrap,
                                                                    uint32_t *out_flags);
@@ -8081,6 +9530,32 @@ enum StatorStatus stator_dom_object_wrap_get_indexed_handler_flags(const struct 
  * the current thread.
  */
 size_t stator_drain_active_microtask_queue(void);
+
+/**
+ * Perform a microtask checkpoint for the active thread-local queue of `ctx`.
+ *
+ * The current FFI architecture stores Promise microtasks in the thread-local
+ * queue installed by the context's Promise globals.  This context-shaped entry
+ * point validates `ctx` and then drains that active queue, returning the number
+ * of microtasks run.  Returns 0 when `ctx` is null or no queue is active.
+ *
+ * # Safety
+ * `ctx` must be null or a valid, live [`StatorContext`] pointer.
+ */
+size_t stator_context_perform_microtask_checkpoint(struct StatorContext *ctx);
+
+/**
+ * Perform a microtask checkpoint for the active thread-local queue of `isolate`.
+ *
+ * This isolate-shaped entry point mirrors
+ * [`stator_context_perform_microtask_checkpoint`] for embedders that schedule
+ * checkpoints at isolate boundaries.  Returns 0 when `isolate` is null or no
+ * queue is active.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+size_t stator_isolate_perform_microtask_checkpoint(struct StatorIsolate *isolate);
 
 /**
  * Drain active host-visible Promise rejection events.
@@ -8420,19 +9895,19 @@ size_t stator_inspector_clear_context_group(struct StatorInspector *inspector, u
 
 /**
  * Create a new persistent (embedder-rooted) handle that keeps `value` alive
- * independently of any open [`StatorHandleScope`].
+ * independently of any open `StatorHandleScope`.
  *
  * The persistent's underlying storage is owned by `ctx`'s parent isolate
- * and survives both [`stator_handle_scope_close`] and any number of
- * [`stator_isolate_gc`] calls.  The slot is released by
- * [`stator_persistent_dispose`].
+ * and survives both `stator_handle_scope_close` and any number of
+ * `stator_isolate_gc` calls.  The slot is released by
+ * `stator_persistent_dispose`.
  *
  * Returns null if either argument is null, or if `value` was created on a
  * different isolate than `ctx`'s parent.
  *
  * # Safety
- * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
- * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ * - `ctx` must be null or a valid, live `StatorContext` pointer.
+ * - `value` must be null or a valid, live `StatorValue` pointer.
  */
 struct StatorPersistent *stator_persistent_new(struct StatorContext *ctx,
                                                struct StatorValue *value);
@@ -8449,24 +9924,24 @@ struct StatorPersistent *stator_persistent_new(struct StatorContext *ctx,
  *
  * # Safety
  * `persistent` must be null or a slot pointer returned by
- * [`stator_persistent_new`] that has not yet been passed to
- * [`stator_persistent_dispose`].
+ * `stator_persistent_new` that has not yet been passed to
+ * `stator_persistent_dispose`.
  */
 void stator_persistent_reset(struct StatorPersistent *persistent);
 
 /**
  * Return `true` if `persistent` is null or has been cleared via
- * [`stator_persistent_reset`].
+ * `stator_persistent_reset`.
  *
  * # Safety
  * `persistent` must be null or a slot pointer returned by
- * [`stator_persistent_new`] that has not yet been passed to
- * [`stator_persistent_dispose`].
+ * `stator_persistent_new` that has not yet been passed to
+ * `stator_persistent_dispose`.
  */
 bool stator_persistent_is_empty(const struct StatorPersistent *persistent);
 
 /**
- * Materialise a fresh [`StatorValue`] from the value stored in `persistent`.
+ * Materialise a fresh `StatorValue` from the value stored in `persistent`.
  *
  * The returned value is allocated on the embedder side and, if a handle
  * scope is open on the persistent's isolate, registered with that scope so
@@ -8475,8 +9950,8 @@ bool stator_persistent_is_empty(const struct StatorPersistent *persistent);
  *
  * # Safety
  * `persistent` must be null or a slot pointer returned by
- * [`stator_persistent_new`] that has not yet been passed to
- * [`stator_persistent_dispose`].
+ * `stator_persistent_new` that has not yet been passed to
+ * `stator_persistent_dispose`.
  */
 struct StatorValue *stator_persistent_get(const struct StatorPersistent *persistent);
 
@@ -8492,7 +9967,7 @@ struct StatorValue *stator_persistent_get(const struct StatorPersistent *persist
  *
  * # Safety
  * `persistent` must be null or a slot pointer returned by
- * [`stator_persistent_new`].  After this call returns, the embedder must
+ * `stator_persistent_new`.  After this call returns, the embedder must
  * treat the pointer as invalid (it must not be passed to any other
  * `stator_persistent_*` function except as a redundant `dispose`).
  */
@@ -8619,8 +10094,8 @@ void stator_weak_dispose(struct StatorWeak *weak);
  *
  * # Safety
  * `persistent` must be null or a slot pointer returned by
- * [`stator_persistent_new`] that has not yet been passed to
- * [`stator_persistent_dispose`].
+ * `stator_persistent_new` that has not yet been passed to
+ * `stator_persistent_dispose`.
  */
 struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persistent,
                                                void *parameter,
@@ -8638,18 +10113,18 @@ struct StatorWeak *stator_persistent_make_weak(struct StatorPersistent *persiste
  * - `value`'s payload is not a reference-counted (object/wrapper/native
  *   function) variant — primitives carry no GC identity, so a traced
  *   handle would be meaningless.  This rejection is the same as
- *   [`stator_weak_new`].
+ *   `stator_weak_new`.
  *
  * The newly created slot is allocated in the **stale** state: it does
  * not count as a live root until the embedder reports it via
- * [`stator_traced_visitor_visit`] during a GC cycle.  Between cycles it
+ * `stator_traced_visitor_visit` during a GC cycle.  Between cycles it
  * transparently keeps the referent alive via its strong clone, so
  * embedders that need rooting *before* the first GC can simply call
- * [`stator_traced_get`] to materialise the value as needed.
+ * `stator_traced_get` to materialise the value as needed.
  *
  * # Safety
- * - `ctx` must be null or a valid, live [`StatorContext`] pointer.
- * - `value` must be null or a valid, live [`StatorValue`] pointer.
+ * - `ctx` must be null or a valid, live `StatorContext` pointer.
+ * - `value` must be null or a valid, live `StatorValue` pointer.
  */
 struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorValue *value);
 
@@ -8667,8 +10142,8 @@ struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorV
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 void stator_traced_reset(struct StatorTraced *traced);
 
@@ -8678,13 +10153,13 @@ void stator_traced_reset(struct StatorTraced *traced);
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 bool stator_traced_is_empty(const struct StatorTraced *traced);
 
 /**
- * Materialise a fresh [`StatorValue`] from the value stored in `traced`.
+ * Materialise a fresh `StatorValue` from the value stored in `traced`.
  *
  * Returns null when the slot is null, has been reset, or its referent
  * has been collected.  When a strong clone is currently held the value
@@ -8693,8 +10168,8 @@ bool stator_traced_is_empty(const struct StatorTraced *traced);
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * [`stator_traced_new`] that has not yet been passed to
- * [`stator_traced_dispose`].
+ * `stator_traced_new` that has not yet been passed to
+ * `stator_traced_dispose`.
  */
 struct StatorValue *stator_traced_get(const struct StatorTraced *traced);
 
@@ -8716,16 +10191,16 @@ void stator_traced_dispose(struct StatorTraced *traced);
 /**
  * Register the embedder traced-root visitor on `isolate`.
  *
- * Passing a `None` callback clears any previously registered visitor;
+ * Passing a null callback clears any previously registered visitor;
  * subsequent GC cycles will treat every traced slot as unvisited and
  * therefore unreachable from the embedder.  The callback runs on the
  * owning thread at the start of every GC cycle driven by
- * [`stator_isolate_gc`] / [`stator_gc_collect`].
+ * `stator_isolate_gc` / `stator_gc_collect`.
  *
  * Null-tolerant: passing null `isolate` is a no-op.
  *
  * # Safety
- * `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
  * The supplied `userdata` is passed verbatim to the callback; its
  * lifetime is entirely the embedder's responsibility and must outlive
  * the registration.
@@ -8737,7 +10212,7 @@ void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,
 /**
  * Mark `traced` as visited in the current GC cycle.
  *
- * Only valid to call from inside a [`StatorTracedRootVisitor`]
+ * Only valid to call from inside a `StatorTracedRootVisitor`
  * invocation; the `visitor` token is the one supplied to the visitor
  * callback by the engine.  Fails closed (no-op) when `visitor` or
  * `traced` is null, when the visitor's epoch does not match the current
@@ -8748,8 +10223,8 @@ void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,
  * - `visitor` must be null or the live token supplied to the current
  *   visitor callback invocation on `traced`'s isolate.
  * - `traced` must be null or a slot pointer returned by
- *   [`stator_traced_new`] that has not yet been passed to
- *   [`stator_traced_dispose`].
+ *   `stator_traced_new` that has not yet been passed to
+ *   `stator_traced_dispose`.
  */
 void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct StatorTraced *traced);
 
@@ -8759,8 +10234,8 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
  * This is the JS→C++ direction of the cross-heap tracing protocol: it lets an
  * embedder (typically Oilpan) discover every live traced edge a JS host object
  * holds without poking at engine internals. DOM wrapper values created by
- * [`stator_dom_object_wrap_as_value`] expose the borrowed edges registered via
- * [`stator_dom_object_wrap_add_traced_edge`]. Ordinary JS values, invalidated
+ * `stator_dom_object_wrap_as_value` expose the borrowed edges registered via
+ * `stator_dom_object_wrap_add_traced_edge`. Ordinary JS values, invalidated
  * wrappers, cross-isolate values, null arguments, and empty traced slots fail
  * closed by reporting zero edges.
  *
@@ -8768,9 +10243,9 @@ void stator_traced_visitor_visit(struct StatorTracedVisitor *visitor, struct Sta
  * call and must not reset or dispose it.
  *
  * # Safety
- * - `isolate` must be null or a valid, live [`StatorIsolate`] pointer.
- * - `host` must be null or a valid, live [`StatorValue`] pointer.
- * - `callback` (if non-`None`) and `userdata` lifetimes are entirely the
+ * - `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ * - `host` must be null or a valid, live `StatorValue` pointer.
+ * - `callback` (if non-null) and `userdata` lifetimes are entirely the
  *   embedder's responsibility.
  */
 void stator_traced_visit_outgoing(struct StatorIsolate *isolate,
@@ -8785,8 +10260,24 @@ size_t stator_native_code_cache_header_size(void);
 
 /**
  * Return a stable low-cardinality telemetry code string for a diagnostic.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
  */
 const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheDiagnostic diagnostic);
+
+/**
+ * Return a stable telemetry code string for a raw diagnostic value.
+ *
+ * Unknown or future diagnostic values return `"unknown_diagnostic"` rather
+ * than requiring C callers to construct an invalid Rust enum value.
+ *
+ * The returned pointer refers to a process-static, NUL-terminated string owned
+ * by Stator. Embedders must not free or mutate it; it remains valid for the
+ * lifetime of the process.
+ */
+const char *stator_native_code_cache_diagnostic_name_u32(uint32_t diagnostic);
 
 /**
  * Decode a native-tier artifact header without checking runtime compatibility.
@@ -8796,8 +10287,11 @@ const char *stator_native_code_cache_diagnostic_name(enum StatorNativeCodeCacheD
  *
  * # Safety
  *
- * `bytes` must point to `len` readable bytes for the duration of the call.
- * When `out_info` is non-null, it must be valid for one write.
+ * When `bytes` is non-null and `len > 0`, it must point to `len` readable
+ * bytes for the duration of the call. Null `bytes` or zero `len` returns
+ * `StatorNativeCodeCacheDiagnosticInvalidArgument`
+ * without dereferencing `bytes`. When `out_info` is non-null, it must be valid
+ * for one write; null `out_info` is accepted.
  */
 enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(const uint8_t *bytes,
                                                                               size_t len,
@@ -8813,9 +10307,13 @@ enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_classify_header(co
  *
  * # Safety
  *
- * `bytes` must point to `len` readable bytes for the duration of the call,
- * `expected` must point to a valid compatibility struct, and `out_info` must be
- * valid for one write when it is non-null.
+ * When `bytes` is non-null and `len > 0`, it must point to `len` readable
+ * bytes for the duration of the call. `expected` must either be null or point
+ * to a valid compatibility struct. Null `bytes`, zero `len`, or null
+ * `expected` returns
+ * `StatorNativeCodeCacheDiagnosticInvalidArgument`
+ * without dereferencing invalid inputs. When `out_info` is non-null, it must be
+ * valid for one write; null `out_info` is accepted.
  */
 enum StatorNativeCodeCacheDiagnostic stator_native_code_cache_validate_header(const uint8_t *bytes,
                                                                               size_t len,

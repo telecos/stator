@@ -179,6 +179,16 @@ present each must be valid for one write. Cache bytes are untrusted input and
 must fail closed: accepted blobs may skip parsing and bytecode generation, but
 must never weaken source, origin, option, or version validation.
 
+## Module record lifetime
+
+Linked module graphs are retained by their `StatorContext` until context
+teardown so Edge may reuse module records, namespace objects, and source metadata
+after the embedder releases individual raw `StatorModule *` pointers. Embedders
+that need a queryable edge to one record can call `stator_module_retain`, use
+`stator_module_handle_get_module` / `stator_module_handle_get_status`, then call
+`stator_module_handle_release` and `stator_module_handle_destroy`. Released or
+otherwise stale handles fail closed by returning null or `Errored`.
+
 ### Parity and differences versus module cache
 
 Script and module caches share the same key schema, manifest invalidation rules,
@@ -214,7 +224,7 @@ The header format is exactly 256 bytes:
 | Offset | Field | Type | Compatibility diagnostic |
 |---:|---|---|---|
 | 0 | `magic` | 8 ASCII bytes `STNCACH1` | `corrupt_payload` |
-| 8 | `native_header_format_version` | u32 little-endian, currently `1` | `rejected_format_version` |
+| 8 | `native_header_format_version` | u32 little-endian, currently `1` | `corrupt_payload` |
 | 12 | `target_tier` | u32 (`1` baseline, `2` maglev, `3` turbofan) | `rejected_artifact_type` |
 | 16 | `native_format_version` | u32 baseline/JIT artifact format | `rejected_format_version` |
 | 20 | `target_ffi_abi_version` | packed u32 `STATOR_FFI_ABI_VERSION` | `rejected_engine_version` |
@@ -227,7 +237,7 @@ The header format is exactly 256 bytes:
 | 216 | `payload_digest` | SHA-256 of the native payload bytes after the header | `corrupt_payload` |
 | 248 | `payload_length_bytes` | u64 little-endian exact payload length | `corrupt_payload` |
 
-The public FFI helpers `stator_native_code_cache_classify_header`, `stator_native_code_cache_validate_header`, `stator_native_code_cache_header_size`, and `stator_native_code_cache_diagnostic_name` expose this contract to embedders. Classification only decodes the fixed header. Validation compares target tier, engine/ABI/compiler identity, target triple and CPU features, JIT flags, source key digest, payload digest, and payload length. A fully compatible artifact returns `unsupported_native_code` until Stator has a safe native compiled-artifact serialization and loader.
+The public FFI helpers `stator_native_code_cache_classify_header`, `stator_native_code_cache_validate_header`, `stator_native_code_cache_header_size`, and `stator_native_code_cache_diagnostic_name` expose this contract to embedders. Classification only decodes the fixed header. Validation compares target tier, engine/ABI/compiler identity, target triple and CPU features, JIT flags, source key digest, payload digest, and payload length. A fully compatible artifact returns `unsupported_native_code` until Stator has a safe native compiled-artifact serialization and loader. Classification and validation return `invalid_argument` for null `bytes` or zero `len`, validation also returns `invalid_argument` for null `expected`, `out_info` may be null, and diagnostic-name pointers are process-static strings that embedders must not free.
 
 ### Module source metadata v2 plumbing
 

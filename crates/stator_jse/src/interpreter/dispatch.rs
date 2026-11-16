@@ -21,36 +21,43 @@ use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, rec
 use super::{
     ACTIVE_DEBUGGER, CallArgs, FAST_ARRAY_METHOD_KEY, GlobalEnv, INLINE_BYTECODE_THRESHOLD,
     Interpreter, InterpreterFrame, MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc,
-    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, acquire_frame, bigint_pow, clone_shared_global_env,
-    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
-    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
-    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, fast_array_method_name, fast_array_method_target,
-    find_handler, fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add,
-    js_less_than, keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
-    resolve_jump, restore_closure_context, run_callee_pooled, set_function_name_if_missing,
-    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, acquire_frame, bigint_pow, bind_no_receiver_this,
+    clone_shared_global_env, collect_args, concat_rc_strs, constant_pool_jump_delta,
+    constant_to_value, construct_builtin_result, decode_string_constant, dispatch_call_property,
+    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, fast_array_method_name,
+    fast_array_method_target, find_handler, fn_global_env_get, fn_props_get, fn_props_set,
+    has_property_in_chain, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
+    keyed_load, keyed_store, leaked_internal_await_error, make_construct_this,
+    make_generator_no_receiver_activation, make_generator_with_receiver_activation,
+    maybe_cache_construct_boilerplate, maybe_compile_baseline, maybe_compile_maglev,
+    maybe_compile_turbofan, normalize_async_iterator, notify_mapped_arguments_property_delete,
+    notify_mapped_arguments_property_write, number_to_jsvalue, ordinary_set_prototype_of,
+    plain_object_to_array_items, populate_self_name, proto_lookup, proto_lookup_cached_resolution,
+    proto_lookup_chain_depth, register_context_mapped_argument_alias, resolve_construct_proto,
+    resolve_jump, restore_closure_context, restore_no_receiver_this, run_callee_pooled,
+    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
+    sync_global_object_property_delete, sync_global_object_property_store, to_array_index,
+    to_bigint, to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
     try_inline_small_function, try_proto_lookup_rc, walk_context_chain,
+    with_function_constructor_global_env,
 };
 use crate::builtins::error::{ErrorKind, JsError, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
-    proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
+    proxy_apply, proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
 };
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
-    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
+    ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
+    TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
 use crate::ic::counters::{self as ic_counters, IcEvent, IcOp, IcTier};
+use crate::inspector::debugger::PauseFrameSnapshot;
 use crate::objects::js_object::JsObject;
 use crate::objects::value::{
-    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
-    NativeIterator,
+    GeneratorResumeMode, GeneratorStatus, GeneratorStep, JsContext, JsContextMappedArgumentAlias,
+    JsValue, NativeIterator,
 };
 
 /// Stack-allocated integer-to-string conversion.
@@ -92,6 +99,48 @@ fn itoa_stack(mut n: u32) -> StackStr {
     s.len = i as u8;
     s.buf[..i].reverse();
     s
+}
+
+fn plain_object_index_store_needs_general_path(map: &PropertyMap, key: &str) -> bool {
+    if map.get("__typed_array__").is_some() {
+        return true;
+    }
+
+    let has_own_key = map.contains_key(key);
+    if map.has_accessors && (map.has_getter_for(key) || map.has_setter_for(key)) {
+        return true;
+    }
+    if has_own_key && !map.is_writable(key) {
+        return true;
+    }
+    if !has_own_key && !map.extensible {
+        return true;
+    }
+
+    let mut proto = map
+        .get(INTERNAL_PROTO_PROPERTY_KEY)
+        .or_else(|| map.get("__proto__"))
+        .cloned();
+    for _ in 0..256 {
+        match proto.take() {
+            Some(JsValue::PlainObject(p)) => {
+                let pb = p.borrow();
+                if pb.has_accessors && (pb.has_getter_for(key) || pb.has_setter_for(key)) {
+                    return true;
+                }
+                if pb.contains_key(key) && !pb.is_writable(key) {
+                    return true;
+                }
+                proto = pb
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| pb.get("__proto__"))
+                    .cloned();
+            }
+            _ => break,
+        }
+    }
+
+    false
 }
 
 /// Result of executing a single opcode handler.
@@ -174,6 +223,40 @@ fn private_getter_key(storage_key: &str) -> String {
 
 fn private_setter_key(storage_key: &str) -> String {
     format!("__set_{storage_key}__")
+}
+
+fn accessor_getter_key(property_key: &str) -> String {
+    format!("__get_{property_key}__")
+}
+
+fn accessor_setter_key(property_key: &str) -> String {
+    format!("__set_{property_key}__")
+}
+
+fn accessor_delete_targets(pm: &PropertyMap, property_key: &str) -> Option<Vec<String>> {
+    if !pm.is_accessor_property(property_key) {
+        return None;
+    }
+
+    let getter_key = accessor_getter_key(property_key);
+    let setter_key = accessor_setter_key(property_key);
+    let has_getter = pm.contains_key(&getter_key);
+    let has_setter = pm.contains_key(&setter_key);
+    if !has_getter && !has_setter {
+        return None;
+    }
+
+    let mut targets = Vec::new();
+    if pm.contains_key(property_key) {
+        targets.push(property_key.to_string());
+    }
+    if has_getter {
+        targets.push(getter_key);
+    }
+    if has_setter {
+        targets.push(setter_key);
+    }
+    Some(targets)
 }
 
 fn private_display_name(storage_key: &str) -> String {
@@ -598,8 +681,8 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
         return Err(err_bad_operand("Star", 0));
     };
     let val = ctx.frame.accumulator.cheap_clone();
-    let idx = ctx.frame.reg_index(v)?;
-    let old = std::mem::replace(&mut ctx.frame.registers[idx], val);
+    ctx.frame.reg_index(v)?;
+    let old = unsafe { ctx.frame.swap_reg_unchecked(v, val) };
     if let JsValue::PlainObject(rc) = old {
         recycle_object_rc(rc);
     }
@@ -1375,7 +1458,7 @@ fn handle_test_equal(
         return Err(err_bad_operand("TestEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    let result = abstract_eq(&ctx.frame.accumulator, rhs);
+    let result = abstract_eq(&ctx.frame.accumulator, rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1388,7 +1471,7 @@ fn handle_test_not_equal(
         return Err(err_bad_operand("TestNotEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    let result = !abstract_eq(&ctx.frame.accumulator, rhs);
+    let result = !abstract_eq(&ctx.frame.accumulator, rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1536,7 +1619,7 @@ fn handle_test_equal_jump(
     };
 
     let rhs = ctx.frame.read_reg(v)?;
-    let comparison = abstract_eq(&ctx.frame.accumulator, rhs);
+    let comparison = abstract_eq(&ctx.frame.accumulator, rhs)?;
 
     ctx.frame.accumulator = JsValue::Boolean(comparison);
     let should_jump = if is_true_flag == 0 {
@@ -1569,7 +1652,7 @@ fn handle_test_not_equal_jump(
     };
 
     let rhs = ctx.frame.read_reg(v)?;
-    let comparison = !abstract_eq(&ctx.frame.accumulator, rhs);
+    let comparison = !abstract_eq(&ctx.frame.accumulator, rhs)?;
 
     ctx.frame.accumulator = JsValue::Boolean(comparison);
     let should_jump = if is_true_flag == 0 {
@@ -2076,7 +2159,11 @@ fn handle_create_closure(
     if !is_arrow && func_rc.is_generator() {
         let func_val = JsValue::Function(Rc::clone(&func_rc));
         let mut proto = PropertyMap::new();
-        proto.insert("constructor".to_string(), func_val);
+        proto.insert_with_attrs(
+            "constructor".to_string(),
+            func_val,
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
         if let Some(generator_proto) = super::default_generator_object_prototype() {
             proto.insert("__proto__".to_string(), generator_proto);
         }
@@ -2110,17 +2197,24 @@ fn handle_call_any_receiver(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(&ba));
-                super::init_generator_state_prototype(&state, &ba);
-                ctx.frame.accumulator = JsValue::Generator(state);
+                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
             } else if ba.is_async() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 // ── Inline small functions (zero-arg fast path) ──
                 if arg_count == 0
+                    && !ba.is_strict()
+                    && !ctx.frame.bytecode_array.is_strict()
                     && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                     && !ba.has_exception_handler()
+                    && ba.self_name_register().is_none()
                     && let Some(result) =
                         try_inline_small_function(ba.as_ref(), &[], &ctx.frame.global_env)
                 {
@@ -2146,8 +2240,14 @@ fn handle_call_any_receiver(
                     }
                 }
                 let callee_val = JsValue::Function(Rc::clone(&ba));
-                let mut callee_frame =
-                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
+                } else {
+                    None
+                };
+                let global_env =
+                    fn_global_env_get(&ba).unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
+                let mut callee_frame = acquire_frame(Rc::clone(&ba), args, global_env);
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2160,6 +2260,9 @@ fn handle_call_any_receiver(
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
                 }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
+                }
                 ctx.frame.accumulator = result?;
             }
         }
@@ -2168,13 +2271,18 @@ fn handle_call_any_receiver(
             ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
+        JsValue::Proxy(proxy) => {
+            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+            ctx.frame.accumulator =
+                proxy_apply(&mut proxy.borrow_mut(), JsValue::Undefined, args.into_vec())?;
+            ctx.frame.global_cache_invalidate();
+        }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    ctx.frame.accumulator = f(args.into_vec())?;
-                    ctx.frame.global_cache_invalidate();
+                    ctx.frame.accumulator = call_plain_object_native_function(ctx, map, &f, args)?;
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -2200,14 +2308,6 @@ fn handle_tail_call(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if !ctx.frame.bytecode_array.is_strict() {
-        // TailCall is terminal — the callee's result must be returned to
-        // our caller, not continued past the (non-existent) next bytecode.
-        // handle_call_any_receiver sets the accumulator and returns Continue;
-        // convert that into Return so the frame unwinds correctly.
-        handle_call_any_receiver(ctx, instr)?;
-        return Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()));
-    }
     let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("TailCall", 0));
     };
@@ -2221,16 +2321,8 @@ fn handle_tail_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() || ba.is_async() {
-                // Generators/async cannot be tail-called;
-                // fall back to a normal call.
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                if ba.is_generator() {
-                    let state = GeneratorState::new(Rc::clone(&ba));
-                    super::init_generator_state_prototype(&state, &ba);
-                    ctx.frame.accumulator = JsValue::Generator(state);
-                } else {
-                    ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
-                }
+                handle_call_any_receiver(ctx, instr)?;
+                Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()))
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering (cold path: compile but do NOT execute JIT
@@ -2259,8 +2351,12 @@ fn handle_tail_call(
                 let frame_size = ba.frame_size() as usize;
                 let total_regs = param_count + frame_size;
                 let inherited_new_target = ctx.frame.new_target.clone();
+                let global_env =
+                    fn_global_env_get(&ba).unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
                 ctx.frame.bytecode_array = Rc::clone(&ba);
                 ctx.frame.call_args = args;
+                ctx.frame.global_env = global_env;
+                ctx.frame.clear_mapped_arguments_aliases();
                 ctx.frame.registers.clear();
                 ctx.frame.registers.resize(total_regs, JsValue::Undefined);
                 for (i, arg) in ctx
@@ -2285,11 +2381,8 @@ fn handle_tail_call(
                 } else {
                     JsValue::Undefined
                 };
-                if !ba.is_arrow() && ba.is_strict() {
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
+                if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict());
                 }
                 restore_closure_context(ctx.frame, &ba);
                 if ba.self_name_register().is_some() {
@@ -2303,32 +2396,14 @@ fn handle_tail_call(
                 ctx.frame.mega_store_ic = None;
                 ctx.frame.global_ic_reset();
                 ctx.frame.global_cache_invalidate();
-                return Ok(DispatchAction::TailCall);
+                Ok(DispatchAction::TailCall)
             }
         }
-        JsValue::NativeFunction(f) => {
-            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args.into_vec())?;
-            ctx.frame.global_cache_invalidate();
-        }
-        JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = f(args.into_vec())?;
-                ctx.frame.global_cache_invalidate();
-            } else {
-                return Err(StatorError::TypeError(
-                    "TailCall: callee is not a function (got PlainObject)".to_string(),
-                ));
-            }
-        }
-        other => {
-            return Err(StatorError::TypeError(format!(
-                "TailCall: callee is not a function (got {other:?})"
-            )));
+        _ => {
+            handle_call_any_receiver(ctx, instr)?;
+            Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()))
         }
     }
-    Ok(DispatchAction::Continue)
 }
 
 fn handle_call_undefined_receiver0(
@@ -2350,10 +2425,13 @@ fn handle_call_undefined_receiver0(
                     return Ok(DispatchAction::Continue);
                 }
             }
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+            if !ba.is_strict()
+                && !ctx.frame.bytecode_array.is_strict()
+                && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
+                && ba.self_name_register().is_none()
             {
                 let no_args: &[JsValue] = &[];
                 if let Some(result) =
@@ -2364,19 +2442,17 @@ fn handle_call_undefined_receiver0(
                 }
             }
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
+                ctx.frame.accumulator = make_generator_no_receiver_activation(
+                    &ba,
+                    CallArgs::new(),
+                    &ctx.frame.global_env,
+                );
             } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), CallArgs::new())
-                }
-                ctx.frame.accumulator = run_async(&ba)?;
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    CallArgs::new(),
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let no_args: &[JsValue] = &[];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
@@ -2398,13 +2474,8 @@ fn handle_call_undefined_receiver0(
                 }
                 // Arrow functions use lexical `this` — skip override.
                 // Strict mode: `this` is undefined for free function calls.
-                let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                    let old = ctx.frame.global_env.borrow().get_this().cloned();
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
-                    old
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                 } else {
                     None
                 };
@@ -2435,15 +2506,8 @@ fn handle_call_undefined_receiver0(
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
                 }
-                if !ba.is_arrow() && ba.is_strict() {
-                    match saved_this {
-                        Some(v) => {
-                            ctx.frame.global_env.borrow_mut().set_this(v);
-                        }
-                        None => {
-                            ctx.frame.global_env.borrow_mut().remove_this();
-                        }
-                    }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                 }
                 ctx.frame.accumulator = result?;
             }
@@ -2494,10 +2558,13 @@ fn handle_call_undefined_receiver1(
     }
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+            if !ba.is_strict()
+                && !ctx.frame.bytecode_array.is_strict()
+                && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
+                && ba.self_name_register().is_none()
             {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
@@ -2509,21 +2576,18 @@ fn handle_call_undefined_receiver1(
                 }
             }
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
-            } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), args)
-                }
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1];
-                ctx.frame.accumulator = run_async(&ba, args)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+            } else if ba.is_async() {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let args: CallArgs = smallvec![arg1];
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
@@ -2545,13 +2609,8 @@ fn handle_call_undefined_receiver1(
                     }
                 }
                 // Arrow functions use lexical `this` — skip override.
-                let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                    let old = ctx.frame.global_env.borrow().get_this().cloned();
-                    ctx.frame
-                        .global_env
-                        .borrow_mut()
-                        .set_this(JsValue::Undefined);
-                    old
+                let saved_this = if !ba.is_arrow() {
+                    bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                 } else {
                     None
                 };
@@ -2575,15 +2634,8 @@ fn handle_call_undefined_receiver1(
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
                 }
-                if !ba.is_arrow() && ba.is_strict() {
-                    match saved_this {
-                        Some(v) => {
-                            ctx.frame.global_env.borrow_mut().set_this(v);
-                        }
-                        None => {
-                            ctx.frame.global_env.borrow_mut().remove_this();
-                        }
-                    }
+                if !ba.is_arrow() {
+                    restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                 }
                 ctx.frame.accumulator = result?;
             }
@@ -2632,38 +2684,21 @@ fn handle_call_undefined_receiver2(
     let callee = ctx.frame.read_reg(callee_v)?.resolve_live_binding();
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
-                && !ba.has_exception_handler()
-                && !ba.is_generator()
-                && !ba.is_async()
-            {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
-                let inline_args = [arg1, arg2];
-                if let Some(result) =
-                    try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
-                {
-                    ctx.frame.accumulator = result;
-                    return Ok(DispatchAction::Continue);
-                }
-            }
             if ba.is_generator() {
-                #[cold]
-                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
-                    let state = GeneratorState::new(Rc::clone(ba));
-                    super::init_generator_state_prototype(&state, ba);
-                    JsValue::Generator(state)
-                }
-                ctx.frame.accumulator = make_generator(&ba);
-            } else if ba.is_async() {
-                #[cold]
-                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
-                    Interpreter::run_async_function(Rc::clone(ba), args)
-                }
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1, arg2];
-                ctx.frame.accumulator = run_async(&ba, args)?;
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+            } else if ba.is_async() {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
+                let args: CallArgs = smallvec![arg1, arg2];
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
@@ -2686,13 +2721,8 @@ fn handle_call_undefined_receiver2(
                 }
                 if !tried_jit {
                     // Arrow functions use lexical `this` — skip override.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get_this().cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .set_this(JsValue::Undefined);
-                        old
+                    let saved_this = if !ba.is_arrow() {
+                        bind_no_receiver_this(&ctx.frame.global_env, ba.is_strict())
                     } else {
                         None
                     };
@@ -2716,15 +2746,8 @@ fn handle_call_undefined_receiver2(
                     if gen_before != ctx.frame.global_env.borrow().generation() {
                         ctx.frame.global_cache_invalidate();
                     }
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame.global_env.borrow_mut().set_this(v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove_this();
-                            }
-                        }
+                    if !ba.is_arrow() {
+                        restore_no_receiver_this(&ctx.frame.global_env, saved_this);
                     }
                     ctx.frame.accumulator = result?;
                 }
@@ -2824,7 +2847,7 @@ fn handle_call_property(
 /// into the flattened output, leaving non-array values untouched.
 ///
 /// Also handles iterables (String, Iterator, Generator) for robustness.
-fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
+fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> StatorResult<CallArgs> {
     let mut out = SmallVec::new();
     for arg in raw_args {
         match &arg {
@@ -2874,7 +2897,12 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
                                             }
                                             break;
                                         }
-                                        Err(_) => break,
+                                        Ok(GeneratorStep::Await(_)) => {
+                                            return Err(leaked_internal_await_error(
+                                                "object spread iterator",
+                                            ));
+                                        }
+                                        Err(error) => return Err(error),
                                     }
                                 },
                                 // PlainObject with "next" → user-defined iterator.
@@ -2929,7 +2957,10 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
                         }
                         break;
                     }
-                    Err(_) => break,
+                    Ok(GeneratorStep::Await(_)) => {
+                        return Err(leaked_internal_await_error("spread iterator"));
+                    }
+                    Err(error) => return Err(error),
                 }
             },
             _ => {
@@ -2937,7 +2968,7 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn handle_call_with_spread(
@@ -2957,9 +2988,22 @@ fn handle_call_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
-    let args = expand_spread_args(raw_args);
+    let args = expand_spread_args(raw_args)?;
     match callee {
         JsValue::Function(ba) => {
+            if ba.is_generator() {
+                ctx.frame.accumulator =
+                    make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+                return Ok(DispatchAction::Continue);
+            }
+            if ba.is_async() {
+                ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                )?;
+                return Ok(DispatchAction::Continue);
+            }
             // ── Tiering ──────────────────────────────────────
             let count = ba.increment_invocation_count();
             if count >= TIERING_THRESHOLD && !ba.has_any_jit_code() {
@@ -2995,13 +3039,35 @@ fn handle_call_with_spread(
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(args.into_vec())?;
-                ctx.frame.global_cache_invalidate();
-            } else {
-                return Err(StatorError::TypeError(
-                    "CallWithSpread: callee is not a function (got PlainObject)".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    ctx.frame.accumulator = call_plain_object_native_function(ctx, map, &f, args)?;
+                }
+                Some(JsValue::Function(ba)) => {
+                    if ba.is_generator() {
+                        ctx.frame.accumulator = make_generator_with_receiver_activation(
+                            &ba,
+                            args,
+                            &ctx.frame.global_env,
+                            JsValue::PlainObject(Rc::clone(map)),
+                        );
+                    } else if ba.is_async() {
+                        ctx.frame.accumulator = Interpreter::run_async_function_with_receiver(
+                            Rc::clone(&ba),
+                            args,
+                            Rc::clone(&ctx.frame.global_env),
+                            JsValue::PlainObject(Rc::clone(map)),
+                        )?;
+                    } else {
+                        call_plain_object_function(ctx, &ba, map, args)?;
+                    }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CallWithSpread: callee is not a function (got PlainObject)".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -3019,6 +3085,84 @@ fn handle_call_with_spread(
 /// constructor is called (not `[[Construct]]`-ed).  The shared global
 /// environment already has `"this"` set by the enclosing `[[Construct]]`
 /// handler, so the parent body can see and mutate the same object.
+fn call_plain_object_native_function(
+    ctx: &mut DispatchContext,
+    map: &Rc<RefCell<PropertyMap>>,
+    f: &crate::objects::value::NativeFn,
+    args: CallArgs,
+) -> StatorResult<JsValue> {
+    let (is_super_callee, previous_this, pending_super_this, derived_init_caller) = {
+        let mut env = ctx.frame.global_env.borrow_mut();
+        let is_super_callee = matches!(
+            env.get("super"),
+            Some(JsValue::PlainObject(super_map)) if Rc::ptr_eq(super_map, map)
+        );
+        if is_super_callee {
+            (
+                true,
+                env.get_this().cloned(),
+                env.get(".class_pending_this").cloned(),
+                env.remove(".class_pending_derived_init"),
+            )
+        } else {
+            (false, None, None, None)
+        }
+    };
+    let mut derived_init_caller = derived_init_caller;
+
+    if let Some(pending_this) = pending_super_this.as_ref().cloned() {
+        let current_this = ctx
+            .frame
+            .global_env
+            .borrow()
+            .get_this()
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        if current_this != JsValue::TheHole {
+            return Err(StatorError::ReferenceError(
+                "Super constructor may only be called once".into(),
+            ));
+        }
+        ctx.frame.global_env.borrow_mut().set_this(pending_this);
+    }
+
+    let result = match f(args.into_vec()) {
+        Ok(result) => result,
+        Err(err) => {
+            if is_super_callee {
+                restore_failed_super_call_state(
+                    &ctx.frame.global_env,
+                    previous_this,
+                    pending_super_this.as_ref(),
+                    derived_init_caller.take(),
+                );
+                ctx.frame.global_cache_invalidate();
+            }
+            return Err(err);
+        }
+    };
+    ctx.frame.global_cache_invalidate();
+    if is_super_callee && is_constructor_return_object(&result) {
+        ctx.frame.global_env.borrow_mut().set_this(result.clone());
+        ctx.frame.global_cache_invalidate();
+    }
+
+    // Run the derived caller's instance-field initializer immediately
+    // after `super()` returns successfully, before the rest of the
+    // derived constructor body continues (ES §15.7.14).
+    if let Some(JsValue::PlainObject(caller_class)) = derived_init_caller {
+        let this = ctx.frame.global_env.borrow().get_this().cloned();
+        if let Some(this) = this
+            && !matches!(this, JsValue::TheHole)
+        {
+            let new_target = ctx.frame.new_target.clone();
+            run_class_field_init(&ctx.frame.global_env, &this, &caller_class, &new_target)?;
+            ctx.frame.global_cache_invalidate();
+        }
+    }
+
+    Ok(result)
+}
 fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
@@ -3029,7 +3173,32 @@ fn call_plain_object_function(
         map.borrow().get(".class_constructor"),
         Some(JsValue::Boolean(true))
     );
+    let is_derived_constructor = is_class_constructor
+        && matches!(
+            map.borrow().get(".class_derived"),
+            Some(JsValue::Boolean(true))
+        );
+    let is_super_callee = if is_class_constructor {
+        let env = ctx.frame.global_env.borrow();
+        matches!(
+            env.get("super"),
+            Some(JsValue::PlainObject(super_map)) if Rc::ptr_eq(super_map, map)
+        )
+    } else {
+        false
+    };
+    let previous_this = if is_class_constructor && is_super_callee {
+        ctx.frame.global_env.borrow().get_this().cloned()
+    } else {
+        None
+    };
+    let mut pending_super_this = None;
     if is_class_constructor {
+        if !is_super_callee {
+            return Err(StatorError::TypeError(
+                "Class constructor cannot be invoked without 'new'".into(),
+            ));
+        }
         let pending_this = ctx
             .frame
             .global_env
@@ -3038,6 +3207,7 @@ fn call_plain_object_function(
             .cloned();
         match pending_this {
             Some(pending_this) => {
+                pending_super_this = Some(pending_this.clone());
                 let current_this = ctx
                     .frame
                     .global_env
@@ -3050,9 +3220,24 @@ fn call_plain_object_function(
                         "Super constructor may only be called once".into(),
                     ));
                 }
-                ctx.frame.global_env.borrow_mut().set_this(pending_this);
+                if !is_derived_constructor {
+                    let mut env = ctx.frame.global_env.borrow_mut();
+                    env.set_this(pending_this.clone());
+                }
             }
             None => {
+                let current_this = ctx
+                    .frame
+                    .global_env
+                    .borrow()
+                    .get_this()
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                if is_super_callee && current_this != JsValue::TheHole {
+                    return Err(StatorError::ReferenceError(
+                        "Super constructor may only be called once".into(),
+                    ));
+                }
                 return Err(StatorError::TypeError(
                     "Class constructor cannot be invoked without 'new'".into(),
                 ));
@@ -3061,12 +3246,203 @@ fn call_plain_object_function(
     }
     let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
+    if ba.self_name_register().is_some() {
+        populate_self_name(&mut callee_frame, ba, &JsValue::PlainObject(Rc::clone(map)));
+    }
     callee_frame.new_target = ctx.frame.new_target.clone();
+    let saved_super = if is_derived_constructor {
+        let parent = map.borrow().get("__proto__").cloned();
+        let mut env = ctx.frame.global_env.borrow_mut();
+        let saved = env.get("super").cloned();
+        match parent {
+            Some(parent) if !matches!(parent, JsValue::Undefined | JsValue::Null) => {
+                env.insert("super".to_string(), parent);
+            }
+            _ => {
+                env.remove("super");
+            }
+        }
+        Some(saved)
+    } else {
+        None
+    };
+    // Take the caller's pending derived-field-init marker.  When `super()`
+    // returns successfully we run the caller's instance-field initializer
+    // before the rest of its constructor body continues (ES §15.7.14).
+    // If this super-callee is itself a derived constructor, install its
+    // own marker so its `super()` call can consume it.
+    let mut derived_init_caller = if is_class_constructor && is_super_callee {
+        let mut env = ctx.frame.global_env.borrow_mut();
+        let caller = env.remove(".class_pending_derived_init");
+        if is_derived_constructor {
+            env.insert(
+                ".class_pending_derived_init".to_string(),
+                JsValue::PlainObject(Rc::clone(map)),
+            );
+        }
+        caller
+    } else {
+        None
+    };
+    if is_class_constructor
+        && is_super_callee
+        && !is_derived_constructor
+        && let Some(this) = pending_super_this.as_ref()
+    {
+        run_class_field_init(&ctx.frame.global_env, this, map, &ctx.frame.new_target)?;
+    }
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
+    let val = match result {
+        Ok(val) => val,
+        Err(err) => {
+            if is_class_constructor && is_super_callee {
+                if is_derived_constructor {
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .remove(".class_pending_derived_init");
+                }
+                restore_saved_super(&ctx.frame.global_env, saved_super);
+                restore_failed_super_call_state(
+                    &ctx.frame.global_env,
+                    previous_this,
+                    pending_super_this.as_ref(),
+                    derived_init_caller.take(),
+                );
+                ctx.frame.global_cache_invalidate();
+            } else {
+                restore_saved_super(&ctx.frame.global_env, saved_super);
+            }
+            return Err(err);
+        }
+    };
+    // Defensively clear any marker we installed for this super-callee in
+    // case its body did not consume it (e.g., never called `super()`).
+    if is_class_constructor && is_super_callee && is_derived_constructor {
+        ctx.frame
+            .global_env
+            .borrow_mut()
+            .remove(".class_pending_derived_init");
+    }
+    restore_saved_super(&ctx.frame.global_env, saved_super);
     ctx.frame.global_cache_invalidate();
-    ctx.frame.accumulator = result?;
+    if is_class_constructor && is_super_callee && is_constructor_return_object(&val) {
+        ctx.frame.global_env.borrow_mut().set_this(val.clone());
+        ctx.frame.global_cache_invalidate();
+    }
+
+    // Run the derived caller's instance-field initializer immediately
+    // after `super()` returns successfully.
+    if let Some(JsValue::PlainObject(caller_class)) = derived_init_caller {
+        let this = ctx.frame.global_env.borrow().get_this().cloned();
+        if let Some(this) = this
+            && !matches!(this, JsValue::TheHole)
+        {
+            let new_target = ctx.frame.new_target.clone();
+            run_class_field_init(&ctx.frame.global_env, &this, &caller_class, &new_target)?;
+            ctx.frame.global_cache_invalidate();
+        }
+    }
+
+    ctx.frame.accumulator = val;
+    Ok(())
+}
+
+fn is_constructor_return_object(value: &JsValue) -> bool {
+    value.is_object_like() && !matches!(value, JsValue::TheHole)
+}
+
+fn restore_saved_super(global_env: &Rc<RefCell<GlobalEnv>>, saved_super: Option<Option<JsValue>>) {
+    if let Some(saved_super) = saved_super {
+        let mut env = global_env.borrow_mut();
+        match saved_super {
+            Some(value) => {
+                env.insert("super".to_string(), value);
+            }
+            None => {
+                env.remove("super");
+            }
+        }
+    }
+}
+
+fn restore_failed_super_call_state(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    previous_this: Option<JsValue>,
+    pending_this: Option<&JsValue>,
+    derived_init_caller: Option<JsValue>,
+) {
+    let mut env = global_env.borrow_mut();
+    match previous_this {
+        Some(value) => env.set_this(value),
+        None => env.remove_this(),
+    }
+    if let Some(pending_this) = pending_this {
+        env.insert(
+            ".class_pending_this".to_string(),
+            fresh_pending_this(pending_this),
+        );
+    }
+    if let Some(derived_init_caller) = derived_init_caller {
+        env.insert(
+            ".class_pending_derived_init".to_string(),
+            derived_init_caller,
+        );
+    }
+}
+
+fn fresh_pending_this(value: &JsValue) -> JsValue {
+    match value {
+        JsValue::PlainObject(map) => {
+            let mut fresh = PropertyMap::new();
+            let borrow = map.borrow();
+            if let Some(proto) = borrow.get("__proto__") {
+                fresh.insert("__proto__".to_string(), proto.clone());
+            }
+            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                fresh.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+            }
+            JsValue::PlainObject(Rc::new(RefCell::new(fresh)))
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Run a class's instance-field initializer closure on the given `this`.
+///
+/// Looks up the hidden `.class_field_initializer` property stored on
+/// the class constructor and, if present, invokes it with `this` as
+/// the implicit receiver and parameter.  The `new.target` of the
+/// surrounding `[[Construct]]` is propagated into the initializer
+/// frame so `new.target`-aware field initializers behave correctly.
+fn run_class_field_init(
+    env: &Rc<RefCell<GlobalEnv>>,
+    this: &JsValue,
+    class_map: &Rc<RefCell<PropertyMap>>,
+    new_target: &JsValue,
+) -> StatorResult<()> {
+    let init = class_map.borrow().get(".class_field_initializer").cloned();
+    let Some(JsValue::Function(init_ba)) = init else {
+        return Ok(());
+    };
+    let mut init_frame = acquire_frame(Rc::clone(&init_ba), vec![this.clone()], Rc::clone(env));
+    restore_closure_context(&mut init_frame, &init_ba);
+    init_frame.new_target = new_target.clone();
+    {
+        let mut globals = init_frame.global_env.borrow_mut();
+        globals.set_this(this.clone());
+        globals.insert(
+            ".class_initializer_class".to_string(),
+            JsValue::PlainObject(Rc::clone(class_map)),
+        );
+    }
+    push_call_frame("<field_init>")?;
+    let result = run_callee_pooled(init_frame);
+    pop_call_frame();
+    env.borrow_mut().remove(".class_initializer_class");
+    result?;
     Ok(())
 }
 
@@ -3082,13 +3458,14 @@ fn call_plain_object_function(
 ///   4. Invokes the hidden `.class_field_initializer` closure, if present.
 ///   5. Returns the `this` object (or an explicit object returned by the
 ///      constructor).
-fn construct_class_from_plain_object(
-    ctx: &mut DispatchContext,
+pub(super) fn construct_class_from_plain_object_value(
+    global_env: &Rc<RefCell<GlobalEnv>>,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
     class_map: &Rc<RefCell<PropertyMap>>,
     ctor_proto: &JsValue,
     args: CallArgs,
-) -> StatorResult<()> {
+    new_target: JsValue,
+) -> StatorResult<JsValue> {
     let constructor_args = args.clone();
     // 1. Create `this`.
     let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -3100,9 +3477,9 @@ fn construct_class_from_plain_object(
     let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
 
     // 2. Set up callee frame.
-    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
+    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(global_env));
     restore_closure_context(&mut callee_frame, ba);
-    callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
+    callee_frame.new_target = new_target.clone();
 
     // 3. Expose parent constructor as "super" for `super()` calls.
     // A class is "derived" only when it has an `extends` clause; we mark
@@ -3128,6 +3505,15 @@ fn construct_class_from_plain_object(
             .global_env
             .borrow_mut()
             .insert("super".to_string(), parent);
+        // Mark which class's instance-field initializer must run as soon
+        // as `super()` returns in the constructor body.  The super-call
+        // path consumes this marker; if it is still present after the
+        // body completes, super() never ran successfully and we leave
+        // field initialization to the fallback below (step 6).
+        callee_frame.global_env.borrow_mut().insert(
+            ".class_pending_derived_init".to_string(),
+            JsValue::PlainObject(Rc::clone(class_map)),
+        );
         true
     } else {
         callee_frame
@@ -3137,93 +3523,95 @@ fn construct_class_from_plain_object(
         false
     };
 
-    // Helper closure: run the field initializer on the given `this` value.
+    let body_env = Rc::clone(&callee_frame.global_env);
     let new_target = callee_frame.new_target.clone();
-    let run_field_init = |env: &Rc<RefCell<GlobalEnv>>, this: &JsValue| -> StatorResult<()> {
-        if let Some(JsValue::Function(init_ba)) =
-            class_map.borrow().get(".class_field_initializer").cloned()
-        {
-            let mut init_frame =
-                acquire_frame(Rc::clone(&init_ba), vec![this.clone()], Rc::clone(env));
-            restore_closure_context(&mut init_frame, &init_ba);
-            init_frame.new_target = new_target.clone();
-            {
-                let mut globals = init_frame.global_env.borrow_mut();
-                globals.set_this(this.clone());
-                globals.insert(
-                    ".class_initializer_class".to_string(),
-                    JsValue::PlainObject(Rc::clone(class_map)),
-                );
-            }
-            push_call_frame("<field_init>")?;
-            let result = run_callee_pooled(init_frame);
-            pop_call_frame();
-            env.borrow_mut().remove(".class_initializer_class");
-            result?;
-        }
-        Ok(())
-    };
 
     // 4. For base classes, fields are initialized before the constructor
     //    body runs (ES §15.7.14).  For derived classes, field
-    //    initialization is deferred until after the constructor (which
-    //    calls super()) so that `this` is available.
+    //    initialization happens at the point `super()` returns so that
+    //    `this` is available and the field initializers run before the
+    //    rest of the derived constructor body.
     if !is_derived {
-        run_field_init(&ctx.frame.global_env, &this_val)?;
-        ctx.frame.global_cache_invalidate();
+        run_class_field_init(global_env, &this_val, class_map, &new_target)?;
     }
 
     // 5. Run constructor body.
     push_call_frame("<anonymous>")?;
     let result = run_callee_pooled(callee_frame);
     pop_call_frame();
-    ctx.frame.global_cache_invalidate();
     let val = result?;
 
     if is_derived
-        && ctx
-            .frame
-            .global_env
+        && global_env
             .borrow()
             .get_this()
             .is_some_and(|this| *this == JsValue::TheHole)
         && let Some(parent) = class_map.borrow().get("__proto__").cloned()
-        && ctx
-            .frame
-            .global_env
+        && global_env
             .borrow()
             .get("Promise")
             .is_some_and(|promise_ctor| *promise_ctor == parent)
     {
-        ctx.frame.global_env.borrow_mut().set_this(this_val.clone());
+        global_env.borrow_mut().set_this(this_val.clone());
         dispatch_call_value(&parent, constructor_args.into_vec())?;
-        ctx.frame.global_cache_invalidate();
     }
 
-    // 6. For derived classes, run field initializer after the constructor.
+    // 6. Fallback: if the derived field initializer marker is still
+    //    present, `super()` did not run during the constructor body —
+    //    typically an explicit-return-without-super pattern.  Run the
+    //    field initializer on the current `this` if it has been bound
+    //    (e.g., via the Promise subclass shim above).
     if is_derived {
-        // After `super()`, `this` is the constructed value.
-        let derived_this = ctx
-            .frame
-            .global_env
+        let pending = body_env.borrow_mut().remove(".class_pending_derived_init");
+        if pending.is_some() {
+            let derived_this = global_env
+                .borrow()
+                .get_this()
+                .cloned()
+                .unwrap_or(this_val.clone());
+            if !matches!(derived_this, JsValue::TheHole) {
+                run_class_field_init(global_env, &derived_this, class_map, &new_target)?;
+            }
+        }
+    }
+
+    global_env.borrow_mut().remove(".class_pending_this");
+
+    let final_this = if is_derived {
+        global_env
             .borrow()
             .get_this()
             .cloned()
-            .unwrap_or(this_val.clone());
-        run_field_init(&ctx.frame.global_env, &derived_this)?;
-        ctx.frame.global_cache_invalidate();
-    }
-
-    ctx.frame
-        .global_env
-        .borrow_mut()
-        .remove(".class_pending_this");
-
-    // 7. If constructor returns an object, use it; else use `this`.
-    ctx.frame.accumulator = match val {
-        JsValue::PlainObject(_) | JsValue::Object(_) => val,
-        _ => this_val,
+            .filter(|this| !matches!(this, JsValue::TheHole))
+            .unwrap_or_else(|| this_val.clone())
+    } else {
+        this_val
     };
+
+    // 7. If constructor returns an object, use it; else use the bound `this`.
+    Ok(match val {
+        JsValue::PlainObject(_) | JsValue::Object(_) => val,
+        _ => final_this,
+    })
+}
+
+fn construct_class_from_plain_object(
+    ctx: &mut DispatchContext,
+    ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    class_map: &Rc<RefCell<PropertyMap>>,
+    ctor_proto: &JsValue,
+    args: CallArgs,
+    new_target: JsValue,
+) -> StatorResult<()> {
+    ctx.frame.accumulator = construct_class_from_plain_object_value(
+        &ctx.frame.global_env,
+        ba,
+        class_map,
+        ctor_proto,
+        args,
+        new_target,
+    )?;
+    ctx.frame.global_cache_invalidate();
     Ok(())
 }
 
@@ -3320,7 +3708,14 @@ fn handle_construct(
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(format!(
@@ -3364,7 +3759,7 @@ fn handle_construct_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
-    let args = expand_spread_args(raw_args);
+    let args = expand_spread_args(raw_args)?;
     match ctor {
         JsValue::Function(ba) => {
             // Fast path: resolve prototype from cache when available.
@@ -3421,7 +3816,14 @@ fn handle_construct_with_spread(
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -3455,6 +3857,8 @@ fn handle_push_context(
     let old_ctx = ctx.frame.context.take().unwrap_or(JsValue::Undefined);
     ctx.frame.write_reg(v, old_ctx)?;
     ctx.frame.context = Some(ctx.frame.accumulator.cheap_clone());
+    ctx.frame
+        .install_mapped_arguments_aliases_for_current_context();
     Ok(DispatchAction::Continue)
 }
 
@@ -3471,6 +3875,26 @@ fn handle_pop_context(
     } else {
         Some(saved)
     };
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_set_literal_prototype(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
+        return Err(err_bad_operand("SetLiteralPrototype", 0));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let proto = ctx.frame.accumulator.cheap_clone();
+    if matches!(proto, JsValue::Null) || proto.is_object_like() {
+        ordinary_set_prototype_of(&obj, proto)?;
+        if let JsValue::PlainObject(ref map) = obj {
+            invalidate_plain_object_caches(ctx, map);
+        }
+        ctx.frame.global_cache_invalidate();
+    }
+    ctx.frame.accumulator = obj;
     Ok(DispatchAction::Continue)
 }
 
@@ -3540,12 +3964,17 @@ fn handle_sta_context_slot(
     let ctx_val = ctx.frame.read_reg(ctx_v)?.cheap_clone();
     let js_ctx = extract_context(&ctx_val, "StaContextSlot")?;
     let target = walk_context_chain(&js_ctx, depth as u32, "StaContextSlot")?;
-    let mut borrowed = target.borrow_mut();
     let slot = slot_idx as usize;
-    if slot >= borrowed.slots.len() {
-        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    let value = ctx.frame.accumulator.cheap_clone();
+    {
+        let mut borrowed = target.borrow_mut();
+        if slot >= borrowed.slots.len() {
+            borrowed.slots.resize(slot + 1, JsValue::Undefined);
+        }
+        borrowed.slots[slot] = value.cheap_clone();
     }
-    borrowed.slots[slot] = ctx.frame.accumulator.cheap_clone();
+    ctx.frame
+        .sync_mapped_arguments_from_context_slot(&target, slot_idx, &value);
     Ok(DispatchAction::Continue)
 }
 
@@ -3574,6 +4003,62 @@ fn handle_sta_current_context_slot(
     );
     if let JsValue::PlainObject(rc) = old {
         recycle_object_rc(rc);
+    }
+    drop(borrowed);
+    let value = ctx.frame.accumulator.cheap_clone();
+    ctx.frame
+        .sync_mapped_arguments_from_context_slot(&js_ctx, slot_idx, &value);
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_forward_mapped_argument_alias(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(parent_ctx_reg) = *instr.operand(0) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 0));
+    };
+    let Operand::ConstantPoolIdx(parent_slot) = *instr.operand(1) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 1));
+    };
+    let Operand::ConstantPoolIdx(current_slot) = *instr.operand(2) else {
+        return Err(err_bad_operand("ForwardMappedArgumentAlias", 2));
+    };
+    let parent_ctx = ctx.frame.read_reg(parent_ctx_reg)?.cheap_clone();
+    let JsValue::Context(parent_ctx) = parent_ctx else {
+        return Ok(DispatchAction::Continue);
+    };
+    let Some(JsValue::Context(current_ctx)) = ctx.frame.context.as_ref() else {
+        return Ok(DispatchAction::Continue);
+    };
+    let aliases = {
+        let parent_ctx = parent_ctx.borrow();
+        parent_ctx
+            .mapped_argument_aliases
+            .iter()
+            .filter(|alias| alias.slot_index == parent_slot && alias.live.get())
+            .map(|alias| JsContextMappedArgumentAlias {
+                slot_index: current_slot,
+                argument_index: alias.argument_index,
+                object: Rc::clone(&alias.object),
+                live: Rc::clone(&alias.live),
+            })
+            .collect::<Vec<_>>()
+    };
+    if !aliases.is_empty() {
+        for alias in &aliases {
+            register_context_mapped_argument_alias(
+                current_ctx,
+                &alias.object,
+                alias.slot_index,
+                alias.argument_index,
+                &alias.live,
+            );
+        }
+        current_ctx
+            .borrow_mut()
+            .mapped_argument_aliases
+            .extend(aliases);
     }
     Ok(DispatchAction::Continue)
 }
@@ -3688,9 +4173,11 @@ fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult
             // consume_exception_resume returns true on a
             // resume re-execution — skip the pause in that
             // case so the exception can propagate.
-            if dbg.pause_on_exceptions && !dbg.consume_exception_resume() {
+            let resumed_throw = dbg.consume_exception_resume();
+            if dbg.pause_on_exceptions && !dbg.skip_all_pauses() && !resumed_throw {
                 ctx.frame.pc = throw_idx as usize; // back up
-                Some(dbg.on_exception(throw_offset))
+                let snapshot = PauseFrameSnapshot::from_frame(ctx.frame, &ctx.frame.accumulator);
+                dbg.on_exception_with_frame(throw_offset, Some(snapshot))
             } else {
                 None
             }
@@ -4236,6 +4723,14 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
+            if prop_name.as_ref() == "__proto__" {
+                if matches!(val, JsValue::Null) || val.is_object_like() {
+                    ordinary_set_prototype_of(&obj, val)?;
+                    invalidate_plain_object_caches(ctx, map);
+                    ctx.frame.global_cache_invalidate();
+                }
+                return Ok(DispatchAction::Continue);
+            }
             let ic_eligible = slot != u32::MAX;
             if ic_eligible {
                 ic_counters::record_probe(IcTier::Interpreter, IcOp::NamedStore);
@@ -4251,7 +4746,8 @@ fn handle_sta_named_property(
                     && pm.is_writable_by_offset(cached_offset)
                 {
                     drop(pm);
-                    map.borrow_mut().set_by_offset(cached_offset, val);
+                    map.borrow_mut().set_by_offset(cached_offset, val.clone());
+                    sync_global_object_property_store(map, prop_name.as_ref(), val);
                     invalidate_plain_object_caches(ctx, map);
                     ic_counters::record(IcTier::Interpreter, IcOp::NamedStore, IcEvent::Hit);
                     return Ok(DispatchAction::Continue);
@@ -4270,7 +4766,8 @@ fn handle_sta_named_property(
                 if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
                     if pm.is_writable_by_offset(offset) {
                         drop(pm);
-                        map.borrow_mut().set_by_offset(offset, val);
+                        map.borrow_mut().set_by_offset(offset, val.clone());
+                        sync_global_object_property_store(map, prop_name.as_ref(), val);
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
                         if let Some(cache) = &mut ctx.frame.mono_load_cache {
@@ -4377,9 +4874,11 @@ fn handle_sta_named_property(
                 }
             }
             set_function_name_if_missing(&val, &prop_name);
+            let global_sync_value = val.clone();
             let fill_result = map.borrow_mut().try_template_fill(&prop_name, val);
             match fill_result {
                 Ok(offset) => {
+                    sync_global_object_property_store(map, prop_name.as_ref(), global_sync_value);
                     if slot != u32::MAX && offset <= u16::MAX as usize {
                         let receiver_layout = map.borrow().layout_id();
                         ctx.frame.mega_store_ic_mut().update(MegamorphicIcEntry {
@@ -4415,7 +4914,10 @@ fn handle_sta_named_property(
                     }
                     return Ok(DispatchAction::Continue);
                 }
-                Err(val) => map.borrow_mut().insert_rc(Rc::clone(&prop_name), val),
+                Err(val) => {
+                    map.borrow_mut().insert_rc(Rc::clone(&prop_name), val);
+                    sync_global_object_property_store(map, prop_name.as_ref(), global_sync_value);
+                }
             }
             // Populate megamorphic store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -4528,6 +5030,15 @@ fn handle_lda_keyed_property(
             if borrow.get("__typed_array__").is_none() {
                 let key_str = itoa_stack(idx_val as u32);
                 if let Some(val) = borrow.get(key_str.as_str()) {
+                    if borrow.has_accessors
+                        && let Some(getter) = borrow.get_getter_for(key_str.as_str()).cloned()
+                    {
+                        drop(borrow);
+                        let this_obj = JsValue::PlainObject(Rc::clone(map));
+                        ctx.frame.accumulator = dispatch_getter(&getter, &this_obj)?;
+                        ic_counters::record(IcTier::Interpreter, IcOp::IndexedLoad, IcEvent::Hit);
+                        return Ok(DispatchAction::Continue);
+                    }
                     let result = val.resolve_live_binding();
                     drop(borrow);
                     ctx.frame.accumulator = result;
@@ -4569,9 +5080,8 @@ fn handle_sta_keyed_property(
         return Err(err_bad_operand("StaKeyedProperty", 1));
     };
     ic_counters::record_probe(IcTier::Interpreter, IcOp::IndexedStore);
-    // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
-    // Skips setter check, prototype walk, writable check, and string alloc.
-    // Numeric indices on array-like PlainObjects never have setter accessors.
+    // ── Fast path: Smi key — Array first (hot for sieve), then plain data
+    // PlainObject stores that do not need descriptor/accessor semantics.
     if let JsValue::Smi(idx) = ctx.frame.read_reg(key_v)?
         && *idx >= 0
     {
@@ -4579,8 +5089,8 @@ fn handle_sta_keyed_property(
         // Read accumulator before the object register so we don't need
         // Rc::clone — both reads are shared borrows of ctx.frame.
         let val = ctx.frame.accumulator.cheap_clone();
-        let obj_ref = ctx.frame.read_reg(obj_v)?;
-        if let JsValue::Array(items) = obj_ref {
+        let obj_ref = ctx.frame.read_reg(obj_v)?.cheap_clone();
+        if let JsValue::Array(items) = &obj_ref {
             let i = idx_val as usize;
             // SAFETY: single-threaded interpreter; no concurrent borrows
             // possible between the raw deref and the element write.
@@ -4596,26 +5106,36 @@ fn handle_sta_keyed_property(
             }
             ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
             return Ok(DispatchAction::Continue);
-        } else if let JsValue::PlainObject(map) = obj_ref {
-            // SAFETY: single-threaded interpreter; no concurrent borrows.
-            let m = unsafe { &mut *map.as_ptr() };
-            // TypedArray: skip the fast path so integer indices reach the
-            // shared backing buffer via keyed_store, not a wrapper own
-            // property that would shadow the buffer.
-            if m.get("__typed_array__").is_some() {
-                // Fall through to general path.
-            } else {
+        } else if let JsValue::PlainObject(map) = &obj_ref {
+            let fast_key = {
+                // SAFETY: single-threaded interpreter; no concurrent borrows
+                // possible during this scoped raw access. Drop the raw mutable
+                // borrow before notifying mapped-arguments aliases, which can
+                // re-enter the same RefCell through context-slot sync.
+                let m = unsafe { &mut *map.as_ptr() };
                 let key_str = itoa_stack(idx_val as u32);
-                m.insert(key_str.as_str().to_owned(), val);
-                // Update length if needed for array-like objects.
-                let i = idx_val as usize;
-                let cur_len = match m.get("length") {
-                    Some(JsValue::Smi(n)) => *n as usize,
-                    _ => 0,
-                };
-                if i >= cur_len {
-                    m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+                let key_ref = key_str.as_str();
+                if plain_object_index_store_needs_general_path(m, key_ref) {
+                    // Fall through to general path.
+                    None
+                } else {
+                    let key = key_ref.to_owned();
+                    m.insert(key.clone(), val);
+                    if matches!(m.get("__is_array__"), Some(JsValue::Boolean(true))) {
+                        let i = idx_val as usize;
+                        let cur_len = match m.get("length") {
+                            Some(JsValue::Smi(n)) => *n as usize,
+                            _ => 0,
+                        };
+                        if i >= cur_len {
+                            m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
+                        }
+                    }
+                    Some(key)
                 }
+            };
+            if let Some(key) = fast_key {
+                notify_mapped_arguments_property_write(map, &key);
                 ic_counters::record(IcTier::Interpreter, IcOp::IndexedStore, IcEvent::Hit);
                 return Ok(DispatchAction::Continue);
             }
@@ -4746,6 +5266,14 @@ fn handle_sta_keyed_property(
                                 return Ok(DispatchAction::Continue);
                             }
                         }
+                        if pb.contains_key(&key_str) && !pb.is_writable(&key_str) {
+                            if ctx.frame.bytecode_array.is_strict() {
+                                return Err(StatorError::TypeError(format!(
+                                    "Cannot assign to read only property '{key_str}'"
+                                )));
+                            }
+                            return Ok(DispatchAction::Continue);
+                        }
                         proto = pb
                             .get(INTERNAL_PROTO_PROPERTY_KEY)
                             .or_else(|| pb.get("__proto__"))
@@ -4776,7 +5304,20 @@ fn handle_sta_keyed_property(
         }
         drop(pm);
     }
-    keyed_store(&obj, &key, val)?;
+    let mapped_store = if let JsValue::PlainObject(map) = &obj
+        && ctx.frame.is_mapped_arguments_object(map)
+    {
+        let prop_name = to_property_key(&key)?;
+        keyed_store(&obj, &JsValue::String(prop_name.clone().into()), val)?;
+        Some((Rc::clone(map), prop_name))
+    } else {
+        keyed_store(&obj, &key, val)?;
+        None
+    };
+    if let Some((map, key)) = mapped_store {
+        ctx.frame
+            .sync_mapped_parameter_from_arguments_property(&map, &key);
+    }
     // Accumulator stays unchanged.
     Ok(DispatchAction::Continue)
 }
@@ -4810,15 +5351,12 @@ fn handle_get_iterator(
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
         // PlainObject with @@iterator or Symbol.iterator → call it.
         JsValue::PlainObject(ref map) => {
-            let borrow = map.borrow();
-            // Check for both internal @@iterator and user-visible Symbol(SYMBOL_ITERATOR)
-            let iter_fn = borrow.get("@@iterator").cloned().or_else(|| {
-                let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
-                borrow.get(&sym_key).cloned()
-            });
-            drop(borrow);
+            let iter_fn = keyed_load(
+                &iterable,
+                &JsValue::Symbol(crate::builtins::symbol::SYMBOL_ITERATOR),
+            )?;
             match iter_fn {
-                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_)) => {
                     let result = dispatch_call_with_this(f, iterable.clone(), vec![])?;
                     // §7.4.1: result of @@iterator must be an object.
                     match &result {
@@ -4834,7 +5372,7 @@ fn handle_get_iterator(
                         }
                     }
                 }
-                Some(JsValue::PlainObject(ref call_obj))
+                JsValue::PlainObject(ref call_obj)
                     if call_obj.borrow().contains_key("__call__") =>
                 {
                     let result = dispatch_call_with_this(
@@ -4855,19 +5393,19 @@ fn handle_get_iterator(
                         }
                     }
                 }
-                Some(_) => {
-                    return Err(StatorError::TypeError(
-                        "GetIterator: @@iterator is not a function".into(),
-                    ));
-                }
-                None => {
-                    // Fallback: PlainObject with "length" → array-like
+                JsValue::Undefined => {
+                    // Fallback: PlainObject with "length" → array-like.
                     if map.borrow().contains_key("length") {
                         let items = plain_object_to_array_items(map);
                         JsValue::Iterator(NativeIterator::from_items(items))
                     } else {
                         return Err(StatorError::TypeError("object is not iterable".into()));
                     }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetIterator: @@iterator is not a function".into(),
+                    ));
                 }
             }
         }
@@ -4983,18 +5521,16 @@ fn handle_iterator_next(
         JsValue::Generator(gs) => {
             if gs.borrow().bytecode_array.is_async() {
                 let queue = crate::builtins::promise::MicrotaskQueue::new();
-                let result = Interpreter::run_generator_step(&gs, JsValue::Undefined).map(
-                    |step| match step {
-                        GeneratorStep::Yield(v) => super::make_iterator_result(v, false),
-                        GeneratorStep::Return(v) => super::make_iterator_result(v, true),
-                    },
-                )?;
+                let result = Interpreter::async_generator_next(&gs, JsValue::Undefined)?;
                 settle_async_iterator_result(result, &queue)
                     .map_err(super::async_iterator_reason_to_error)?
             } else {
                 match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
                     GeneratorStep::Yield(v) => (v, false),
                     GeneratorStep::Return(v) => (v, true),
+                    GeneratorStep::Await(_) => {
+                        return Err(leaked_internal_await_error("IteratorNext"));
+                    }
                 }
             }
         }
@@ -5222,9 +5758,10 @@ fn handle_copy_data_properties(
 #[cold]
 fn handle_suspend_generator(
     ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let yield_val = ctx.frame.accumulator.cheap_clone();
+    let suspend_id = instr.immediate(3);
 
     // Save state into the attached GeneratorState (if any).
     if let Some(gs_rc) = ctx.frame.generator_state.as_ref() {
@@ -5235,6 +5772,7 @@ fn handle_suspend_generator(
         // ctx.frame.pc was already advanced past this instruction.
         gs.resume_pc = ctx.frame.pc;
         gs.status = GeneratorStatus::SuspendedAtYield;
+        gs.last_suspend_id = (suspend_id >= 0).then_some(suspend_id as u32);
     }
 
     ctx.frame.suspend_result = Some(yield_val.clone());
@@ -5338,8 +5876,15 @@ fn handle_debugger(
     let stmt_offset = ctx.byte_offsets[ctx.frame.pc - 1] as u32;
     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
         let opt = d.borrow();
-        opt.as_ref()
-            .map(|rc| rc.borrow_mut().on_debugger_statement(stmt_offset))
+        opt.as_ref().and_then(|rc| {
+            let mut dbg = rc.borrow_mut();
+            if dbg.skip_all_pauses() {
+                None
+            } else {
+                let snapshot = PauseFrameSnapshot::from_frame(ctx.frame, &ctx.frame.accumulator);
+                dbg.on_debugger_statement_with_frame(stmt_offset, Some(snapshot))
+            }
+        })
     }) {
         return Err(pause_err);
     }
@@ -5747,6 +6292,9 @@ fn handle_create_array_from_iterable(
                         }
                         break;
                     }
+                    GeneratorStep::Await(_) => {
+                        return Err(leaked_internal_await_error("CreateArrayFromIterable"));
+                    }
                 }
             }
             out
@@ -5782,6 +6330,11 @@ fn handle_create_array_from_iterable(
                                         out.push(v);
                                     }
                                     break;
+                                }
+                                GeneratorStep::Await(_) => {
+                                    return Err(leaked_internal_await_error(
+                                        "CreateArrayFromIterable",
+                                    ));
                                 }
                             }
                         }
@@ -6057,25 +6610,17 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.cheap_clone();
 
-    // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
-    let rhs_callable = match &constructor {
-        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
-        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
-        JsValue::Proxy(p) => p.borrow().is_callable(),
-        _ => false,
-    };
-    if !rhs_callable {
+    if !is_js_receiver(&constructor) {
         return Err(StatorError::TypeError(
-            "Right-hand side of 'instanceof' is not callable".to_string(),
+            "Right-hand side of 'instanceof' is not an object".to_string(),
         ));
     }
 
-    // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
+    // §13.10.1 InstanceofOperator — consult @@hasInstance before checking
+    // ordinary RHS callability.
     let has_instance_fn = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
         JsValue::NativeFunction(_) | JsValue::Function(_) => {
-            // Look up @@hasInstance via the prototype chain (e.g.
-            // Function.prototype[@@hasInstance]).
             let v = proto_lookup(&constructor, "@@hasInstance");
             if matches!(v, JsValue::Undefined) {
                 None
@@ -6087,19 +6632,38 @@ fn handle_test_instance_of(
     };
     if let Some(ref hi) = has_instance_fn {
         match hi {
-            JsValue::NativeFunction(f) => {
-                let result = f(vec![ctx.frame.accumulator.cheap_clone()])?;
+            JsValue::NativeFunction(_)
+            | JsValue::Function(_)
+            | JsValue::PlainObject(_)
+            | JsValue::Proxy(_) => {
+                let result = dispatch_call_with_this(
+                    hi,
+                    constructor.clone(),
+                    vec![ctx.frame.accumulator.cheap_clone()],
+                )?;
                 ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
-            JsValue::Function(_) | JsValue::PlainObject(_) => {
-                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.cheap_clone()])?;
-                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
-                return Ok(DispatchAction::Continue);
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Symbol.hasInstance value is not callable".to_string(),
+                ));
             }
-            _ => {}
         }
+    }
+
+    // §7.3.21 OrdinaryHasInstance — without @@hasInstance, RHS must be callable.
+    let rhs_callable = match &constructor {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        JsValue::Proxy(p) => p.borrow().is_callable(),
+        _ => false,
+    };
+    if !rhs_callable {
+        return Err(StatorError::TypeError(
+            "Right-hand side of 'instanceof' is not callable".to_string(),
+        ));
     }
 
     // ── Built-in type checks via constructor identity ──────────────
@@ -6223,8 +6787,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         }
         JsValue::PlainObject(_) => {
             let prop = to_property_key(key)?;
-            // Walk the prototype chain for `in` operator.
-            !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
+            has_property_in_chain(&object, &prop)
         }
         JsValue::Array(items) => {
             // "length" is always present on arrays.
@@ -6308,17 +6871,25 @@ fn handle_for_in_enumerate(
                     // to the actual property name X.
                     if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string().into()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        let raw_inserted = seen.insert(k.clone());
+                        if borrow.is_accessor_property(prop) {
+                            if seen.insert(prop.to_string().into()) && is_enumerable {
+                                all_keys.push(JsValue::String(prop.to_string().into()));
+                            }
+                        } else if raw_inserted && is_enumerable {
+                            all_keys.push(JsValue::String(k.clone()));
                         }
                         continue;
                     }
                     if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string().into()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        let raw_inserted = seen.insert(k.clone());
+                        if borrow.is_accessor_property(prop) {
+                            if seen.insert(prop.to_string().into()) && is_enumerable {
+                                all_keys.push(JsValue::String(prop.to_string().into()));
+                            }
+                        } else if raw_inserted && is_enumerable {
+                            all_keys.push(JsValue::String(k.clone()));
                         }
                         continue;
                     }
@@ -6366,6 +6937,18 @@ fn handle_for_in_enumerate(
 }
 
 fn is_for_in_excluded_key(key: &str) -> bool {
+    if key
+        .strip_prefix("__get_")
+        .and_then(|s| s.strip_suffix("__"))
+        .is_some()
+        || key
+            .strip_prefix("__set_")
+            .and_then(|s| s.strip_suffix("__"))
+            .is_some()
+    {
+        return false;
+    }
+
     (key.starts_with("__") && key.ends_with("__"))
         || crate::builtins::symbol::is_symbol_property_key(key)
         || key.starts_with('.')
@@ -6383,6 +6966,17 @@ fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
             for _ in 0..256 {
                 let Some(m) = current_map.take() else { break };
                 let borrow = m.borrow();
+                if borrow.is_accessor_property(key) {
+                    let getter_key = format!("__get_{key}__");
+                    if let Some((_value, attrs)) = borrow.get_with_attrs(&getter_key) {
+                        return attrs.contains(PropertyAttributes::ENUMERABLE);
+                    }
+                    let setter_key = format!("__set_{key}__");
+                    if let Some((_value, attrs)) = borrow.get_with_attrs(&setter_key) {
+                        return attrs.contains(PropertyAttributes::ENUMERABLE);
+                    }
+                    return false;
+                }
                 if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
                     return attrs.contains(PropertyAttributes::ENUMERABLE);
                 }
@@ -6514,17 +7108,34 @@ fn handle_delete_property_sloppy(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
-    let removed = if let JsValue::Proxy(ref p) = obj {
+    let removed = if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot delete property '{key}' of null or undefined"
+        )));
+    } else if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key)?
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
-        if pm.contains_key(&key) {
+        if let Some(targets) = accessor_delete_targets(&pm, &key) {
+            if targets.iter().any(|target| !pm.is_configurable(target)) {
+                // Non-configurable: silently fail in sloppy mode.
+                false
+            } else {
+                drop(pm);
+                let mut pm = map.borrow_mut();
+                for target in targets {
+                    pm.remove(&target);
+                }
+                true
+            }
+        } else if pm.contains_key(&key) {
             if !pm.is_configurable(&key) {
                 // Non-configurable: silently fail in sloppy mode.
                 false
             } else {
                 drop(pm);
                 map.borrow_mut().remove(&key);
+                sync_global_object_property_delete(map, &key);
                 true
             }
         } else {
@@ -6548,6 +7159,9 @@ fn handle_delete_property_sloppy(
         // Primitives and other object types: delete returns true.
         true
     };
+    if removed && let JsValue::PlainObject(ref map) = obj {
+        notify_mapped_arguments_property_delete(map, &key);
+    }
     ctx.frame.accumulator = JsValue::Boolean(removed);
     Ok(DispatchAction::Continue)
 }
@@ -6561,7 +7175,11 @@ fn handle_delete_property_strict(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
-    if let JsValue::Proxy(ref p) = obj {
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot delete property '{key}' of null or undefined"
+        )));
+    } else if let JsValue::Proxy(ref p) = obj {
         let deleted = proxy_delete_property(&mut p.borrow_mut(), &key)?;
         if !deleted {
             return Err(StatorError::TypeError(format!(
@@ -6570,13 +7188,30 @@ fn handle_delete_property_strict(
         }
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
-        if pm.contains_key(&key) && !pm.is_configurable(&key) {
+        if let Some(targets) = accessor_delete_targets(&pm, &key) {
+            if targets.iter().any(|target| !pm.is_configurable(target)) {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot delete property '{key}' of object"
+                )));
+            }
+            drop(pm);
+            let mut pm = map.borrow_mut();
+            for target in targets {
+                pm.remove(&target);
+            }
+            drop(pm);
+            sync_global_object_property_delete(map, &key);
+            notify_mapped_arguments_property_delete(map, &key);
+        } else if pm.contains_key(&key) && !pm.is_configurable(&key) {
             return Err(StatorError::TypeError(format!(
                 "Cannot delete property '{key}' of object"
             )));
+        } else {
+            drop(pm);
+            map.borrow_mut().remove(&key);
+            sync_global_object_property_delete(map, &key);
+            notify_mapped_arguments_property_delete(map, &key);
         }
-        drop(pm);
-        map.borrow_mut().remove(&key);
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {
             return Err(StatorError::TypeError(
@@ -6612,13 +7247,7 @@ fn handle_create_mapped_arguments(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let args: Vec<JsValue> = ctx
-        .frame
-        .call_args
-        .get(..param_count)
-        .unwrap_or(&[])
-        .to_vec();
+    let args: Vec<JsValue> = ctx.frame.call_args.to_vec();
     let mut map = PropertyMap::new();
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
@@ -6644,7 +7273,11 @@ fn handle_create_mapped_arguments(
             )))
         })),
     );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    let object = Rc::new(RefCell::new(map));
+    let aliases = ctx.frame.bytecode_array.mapped_arguments_aliases().to_vec();
+    ctx.frame
+        .install_mapped_arguments_aliases(Rc::clone(&object), &aliases);
+    ctx.frame.accumulator = JsValue::PlainObject(object);
     Ok(DispatchAction::Continue)
 }
 
@@ -6652,13 +7285,7 @@ fn handle_create_unmapped_arguments(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let args: Vec<JsValue> = ctx
-        .frame
-        .call_args
-        .get(..param_count)
-        .unwrap_or(&[])
-        .to_vec();
+    let args: Vec<JsValue> = ctx.frame.call_args.to_vec();
     let mut map = PropertyMap::new();
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
@@ -6668,14 +7295,14 @@ fn handle_create_unmapped_arguments(
         JsValue::Smi(args.len() as i32),
         PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
     );
-    map.insert(
-        "callee".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
-            Err(StatorError::TypeError(
-                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
-            ))
-        })),
-    );
+    let restricted_callee = JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
+        Err(StatorError::TypeError(
+            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+        ))
+    }));
+    map.insert("__get_callee__".to_string(), restricted_callee.clone());
+    map.insert("__set_callee__".to_string(), restricted_callee);
+    map.mark_accessor_property("callee");
     // @@iterator: array-like iteration support via NativeIterator
     let args_for_iter = args.clone();
     map.insert(
@@ -6708,6 +7335,23 @@ fn handle_throw_reference_error_if_hole(
         )));
     }
     Ok(DispatchAction::Continue)
+}
+
+#[cold]
+fn handle_throw_const_assignment_type_error(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
+        return Err(err_bad_operand("ThrowConstAssignmentTypeError", 0));
+    };
+    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => "<unknown>".to_string(),
+    };
+    Err(StatorError::TypeError(format!(
+        "Assignment to constant variable '{name}'"
+    )))
 }
 
 #[cold]
@@ -7754,7 +8398,14 @@ fn handle_construct_forward_all_args(
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                    construct_class_from_plain_object(
+                        ctx,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        ctor.clone(),
+                    )?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(format!(
@@ -7868,6 +8519,11 @@ fn handle_call_direct_eval(
             }
         };
         let binding_registers = ctx.frame.bytecode_array.binding_registers().clone();
+        let context_bindings = ctx.frame.bytecode_array.context_bindings().clone();
+        let caller_context = match &ctx.frame.context {
+            Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+            _ => None,
+        };
         let original_global_names: HashSet<String> =
             ctx.frame.global_env.borrow().vars.keys().cloned().collect();
         let mut eval_bindings = ctx.frame.global_env.borrow().vars.clone();
@@ -7879,28 +8535,82 @@ fn handle_call_direct_eval(
         for (name, reg) in &binding_registers {
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.cheap_clone());
         }
+        if let Some(context) = &caller_context {
+            let context = context.borrow();
+            for (name, slot) in &context_bindings {
+                if let Some(value) = context.slots.get(*slot as usize) {
+                    eval_bindings.insert(name.clone(), value.cheap_clone());
+                }
+            }
+        }
         let eval_env = Rc::new(RefCell::new(GlobalEnv::with_vars(eval_bindings)));
+        let function_global_env = super::current_function_constructor_global_env()
+            .unwrap_or_else(|| Rc::clone(&ctx.frame.global_env));
         let (result, final_env, is_strict) =
-            crate::builtins::global::global_eval_direct_with_scope_capture(
-                &source,
-                Rc::clone(&eval_env),
-                ctx.frame.context.clone(),
-            )?;
-        let final_bindings = final_env.borrow();
-        for (name, reg) in &binding_registers {
-            if let Some(value) = final_bindings.get(name) {
-                ctx.frame.write_reg(*reg as u32, value.clone())?;
+            with_function_constructor_global_env(function_global_env, || {
+                crate::builtins::global::global_eval_direct_with_scope_capture(
+                    &source,
+                    Rc::clone(&eval_env),
+                    ctx.frame.context.clone(),
+                    ctx.frame.bytecode_array.is_strict(),
+                )
+            })?;
+        let (register_updates, context_updates, global_updates) = {
+            let final_bindings = final_env.borrow();
+            let register_updates: Vec<(u32, JsValue)> = binding_registers
+                .iter()
+                .filter_map(|(name, reg)| {
+                    final_bindings
+                        .get(name)
+                        .map(|value| (*reg as u32, value.clone()))
+                })
+                .collect();
+            let context_updates: Vec<(u32, JsValue)> = context_bindings
+                .iter()
+                .filter_map(|(name, slot)| {
+                    final_bindings.get(name).map(|value| (*slot, value.clone()))
+                })
+                .collect();
+            let global_updates: Vec<(String, JsValue)> = final_bindings
+                .vars
+                .iter()
+                .filter_map(|(name, value)| {
+                    if binding_registers.contains_key(name) || context_bindings.contains_key(name) {
+                        return None;
+                    }
+                    if !is_strict || original_global_names.contains(name) {
+                        Some((name.clone(), value.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (register_updates, context_updates, global_updates)
+        };
+        for (reg, value) in register_updates {
+            ctx.frame.write_reg(reg, value)?;
+        }
+        if let Some(context_rc) = caller_context {
+            let mut applied_context_updates = Vec::with_capacity(context_updates.len());
+            let mut context = context_rc.borrow_mut();
+            for (slot, value) in context_updates {
+                let slot = slot as usize;
+                if slot >= context.slots.len() {
+                    context.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                context.slots[slot] = value.cheap_clone();
+                applied_context_updates.push((slot as u32, value));
+            }
+            drop(context);
+            for (slot, value) in applied_context_updates {
+                ctx.frame
+                    .sync_mapped_arguments_from_context_slot(&context_rc, slot, &value);
             }
         }
         {
             let mut globals = ctx.frame.global_env.borrow_mut();
-            for (name, value) in final_bindings.vars.iter() {
-                if binding_registers.contains_key(name) {
-                    continue;
-                }
-                if !is_strict || original_global_names.contains(name) {
-                    globals.insert(name.clone(), value.clone());
-                }
+            for (name, value) in global_updates {
+                globals.insert(name, value);
             }
         }
         ctx.frame.accumulator = result;
@@ -7909,9 +8619,14 @@ fn handle_call_direct_eval(
         match callee {
             JsValue::Function(ba) => {
                 if ba.is_generator() {
-                    let state = GeneratorState::new(Rc::clone(&ba));
-                    super::init_generator_state_prototype(&state, &ba);
-                    ctx.frame.accumulator = JsValue::Generator(state);
+                    ctx.frame.accumulator =
+                        make_generator_no_receiver_activation(&ba, args, &ctx.frame.global_env);
+                } else if ba.is_async() {
+                    ctx.frame.accumulator = Interpreter::run_async_function_no_receiver(
+                        Rc::clone(&ba),
+                        args,
+                        Rc::clone(&ctx.frame.global_env),
+                    )?;
                 } else {
                     let mut callee_frame =
                         acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
@@ -8113,8 +8828,9 @@ fn handle_define_getter_property(
         } else {
             PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8149,8 +8865,9 @@ fn handle_define_setter_property(
         } else {
             PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8172,11 +8889,17 @@ fn handle_define_keyed_getter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
+            fn_props_set(
+                ba,
+                "name".to_string(),
+                JsValue::String(format!("get {key_str}").into()),
+            );
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8198,11 +8921,17 @@ fn handle_define_keyed_setter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
+            fn_props_set(
+                ba,
+                "name".to_string(),
+                JsValue::String(format!("set {key_str}").into()),
+            );
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8269,8 +8998,9 @@ fn handle_define_class_getter_property(
         } else {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8305,8 +9035,9 @@ fn handle_define_class_setter_property(
         } else {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
         };
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(prop_name);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8353,8 +9084,9 @@ fn handle_define_class_keyed_getter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8379,8 +9111,9 @@ fn handle_define_class_keyed_setter_property(
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
         let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
-        map.borrow_mut()
-            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        let mut borrow = map.borrow_mut();
+        borrow.insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+        borrow.mark_accessor_property(key_str);
     }
     Ok(DispatchAction::Continue)
 }
@@ -8813,6 +9546,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::StaKeyedProperty as usize] = handle_sta_keyed_property;
     table[Opcode::DefineNamedOwnProperty as usize] = handle_define_named_own_property;
     table[Opcode::DefineKeyedOwnProperty as usize] = handle_define_keyed_own_property;
+    table[Opcode::SetLiteralPrototype as usize] = handle_set_literal_prototype;
     table[Opcode::StaInArrayLiteral as usize] = handle_sta_in_array_literal;
     table[Opcode::DefineKeyedOwnPropertyInLiteral as usize] =
         handle_define_keyed_own_property_in_literal;
@@ -8946,6 +9680,8 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::JumpIfJSReceiverConstant as usize] = handle_jump_if_js_receiver_constant;
     table[Opcode::Return as usize] = handle_return;
     table[Opcode::ThrowReferenceErrorIfHole as usize] = handle_throw_reference_error_if_hole;
+    table[Opcode::ThrowConstAssignmentTypeError as usize] =
+        handle_throw_const_assignment_type_error;
     table[Opcode::ThrowSuperNotCalledIfHole as usize] = handle_throw_super_not_called_if_hole;
     table[Opcode::ThrowSuperAlreadyCalledIfNotHole as usize] =
         handle_throw_super_already_called_if_not_hole;
@@ -8972,6 +9708,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::CreateObjectFromIterable as usize] = handle_create_object_from_iterable;
     table[Opcode::PushContext as usize] = handle_push_context;
     table[Opcode::PopContext as usize] = handle_pop_context;
+    table[Opcode::ForwardMappedArgumentAlias as usize] = handle_forward_mapped_argument_alias;
     table[Opcode::ForInEnumerate as usize] = handle_for_in_enumerate;
     table[Opcode::ForInPrepare as usize] = handle_for_in_prepare;
     table[Opcode::ForInNext as usize] = handle_for_in_next;
@@ -9044,7 +9781,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_user_constructor_instanceof() {
         let result = crate::builtins::global::global_eval(
             "function Foo() {} var x = new Foo(); x instanceof Foo",
@@ -9097,7 +9833,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { #bar() { return 42; } test() { return this.#bar(); } } \
@@ -9108,7 +9843,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field() {
         let result = crate::builtins::global::global_eval(
             "class C { #x = 10; get() { return this.#x; } } new C().get()",
@@ -9118,7 +9852,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_private_field_write() {
         let result = crate::builtins::global::global_eval(
             "class C { #x = 0; set(v) { this.#x = v; } get() { return this.#x; } } \
@@ -9767,6 +10500,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn e2e_inherited_non_writable_index_store_does_not_create_own_property() {
+        let result = crate::builtins::global::global_eval(
+            "var p = {}; \
+             Object.defineProperty(p, '0', { value: 1, writable: false }); \
+             var o = Object.create(p); \
+             o[0] = 2; \
+             o[0] + ':' + Object.prototype.hasOwnProperty.call(o, '0')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1:false".into()));
+    }
+
+    #[test]
+    fn e2e_inherited_non_writable_index_store_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; \
+             var p = {}; \
+             Object.defineProperty(p, '0', { value: 1, writable: false }); \
+             var o = Object.create(p); \
+             o[0] = 2;",
+        );
+        assert!(result.is_err());
+    }
+
     /// preventExtensions: new property in sloppy mode silently fails.
     #[test]
     fn e2e_prevent_extensions_sloppy_new_prop() {
@@ -9825,6 +10583,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_delete_configurable_accessor_removes_backing_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var before = Object.keys(o).join(','); \
+             var deleted = delete o.x; \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             before + '|' + deleted + '|' + (desc === undefined) + '|' + (o.x === undefined)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x|true|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_delete_missing_property_preserves_accessor_shaped_user_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             var before = '__get_x__' in o; \
+             var deleted = delete o.x; \
+             var after = '__get_x__' in o; \
+             '' + before + '|' + deleted + '|' + after + '|' + o.__get_x__",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|true|true|1".into()));
+    }
+
+    #[test]
+    fn e2e_accessor_shaped_user_key_does_not_create_accessor_property() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = function() { return 3; }; \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + (o.x === undefined) + '|' + (desc === undefined) + '|' + (typeof o.__get_x__)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|true|function".into()));
+    }
+
+    #[test]
+    fn e2e_define_property_data_preserves_accessor_shaped_user_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             Object.defineProperty(o, 'x', { value: 2, configurable: true }); \
+             '' + ('__get_x__' in o) + '|' + o.__get_x__ + '|' + o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|1|2".into()));
+    }
+
+    #[test]
+    fn e2e_accessor_shaped_user_keys_do_not_enumerate_as_accessor_names() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__get_x__ = 1; \
+             o.__set_y__ = 2; \
+             var own = Reflect.ownKeys(o).join(','); \
+             var names = Object.getOwnPropertyNames(o).join(','); \
+             var iter = ''; \
+             for (var k in o) { iter += k + ','; } \
+             [own, names, iter, own.split(',').indexOf('x'), own.split(',').indexOf('y'), names.split(',').indexOf('x'), names.split(',').indexOf('y'), iter.split(',').indexOf('x'), iter.split(',').indexOf('y')].join('|')",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(
+                "__get_x__,__set_y__|__get_x__,__set_y__|__get_x__,__set_y__,|-1|-1|-1|-1|-1|-1"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn e2e_marked_accessors_enumerate_as_canonical_names() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var own = Reflect.ownKeys(o).join(','); \
+             var names = Object.getOwnPropertyNames(o).join(','); \
+             [own, names].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x|x".into()));
+    }
+
+    #[test]
+    fn e2e_object_literal_accessors_are_marked() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { get x() { return 1; }, set y(v) { this.z = v; } }; \
+             o.y = 5; \
+             [o.x, o.z, Reflect.ownKeys(o).indexOf('x') !== -1, Reflect.ownKeys(o).indexOf('y') !== -1].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1|5|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_class_accessors_are_marked() {
+        let result = crate::builtins::global::global_eval(
+            "class C { get x() { return 2; } set y(v) { this.z = v; } } \
+             var o = new C(); \
+             o.y = 7; \
+             [o.x, o.z, Reflect.ownKeys(C.prototype).indexOf('x') !== -1, Reflect.ownKeys(C.prototype).indexOf('y') !== -1].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2|7|true|true".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_set_does_not_call_accessor_shaped_user_key() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             var called = false; \
+             o.__set_x__ = function(v) { called = true; }; \
+             var ok = Reflect.set(o, 'x', 7); \
+             [ok, called, o.x].join('|')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true|false|7".into()));
+    }
+
+    #[test]
+    fn e2e_delete_non_configurable_accessor_rejects_backing_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             var sloppy = delete o.x; \
+             var strict = (function() { 'use strict'; try { delete o.x; return 'no error'; } catch (e) { return 'threw'; } })(); \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + sloppy + '|' + strict + '|' + desc.configurable + '|' + o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false|threw|false|1".into()));
     }
 
     /// Object.freeze makes properties non-writable AND non-configurable.
@@ -9985,7 +10880,6 @@ mod tests {
 
     /// Spread in array literal
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_spread_in_array_literal() {
         let result =
             crate::builtins::global::global_eval("var a = [1,2,3]; [...a].length").unwrap();
@@ -10109,7 +11003,6 @@ mod tests {
 
     /// Class basic
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_basic_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { bar() { return 42; } } new Foo().bar()",
@@ -10280,7 +11173,6 @@ mod tests {
     /// prototype chain.
     // NOTE: for-in prototype chain enumeration not yet fully implemented
     #[test]
-    #[ignore]
     fn test_for_in_prototype_chain() {
         let result = crate::builtins::global::global_eval(
             "function Base() {} \
@@ -10393,7 +11285,6 @@ mod tests {
 
     /// Static methods should be accessible on the class constructor.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static bar() { return 99; } } Foo.bar()",
@@ -10404,7 +11295,6 @@ mod tests {
 
     /// Class expression (not just declaration).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_expression() {
         let result = crate::builtins::global::global_eval(
             "var Foo = class { greet() { return 7; } }; new Foo().greet()",
@@ -10415,7 +11305,6 @@ mod tests {
 
     /// Class with computed property name in method.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_property_name() {
         let result = crate::builtins::global::global_eval(
             "var name = 'greet'; \
@@ -10456,7 +11345,6 @@ mod tests {
 
     /// super.method() in a derived class.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_super_method_call() {
         let result = crate::builtins::global::global_eval(
             "class Base { value() { return 10; } } \
@@ -10469,7 +11357,6 @@ mod tests {
 
     /// Class inheritance — instanceof works for subclass.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_inheritance_instanceof() {
         let result = crate::builtins::global::global_eval(
             "class Base {} class Child extends Base {} \
@@ -10480,14 +11367,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_inheritance_prototype_chain() {
         let result = crate::builtins::global::global_eval(
             "class Foo {} \
              class Bar extends Foo {} \
              (Bar.__proto__ === Foo) && \
              (Bar.prototype.__proto__ === Foo.prototype) && \
-             !(Bar.prototype instanceof Foo) && \
+             (Bar.prototype instanceof Foo) && \
              (new Bar() instanceof Foo)",
         )
         .unwrap();
@@ -10519,7 +11405,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_this_identity_matches_class() {
         assert_eval_true("class C { static ok = false; static { this.ok = this === C; } } C.ok");
     }
@@ -10584,7 +11469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_super_calls_parent_static_method() {
         assert_eval_true(
             "class A { static value() { return 40; } } class B extends A { static result = 0; static { this.result = super.value() + 2; } } B.result === 42",
@@ -10592,7 +11476,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_super_uses_current_class_as_receiver() {
         assert_eval_true(
             "class A { static who() { return this.name; } } class B extends A { static result = ''; static { this.result = super.who(); } } B.result === 'B'",
@@ -10600,7 +11483,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_field_super_calls_parent_static_method() {
         assert_eval_true(
             "class A { static value() { return 5; } } class B extends A { static x = super.value() + 1; } B.x === 6",
@@ -10608,7 +11490,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_field_super_uses_current_class_as_receiver() {
         assert_eval_true(
             "class A { static who() { return this.name; } } class B extends A { static value = super.who(); } B.value === 'B'",
@@ -10642,7 +11523,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_static_block_sees_class_expression_name() {
         assert_eval_true(
             "var value = class C { static { this.ok = C === this; } }; value.ok === true",
@@ -10671,15 +11551,97 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_fields_run_after_super_in_derived_constructor() {
         assert_eval_true(
             "class A { constructor() { this.log = ['base']; } } class B extends A { x = this.log.push('field'); constructor() { super(); this.log.push('ctor'); } } new B().log.join(',') === 'base,field,ctor'",
         );
     }
 
+    /// Field initializers in a 3-level derived chain run at each level
+    /// immediately after that level's `super()` returns, in correct order
+    /// (ES §15.7.14): grandparent body → parent field → parent ctor body →
+    /// child field → child ctor body.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    fn test_class_instance_fields_run_after_super_in_nested_derived_chain() {
+        assert_eval_true(
+            "class A { constructor() { this.log = ['A']; } } \
+             class B extends A { bf = this.log.push('Bf'); constructor() { super(); this.log.push('Bc'); } } \
+             class C extends B { cf = this.log.push('Cf'); constructor() { super(); this.log.push('Cc'); } } \
+             new C().log.join(',') === 'A,Bf,Bc,Cf,Cc'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_run_on_object_returned_from_super() {
+        assert_eval_true(
+            "class A { constructor() { return { log: [] }; } } \
+             class B extends A { field = this.log.push('field'); constructor() { super(); this.log.push('body'); } } \
+             new B().log.join(',') === 'field,body'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_survive_native_super_reentrant_construction() {
+        assert_eval_true(
+            "var log = []; \
+             class Outer extends Promise { \
+                 field = log.push('outer-field'); \
+                 constructor() { \
+                     super(function(resolve) { \
+                         class InnerBase { constructor() {} } \
+                         class Inner extends InnerBase { field = log.push('inner-field'); constructor() { super(); log.push('inner-body'); } } \
+                         new Inner(); \
+                         resolve(); \
+                     }); \
+                     log.push('outer-body'); \
+                 } \
+             } \
+             new Outer(); \
+             log.join(',') === 'inner-field,inner-body,outer-field,outer-body'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_retry_after_throwing_super() {
+        assert_eval_true(
+            "class A { \
+                 constructor(flag) { \
+                     if (flag) { this.leak = 'bad'; throw 1; } \
+                     this.log = ['base']; \
+                 } \
+             } \
+             class B extends A { \
+                 x = this.log.push('field'); \
+                 constructor() { \
+                     try { super(true); } catch (e) {} \
+                     super(false); \
+                     this.log.push('body'); \
+                 } \
+             } \
+             var b = new B(); \
+             b.log.join(',') === 'base,field,body' && b.leak === undefined",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_field_throw_keeps_successful_super_this() {
+        assert_eval_true(
+            "var ok = false; var secondSuperRejected = false; \
+             class A { constructor() { this.ready = true; } } \
+             class B extends A { \
+                 x = (function() { throw 1; })(); \
+                 constructor() { \
+                     try { super(); } catch (e) { \
+                         ok = this.ready === true; \
+                         try { super(); } catch (again) { secondSuperRejected = true; } \
+                     } \
+                 } \
+             } \
+             new B(); ok && secondSuperRejected",
+        );
+    }
+
+    #[test]
     fn test_class_instance_computed_field_name_evaluates_once() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 1",
@@ -10687,7 +11649,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_follow_source_order() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; [key('b')] = 2; } new C(); new C(); log.join(',') === 'a,b'",
@@ -10695,7 +11656,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_interleave_with_static_blocks() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static { log.push('b'); } [key('c')] = 2; } log.join(',') === 'a,b,c'",
@@ -10703,7 +11663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_interleave_with_static_fields() {
         assert_eval_true(
             "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static x = log.push('b'); [key('c')] = 2; } log.join(',') === 'a,b,c'",
@@ -10711,7 +11670,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_cached_for_multiple_fields() {
         assert_eval_true(
             "var idx = 0; function key() { idx++; return 'k' + idx; } class C { [key()] = 1; [key()] = 2; } var o = new C(); idx === 2 && o.k1 === 1 && o.k2 === 2",
@@ -10719,7 +11677,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_cached_across_instances() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } var value = 0; class C { [key()] = ++value; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 2",
@@ -10727,7 +11684,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_only_run_once_for_derived_class() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class A {} class B extends A { [key()] = 1; } new B(); new B(); count === 1",
@@ -10735,7 +11691,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_name_with_this_based_initializer() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { y = 2; [key()] = this.y + 1; } var o = new C(); count === 1 && o.x === 3",
@@ -10743,7 +11698,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_instance_computed_field_names_are_defined_on_each_instance() {
         assert_eval_true(
             "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.hasOwnProperty('x') && b.hasOwnProperty('x')",
@@ -10853,7 +11807,6 @@ mod tests {
 
     /// 6. `new.target` preserved through multiple inheritance levels.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_three_level_inheritance() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
@@ -10985,7 +11938,6 @@ mod tests {
 
     /// 17. `Reflect.construct` sets prototype from `newTarget`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_reflect_construct_prototype_from_new_target() {
         let r = crate::builtins::global::global_eval(
             "function A() {} \
@@ -11070,7 +12022,6 @@ mod tests {
 
     /// 24. `new.target` in a method is `undefined`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_in_method_undefined() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
@@ -11126,7 +12077,6 @@ mod tests {
 
     /// 29. `new.target` in arrow inside method → `undefined`.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_arrow_in_method_undefined() {
         let r = crate::builtins::global::global_eval(
             "var nt; \
@@ -11139,7 +12089,6 @@ mod tests {
 
     /// 30. Conditional based on `new.target` (abstract class pattern).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_new_target_abstract_class_pattern() {
         let r = crate::builtins::global::global_eval(
             "class Abstract { \
@@ -11786,7 +12735,6 @@ mod tests {
 
     /// Spread string into array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_string_into_array() {
         let result =
             crate::builtins::global::global_eval("var a = [...'abc']; a.join('-')").unwrap();
@@ -11826,7 +12774,6 @@ mod tests {
 
     /// Spread generator into array.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_generator_into_array() {
         let result = crate::builtins::global::global_eval(
             "function* gen() { yield 1; yield 2; yield 3; } var a = [...gen()]; a.join(',')",
@@ -11895,7 +12842,6 @@ mod tests {
 
     /// arguments object is iterable with for-of.
     #[test]
-    #[ignore] // TODO: arguments @@iterator not fully supported
     fn e2e_for_of_arguments() {
         let result = crate::builtins::global::global_eval(
             "function f() { var r = 0; for (var x of arguments) r += x; return r; } f(1,2,3)",
@@ -11906,7 +12852,6 @@ mod tests {
 
     /// Spread arguments object.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_spread_arguments() {
         let result = crate::builtins::global::global_eval(
             "function f() { return [...arguments].join('-'); } f('a','b','c')",
@@ -11949,7 +12894,6 @@ mod tests {
 
     /// for-in integer indices appear first in ascending order.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_for_in_integer_order() {
         let result = crate::builtins::global::global_eval(
             "var o = {}; o.z = 1; o['10'] = 2; o['2'] = 3; o.a = 4; \
@@ -12131,7 +13075,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_custom_has_instance() {
         let result = crate::builtins::global::global_eval(
             "var obj = { [Symbol.hasInstance](v) { return v === 42; } }; 42 instanceof obj",
@@ -12141,7 +13084,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_instanceof_class_symbol_has_instance_true() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static [Symbol.hasInstance](x) { return x === 1; } } 1 instanceof Foo",
@@ -12242,7 +13184,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_error_subclass_prototype_chain() {
         // TypeError.prototype should inherit from Error.prototype.
         let result = crate::builtins::global::global_eval(
@@ -12344,7 +13285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arrow arguments object regression
     fn e2e_arrow_no_own_arguments() {
         // Arrow functions do NOT have their own `arguments` object.
         let result = crate::builtins::global::global_eval(
@@ -12355,7 +13295,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arrow arguments object regression
     fn e2e_arrow_inherits_outer_arguments() {
         // Arrow should read enclosing function's arguments.
         let result = crate::builtins::global::global_eval(
@@ -12363,6 +13302,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_arrow_arguments_ignore_call_time_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function outer(){ var f = () => arguments[0] + ':' + arguments.length; return f; } \
+             outer('outer', 'x')('inner')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("outer:2".into()));
+    }
+
+    #[test]
+    fn e2e_nested_arrow_inherits_outer_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function wrap(a){ return (() => (() => arguments[0])); } wrap(41)()()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(41));
     }
 
     #[test]
@@ -12477,7 +13435,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: bind + call this override regression
     fn e2e_bind_subsequent_call_doesnt_change_this() {
         // .bind() creates a bound function; subsequent .call() doesn't override.
         let result = crate::builtins::global::global_eval(
@@ -12522,7 +13479,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_closure_survives_after_return() {
         let result = crate::builtins::global::global_eval(
             "function counter() { var n = 0; return function() { n = n + 1; return n; }; } \
@@ -12547,7 +13503,6 @@ mod tests {
     // ── arguments object ────────────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: arguments object regression
     fn e2e_arguments_length() {
         let result = crate::builtins::global::global_eval(
             "function f() { return arguments.length; } f(1,2,3)",
@@ -12557,7 +13512,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arguments object regression
     fn e2e_arguments_indexed_access() {
         let result = crate::builtins::global::global_eval(
             "function f() { return arguments[0] + arguments[1]; } f(10, 20)",
@@ -12576,7 +13530,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: arguments @@iterator not fully supported
     fn e2e_arguments_iterable() {
         let result = crate::builtins::global::global_eval(
             "function f() { var r = ''; for (var x of arguments) r += x + ','; return r; } \
@@ -12751,7 +13704,6 @@ mod tests {
     // ── Object literal __proto__ ────────────────────────────────────────
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_in_literal() {
         let result = crate::builtins::global::global_eval(
             "var base = {greet() { return 'hello'; }};\
@@ -12763,7 +13715,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn e2e_proto_inherited_property() {
         let result = crate::builtins::global::global_eval(
             "var parent = {x: 100};\

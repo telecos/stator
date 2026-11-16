@@ -89,6 +89,24 @@ pub struct HandlerTableEntry {
     pub is_finally: bool,
 }
 
+/// Runtime storage location for a sloppy mapped-arguments alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappedArgumentTarget {
+    /// The alias targets the formal parameter register at the given flat index.
+    Register(u32),
+    /// The alias targets a slot in the current function context.
+    CurrentContextSlot(u32),
+}
+
+/// Immutable bytecode metadata for one sloppy mapped-arguments alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedArgumentAlias {
+    /// Canonical `arguments[index]` property that participates in aliasing.
+    pub argument_index: u32,
+    /// Parameter storage location that remains aliased until delete succeeds.
+    pub target: MappedArgumentTarget,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConstantPoolEntry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,6 +171,19 @@ impl SourcePosition {
             column,
         }
     }
+}
+
+/// Classification for a generator suspension point.
+///
+/// User-visible `yield` suspensions must resolve generator `.next()` calls,
+/// while internal `await` suspensions in async generators must resume after the
+/// awaited value settles without leaking an iterator result to user code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendKind {
+    /// A user-visible generator `yield` or delegated `yield*` suspension.
+    Yield,
+    /// An internal `await` suspension.
+    Await,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -449,14 +480,20 @@ struct SharedBytecodeTemplate {
     source_text: Option<Rc<str>>,
     /// Visible binding-to-register mapping for direct `eval()`.
     binding_registers: Rc<HashMap<String, i32>>,
+    /// Captured local binding-to-context-slot mapping for direct `eval()`.
+    context_bindings: Rc<HashMap<String, u32>>,
     /// Sparse mapping from bytecode offsets to source locations.
     source_positions: Rc<[SourcePosition]>,
+    /// Sloppy mapped-arguments aliases compiled for this function.
+    mapped_arguments_aliases: Rc<[MappedArgumentAlias]>,
     /// Compile-time description of all inline-cache feedback slots.
     feedback_metadata: Rc<FeedbackMetadata>,
     /// Runtime inline-cache feedback shared by all clones of this function.
     feedback_vector: SharedFeedbackVector,
     /// Per-function exception handler table (pre-peephole instruction indices).
     handler_table: Rc<Vec<HandlerTableEntry>>,
+    /// Suspension metadata keyed by the `SuspendGenerator` suspend id.
+    suspend_kinds: Rc<[SuspendKind]>,
     /// Lazily-populated remapped handler table (post-peephole instruction
     /// indices).
     handler_table_remapped: Rc<OnceCell<Rc<Vec<HandlerTableEntry>>>>,
@@ -613,9 +650,12 @@ impl PartialEq for BytecodeArray {
             && self.inner.function_name == other.inner.function_name
             && self.inner.source_text == other.inner.source_text
             && self.inner.binding_registers == other.inner.binding_registers
+            && self.inner.context_bindings == other.inner.context_bindings
             && self.inner.source_positions == other.inner.source_positions
+            && self.inner.mapped_arguments_aliases == other.inner.mapped_arguments_aliases
             && self.inner.feedback_metadata == other.inner.feedback_metadata
             && self.inner.handler_table == other.inner.handler_table
+            && self.inner.suspend_kinds == other.inner.suspend_kinds
             && self.inner.is_generator == other.inner.is_generator
             && self.inner.is_async == other.inner.is_async
             && self.inner.is_module == other.inner.is_module
@@ -661,10 +701,13 @@ impl BytecodeArray {
                 function_name: Rc::from(""),
                 source_text: None,
                 binding_registers: Rc::new(HashMap::new()),
+                context_bindings: Rc::new(HashMap::new()),
                 source_positions: source_positions.into(),
+                mapped_arguments_aliases: Rc::from([]),
                 feedback_metadata: Rc::new(feedback_metadata),
                 feedback_vector: Rc::new(RefCell::new(feedback_vector)),
                 handler_table: Rc::new(handler_table),
+                suspend_kinds: Rc::from([]),
                 handler_table_remapped: Rc::new(OnceCell::new()),
                 cached_decode: Rc::new(OnceCell::new()),
                 fusion_pattern_cache: Rc::new(OnceCell::new()),
@@ -732,6 +775,31 @@ impl BytecodeArray {
     #[cfg(test)]
     pub(crate) fn template_cache_len(&self) -> usize {
         self.inner.template_cache.borrow().len()
+    }
+
+    /// Attach suspension metadata keyed by `SuspendGenerator` suspend id.
+    pub fn with_suspend_kinds(mut self, suspend_kinds: Vec<SuspendKind>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_suspend_kinds called after sharing")
+            .suspend_kinds = suspend_kinds.into();
+        self
+    }
+
+    /// Return the kind recorded for a generator suspension id.
+    ///
+    /// Missing metadata is treated as [`SuspendKind::Yield`] to preserve legacy
+    /// bytecode behavior for old callers and hand-built bytecode in tests.
+    pub fn suspend_kind(&self, suspend_id: u32) -> SuspendKind {
+        self.inner
+            .suspend_kinds
+            .get(suspend_id as usize)
+            .copied()
+            .unwrap_or(SuspendKind::Yield)
+    }
+
+    /// Return all recorded suspension kinds.
+    pub fn suspend_kinds(&self) -> &[SuspendKind] {
+        &self.inner.suspend_kinds
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.
@@ -950,6 +1018,11 @@ impl BytecodeArray {
     /// `[[Construct]]` calls.
     pub fn set_construct_proto_cache(&self, proto: crate::objects::value::JsValue) {
         *self.inner.construct_proto_cache.borrow_mut() = Some(proto);
+    }
+
+    /// Clears the cached constructor `.prototype` value after mutation.
+    pub fn clear_construct_proto_cache(&self) {
+        *self.inner.construct_proto_cache.borrow_mut() = None;
     }
 
     /// Returns a clone of the cached construct boilerplate, if populated.
@@ -1394,6 +1467,11 @@ impl BytecodeArray {
         &self.inner.binding_registers
     }
 
+    /// Captured local binding-to-context-slot mapping for direct `eval()`.
+    pub fn context_bindings(&self) -> &HashMap<String, u32> {
+        &self.inner.context_bindings
+    }
+
     /// Set the binding-to-register mapping used by direct `eval()`.
     pub fn with_binding_registers(mut self, binding_registers: HashMap<String, i32>) -> Self {
         Rc::get_mut(&mut self.inner)
@@ -1402,9 +1480,30 @@ impl BytecodeArray {
         self
     }
 
+    /// Set the captured binding-to-context-slot mapping used by direct `eval()`.
+    pub fn with_context_bindings(mut self, context_bindings: HashMap<String, u32>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_context_bindings called after sharing")
+            .context_bindings = Rc::new(context_bindings);
+        self
+    }
+
     /// The source-position table (may be empty if debug info was stripped).
     pub fn source_positions(&self) -> &[SourcePosition] {
         &self.inner.source_positions
+    }
+
+    /// Sloppy mapped-arguments alias metadata for this function.
+    pub fn mapped_arguments_aliases(&self) -> &[MappedArgumentAlias] {
+        &self.inner.mapped_arguments_aliases
+    }
+
+    /// Set sloppy mapped-arguments alias metadata for this function.
+    pub fn with_mapped_arguments_aliases(mut self, aliases: Vec<MappedArgumentAlias>) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("with_mapped_arguments_aliases called after sharing")
+            .mapped_arguments_aliases = aliases.into();
+        self
     }
 
     /// The compile-time feedback metadata for all inline-cache slots.
@@ -1470,6 +1569,23 @@ impl BytecodeArray {
     /// Returns an error if the byte stream is malformed.
     pub fn instructions(&self) -> StatorResult<Vec<Instruction>> {
         bytecodes::decode(&self.inner.bytecodes)
+    }
+
+    /// Return whether this bytecode stream contains a tail-call opcode.
+    ///
+    /// Tail-call bytecode is currently interpreter-only. If decoding fails,
+    /// report `true` so tiering paths conservatively avoid compiling unknown
+    /// bytecode.
+    #[must_use]
+    pub fn contains_tail_call(&self) -> bool {
+        self.decoded_instructions()
+            .map(|decoded| {
+                decoded
+                    .0
+                    .iter()
+                    .any(|instruction| instruction.opcode == bytecodes::Opcode::TailCall)
+            })
+            .unwrap_or(true)
     }
 
     fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<DecodedBytecode>> {
@@ -2028,6 +2144,33 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_tail_call_detects_tail_call_opcode() {
+        let tail_call = BytecodeArray::new(
+            encode(&[
+                Instruction::new_unchecked(
+                    Opcode::TailCall,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::RegisterCount(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ]),
+            vec![],
+            2,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+
+        assert!(!make_simple_array().contains_tail_call());
+        assert!(tail_call.contains_tail_call());
+    }
+
+    #[test]
     fn test_constant_pool() {
         let instructions = vec![
             Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
@@ -2162,14 +2305,9 @@ mod tests {
 
     #[test]
     fn test_decoded_instructions_are_cached() {
-        let mut array = make_simple_array();
+        let array = make_simple_array();
 
-        // Decode fresh to compare against cached version.
-        let expected_offsets = bytecodes::decode_with_byte_offsets(array.bytecodes())
-            .expect("valid bytecode")
-            .1;
-
-        // First call populates the cache (uses &mut self).
+        // First call populates the cache.
         // The peephole optimizer fuses LdaSmi+Star into LdaSmiStar, yielding
         // two instructions instead of three.
         {
@@ -2220,7 +2358,7 @@ mod tests {
 
     #[test]
     fn test_decoded_instructions_cache_includes_jump_targets() {
-        let mut array = make_jump_array();
+        let array = make_jump_array();
 
         let (instructions, _offsets, jump_targets) =
             array.decoded_instructions().expect("valid bytecode");
@@ -2254,7 +2392,7 @@ mod tests {
         *resolved[4].operand_mut(0) =
             Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
-        let mut array = BytecodeArray::new(
+        let array = BytecodeArray::new(
             encode(&resolved),
             vec![],
             4,
