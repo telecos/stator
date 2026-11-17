@@ -17086,6 +17086,10 @@ mod tests {
     /// last slot, and the per-site stride keeps the codegen and the
     /// helper in lock-step.  Drift here would silently corrupt cache
     /// state at every named-IC site.
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn named_ic_layout_constants_are_consistent() {
         use super::jit_runtime::{NAMED_IC_HIT_SLOT_INDEX, NAMED_IC_SLOT_COUNT};

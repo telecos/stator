@@ -24007,6 +24007,10 @@ mod tests {
         let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         let (count_before, bytes_before) = jit_stats();
 
         // Call enough times to cross the tiering threshold and trigger JIT.
@@ -24412,7 +24416,6 @@ mod tests {
     /// polls for the Maglev cache to be populated, asserting the correct result.
     #[test]
     fn test_maglev_compiled_after_threshold() {
-        use super::maglev_stats;
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
 
         let add_ba = make_add_bytecode();
@@ -24489,7 +24492,7 @@ mod tests {
             assert_eq!(result, JsValue::Smi(3), "Maglev add(1, 2) must return 3");
 
             // Maglev stats must have been incremented.
-            let (maglev_count, _maglev_bytes) = maglev_stats();
+            let (maglev_count, _maglev_bytes) = super::maglev_stats();
             assert!(
                 maglev_count > 0,
                 "maglev_stats count must be > 0 after Maglev compilation"
