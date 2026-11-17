@@ -88,7 +88,7 @@ jobs:
           components: miri, rust-src
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -96,7 +96,7 @@ jobs:
             ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-${{ hashFiles('**/Cargo.lock') }}
@@ -104,7 +104,7 @@ jobs:
             ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-
 
       - name: Cache Miri build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target/miri
           key: ${{ runner.os }}-miri-target-${{ matrix.target }}-${{ steps.toolchain.outputs.rustc-version }}-${{ hashFiles('**/Cargo.lock') }}
