@@ -544,9 +544,8 @@ struct SharedBytecodeTemplate {
     jit_maglev_deopt_count: Rc<Cell<u32>>,
     /// Invocation count at which Maglev should next be attempted after a deopt.
     maglev_next_try_at: Rc<Cell<u32>>,
-    /// `true` if this function's bytecode writes to any captured closure
-    /// variable (via `StaContextSlot` or `StaCurrentContextSlot`).
-    writes_closure_vars: bool,
+    /// `true` if this function's bytecode accesses captured closure variables.
+    uses_closure_vars: bool,
     /// Register index for the named function expression self-reference.
     self_name_register: Option<i32>,
     // ─── Constructor fast-path caches (shared across clones via Rc) ──────
@@ -663,7 +662,7 @@ impl PartialEq for BytecodeArray {
             && self.inner.is_arrow == other.inner.is_arrow
             && self.inner.is_top_level == other.inner.is_top_level
             && self.inner.self_name_register == other.inner.self_name_register
-            && self.inner.writes_closure_vars == other.inner.writes_closure_vars
+            && self.inner.uses_closure_vars == other.inner.uses_closure_vars
     }
 }
 
@@ -732,7 +731,7 @@ impl BytecodeArray {
                 jit_baseline_deopted: Rc::new(Cell::new(false)),
                 jit_maglev_deopt_count: Rc::new(Cell::new(0)),
                 maglev_next_try_at: Rc::new(Cell::new(0)),
-                writes_closure_vars: false,
+                uses_closure_vars: false,
                 self_name_register: None,
                 construct_proto_cache: Rc::new(RefCell::new(None)),
                 construct_boilerplate: Rc::new(RefCell::new(None)),
@@ -952,10 +951,10 @@ impl BytecodeArray {
         self.closure_context = Some(ctx);
     }
 
-    /// Returns `true` if this function's bytecode writes to any captured
-    /// closure variable.
-    pub fn writes_closure_vars(&self) -> bool {
-        self.inner.writes_closure_vars
+    /// Returns `true` if this function's bytecode accesses captured closure
+    /// variables.
+    pub fn uses_closure_vars(&self) -> bool {
+        self.inner.uses_closure_vars
     }
 
     /// Returns `true` if `fn_props_set` has been called on this bytecode
@@ -972,11 +971,11 @@ impl BytecodeArray {
         self.has_fn_props.set(true);
     }
 
-    /// Mark whether this function writes to captured closure variables.
-    pub fn with_writes_closure_vars(mut self, flag: bool) -> Self {
+    /// Mark whether this function accesses captured closure variables.
+    pub fn with_uses_closure_vars(mut self, flag: bool) -> Self {
         Rc::get_mut(&mut self.inner)
-            .expect("with_writes_closure_vars called after sharing")
-            .writes_closure_vars = flag;
+            .expect("with_uses_closure_vars called after sharing")
+            .uses_closure_vars = flag;
         self
     }
 

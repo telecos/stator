@@ -1899,6 +1899,9 @@ pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
             }
         }
         JitTier::Maglev => {
+            if ba.uses_closure_vars() {
+                return TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false);
+            }
             #[cfg(any(
                 stator_maglev_jit_x86_64,
                 all(target_arch = "x86_64", any(unix, windows))
@@ -2228,7 +2231,7 @@ struct MaglevCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub fn maybe_compile_maglev(ba: &BytecodeArray) {
-    if tiering_blocked_by_tail_call(ba) {
+    if tiering_blocked_by_tail_call(ba) || ba.uses_closure_vars() {
         return;
     }
     #[cfg(any(
@@ -2427,6 +2430,9 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     if tiering_blocked_by_tail_call(ba) {
         return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
     }
+    if ba.uses_closure_vars() {
+        return TierRequestResult::new(tier, TierRequestStatus::UnsupportedTier, false);
+    }
     let timer = PromotionTimer::start(PromotionTier::Maglev);
     if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
         timer.discard();
@@ -2541,7 +2547,7 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
 fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
-    if tiering_blocked_by_tail_call(ba) {
+    if tiering_blocked_by_tail_call(ba) || ba.uses_closure_vars() {
         return None;
     }
     #[cfg(any(
@@ -23693,6 +23699,57 @@ mod tests {
         assert!(try_execute_maglev_raw(&tail_ba, &[]).is_none());
         assert!(try_execute_best_jit(&tail_ba, &[]).is_none());
         assert!(try_execute_best_jit_no_result(&tail_ba, &[]).is_none());
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_maglev_skips_functions_that_access_closure_variables() {
+        let function = crate::builtins::global::global_eval(
+            "(function() { var n = 0; return function() { n++; return n; }; })()",
+        )
+        .unwrap();
+        let JsValue::Function(ba) = function else {
+            panic!("expected a closure");
+        };
+        assert!(ba.uses_closure_vars());
+
+        assert_eq!(
+            observe_tier(&ba, JitTier::Maglev).status,
+            TierRequestStatus::UnsupportedTier
+        );
+        maybe_compile_maglev(&ba);
+        assert!(!ba.maglev_compile_attempted());
+        assert!(!compile_maglev_sync(&ba));
+        assert!(!ba.has_maglev_executable_cached());
+        assert!(try_execute_maglev_raw(&ba, &[]).is_none());
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_maglev_skips_functions_that_read_closure_variables() {
+        let function = crate::builtins::global::global_eval(
+            "(function() { var n = 0; return function() { return n; }; })()",
+        )
+        .unwrap();
+        let JsValue::Function(ba) = function else {
+            panic!("expected a closure");
+        };
+        assert!(ba.uses_closure_vars());
+        assert_eq!(
+            observe_tier(&ba, JitTier::Maglev).status,
+            TierRequestStatus::UnsupportedTier
+        );
+        maybe_compile_maglev(&ba);
+        assert!(!ba.maglev_compile_attempted());
+        assert!(!compile_maglev_sync(&ba));
+        assert!(!ba.has_maglev_executable_cached());
+        assert!(try_execute_maglev_raw(&ba, &[]).is_none());
     }
 
     /// Calling a function more than [`TIERING_THRESHOLD`] times must trigger

@@ -8978,22 +8978,24 @@ fn compile_function_inner(
         ba = ba.with_source_text(source);
     }
 
-    // Detect whether the function body writes to any captured closure
-    // variables.  Currently StaContextSlot / StaCurrentContextSlot are not
-    // emitted by the compiler, so all closures are read-only, but we scan
-    // defensively to future-proof against new emission paths.
-    let writes_closure = ba
+    // Detect closure-context accesses so Maglev can avoid functions whose
+    // captured state it cannot yet safely access.
+    let uses_closure = ba
         .instructions()
         .map(|instrs| {
             instrs.iter().any(|i| {
                 matches!(
                     i.opcode,
-                    Opcode::StaContextSlot | Opcode::StaCurrentContextSlot
+                    Opcode::LdaContextSlot
+                        | Opcode::LdaCurrentContextSlot
+                        | Opcode::LdaImmutableCurrentContextSlot
+                        | Opcode::StaContextSlot
+                        | Opcode::StaCurrentContextSlot
                 )
             })
         })
         .unwrap_or(false);
-    ba = ba.with_writes_closure_vars(writes_closure);
+    ba = ba.with_uses_closure_vars(uses_closure);
 
     Ok(ba)
 }
