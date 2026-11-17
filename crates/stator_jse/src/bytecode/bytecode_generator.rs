@@ -8978,10 +8978,8 @@ fn compile_function_inner(
         ba = ba.with_source_text(source);
     }
 
-    // Detect whether the function body writes to any captured closure
-    // variables.  Currently StaContextSlot / StaCurrentContextSlot are not
-    // emitted by the compiler, so all closures are read-only, but we scan
-    // defensively to future-proof against new emission paths.
+    // Detect writes to closure-context slots so Maglev can avoid functions
+    // whose captured state it cannot safely update yet.
     let writes_closure = ba
         .instructions()
         .map(|instrs| {

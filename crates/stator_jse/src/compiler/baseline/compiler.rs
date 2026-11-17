@@ -3615,7 +3615,7 @@ pub(crate) mod jit_runtime {
             all(target_arch = "x86_64", any(unix, windows))
         ))]
         {
-            if !ba.jit_maglev_has_deopted() {
+            if !ba.writes_closure_vars() && !ba.jit_maglev_has_deopted() {
                 let maglev_cache = ba.maglev_executable_cache();
                 // SAFETY: single-threaded JIT; no concurrent mutation.
                 let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
@@ -3653,7 +3653,7 @@ pub(crate) mod jit_runtime {
                 crate::interpreter::maybe_compile_maglev(ba);
             }
 
-            if !ba.jit_maglev_has_deopted() {
+            if !ba.writes_closure_vars() && !ba.jit_maglev_has_deopted() {
                 let maglev_cache = ba.maglev_executable_cache();
                 // SAFETY: single-threaded JIT; no concurrent mutation.
                 let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
