@@ -27188,9 +27188,25 @@ mod tests {
     use super::*;
 
     static FFI_OSR_COUNTERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FFI_IC_COUNTERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FFI_TIER_LATENCY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock_ffi_osr_counters() -> std::sync::MutexGuard<'static, ()> {
         match FFI_OSR_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_ffi_ic_counters() -> std::sync::MutexGuard<'static, ()> {
+        match FFI_IC_COUNTERS_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_ffi_tier_latency() -> std::sync::MutexGuard<'static, ()> {
+        match FFI_TIER_LATENCY_LOCK.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
@@ -39285,6 +39301,7 @@ mod tests {
 
     #[test]
     fn test_ic_counters_stats_null_safety() {
+        let _g = lock_ffi_ic_counters();
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_ic_counters_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -39309,12 +39326,7 @@ mod tests {
 
     #[test]
     fn test_ic_counters_snapshot_roundtrip_via_ffi() {
-        use std::sync::Mutex;
-        static FFI_IC_COUNTERS_LOCK: Mutex<()> = Mutex::new(());
-        let _g = match FFI_IC_COUNTERS_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _g = lock_ffi_ic_counters();
 
         // SAFETY: null isolate is accepted; we reset before recording.
         unsafe { stator_isolate_reset_ic_counters_stats(std::ptr::null_mut()) };
@@ -39351,6 +39363,7 @@ mod tests {
 
     #[test]
     fn test_tier_latency_stats_null_safety() {
+        let _g = lock_ffi_tier_latency();
         // SAFETY: null output is documented as a no-op.
         unsafe { stator_isolate_get_tier_latency_stats(std::ptr::null(), std::ptr::null_mut()) };
         // SAFETY: null isolate is accepted and `stats` is valid for writes.
@@ -39370,15 +39383,10 @@ mod tests {
 
     #[test]
     fn test_tier_latency_snapshot_roundtrip_via_ffi() {
-        use std::sync::Mutex;
         use std::time::Duration;
         // Serialise with other tier-latency tests to avoid stomping the
         // process-global counters.
-        static FFI_TIER_LATENCY_LOCK: Mutex<()> = Mutex::new(());
-        let _g = match FFI_TIER_LATENCY_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _g = lock_ffi_tier_latency();
 
         // SAFETY: null isolate is accepted; we reset before recording.
         unsafe { stator_isolate_reset_tier_latency_stats(std::ptr::null_mut()) };
