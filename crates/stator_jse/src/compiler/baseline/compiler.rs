@@ -202,6 +202,7 @@ pub(crate) mod jit_runtime {
         recycle_object_rc,
     };
     use crate::objects::value::{JsContext, JsValue, NativeIterator, recycle_context_rc};
+    use std::sync::atomic::Ordering;
 
     /// One slot of the own-property inline cache for `LdaNamedProperty`.
     #[derive(Clone, Copy)]
@@ -484,20 +485,6 @@ pub(crate) mod jit_runtime {
             Cell::new(ObjectLiteralIcEntry::EMPTY)
         };
 
-        /// Cached resolved pattern for [`SpeculativeCallFusion`] runtime
-        /// stub.  Stores only value-type data (no pointers) so it is
-        /// safe to keep across JIT invocations without invalidation.
-        ///
-        /// On a cache hit (same `callee` heap handle, which is
-        /// deterministic when the heap is cleared between iterations),
-        /// the fusion function skips the [`Rc`] deref into the
-        /// [`OnceCell`]-based pattern cache and the pattern-match
-        /// destructure — going straight to the heap lookup for the
-        /// closure context.
-        static RT_FUSION_CACHE: Cell<FusionFastCache> = const {
-            Cell::new(FusionFastCache::EMPTY)
-        };
-
         /// Cached Vec pointer for `jit_runtime_array_push`.  Avoids
         /// repeated heap → JsValue::Array → Rc<RefCell<Vec>> dereferences
         /// when the receiver is the same array across iterations.
@@ -681,69 +668,13 @@ pub(crate) mod jit_runtime {
         RT_STUB_CALL_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
     }
 
-    /// Cached fusion-pattern data for [`SpeculativeCallFusion`] runtime stub.
-    ///
-    /// Stores only value-type data (heap-handle identity, slot index,
-    /// increment constant) — no raw pointers — so the cache is safe to
-    /// keep across `jit_runtime_setup` / `jit_runtime_teardown` cycles.
-    #[derive(Clone, Copy)]
-    struct FusionFastCache {
-        /// Callee heap handle used as the cache key.
-        callee: i64,
-        /// Context-slot index from the fusion pattern.
-        slot: usize,
-        /// Increment constant from the fusion pattern.
-        k: i64,
-    }
-
-    impl FusionFastCache {
-        const EMPTY: Self = Self {
-            callee: 0,
-            slot: 0,
-            k: 0,
-        };
-    }
-
-    // ── Global fusion context cache (for Maglev inline fast path) ───
-    //
-    // Caches the result of the last `jit_runtime_fusion_ctx_slot_ptr`
-    // call so that the Maglev codegen can check it directly from
-    // generated machine code (via the global address embedded as an
-    // immediate) without any function call on cache hit.
-    //
-    // The engine is single-threaded, so `AtomicI64` with `Relaxed`
-    // ordering compiles to plain loads/stores on x86.
-
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    /// Cached callee heap handle for the fusion context inline cache.
-    static FUSION_CTX_CALLEE: AtomicI64 = AtomicI64::new(0);
-
-    /// Cached raw pointer to the target `JsValue` slot for the fusion
-    /// context inline cache.
-    static FUSION_CTX_SLOT_PTR: AtomicI64 = AtomicI64::new(0);
-
-    /// Return the address of [`FUSION_CTX_CALLEE`] for embedding as
-    /// an absolute address immediate in JIT machine code.
-    pub fn fusion_ctx_callee_addr() -> usize {
-        &FUSION_CTX_CALLEE as *const AtomicI64 as usize
-    }
-
-    /// Return the address of [`FUSION_CTX_SLOT_PTR`] for embedding as
-    /// an absolute address immediate in JIT machine code.
-    pub fn fusion_ctx_slot_ptr_addr() -> usize {
-        &FUSION_CTX_SLOT_PTR as *const AtomicI64 as usize
-    }
-
     /// Lightweight fusion resolve stub: given a callee heap handle and
     /// a compile-time–known slot index, returns a raw pointer to the
     /// target `JsValue` slot in the closure context.
     ///
     /// Unlike [`jit_runtime_fusion_resolve`], this skips bytecode pattern
     /// analysis entirely — `(slot, k)` are compile-time constants embedded
-    /// in the IR.  On success the global inline cache is also updated so
-    /// subsequent calls from the Maglev fast path hit the cache and
-    /// bypass this stub entirely.
+    /// in the IR.
     ///
     /// Returns `0` on any failure (non-heap-handle, missing context, etc.).
     #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
@@ -780,10 +711,6 @@ pub(crate) mod jit_runtime {
         }
         let slot_ptr = unsafe { ctx.slots.as_ptr().add(slot) } as i64;
 
-        // Update the global inline cache.
-        FUSION_CTX_CALLEE.store(callee_i64, Ordering::Relaxed);
-        FUSION_CTX_SLOT_PTR.store(slot_ptr, Ordering::Relaxed);
-
         slot_ptr
     }
 
@@ -799,6 +726,7 @@ pub(crate) mod jit_runtime {
     struct CachedCalleeEntry {
         callee_i64: i64,
         ba_ptr: *const BytecodeArray,
+        ba_rc_raw: *const BytecodeArray,
         ctx_ptr: i64,
         entry_fn: usize,
         reg_slots: usize,
@@ -821,6 +749,7 @@ pub(crate) mod jit_runtime {
         const EMPTY: Self = Self {
             callee_i64: 0,
             ba_ptr: std::ptr::null(),
+            ba_rc_raw: std::ptr::null(),
             ctx_ptr: 0,
             entry_fn: 0,
             reg_slots: 0,
@@ -876,6 +805,17 @@ pub(crate) mod jit_runtime {
             // The matching decrement here balances that clone.
             unsafe {
                 drop(Rc::from_raw(raw));
+            }
+        }
+    }
+
+    fn drop_cached_callee_entry(entry: CachedCalleeEntry) {
+        drop_cached_ctx_rc_raw(entry.ctx_rc_raw);
+        if !entry.ba_rc_raw.is_null() {
+            // SAFETY: `ba_rc_raw` was produced by `Rc::into_raw` from a
+            // cloned `Rc<BytecodeArray>` stored in this cache entry.
+            unsafe {
+                drop(Rc::from_raw(entry.ba_rc_raw));
             }
         }
     }
@@ -1128,8 +1068,8 @@ pub(crate) mod jit_runtime {
     /// `Box<ObjectLiteralTemplate>` inside
     /// `ObjectLiteralCacheEntry::Cached`.  That heap allocation is stable
     /// because cached entries are never removed or replaced.  The IC is
-    /// invalidated when the [`BytecodeArray`] changes (see
-    /// [`jit_runtime_setup`]).
+    /// invalidated when the JIT heap is recycled or the [`BytecodeArray`]
+    /// changes (see [`jit_runtime_setup`] and [`jit_runtime_teardown`]).
     #[derive(Clone, Copy)]
     struct ObjectLiteralIcEntry {
         /// Feedback slot this entry is for.
@@ -1253,9 +1193,10 @@ pub(crate) mod jit_runtime {
             recycle_and_clear_heap();
             RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
             RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+            RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
             CACHED_CALLEE.with(|c| {
                 let old = c.get();
-                drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+                drop_cached_callee_entry(old);
                 c.set(CachedCalleeEntry::EMPTY);
             });
             MAGLEV_CALLEE_CACHE.with(|c| {
@@ -1366,9 +1307,10 @@ pub(crate) mod jit_runtime {
         // set the flag so setup can skip the redundant work.
         RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
         RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+        RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
         CACHED_CALLEE.with(|c| {
             let old = c.get();
-            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+            drop_cached_callee_entry(old);
             c.set(CachedCalleeEntry::EMPTY);
         });
         RT_HEAP_CLEAN.with(|c| c.set(true));
@@ -1394,7 +1336,7 @@ pub(crate) mod jit_runtime {
         // ── Drop leaked Rc in callee caches ────────────────────────
         CACHED_CALLEE.with(|c| {
             let entry = c.get();
-            drop_cached_ctx_rc_raw(entry.ctx_rc_raw);
+            drop_cached_callee_entry(entry);
             c.set(CachedCalleeEntry::EMPTY);
         });
         MAGLEV_CALLEE_CACHE.with(|c| {
@@ -1412,11 +1354,7 @@ pub(crate) mod jit_runtime {
         });
         DIRECT_CALL_OLD_CTX.with(|c| *c.borrow_mut() = None);
         RT_LAST_BA.with(|b| b.set((std::ptr::null(), 0)));
-        RT_FUSION_CACHE.with(|c| c.set(FusionFastCache::EMPTY));
         RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
-        FUSION_CTX_CALLEE.store(0, Ordering::Relaxed);
-        FUSION_CTX_SLOT_PTR.store(0, Ordering::Relaxed);
-
         // ── Clear heap so recycled PlainObjects don't linger ───────
         RT_HEAP.with(|h| h.borrow_mut().clear());
         RT_HANDLE_DEDUP.with(|m| m.borrow_mut().clear());
@@ -3559,25 +3497,12 @@ pub(crate) mod jit_runtime {
             _ => return fail,
         };
 
-        // ── Resolve (slot, k) pattern (with TLS fast cache) ─────────
-        let cache = RT_FUSION_CACHE.with(|c| c.get());
-        let (slot, k) = if cache.callee == callee_i64 && cache.callee != 0 {
-            (cache.slot, cache.k)
-        } else {
-            let &pattern = ba
-                .fusion_pattern_cache()
-                .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
-            let Some((slot, k)) = pattern else {
-                return fail;
-            };
-            RT_FUSION_CACHE.with(|c| {
-                c.set(FusionFastCache {
-                    callee: callee_i64,
-                    slot,
-                    k,
-                });
-            });
-            (slot, k)
+        // ── Resolve (slot, k) pattern ───────────────────────────────
+        let &pattern = ba
+            .fusion_pattern_cache()
+            .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
+        let Some((slot, k)) = pattern else {
+            return fail;
         };
 
         // ── Get closure-context slot pointer ─────────────────────────
@@ -4428,7 +4353,25 @@ pub(crate) mod jit_runtime {
                 // and enum discriminant check on every call.
                 let (ba_ptr, cached_entry): (*const BytecodeArray, CachedCalleeEntry) = {
                     let cached = ptrs.get_cached_callee();
-                    if cached.callee_i64 == callee_i64 && !cached.ba_ptr.is_null() {
+                    let cache_matches_heap =
+                        if cached.callee_i64 == callee_i64 && !cached.ba_ptr.is_null() {
+                            let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+                            // SAFETY: `heap_ref` points to the current thread's
+                            // JIT heap for the duration of this runtime call.
+                            let heap = unsafe { &*heap_ref.as_ptr() };
+                            matches!(
+                                heap.get(idx),
+                                Some(JsValue::Function(ba))
+                                    if Rc::as_ptr(ba) == cached.ba_ptr
+                                        && ba.closure_context()
+                                            .map(Rc::as_ptr)
+                                            .unwrap_or(std::ptr::null()) as i64
+                                            == cached.ctx_ptr
+                            )
+                        } else {
+                            false
+                        };
+                    if cache_matches_heap {
                         (cached.ba_ptr, cached)
                     } else {
                         // Cache miss — look up the heap in a scoped borrow.
@@ -4459,6 +4402,7 @@ pub(crate) mod jit_runtime {
                                     .closure_context()
                                     .map(|rc| Rc::into_raw(Rc::clone(rc)))
                                     .unwrap_or(std::ptr::null());
+                                let ba_rc_raw = Rc::into_raw(Rc::clone(ba));
                                 #[cfg(any(
                                     stator_maglev_jit_x86_64,
                                     all(target_arch = "x86_64", any(unix, windows))
@@ -4482,6 +4426,7 @@ pub(crate) mod jit_runtime {
                                 let entry = CachedCalleeEntry {
                                     callee_i64,
                                     ba_ptr: ptr,
+                                    ba_rc_raw,
                                     ctx_ptr,
                                     entry_fn,
                                     reg_slots,
@@ -4490,10 +4435,14 @@ pub(crate) mod jit_runtime {
                                     skip_args: ba_ref.parameter_count() == 0,
                                     ctx_rc_raw,
                                 };
-                                // Drop old entry's Rc refcount if callee changed.
+                                // Drop old entry's Rc references when the heap
+                                // slot has been recycled or its closure context changed.
                                 let old = ptrs.get_cached_callee();
-                                if !old.ctx_rc_raw.is_null() && old.callee_i64 != callee_i64 {
-                                    drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+                                if old.callee_i64 != callee_i64
+                                    || old.ba_ptr != ptr
+                                    || old.ctx_ptr != ctx_ptr
+                                {
+                                    drop_cached_callee_entry(old);
                                 }
                                 ptrs.set_cached_callee(entry);
                                 (ptr, entry)
@@ -4931,7 +4880,7 @@ pub(crate) mod jit_runtime {
                         if is_jit_deopt(jit_result) {
                             ba.mark_jit_baseline_deopted();
                             // Drop ctx_rc_raw before clearing the entry.
-                            drop_cached_ctx_rc_raw(entry.ctx_rc_raw);
+                            drop_cached_callee_entry(entry);
                             ptrs.set_cached_callee(CachedCalleeEntry::EMPTY);
                             unsafe {
                                 if (*heap_ref.as_ptr()).len() != heap_base {

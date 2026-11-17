@@ -697,9 +697,9 @@ pub fn unroll_loops(graph: &mut MaglevGraph) {
             let total_len = graph.blocks()[block_idx].nodes.len();
             let start = total_len - cloned_nodes.len();
             let block = &mut graph.blocks_mut()[block_idx];
-            for i in start..total_len {
+            for (_, node) in block.nodes.iter_mut().take(total_len).skip(start) {
                 let resolve = |id: NodeId| *id_remap.get(&id).unwrap_or(&id);
-                apply_subst_to_value_node(&mut block.nodes[i].1, &resolve);
+                apply_subst_to_value_node(node, &resolve);
             }
         }
 

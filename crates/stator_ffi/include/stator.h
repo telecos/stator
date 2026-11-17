@@ -3104,10 +3104,9 @@ typedef struct StatorDomClassInfo {
  * Opaque traced-handle slot exposed to the embedder.
  *
  * The pointer returned by `stator_traced_new` is the address of a
- * stable, isolate-owned slot.  Its address does not change until the slot
- * is freed by `stator_traced_dispose`.  The bytes pointed at are
- * implementation-defined and must not be inspected or mutated by the
- * embedder.
+ * stable, isolate-owned slot. Its address remains valid until the isolate is
+ * destroyed. The bytes pointed at are implementation-defined and must not be
+ * inspected or mutated by the embedder.
  */
 typedef struct StatorTraced {
   uint8_t _opaque[0];
@@ -3363,11 +3362,10 @@ typedef struct StatorEmbedderCallbacks {
 /**
  * Opaque persistent-handle slot exposed to the embedder.
  *
- * The pointer returned by `stator_persistent_new` is the address of a
- * stable, isolate-owned slot.  Its address does not change until the slot
- * is freed by `stator_persistent_dispose`.  The bytes pointed at are
- * implementation-defined and must not be inspected or mutated by the
- * embedder.
+ * The pointer returned by [`stator_persistent_new`] is the address of a
+ * stable, isolate-owned slot. Its address remains valid until the isolate is
+ * destroyed. The bytes pointed at are implementation-defined and must not be
+ * inspected or mutated by the embedder.
  */
 typedef struct StatorPersistent {
   uint8_t _opaque[0];
@@ -3377,10 +3375,10 @@ typedef struct StatorPersistent {
  * Opaque weak-handle slot exposed to the embedder.
  *
  * The pointer returned by [`stator_weak_new`] / [`stator_persistent_make_weak`]
- * is the address of a stable, isolate-owned slot.  Its address does not
- * change until the slot is freed by [`stator_weak_dispose`].  The bytes
- * pointed at are implementation-defined and must not be inspected or
- * mutated by the embedder.
+ * is the address of a stable, isolate-owned slot. Its address remains valid
+ * until the isolate is destroyed. The bytes pointed at are
+ * implementation-defined and must not be inspected or mutated by the
+ * embedder.
  */
 typedef struct StatorWeak {
   uint8_t _opaque[0];
@@ -9917,10 +9915,10 @@ struct StatorPersistent *stator_persistent_new(struct StatorContext *ctx,
 /**
  * Clear the value stored in `persistent` without freeing the slot.
  *
- * After `reset()`, `stator_persistent_is_empty` returns `true` and
- * `stator_persistent_get` returns null until the slot is disposed and a
- * new persistent is allocated.  The slot pointer itself remains valid; the
- * slot is only freed by `stator_persistent_dispose`.
+ * After `reset()`, [`stator_persistent_is_empty`] returns `true` and
+ * [`stator_persistent_get`] returns null until the slot is disposed and a
+ * new persistent is allocated. The slot pointer remains valid until its
+ * isolate is destroyed.
  *
  * Null-tolerant: passing null is a no-op.
  *
@@ -9959,7 +9957,8 @@ struct StatorValue *stator_persistent_get(const struct StatorPersistent *persist
 
 /**
  * Free the slot backing `persistent`, releasing the engine-side root and
- * the cloned value it owns.
+ * the cloned value it owns. The slot allocation remains alive until its
+ * isolate is destroyed to make redundant dispose calls safe.
  *
  * After this call the `persistent` pointer must not be used.  Calling
  * `dispose` twice on the same slot is a documented no-op: the first call
@@ -10016,7 +10015,8 @@ struct StatorWeak *stator_weak_new(struct StatorContext *ctx,
  * skipped by future weak-callback dispatch phases (so the one-shot
  * callback is **never** invoked, even if the referent is already dead),
  * and [`stator_weak_upgrade`] returns null.  The slot itself is only
- * freed by [`stator_weak_dispose`].
+ * removed from the callback table by [`stator_weak_dispose`]; its allocation
+ * remains alive until the isolate is destroyed.
  *
  * Null-tolerant: passing null is a no-op.
  *
@@ -10062,13 +10062,15 @@ bool stator_weak_is_empty(const struct StatorWeak *weak);
 struct StatorPersistent *stator_weak_upgrade(struct StatorWeak *weak);
 
 /**
- * Free the slot backing `weak`.
+ * Remove the slot backing `weak` from the callback table.
  *
  * After this call the `weak` pointer must not be used (except as a
  * redundant `dispose`, which is a documented no-op).  Disposing a weak
  * slot **before** its callback fires permanently suppresses the callback —
  * the slot is removed from the isolate's table before any future dispatch
- * phase can observe it.  Passing null is also a no-op.
+ * phase can observe it. Its allocation remains alive until the isolate is
+ * destroyed to make redundant dispose calls safe. Passing null is also a
+ * no-op.
  *
  * # Safety
  * `weak` must be null or a slot pointer returned by [`stator_weak_new`]
@@ -10131,7 +10133,7 @@ struct StatorTraced *stator_traced_new(struct StatorContext *ctx, struct StatorV
  *
  * After `reset()`, `stator_traced_is_empty` returns `true` and
  * `stator_traced_get` returns null.  The slot pointer itself remains
- * valid; the slot is only freed by `stator_traced_dispose`.  A
+ * valid until the isolate is destroyed. A
  * subsequent embedder visitor call that visits this slot still marks it
  * as visited, but no strong reference is restored because the weak
  * handle has been cleared.
@@ -10172,16 +10174,17 @@ bool stator_traced_is_empty(const struct StatorTraced *traced);
 struct StatorValue *stator_traced_get(const struct StatorTraced *traced);
 
 /**
- * Free the slot backing `traced`.
+ * Remove the slot backing `traced` from the root table.
  *
  * After this call the `traced` pointer must not be used (except as a
  * redundant `dispose`, which is a documented no-op).  Passing null is
- * also a no-op.
+ * also a no-op. Its allocation remains alive until the isolate is destroyed
+ * to make redundant dispose calls safe.
  *
  * # Safety
  * `traced` must be null or a slot pointer returned by
- * `stator_traced_new`.  After this call returns the embedder must
- * treat the pointer as invalid.
+ * `stator_traced_new`. After this call returns, the embedder must treat the
+ * pointer as invalid except for a redundant dispose while the isolate lives.
  */
 void stator_traced_dispose(struct StatorTraced *traced);
 
@@ -10212,10 +10215,9 @@ void stator_isolate_set_traced_root_visitor(struct StatorIsolate *isolate,
  * Only valid to call from inside a `StatorTracedRootVisitor`
  * invocation; the `visitor` token is the one supplied to the visitor
  * callback by the engine.  Fails closed (no-op) when `visitor` or
- * `traced` is null, when the visitor has an out-of-date epoch (callers
- * holding a stale token across cycles cannot accidentally mark slots),
- * or when `traced`'s referent has already been collected by a previous
- * cycle.
+ * `traced` is null, when the visitor's epoch does not match the current
+ * cycle, or when `traced`'s referent has already been collected by a
+ * previous cycle.
  *
  * # Safety
  * - `visitor` must be null or the live token supplied to the current

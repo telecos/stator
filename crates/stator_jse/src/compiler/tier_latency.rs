@@ -301,11 +301,9 @@ impl TierLatencySnapshot {
     /// successes have been recorded.
     #[must_use]
     pub fn mean_success_ns(&self) -> u64 {
-        if self.succeeded == 0 {
-            0
-        } else {
-            self.success_total_ns / self.succeeded
-        }
+        self.success_total_ns
+            .checked_div(self.succeeded)
+            .unwrap_or_default()
     }
 }
 
