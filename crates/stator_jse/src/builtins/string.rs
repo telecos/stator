@@ -743,6 +743,27 @@ pub fn string_replace(s: &str, search: &str, replacement: &str) -> String {
     }
 }
 
+/// Fallible callback form of [`string_replace`].
+pub fn string_replace_functional_fallible<F, E>(
+    s: &str,
+    search: &str,
+    mut replacer: F,
+) -> Result<String, E>
+where
+    F: FnMut(&str, usize, &str) -> Result<String, E>,
+{
+    match s.find(search) {
+        Some(pos) => {
+            let end = pos + search.len();
+            let mut result = s[..pos].to_string();
+            result.push_str(&replacer(search, encode_utf16(&s[..pos]).len(), s)?);
+            result.push_str(&s[end..]);
+            Ok(result)
+        }
+        None => Ok(s.to_string()),
+    }
+}
+
 /// ECMAScript §22.1.3.18 `String.prototype.replaceAll(searchValue, replaceValue)`.
 ///
 /// Replaces **every** occurrence of `search` with `replacement`.
@@ -890,6 +911,49 @@ where
     // Suppress unused variable warning for s_units (used for semantics clarity).
     let _ = s_units;
     result
+}
+
+/// Fallible callback form of [`string_replace_all_functional`].
+pub fn string_replace_all_functional_fallible<F, E>(
+    s: &str,
+    search: &str,
+    mut replacer: F,
+) -> Result<String, E>
+where
+    F: FnMut(&str, usize, &str) -> Result<String, E>,
+{
+    if search.is_empty() {
+        let units = encode_utf16(s);
+        let mut result = replacer("", 0, s)?;
+        let mut utf16_pos = 0;
+        for u in &units {
+            result.push_str(&decode_utf16(&[*u]));
+            utf16_pos += 1;
+            result.push_str(&replacer("", utf16_pos, s)?);
+        }
+        return Ok(result);
+    }
+
+    let search_units = encode_utf16(search);
+    let search_len = search_units.len();
+    let mut result = String::new();
+    let mut cursor = 0usize;
+    let mut utf16_cursor = 0usize;
+
+    while let Some(relative_pos) = s[cursor..].find(search) {
+        let pos = cursor + relative_pos;
+        let skipped = &s[cursor..pos];
+        utf16_cursor += encode_utf16(skipped).len();
+
+        result.push_str(skipped);
+        result.push_str(&replacer(search, utf16_cursor, s)?);
+
+        let end = pos + search.len();
+        cursor = end;
+        utf16_cursor += search_len;
+    }
+    result.push_str(&s[cursor..]);
+    Ok(result)
 }
 
 // ── match ─────────────────────────────────────────────────────────────────────

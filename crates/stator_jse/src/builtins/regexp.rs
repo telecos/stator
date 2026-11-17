@@ -49,13 +49,9 @@ fn update_regexp_statics(m: &RegExpMatch) {
         let mut s = cell.borrow_mut();
         s.input.clone_from(&m.input);
         s.last_match.clone_from(&m.matched);
-        s.left_context = m.input[..m.index].to_string();
+        s.left_context = m.input.get(..m.index).unwrap_or("").to_string();
         let end = m.index + m.matched.len();
-        s.right_context = if end <= m.input.len() {
-            m.input[end..].to_string()
-        } else {
-            String::new()
-        };
+        s.right_context = m.input.get(end..).unwrap_or("").to_string();
         // last paren = last non-empty capture
         s.last_paren = m
             .captures
@@ -273,43 +269,47 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
         let re_test = Rc::clone(&re);
         let re_test_exec = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "test".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_test);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                // Use try_exec internally so we can capture match data for
-                // statics and propagate termination / step-budget exhaustion.
-                let matched = re_test_exec.try_exec(&input)?;
-                if let Some(ref m) = matched {
-                    update_regexp_statics(m);
-                }
-                sync_last_index_to_props(&w, &re_test);
-                Ok(JsValue::Boolean(matched.is_some()))
-            })),
-        );
+        let test_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_test);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            // Use try_exec internally so we can capture match data for
+            // statics and propagate termination / step-budget exhaustion.
+            let matched = re_test_exec.try_exec(&input)?;
+            if let Some(ref m) = matched {
+                update_regexp_statics(m);
+            }
+            sync_last_index_to_props(&w, &re_test);
+            Ok(JsValue::Boolean(matched.is_some()))
+        }));
+        {
+            let mut props = props_rc.borrow_mut();
+            props.insert("__regexp_test__".into(), test_fn.clone());
+            props.insert("test".into(), test_fn);
+        }
     }
 
     // exec(string)
     {
         let re_exec = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "exec".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_exec);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = match re_exec.try_exec(&input)? {
-                    Some(m) => {
-                        update_regexp_statics(&m);
-                        match_to_js(&m)
-                    }
-                    None => JsValue::Null,
-                };
-                sync_last_index_to_props(&w, &re_exec);
-                Ok(result)
-            })),
-        );
+        let exec_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_exec);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let result = match re_exec.try_exec(&input)? {
+                Some(m) => {
+                    update_regexp_statics(&m);
+                    match_to_js(&m)
+                }
+                None => JsValue::Null,
+            };
+            sync_last_index_to_props(&w, &re_exec);
+            Ok(result)
+        }));
+        {
+            let mut props = props_rc.borrow_mut();
+            props.insert("__regexp_exec__".into(), exec_fn.clone());
+            props.insert("exec".into(), exec_fn);
+        }
     }
 
     // toString()
@@ -327,45 +327,45 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_match = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_match__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_match);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = match re_match.try_symbol_match(&input)? {
-                    None => JsValue::Null,
-                    Some(SymbolMatchResult::Single(m)) => match_to_js(&m),
-                    Some(SymbolMatchResult::All(v)) => {
-                        let arr: Vec<JsValue> =
-                            v.into_iter().map(|s| JsValue::String(s.into())).collect();
-                        JsValue::new_array(arr)
-                    }
-                };
-                sync_last_index_to_props(&w, &re_match);
-                Ok(result)
-            })),
-        );
+        let match_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_match);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let result = match re_match.try_symbol_match(&input)? {
+                None => JsValue::Null,
+                Some(SymbolMatchResult::Single(m)) => match_to_js(&m),
+                Some(SymbolMatchResult::All(v)) => {
+                    let arr: Vec<JsValue> =
+                        v.into_iter().map(|s| JsValue::String(s.into())).collect();
+                    JsValue::new_array(arr)
+                }
+            };
+            sync_last_index_to_props(&w, &re_match);
+            Ok(result)
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_match__".into(), match_fn.clone());
+        props.insert("@@match".into(), match_fn);
     }
 
     // [Symbol.replace](string, replacement)
     {
         let re_replace = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_replace__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_replace);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
-                let result = if is_callable(&replacement) {
-                    regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
-                } else {
-                    re_replace.try_symbol_replace(&input, &replacement.to_js_string()?)?
-                };
-                sync_last_index_to_props(&w, &re_replace);
-                Ok(JsValue::String(result.into()))
-            })),
-        );
+        let replace_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_replace);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+            let result = if is_callable(&replacement) {
+                regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
+            } else {
+                re_replace.try_symbol_replace(&input, &replacement.to_js_string()?)?
+            };
+            sync_last_index_to_props(&w, &re_replace);
+            Ok(JsValue::String(result.into()))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_replace__".into(), replace_fn.clone());
+        props.insert("@@replace".into(), replace_fn);
     }
 
     // [Symbol.search](string)
@@ -392,45 +392,45 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     {
         let re_split = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_split__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_split);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let limit = match args.get(1) {
-                    Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(crate::builtins::util::clamped_f64_to_usize(v.to_number()?)),
-                };
-                let parts = re_split.try_symbol_split(&input, limit)?;
-                sync_last_index_to_props(&w, &re_split);
-                Ok(JsValue::new_array(
-                    parts
-                        .into_iter()
-                        .map(|s| match s {
-                            Some(s) => JsValue::String(s.into()),
-                            None => JsValue::Undefined,
-                        })
-                        .collect(),
-                ))
-            })),
-        );
+        let split_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_split);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let limit = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_uint32()? as usize),
+            };
+            let parts = re_split.try_symbol_split(&input, limit)?;
+            sync_last_index_to_props(&w, &re_split);
+            Ok(JsValue::new_array(
+                parts
+                    .into_iter()
+                    .map(|s| match s {
+                        Some(s) => JsValue::String(s.into()),
+                        None => JsValue::Undefined,
+                    })
+                    .collect(),
+            ))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_split__".into(), split_fn.clone());
+        props.insert("@@split".into(), split_fn);
     }
 
     // [Symbol.matchAll](string)
     {
         let re_match_all = Rc::clone(&re);
         let w = weak.clone();
-        props_rc.borrow_mut().insert(
-            "__symbol_match_all__".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
-                sync_last_index_from_props(&w, &re_match_all);
-                let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let matches = re_match_all.try_symbol_match_all(&input)?;
-                sync_last_index_to_props(&w, &re_match_all);
-                let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            })),
-        );
+        let match_all_fn = JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            sync_last_index_from_props(&w, &re_match_all);
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let matches = re_match_all.try_symbol_match_all(&input)?;
+            sync_last_index_to_props(&w, &re_match_all);
+            let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
+            Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+        }));
+        let mut props = props_rc.borrow_mut();
+        props.insert("__symbol_match_all__".into(), match_all_fn.clone());
+        props.insert("@@matchAll".into(), match_all_fn);
     }
 
     JsValue::PlainObject(props_rc)
@@ -457,9 +457,9 @@ fn sync_last_index_to_props(weak: &Weak<RefCell<PropertyMap>>, re: &JsRegExp) {
     }
 }
 
-fn is_callable(value: &JsValue) -> bool {
+pub(crate) fn is_callable(value: &JsValue) -> bool {
     match value {
-        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => true,
         JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
         _ => false,
     }
@@ -471,6 +471,7 @@ fn insert_regexp_getter(props: &mut PropertyMap, name: &str, getter: JsValue) {
         getter,
         PropertyAttributes::CONFIGURABLE,
     );
+    props.mark_accessor_property(name);
 }
 
 fn bool_getter(re: &Rc<JsRegExp>, flag: RegExpFlags) -> JsValue {
@@ -518,7 +519,7 @@ fn call_replace_callback(
     dispatch_call_value(callback, args)?.to_js_string()
 }
 
-fn regexp_replace_with_callback(
+pub(crate) fn regexp_replace_with_callback(
     re: &JsRegExp,
     input: &str,
     replacement: &JsValue,
@@ -566,7 +567,7 @@ fn regexp_replace_with_callback(
 /// * `input` → original input string
 /// * `groups` → named groups object (or `undefined`)
 /// * `indices` → `{ 0: [s,e], 1: [s,e], …, groups: {…} }` when `/d` flag
-fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
+pub(crate) fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     let mut props = PropertyMap::new();
 
     // [0] = full match

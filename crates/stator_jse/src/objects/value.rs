@@ -30,7 +30,7 @@
 //! - [`NativeIterator`] — a Rust-level iterator that wraps a pre-collected
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -126,6 +126,8 @@ pub struct GeneratorState {
     pub call_args: Vec<JsValue>,
     /// Global environment used to execute/resume the activation.
     pub global_env: Option<Rc<RefCell<crate::interpreter::GlobalEnv>>>,
+    /// `this` binding captured when the generator activation was created.
+    pub this_binding: Option<JsValue>,
     /// Instruction index to resume from; `0` = start of function body.
     pub resume_pc: usize,
     /// Current lifecycle status.
@@ -134,6 +136,8 @@ pub struct GeneratorState {
     pub resume_mode: GeneratorResumeMode,
     /// The `new.target` value visible to the activation.
     pub new_target: JsValue,
+    /// Metadata id of the most recent `SuspendGenerator` instruction.
+    pub last_suspend_id: Option<u32>,
 }
 
 impl GeneratorState {
@@ -147,11 +151,33 @@ impl GeneratorState {
             registers: crate::interpreter::RegisterFile::new(),
             call_args: Vec::new(),
             global_env: None,
+            this_binding: None,
             resume_pc: 0,
             status: GeneratorStatus::SuspendedAtStart,
             resume_mode: GeneratorResumeMode::Normal,
             new_target: JsValue::Undefined,
+            last_suspend_id: None,
         }))
+    }
+
+    /// Create a generator with the activation metadata needed to start the
+    /// body later through [`crate::interpreter::Interpreter::run_generator_step`].
+    pub fn with_activation(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        global_env: Rc<RefCell<crate::interpreter::GlobalEnv>>,
+        this_binding: Option<JsValue>,
+        new_target: JsValue,
+    ) -> Rc<RefCell<Self>> {
+        let state = Self::new(bytecode_array);
+        {
+            let mut borrow = state.borrow_mut();
+            borrow.call_args = args.into_iter().collect();
+            borrow.global_env = Some(global_env);
+            borrow.this_binding = this_binding;
+            borrow.new_target = new_target;
+        }
+        state
     }
 }
 
@@ -162,6 +188,9 @@ pub enum GeneratorStep {
     /// The generator suspended at a `yield` expression; the contained value
     /// is the yielded result.  The generator may be resumed.
     Yield(JsValue),
+    /// The generator suspended at an internal `await`; the contained value is
+    /// awaited by async function/module/async-generator drivers.
+    Await(JsValue),
     /// The generator's function body returned; the contained value is the
     /// final return value.  The generator is now exhausted.
     Return(JsValue),
@@ -428,11 +457,26 @@ const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 /// Each context contains a vector of numbered slots and an optional parent
 /// pointer so that inner scopes can walk the chain to reach outer scopes.
 #[derive(Debug, Clone, PartialEq)]
+pub struct JsContextMappedArgumentAlias {
+    /// Slot in this context that remains aliased to a mapped `arguments` index.
+    pub slot_index: u32,
+    /// Canonical `arguments[index]` property backed by the context slot.
+    pub argument_index: u32,
+    /// The mapped `arguments` object that owns the aliased property.
+    pub object: Rc<RefCell<crate::objects::property_map::PropertyMap>>,
+    /// Shared liveness flag, cleared after a successful delete/freeze severs the mapped alias.
+    pub live: Rc<Cell<bool>>,
+}
+
+/// A captured lexical environment with optional mapped-arguments alias state.
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsContext {
     /// The captured variable slots.
     pub slots: Vec<JsValue>,
     /// The enclosing (parent) context, or `None` for the outermost scope.
     pub parent: Option<Rc<RefCell<JsContext>>>,
+    /// Mapped `arguments` aliases whose targets live in this context.
+    pub mapped_argument_aliases: Vec<JsContextMappedArgumentAlias>,
 }
 
 impl JsContext {
@@ -452,12 +496,14 @@ impl JsContext {
             ctx.slots.clear();
             ctx.slots.resize(slot_count, JsValue::Undefined);
             ctx.parent = parent;
+            ctx.mapped_argument_aliases.clear();
             drop(ctx);
             rc
         } else {
             Rc::new(RefCell::new(Self {
                 slots: vec![JsValue::Undefined; slot_count],
                 parent,
+                mapped_argument_aliases: Vec::new(),
             }))
         }
     }
@@ -593,8 +639,8 @@ impl PartialEq for JsValue {
             // pointer; equality is pointer equality (same allocation).
             (Self::Object(a), Self::Object(b)) => std::ptr::eq(*a, *b),
             (Self::BigInt(a), Self::BigInt(b)) => a == b,
-            // Reference types: compare contents (matching the original derive behaviour).
-            (Self::Function(a), Self::Function(b)) => a == b,
+            // Reference types: compare object identity.
+            (Self::Function(a), Self::Function(b)) => Rc::ptr_eq(a, b),
             (Self::Array(a), Self::Array(b)) => Rc::ptr_eq(a, b),
             (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
             (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),
@@ -1351,7 +1397,11 @@ impl JsValue {
                     let utf16: Vec<u16> = s.encode_utf16().collect();
                     for (index, unit) in utf16.iter().enumerate() {
                         let ch = String::from_utf16_lossy(std::slice::from_ref(unit));
-                        map.insert(index.to_string(), JsValue::String(ch.into()));
+                        map.insert_with_attrs(
+                            index.to_string(),
+                            JsValue::String(ch.into()),
+                            PropertyAttributes::ENUMERABLE,
+                        );
                     }
                 }
                 let ctor_name = match self {
@@ -2005,6 +2055,10 @@ fn ordinary_to_primitive(value: &JsValue, hint: ToPrimitiveHint) -> StatorResult
         if result.is_primitive() {
             return Ok(result);
         }
+    }
+
+    if matches!(value, JsValue::Object(_)) {
+        return Ok(JsValue::String(value.obj_to_string_tag().into()));
     }
 
     Err(StatorError::TypeError(
@@ -2828,7 +2882,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_number_object_via_to_primitive() {
         // Object goes through ToPrimitive → "[object Object]" → NaN.
         let mut obj = HeapObject::new_null();
@@ -2977,7 +3030,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_to_js_string_object_via_to_primitive() {
         // Object goes through ToPrimitive → "[object Object]".
         let mut obj = HeapObject::new_null();

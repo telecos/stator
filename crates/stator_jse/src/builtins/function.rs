@@ -280,8 +280,11 @@ pub fn function_dynamic_to_string(params: &[&str], body: &str) -> String {
 /// assert!(result.is_ok());
 /// ```
 pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
-    use crate::builtins::global::global_eval;
-    use crate::interpreter::fn_props_set;
+    use crate::builtins::global::{global_eval, global_eval_with_env};
+    use crate::interpreter::{
+        current_function_constructor_global_env, current_global_env, fn_global_env_set,
+        fn_props_set,
+    };
 
     // Convert all args to strings.
     let string_args: Vec<String> = args
@@ -298,8 +301,16 @@ pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
         &body,
     );
     let source = format!("({source_text})");
-    let result = global_eval(&source)?;
+    let function_global_env = current_function_constructor_global_env().or_else(current_global_env);
+    let result = if let Some(env) = function_global_env.as_ref() {
+        global_eval_with_env(&source, Rc::clone(env))?
+    } else {
+        global_eval(&source)?
+    };
     if let JsValue::Function(ba) = &result {
+        if let Some(env) = function_global_env {
+            fn_global_env_set(ba, env);
+        }
         fn_props_set(ba, "name".to_string(), JsValue::String("anonymous".into()));
         fn_props_set(
             ba,

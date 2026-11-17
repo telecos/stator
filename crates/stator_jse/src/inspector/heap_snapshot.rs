@@ -112,6 +112,12 @@ pub fn stop_tracking() -> Vec<AllocationRecord> {
     ALLOCATION_RECORDS.with(|r| r.borrow_mut().drain(..).collect())
 }
 
+/// Return a clone of the currently recorded allocation events without stopping
+/// the active tracking session.
+pub fn snapshot_tracking() -> Vec<AllocationRecord> {
+    ALLOCATION_RECORDS.with(|r| r.borrow().clone())
+}
+
 /// Record a single allocation of `size` bytes, if tracking is active.
 ///
 /// Captures the current JavaScript call stack via

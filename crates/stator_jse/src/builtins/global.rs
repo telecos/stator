@@ -393,7 +393,14 @@ type DirectEvalCapture = (JsValue, Rc<RefCell<GlobalEnv>>, bool);
 /// assert_eq!(result, JsValue::Boolean(true));
 /// ```
 pub fn global_eval(source: &str) -> StatorResult<JsValue> {
-    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
+    Ok(eval_core(source, EvalMode::Indirect, None, None, false)?.result)
+}
+
+pub(crate) fn global_eval_with_env(
+    source: &str,
+    global_env: Rc<RefCell<GlobalEnv>>,
+) -> StatorResult<JsValue> {
+    Ok(eval_core(source, EvalMode::Indirect, Some(global_env), None, false)?.result)
 }
 
 /// Direct eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = true`.
@@ -436,7 +443,7 @@ pub fn global_eval_direct(
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
 pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
-    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
+    Ok(eval_core(source, EvalMode::Indirect, None, None, false)?.result)
 }
 
 /// Strict-mode eval — the evaluated code receives its own variable
@@ -466,6 +473,8 @@ pub fn global_eval_strict(
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    program.is_strict = true;
+    reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
 
     let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
@@ -484,12 +493,17 @@ fn eval_core(
     mode: EvalMode,
     caller_env: Option<Rc<RefCell<GlobalEnv>>>,
     caller_context: Option<JsValue>,
+    caller_is_strict: bool,
 ) -> StatorResult<EvalOutcome> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame, current_global_env};
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    if matches!(mode, EvalMode::Direct) && caller_is_strict {
+        program.is_strict = true;
+    }
+    reject_illegal_eval_returns(&program)?;
     rewrite_last_expr_to_return(&mut program);
     let is_strict = program.is_strict;
 
@@ -515,14 +529,20 @@ fn eval_core(
         }
         EvalMode::Indirect => {
             let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
-            if let Some(env) = current_global_env() {
+            if let Some(env) = caller_env.or_else(current_global_env) {
                 InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], env)
             } else {
                 InterpreterFrame::new(Rc::new(bytecode), vec![])
             }
         }
     };
-    let result = Interpreter::run(&mut frame)?;
+    let preserve_current_globals =
+        matches!(mode, EvalMode::Direct) && current_global_env().is_some();
+    let result = if preserve_current_globals {
+        Interpreter::run_same_env(&mut frame)?
+    } else {
+        Interpreter::run(&mut frame)?
+    };
     Ok(EvalOutcome {
         result,
         global_env: Rc::clone(&frame.global_env),
@@ -535,29 +555,158 @@ pub(crate) fn global_eval_direct_with_scope(
     caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<JsValue> {
-    Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context)?.0)
+    Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context, false)?.0)
 }
 
 pub(crate) fn global_eval_direct_with_scope_capture(
     source: &str,
     caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
+    caller_is_strict: bool,
 ) -> StatorResult<DirectEvalCapture> {
-    let outcome = eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)?;
+    let outcome = eval_core(
+        source,
+        EvalMode::Direct,
+        Some(caller_env),
+        caller_context,
+        caller_is_strict,
+    )?;
     Ok((outcome.result, outcome.global_env, outcome.is_strict))
 }
 
-/// If the last program item is an expression statement, rewrite it to a
-/// `return` so the interpreter propagates the completion value.
+/// Rewrite the eval completion value into an explicit return.
 fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
-    use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
+    use crate::parser::ast::{
+        BlockStmt, Expr, ExprStmt, NumLit, ProgramItem, ReturnStmt, Stmt, UnaryExpr, UnaryOp,
+    };
     if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
         let return_stmt = ReturnStmt {
             loc: expr_stmt.loc,
             argument: Some(expr_stmt.expr.clone()),
         };
         *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
+    } else if let Some(ProgramItem::Stmt(Stmt::If(if_stmt))) = program.body.last_mut() {
+        if stmt_has_static_empty_completion(&if_stmt.consequent) {
+            append_undefined_completion(&mut if_stmt.consequent);
+        }
+        if let Some(alternate) = &mut if_stmt.alternate {
+            if stmt_has_static_empty_completion(alternate) {
+                append_undefined_completion(alternate);
+            }
+        } else {
+            if_stmt.alternate = Some(Box::new(undefined_completion_stmt(if_stmt.loc)));
+        }
+    } else if matches!(
+        program.body.last(),
+        Some(ProgramItem::Stmt(Stmt::VarDecl(_)))
+    ) {
+        program
+            .body
+            .push(ProgramItem::Stmt(Stmt::Return(ReturnStmt {
+                loc: program.loc,
+                argument: None,
+            })));
     }
+
+    fn stmt_has_static_empty_completion(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Empty(_)
+            | Stmt::VarDecl(_)
+            | Stmt::FnDecl(_)
+            | Stmt::ClassDecl(_)
+            | Stmt::Debugger(_) => true,
+            Stmt::Block(block) => block.body.iter().all(stmt_has_static_empty_completion),
+            _ => false,
+        }
+    }
+
+    fn append_undefined_completion(stmt: &mut Box<Stmt>) {
+        let loc = stmt.loc();
+        match stmt.as_mut() {
+            Stmt::Block(block) => {
+                block.body.push(undefined_completion_stmt(block.loc));
+            }
+            _ => {
+                let original = (**stmt).clone();
+                **stmt = Stmt::Block(BlockStmt {
+                    loc,
+                    body: vec![original, undefined_completion_stmt(loc)],
+                });
+            }
+        }
+    }
+
+    fn undefined_completion_stmt(loc: crate::parser::ast::SourceLocation) -> Stmt {
+        Stmt::Expr(ExprStmt {
+            loc,
+            expr: Box::new(Expr::Unary(Box::new(UnaryExpr {
+                loc,
+                op: UnaryOp::Void,
+                argument: Box::new(Expr::Num(NumLit {
+                    loc,
+                    value: 0.0,
+                    raw: "0".to_string(),
+                })),
+            }))),
+        })
+    }
+}
+
+fn reject_illegal_eval_returns(program: &crate::parser::ast::Program) -> StatorResult<()> {
+    use crate::parser::ast::{ProgramItem, Stmt};
+
+    fn stmt_contains_return(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return(_) => true,
+            Stmt::Block(block) => block.body.iter().any(stmt_contains_return),
+            Stmt::If(stmt) => {
+                stmt_contains_return(&stmt.consequent)
+                    || stmt.alternate.as_deref().is_some_and(stmt_contains_return)
+            }
+            Stmt::For(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::ForIn(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::ForOf(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::While(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::DoWhile(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::Switch(stmt) => stmt
+                .cases
+                .iter()
+                .any(|case| case.consequent.iter().any(stmt_contains_return)),
+            Stmt::Try(stmt) => {
+                stmt.block.body.iter().any(stmt_contains_return)
+                    || stmt
+                        .handler
+                        .as_ref()
+                        .is_some_and(|handler| handler.body.body.iter().any(stmt_contains_return))
+                    || stmt
+                        .finalizer
+                        .as_ref()
+                        .is_some_and(|block| block.body.iter().any(stmt_contains_return))
+            }
+            Stmt::Labeled(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::With(stmt) => stmt_contains_return(&stmt.body),
+            Stmt::VarDecl(_)
+            | Stmt::FnDecl(_)
+            | Stmt::ClassDecl(_)
+            | Stmt::Expr(_)
+            | Stmt::Throw(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Debugger(_)
+            | Stmt::Empty(_) => false,
+        }
+    }
+
+    if program.body.iter().any(|item| {
+        matches!(
+            item,
+            ProgramItem::Stmt(stmt) if stmt_contains_return(stmt)
+        )
+    }) {
+        return Err(StatorError::SyntaxError("Illegal return statement".into()));
+    }
+
+    Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

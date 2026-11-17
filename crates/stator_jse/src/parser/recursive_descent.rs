@@ -41,6 +41,7 @@ use crate::parser::ast::{
     WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue, cook_template_raw};
+use std::collections::HashSet;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Parser
@@ -1113,6 +1114,7 @@ impl<'src> Parser<'src> {
         self.breakable_depth += 1;
         let mut cases = Vec::new();
         let mut seen_default = false;
+        let mut lexical_names = HashSet::new();
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
                 return Err(self.error("unexpected end of input in switch statement"));
@@ -1141,6 +1143,9 @@ impl<'src> Parser<'src> {
                 }
                 consequent.push(self.parse_stmt()?);
             }
+            for stmt in &consequent {
+                self.check_switch_lexical_names(stmt, &mut lexical_names)?;
+            }
 
             let case_end = if let Some(last) = consequent.last() {
                 last.loc()
@@ -1162,6 +1167,73 @@ impl<'src> Parser<'src> {
             discriminant: Box::new(discriminant),
             cases,
         }))
+    }
+
+    fn check_switch_lexical_names(
+        &self,
+        stmt: &Stmt,
+        seen: &mut HashSet<String>,
+    ) -> StatorResult<()> {
+        match stmt {
+            Stmt::VarDecl(decl) if matches!(decl.kind, VarKind::Let | VarKind::Const) => {
+                for declarator in &decl.declarators {
+                    let mut names = Vec::new();
+                    Self::collect_bound_names_from_pat(&declarator.id, &mut names);
+                    for name in names {
+                        if !seen.insert(name.clone()) {
+                            return Err(Self::error_at(
+                                declarator.id.loc(),
+                                &format!(
+                                    "duplicate lexical declaration '{name}' in switch statement"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            Stmt::ClassDecl(class_decl) => {
+                if let Some(id) = &class_decl.id
+                    && !seen.insert(id.name.clone())
+                {
+                    return Err(Self::error_at(
+                        id.loc,
+                        &format!(
+                            "duplicate lexical declaration '{}' in switch statement",
+                            id.name
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn collect_bound_names_from_pat(pat: &Pat, names: &mut Vec<String>) {
+        match pat {
+            Pat::Ident(ident) => names.push(ident.name.clone()),
+            Pat::Array(array) => {
+                for element in array.elements.iter().flatten() {
+                    Self::collect_bound_names_from_pat(element, names);
+                }
+            }
+            Pat::Object(object) => {
+                for prop in &object.properties {
+                    match prop {
+                        ObjectPatProp::KeyValue(prop) => {
+                            Self::collect_bound_names_from_pat(&prop.value, names);
+                        }
+                        ObjectPatProp::Assign(prop) => names.push(prop.key.name.clone()),
+                        ObjectPatProp::Rest(rest) => {
+                            Self::collect_bound_names_from_pat(&rest.argument, names);
+                        }
+                    }
+                }
+            }
+            Pat::Rest(rest) => Self::collect_bound_names_from_pat(&rest.argument, names),
+            Pat::Assign(assign) => Self::collect_bound_names_from_pat(&assign.left, names),
+            Pat::Expr(_) => {}
+        }
     }
 
     fn parse_fn_decl(&mut self, fn_span: Span, is_async: bool) -> StatorResult<Stmt> {
@@ -2888,7 +2960,57 @@ impl<'src> Parser<'src> {
                 self.scanner = saved_scanner.clone();
                 self.current = saved_current.clone();
             } else {
-                // Not `()`, restore for the general path below.
+                if self.peek_kind() == TokenKind::DotDotDot {
+                    let rest_start = self.current_span();
+                    self.bump()?; // consume `...`
+                    let arg = self.parse_binding_pat()?;
+                    let rest_end = arg.loc();
+                    let params = vec![Param {
+                        loc: Self::merge_spans(rest_start, rest_end),
+                        pat: Pat::Rest(Box::new(RestElement {
+                            loc: Self::merge_spans(rest_start, rest_end),
+                            argument: Box::new(arg),
+                        })),
+                        default: None,
+                    }];
+                    self.expect(TokenKind::RightParen)?;
+                    if self.peek_kind() == TokenKind::Arrow {
+                        self.bump()?; // consume `=>`
+                        let body = self.parse_arrow_body(false)?;
+                        let end = self.arrow_body_loc(&body);
+                        return Ok(Expr::Arrow(Box::new(ArrowExpr {
+                            loc: Self::merge_spans(start, end),
+                            is_async: false,
+                            params,
+                            body,
+                            is_strict: self.strict_mode,
+                        })));
+                    }
+                }
+                // Try parsing a full formal parameter list. This handles
+                // parameter forms that are not valid expressions in the cover
+                // grammar, such as rest-only arrows: `(...args) => args`.
+                let params_result = self.parse_formal_params();
+                if let Ok(params) = params_result
+                    && self.peek_kind() == TokenKind::RightParen
+                {
+                    self.bump()?; // consume `)`
+                    if self.peek_kind() == TokenKind::Arrow {
+                        self.bump()?; // consume `=>`
+                        self.check_unique_params(&params)?;
+                        let body = self.parse_arrow_body(false)?;
+                        let end = self.arrow_body_loc(&body);
+                        return Ok(Expr::Arrow(Box::new(ArrowExpr {
+                            loc: Self::merge_spans(start, end),
+                            is_async: false,
+                            params,
+                            body,
+                            is_strict: self.strict_mode,
+                        })));
+                    }
+                }
+                // Not a parenthesized formal-parameter arrow; restore for the
+                // expression cover grammar below.
                 self.scanner = saved_scanner.clone();
                 self.current = saved_current.clone();
             }
@@ -3109,6 +3231,12 @@ impl<'src> Parser<'src> {
         // `#x in obj` — private brand check.
         if self.peek_kind() == TokenKind::PrivateIdentifier && !self.no_in {
             let tok = self.bump()?;
+            if self.class_depth == 0 {
+                return Err(Self::error_at(
+                    tok.span,
+                    "private names can only be used inside a class",
+                ));
+            }
             let name = match tok.value {
                 TokenValue::Str(s) => s,
                 _ => return Err(Self::error_at(tok.span, "invalid private name token")),
@@ -3364,6 +3492,12 @@ impl<'src> Parser<'src> {
                     if self.peek_kind() == TokenKind::PrivateIdentifier {
                         // Private access: `obj.#field`
                         let prop_tok = self.bump()?;
+                        if self.class_depth == 0 {
+                            return Err(Self::error_at(
+                                prop_tok.span,
+                                "private names can only be used inside a class",
+                            ));
+                        }
                         let name = match prop_tok.value {
                             TokenValue::Str(s) => s,
                             _ => {
@@ -3460,6 +3594,12 @@ impl<'src> Parser<'src> {
                         TokenKind::PrivateIdentifier => {
                             // `object?.#field`
                             let prop_tok = self.bump()?;
+                            if self.class_depth == 0 {
+                                return Err(Self::error_at(
+                                    prop_tok.span,
+                                    "private names can only be used inside a class",
+                                ));
+                            }
                             let name = match prop_tok.value {
                                 TokenValue::Str(s) => s,
                                 _ => {
@@ -4127,6 +4267,12 @@ impl<'src> Parser<'src> {
                             self.bump()?;
                             if self.peek_kind() == TokenKind::PrivateIdentifier {
                                 let prop_tok = self.bump()?;
+                                if self.class_depth == 0 {
+                                    return Err(Self::error_at(
+                                        prop_tok.span,
+                                        "private names can only be used inside a class",
+                                    ));
+                                }
                                 let name = match prop_tok.value {
                                     TokenValue::Str(s) => s,
                                     _ => {
@@ -4235,9 +4381,7 @@ impl<'src> Parser<'src> {
                     if prop_name != "meta" {
                         return Err(Self::error_at(
                             prop_tok.span,
-                            &format!(
-                                "the only valid meta property for import is 'import.meta', got 'import.{prop_name}'"
-                            ),
+                            &format!("expected 'meta' after 'import.', got '{prop_name}'"),
                         ));
                     }
                     if !self.is_module {
@@ -4983,9 +5127,8 @@ pub fn parse_module(source: &str) -> StatorResult<Program> {
 /// Parse `source` as a classic script.
 ///
 /// Script mode does not allow top-level `await` (unless inside an `async`
-/// function) and `import.meta` is not available.  The source type is always
-/// [`SourceType::Script`] unless `import`/`export` declarations are
-/// encountered (which cause auto-promotion to module mode).
+/// function), `import.meta` is not available, and top-level static
+/// `import`/`export` declarations are rejected.
 ///
 /// # Errors
 ///
@@ -5004,6 +5147,11 @@ pub fn parse_script(source: &str) -> StatorResult<Program> {
     stacker::maybe_grow(32 * 1024, 512 * 1024, || {
         let mut parser = Parser::new(source)?;
         let program = parser.parse_program()?;
+        if program.source_type == SourceType::Module {
+            return Err(StatorError::SyntaxError(
+                "import/export declarations are only valid in module code".into(),
+            ));
+        }
         Ok(program)
     })
 }
@@ -6088,7 +6236,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_class_computed_method() {
         let prog = parse("class Foo { [Symbol.iterator]() {} }").unwrap();
         assert_eq!(prog.body.len(), 1);
@@ -7891,6 +8038,18 @@ mod tests {
     }
 
     #[test]
+    fn test_private_member_access_outside_class_is_syntax_error() {
+        assert!(parse("obj.#x").is_err());
+        assert!(parse("obj?.#x").is_err());
+        assert!(parse("new obj.#x()").is_err());
+    }
+
+    #[test]
+    fn test_private_brand_check_outside_class_is_syntax_error() {
+        assert!(parse("#x in obj").is_err());
+    }
+
+    #[test]
     fn test_class_private_optional_chain() {
         // `obj?.#field` should produce OptionalChain(OptionalMember) with MemberProp::Private.
         let prog = parse("class C { #x; m(o) { return o?.#x; } }").unwrap();
@@ -8453,7 +8612,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
     fn test_parse_import_dot_non_meta_is_error() {
         // `import.foo` is a SyntaxError — only `import.meta` is valid.
         let err = parse_module("import.foo").unwrap_err();
@@ -9640,7 +9798,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // NOTE: rest-only arrow params not yet supported
     fn test_arrow_rest_param() {
         parse("(...args) => args").unwrap();
     }
@@ -10275,6 +10432,25 @@ mod tests {
             assert!(en.source.is_some());
         } else {
             panic!("expected re-export with alias");
+        }
+    }
+
+    #[test]
+    fn test_re_export_named_with_string_literal_names() {
+        let prog =
+            parse_module("export { \"not an id\" as \"also not an id\" } from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[0] {
+            assert_eq!(en.specifiers.len(), 1);
+            assert!(matches!(
+                en.specifiers[0].local,
+                ModuleExportName::Str(ref s) if s.value == "\"not an id\""
+            ));
+            assert!(matches!(
+                en.specifiers[0].exported,
+                ModuleExportName::Str(ref s) if s.value == "\"also not an id\""
+            ));
+        } else {
+            panic!("expected re-export with string literal names");
         }
     }
 

@@ -576,7 +576,7 @@ public:
             stator_object_template_new(isolate ? isolate->raw() : nullptr);
         if (!raw)
             return Local<ObjectTemplate>();
-        return Local<ObjectTemplate>(new ObjectTemplate(raw));
+        return Local<ObjectTemplate>(new ObjectTemplate(raw, /*owned=*/true));
     }
 
     /// Set a named property on the template.
@@ -603,6 +603,16 @@ public:
         return raw_ ? stator_object_template_internal_field_count(raw_) : 0;
     }
 
+    /// Return the template used as this template's prototype object.
+    Local<ObjectTemplate> PrototypeTemplate() const {
+        StatorObjectTemplate *raw =
+            stator_object_template_prototype_template(raw_);
+        if (!raw)
+            return Local<ObjectTemplate>();
+        return Local<ObjectTemplate>(
+            new ObjectTemplate(raw, /*owned=*/false));
+    }
+
     /// Create a new object instance from this template.
     MaybeLocal<Object> NewInstance(Local<Context> context);
 
@@ -612,13 +622,16 @@ public:
     ObjectTemplate &operator=(const ObjectTemplate &) = delete;
 
     ~ObjectTemplate() noexcept {
-        if (raw_)
+        if (raw_ && owned_)
             stator_object_template_destroy(raw_);
     }
 
 private:
-    explicit ObjectTemplate(StatorObjectTemplate *raw) noexcept : raw_(raw) {}
+    friend class FunctionTemplate;
+    explicit ObjectTemplate(StatorObjectTemplate *raw, bool owned) noexcept
+        : raw_(raw), owned_(owned) {}
     StatorObjectTemplate *raw_;
+    bool                  owned_;
 };
 
 // ---------------------------------------------------------------------------
@@ -649,6 +662,32 @@ public:
         if (!v)
             return Local<Value>();
         return Local<Value>(new Value(v, /*owned=*/true));
+    }
+
+    /// Return the template used for own properties on DOM wrapper instances.
+    Local<ObjectTemplate> InstanceTemplate() const {
+        StatorObjectTemplate *raw =
+            stator_function_template_instance_template(raw_);
+        if (!raw)
+            return Local<ObjectTemplate>();
+        return Local<ObjectTemplate>(
+            new ObjectTemplate(raw, /*owned=*/false));
+    }
+
+    /// Return the template used for the DOM wrapper prototype object.
+    Local<ObjectTemplate> PrototypeTemplate() const {
+        StatorObjectTemplate *raw =
+            stator_function_template_prototype_template(raw_);
+        if (!raw)
+            return Local<ObjectTemplate>();
+        return Local<ObjectTemplate>(
+            new ObjectTemplate(raw, /*owned=*/false));
+    }
+
+    /// Snapshot parent template inheritance into this template.
+    void Inherit(Local<FunctionTemplate> parent) {
+        if (raw_ && parent)
+            stator_function_template_inherit(raw_, parent->raw());
     }
 
     StatorFunctionTemplate *raw() const noexcept { return raw_; }

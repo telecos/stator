@@ -26,6 +26,139 @@ event per successful lifecycle transition; repeated teardown is a no-op.
 Creating or destroying contexts with no attached inspector session is
 fail-closed and only updates the registry.
 
+## Inspector RemoteObject registry
+
+Each inspector session owns a per-session `RemoteObjectRegistry` that mints
+stable decimal `objectId` strings (`"1"`, `"2"`, ...) for every non-primitive
+[`JsValue`] surfaced through CDP. Primitive values (`undefined`, `null`,
+booleans, numbers, strings, BigInt, the internal `TheHole` sentinel) are
+serialised by value and **never** mint an `objectId`. Heap values
+(`PlainObject`, `Array`, `Function`, `NativeFunction`, `Error`, `Promise`,
+`Proxy`, `ArrayBuffer`, `TypedArray`, `DataView`, `Generator`, `Iterator`,
+`ModuleBinding`, raw `Object`, `Symbol`, `Context`) always do.
+
+`Runtime.evaluate` and `Runtime.callFunctionOn` honour the optional
+`objectGroup` parameter; every `RemoteObject` minted while producing the
+result inherits that group. `Runtime.getProperties` registers nested child
+values under the parent's group so that `Runtime.releaseObjectGroup`
+cascades.
+
+### Lifetime and identity
+
+- IDs are scoped to one CDP session. Two sessions never observe each other's
+  IDs, and an ID minted in session A always fails closed when used in
+  session B with a structured error.
+- IDs are monotonically increasing and never reused while live.
+- `Runtime.releaseObject` with an unknown or already-released ID returns a
+  structured error rather than silently succeeding, so embedders catch
+  double-release bugs early.
+- `Runtime.releaseObjectGroup` with an unknown group is a no-op success,
+  matching V8 inspector semantics.
+- Dropping the inspector session (and therefore the dispatcher) drops the
+  registry; no out-of-band cleanup is required.
+- The registry holds `JsValue` clones, which for heap variants is an `Rc`
+  bump — it does not introduce additional GC strong roots beyond the entry
+  itself.
+
+### `Runtime.getProperties` and preview coverage
+
+Stator's `Runtime.getProperties` returns own properties for the following
+shapes:
+
+| `JsValue` variant | Properties returned                                       |
+|-------------------|-----------------------------------------------------------|
+| `PlainObject`     | Every entry in insertion order with the engine's `writable` / `enumerable` / `configurable` attributes |
+| `Array`           | Indexed elements `0..n` followed by a non-enumerable, non-configurable `length` |
+| `Function`        | Synthetic `length` (parameter count) and `name`           |
+| `Error`           | No lazy own properties yet; preview exposes derived `name` / `message` |
+| Other heap classes (Promise, Proxy, ArrayBuffer, TypedArray, DataView, Generator, Iterator, NativeFunction, ModuleBinding, raw `Object`, `Context`) | Empty own-property list — DevTools renders the `className`/`description` from the RemoteObject payload |
+
+When `Runtime.evaluate` or `Runtime.callFunctionOn` receives
+`generatePreview: true`, Stator emits CDP `preview` objects for
+`PlainObject`, `Array`, `Function`, and `Error` results/exceptions. Previews
+are intentionally shallow: at most five properties are included, nested
+object previews stop after one level, and unsupported host/native values do
+not fabricate preview data. `customPreview` is not emitted.
+
+### `Runtime.ExceptionDetails` coverage
+
+`Runtime.evaluate` and `Runtime.callFunctionOn` surface parse/compile/runtime
+failures as successful CDP replies containing `exceptionDetails` plus an
+`undefined` result, matching DevTools' expected Runtime shape. Details use
+per-session monotonically increasing `exceptionId` values, include the
+requested `executionContextId`, report `lineNumber` / `columnNumber` as `0`
+unless source locations are available, and carry `url` when the request
+supplies `sourceURL` or a trailing `//# sourceURL=` comment.
+
+For uncaught JavaScript `throw` completions, the original thrown `JsValue` is
+also exposed as `exception` with the same RemoteObject/preview rules and
+object-group lifetime as normal results. Engine/parser errors that do not
+have a thrown JavaScript value omit `exception` rather than inventing one.
+Error stack strings are exposed as `stackTrace.description`; call frames are
+included only from the currently captured JavaScript call stack.
+
+Runtime-enabled sessions receive `Runtime.exceptionThrown` before the
+corresponding response. Sessions that have not sent `Runtime.enable` still
+receive `exceptionDetails` in the response but no event is queued. Stator has
+no exception-clearing lifecycle today, so `Runtime.exceptionRevoked` is not
+emitted.
+
+### CDP method coverage
+
+| Method                       | Behaviour                                          |
+|------------------------------|---------------------------------------------------|
+| `Runtime.evaluate`           | Returns `result`; failures return `exceptionDetails`. |
+| `Runtime.callFunctionOn`     | Returns `result`; failures return `exceptionDetails`. |
+| `Runtime.getProperties`      | Required `objectId`. Unknown/stale ID → error.    |
+| `Runtime.releaseObject`      | Required `objectId`. Unknown/stale ID → error.    |
+| `Runtime.releaseObjectGroup` | Required `objectGroup`. Unknown group → no-op OK. |
+| `Debugger.enable`/`disable`  | Toggles per-session domain state.                 |
+| `Debugger.setPauseOnExceptions` | `"none"`/`"uncaught"`/`"all"`; other values → typed error. Forwarded to the attached interpreter debugger (and cached so a debugger attached later inherits the chosen state). |
+| `Debugger.setBreakpointByUrl`| Returns a per-session breakpoint id with a single location. |
+| `Debugger.resume`            | Applies `Continue` to the attached debugger when there is an active pause; emits `Debugger.resumed`. Otherwise a silent no-op success so DevTools teardown does not error. |
+| `Debugger.stepInto`/`stepOver`/`stepOut` | Applies the matching step on the attached debugger and emits `Debugger.resumed`; typed error when no debugger is attached or no pause is active. |
+| `Debugger.pause`             | Fail-closed: synchronous interpreter cannot be interrupted. Use `debugger;` or `setBreakpointByUrl` instead. |
+| `Debugger.evaluateOnCallFrame` | Fail-closed: call-frame snapshots are not exposed through CDP yet. |
+| `Debugger.getScriptSource`/`getPossibleBreakpoints` | Fail-closed: not bridged through the dispatcher yet. |
+
+## Bridging interpreter Debugger pauses into CDP
+
+The in-process inspector owns a single `inspector::debugger::Debugger`
+instance — exposed to the embedder via `InProcessInspector::debugger()` and
+shared with every session's dispatcher. Embedders attach it to the
+interpreter with `interpreter::attach_debugger(inspector.debugger())` before
+calling `Interpreter::run`. When `Interpreter::run` returns
+`StatorError::DebuggerPaused`, the embedder calls
+`InProcessInspector::notify_paused()`, which emits one `Debugger.paused`
+event into every session that has sent `Debugger.enable`. Sessions without
+`Debugger.enable` receive nothing.
+
+The emitted `Debugger.paused` payload is intentionally conservative:
+
+- `reason` maps interpreter pause reasons onto CDP strings:
+  `DebuggerStatement` → `"debuggerStatement"`,
+  `Breakpoint` → `"other"` plus a populated `hitBreakpoints` array,
+  `Step` → `"other"`,
+  `Exception` → `"exception"`.
+- `callFrames` contains exactly one synthetic frame named
+  `(stator: paused-frame)` carrying the paused source line and bytecode
+  offset under `data.bytecodeOffset`/`data.pausedFrame`. The interpreter
+  does not retain a portable per-frame snapshot at pause time yet, so we
+  deliberately avoid fabricating multi-frame stacks or scope chains.
+- `Debugger.evaluateOnCallFrame` is fail-closed for the same reason; use
+  `Runtime.evaluate` while paused instead.
+
+`Debugger.resume`/`stepInto`/`stepOver`/`stepOut` drive the same shared
+debugger through `Debugger::apply_action`, and emit a matching
+`Debugger.resumed` event into the calling session. Embedders can also push
+`Debugger.resumed` explicitly through
+`InProcessInspector::notify_resumed()` after the embedder resumes
+execution out-of-band.
+
+No new FFI symbols are required — CDP requests/responses flow through the
+existing `stator_inspector_dispatch` and `stator_inspector_next_message`
+entry points.
+
 ## Tier-promotion latency counters
 
 ### Scope
@@ -408,6 +541,133 @@ snapshot with:
 
 If OSR counters are all zero while `true_osr_supported == false`, report the
 build as "no true OSR support" rather than "zero OSR churn".
+
+## JIT Control-Flow Guard / CET shadow-stack diagnostics
+
+### Scope
+
+Chromium/Edge ship with Windows Control-Flow Guard (CFG) enabled and
+rely on hardware CET shadow stacks plus Indirect Branch Tracking
+(`ENDBR64` prologues) on capable CPUs.  Any JIT-emitted executable
+region must comply with both mitigations: every valid indirect call
+target must be registered with the CFG bitmap
+(`SetProcessValidCallTargets`), and every indirect-call target must
+begin with `ENDBR64` so that CET does not trip on the first instruction.
+
+The `stator_jse::jit_mitigations` module exposes a release-safe,
+fail-closed diagnostic surface that reports — per JIT tier — whether
+the build currently has the metadata needed to perform either
+registration, and a process-level probe for the OS-side mitigation
+policy (`GetProcessMitigationPolicy`).
+
+The module deliberately does **not** call `SetProcessValidCallTargets`
+on behalf of any tier today: handing the OS an unverified target list
+would *claim* mitigation coverage we have not actually produced.  When
+a tier learns to emit a verified target list and CET-compatible
+prologues, flip [`JitMitigationsTier::cfg_supported`] /
+[`JitMitigationsTier::cet_compatible`] for that arm and route the
+registration through a new helper that performs the real OS call.
+
+### Current tier support matrix
+
+| Tier      | `cfg_supported` | `cet_compatible` | Notes |
+| --------- | --------------- | ---------------- | ----- |
+| Baseline  | **no**          | **no**           | Handcrafted `masm_x64` prologue/epilogue, no `ENDBR64`, no exported target list. |
+| Maglev    | **no**          | **no**           | Same in-tree assembler. |
+| Turbofan  | **no**          | **no**           | Reserved row; current Stator native backend is Cranelift. |
+| Cranelift | **no**          | **no**           | Standalone Cranelift code shares the JIT pool; targets are not enumerated and `ENDBR64` prologue emission is not yet wired in. |
+
+Until a tier flips an arm, [`jit_mitigations::record_cfg_registration`]
+returns `MitigationError::UnsupportedTier` (or
+`MitigationError::UnsupportedPlatform` off Windows) and bumps the
+fail-closed `cfg_unsupported_tier_attempts` counter.
+[`jit_mitigations::record_cet_page`] called with `compatible = true`
+still lands in the **incompatible** bucket while every tier reports
+`cet_compatible == false`.
+
+### Counters
+
+Per tier (Baseline / Maglev / Turbofan / Cranelift):
+
+| Field | Meaning |
+| ----- | ------- |
+| `cfg_supported` | Mirrors `JitMitigationsTier::cfg_supported`.  Currently always `false`. |
+| `cet_compatible` | Mirrors `JitMitigationsTier::cet_compatible`.  Currently always `false`. |
+| `cfg_register_attempts` | Every call into `record_cfg_registration`. |
+| `cfg_register_successes` | Calls that successfully delivered the target list to the OS (zero while every tier is `cfg_supported == false`). |
+| `cfg_register_failures` | Empty region / OS-rejected outcomes after the supported-tier check passed. |
+| `cfg_unsupported_tier_attempts` | Fail-closed sentinel: the platform or tier had no real registration backend. |
+| `cfg_targets_registered` | Sum of individual targets successfully registered. |
+| `cet_pages_marked_compatible` | JIT pages observed and verified CET-compatible. |
+| `cet_pages_marked_incompatible` | JIT pages observed CET-incompatible (also the fail-closed bucket for unverified claims). |
+
+Aggregate process-level fields:
+
+| Field | Meaning |
+| ----- | ------- |
+| `platform_supported` | Whether the build target is a Windows target.  Off Windows, every other status is `UnsupportedPlatform`. |
+| `process_cfg_status` | `GetProcessMitigationPolicy(ProcessControlFlowGuardPolicy)` result encoded as `STATOR_MITIGATION_STATUS_*`. |
+| `process_cet_shadow_stack_status` | `ProcessUserShadowStackPolicy`'s `EnableUserShadowStack` bit. |
+| `process_cet_user_shadow_stack_strict_status` | `ProcessUserShadowStackPolicy`'s strict-mode bit (only `Enabled` when both the base policy and strict mode are on). |
+
+The `STATOR_MITIGATION_STATUS_*` encoding (stable across the ABI
+minor):
+
+| Value | Constant | Meaning |
+| ----- | -------- | ------- |
+| 0 | `STATOR_MITIGATION_STATUS_UNSUPPORTED_PLATFORM` | Non-Windows build; mitigation does not apply. |
+| 1 | `STATOR_MITIGATION_STATUS_DISABLED` | OS confirms mitigation is off for this process. |
+| 2 | `STATOR_MITIGATION_STATUS_ENABLED` | OS confirms mitigation is on for this process. |
+| 3 | `STATOR_MITIGATION_STATUS_UNKNOWN` | Probe failed (e.g. pre-Win8 host or `GetProcessMitigationPolicy` error). |
+
+### Rust API
+
+```rust
+use stator_jse::jit_mitigations::{self, JitMitigationsTier, MitigationStatus};
+
+let snapshot = jit_mitigations::snapshot();
+assert!(!snapshot.tier(JitMitigationsTier::Baseline).cfg_supported);
+let unsupported = snapshot.total_cfg_unsupported_tier_attempts();
+let cfg_on = matches!(snapshot.process_cfg_status, MitigationStatus::Enabled);
+```
+
+### C FFI
+
+```c
+StatorJitMitigationsStats stats = {0};
+stator_isolate_reset_jit_mitigations_stats(NULL);
+/* ... run workload ... */
+stator_isolate_get_jit_mitigations_stats(NULL, &stats);
+if (!stats.platform_supported) {
+    /* Non-Windows build — CFG/CET do not apply. */
+}
+if (stats.process_cfg_status == STATOR_MITIGATION_STATUS_ENABLED &&
+    !stats.tiers[/*Baseline=*/0].cfg_supported) {
+    /* OS has CFG on but Stator's baseline tier does not yet register
+       its call targets — flag this in Edge crash diagnostics. */
+}
+```
+
+Both FFI calls accept a null `StatorIsolate*` because the counters are
+process-global.  Adding the symbol surface bumps the ABI minor version
+to 19 (additive, backwards-compatible).
+
+### Edge usage notes
+
+* Pair this snapshot with `stator_isolate_get_jit_unwind_stats` and
+  `stator_isolate_get_jit_memory_stats` to build a complete "is the
+  JIT compatible with Chromium/Windows exploit mitigations?" report.
+* A `process_cfg_status == Enabled` plus a tier with
+  `cfg_supported == false` is *not* a regression; it is the documented
+  state until a tier emits a CFG target list.  Edge crash triage
+  should treat it as "Stator JIT runs without CFG coverage" rather
+  than "CFG broke".
+* A monotonically growing `cfg_register_failures` while
+  `cfg_supported == true` for some tier indicates the OS is rejecting
+  registrations — escalate as an ABI/OS bug.
+* `cet_pages_marked_incompatible` will be non-zero on every workload
+  that hits the JIT today; that is expected until a tier emits
+  `ENDBR64` prologues and audited returns.
 
 ## Win64 JIT unwind registration counters
 

@@ -175,7 +175,7 @@ mod temporal_conformance_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
@@ -185,7 +185,10 @@ use crate::builtins::error::{
     call_stack_depth, pop_call_frame, push_call_frame, with_anon_call_frame,
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
-use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
+use crate::builtins::install_globals::create_bound_function_object;
+use crate::builtins::proxy::{
+    proxy_apply, proxy_get_with_receiver, proxy_has, proxy_set_with_receiver,
+};
 use crate::builtins::typed_array::{typed_array_get, typed_array_set};
 #[cfg(any(
     stator_maglev_jit_x86_64,
@@ -196,7 +199,8 @@ use crate::bytecode::bytecode_array::MaglevJitCodeCache;
 use crate::bytecode::bytecode_array::TurbofanJitCodeCache;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
-    MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
+    MAGLEV_TIERING_THRESHOLD, MappedArgumentAlias, MappedArgumentTarget, SuspendKind,
+    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 #[cfg(any(
@@ -347,6 +351,15 @@ thread_local! {
     static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
 
+    static CURRENT_CONSTRUCT_NEW_TARGET: RefCell<Option<JsValue>> = const { RefCell::new(None) };
+
+    static CURRENT_INTERPRETER_FRAME: Cell<*mut InterpreterFrame> =
+        const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_INTERPRETER_FRAMES: RefCell<Vec<*mut InterpreterFrame>> =
+        const { RefCell::new(Vec::new()) };
+    static CONTEXT_MAPPED_ARGUMENT_ALIASES: RefCell<Vec<ContextMappedArgumentAliasEntry>> =
+        const { RefCell::new(Vec::new()) };
+
     // Raw-pointer sentinel for the most-recently published global env.
     // Compared before touching `CURRENT_GLOBALS` or
     // `jit_runtime_set_global_env` to avoid Rc::clone + TLS borrow_mut
@@ -377,6 +390,70 @@ thread_local! {
     /// on a specific receiver instance.
     static BUILTIN_METHODS: RefCell<HashMap<&'static str, JsValue>> =
         RefCell::new(HashMap::with_capacity(8));
+
+    /// Global environments captured by functions created with the `Function`
+    /// constructor. Unlike ordinary closures, these functions always resolve
+    /// free names against the realm global environment, even when they are
+    /// called from inside direct eval.
+    static FUNCTION_GLOBAL_ENVS: RefCell<HashMap<usize, Rc<RefCell<GlobalEnv>>>> =
+        RefCell::new(HashMap::new());
+
+    /// Root global environment for `Function` constructor calls made while a
+    /// direct eval frame is running.
+    static FUNCTION_CONSTRUCTOR_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
+        const { RefCell::new(None) };
+}
+
+struct CurrentInterpreterFrameGuard {
+    frame: *mut InterpreterFrame,
+    previous: *mut InterpreterFrame,
+}
+
+impl CurrentInterpreterFrameGuard {
+    fn new(frame: *mut InterpreterFrame) -> Self {
+        let previous = CURRENT_INTERPRETER_FRAME.with(|current| {
+            let previous = current.get();
+            current.set(frame);
+            previous
+        });
+        CURRENT_INTERPRETER_FRAMES.with(|frames| frames.borrow_mut().push(frame));
+        Self { frame, previous }
+    }
+}
+
+impl Drop for CurrentInterpreterFrameGuard {
+    fn drop(&mut self) {
+        CURRENT_INTERPRETER_FRAME.with(|current| current.set(self.previous));
+        CURRENT_INTERPRETER_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            if frames.last().copied() == Some(self.frame) {
+                frames.pop();
+            } else {
+                debug_assert!(false, "interpreter frame stack out of order");
+                if let Some(pos) = frames.iter().rposition(|frame| *frame == self.frame) {
+                    frames.remove(pos);
+                }
+            }
+        });
+    }
+}
+
+/// Return the `new.target` currently visible to a native constructor callback.
+pub(crate) fn current_construct_new_target() -> Option<JsValue> {
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|new_target| new_target.borrow().clone())
+}
+
+fn with_current_construct_new_target<F>(new_target: &JsValue, f: F) -> StatorResult<JsValue>
+where
+    F: FnOnce() -> StatorResult<JsValue>,
+{
+    let previous =
+        CURRENT_CONSTRUCT_NEW_TARGET.with(|slot| slot.borrow_mut().replace(new_target.clone()));
+    let result = f();
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|slot| {
+        *slot.borrow_mut() = previous;
+    });
+    result
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -421,12 +498,15 @@ pub fn interned_string_count() -> usize {
 /// be called by test harnesses (e.g. Test262) after each test completes.
 pub fn clear_interpreter_state() {
     FUNCTION_PROPS.with(|fp| fp.borrow_mut().clear());
+    FUNCTION_GLOBAL_ENVS.with(|envs| envs.borrow_mut().clear());
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|env| *env.borrow_mut() = None);
     STRING_TABLE.with(|table| {
         *table.borrow_mut() = crate::objects::js_string::StringTable::new();
     });
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
     FRAME_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+    CURRENT_CONSTRUCT_NEW_TARGET.with(|new_target| *new_target.borrow_mut() = None);
     LAST_GLOBALS_PTR.with(|p| p.set(0));
     LAST_INSTALLED_GLOBALS_PTR.with(|p| p.set(0));
     PROTO_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -489,7 +569,7 @@ pub(super) fn default_async_generator_object_prototype() -> Option<JsValue> {
     })
 }
 
-fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
+pub(crate) fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
     state.borrow().prototype.clone().or_else(|| {
         if state.borrow().bytecode_array.is_async() {
             default_async_generator_object_prototype()
@@ -531,6 +611,21 @@ pub fn current_this() -> Option<JsValue> {
 /// Read a property using the interpreter's ordinary `[[Get]]` semantics.
 pub fn dispatch_get_property_value(obj: &JsValue, key: JsValue) -> StatorResult<JsValue> {
     keyed_load(obj, &key)
+}
+
+fn number_proto_to_fixed(n: f64, arg: Option<&JsValue>) -> StatorResult<JsValue> {
+    let digits = match arg {
+        None | Some(JsValue::Undefined) => 0.0,
+        Some(v) => v.to_integer_or_infinity()?,
+    };
+    if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
+        return Err(StatorError::RangeError(
+            "toFixed() digits argument must be between 0 and 100".into(),
+        ));
+    }
+    Ok(JsValue::String(
+        crate::builtins::number::number_to_fixed(n, digits as u32)?.into(),
+    ))
 }
 
 /// Shared implementation of `Number.prototype.toExponential(fractionDigits)`
@@ -654,6 +749,7 @@ pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
                     Some(proto)
                 }
             }),
+        JsValue::Array(_) => global_constructor_prototype("Array"),
         _ => None,
     }
 }
@@ -766,7 +862,7 @@ pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
                     if plain_object_has_own_property(&borrow, key) {
                         return true;
                     }
-                    borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
+                    plain_object_proto_value(&borrow)
                 };
                 match next {
                     Some(JsValue::Null) | Some(JsValue::Undefined) => return false,
@@ -789,6 +885,7 @@ pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
                     }
                 }
             }
+            JsValue::Proxy(p) => return proxy_has(&p.borrow(), key).unwrap_or(false),
             JsValue::Null | JsValue::Undefined => return false,
             _ => return !matches!(proto_lookup(&current, key), JsValue::Undefined),
         }
@@ -911,11 +1008,18 @@ pub fn with_debugger<R, F: FnOnce(&mut Debugger) -> R>(f: F) -> Option<R> {
 /// Uses the raw pointer of the inner `Rc<BytecodeArray>` allocation so that
 /// all clones of the same `Rc` share a single property bag.
 fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
-    Rc::as_ptr(ba) as usize
+    fn_props_key_from_ptr(Rc::as_ptr(ba))
+}
+
+fn fn_props_key_from_ptr(ba: *const BytecodeArray) -> usize {
+    ba as usize
 }
 
 /// Store a named property on a `Function` value's side-table entry.
 pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+    if name == "prototype" {
+        ba.clear_construct_proto_cache();
+    }
     ba.mark_has_fn_props();
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
@@ -937,6 +1041,48 @@ pub(crate) fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
             .and_then(|map| map.borrow().get(name).cloned())
             .unwrap_or(JsValue::Undefined)
     })
+}
+
+/// Capture the global environment a dynamically constructed function must use.
+pub(crate) fn fn_global_env_set(ba: &Rc<BytecodeArray>, env: Rc<RefCell<GlobalEnv>>) {
+    FUNCTION_GLOBAL_ENVS.with(|envs| {
+        envs.borrow_mut().insert(fn_props_key(ba), env);
+    });
+}
+
+fn fn_global_env_get(ba: &Rc<BytecodeArray>) -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_GLOBAL_ENVS.with(|envs| envs.borrow().get(&fn_props_key(ba)).cloned())
+}
+
+fn fn_global_env_get_ref(ba: &BytecodeArray) -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_GLOBAL_ENVS.with(|envs| {
+        envs.borrow()
+            .get(&fn_props_key_from_ptr(ba as *const BytecodeArray))
+            .cloned()
+    })
+}
+
+/// Return the global environment that `Function` constructor calls should
+/// capture in the current execution context.
+pub(crate) fn current_function_constructor_global_env() -> Option<Rc<RefCell<GlobalEnv>>> {
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|env| env.borrow().clone())
+}
+
+/// Run `f` while `Function` constructor calls capture `env` as their global.
+pub(crate) fn with_function_constructor_global_env<R>(
+    env: Rc<RefCell<GlobalEnv>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|slot| {
+        let previous = slot.borrow().clone();
+        *slot.borrow_mut() = Some(env);
+        previous
+    });
+    let result = f();
+    FUNCTION_CONSTRUCTOR_GLOBAL_ENV.with(|slot| {
+        *slot.borrow_mut() = previous;
+    });
+    result
 }
 
 pub(crate) fn function_display_name(value: &JsValue) -> String {
@@ -1086,7 +1232,7 @@ pub(super) fn set_pending_exception(val: JsValue) {
 }
 
 /// Take the pending thrown [`JsValue`], if any.
-pub(super) fn take_pending_exception() -> Option<JsValue> {
+pub(crate) fn take_pending_exception() -> Option<JsValue> {
     PENDING_EXCEPTION.with(|p| p.borrow_mut().take())
 }
 
@@ -1718,9 +1864,16 @@ impl TierRequestResult {
     }
 }
 
+fn tiering_blocked_by_tail_call(ba: &BytecodeArray) -> bool {
+    ba.contains_tail_call()
+}
+
 /// Observe whether `ba` has completed compilation for `tier`.
 #[must_use]
 pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     if ba.jit_disabled() {
         return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
     }
@@ -1791,11 +1944,15 @@ pub fn observe_tier(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
 /// are returned as structured statuses.
 #[must_use]
 pub fn force_tier_sync(ba: &BytecodeArray, tier: JitTier) -> TierRequestResult {
-    if ba.jit_disabled() {
-        return TierRequestResult::new(tier, TierRequestStatus::JitDisabled, false);
-    }
     let observed = observe_tier(ba, tier);
-    if observed.ready {
+    if observed.ready
+        || matches!(
+            observed.status,
+            TierRequestStatus::UnsupportedTier
+                | TierRequestStatus::JitDisabled
+                | TierRequestStatus::DeoptBlocked
+        )
+    {
         return observed;
     }
     match tier {
@@ -1892,6 +2049,9 @@ fn jsvalue_to_jit(v: &JsValue) -> i64 {
 /// and stores the cached executable code via [`BytecodeArray::store_jit_code`].
 /// On other platforms this is a no-op.
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(any(
         stator_baseline_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -1923,6 +2083,9 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
 
 fn force_baseline_sync(ba: &BytecodeArray) -> TierRequestResult {
     let tier = JitTier::Baseline;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     #[cfg(any(
         stator_baseline_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2065,6 +2228,9 @@ struct MaglevCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub fn maybe_compile_maglev(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2258,6 +2424,9 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     use crate::compiler::tier_latency::{PromotionTier, PromotionTimer};
 
     let tier = JitTier::Maglev;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     let timer = PromotionTimer::start(PromotionTier::Maglev);
     if ba.has_maglev_jit_code() || ba.has_maglev_executable_cached() {
         timer.discard();
@@ -2355,6 +2524,9 @@ fn force_maglev_sync(ba: &BytecodeArray) -> TierRequestResult {
     all(target_arch = "x86_64", any(unix, windows))
 ))]
 pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
+    if tiering_blocked_by_tail_call(ba) {
+        return false;
+    }
     force_maglev_sync(ba).ready
 }
 
@@ -2369,6 +2541,9 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
 fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -2531,6 +2706,9 @@ struct TurbofanCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
+    if tiering_blocked_by_tail_call(ba) {
+        return;
+    }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::bytecode::feedback::FeedbackVector;
@@ -2606,6 +2784,9 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 
 fn force_turbofan_sync(ba: &BytecodeArray) -> TierRequestResult {
     let tier = JitTier::Turbofan;
+    if tiering_blocked_by_tail_call(ba) {
+        return TierRequestResult::new(tier, TierRequestStatus::DeoptBlocked, false);
+    }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
@@ -2726,6 +2907,9 @@ pub(super) fn try_execute_best_jit(
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
     if DEBUG_ATTACHED.with(|f| f.get()) {
@@ -2748,6 +2932,9 @@ pub(super) fn try_execute_best_jit_no_result(
     args: &[JsValue],
 ) -> Option<StatorResult<()>> {
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
+    if tiering_blocked_by_tail_call(ba) {
+        return None;
+    }
     if DEBUG_ATTACHED.with(|f| f.get()) {
         return None;
     }
@@ -3024,6 +3211,7 @@ pub(super) fn acquire_frame(
     args: impl IntoIterator<Item = JsValue>,
     global_env: Rc<RefCell<GlobalEnv>>,
 ) -> InterpreterFrame {
+    let global_env = fn_global_env_get(&bytecode_array).unwrap_or(global_env);
     let maybe_frame = FRAME_POOL.with(|pool| pool.borrow_mut().pop());
 
     if let Some(mut frame) = maybe_frame {
@@ -3041,6 +3229,7 @@ pub(super) fn acquire_frame(
 
         frame.bytecode_array = bytecode_array;
         frame.call_args = args;
+        frame.mapped_arguments_aliases = None;
         frame.accumulator = JsValue::Undefined;
         frame.pc = 0;
         frame.context = None;
@@ -3085,6 +3274,7 @@ fn release_frame(mut frame: InterpreterFrame) {
     frame.accumulator = JsValue::Undefined;
     frame.context = None;
     frame.call_args.clear();
+    frame.mapped_arguments_aliases = None;
     frame.pending_message = JsValue::Undefined;
     frame.new_target = JsValue::Undefined;
     frame.suspend_result = None;
@@ -3566,6 +3756,316 @@ impl HotRegisters {
 // InterpreterFrame
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
+struct MappedArgumentsAliases {
+    object: Rc<RefCell<PropertyMap>>,
+    aliases: Vec<LiveMappedArgumentAlias>,
+}
+
+struct LiveMappedArgumentAlias {
+    argument_index: u32,
+    target: MappedArgumentTarget,
+    live: Rc<Cell<bool>>,
+}
+
+fn canonical_mapped_arguments_index(key: &str) -> Option<usize> {
+    if key.is_empty() {
+        return None;
+    }
+    if key == "0" {
+        return Some(0);
+    }
+    if key.starts_with('0') || !key.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    key.parse().ok()
+}
+
+pub(crate) fn notify_mapped_arguments_define_own_property(
+    object: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    descriptor: &PropertyMap,
+) {
+    let has_value = descriptor.contains_key("value");
+    let is_accessor_descriptor = descriptor.contains_key("get") || descriptor.contains_key("set");
+    let makes_non_writable = descriptor
+        .get("writable")
+        .is_some_and(|writable| !writable.to_boolean());
+
+    if !has_value && !is_accessor_descriptor && !makes_non_writable {
+        return;
+    }
+
+    if has_value {
+        notify_mapped_arguments_property_write(object, key);
+    }
+    if is_accessor_descriptor || makes_non_writable {
+        notify_mapped_arguments_property_delete(object, key);
+    }
+}
+
+pub(crate) fn notify_mapped_arguments_property_write(object: &Rc<RefCell<PropertyMap>>, key: &str) {
+    let Some(index) = canonical_mapped_arguments_index(key) else {
+        return;
+    };
+    let Some(value) = object.borrow().get(key).map(JsValue::cheap_clone) else {
+        return;
+    };
+
+    CURRENT_INTERPRETER_FRAMES.with(|frames| {
+        let frames = frames.borrow().clone();
+        for frame in frames.into_iter().rev().filter(|frame| !frame.is_null()) {
+            // SAFETY: `CURRENT_INTERPRETER_FRAMES` is maintained by
+            // `CurrentInterpreterFrameGuard` for nested `run_inner` calls on
+            // this thread. Each pointer remains valid until its guard drops,
+            // and frames are visited one at a time while the interpreter owns
+            // them exclusively.
+            let frame = unsafe { &mut *frame };
+            frame.sync_mapped_parameter_from_arguments_property(object, key);
+            if let Some(context) = frame.current_context_rc() {
+                sync_context_mapped_argument_from_arguments_property(
+                    &context, object, index, &value,
+                );
+            }
+        }
+    });
+    sync_registered_context_mapped_argument_aliases(object, index, &value);
+}
+
+pub(crate) fn notify_mapped_arguments_property_delete(
+    object: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+) {
+    let Some(index) = canonical_mapped_arguments_index(key) else {
+        return;
+    };
+
+    CURRENT_INTERPRETER_FRAMES.with(|frames| {
+        let frames = frames.borrow().clone();
+        for frame in frames.into_iter().rev().filter(|frame| !frame.is_null()) {
+            // SAFETY: `CURRENT_INTERPRETER_FRAMES` is maintained by
+            // `CurrentInterpreterFrameGuard` for nested `run_inner` calls on
+            // this thread. Each pointer remains valid until its guard drops,
+            // and frames are visited one at a time while the interpreter owns
+            // them exclusively.
+            let frame = unsafe { &mut *frame };
+            frame.sever_mapped_argument_alias(object, key);
+            if let Some(context) = frame.current_context_rc() {
+                sever_context_mapped_argument_alias(&context, object, index);
+            }
+        }
+    });
+    sever_registered_context_mapped_argument_aliases(object, index);
+}
+
+pub(crate) fn notify_mapped_arguments_freeze(object: &Rc<RefCell<PropertyMap>>) {
+    let mapped_keys = object
+        .borrow()
+        .keys()
+        .filter(|key| canonical_mapped_arguments_index(key).is_some())
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>();
+    for key in mapped_keys {
+        notify_mapped_arguments_property_delete(object, &key);
+    }
+}
+
+fn sync_context_mapped_argument_from_arguments_property(
+    start: &Rc<RefCell<crate::objects::value::JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+    value: &JsValue,
+) {
+    let mut current = Some(Rc::clone(start));
+    while let Some(context_rc) = current {
+        let (slot_indexes, parent) = {
+            let mut context = context_rc.borrow_mut();
+            let slot_indexes = context
+                .mapped_argument_aliases
+                .iter()
+                .filter(|alias| {
+                    alias.live.get()
+                        && alias.argument_index as usize == argument_index
+                        && Rc::ptr_eq(&alias.object, object)
+                })
+                .map(|alias| alias.slot_index)
+                .collect::<Vec<_>>();
+            for slot_index in &slot_indexes {
+                let slot = *slot_index as usize;
+                if slot >= context.slots.len() {
+                    context.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                context.slots[slot] = value.cheap_clone();
+            }
+            (slot_indexes, context.parent.clone())
+        };
+        for slot_index in slot_indexes {
+            sync_context_mapped_arguments(&context_rc, slot_index, value);
+        }
+        current = parent;
+    }
+}
+
+fn sever_context_mapped_argument_alias(
+    start: &Rc<RefCell<crate::objects::value::JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+) {
+    let mut current = Some(Rc::clone(start));
+    while let Some(context_rc) = current {
+        let parent = {
+            let mut context = context_rc.borrow_mut();
+            for alias in &mut context.mapped_argument_aliases {
+                if alias.argument_index as usize == argument_index
+                    && Rc::ptr_eq(&alias.object, object)
+                {
+                    alias.live.set(false);
+                }
+            }
+            context.parent.clone()
+        };
+        current = parent;
+    }
+}
+
+struct ContextMappedArgumentAliasEntry {
+    context: Weak<RefCell<JsContext>>,
+    object: Weak<RefCell<PropertyMap>>,
+    slot_index: u32,
+    argument_index: u32,
+    live: Weak<Cell<bool>>,
+}
+
+pub(super) fn register_context_mapped_argument_alias(
+    context: &Rc<RefCell<JsContext>>,
+    object: &Rc<RefCell<PropertyMap>>,
+    slot_index: u32,
+    argument_index: u32,
+    live: &Rc<Cell<bool>>,
+) {
+    CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|entry| {
+            entry.context.strong_count() > 0
+                && entry.object.strong_count() > 0
+                && entry.live.upgrade().is_some_and(|live| live.get())
+        });
+
+        let context = Rc::downgrade(context);
+        let object = Rc::downgrade(object);
+        let live = Rc::downgrade(live);
+        if registry.iter().any(|entry| {
+            entry.slot_index == slot_index
+                && entry.argument_index == argument_index
+                && entry.context.ptr_eq(&context)
+                && entry.object.ptr_eq(&object)
+        }) {
+            return;
+        }
+
+        registry.push(ContextMappedArgumentAliasEntry {
+            context,
+            object,
+            slot_index,
+            argument_index,
+            live,
+        });
+    });
+}
+
+fn sync_registered_context_mapped_argument_aliases(
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+    value: &JsValue,
+) {
+    let aliases = CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        let mut aliases = Vec::new();
+        registry.borrow_mut().retain(|entry| {
+            let Some(context) = entry.context.upgrade() else {
+                return false;
+            };
+            let Some(registered_object) = entry.object.upgrade() else {
+                return false;
+            };
+            let Some(live) = entry.live.upgrade() else {
+                return false;
+            };
+            if !live.get() {
+                return false;
+            }
+            if entry.argument_index as usize == argument_index
+                && Rc::ptr_eq(&registered_object, object)
+            {
+                aliases.push((context, entry.slot_index));
+            }
+            true
+        });
+        aliases
+    });
+
+    for (context, slot_index) in aliases {
+        {
+            let mut context = context.borrow_mut();
+            let slot = slot_index as usize;
+            if slot >= context.slots.len() {
+                context.slots.resize(slot + 1, JsValue::Undefined);
+            }
+            context.slots[slot] = value.cheap_clone();
+        }
+        sync_context_mapped_arguments(&context, slot_index, value);
+    }
+}
+
+fn sever_registered_context_mapped_argument_aliases(
+    object: &Rc<RefCell<PropertyMap>>,
+    argument_index: usize,
+) {
+    CONTEXT_MAPPED_ARGUMENT_ALIASES.with(|registry| {
+        registry.borrow_mut().retain(|entry| {
+            if entry.context.strong_count() == 0 {
+                return false;
+            }
+            let Some(registered_object) = entry.object.upgrade() else {
+                return false;
+            };
+            let Some(live) = entry.live.upgrade() else {
+                return false;
+            };
+            if !live.get() {
+                return false;
+            }
+            if entry.argument_index as usize == argument_index
+                && Rc::ptr_eq(&registered_object, object)
+            {
+                live.set(false);
+                return false;
+            }
+            true
+        });
+    });
+}
+
+fn sync_context_mapped_arguments(
+    context: &Rc<RefCell<crate::objects::value::JsContext>>,
+    slot_index: u32,
+    value: &JsValue,
+) {
+    let aliases = {
+        let context = context.borrow();
+        context
+            .mapped_argument_aliases
+            .iter()
+            .filter(|alias| alias.live.get() && alias.slot_index == slot_index)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for alias in aliases {
+        alias
+            .object
+            .borrow_mut()
+            .insert(alias.argument_index.to_string(), value.cheap_clone());
+    }
+}
+
 /// A single activation frame for the Stator bytecode interpreter.
 ///
 /// The frame owns:
@@ -3584,6 +4084,7 @@ pub struct InterpreterFrame {
     /// Full argument list supplied to the current call, including extras beyond
     /// the formal parameter count.
     pub call_args: CallArgs,
+    mapped_arguments_aliases: Option<MappedArgumentsAliases>,
     /// The implicit accumulator register used by most instructions.
     pub accumulator: JsValue,
     /// Program counter: index of the *next* instruction to execute in the
@@ -3690,6 +4191,137 @@ fn fxhash(s: &str) -> u64 {
     h
 }
 
+pub(super) fn bind_no_receiver_this(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    is_strict: bool,
+) -> Option<JsValue> {
+    let old = global_env.borrow().get_this().cloned();
+    let this_value = if is_strict {
+        JsValue::Undefined
+    } else {
+        global_env
+            .borrow()
+            .get("globalThis")
+            .cloned()
+            .unwrap_or(JsValue::Undefined)
+    };
+    global_env.borrow_mut().set_this(this_value);
+    old
+}
+
+pub(super) fn restore_no_receiver_this(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    saved_this: Option<JsValue>,
+) {
+    match saved_this {
+        Some(value) => global_env.borrow_mut().set_this(value),
+        None => global_env.borrow_mut().remove_this(),
+    }
+}
+
+fn effective_call_global_env(
+    ba: &Rc<BytecodeArray>,
+    fallback: &Rc<RefCell<GlobalEnv>>,
+) -> Rc<RefCell<GlobalEnv>> {
+    fn_global_env_get(ba).unwrap_or_else(|| Rc::clone(fallback))
+}
+
+fn global_this_from_env(global_env: &Rc<RefCell<GlobalEnv>>) -> JsValue {
+    global_env
+        .borrow()
+        .get("globalThis")
+        .cloned()
+        .unwrap_or(JsValue::Undefined)
+}
+
+fn fresh_global_env_rc() -> Rc<RefCell<GlobalEnv>> {
+    let mut global_env = GlobalEnv::new();
+    crate::builtins::install_globals::install_globals(&mut global_env.vars);
+    global_env.rebuild_slots();
+    global_env.globals_installed = true;
+    Rc::new(RefCell::new(global_env))
+}
+
+fn lexical_this_binding(ba: &Rc<BytecodeArray>) -> Option<JsValue> {
+    if ba.is_arrow() && ba.has_fn_props() {
+        Some(fn_props_get(ba, ".this"))
+    } else {
+        None
+    }
+}
+
+fn lexical_new_target(ba: &Rc<BytecodeArray>) -> JsValue {
+    if ba.is_arrow() && ba.has_fn_props() {
+        fn_props_get(ba, ".new_target")
+    } else {
+        JsValue::Undefined
+    }
+}
+
+pub(super) fn no_receiver_activation_this(
+    ba: &Rc<BytecodeArray>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Option<JsValue> {
+    lexical_this_binding(ba).or_else(|| {
+        Some(if ba.is_strict() {
+            JsValue::Undefined
+        } else {
+            global_this_from_env(global_env)
+        })
+    })
+}
+
+pub(super) fn receiver_activation_this(
+    ba: &Rc<BytecodeArray>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    this_val: JsValue,
+) -> Option<JsValue> {
+    lexical_this_binding(ba).or_else(|| {
+        Some(if !ba.is_strict() && this_val.is_nullish() {
+            global_this_from_env(global_env)
+        } else {
+            this_val
+        })
+    })
+}
+
+pub(super) fn make_generator_no_receiver_activation(
+    ba: &Rc<BytecodeArray>,
+    args: CallArgs,
+    caller_global_env: &Rc<RefCell<GlobalEnv>>,
+) -> JsValue {
+    let global_env = effective_call_global_env(ba, caller_global_env);
+    let this_binding = no_receiver_activation_this(ba, &global_env);
+    let state = GeneratorState::with_activation(
+        Rc::clone(ba),
+        args,
+        global_env,
+        this_binding,
+        lexical_new_target(ba),
+    );
+    init_generator_state_prototype(&state, ba);
+    JsValue::Generator(state)
+}
+
+pub(super) fn make_generator_with_receiver_activation(
+    ba: &Rc<BytecodeArray>,
+    args: CallArgs,
+    caller_global_env: &Rc<RefCell<GlobalEnv>>,
+    this_val: JsValue,
+) -> JsValue {
+    let global_env = effective_call_global_env(ba, caller_global_env);
+    let this_binding = receiver_activation_this(ba, &global_env, this_val);
+    let state = GeneratorState::with_activation(
+        Rc::clone(ba),
+        args,
+        global_env,
+        this_binding,
+        lexical_new_target(ba),
+    );
+    init_generator_state_prototype(&state, ba);
+    JsValue::Generator(state)
+}
+
 impl InterpreterFrame {
     /// Create a new frame for the given [`BytecodeArray`], pre-loading `args`
     /// into the parameter registers.
@@ -3714,6 +4346,7 @@ impl InterpreterFrame {
             bytecode_array,
             registers,
             call_args: args,
+            mapped_arguments_aliases: None,
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
@@ -3812,6 +4445,7 @@ impl InterpreterFrame {
             bytecode_array,
             registers,
             call_args: args,
+            mapped_arguments_aliases: None,
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
@@ -3837,6 +4471,224 @@ impl InterpreterFrame {
             hot_registers: None,
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
+        }
+    }
+
+    pub(super) fn install_mapped_arguments_aliases(
+        &mut self,
+        object: Rc<RefCell<PropertyMap>>,
+        alias_metadata: &[MappedArgumentAlias],
+    ) {
+        if alias_metadata.is_empty() {
+            self.mapped_arguments_aliases = None;
+            return;
+        }
+        let mut aliases = Vec::with_capacity(alias_metadata.len());
+        {
+            let mut object = object.borrow_mut();
+            for metadata in alias_metadata {
+                if !object.contains_key(&metadata.argument_index.to_string()) {
+                    continue;
+                }
+                let value = match metadata.target {
+                    MappedArgumentTarget::Register(register) => self
+                        .registers
+                        .get(register as usize)
+                        .map(JsValue::cheap_clone)
+                        .unwrap_or(JsValue::Undefined),
+                    MappedArgumentTarget::CurrentContextSlot(slot) => self
+                        .current_context_slot_value(slot)
+                        .unwrap_or(JsValue::Undefined),
+                };
+                object.insert(metadata.argument_index.to_string(), value);
+                aliases.push(LiveMappedArgumentAlias {
+                    argument_index: metadata.argument_index,
+                    target: metadata.target.clone(),
+                    live: Rc::new(Cell::new(true)),
+                });
+            }
+        }
+        self.mapped_arguments_aliases = Some(MappedArgumentsAliases { object, aliases });
+    }
+
+    #[inline]
+    pub(super) fn clear_mapped_arguments_aliases(&mut self) {
+        self.mapped_arguments_aliases = None;
+    }
+
+    pub(super) fn is_mapped_arguments_object(&self, object: &Rc<RefCell<PropertyMap>>) -> bool {
+        self.mapped_arguments_aliases
+            .as_ref()
+            .is_some_and(|aliases| Rc::ptr_eq(&aliases.object, object))
+    }
+
+    fn sync_mapped_argument_from_parameter_index(&mut self, index: usize) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        let Some(value) = self.registers.get(index).map(JsValue::cheap_clone) else {
+            return;
+        };
+        let mut object = aliases.object.borrow_mut();
+        for alias in aliases.aliases.iter().filter(|alias| {
+            alias.live.get() && alias.target == MappedArgumentTarget::Register(index as u32)
+        }) {
+            object.insert(alias.argument_index.to_string(), value.cheap_clone());
+        }
+    }
+
+    fn current_context_slot_value(&self, slot: u32) -> Option<JsValue> {
+        let JsValue::Context(context) = self.context.as_ref()? else {
+            return None;
+        };
+        context
+            .borrow()
+            .slots
+            .get(slot as usize)
+            .map(JsValue::cheap_clone)
+    }
+
+    fn current_context_rc(&self) -> Option<Rc<RefCell<crate::objects::value::JsContext>>> {
+        let JsValue::Context(context) = self.context.as_ref()? else {
+            return None;
+        };
+        Some(Rc::clone(context))
+    }
+
+    fn install_context_mapped_argument_aliases(
+        &self,
+        object: &Rc<RefCell<PropertyMap>>,
+        aliases: &[LiveMappedArgumentAlias],
+    ) {
+        let Some(context_rc) = self.current_context_rc() else {
+            return;
+        };
+        let mut context = context_rc.borrow_mut();
+        for alias in aliases {
+            if let MappedArgumentTarget::CurrentContextSlot(slot_index) = &alias.target {
+                if context.mapped_argument_aliases.iter().any(|existing| {
+                    existing.slot_index == *slot_index
+                        && existing.argument_index == alias.argument_index
+                        && Rc::ptr_eq(&existing.object, object)
+                }) {
+                    continue;
+                }
+                context.mapped_argument_aliases.push(
+                    crate::objects::value::JsContextMappedArgumentAlias {
+                        slot_index: *slot_index,
+                        argument_index: alias.argument_index,
+                        object: Rc::clone(object),
+                        live: Rc::clone(&alias.live),
+                    },
+                );
+                register_context_mapped_argument_alias(
+                    &context_rc,
+                    object,
+                    *slot_index,
+                    alias.argument_index,
+                    &alias.live,
+                );
+            }
+        }
+    }
+
+    pub(super) fn install_mapped_arguments_aliases_for_current_context(&self) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        self.install_context_mapped_argument_aliases(&aliases.object, &aliases.aliases);
+    }
+
+    pub(super) fn sync_mapped_arguments_from_context_slot(
+        &self,
+        context: &Rc<RefCell<crate::objects::value::JsContext>>,
+        slot_index: u32,
+        value: &JsValue,
+    ) {
+        sync_context_mapped_arguments(context, slot_index, value);
+    }
+
+    pub(super) fn sync_mapped_parameter_from_arguments_property(
+        &mut self,
+        object: &Rc<RefCell<PropertyMap>>,
+        key: &str,
+    ) {
+        let Some(aliases) = &self.mapped_arguments_aliases else {
+            return;
+        };
+        if !Rc::ptr_eq(&aliases.object, object) {
+            return;
+        }
+        let Some(index) = canonical_mapped_arguments_index(key) else {
+            return;
+        };
+        let Some(alias) = aliases
+            .aliases
+            .iter()
+            .find(|alias| alias.live.get() && alias.argument_index as usize == index)
+        else {
+            return;
+        };
+        let target = alias.target.clone();
+        let Some(value) = object.borrow().get(key).map(JsValue::cheap_clone) else {
+            return;
+        };
+        match target {
+            MappedArgumentTarget::Register(register_index) => {
+                if let Some(register) = self.registers.get_mut(register_index as usize) {
+                    *register = value;
+                }
+            }
+            MappedArgumentTarget::CurrentContextSlot(slot_index) => {
+                if let Some(context) = self.current_context_rc() {
+                    {
+                        let mut context = context.borrow_mut();
+                        let slot = slot_index as usize;
+                        if slot >= context.slots.len() {
+                            context.slots.resize(slot + 1, JsValue::Undefined);
+                        }
+                        context.slots[slot] = value.cheap_clone();
+                    }
+                    sync_context_mapped_arguments(&context, slot_index, &value);
+                }
+            }
+        }
+    }
+
+    pub(super) fn sever_mapped_argument_alias(
+        &mut self,
+        object: &Rc<RefCell<PropertyMap>>,
+        key: &str,
+    ) {
+        let current_context = self.current_context_rc();
+        let Some(aliases) = &mut self.mapped_arguments_aliases else {
+            return;
+        };
+        if !Rc::ptr_eq(&aliases.object, object) {
+            return;
+        }
+        let Some(index) = canonical_mapped_arguments_index(key) else {
+            return;
+        };
+        for alias in aliases
+            .aliases
+            .iter_mut()
+            .filter(|alias| alias.argument_index as usize == index)
+        {
+            alias.live.set(false);
+            if let MappedArgumentTarget::CurrentContextSlot(slot_index) = &alias.target
+                && let Some(context) = current_context.as_ref()
+            {
+                let mut context = context.borrow_mut();
+                for context_alias in &mut context.mapped_argument_aliases {
+                    if Rc::ptr_eq(&context_alias.object, object)
+                        && context_alias.argument_index as usize == index
+                        && context_alias.slot_index == *slot_index
+                    {
+                        context_alias.live.set(false);
+                    }
+                }
+            }
         }
     }
 
@@ -3991,6 +4843,7 @@ impl InterpreterFrame {
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
+        self.sync_mapped_argument_from_parameter_index(idx);
         Ok(())
     }
 
@@ -4011,6 +4864,7 @@ impl InterpreterFrame {
         debug_assert!(idx < self.registers.len());
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
+        self.sync_mapped_argument_from_parameter_index(idx);
     }
 
     /// Replace the register value and return the old one, without bounds
@@ -4032,7 +4886,9 @@ impl InterpreterFrame {
         };
         debug_assert!(idx < self.registers.len());
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
-        std::mem::replace(unsafe { self.registers.get_unchecked_mut(idx) }, value)
+        let old = std::mem::replace(unsafe { self.registers.get_unchecked_mut(idx) }, value);
+        self.sync_mapped_argument_from_parameter_index(idx);
+        old
     }
 
     /// Copy a value from register `src` to register `dst` directly,
@@ -4045,6 +4901,7 @@ impl InterpreterFrame {
         if src_idx != dst_idx {
             let val = self.registers[src_idx].cheap_clone();
             self.registers[dst_idx] = val;
+            self.sync_mapped_argument_from_parameter_index(dst_idx);
         }
         Ok(())
     }
@@ -4188,7 +5045,15 @@ impl InterpreterFrame {
 
         // Cache miss — single borrow to read value + generation together.
         let env = self.global_env.borrow();
-        let value = env.get(name).cloned().unwrap_or(JsValue::Undefined);
+        let value = match env.get(name).cloned() {
+            Some(value) => value,
+            None if name == "this" => JsValue::Undefined,
+            None => {
+                return Err(StatorError::ReferenceError(format!(
+                    "{name} is not defined"
+                )));
+            }
+        };
         let current_gen = env.generation();
         drop(env);
         self.cache_generation = current_gen;
@@ -4356,7 +5221,7 @@ impl Interpreter {
 
     /// Run a callee frame, skipping the `CURRENT_GLOBALS` TLS check when the
     /// caller guarantees the environment is already published.
-    pub(super) fn run_same_env(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+    pub(crate) fn run_same_env(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
         Self::run_inner(frame, true)
     }
 
@@ -4480,56 +5345,64 @@ impl Interpreter {
         )))]
         let _ = inv_count;
 
-        let result = (|| {
-            if skip_globals {
-                // Caller guarantees CURRENT_GLOBALS is already published.
-            } else {
-                // Fast pointer comparison: skip all Rc cloning and TLS
-                // mutations when the global env is unchanged from the last
-                // run_inner call on this thread.
-                let env_ptr = Rc::as_ptr(&frame.global_env) as usize;
-                let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
-                if env_ptr != cached_ptr {
-                    LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
-                    CURRENT_GLOBALS.with(|g| {
-                        *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                    });
-                    #[cfg(any(
-                        stator_baseline_jit_x86_64,
-                        all(target_arch = "x86_64", any(unix, windows))
-                    ))]
-                    {
-                        use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
-                        jit_runtime_set_global_env(frame.global_env.clone());
+        let result = {
+            let _current_frame = CurrentInterpreterFrameGuard::new(frame as *mut InterpreterFrame);
+            (|| {
+                if skip_globals {
+                    // Caller guarantees CURRENT_GLOBALS is already published.
+                } else {
+                    // Fast pointer comparison: skip all Rc cloning and TLS
+                    // mutations when the global env is unchanged from the last
+                    // run_inner call on this thread.
+                    let env_ptr = Rc::as_ptr(&frame.global_env) as usize;
+                    let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
+                    if env_ptr != cached_ptr {
+                        LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
+                        CURRENT_GLOBALS.with(|g| {
+                            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                        });
+                        #[cfg(any(
+                            stator_baseline_jit_x86_64,
+                            all(target_arch = "x86_64", any(unix, windows))
+                        ))]
+                        {
+                            use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+                            jit_runtime_set_global_env(frame.global_env.clone());
+                        }
                     }
                 }
-            }
-            if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
-                return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
-            }
+                if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
+                    return Self::run_async_function_no_receiver(
+                        frame.bytecode_array.clone(),
+                        frame.call_args.clone(),
+                        Rc::clone(&frame.global_env),
+                    );
+                }
 
-            // JIT fast-path: attempt JIT execution BEFORE the stacker closure
-            // boundary.  Previously the JIT check lived only inside
-            // `run_dispatch`, reached through `stacker::maybe_grow`.  On
-            // Linux x86-64 the stacker closure prevented the JIT entry from
-            // being reached during Criterion measurement for all benchmarks
-            // except `fib_40` (the only one where Maglev never deopted).
-            // Moving the check here ensures `try_execute_best_jit` is always
-            // called, regardless of stack-growth mechanics.
-            if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-            {
-                return jit_result;
-            }
+                // JIT fast-path: attempt JIT execution BEFORE the stacker closure
+                // boundary.  Previously the JIT check lived only inside
+                // `run_dispatch`, reached through `stacker::maybe_grow`.  On
+                // Linux x86-64 the stacker closure prevented the JIT entry from
+                // being reached during Criterion measurement for all benchmarks
+                // except `fib_40` (the only one where Maglev never deopted).
+                // Moving the check here ensures `try_execute_best_jit` is always
+                // called, regardless of stack-growth mechanics.
+                if let Some(jit_result) =
+                    try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                {
+                    return jit_result;
+                }
 
-            // run_callee() handles the stacker guard for deep recursion.
-            // Top-level calls (via `run()`) also need it.
-            if skip_globals {
-                // Nested call: run_callee already guarded the stack.
-                Self::run_dispatch(frame)
-            } else {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
-            }
-        })();
+                // run_callee() handles the stacker guard for deep recursion.
+                // Top-level calls (via `run()`) also need it.
+                if skip_globals {
+                    // Nested call: run_callee already guarded the stack.
+                    Self::run_dispatch(frame)
+                } else {
+                    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
+                }
+            })()
+        };
         // Write back the per-frame IC state to the shared BytecodeArray cache
         // so that subsequent invocations of the same function start warm.
         if let Some(ic) = frame.mega_load_ic.take() {
@@ -4628,8 +5501,15 @@ impl Interpreter {
                     let current_offset = byte_offsets[pc] as u32;
                     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                         let opt = d.borrow();
-                        opt.as_ref()
-                            .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+                        opt.as_ref().and_then(|rc| {
+                            let mut debugger = rc.borrow_mut();
+                            debugger.apply_pending_frame_mutations(frame, &mut acc);
+                            debugger.check_pause_at_with_frame(current_offset, || {
+                                crate::inspector::debugger::PauseFrameSnapshot::from_frame(
+                                    frame, &acc,
+                                )
+                            })
+                        })
                     }) {
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -6910,6 +7790,8 @@ impl Interpreter {
 
                                     // Try inline BEFORE any Rc clones.
                                     if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !func_ba.is_strict()
+                                        && !frame.bytecode_array.is_strict()
                                         && !func_ba.has_exception_handler()
                                         && let Some(result) = try_inline_small_function(
                                             func_ba,
@@ -6955,10 +7837,8 @@ impl Interpreter {
                                     let ba = Rc::clone(func_rc);
                                     frame.pc = pc;
 
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7007,15 +7887,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -7088,11 +7961,14 @@ impl Interpreter {
                                         let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }
                                             .cheap_clone();
                                         let inline_args = [arg1];
-                                        if let Some(result) = try_inline_small_function(
-                                            ba,
-                                            &inline_args,
-                                            &frame.global_env,
-                                        ) {
+                                        if !ba.is_strict()
+                                            && !frame.bytecode_array.is_strict()
+                                            && let Some(result) = try_inline_small_function(
+                                                ba,
+                                                &inline_args,
+                                                &frame.global_env,
+                                            )
+                                        {
                                             match result {
                                                 JsValue::Smi(v) => {
                                                     sa = v;
@@ -7119,10 +7995,8 @@ impl Interpreter {
                                     // Only sync the PC for error traces.
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1];
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7163,15 +8037,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -7228,10 +8095,8 @@ impl Interpreter {
                                         unsafe { frame.read_reg_unchecked(arg2_reg) }.cheap_clone();
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1, arg2];
-                                    let saved_this = if !is_arrow && is_strict {
-                                        let old = frame.global_env.borrow().get_this().cloned();
-                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                        old
+                                    let saved_this = if !is_arrow {
+                                        bind_no_receiver_this(&frame.global_env, is_strict)
                                     } else {
                                         None
                                     };
@@ -7267,15 +8132,8 @@ impl Interpreter {
                                     {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !is_arrow && is_strict {
-                                        match saved_this {
-                                            Some(v) => {
-                                                frame.global_env.borrow_mut().set_this(v);
-                                            }
-                                            None => {
-                                                frame.global_env.borrow_mut().remove_this();
-                                            }
-                                        }
+                                    if !is_arrow {
+                                        restore_no_receiver_this(&frame.global_env, saved_this);
                                     }
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
@@ -7771,7 +8629,14 @@ impl Interpreter {
                                     if depth == 0 {
                                         let mut borrow = ctx_rc.borrow_mut();
                                         if slot < borrow.slots.len() {
-                                            borrow.slots[slot] = materialize_acc!();
+                                            let value = materialize_acc!();
+                                            borrow.slots[slot] = value.cheap_clone();
+                                            drop(borrow);
+                                            frame.sync_mapped_arguments_from_context_slot(
+                                                ctx_rc,
+                                                slot as u32,
+                                                &value,
+                                            );
                                             continue 'smi;
                                         }
                                     } else {
@@ -7792,7 +8657,14 @@ impl Interpreter {
                                         }
                                         let mut borrow = current.borrow_mut();
                                         if slot < borrow.slots.len() {
-                                            borrow.slots[slot] = materialize_acc!();
+                                            let value = materialize_acc!();
+                                            borrow.slots[slot] = value.cheap_clone();
+                                            drop(borrow);
+                                            frame.sync_mapped_arguments_from_context_slot(
+                                                &current,
+                                                slot as u32,
+                                                &value,
+                                            );
                                             continue 'smi;
                                         }
                                     }
@@ -7847,17 +8719,25 @@ impl Interpreter {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
-                                    let mut borrow = ctx_rc.borrow_mut();
-                                    if slot >= borrow.slots.len() {
-                                        borrow.slots.resize(slot + 1, JsValue::Undefined);
+                                    let value = materialize_acc!();
+                                    {
+                                        let mut borrow = ctx_rc.borrow_mut();
+                                        if slot >= borrow.slots.len() {
+                                            borrow.slots.resize(slot + 1, JsValue::Undefined);
+                                        }
+                                        let old_val = std::mem::replace(
+                                            &mut borrow.slots[slot],
+                                            value.cheap_clone(),
+                                        );
+                                        if let JsValue::PlainObject(rc) = old_val {
+                                            recycle_object_rc(rc);
+                                        }
                                     }
-                                    let old_val = std::mem::replace(
-                                        &mut borrow.slots[slot],
-                                        materialize_acc!(),
+                                    frame.sync_mapped_arguments_from_context_slot(
+                                        ctx_rc,
+                                        slot as u32,
+                                        &value,
                                     );
-                                    if let JsValue::PlainObject(rc) = old_val {
-                                        recycle_object_rc(rc);
-                                    }
                                     continue 'smi;
                                 }
                                 acc = materialize_acc!();
@@ -8818,11 +9698,14 @@ impl Interpreter {
                                                 }
                                             }
                                             // Fall back to full pattern match.
-                                            if let Some(result) = try_inline_small_function(
-                                                func_ba,
-                                                &[],
-                                                &frame.global_env,
-                                            ) {
+                                            if !func_ba.is_strict()
+                                                && !frame.bytecode_array.is_strict()
+                                                && let Some(result) = try_inline_small_function(
+                                                    func_ba,
+                                                    &[],
+                                                    &frame.global_env,
+                                                )
+                                            {
                                                 match result {
                                                     JsValue::Smi(v) => {
                                                         sa = v;
@@ -10749,9 +11632,6 @@ impl Interpreter {
                                 }
                                 _ => {}
                             }
-                            let result = abstract_eq(&acc, rhs);
-                            acc = JsValue::Boolean(result);
-                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -10867,9 +11747,6 @@ impl Interpreter {
                                 }
                                 _ => {}
                             }
-                            let result = abstract_eq(&acc, rhs);
-                            acc = JsValue::Boolean(!result);
-                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -11241,7 +12118,12 @@ impl Interpreter {
                                     {
                                         drop(pm);
                                         let val = acc.cheap_clone();
-                                        map_rc.borrow_mut().set_by_offset(offset, val);
+                                        map_rc.borrow_mut().set_by_offset(offset, val.clone());
+                                        sync_global_object_property_store(
+                                            &map_rc,
+                                            key_str.as_str(),
+                                            val,
+                                        );
                                         continue 'dispatch;
                                     }
                                 }
@@ -11455,16 +12337,19 @@ impl Interpreter {
                         if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
-                            let mut borrowed = js_ctx.borrow_mut();
                             let slot = slot_idx as usize;
-                            if slot >= borrowed.slots.len() {
-                                borrowed.slots.resize(slot + 1, JsValue::Undefined);
+                            {
+                                let mut borrowed = js_ctx.borrow_mut();
+                                if slot >= borrowed.slots.len() {
+                                    borrowed.slots.resize(slot + 1, JsValue::Undefined);
+                                }
+                                let old_val =
+                                    std::mem::replace(&mut borrowed.slots[slot], acc.cheap_clone());
+                                if let JsValue::PlainObject(rc) = old_val {
+                                    recycle_object_rc(rc);
+                                }
                             }
-                            let old_val =
-                                std::mem::replace(&mut borrowed.slots[slot], acc.cheap_clone());
-                            if let JsValue::PlainObject(rc) = old_val {
-                                recycle_object_rc(rc);
-                            }
+                            frame.sync_mapped_arguments_from_context_slot(js_ctx, slot_idx, &acc);
                             continue 'dispatch;
                         }
                         // Fall through to table dispatch.
@@ -11527,6 +12412,7 @@ impl Interpreter {
                             // refcount bump when the function is small enough
                             // to be inlined.
                             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !is_strict
                                 && !ba.has_exception_handler()
                                 && let Some(result) =
                                     try_inline_small_function(ba, &[], &frame.global_env)
@@ -11538,10 +12424,8 @@ impl Interpreter {
                             let ba = Rc::clone(ba);
                             frame.pc = pc;
 
-                            let saved_this = if !is_arrow && is_strict {
-                                let old = frame.global_env.borrow().get_this().cloned();
-                                frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                old
+                            let saved_this = if !is_arrow {
+                                bind_no_receiver_this(&frame.global_env, is_strict)
                             } else {
                                 None
                             };
@@ -11587,15 +12471,8 @@ impl Interpreter {
                             {
                                 frame.global_cache_invalidate();
                             }
-                            if !is_arrow && is_strict {
-                                match saved_this {
-                                    Some(v) => {
-                                        frame.global_env.borrow_mut().set_this(v);
-                                    }
-                                    None => {
-                                        frame.global_env.borrow_mut().remove_this();
-                                    }
-                                }
+                            if !is_arrow {
+                                restore_no_receiver_this(&frame.global_env, saved_this);
                             }
                             match result {
                                 Ok(v) => {
@@ -11690,6 +12567,7 @@ impl Interpreter {
                             let arg_ptr =
                                 unsafe { frame.read_reg_unchecked(arg_reg) } as *const JsValue;
                             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !is_strict
                                 && !ba.has_exception_handler()
                                 && let Some(result) = try_inline_small_function(
                                     ba,
@@ -11704,10 +12582,8 @@ impl Interpreter {
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             frame.pc = pc;
-                            let saved_this = if !is_arrow && is_strict {
-                                let old = frame.global_env.borrow().get_this().cloned();
-                                frame.global_env.borrow_mut().set_this(JsValue::Undefined);
-                                old
+                            let saved_this = if !is_arrow {
+                                bind_no_receiver_this(&frame.global_env, is_strict)
                             } else {
                                 None
                             };
@@ -11742,15 +12618,8 @@ impl Interpreter {
                             {
                                 frame.global_cache_invalidate();
                             }
-                            if !is_arrow && is_strict {
-                                match saved_this {
-                                    Some(v) => {
-                                        frame.global_env.borrow_mut().set_this(v);
-                                    }
-                                    None => {
-                                        frame.global_env.borrow_mut().remove_this();
-                                    }
-                                }
+                            if !is_arrow {
+                                restore_no_receiver_this(&frame.global_env, saved_this);
                             }
                             match result {
                                 Ok(v) => {
@@ -11970,6 +12839,8 @@ impl Interpreter {
                             if let JsValue::Function(func_rc) = callee {
                                 let func_ba = func_rc.as_ref();
                                 if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                    && !func_ba.is_strict()
+                                    && !frame.bytecode_array.is_strict()
                                     && !func_ba.has_exception_handler()
                                 {
                                     if let Some(result) =
@@ -12145,6 +13016,12 @@ impl Interpreter {
                                 let mut borrow = ctx_rc.borrow_mut();
                                 if slot < borrow.slots.len() {
                                     borrow.slots[slot] = acc.cheap_clone();
+                                    drop(borrow);
+                                    frame.sync_mapped_arguments_from_context_slot(
+                                        ctx_rc,
+                                        slot as u32,
+                                        &acc,
+                                    );
                                     continue 'dispatch;
                                 }
                             }
@@ -12340,13 +13217,27 @@ impl Interpreter {
         state: &Rc<RefCell<GeneratorState>>,
         input: JsValue,
     ) -> StatorResult<GeneratorStep> {
-        let (status, resume_mode, bytecode_array, saved_registers, resume_pc) = {
+        let (
+            status,
+            resume_mode,
+            bytecode_array,
+            saved_registers,
+            saved_call_args,
+            saved_global_env,
+            saved_this_binding,
+            saved_new_target,
+            resume_pc,
+        ) = {
             let gs = state.borrow();
             (
                 gs.status,
                 gs.resume_mode.clone(),
                 gs.bytecode_array.clone(),
                 gs.registers.clone(),
+                gs.call_args.clone(),
+                gs.global_env.clone(),
+                gs.this_binding.clone(),
+                gs.new_target.clone(),
                 gs.resume_pc,
             )
         };
@@ -12370,27 +13261,39 @@ impl Interpreter {
         // the first step (saved_registers is empty).
         let mut registers = saved_registers;
         registers.resize(total, JsValue::Undefined);
+        if status == GeneratorStatus::SuspendedAtStart {
+            for (i, arg) in saved_call_args
+                .iter()
+                .cloned()
+                .enumerate()
+                .take(param_count)
+            {
+                registers[i] = arg;
+            }
+        }
+
+        let call_args: CallArgs = saved_call_args.iter().cloned().collect();
+        let global_env = saved_global_env
+            .or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            .unwrap_or_else(fresh_global_env_rc);
 
         let mut frame = InterpreterFrame {
             bytecode_array: bytecode_array.clone(),
             registers,
-            call_args: CallArgs::new(),
+            call_args,
+            mapped_arguments_aliases: None,
             accumulator: input,
             pc: resume_pc,
             context: None,
             suspend_result: None,
             generator_state: Some(Rc::clone(state)),
-            global_env: CURRENT_GLOBALS.with(|g| {
-                g.borrow()
-                    .clone()
-                    .unwrap_or_else(|| Rc::new(RefCell::new(GlobalEnv::new())))
-            }),
+            global_env,
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
             deadline: None,
             pending_message: JsValue::Undefined,
-            new_target: JsValue::Undefined,
+            new_target: saved_new_target,
             mono_load_cache: None,
             poly_load_cache: None,
             mega_load_ic: None,
@@ -12431,7 +13334,20 @@ impl Interpreter {
         state.borrow_mut().status = GeneratorStatus::Executing;
 
         push_call_frame("<generator>")?;
+        let previous_this = if let Some(this_binding) = saved_this_binding {
+            let old_this = frame.global_env.borrow().get_this().cloned();
+            frame.global_env.borrow_mut().set_this(this_binding);
+            Some(old_this)
+        } else {
+            None
+        };
         let return_val = run_callee(&mut frame);
+        if let Some(old_this) = previous_this {
+            match old_this {
+                Some(value) => frame.global_env.borrow_mut().set_this(value),
+                None => frame.global_env.borrow_mut().remove_this(),
+            }
+        }
         pop_call_frame();
         let return_val = match return_val {
             Ok(value) => value,
@@ -12450,7 +13366,15 @@ impl Interpreter {
         };
 
         if let Some(yield_val) = frame.suspend_result {
-            Ok(GeneratorStep::Yield(yield_val))
+            let suspend_kind = state
+                .borrow()
+                .last_suspend_id
+                .map(|suspend_id| frame.bytecode_array.suspend_kind(suspend_id))
+                .unwrap_or(SuspendKind::Yield);
+            match suspend_kind {
+                SuspendKind::Yield => Ok(GeneratorStep::Yield(yield_val)),
+                SuspendKind::Await => Ok(GeneratorStep::Await(yield_val)),
+            }
         } else {
             state.borrow_mut().status = GeneratorStatus::Completed;
             Ok(GeneratorStep::Return(return_val))
@@ -12468,17 +13392,80 @@ impl Interpreter {
     /// value, or already rejected if the async body threw.
     pub fn run_async_function(
         bytecode_array: Rc<BytecodeArray>,
-        _args: impl IntoIterator<Item = JsValue>,
+        args: impl IntoIterator<Item = JsValue>,
+    ) -> StatorResult<JsValue> {
+        let caller_global_env = CURRENT_GLOBALS
+            .with(|globals| globals.borrow().clone())
+            .unwrap_or_else(fresh_global_env_rc);
+        Self::run_async_function_no_receiver(bytecode_array, args, caller_global_env)
+    }
+
+    /// Run an async function call that did not provide an explicit receiver.
+    ///
+    /// Captures the caller's effective global environment, the actual call
+    /// arguments, lexical arrow bindings, and strict/sloppy no-receiver `this`
+    /// semantics before driving the async generator body to completion.
+    pub fn run_async_function_no_receiver(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        caller_global_env: Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<JsValue> {
+        let global_env = effective_call_global_env(&bytecode_array, &caller_global_env);
+        let this_binding = no_receiver_activation_this(&bytecode_array, &global_env);
+        Self::run_async_function_with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            lexical_new_target,
+        )
+    }
+
+    /// Run an async function call with an explicit receiver value.
+    ///
+    /// Captures the caller's effective global environment, the actual call
+    /// arguments, lexical arrow bindings, and the receiver-adjusted `this`
+    /// binding before driving the async generator body to completion.
+    pub fn run_async_function_with_receiver(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        caller_global_env: Rc<RefCell<GlobalEnv>>,
+        this_val: JsValue,
+    ) -> StatorResult<JsValue> {
+        let global_env = effective_call_global_env(&bytecode_array, &caller_global_env);
+        let this_binding = receiver_activation_this(&bytecode_array, &global_env, this_val);
+        Self::run_async_function_with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            lexical_new_target,
+        )
+    }
+
+    fn run_async_function_with_activation(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        global_env: Rc<RefCell<GlobalEnv>>,
+        this_binding: Option<JsValue>,
+        new_target: fn(&Rc<BytecodeArray>) -> JsValue,
     ) -> StatorResult<JsValue> {
         use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
         let queue = MicrotaskQueue::new();
-        let state = GeneratorState::new(bytecode_array);
+        let new_target = new_target(&bytecode_array);
+        let state = GeneratorState::with_activation(
+            bytecode_array,
+            args,
+            global_env,
+            this_binding,
+            new_target,
+        );
         let mut input = JsValue::Undefined;
 
         loop {
             match Interpreter::run_generator_step(&state, input) {
-                Ok(GeneratorStep::Yield(awaited)) => {
+                Ok(GeneratorStep::Await(awaited)) => {
                     match resolve_promise_like(awaited, &queue) {
                         AwaitResolution::Fulfilled(value) => input = value,
                         AwaitResolution::Rejected(reason) => {
@@ -12491,6 +13478,11 @@ impl Interpreter {
                             input = JsValue::Undefined;
                         }
                     }
+                }
+                Ok(GeneratorStep::Yield(_)) => {
+                    return Err(StatorError::Internal(
+                        "async function suspended with public yield".into(),
+                    ));
                 }
                 Ok(GeneratorStep::Return(v)) => {
                     let p = promise_resolve(v, &queue);
@@ -12509,6 +13501,48 @@ impl Interpreter {
                     }
                     return Err(e);
                 }
+            }
+        }
+    }
+
+    fn drive_async_generator_step(
+        state: &Rc<RefCell<GeneratorState>>,
+        mut input: JsValue,
+    ) -> StatorResult<GeneratorStep> {
+        let queue = crate::builtins::promise::MicrotaskQueue::new();
+        loop {
+            match Self::run_generator_step(state, input)? {
+                GeneratorStep::Await(awaited) => match resolve_promise_like(awaited, &queue) {
+                    AwaitResolution::Fulfilled(value) => input = value,
+                    AwaitResolution::Rejected(reason) => {
+                        state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
+                        input = JsValue::Undefined;
+                    }
+                    AwaitResolution::Pending => {
+                        return Err(StatorError::TypeError(
+                            "async generator await on a pending promise: Stator's async generator \
+                             driver does not yet drive an event loop"
+                                .into(),
+                        ));
+                    }
+                },
+                step @ (GeneratorStep::Yield(_) | GeneratorStep::Return(_)) => return Ok(step),
+            }
+        }
+    }
+
+    /// Execute one async-generator `.next(value)` step and drive internal
+    /// `await` suspensions until a user-visible `{ value, done }` result is
+    /// available.
+    pub(crate) fn async_generator_next(
+        state: &Rc<RefCell<GeneratorState>>,
+        input: JsValue,
+    ) -> StatorResult<JsValue> {
+        match Self::drive_async_generator_step(state, input)? {
+            GeneratorStep::Yield(value) => Ok(make_iterator_result(value, false)),
+            GeneratorStep::Return(value) => Ok(make_iterator_result(value, true)),
+            GeneratorStep::Await(_) => {
+                Err(leaked_internal_await_error("AsyncGenerator.prototype.next"))
             }
         }
     }
@@ -12701,7 +13735,7 @@ fn drive_module_top_level(
         }
 
         match Interpreter::run_generator_step(state, input)? {
-            GeneratorStep::Yield(awaited) => match resolve_promise_like(awaited.clone(), queue) {
+            GeneratorStep::Await(awaited) => match resolve_promise_like(awaited.clone(), queue) {
                 AwaitResolution::Fulfilled(value) => input = value,
                 AwaitResolution::Rejected(reason) => {
                     state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(reason);
@@ -12721,6 +13755,11 @@ fn drive_module_top_level(
                     }));
                 }
             },
+            GeneratorStep::Yield(_) => {
+                return Err(StatorError::Internal(
+                    "async module suspended with public yield".into(),
+                ));
+            }
             GeneratorStep::Return(value) => {
                 queue.drain();
                 return Ok(ModuleTopLevelStep::Completed(value));
@@ -12788,6 +13827,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Return(value.clone());
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.return"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         state.borrow_mut().status = GeneratorStatus::Completed;
@@ -12795,7 +13837,7 @@ impl Interpreter {
                     }
                 }
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Completed => Ok(make_iterator_result(value, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -12821,6 +13863,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value.clone());
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.throw"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         // Uncaught ΓÇö mark the generator as completed.
@@ -12833,6 +13878,9 @@ impl Interpreter {
                 state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value);
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Await(_)) => {
+                        Err(leaked_internal_await_error("Generator.prototype.throw"))
+                    }
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
                         state.borrow_mut().status = GeneratorStatus::Completed;
@@ -12840,7 +13888,7 @@ impl Interpreter {
                     }
                 }
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Completed => Err(async_iterator_reason_to_error(value)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -12867,6 +13915,10 @@ pub(crate) fn resolve_promise_like(
     } else {
         AwaitResolution::Pending
     }
+}
+
+pub(crate) fn leaked_internal_await_error(context: &str) -> StatorError {
+    StatorError::Internal(format!("internal await suspension leaked into {context}"))
 }
 
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -12983,6 +14035,9 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
                 JsValue::Generator(gs) => match Interpreter::run_generator_step(gs, input) {
                     Ok(GeneratorStep::Yield(value)) => Ok(make_iterator_result(value, false)),
                     Ok(GeneratorStep::Return(value)) => Ok(make_iterator_result(value, true)),
+                    Ok(GeneratorStep::Await(_)) => Err(leaked_internal_await_error(
+                        "async-from-sync iterator wrapper",
+                    )),
                     Err(error) => Err(error),
                 },
                 JsValue::PlainObject(map) => {
@@ -13522,7 +14577,7 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
         return Ok(a < b);
     }
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
-        return Ok(a < b);
+        return Ok(a.encode_utf16().cmp(b.encode_utf16()).is_lt());
     }
     // Full spec: ┬º7.2.14 IsLessThan(x, y, true)
     // Returns None for undefined (NaN cases) ΓåÆ map to false
@@ -13533,8 +14588,8 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
 ///
 /// Delegates to [`JsValue::is_loosely_equal`] which implements the full spec
 /// algorithm including ToPrimitive coercion for objects.
-pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    lhs.is_loosely_equal(rhs).unwrap_or(false)
+pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
+    lhs.is_loosely_equal(rhs)
 }
 
 /// ECMAScript ┬º7.2.15 **Strict Equality Comparison** (`===`).
@@ -13748,11 +14803,21 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
 #[inline(always)]
 fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
     const STACK_GUARD_DEPTH: usize = 64;
+    let should_publish_globals =
+        Rc::as_ptr(&callee_frame.global_env) as usize != LAST_GLOBALS_PTR.with(Cell::get);
     if call_stack_depth() < STACK_GUARD_DEPTH {
-        Interpreter::run_same_env(callee_frame)
+        if should_publish_globals {
+            Interpreter::run(callee_frame)
+        } else {
+            Interpreter::run_same_env(callee_frame)
+        }
     } else {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            Interpreter::run_same_env(callee_frame)
+            if should_publish_globals {
+                Interpreter::run(callee_frame)
+            } else {
+                Interpreter::run_same_env(callee_frame)
+            }
         })
     }
 }
@@ -13802,13 +14867,16 @@ pub(super) fn dispatch_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                frame.accumulator = JsValue::Generator(state);
+                frame.accumulator =
+                    make_generator_no_receiver_activation(ba, args, &frame.global_env);
             } else if ba.is_async() {
                 // Async (non-generator) function: drive the internal generator
                 // to completion and return a Promise.
-                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
+                frame.accumulator = Interpreter::run_async_function_no_receiver(
+                    Rc::clone(ba),
+                    args,
+                    Rc::clone(&frame.global_env),
+                )?;
             } else {
                 let count = ba.increment_invocation_count();
                 // Only check tiering/JIT when the function has been called
@@ -13843,15 +14911,7 @@ pub(super) fn dispatch_call(
                         );
                     }
                     let gen_before = frame.cache_generation;
-                    let result = with_anon_call_frame(|depth| {
-                        if depth < 64 {
-                            Interpreter::run_same_env(&mut callee_frame)
-                        } else {
-                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                                Interpreter::run_same_env(&mut callee_frame)
-                            })
-                        }
-                    });
+                    let result = with_anon_call_frame(|_| run_callee(&mut callee_frame));
                     release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
@@ -13910,11 +14970,15 @@ pub(super) fn dispatch_call_property(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                frame.accumulator = JsValue::Generator(state);
+                frame.accumulator =
+                    make_generator_with_receiver_activation(ba, args, &frame.global_env, this_val);
             } else if ba.is_async() {
-                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
+                frame.accumulator = Interpreter::run_async_function_with_receiver(
+                    Rc::clone(ba),
+                    args,
+                    Rc::clone(&frame.global_env),
+                    this_val,
+                )?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -13948,15 +15012,7 @@ pub(super) fn dispatch_call_property(
                         callee_frame.global_env.borrow_mut().set_this(this_val);
                     }
                     let gen_before = frame.cache_generation;
-                    let result = with_anon_call_frame(|depth| {
-                        if depth < 64 {
-                            Interpreter::run_same_env(&mut callee_frame)
-                        } else {
-                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                                Interpreter::run_same_env(&mut callee_frame)
-                            })
-                        }
-                    });
+                    let result = with_anon_call_frame(|_| run_callee(&mut callee_frame));
                     release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
@@ -14017,9 +15073,87 @@ fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
     }
 }
 
+fn array_join_element_string(value: &JsValue) -> StatorResult<String> {
+    match value {
+        JsValue::Null | JsValue::Undefined | JsValue::TheHole => Ok(String::new()),
+        JsValue::Array(_) => array_join_string(value, ","),
+        JsValue::PlainObject(map) => {
+            if is_array_like_plain_object(&map.borrow()) {
+                array_join_string(value, ",")
+            } else {
+                value.to_js_string()
+            }
+        }
+        other => other.to_js_string(),
+    }
+}
+
+fn array_join_string(value: &JsValue, separator: &str) -> StatorResult<String> {
+    let elements = match value {
+        JsValue::Array(items) => items.borrow().clone(),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = array_like_length_from_property_map(&borrow);
+            (0..len)
+                .map(|index| {
+                    borrow
+                        .get(&index.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    elements
+        .iter()
+        .map(array_join_element_string)
+        .collect::<StatorResult<Vec<_>>>()
+        .map(|parts| parts.join(separator))
+}
+
 fn is_array_like_plain_object(map: &PropertyMap) -> bool {
     map.get("__is_array__")
         .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+}
+
+fn is_concat_spreadable_value(value: &JsValue) -> bool {
+    match value {
+        JsValue::Array(_) => true,
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let is_array = is_array_like_plain_object(&borrow);
+            match borrow.get("@@isConcatSpreadable") {
+                Some(JsValue::Undefined) => is_array,
+                Some(value) => value.to_boolean(),
+                None => is_array,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn append_concat_value(result: &mut Vec<JsValue>, value: JsValue) {
+    if !is_concat_spreadable_value(&value) {
+        result.push(value);
+        return;
+    }
+    match value {
+        JsValue::Array(items) => result.extend_from_slice(&items.borrow()),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = array_like_length_from_property_map(&borrow);
+            for index in 0..len {
+                result.push(
+                    borrow
+                        .get(&index.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
+                );
+            }
+        }
+        other => result.push(other),
+    }
 }
 
 pub(crate) fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue {
@@ -14047,6 +15181,24 @@ pub(crate) fn make_fast_array_method(target: &JsValue, name: &str, length: i32) 
             )
         })),
         attrs,
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn make_bound_string_builtin(
+    receiver: Rc<str>,
+    name: &str,
+    length: i32,
+    f: impl Fn(&str, Vec<JsValue>) -> StatorResult<JsValue> + 'static,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let attrs = PropertyAttributes::CONFIGURABLE;
+    props.insert_with_attrs("name".into(), JsValue::String(name.into()), attrs);
+    props.insert_with_attrs("length".into(), JsValue::Smi(length), attrs);
+    props.insert(
+        "__call__".into(),
+        JsValue::NativeFunction(Rc::new(move |args| f(&receiver, args))),
     );
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -14295,11 +15447,14 @@ pub(super) fn restore_closure_context(
     let home_object = fn_props_get(ba, ".home_object");
     match home_object {
         JsValue::PlainObject(map) => {
-            let super_lookup_start = map
-                .borrow()
-                .get(INTERNAL_PROTO_PROPERTY_KEY)
-                .cloned()
-                .unwrap_or(JsValue::Undefined);
+            let super_lookup_start = {
+                let borrow = map.borrow();
+                borrow
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| borrow.get("__proto__"))
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+            };
             frame
                 .global_env
                 .borrow_mut()
@@ -14699,8 +15854,59 @@ fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
         all_instrs
     };
 
+    // Match LdaCurrentContextSlot + Star + LdaSmiStar + Ldar + Add +
+    // StaCurrentContextSlot + [Reload +] Return (closure_counter pattern
+    // emitted by left-to-right binary evaluation). Returns same tag as AddSmi (0).
+    if instrs.len() >= 7
+        && is_inline_current_context_load(instrs[0].opcode)
+        && instrs[1].opcode == Opcode::Star
+        && instrs[2].opcode == Opcode::LdaSmiStar
+        && instrs[3].opcode == Opcode::Ldar
+        && instrs[4].opcode == Opcode::Add
+        && instrs[5].opcode == Opcode::StaCurrentContextSlot
+    {
+        let ok_tail = (instrs.len() == 7 && instrs[6].opcode == Opcode::Return)
+            || (instrs.len() == 8
+                && is_inline_current_context_load(instrs[6].opcode)
+                && instrs[7].opcode == Opcode::Return);
+        let lhs_reg = checked_operand_reg(&instrs[1], 0)?;
+        let reload_reg = checked_operand_reg(&instrs[3], 0)?;
+        let rhs_reg = checked_operand_reg(&instrs[2], 1)?;
+        let add_reg = checked_operand_reg(&instrs[4], 0)?;
+        let slot = checked_operand_constant_pool_idx(&instrs[0], 0)? as usize;
+        let store_slot = checked_operand_constant_pool_idx(&instrs[5], 0)? as usize;
+        if ok_tail && lhs_reg == reload_reg && rhs_reg == add_reg && slot == store_slot {
+            let imm = checked_operand_imm(&instrs[2], 0)?;
+            return Some((slot, imm, 0u8));
+        }
+    }
+    if instrs.len() >= 8
+        && is_inline_current_context_load(instrs[0].opcode)
+        && instrs[1].opcode == Opcode::Star
+        && instrs[2].opcode == Opcode::LdaSmi
+        && instrs[3].opcode == Opcode::Star
+        && instrs[4].opcode == Opcode::Ldar
+        && instrs[5].opcode == Opcode::Add
+        && instrs[6].opcode == Opcode::StaCurrentContextSlot
+    {
+        let ok_tail = (instrs.len() == 8 && instrs[7].opcode == Opcode::Return)
+            || (instrs.len() == 9
+                && is_inline_current_context_load(instrs[7].opcode)
+                && instrs[8].opcode == Opcode::Return);
+        let lhs_reg = checked_operand_reg(&instrs[1], 0)?;
+        let reload_reg = checked_operand_reg(&instrs[4], 0)?;
+        let rhs_reg = checked_operand_reg(&instrs[3], 0)?;
+        let add_reg = checked_operand_reg(&instrs[5], 0)?;
+        let slot = checked_operand_constant_pool_idx(&instrs[0], 0)? as usize;
+        let store_slot = checked_operand_constant_pool_idx(&instrs[6], 0)? as usize;
+        if ok_tail && lhs_reg == reload_reg && rhs_reg == add_reg && slot == store_slot {
+            let imm = checked_operand_imm(&instrs[2], 0)?;
+            return Some((slot, imm, 0u8));
+        }
+    }
+
     // Match LdaSmiStar + LdaCurrentContextSlot + Add + StaCurrentContextSlot + [Reload +] Return
-    // (closure_counter pattern).  Returns same tag as AddSmi (0).
+    // (legacy closure_counter pattern).  Returns same tag as AddSmi (0).
     if instrs.len() >= 5
         && instrs[0].opcode == Opcode::LdaSmiStar
         && is_inline_current_context_load(instrs[1].opcode)
@@ -14792,6 +15998,8 @@ pub(crate) fn try_inline_small_function(
 
     let decoded = ba.shared_decoded_instructions().ok()?;
     let all_instrs = decoded.0.as_slice();
+    let captured_global_env = fn_global_env_get_ref(ba);
+    let global_env = captured_global_env.as_ref().unwrap_or(global_env);
 
     // Strip leading CreateMappedArguments/CreateUnmappedArguments + Star pair.
     // Sloppy-mode functions always emit these, but when the arguments object
@@ -14995,6 +16203,136 @@ pub(crate) fn try_inline_small_function(
             let opcode = inline_smi_binary_opcode(op.opcode)?;
             let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
             inline_binary_op(opcode, &lhs, &JsValue::Smi(checked_operand_imm(op, 0)?))
+        }
+        // Context-slot add with Smi constant emitted by left-to-right binary evaluation.
+        // LdaCurrentContextSlot(slot) + Star(lhs) + LdaSmiStar(imm,rhs) +
+        // Ldar(lhs) + Add(rhs) + StaCurrentContextSlot(slot) + Return
+        [load, star, lda_smi_star, ldar, add_instr, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && lda_smi_star.opcode == Opcode::LdaSmiStar
+                && ldar.opcode == Opcode::Ldar
+                && add_instr.opcode == Opcode::Add
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(lda_smi_star, 1)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if lhs_reg != reload_reg || rhs_reg != add_reg || load_slot != store_slot {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same pattern with a reload before return.
+        [
+            load,
+            star,
+            lda_smi_star,
+            ldar,
+            add_instr,
+            store,
+            reload,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star.opcode == Opcode::Star
+            && lda_smi_star.opcode == Opcode::LdaSmiStar
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && is_inline_current_context_load(reload.opcode)
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(lda_smi_star, 1)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if lhs_reg != reload_reg
+                || rhs_reg != add_reg
+                || load_slot != store_slot
+                || load_slot != reload_slot
+            {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same left-to-right context-slot add pattern when LdaSmi and Star were
+        // not fused by peephole.
+        [
+            load,
+            star_lhs,
+            lda_smi,
+            star_rhs,
+            ldar,
+            add_instr,
+            store,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star_lhs.opcode == Opcode::Star
+            && lda_smi.opcode == Opcode::LdaSmi
+            && star_rhs.opcode == Opcode::Star
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star_lhs, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(star_rhs, 0)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if lhs_reg != reload_reg || rhs_reg != add_reg || load_slot != store_slot {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // Same pattern with a reload before return.
+        [
+            load,
+            star_lhs,
+            lda_smi,
+            star_rhs,
+            ldar,
+            add_instr,
+            store,
+            reload,
+            ret,
+        ] if is_inline_current_context_load(load.opcode)
+            && star_lhs.opcode == Opcode::Star
+            && lda_smi.opcode == Opcode::LdaSmi
+            && star_rhs.opcode == Opcode::Star
+            && ldar.opcode == Opcode::Ldar
+            && add_instr.opcode == Opcode::Add
+            && store.opcode == Opcode::StaCurrentContextSlot
+            && is_inline_current_context_load(reload.opcode)
+            && ret.opcode == Opcode::Return =>
+        {
+            let lhs_reg = checked_operand_reg(star_lhs, 0)?;
+            let reload_reg = checked_operand_reg(ldar, 0)?;
+            let rhs_reg = checked_operand_reg(star_rhs, 0)?;
+            let add_reg = checked_operand_reg(add_instr, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if lhs_reg != reload_reg
+                || rhs_reg != add_reg
+                || load_slot != store_slot
+                || load_slot != reload_slot
+            {
+                return None;
+            }
+            let imm = checked_operand_imm(lda_smi, 0)?;
+            inline_context_slot_smi_add(ba, load_slot, imm)
         }
         [rhs, star, lhs, op, ret]
             if rhs.opcode == Opcode::Ldar
@@ -15623,15 +16961,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let getter_key = format!("__get_{prop}__");
                         // Walk the prototype chain looking for the getter.
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if b.has_accessors
-                                    && let Some(g) = b.get(&getter_key)
-                                {
+                                if let Some(g) = b.get_getter_for(&prop) {
                                     return Ok(g.clone());
                                 }
                                 match plain_object_proto_value(&b) {
@@ -15660,14 +16995,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let setter_key = format!("__set_{prop}__");
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if b.has_accessors
-                                    && let Some(s) = b.get(&setter_key)
-                                {
+                                if let Some(s) = b.get_setter_for(&prop) {
                                     return Ok(s.clone());
                                 }
                                 match plain_object_proto_value(&b) {
@@ -15698,7 +17030,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         };
                         let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let getter_key = format!("__get_{prop}__");
-                        map.borrow_mut().insert(getter_key, getter);
+                        let mut borrow = map.borrow_mut();
+                        borrow.insert(getter_key, getter);
+                        borrow.mark_accessor_property(prop);
                         Ok(JsValue::Undefined)
                     }));
                     proto_cache_store(&cache_map, key, proto_generation, &value, 1);
@@ -15716,7 +17050,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         };
                         let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let setter_key = format!("__set_{prop}__");
-                        map.borrow_mut().insert(setter_key, setter);
+                        let mut borrow = map.borrow_mut();
+                        borrow.insert(setter_key, setter);
+                        borrow.mark_accessor_property(prop);
                         Ok(JsValue::Undefined)
                     }));
                     proto_cache_store(&cache_map, key, proto_generation, &value, 1);
@@ -15789,17 +17125,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let frac = match args.first() {
-                        Some(v) => v.to_number()?,
-                        None => 0.0,
-                    };
-                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
-                        return Err(StatorError::RangeError(
-                            "toFixed() digits argument must be between 0 and 100".into(),
-                        ));
-                    }
-                    let digits = frac as usize;
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    number_proto_to_fixed(n, args.first())
                 }));
             }
             "toExponential" => {
@@ -15867,25 +17193,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let frac = match args.first() {
-                        Some(v) => v.to_number()?,
-                        None => 0.0,
-                    };
-                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
-                        return Err(StatorError::RangeError(
-                            "toFixed() digits argument must be between 0 and 100".into(),
-                        ));
-                    }
-                    let digits = frac as usize;
-                    if n.is_nan() {
-                        return Ok(JsValue::String("NaN".into()));
-                    }
-                    if n.is_infinite() {
-                        return Ok(JsValue::String(
-                            if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
-                        ));
-                    }
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    number_proto_to_fixed(n, args.first())
                 }));
             }
             "toExponential" => {
@@ -16048,9 +17356,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "trim" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trim", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim(s).into(),
+                    ))
+                });
             }
             "split" => {
                 let s = s.clone();
@@ -16062,7 +17372,46 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         _ => None,
                     };
-                    // A limit of 0 always returns an empty array.
+                    let split_with_string_separator = |sep: &str| {
+                        if sep.is_empty() {
+                            let chars: Vec<JsValue> = s
+                                .chars()
+                                .take(limit.unwrap_or(usize::MAX))
+                                .map(|c| JsValue::String(c.to_string().into()))
+                                .collect();
+                            JsValue::new_array(chars)
+                        } else {
+                            let parts: Vec<JsValue> = s
+                                .split(sep)
+                                .take(limit.unwrap_or(usize::MAX))
+                                .map(|p| JsValue::String(p.to_string().into()))
+                                .collect();
+                            JsValue::new_array(parts)
+                        }
+                    };
+                    if let Some(separator) = args.first()
+                        && !matches!(separator, JsValue::Undefined)
+                    {
+                        let split_method = dispatch_get_property_value(
+                            separator,
+                            JsValue::String("@@split".into()),
+                        )?;
+                        if !matches!(split_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&split_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.split @@split value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            let limit_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            return dispatch_call_with_this(
+                                &split_method,
+                                separator.clone(),
+                                vec![JsValue::String(s.clone()), limit_arg],
+                            );
+                        }
+                    }
+                    // A limit of 0 always returns an empty array after custom split dispatch.
                     if limit == Some(0) {
                         return Ok(JsValue::new_array(vec![]));
                     }
@@ -16090,27 +17439,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                     .collect();
                                 Ok(JsValue::new_array(items))
                             } else {
-                                Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
+                                let sep = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(split_with_string_separator(&sep))
                             }
                         }
                         Some(JsValue::String(sep)) => {
                             let sep = sep.to_string();
-                            if sep.is_empty() {
-                                // Empty separator: split into individual characters.
-                                let chars: Vec<JsValue> = s
-                                    .chars()
-                                    .take(limit.unwrap_or(usize::MAX))
-                                    .map(|c| JsValue::String(c.to_string().into()))
-                                    .collect();
-                                Ok(JsValue::new_array(chars))
-                            } else {
-                                let parts: Vec<JsValue> = s
-                                    .split(&sep)
-                                    .take(limit.unwrap_or(usize::MAX))
-                                    .map(|p| JsValue::String(p.to_string().into()))
-                                    .collect();
-                                Ok(JsValue::new_array(parts))
-                            }
+                            Ok(split_with_string_separator(&sep))
                         }
                         Some(JsValue::Undefined) | None => {
                             Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
@@ -16230,11 +17565,28 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "replace" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        Some(v) => v.to_js_string()?,
-                        _ => "undefined".to_string(),
-                    };
+                    let replacement = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(search_value) = args.first()
+                        && !matches!(search_value, JsValue::Undefined)
+                    {
+                        let replace_method = dispatch_get_property_value(
+                            search_value,
+                            JsValue::String("@@replace".into()),
+                        )?;
+                        if !matches!(replace_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&replace_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.replace @@replace value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &replace_method,
+                                search_value.clone(),
+                                vec![JsValue::String(s.clone()), replacement],
+                            );
+                        }
+                    }
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -16249,16 +17601,55 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(
-                                    re.try_symbol_replace(&s, &replacement)?.into(),
-                                ))
+                                let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                    let weak = std::rc::Weak::<RefCell<PropertyMap>>::new();
+                                    crate::builtins::regexp::regexp_replace_with_callback(
+                                        &re,
+                                        &s,
+                                        &replacement,
+                                        &weak,
+                                    )?
+                                } else {
+                                    re.try_symbol_replace(&s, &replacement.to_js_string()?)?
+                                };
+                                Ok(JsValue::String(result.into()))
                             } else {
-                                Ok(JsValue::String(s.clone()))
+                                let search =
+                                    JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                let result = crate::builtins::string::string_replace(
+                                    &s,
+                                    &search,
+                                    &replacement.to_js_string()?,
+                                );
+                                Ok(JsValue::String(result.into()))
                             }
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(s.replacen(&search, &replacement, 1).into()))
+                            let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                crate::builtins::string::string_replace_functional_fallible(
+                                    &s,
+                                    &search,
+                                    |matched, offset, input| {
+                                        dispatch_call_value(
+                                            &replacement,
+                                            vec![
+                                                JsValue::String(matched.into()),
+                                                JsValue::Smi(offset as i32),
+                                                JsValue::String(input.into()),
+                                            ],
+                                        )?
+                                        .to_js_string()
+                                    },
+                                )?
+                            } else {
+                                crate::builtins::string::string_replace(
+                                    &s,
+                                    &search,
+                                    &replacement.to_js_string()?,
+                                )
+                            };
+                            Ok(JsValue::String(result.into()))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }
@@ -16283,11 +17674,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "replaceAll" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        Some(v) => v.to_js_string()?,
-                        _ => "undefined".to_string(),
-                    };
+                    let replacement = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -16307,16 +17694,48 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 };
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                                Ok(JsValue::String(
-                                    re.try_symbol_replace(&s, &replacement)?.into(),
-                                ))
+                                let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                    let weak = std::rc::Weak::<RefCell<PropertyMap>>::new();
+                                    crate::builtins::regexp::regexp_replace_with_callback(
+                                        &re,
+                                        &s,
+                                        &replacement,
+                                        &weak,
+                                    )?
+                                } else {
+                                    re.try_symbol_replace(&s, &replacement.to_js_string()?)?
+                                };
+                                Ok(JsValue::String(result.into()))
                             } else {
                                 Ok(JsValue::String(s.clone()))
                             }
                         }
                         Some(JsValue::String(search)) => {
                             let search = search.to_string();
-                            Ok(JsValue::String(s.replace(&search, &replacement).into()))
+                            let result = if crate::builtins::regexp::is_callable(&replacement) {
+                                crate::builtins::string::string_replace_all_functional_fallible(
+                                    &s,
+                                    &search,
+                                    |matched, offset, input| {
+                                        dispatch_call_value(
+                                            &replacement,
+                                            vec![
+                                                JsValue::String(matched.into()),
+                                                JsValue::Smi(offset as i32),
+                                                JsValue::String(input.into()),
+                                            ],
+                                        )?
+                                        .to_js_string()
+                                    },
+                                )?
+                            } else {
+                                crate::builtins::string::string_replace_all(
+                                    &s,
+                                    &search,
+                                    &replacement.to_js_string()?,
+                                )
+                            };
+                            Ok(JsValue::String(result.into()))
                         }
                         _ => Ok(JsValue::String(s.clone())),
                     }
@@ -16337,15 +17756,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "trimStart" | "trimLeft" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_start().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trimStart", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim_start(s).into(),
+                    ))
+                });
             }
             "trimEnd" | "trimRight" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_end().to_string().into()))
-                }));
+                return make_bound_string_builtin(s, "trimEnd", 0, |s, _args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_trim_end(s).into(),
+                    ))
+                });
             }
             "concat" => {
                 let s = s.clone();
@@ -16383,25 +17806,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "normalize" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // ES ┬º22.1.3.13 String.prototype.normalize([form])
-                    // Determine the normalization form (default: "NFC").
                     let form = match args.first() {
-                        None | Some(JsValue::Undefined) => "NFC".to_string(),
-                        Some(v) => v.to_js_string()?,
+                        None | Some(JsValue::Undefined) => None,
+                        Some(v) => Some(v.to_js_string()?),
                     };
-                    match form.as_str() {
-                        "NFC" | "NFD" | "NFKC" | "NFKD" => {
-                            // ASCII-only strings are already in all normalization
-                            // forms, so we can return as-is.  For non-ASCII we
-                            // also return as-is (best-effort without the
-                            // unicode-normalization crate).
-                            Ok(JsValue::String(s.clone()))
-                        }
-                        _ => Err(StatorError::RangeError(
-                            "The normalization form should be one of NFC, NFD, NFKC, NFKD."
-                                .to_string(),
-                        )),
-                    }
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_normalize(&s, form.as_deref())?.into(),
+                    ))
                 }));
             }
             "localeCompare" => {
@@ -16416,153 +17827,253 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "match" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            match re.try_symbol_match(&s)? {
-                                Some(result) => {
-                                    use crate::objects::regexp::SymbolMatchResult;
-                                    match result {
-                                        SymbolMatchResult::Single(m) => {
-                                            let mut arr = vec![JsValue::String(m.matched.into())];
-                                            for c in &m.captures {
-                                                arr.push(match c {
-                                                    Some(s) => JsValue::String(s.clone().into()),
-                                                    None => JsValue::Undefined,
-                                                });
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let string_match_result = |pat: &str| {
+                        let index = crate::builtins::string::string_index_of(&s, pat, None);
+                        if index < 0 {
+                            JsValue::Null
+                        } else {
+                            let mut props = PropertyMap::new();
+                            props.insert("0".into(), JsValue::String(pat.into()));
+                            props.insert("index".into(), JsValue::Smi(index as i32));
+                            props.insert("input".into(), JsValue::String(s.clone()));
+                            props.insert("groups".into(), JsValue::Undefined);
+                            props.insert("length".into(), JsValue::Smi(1));
+                            props.insert("__is_array__".into(), JsValue::Boolean(true));
+                            JsValue::PlainObject(Rc::new(RefCell::new(props)))
+                        }
+                    };
+                    if let Some(matcher) = args.first()
+                        && !matches!(matcher, JsValue::Undefined)
+                    {
+                        let match_method = dispatch_get_property_value(
+                            matcher,
+                            JsValue::String("@@match".into()),
+                        )?;
+                        if !matches!(match_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&match_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.match @@match value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &match_method,
+                                matcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
+                        }
+                    }
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                match re.try_symbol_match(&s)? {
+                                    Some(result) => {
+                                        use crate::objects::regexp::SymbolMatchResult;
+                                        match result {
+                                            SymbolMatchResult::Single(m) => {
+                                                Ok(crate::builtins::regexp::match_to_js(&m))
                                             }
-                                            Ok(JsValue::new_array(arr))
-                                        }
-                                        SymbolMatchResult::All(matches) => {
-                                            let arr: Vec<JsValue> = matches
-                                                .into_iter()
-                                                .map(|m| JsValue::String(m.into()))
-                                                .collect();
-                                            Ok(JsValue::new_array(arr))
+                                            SymbolMatchResult::All(matches) => {
+                                                let arr: Vec<JsValue> = matches
+                                                    .into_iter()
+                                                    .map(|m| JsValue::String(m.into()))
+                                                    .collect();
+                                                Ok(JsValue::new_array(arr))
+                                            }
                                         }
                                     }
+                                    None => Ok(JsValue::Null),
                                 }
-                                None => Ok(JsValue::Null),
+                            } else {
+                                let pat = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(string_match_result(&pat))
                             }
-                        } else {
-                            Ok(JsValue::Null)
                         }
-                    }
-                    Some(JsValue::String(pat)) => {
-                        let pat = pat.to_string();
-                        match s.find(&pat) {
-                            Some(_idx) => {
-                                let arr = vec![JsValue::String(pat.into())];
-                                Ok(JsValue::new_array(arr))
-                            }
-                            None => Ok(JsValue::Null),
+                        Some(JsValue::String(pat)) => {
+                            let pat = pat.to_string();
+                            Ok(string_match_result(&pat))
                         }
+                        _ => Ok(JsValue::Null),
                     }
-                    _ => Ok(JsValue::Null),
                 }));
             }
             "search" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            Ok(JsValue::Smi(re.symbol_search(&s) as i32))
-                        } else {
-                            Ok(JsValue::Smi(-1))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    if let Some(searcher) = args.first()
+                        && !matches!(searcher, JsValue::Undefined)
+                    {
+                        let search_method = dispatch_get_property_value(
+                            searcher,
+                            JsValue::String("@@search".into()),
+                        )?;
+                        if !matches!(search_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&search_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.search @@search value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &search_method,
+                                searcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
                         }
                     }
-                    Some(JsValue::String(pat)) => {
-                        let pat = pat.to_string();
-                        Ok(s.find(&pat)
-                            .map_or(JsValue::Smi(-1), |i| JsValue::Smi(i as i32)))
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                Ok(JsValue::Smi(re.symbol_search(&s) as i32))
+                            } else {
+                                let pat = JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(JsValue::Smi(crate::builtins::string::string_index_of(
+                                    &s, &pat, None,
+                                ) as i32))
+                            }
+                        }
+                        Some(JsValue::String(pat)) => {
+                            let pat = pat.to_string();
+                            Ok(JsValue::Smi(
+                                crate::builtins::string::string_index_of(&s, &pat, None) as i32,
+                            ))
+                        }
+                        _ => Ok(JsValue::Smi(-1)),
                     }
-                    _ => Ok(JsValue::Smi(-1)),
                 }));
             }
             "matchAll" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| match args.first() {
-                    Some(JsValue::PlainObject(re_obj)) => {
-                        let borrow = re_obj.borrow();
-                        if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
-                            let source = match borrow.get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            let flags = match borrow.get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
-                            };
-                            // ES ┬º22.1.3.12: matchAll requires the global flag.
-                            if !flags.contains('g') {
-                                return Err(StatorError::TypeError(
-                                    "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
-                                ));
-                            }
-                            drop(borrow);
-                            let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
-                            let matches = re.try_symbol_match_all(&s)?;
-                            let results: Vec<JsValue> = matches
-                                .into_iter()
-                                .map(|m| {
-                                    let mut parts: Vec<JsValue> =
-                                        vec![JsValue::String(m.matched.clone().into())];
-                                    for g in &m.captures {
-                                        parts.push(match g {
-                                            Some(s) => JsValue::String(s.clone().into()),
-                                            None => JsValue::Undefined,
-                                        });
-                                    }
-                                    JsValue::new_array(parts)
-                                })
-                                .collect();
-                            Ok(JsValue::Iterator(NativeIterator::from_items(results)))
-                        } else {
-                            Ok(JsValue::Iterator(NativeIterator::from_items(vec![])))
-                        }
-                    }
-                    Some(JsValue::String(pattern)) => {
-                        let pattern = pattern.to_string();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let string_match_all_results = |input: &Rc<str>, pattern: &str| {
                         if pattern.is_empty() {
-                            return Ok(JsValue::Iterator(NativeIterator::from_items(vec![])));
+                            return JsValue::Iterator(NativeIterator::from_items(vec![]));
                         }
                         let mut results = Vec::new();
                         let mut start = 0;
-                        while let Some(pos) = s[start..].find(pattern.as_str()) {
+                        while let Some(pos) = input[start..].find(pattern) {
                             let abs = start + pos;
                             let mut m = PropertyMap::new();
-                            m.insert("0".to_string(), JsValue::String(Rc::from(pattern.as_str())));
-                            m.insert("index".to_string(), JsValue::Smi(abs as i32));
-                            m.insert("input".to_string(), JsValue::String(s.clone()));
+                            m.insert("0".to_string(), JsValue::String(Rc::from(pattern)));
+                            m.insert(
+                                "index".to_string(),
+                                JsValue::Smi(input[..abs].encode_utf16().count() as i32),
+                            );
+                            m.insert("input".to_string(), JsValue::String(input.clone()));
+                            m.insert("groups".to_string(), JsValue::Undefined);
                             m.insert("length".to_string(), JsValue::Smi(1));
+                            m.insert("__is_array__".to_string(), JsValue::Boolean(true));
                             results.push(JsValue::PlainObject(Rc::new(RefCell::new(m))));
                             start = abs + pattern.len();
                         }
-                        Ok(JsValue::Iterator(NativeIterator::from_items(results)))
+                        JsValue::Iterator(NativeIterator::from_items(results))
+                    };
+
+                    if let Some(matcher) = args.first()
+                        && !matches!(matcher, JsValue::Undefined)
+                    {
+                        if let JsValue::PlainObject(map) = matcher {
+                            let borrow = map.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                if !flags.contains('g') {
+                                    return Err(StatorError::TypeError(
+                                        "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        let match_all_method = dispatch_get_property_value(
+                            matcher,
+                            JsValue::String("@@matchAll".into()),
+                        )?;
+                        if !matches!(match_all_method, JsValue::Undefined) {
+                            if !crate::builtins::regexp::is_callable(&match_all_method) {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.matchAll @@matchAll value is not callable"
+                                        .to_string(),
+                                ));
+                            }
+                            return dispatch_call_with_this(
+                                &match_all_method,
+                                matcher.clone(),
+                                vec![JsValue::String(s.clone())],
+                            );
+                        }
                     }
-                    _ => Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
+
+                    match args.first() {
+                        Some(JsValue::PlainObject(re_obj)) => {
+                            let borrow = re_obj.borrow();
+                            if borrow.get("__is_regexp__") == Some(&JsValue::Boolean(true)) {
+                                let source = match borrow.get("source") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                let flags = match borrow.get("flags") {
+                                    Some(JsValue::String(s)) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                // ES §22.1.3.12: matchAll requires the global flag.
+                                if !flags.contains('g') {
+                                    return Err(StatorError::TypeError(
+                                        "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+                                    ));
+                                }
+                                let last_index = borrow
+                                    .get("lastIndex")
+                                    .and_then(|value| value.to_length().ok())
+                                    .unwrap_or(0)
+                                    as usize;
+                                drop(borrow);
+                                let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
+                                re.set_last_index(last_index);
+                                let matches = re.try_symbol_match_all(&s)?;
+                                let results: Vec<JsValue> = matches
+                                    .into_iter()
+                                    .map(|m| crate::builtins::regexp::match_to_js(&m))
+                                    .collect();
+                                Ok(JsValue::Iterator(NativeIterator::from_items(results)))
+                            } else {
+                                let pattern =
+                                    JsValue::PlainObject(Rc::clone(re_obj)).to_js_string()?;
+                                Ok(string_match_all_results(&s, &pattern))
+                            }
+                        }
+                        Some(JsValue::String(pattern)) => {
+                            let pattern = pattern.to_string();
+                            Ok(string_match_all_results(&s, &pattern))
+                        }
+                        _ => Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
+                    }
                 }));
             }
             "@@iterator" | "Symbol(1)" => {
@@ -16608,7 +18119,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "substr" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "substr", 2, |s, args| {
                     let start = args
                         .first()
                         .map(|v| v.to_number().unwrap_or(f64::NAN) as i64)
@@ -16617,133 +18128,133 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         .get(1)
                         .map(|v| v.to_number().unwrap_or(f64::NAN) as i64);
                     Ok(JsValue::String(
-                        crate::builtins::string::string_substr(&s, start, length).into(),
+                        crate::builtins::string::string_substr(s, start, length).into(),
                     ))
-                }));
+                });
             }
             "anchor" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "anchor", 1, |s, args| {
                     let name = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_anchor(&s, &name).into(),
+                        crate::builtins::string::string_anchor(s, &name).into(),
                     ))
-                }));
+                });
             }
             "big" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "big", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_big(&s).into(),
+                        crate::builtins::string::string_big(s).into(),
                     ))
-                }));
+                });
             }
             "blink" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "blink", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_blink(&s).into(),
+                        crate::builtins::string::string_blink(s).into(),
                     ))
-                }));
+                });
             }
             "bold" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "bold", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_bold(&s).into(),
+                        crate::builtins::string::string_bold(s).into(),
                     ))
-                }));
+                });
             }
             "fixed" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "fixed", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fixed(&s).into(),
+                        crate::builtins::string::string_fixed(s).into(),
                     ))
-                }));
+                });
             }
             "fontcolor" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "fontcolor", 1, |s, args| {
                     let color = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fontcolor(&s, &color).into(),
+                        crate::builtins::string::string_fontcolor(s, &color).into(),
                     ))
-                }));
+                });
             }
             "fontsize" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "fontsize", 1, |s, args| {
                     let size = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_fontsize(&s, &size).into(),
+                        crate::builtins::string::string_fontsize(s, &size).into(),
                     ))
-                }));
+                });
             }
             "italics" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "italics", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_italics(&s).into(),
+                        crate::builtins::string::string_italics(s).into(),
                     ))
-                }));
+                });
             }
             "link" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |args| {
+                return make_bound_string_builtin(s, "link", 1, |s, args| {
                     let url = args
                         .first()
                         .map(|v| v.to_js_string())
                         .transpose()?
                         .unwrap_or_default();
                     Ok(JsValue::String(
-                        crate::builtins::string::string_link(&s, &url).into(),
+                        crate::builtins::string::string_link(s, &url).into(),
                     ))
-                }));
+                });
             }
             "small" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "small", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_small(&s).into(),
+                        crate::builtins::string::string_small(s).into(),
                     ))
-                }));
+                });
             }
             "strike" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "strike", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_strike(&s).into(),
+                        crate::builtins::string::string_strike(s).into(),
                     ))
-                }));
+                });
             }
             "sub" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "sub", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_sub(&s).into(),
+                        crate::builtins::string::string_sub(s).into(),
                     ))
-                }));
+                });
             }
             "sup" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
+                return make_bound_string_builtin(s, "sup", 0, |s, _args| {
                     Ok(JsValue::String(
-                        crate::builtins::string::string_sup(&s).into(),
+                        crate::builtins::string::string_sup(s).into(),
                     ))
-                }));
+                });
             }
             "@@toPrimitive" => {
                 let s = s.clone();
@@ -16871,37 +18382,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(JsValue::String(s)) => s.to_string(),
                             _ => ",".to_string(),
                         };
-                        let parts: Vec<String> = a
-                            .borrow()
-                            .iter()
-                            .map(|v| match v {
-                                JsValue::String(s) => s.to_string(),
-                                JsValue::Smi(n) => n.to_string(),
-                                JsValue::HeapNumber(n) => format!("{n}"),
-                                JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null | JsValue::Undefined => String::new(),
-                                _ => String::new(),
-                            })
-                            .collect();
-                        Ok(JsValue::String(parts.join(&sep).into()))
+                        array_join_string(&JsValue::Array(Rc::clone(&a)), &sep)
+                            .map(|joined| JsValue::String(joined.into()))
                     }));
                 }
                 "toString" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let parts: Vec<String> = a
-                            .borrow()
-                            .iter()
-                            .map(|v| match v {
-                                JsValue::String(s) => s.to_string(),
-                                JsValue::Smi(n) => n.to_string(),
-                                JsValue::HeapNumber(n) => format!("{n}"),
-                                JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null | JsValue::Undefined => String::new(),
-                                _ => String::new(),
-                            })
-                            .collect();
-                        Ok(JsValue::String(parts.join(",").into()))
+                        array_join_string(&JsValue::Array(Rc::clone(&a)), ",")
+                            .map(|joined| JsValue::String(joined.into()))
                     }));
                 }
                 "indexOf" => return make_fast_array_method(obj, "indexOf", 1),
@@ -16968,10 +18457,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let mut result = a.borrow().clone();
                         for arg in args {
-                            match arg {
-                                JsValue::Array(other) => result.extend_from_slice(&other.borrow()),
-                                v => result.push(v),
-                            }
+                            append_concat_value(&mut result, arg);
                         }
                         Ok(JsValue::new_array(result))
                     }));
@@ -17003,6 +18489,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         let mut results = Vec::new();
@@ -17011,8 +18498,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17134,6 +18622,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17143,8 +18632,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 item.clone()
                             };
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17158,6 +18648,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17167,8 +18658,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 item.clone()
                             };
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![v, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17182,6 +18674,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17189,8 +18682,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if !val.to_boolean() {
@@ -17204,6 +18698,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, item) in items.iter().enumerate() {
@@ -17211,8 +18706,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             if item.is_the_hole() {
                                 continue;
                             }
-                            let val = dispatch_call_value(
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
@@ -17289,17 +18785,28 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         let mut result = Vec::new();
                         for (i, item) in items.iter().enumerate() {
-                            let val = dispatch_call_value(
+                            if item.is_the_hole() {
+                                continue;
+                            }
+                            let val = dispatch_call_with_this(
                                 &callback,
+                                this_arg.clone(),
                                 vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             match &val {
                                 JsValue::Array(inner) => {
-                                    result.extend_from_slice(&inner.borrow());
+                                    result.extend(inner.borrow().iter().filter_map(|value| {
+                                        if value.is_the_hole() {
+                                            None
+                                        } else {
+                                            Some(value.clone())
+                                        }
+                                    }));
                                 }
                                 JsValue::PlainObject(map) => {
                                     let borrow = map.borrow();
@@ -17312,12 +18819,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                             _ => 0,
                                         };
                                         for idx in 0..len {
-                                            result.push(
-                                                borrow
-                                                    .get(&idx.to_string())
-                                                    .cloned()
-                                                    .unwrap_or(JsValue::Undefined),
-                                            );
+                                            if let Some(value) = borrow.get(&idx.to_string()) {
+                                                result.push(value.clone());
+                                            }
                                         }
                                     } else {
                                         result.push(val.clone());
@@ -17378,7 +18882,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "values" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let items = a.borrow().clone();
+                        let items = a
+                            .borrow()
+                            .iter()
+                            .map(|value| {
+                                if value.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                            .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }
@@ -17390,7 +18904,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             .iter()
                             .enumerate()
                             .map(|(i, v)| {
-                                JsValue::new_array(vec![JsValue::Smi(i as i32), v.clone()])
+                                let value = if v.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    v.clone()
+                                };
+                                JsValue::new_array(vec![JsValue::Smi(i as i32), value])
                             })
                             .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(entries)))
@@ -17399,7 +18918,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "@@iterator" | "Symbol(1)" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let items = a.borrow().clone();
+                        let items = a
+                            .borrow()
+                            .iter()
+                            .map(|value| {
+                                if value.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                            .collect();
                         Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }
@@ -17478,11 +19007,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, v) in items.iter().enumerate().rev() {
-                            let result = dispatch_call_value(
+                            let result = dispatch_call_with_this(
                                 &cb,
+                                this_arg.clone(),
                                 vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if to_boolean_val(&result) {
@@ -17496,6 +19027,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, v) in items.iter().enumerate().rev() {
@@ -17504,8 +19036,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             } else {
                                 v.clone()
                             };
-                            let result = dispatch_call_value(
+                            let result = dispatch_call_with_this(
                                 &cb,
+                                this_arg.clone(),
                                 vec![elem, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if to_boolean_val(&result) {
@@ -17537,9 +19070,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cmp_fn = args.first().cloned();
+                        if let Some(cb) = cmp_fn.as_ref()
+                            && !matches!(cb, JsValue::Undefined)
+                            && !crate::builtins::regexp::is_callable(cb)
+                        {
+                            return Err(StatorError::TypeError(
+                                "Array.prototype.toSorted compareFn must be callable".into(),
+                            ));
+                        }
                         let mut sorted = a.borrow().clone();
                         sorted.sort_by(|x, y| {
                             if let Some(ref cb) = cmp_fn
+                                && !matches!(cb, JsValue::Undefined)
                                 && let Ok(r) = dispatch_call_value(cb, vec![x.clone(), y.clone()])
                             {
                                 let n = match &r {
@@ -17559,15 +19101,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "with" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
-                        let idx = match args.first() {
-                            Some(JsValue::Smi(i)) => *i,
-                            Some(JsValue::HeapNumber(n)) => *n as i32,
-                            _ => 0,
-                        };
+                        let idx = args
+                            .first()
+                            .unwrap_or(&JsValue::Smi(0))
+                            .to_integer_or_infinity()?;
                         let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        let len = a.borrow().len() as i32;
-                        let actual = if idx < 0 { len + idx } else { idx };
-                        if actual < 0 || actual >= len {
+                        let len = a.borrow().len() as f64;
+                        let actual = if idx < 0.0 { len + idx } else { idx };
+                        if actual < 0.0 || actual >= len {
                             return Err(StatorError::RangeError("Invalid index".to_string()));
                         }
                         let mut new_arr = a.borrow().clone();
@@ -17591,6 +19132,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             start_raw.min(len)
                         } as usize;
                         let delete_count = match args.get(1) {
+                            Some(JsValue::Undefined) => 0,
                             Some(JsValue::Smi(i)) => (*i).max(0) as usize,
                             Some(JsValue::HeapNumber(n)) => (*n as i32).max(0) as usize,
                             _ => (len as usize).saturating_sub(start),
@@ -17855,11 +19397,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 if is_async_generator {
                     JsValue::NativeFunction(Rc::new(move |args| {
                         let input = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                        let result =
-                            Interpreter::run_generator_step(&gs, input).map(|step| match step {
-                                GeneratorStep::Yield(value) => make_iterator_result(value, false),
-                                GeneratorStep::Return(value) => make_iterator_result(value, true),
-                            });
+                        let result = Interpreter::async_generator_next(&gs, input);
                         async_iterator_result_promise(result)
                     }))
                 } else {
@@ -17868,6 +19406,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         match Interpreter::run_generator_step(&gs, input)? {
                             GeneratorStep::Yield(v) => Ok(make_iterator_result(v, false)),
                             GeneratorStep::Return(v) => Ok(make_iterator_result(v, true)),
+                            GeneratorStep::Await(_) => {
+                                Err(leaked_internal_await_error("Generator.prototype.next"))
+                            }
                         }
                     }))
                 }
@@ -17910,13 +19451,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
             }
             "__proto__" => proto.clone().unwrap_or(JsValue::Null),
-            _ => {
-                if let Some(proto) = proto {
-                    proto_lookup_chain(&proto, key, obj)
-                } else {
-                    JsValue::Undefined
-                }
-            }
+            _ => crate::builtins::iterator::get_bound_iterator_method(obj, key).unwrap_or_else(
+                || {
+                    if let Some(proto) = proto {
+                        proto_lookup_chain(&proto, key, obj)
+                    } else {
+                        JsValue::Undefined
+                    }
+                },
+            ),
         };
     }
     // Handle JsValue::Iterator ΓÇö expose next/return/@@iterator so that
@@ -17952,7 +19495,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let iter = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(iter.clone())))
             }
-            _ => JsValue::Undefined,
+            _ => crate::builtins::iterator::get_bound_iterator_method(obj, key)
+                .unwrap_or(JsValue::Undefined),
         };
     }
     if let JsValue::Promise(_) = obj {
@@ -17973,7 +19517,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if key == "prototype" && !ba.is_arrow() && !ba.is_generator() {
             let func_val = JsValue::Function(Rc::clone(ba));
             let mut proto_map = PropertyMap::new();
-            proto_map.insert("constructor".to_string(), func_val);
+            proto_map.insert_with_attrs(
+                "constructor".to_string(),
+                func_val,
+                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+            );
             let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
             fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
             return proto_obj;
@@ -18038,37 +19586,29 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     } else {
                         vec![]
                     };
-                    let ba2 = Rc::clone(&ba);
                     let bound_count = bound_args.len() as i32;
                     let result_len =
                         function_length(ba.function_length(), bound_count as u32) as i32;
                     let target = JsValue::Function(Rc::clone(&ba));
                     let bound_name = function_bound_name(&function_display_name(&target));
 
-                    // Build bound function as a PlainObject with __call__,
-                    // carrying the correct `name` and `length` per ES ┬º20.2.3.2.
+                    // [[Call]] wrapper: forwards to the target with the
+                    // captured `this_arg` and bound prefix. The matching
+                    // [[Construct]] slot installed by
+                    // `create_bound_function_object` instead ignores
+                    // `this_arg`, prepends the bound prefix, and constructs
+                    // the target (ES §10.4.1).
+                    let target_for_call = target.clone();
+                    let call_bound_args = bound_args.clone();
                     let call_fn =
                         JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
-                            let mut all_args = bound_args.clone();
+                            let mut all_args = call_bound_args.clone();
                             all_args.extend(call_args);
-                            dispatch_call_with_this(
-                                &JsValue::Function(Rc::clone(&ba2)),
-                                this_arg.clone(),
-                                all_args,
-                            )
+                            dispatch_call_with_this(&target_for_call, this_arg.clone(), all_args)
                         }));
-                    let mut props = PropertyMap::new();
-                    props.insert("__call__".to_string(), call_fn);
-                    props.insert("name".to_string(), JsValue::String(bound_name.into()));
-                    props.insert("length".to_string(), JsValue::Smi(result_len));
-                    props.insert(
-                        "source".to_string(),
-                        JsValue::String(function_to_string("").into()),
-                    );
-                    if let Some(function_proto) = global_constructor_prototype("Function") {
-                        props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), function_proto);
-                    }
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+                    Ok(create_bound_function_object(
+                        call_fn, target, bound_args, bound_name, result_len,
+                    ))
                 }));
             }
             "name" => {
@@ -18393,6 +19933,10 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
         if matches!(current, JsValue::Null | JsValue::Undefined) {
             return JsValue::Undefined;
         }
+        if let JsValue::Proxy(p) = &current {
+            return proxy_get_with_receiver(&p.borrow(), key, this_obj)
+                .unwrap_or(JsValue::Undefined);
+        }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
             // Check for getter accessor BEFORE data key (same rationale
@@ -18440,6 +19984,10 @@ fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -
     for _ in 0..256 {
         if matches!(current, JsValue::Null | JsValue::Undefined) {
             return JsValue::Undefined;
+        }
+        if let JsValue::Proxy(p) = &current {
+            return proxy_get_with_receiver(&p.borrow(), key_str, this_obj)
+                .unwrap_or(JsValue::Undefined);
         }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
@@ -18554,14 +20102,11 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let getter_key = format!("__get_{prop}__");
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if b.has_accessors
-                                    && let Some(g) = b.get(&getter_key)
-                                {
+                                if let Some(g) = b.get_getter_for(&prop) {
                                     return Ok(g.clone());
                                 }
                                 match plain_object_proto_value(&b) {
@@ -18590,14 +20135,11 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let setter_key = format!("__set_{prop}__");
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if b.has_accessors
-                                    && let Some(s) = b.get(&setter_key)
-                                {
+                                if let Some(s) = b.get_setter_for(&prop) {
                                     return Ok(s.clone());
                                 }
                                 match plain_object_proto_value(&b) {
@@ -18628,7 +20170,9 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
                         };
                         let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let getter_key = format!("__get_{prop}__");
-                        map.borrow_mut().insert(getter_key, getter);
+                        let mut borrow = map.borrow_mut();
+                        borrow.insert(getter_key, getter);
+                        borrow.mark_accessor_property(prop);
                         Ok(JsValue::Undefined)
                     }));
                     proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
@@ -18646,7 +20190,9 @@ pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
                         };
                         let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let setter_key = format!("__set_{prop}__");
-                        map.borrow_mut().insert(setter_key, setter);
+                        let mut borrow = map.borrow_mut();
+                        borrow.insert(setter_key, setter);
+                        borrow.mark_accessor_property(prop);
                         Ok(JsValue::Undefined)
                     }));
                     proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
@@ -18719,6 +20265,9 @@ fn try_lookup_accessor_in_chain(
 /// where accessor errors must propagate instead of being coerced to
 /// `undefined`.
 pub(super) fn try_proto_lookup(obj: &JsValue, key: &str) -> StatorResult<JsValue> {
+    if let JsValue::Proxy(p) = obj {
+        return proxy_get_with_receiver(&p.borrow(), key, obj);
+    }
     if let Some(value) = try_lookup_accessor_in_chain(obj, key, obj)? {
         return Ok(value);
     }
@@ -18728,6 +20277,9 @@ pub(super) fn try_proto_lookup(obj: &JsValue, key: &str) -> StatorResult<JsValue
 /// Interned-key variant of [`try_proto_lookup`].
 pub(super) fn try_proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> StatorResult<JsValue> {
     let key_str = key.as_ref();
+    if let JsValue::Proxy(p) = obj {
+        return proxy_get_with_receiver(&p.borrow(), key_str, obj);
+    }
     if let Some(value) = try_lookup_accessor_in_chain(obj, key_str, obj)? {
         return Ok(value);
     }
@@ -18735,24 +20287,18 @@ pub(super) fn try_proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> StatorResult<
 }
 
 /// Invoke a setter accessor function with the given value.
-pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
+pub(crate) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
     match setter {
-        JsValue::Function(ba) => {
-            push_call_frame("<setter>")?;
-            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                acquire_frame(Rc::clone(ba), vec![val], globals)
-            } else {
-                InterpreterFrame::new(Rc::clone(ba), vec![val])
-            };
-            restore_closure_context(&mut frame, ba);
-            frame.global_env.borrow_mut().set_this(this.clone());
-            let result = run_callee_pooled(frame);
-            pop_call_frame();
-            result?;
-            Ok(())
-        }
         JsValue::NativeFunction(f) => {
             f(vec![this.clone(), val])?;
+            Ok(())
+        }
+        JsValue::Function(ba) => {
+            dispatch_call_with_this(&JsValue::Function(Rc::clone(ba)), this.clone(), vec![val])?;
+            Ok(())
+        }
+        JsValue::PlainObject(_) | JsValue::Proxy(_) => {
+            dispatch_call_with_this(setter, this.clone(), vec![val])?;
             Ok(())
         }
         _ => Ok(()),
@@ -18777,12 +20323,29 @@ pub fn dispatch_call_value(
             // Generator functions return a suspended generator object instead
             // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                return Ok(JsValue::Generator(state));
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Ok(make_generator_no_receiver_activation(
+                    ba,
+                    args,
+                    &caller_global_env,
+                ));
+            }
+            if ba.is_async() {
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Interpreter::run_async_function_no_receiver(
+                    Rc::clone(ba),
+                    args,
+                    caller_global_env,
+                );
             }
             push_call_frame("<anonymous>")?;
-            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+            let mut frame = if let Some(globals) =
+                fn_global_env_get(ba).or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            {
                 acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
@@ -18828,12 +20391,31 @@ pub fn dispatch_call_with_this(
             // Generator functions return a suspended generator object instead
             // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(ba));
-                init_generator_state_prototype(&state, ba);
-                return Ok(JsValue::Generator(state));
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Ok(make_generator_with_receiver_activation(
+                    ba,
+                    args,
+                    &caller_global_env,
+                    this_val,
+                ));
+            }
+            if ba.is_async() {
+                let caller_global_env = CURRENT_GLOBALS
+                    .with(|globals| globals.borrow().clone())
+                    .unwrap_or_else(fresh_global_env_rc);
+                return Interpreter::run_async_function_with_receiver(
+                    Rc::clone(ba),
+                    args,
+                    caller_global_env,
+                    this_val,
+                );
             }
             push_call_frame("<anonymous>")?;
-            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+            let mut frame = if let Some(globals) =
+                fn_global_env_get(ba).or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+            {
                 acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
@@ -18957,7 +20539,7 @@ pub fn dispatch_construct_call(
     new_target: JsValue,
 ) -> StatorResult<JsValue> {
     let args: CallArgs = args.into_iter().collect();
-    match callee {
+    with_current_construct_new_target(&new_target, || match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
@@ -18967,7 +20549,7 @@ pub fn dispatch_construct_call(
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            frame.new_target = new_target;
+            frame.new_target = new_target.clone();
             frame.global_env.borrow_mut().set_this(this_val);
             let result = run_callee_pooled(frame);
             pop_call_frame();
@@ -18985,14 +20567,27 @@ pub fn dispatch_construct_call(
                     .or_else(|| borrow.get("__call__"))
                     .cloned()
             };
-            if let Some(f) = construct_fn {
-                dispatch_construct_call(&f, this_val, args, new_target)
-            } else {
-                Err(StatorError::TypeError("object is not a function".into()))
+            match construct_fn {
+                Some(JsValue::Function(ba)) => {
+                    let ctor_proto = proto_lookup(&new_target, "prototype");
+                    let global_env = fn_global_env_get(&ba)
+                        .or_else(|| CURRENT_GLOBALS.with(|g| g.borrow().clone()))
+                        .unwrap_or_else(|| Rc::new(RefCell::new(GlobalEnv::new())));
+                    dispatch::construct_class_from_plain_object_value(
+                        &global_env,
+                        &ba,
+                        map,
+                        &ctor_proto,
+                        args,
+                        new_target.clone(),
+                    )
+                }
+                Some(f) => dispatch_construct_call(&f, this_val, args, new_target.clone()),
+                None => Err(StatorError::TypeError("object is not a function".into())),
             }
         }
         _ => Err(StatorError::TypeError("value is not a function".into())),
-    }
+    })
 }
 
 pub(super) fn construct_builtin_result(
@@ -19059,7 +20654,11 @@ pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) ->
     if matches!(proto, JsValue::Undefined) && !ba.is_arrow() {
         let func_val = JsValue::Function(Rc::clone(ba));
         let mut proto_map = PropertyMap::new();
-        proto_map.insert("constructor".to_string(), func_val);
+        proto_map.insert_with_attrs(
+            "constructor".to_string(),
+            func_val,
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
         let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
         fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
         ba.set_construct_proto_cache(proto_obj.clone());
@@ -19204,6 +20803,48 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 ///   before reaching this helper).
 /// - **Non-writable properties**: the store is silently ignored.
 /// - **Non-extensible objects**: adding a new property is silently ignored.
+pub(super) fn sync_global_object_property_store(
+    map: &Rc<RefCell<PropertyMap>>,
+    prop_name: &str,
+    value: JsValue,
+) {
+    if prop_name == "globalThis" || prop_name == "this" {
+        return;
+    }
+
+    let Some(globals) = current_global_env() else {
+        return;
+    };
+    let is_active_global_object = {
+        let env = globals.borrow();
+        matches!(
+            env.get("globalThis"),
+            Some(JsValue::PlainObject(global_object)) if Rc::ptr_eq(global_object, map)
+        )
+    };
+    if is_active_global_object {
+        globals.borrow_mut().insert(prop_name.to_string(), value);
+    }
+}
+pub(super) fn sync_global_object_property_delete(map: &Rc<RefCell<PropertyMap>>, prop_name: &str) {
+    if prop_name == "globalThis" || prop_name == "this" {
+        return;
+    }
+
+    let Some(globals) = current_global_env() else {
+        return;
+    };
+    let is_active_global_object = {
+        let env = globals.borrow();
+        matches!(
+            env.get("globalThis"),
+            Some(JsValue::PlainObject(global_object)) if Rc::ptr_eq(global_object, map)
+        )
+    };
+    if is_active_global_object {
+        globals.borrow_mut().remove(prop_name);
+    }
+}
 pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()> {
     match obj {
         JsValue::Proxy(p) => {
@@ -19299,9 +20940,15 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                     return Ok(());
                 }
             }
-            map.borrow_mut().insert(prop_name, value);
+            map.borrow_mut().insert(prop_name.clone(), value.clone());
+            sync_global_object_property_store(map, &prop_name, value);
+            notify_mapped_arguments_property_write(map, &prop_name);
             // If this is an array-like PlainObject, update "length".
-            if let Some(idx) = to_array_index(key) {
+            let is_array = {
+                let pm = map.borrow();
+                matches!(pm.get("__is_array__"), Some(JsValue::Boolean(true)))
+            };
+            if is_array && let Some(idx) = to_array_index(key) {
                 let new_len = (idx + 1) as i32;
                 let cur_len = map
                     .borrow()
@@ -21940,6 +23587,114 @@ mod tests {
         make_bytecode(instrs, 1, 2) // frame_size=1, param_count=2
     }
 
+    /// Build a bytecode array containing a `TailCall` opcode.
+    ///
+    /// Simulates `return add(4, 5)` using a tail-position call, so the bytecode
+    /// remains interpreter-valid while tiering/JIT paths must reject it.
+    fn make_tail_call_bytecode() -> BytecodeArray {
+        let add_ba = make_add_bytecode();
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(4)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::TailCall,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
+        make_bytecode_with_pool(instrs, pool, 3, 0)
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_interprets_without_jit() {
+        let tail_ba = make_tail_call_bytecode();
+        assert!(tail_ba.contains_tail_call());
+
+        let mut frame = InterpreterFrame::new(Rc::new(tail_ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_reports_deopt_blocked_for_all_tiers() {
+        let tail_ba = make_tail_call_bytecode();
+
+        for tier in [JitTier::Baseline, JitTier::Maglev, JitTier::Turbofan] {
+            let observed = observe_tier(&tail_ba, tier);
+            assert_eq!(observed.requested_tier, tier);
+            assert_eq!(observed.status, TierRequestStatus::DeoptBlocked);
+            assert!(!observed.ready);
+
+            let forced = force_tier_sync(&tail_ba, tier);
+            assert_eq!(forced.requested_tier, tier);
+            assert_eq!(forced.status, TierRequestStatus::DeoptBlocked);
+            assert!(!forced.ready);
+
+            let waited = wait_for_tier(&tail_ba, tier, Duration::from_millis(0));
+            assert_eq!(waited.requested_tier, tier);
+            assert_eq!(waited.status, TierRequestStatus::DeoptBlocked);
+            assert!(!waited.ready);
+        }
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_deopt_blocked_precedes_jit_disabled() {
+        let tail_ba = make_tail_call_bytecode();
+        tail_ba.set_jit_disabled(true);
+
+        let result = force_tier_sync(&tail_ba, JitTier::Baseline);
+
+        assert!(!result.ready);
+        assert_eq!(result.status, TierRequestStatus::DeoptBlocked);
+    }
+
+    #[test]
+    fn test_tail_call_bytecode_compile_requests_do_not_populate_jit_caches() {
+        let tail_ba = make_tail_call_bytecode();
+
+        maybe_compile_baseline(&tail_ba);
+        maybe_compile_maglev(&tail_ba);
+        maybe_compile_turbofan(&tail_ba);
+
+        assert!(!tail_ba.has_baseline_jit_code());
+        assert!(!tail_ba.has_maglev_jit_code());
+        assert!(!tail_ba.has_maglev_executable_cached());
+        assert!(!tail_ba.maglev_compile_attempted());
+        assert!(!tail_ba.has_turbofan_jit_code());
+    }
+
+    #[test]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn test_tail_call_bytecode_maglev_sync_and_execution_decline() {
+        let tail_ba = make_tail_call_bytecode();
+
+        assert!(!compile_maglev_sync(&tail_ba));
+        assert!(!tail_ba.has_maglev_executable_cached());
+        assert!(try_execute_maglev_raw(&tail_ba, &[]).is_none());
+        assert!(try_execute_best_jit(&tail_ba, &[]).is_none());
+        assert!(try_execute_best_jit_no_result(&tail_ba, &[]).is_none());
+    }
+
     /// Calling a function more than [`TIERING_THRESHOLD`] times must trigger
     /// baseline JIT compilation and cache the compiled code in the shared
     /// [`BytecodeArray`].
@@ -22219,7 +23974,6 @@ mod tests {
     /// JIT.  The test captures a snapshot before and after triggering
     /// compilation and asserts that the counters increase on x86-64 Unix.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô JIT stats polling
     fn test_jit_stats_updated_after_compilation() {
         use super::jit_stats;
         use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
@@ -22657,7 +24411,6 @@ mod tests {
     /// The test calls `add(1, 2)` well above the Maglev threshold and then
     /// polls for the Maglev cache to be populated, asserting the correct result.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô Maglev tiering polling
     fn test_maglev_compiled_after_threshold() {
         use super::maglev_stats;
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
@@ -22747,7 +24500,6 @@ mod tests {
     /// After the Maglev tier is installed the function must continue to return
     /// the correct result for all argument combinations.
     #[test]
-    #[ignore] // TODO: hangs in CI ΓÇô Maglev tier-up polling
     fn test_maglev_correct_result_after_tier_up() {
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
 
@@ -23721,7 +25473,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_inherited_property() {
         let parent = make_plain_object(vec![("inherited", JsValue::Smi(99))]);
         let child = make_plain_object(vec![("own", JsValue::Smi(1)), ("__proto__", parent)]);
@@ -23742,7 +25493,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_multi_level_chain() {
         let grandparent = make_plain_object(vec![("deep", JsValue::String("gp".into()))]);
         let parent = make_plain_object(vec![
@@ -23814,7 +25564,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: proto chain keyed load regression
     fn test_keyed_load_walks_proto_chain() {
         let parent = make_plain_object(vec![("greet", JsValue::String("hello".into()))]);
         let child = make_plain_object(vec![("__proto__", parent)]);
@@ -23966,7 +25715,9 @@ mod tests {
                 *stored_clone.borrow_mut() = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 Ok(JsValue::Undefined)
             }));
-            map.borrow_mut().insert("__set_x__".to_string(), setter);
+            let mut borrow = map.borrow_mut();
+            borrow.insert("__set_x__".to_string(), setter);
+            borrow.mark_accessor_property("x");
         }
         keyed_store(
             &obj,
@@ -23987,7 +25738,9 @@ mod tests {
         let obj = make_plain_object(vec![]);
         if let JsValue::PlainObject(ref map) = obj {
             let getter = JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Smi(99))));
-            map.borrow_mut().insert("__get_x__".to_string(), getter);
+            let mut borrow = map.borrow_mut();
+            borrow.insert("__get_x__".to_string(), getter);
+            borrow.mark_accessor_property("x");
         }
         // Store should be silently ignored (no error in sloppy mode).
         keyed_store(
@@ -24005,7 +25758,9 @@ mod tests {
         let obj = make_plain_object(vec![("x", JsValue::Undefined)]);
         if let JsValue::PlainObject(ref map) = obj {
             let getter = JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Smi(42))));
-            map.borrow_mut().insert("__get_x__".to_string(), getter);
+            let mut borrow = map.borrow_mut();
+            borrow.insert("__get_x__".to_string(), getter);
+            borrow.mark_accessor_property("x");
         }
         let result = proto_lookup(&obj, "x");
         assert_eq!(
@@ -26368,7 +28123,7 @@ mod tests {
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(1)]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::Array(arr) = result {
-            assert!(arr.borrow().len() >= 0);
+            assert_eq!(arr.borrow().len(), 0);
         } else {
             panic!("expected Array, got {result:?}");
         }
@@ -26424,8 +28179,11 @@ mod tests {
             assert_eq!(m.get("1"), Some(&JsValue::Smi(6)));
             assert_eq!(m.get("length"), Some(&JsValue::Smi(2)));
             // callee in unmapped (strict) arguments should be a throwing accessor
-            assert!(m.get("callee").is_some());
-            assert!(matches!(m.get("callee"), Some(JsValue::NativeFunction(_))));
+            assert!(m.is_accessor_property("callee"));
+            assert!(matches!(
+                m.get_getter_for("callee"),
+                Some(JsValue::NativeFunction(_))
+            ));
             // @@iterator should be present
             assert!(m.get("@@iterator").is_some());
         } else {
@@ -27009,9 +28767,7 @@ mod tests {
 
     // ΓöÇΓöÇ LdaNamedPropertyFromSuper ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-    // NOTE: LdaNamedPropertyFromSuper bytecode-level test ΓÇö super property lookup not fully wired
     #[test]
-    #[ignore]
     fn test_lda_named_property_from_super() {
         let ba = make_bytecode_with_pool(
             vec![
@@ -27027,7 +28783,9 @@ mod tests {
                         Operand::FeedbackSlot(0),
                     ],
                 ),
-                // LdaNamedPropertyFromSuper reads from reg 0
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                // LdaNamedPropertyFromSuper starts lookup from the accumulator;
+                // operand 0 is the receiver that accessors would observe.
                 Instruction::new_unchecked(
                     Opcode::LdaNamedPropertyFromSuper,
                     vec![
@@ -27848,6 +29606,14 @@ mod tests {
         assert!(matches!(err, StatorError::SyntaxError(_)), "{src}: {err:?}");
     }
 
+    fn assert_script_reference_error(src: &str) {
+        let err = compile_source_and_run(src).unwrap_err();
+        assert!(
+            matches!(err, StatorError::ReferenceError(_)),
+            "{src}: {err:?}"
+        );
+    }
+
     #[test]
     fn test_eval_direct_reads_function_scope_var() {
         assert_script_result(
@@ -27907,7 +29673,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_returns_undefined_for_statement_only_program() {
         assert_script_result(
             "typeof eval('var x = 1; if (x) { }');",
@@ -27938,9 +29703,8 @@ mod tests {
 
     #[test]
     fn test_eval_indirect_cannot_read_local_binding() {
-        assert_script_result(
-            "function f() { var x = 1; var e = eval; return typeof e('x'); } f();",
-            JsValue::String("undefined".into()),
+        assert_script_reference_error(
+            "function f() { var x = 1; var e = eval; return e('x'); } f();",
         );
     }
 
@@ -27958,7 +29722,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_strict_var_declaration_does_not_leak() {
         assert_script_result(
             "function f() { eval('\"use strict\"; var x = 1'); return typeof x; } f();",
@@ -27993,7 +29756,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_invalid_return_throws_syntax_error() {
         assert_script_syntax_error("eval('return 1;');");
     }
@@ -28012,7 +29774,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_this_is_undefined_in_strict_free_function() {
         assert_script_result(
             "function f() { 'use strict'; return eval('this') === undefined; } f();",
@@ -28098,7 +29859,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_function_constructor_body_reads_global_this() {
         assert_script_result(
             "var marker = 8; var f = new Function('return this.marker'); f();",
@@ -28358,11 +30118,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_promise_resolve_thenable_unwraps() {
+        use crate::builtins::promise::drain_active_microtask_queue;
+
         let result =
             compile_source_and_run(r#"Promise.resolve({ then(resolve) { resolve(14); } })"#)
                 .unwrap();
+        drain_active_microtask_queue();
         assert_fulfilled_promise_value(result, JsValue::Smi(14));
     }
 
@@ -28424,7 +30186,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_custom_async_iterable() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -28481,7 +30242,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_method() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; } async function f() { var it = g(); await it.next(); var r = await it.return(5); return r.value + (r.done ? 1 : 0); } f()",
@@ -28554,7 +30314,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_after_completion_keeps_done_true() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(7); return r.value + (r.done ? 1 : 0); } f()",
@@ -28564,7 +30323,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_awaits_return_argument() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.return(Promise.resolve(6)); return r.value + (r.done ? 1 : 0); } f()",
@@ -28610,7 +30368,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -28636,7 +30393,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_iterator_fallback() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -28662,7 +30418,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_async_iterator_awaits_value_promises() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -28801,7 +30556,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_yield_star_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function* outer() {
@@ -28855,7 +30609,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_yield_await_chain() {
         // yield await p1; yield await p2 ΓÇö two awaits in sequence.
         let result = compile_source_and_run(
@@ -28884,7 +30637,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_break_early() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s = s + x; if (x === 2) break; } return s; } f()",
@@ -28940,7 +30692,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_promise_value_is_awaited() {
         // .return(Promise.resolve(X)) should await the promise.
         let result = compile_source_and_run(
@@ -29018,7 +30769,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_on_completed_gen() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(55); return r.value + (r.done ? 1 : 0); } f()",
@@ -29028,7 +30778,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_throw_on_completed_gen_rejects() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); return await it.throw('late'); } f()",
@@ -29058,7 +30807,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_closure_captures() {
         let result = compile_source_and_run(
             r#"function makeGen(start) {
@@ -29193,7 +30941,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_parameters() {
         let result = compile_source_and_run(
             "async function* g(a, b) { yield a; yield b; yield a + b; } async function f() { var s = 0; for await (const x of g(3, 7)) { s = s + x; } return s; } f()",
@@ -29223,7 +30970,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_with_yield_await() {
         let result = compile_source_and_run(
             "async function* g() { yield await Promise.resolve(5); yield await Promise.resolve(15); } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
@@ -29251,7 +30997,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_return_method() {
         // Generator .return(val) should complete the generator.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -29288,7 +31033,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: generator return on completed regression
     fn test_generator_return_on_completed() {
         // .return(val) on a completed generator returns { value: val, done: true }
         // per ┬º27.5.3.4 GeneratorResumeAbrupt step 2a.
@@ -29334,7 +31078,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_not_resumable_after_return() {
         // After .return(), .next() should return { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -29422,7 +31165,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: generator throw on completed regression
     fn test_generator_throw_on_completed_generator() {
         // .throw(err) on a completed generator throws the error.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -29489,7 +31231,9 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let ba = make_bytecode(instrs, 3, 0).with_async_flag(true);
+        let ba = make_bytecode(instrs, 3, 0)
+            .with_suspend_kinds(vec![SuspendKind::Await])
+            .with_async_flag(true);
         let result = Interpreter::run_async_function(Rc::new(ba), vec![]).unwrap();
         if let JsValue::Promise(p) = &result {
             assert_eq!(
@@ -29725,7 +31469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_strict() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
@@ -29757,7 +31500,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_named_function_expression_strict() {
         test_tail_call_assert_smi(
             "var sum = function inner(n, acc) { \
@@ -29770,7 +31512,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_arrow_function_strict() {
         test_tail_call_assert_smi(
             "function run(n) { \
@@ -29871,7 +31612,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // debug: frames too large; release/linux: Maglev JIT boolean return bug
     fn test_tail_call_mutual_recursion_sloppy_small() {
         test_tail_call_assert_bool(
             "function even(n) { \
@@ -29910,7 +31650,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore)] // debug: JIT slow-path frames too large
     fn test_tail_call_logical_or_sloppy_small() {
         test_tail_call_assert_bool(
             "function any(n) { \
@@ -29933,7 +31672,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_sloppy_small() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
@@ -29946,7 +31684,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_named_function_expression_sloppy_small() {
         test_tail_call_assert_smi(
             "var sum = function inner(n, acc) { \
@@ -29975,7 +31712,6 @@ mod tests {
     /// Static methods: `class Foo { static bar() { return 1; } }`
     /// ΓÇö `Foo.bar()` should work.
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_static_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static bar() { return 99; } } \
@@ -30013,7 +31749,6 @@ mod tests {
     /// `Foo.prototype.__proto__ === Bar.prototype` and
     /// `Foo.__proto__ === Bar` (static inheritance).
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_extends_prototype_chain() {
         // Verify that an instance of Child can access Parent prototype methods.
         let result = crate::builtins::global::global_eval(
@@ -31237,7 +32972,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_with_closure_captures_with_scope() {
         let r = eval(
             "var obj = {x: 7}; var fn; with (obj) { fn = function() { return x; }; } return fn();",
@@ -31667,7 +33401,6 @@ mod tests {
     // ΓöÇΓöÇ instanceof operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
-    #[ignore] // TODO: instanceof Array regression
     fn test_instanceof_array() {
         let r = eval(r#"return [] instanceof Array;"#).unwrap();
         assert_eq!(r, JsValue::Boolean(true));
@@ -31680,7 +33413,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: instanceof custom class regression
     fn test_instanceof_custom_class() {
         let r = eval(
             r#"

@@ -3,9 +3,12 @@
 //! This module contains [`cdp`], a minimal WebSocket server that implements
 //! enough of the Chrome DevTools Protocol to support:
 //!
-//! - **Runtime**: `enable`, `evaluate`, `callFunctionOn`, `getProperties`
-//! - **Debugger**: `enable`, `setPauseOnExceptions`, `setBreakpointByUrl`,
-//!   `resume`
+//! - **Runtime**: `enable`, `evaluate`, `callFunctionOn`, `getProperties`,
+//!   `releaseObject`, `releaseObjectGroup`
+//! - **Debugger**: `enable`, `disable`, `setPauseOnExceptions`,
+//!   `setBreakpointByUrl`, `getScriptSource`, `resume`, `stepInto`,
+//!   `getPossibleBreakpoints`, `stepOver`, `stepOut`. Unsupported methods
+//!   (`pause`, `evaluateOnCallFrame`) return typed CDP errors.
 //! - **Console**: `enable`, `disable` (with buffered `messageAdded` events)
 //! - **Profiler**: `enable`, `start`, `stop`
 //! - **HeapProfiler**: `enable`, `takeHeapSnapshot`,

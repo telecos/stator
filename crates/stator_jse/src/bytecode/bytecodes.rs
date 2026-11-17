@@ -718,6 +718,8 @@ pub enum Opcode {
     Return,
     /// Throw a `ReferenceError` if the accumulator is the hole. `[name_idx]`
     ThrowReferenceErrorIfHole,
+    /// Throw a `TypeError` for assignment to a const binding. `[name_idx]`
+    ThrowConstAssignmentTypeError,
     /// Throw if `super()` has not yet been called.
     ThrowSuperNotCalledIfHole,
     /// Throw if `super()` has already been called.
@@ -778,6 +780,9 @@ pub enum Opcode {
     PushContext,
     /// Pop to the context stored in `reg`. `[reg]`
     PopContext,
+    /// Forward a mapped-arguments alias from a parent context slot into the current context.
+    /// [parent_context_reg, parent_slot, current_slot]
+    ForwardMappedArgumentAlias,
 
     // ── For-in ────────────────────────────────────────────────────────────
     /// Enumerate own properties of `obj`. `[obj]`
@@ -1103,6 +1108,7 @@ impl Opcode {
             // Return / Throw
             Opcode::Return => &[],
             Opcode::ThrowReferenceErrorIfHole => &[ConstantPoolIdx],
+            Opcode::ThrowConstAssignmentTypeError => &[ConstantPoolIdx],
             Opcode::ThrowSuperNotCalledIfHole => &[],
             Opcode::ThrowSuperAlreadyCalledIfNotHole => &[],
             Opcode::ThrowIfNullOrUndefined => &[],
@@ -1134,6 +1140,7 @@ impl Opcode {
             // Context
             Opcode::PushContext => &[Register],
             Opcode::PopContext => &[Register],
+            Opcode::ForwardMappedArgumentAlias => &[Register, ConstantPoolIdx, ConstantPoolIdx],
 
             // For-in
             Opcode::ForInEnumerate => &[Register],
@@ -1824,6 +1831,14 @@ mod tests {
         round_trip(vec![
             Instruction::new_unchecked(Opcode::PushContext, vec![Operand::Register(2)]),
             Instruction::new_unchecked(Opcode::PopContext, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::ForwardMappedArgumentAlias,
+                vec![
+                    Operand::Register(2),
+                    Operand::ConstantPoolIdx(3),
+                    Operand::ConstantPoolIdx(4),
+                ],
+            ),
         ]);
     }
 

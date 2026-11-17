@@ -2525,9 +2525,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: prototype chain snapshot regression
     fn test_round_trip_prototype_chain() {
-        // Simulate a prototype chain: child.__proto__ = parent
+        // Simulate a prototype chain: child.[[Prototype]] = parent.
         let mut parent_map = PropertyMap::new();
         parent_map.insert(
             "greet".to_string(),
@@ -2537,7 +2536,7 @@ mod tests {
         let mut child_map = PropertyMap::new();
         child_map.insert("x".to_string(), JsValue::Smi(10));
         child_map.insert(
-            "__proto__".to_string(),
+            crate::objects::property_map::INTERNAL_PROTO_PROPERTY_KEY.to_string(),
             JsValue::PlainObject(Rc::clone(&parent)),
         );
         let child = Rc::new(RefCell::new(child_map));
@@ -2546,7 +2545,7 @@ mod tests {
         let mut child2_map = PropertyMap::new();
         child2_map.insert("y".to_string(), JsValue::Smi(20));
         child2_map.insert(
-            "__proto__".to_string(),
+            crate::objects::property_map::INTERNAL_PROTO_PROPERTY_KEY.to_string(),
             JsValue::PlainObject(Rc::clone(&parent)),
         );
         let child2 = Rc::new(RefCell::new(child2_map));
@@ -2581,7 +2580,7 @@ mod tests {
                     Some(&JsValue::String("hello".to_string().into()))
                 );
             } else {
-                panic!("expected __proto__ to be PlainObject");
+                panic!("expected internal prototype to be PlainObject");
             }
         } else {
             panic!("expected two PlainObject children");
