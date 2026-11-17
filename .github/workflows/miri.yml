@@ -75,7 +75,7 @@ jobs:
               --skip objects::regexp
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install cross-compilation toolchain
         if: ${{ matrix.packages != '' && matrix.packages != null }}
