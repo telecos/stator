@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -282,8 +283,11 @@ pub struct StatorIsolate {
     ///
     /// Slot addresses are exposed to the embedder as opaque
     /// [`StatorPersistent`] pointers and remain stable until
-    /// [`stator_persistent_dispose`] frees the slot.
+    /// the isolate is destroyed.
     persistent_slots: Vec<Option<Box<StatorPersistentSlot>>>,
+    /// Disposed slot allocations are kept alive so redundant dispose calls can
+    /// safely inspect their pointers, even when their table indices are reused.
+    persistent_retired_slots: Vec<Pin<Box<StatorPersistentSlot>>>,
     /// GC root registry mirroring `persistent_slots` so engine-side GC
     /// abstractions (see [`stator_jse::gc::handle::PersistentRoots`]) see
     /// every persistent as a strong root.  Each entry stores the address of
@@ -296,11 +300,13 @@ pub struct StatorIsolate {
     ///
     /// Slot addresses are exposed to the embedder as opaque
     /// [`StatorWeak`] pointers and remain stable until
-    /// [`stator_weak_dispose`] frees the slot.  Unlike `persistent_slots`,
-    /// weak entries are **not** mirrored into `persistent_roots`; they are
-    /// scanned only during the weak-callback dispatch phase driven by
-    /// [`stator_isolate_gc`].
+    /// the isolate is destroyed. Unlike `persistent_slots`, weak entries are
+    /// **not** mirrored into `persistent_roots`; they are scanned only during
+    /// the weak-callback dispatch phase driven by [`stator_isolate_gc`].
     weak_slots: Vec<Option<Box<StatorWeakSlot>>>,
+    /// Disposed weak slot allocations are kept alive so redundant dispose
+    /// calls can safely inspect their pointers, even when indices are reused.
+    weak_retired_slots: Vec<Pin<Box<StatorWeakSlot>>>,
     /// Traced (Oilpan-style) root table.  Each entry owns a
     /// [`StatorTracedSlot`] whose strong reference is only held *between*
     /// GC cycles in which the embedder root visitor reports the slot.  See
@@ -308,8 +314,11 @@ pub struct StatorIsolate {
     ///
     /// Slot addresses are exposed to the embedder as opaque
     /// [`StatorTraced`] pointers and remain stable until
-    /// [`stator_traced_dispose`] frees the slot.
+    /// the isolate is destroyed.
     traced_slots: Vec<Option<Box<StatorTracedSlot>>>,
+    /// Disposed traced slot allocations are kept alive so redundant dispose
+    /// calls can safely inspect their pointers, even when indices are reused.
+    traced_retired_slots: Vec<Pin<Box<StatorTracedSlot>>>,
     /// Engine-side registry mirroring `traced_slots`; tracks which slots
     /// were visited in the current GC cycle.  See
     /// [`stator_jse::gc::handle::TracedRoots`].
@@ -362,9 +371,12 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         jit_disabled: false,
         terminating: AtomicBool::new(false),
         persistent_slots: Vec::new(),
+        persistent_retired_slots: Vec::new(),
         persistent_roots: stator_jse::gc::handle::PersistentRoots::new(),
         weak_slots: Vec::new(),
+        weak_retired_slots: Vec::new(),
         traced_slots: Vec::new(),
+        traced_retired_slots: Vec::new(),
         traced_roots: stator_jse::gc::handle::TracedRoots::new(),
         traced_visitor: None,
         dom_class_registry: DomClassIdRegistry::new(),
@@ -7354,10 +7366,7 @@ fn serialize_js_module_payload(payload: &JsModulePayload, out: &mut Vec<u8>) -> 
         }
     }
 
-    if !push_bytes(out, &payload.bytecode) {
-        return false;
-    }
-    true
+    push_bytes(out, &payload.bytecode)
 }
 
 fn serialize_wasm_val_kinds(kinds: &[HostValKind], out: &mut Vec<u8>) -> bool {
@@ -14117,10 +14126,7 @@ unsafe fn run_script_inner(
     // microtask drains poll it.  Cleared on drop, even on panic.
     let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
-    let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b,
-        None => return None,
-    };
+    let bytecodes = unsafe { (*script).bytecodes.as_ref()? };
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };
@@ -14164,10 +14170,7 @@ unsafe fn run_script_no_result_inner(
     }
     let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
-    let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b,
-        None => return None,
-    };
+    let bytecodes = unsafe { (*script).bytecodes.as_ref()? };
     if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
         let isolate = unsafe { (*ctx)._isolate };
@@ -25771,16 +25774,16 @@ unsafe fn ffi_utf8_or_default(ptr: *const c_char, len: usize, default: &str) -> 
 // All `stator_persistent_*` functions are null-tolerant: passing a null
 // `StatorPersistent*` is a documented no-op (or returns null / true /
 // `false`, as appropriate).  Calling `stator_persistent_dispose` more than
-// once on the same slot is safe — the second call is a no-op because the
-// slot pointer has already been removed from the isolate's table.
+// once on the same slot is safe — its allocation remains alive until the
+// isolate is destroyed, so the second call can detect that it is no longer
+// present in the isolate's active table.
 
 /// Opaque persistent-handle slot exposed to the embedder.
 ///
-/// The pointer returned by `stator_persistent_new` is the address of a
-/// stable, isolate-owned slot.  Its address does not change until the slot
-/// is freed by `stator_persistent_dispose`.  The bytes pointed at are
-/// implementation-defined and must not be inspected or mutated by the
-/// embedder.
+/// The pointer returned by [`stator_persistent_new`] is the address of a
+/// stable, isolate-owned slot. Its address remains valid until the isolate is
+/// destroyed. The bytes pointed at are implementation-defined and must not be
+/// inspected or mutated by the embedder.
 #[repr(C)]
 pub struct StatorPersistent {
     _opaque: [u8; 0],
@@ -25910,10 +25913,10 @@ pub unsafe extern "C" fn stator_persistent_new(
 
 /// Clear the value stored in `persistent` without freeing the slot.
 ///
-/// After `reset()`, `stator_persistent_is_empty` returns `true` and
-/// `stator_persistent_get` returns null until the slot is disposed and a
-/// new persistent is allocated.  The slot pointer itself remains valid; the
-/// slot is only freed by `stator_persistent_dispose`.
+/// After `reset()`, [`stator_persistent_is_empty`] returns `true` and
+/// [`stator_persistent_get`] returns null until the slot is disposed and a
+/// new persistent is allocated. The slot pointer remains valid until its
+/// isolate is destroyed.
 ///
 /// Null-tolerant: passing null is a no-op.
 ///
@@ -25988,7 +25991,8 @@ pub unsafe extern "C" fn stator_persistent_get(
 }
 
 /// Free the slot backing `persistent`, releasing the engine-side root and
-/// the cloned value it owns.
+/// the cloned value it owns. The slot allocation remains alive until its
+/// isolate is destroyed to make redundant dispose calls safe.
 ///
 /// After this call the `persistent` pointer must not be used.  Calling
 /// `dispose` twice on the same slot is a documented no-op: the first call
@@ -26022,7 +26026,7 @@ pub unsafe extern "C" fn stator_persistent_dispose(persistent: *mut StatorPersis
     let iso_ref = unsafe { &mut *isolate };
     // Take the owning Box out of the table; if the slot is already `None`
     // this call is a safe no-op (double-dispose).
-    let Some(slot_box) = iso_ref
+    let Some(mut slot_box) = iso_ref
         .persistent_slots
         .get_mut(index)
         .and_then(Option::take)
@@ -26038,7 +26042,10 @@ pub unsafe extern "C" fn stator_persistent_dispose(persistent: *mut StatorPersis
         return;
     }
     iso_ref.persistent_roots.unregister_root(root_index);
-    drop(slot_box);
+    slot_box.inner = None;
+    iso_ref
+        .persistent_retired_slots
+        .push(Box::into_pin(slot_box));
 }
 
 // ── Weak handles ─────────────────────────────────────────────────────────────
@@ -26069,10 +26076,10 @@ pub unsafe extern "C" fn stator_persistent_dispose(persistent: *mut StatorPersis
 /// Opaque weak-handle slot exposed to the embedder.
 ///
 /// The pointer returned by [`stator_weak_new`] / [`stator_persistent_make_weak`]
-/// is the address of a stable, isolate-owned slot.  Its address does not
-/// change until the slot is freed by [`stator_weak_dispose`].  The bytes
-/// pointed at are implementation-defined and must not be inspected or
-/// mutated by the embedder.
+/// is the address of a stable, isolate-owned slot. Its address remains valid
+/// until the isolate is destroyed. The bytes pointed at are
+/// implementation-defined and must not be inspected or mutated by the
+/// embedder.
 #[repr(C)]
 pub struct StatorWeak {
     _opaque: [u8; 0],
@@ -26138,7 +26145,7 @@ struct StatorWeakSlot {
     /// The isolate that owns this slot.
     isolate: *mut StatorIsolate,
     /// Index into the isolate's `weak_slots` table; stable for the slot's
-    /// lifetime and used by [`stator_weak_dispose`] to free the slot.
+    /// lifetime and used by [`stator_weak_dispose`] to remove it from the table.
     index: usize,
     /// One-shot callback; cleared once fired so a subsequent GC cycle that
     /// somehow re-observes the (now empty) slot can never re-enter it.
@@ -26411,7 +26418,8 @@ pub unsafe extern "C" fn stator_weak_new(
 /// skipped by future weak-callback dispatch phases (so the one-shot
 /// callback is **never** invoked, even if the referent is already dead),
 /// and [`stator_weak_upgrade`] returns null.  The slot itself is only
-/// freed by [`stator_weak_dispose`].
+/// removed from the callback table by [`stator_weak_dispose`]; its allocation
+/// remains alive until the isolate is destroyed.
 ///
 /// Null-tolerant: passing null is a no-op.
 ///
@@ -26520,13 +26528,15 @@ pub unsafe extern "C" fn stator_weak_upgrade(weak: *mut StatorWeak) -> *mut Stat
     raw as *mut StatorPersistent
 }
 
-/// Free the slot backing `weak`.
+/// Remove the slot backing `weak` from the callback table.
 ///
 /// After this call the `weak` pointer must not be used (except as a
 /// redundant `dispose`, which is a documented no-op).  Disposing a weak
 /// slot **before** its callback fires permanently suppresses the callback —
 /// the slot is removed from the isolate's table before any future dispatch
-/// phase can observe it.  Passing null is also a no-op.
+/// phase can observe it. Its allocation remains alive until the isolate is
+/// destroyed to make redundant dispose calls safe. Passing null is also a
+/// no-op.
 ///
 /// # Safety
 /// `weak` must be null or a slot pointer returned by [`stator_weak_new`]
@@ -26546,7 +26556,7 @@ pub unsafe extern "C" fn stator_weak_dispose(weak: *mut StatorWeak) {
     // SAFETY: `isolate` is alive for the slot's lifetime; we are on its
     // owning thread.
     let iso_ref = unsafe { &mut *isolate };
-    let Some(slot_box) = iso_ref.weak_slots.get_mut(index).and_then(Option::take) else {
+    let Some(mut slot_box) = iso_ref.weak_slots.get_mut(index).and_then(Option::take) else {
         return;
     };
     // Defence in depth: if the slot index has been re-used by a fresh
@@ -26557,7 +26567,12 @@ pub unsafe extern "C" fn stator_weak_dispose(weak: *mut StatorWeak) {
         iso_ref.weak_slots[index] = Some(slot_box);
         return;
     }
-    drop(slot_box);
+    slot_box.referent = None;
+    slot_box.callback = None;
+    slot_box.parameter = std::ptr::null_mut();
+    slot_box.internal_fields = [std::ptr::null_mut(); 2];
+    slot_box.fired = true;
+    iso_ref.weak_retired_slots.push(Box::into_pin(slot_box));
 }
 
 /// Downgrade `persistent` to a weak handle in place.
@@ -26656,10 +26671,9 @@ pub unsafe extern "C" fn stator_persistent_make_weak(
 /// Opaque traced-handle slot exposed to the embedder.
 ///
 /// The pointer returned by `stator_traced_new` is the address of a
-/// stable, isolate-owned slot.  Its address does not change until the slot
-/// is freed by `stator_traced_dispose`.  The bytes pointed at are
-/// implementation-defined and must not be inspected or mutated by the
-/// embedder.
+/// stable, isolate-owned slot. Its address remains valid until the isolate is
+/// destroyed. The bytes pointed at are implementation-defined and must not be
+/// inspected or mutated by the embedder.
 #[repr(C)]
 pub struct StatorTraced {
     _opaque: [u8; 0],
@@ -26721,15 +26735,12 @@ struct StatorTracedSlot {
     root_index: usize,
 }
 
-/// Internal traced-visitor state carried behind a `StatorTracedVisitor`
-/// opaque pointer.  Fields are read by `stator_traced_visitor_visit` to
-/// validate the visitor is still the live one for `isolate`.
+/// Internal traced-visitor state carried behind a [`StatorTracedVisitor`]
+/// opaque pointer.
 #[repr(C)]
 struct TracedVisitorState {
     isolate: *mut StatorIsolate,
-    /// The GC epoch active when this visitor was minted.  If the embedder
-    /// somehow holds the token across a cycle boundary the epoch check
-    /// will fail and `visit` becomes a fail-closed no-op.
+    /// The GC epoch active when this visitor was minted.
     epoch: u32,
 }
 
@@ -26812,7 +26823,7 @@ pub unsafe extern "C" fn stator_traced_new(
 ///
 /// After `reset()`, `stator_traced_is_empty` returns `true` and
 /// `stator_traced_get` returns null.  The slot pointer itself remains
-/// valid; the slot is only freed by `stator_traced_dispose`.  A
+/// valid until the isolate is destroyed. A
 /// subsequent embedder visitor call that visits this slot still marks it
 /// as visited, but no strong reference is restored because the weak
 /// handle has been cleared.
@@ -26901,16 +26912,17 @@ pub unsafe extern "C" fn stator_traced_get(traced: *const StatorTraced) -> *mut 
     unsafe { allocate_stator_value(isolate, cloned) }
 }
 
-/// Free the slot backing `traced`.
+/// Remove the slot backing `traced` from the root table.
 ///
 /// After this call the `traced` pointer must not be used (except as a
 /// redundant `dispose`, which is a documented no-op).  Passing null is
-/// also a no-op.
+/// also a no-op. Its allocation remains alive until the isolate is destroyed
+/// to make redundant dispose calls safe.
 ///
 /// # Safety
 /// `traced` must be null or a slot pointer returned by
-/// `stator_traced_new`.  After this call returns the embedder must
-/// treat the pointer as invalid.
+/// `stator_traced_new`. After this call returns, the embedder must treat the
+/// pointer as invalid except for a redundant dispose while the isolate lives.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
     if traced.is_null() {
@@ -26930,7 +26942,7 @@ pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
     }
     // SAFETY: `isolate` is alive for the slot's lifetime.
     let iso_ref = unsafe { &mut *isolate };
-    let Some(slot_box) = iso_ref.traced_slots.get_mut(index).and_then(Option::take) else {
+    let Some(mut slot_box) = iso_ref.traced_slots.get_mut(index).and_then(Option::take) else {
         return;
     };
     // Defence in depth: if the index has been re-used by a fresh
@@ -26940,7 +26952,9 @@ pub unsafe extern "C" fn stator_traced_dispose(traced: *mut StatorTraced) {
         return;
     }
     iso_ref.traced_roots.unregister_root(root_index);
-    drop(slot_box);
+    slot_box.strong = None;
+    slot_box.weak = None;
+    iso_ref.traced_retired_slots.push(Box::into_pin(slot_box));
 }
 
 /// Register the embedder traced-root visitor on `isolate`.
@@ -26977,10 +26991,9 @@ pub unsafe extern "C" fn stator_isolate_set_traced_root_visitor(
 /// Only valid to call from inside a `StatorTracedRootVisitor`
 /// invocation; the `visitor` token is the one supplied to the visitor
 /// callback by the engine.  Fails closed (no-op) when `visitor` or
-/// `traced` is null, when the visitor has an out-of-date epoch (callers
-/// holding a stale token across cycles cannot accidentally mark slots),
-/// or when `traced`'s referent has already been collected by a previous
-/// cycle.
+/// `traced` is null, when the visitor's epoch does not match the current
+/// cycle, or when `traced`'s referent has already been collected by a
+/// previous cycle.
 ///
 /// # Safety
 /// - `visitor` must be null or the live token supplied to the current
@@ -27007,13 +27020,9 @@ pub unsafe extern "C" fn stator_traced_visitor_visit(
     }
     // SAFETY: `visitor_isolate` is alive; we are on its owning thread.
     let iso_ref = unsafe { &mut *visitor_isolate };
-    // Fail closed if the visitor token is from a previous cycle.
-    if iso_ref.traced_roots.current_epoch() != visitor_epoch {
-        return;
-    }
     // SAFETY: caller guarantees `traced` is live.
     let root_index = unsafe { (*slot).root_index };
-    let _ = iso_ref.traced_roots.mark_visited(root_index);
+    let _ = mark_traced_visitor_root(&mut iso_ref.traced_roots, visitor_epoch, root_index);
     // No-op for strong: the slot already owns a strong clone from
     // `stator_traced_new`.  The visitor only refreshes the epoch
     // stamp; the dispatch loop drops the strong clone for any slot
@@ -27086,6 +27095,17 @@ pub unsafe extern "C" fn stator_traced_visit_outgoing(
         // visitation and receives a borrowed, live edge pointer.
         unsafe { callback(userdata, edge) };
     }
+}
+
+fn mark_traced_visitor_root(
+    roots: &mut stator_jse::gc::handle::TracedRoots,
+    visitor_epoch: u32,
+    root_index: usize,
+) -> bool {
+    if roots.current_epoch() != visitor_epoch {
+        return false;
+    }
+    roots.mark_visited(root_index)
 }
 
 /// Run the embedder traced-root visitor for `isolate` and clear the
@@ -50002,74 +50022,25 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_visitor_visit_stale_token_is_noop() {
-        // A visitor token captured during one cycle is not allowed to be
-        // re-used in a later cycle.  We synthesise that scenario by
-        // running one cycle, capturing the token mid-callback, then
-        // calling the visit helper again afterwards: the epoch check
-        // must reject it without observable effect.
-        struct Captured {
-            visitor: *mut StatorTracedVisitor,
-            captured: bool,
-        }
-        unsafe extern "C" fn capture_cb(userdata: *mut c_void, visitor: *mut StatorTracedVisitor) {
-            // SAFETY: `userdata` is the leaked `Captured` below.
-            unsafe {
-                let c = &mut *(userdata as *mut Captured);
-                if !c.captured {
-                    c.visitor = visitor;
-                    c.captured = true;
-                }
-            }
-        }
+    fn test_stale_traced_visitor_epoch_is_ignored() {
+        let mut roots = stator_jse::gc::handle::TracedRoots::new();
+        let root_index = roots.register_root(std::ptr::null_mut());
+        let stale_epoch = roots.begin_epoch();
+        assert!(mark_traced_visitor_root(
+            &mut roots,
+            stale_epoch,
+            root_index
+        ));
+        assert!(roots.is_visited(root_index));
 
-        let iso = IsolateGuard::new();
-        let ctx = ContextGuard::new(iso.as_ptr());
-        let obj = unsafe { stator_object_new(iso.as_ptr()) };
-        let val = unsafe { stator_object_as_value(obj) };
-        let traced = unsafe { stator_traced_new(ctx.as_ptr(), val) };
-        unsafe { stator_value_destroy(val) };
-        unsafe { stator_object_destroy(obj) };
-
-        let captured = Box::into_raw(Box::new(Captured {
-            visitor: std::ptr::null_mut(),
-            captured: false,
-        }));
-        unsafe {
-            stator_isolate_set_traced_root_visitor(
-                iso.as_ptr(),
-                Some(capture_cb),
-                captured as *mut c_void,
-            )
-        };
-        unsafe { stator_isolate_gc(iso.as_ptr()) };
-        // The visitor did not report `traced`, so by now it should be
-        // empty.
-        assert!(unsafe { stator_traced_is_empty(traced) });
-        // SAFETY: `captured` still alive; visitor has fired once.
-        let stale_token = unsafe { (*captured).visitor };
-        assert!(!stale_token.is_null());
-
-        // Re-create a live traced slot so we can verify the stale token
-        // does not resurrect it.
-        let obj2 = unsafe { stator_object_new(iso.as_ptr()) };
-        let val2 = unsafe { stator_object_as_value(obj2) };
-        let traced2 = unsafe { stator_traced_new(ctx.as_ptr(), val2) };
-        unsafe { stator_value_destroy(val2) };
-        unsafe { stator_object_destroy(obj2) };
-
-        // The token was minted in the previous cycle.  Using it after
-        // the cycle ended must fail closed: subsequent GC will still
-        // observe `traced2` as unreported and collect it.
-        unsafe { stator_traced_visitor_visit(stale_token, traced2) };
-        unsafe { stator_isolate_gc(iso.as_ptr()) };
-        assert!(unsafe { stator_traced_is_empty(traced2) });
-
-        unsafe { stator_traced_dispose(traced) };
-        unsafe { stator_traced_dispose(traced2) };
-        unsafe { stator_isolate_set_traced_root_visitor(iso.as_ptr(), None, std::ptr::null_mut()) };
-        // SAFETY: pointer was returned by `Box::into_raw` above.
-        drop(unsafe { Box::from_raw(captured) });
+        roots.begin_epoch();
+        assert!(!roots.is_visited(root_index));
+        assert!(!mark_traced_visitor_root(
+            &mut roots,
+            stale_epoch,
+            root_index
+        ));
+        assert!(!roots.is_visited(root_index));
     }
 
     #[test]

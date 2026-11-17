@@ -7841,7 +7841,6 @@ fn write_http_response(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;

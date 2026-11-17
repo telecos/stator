@@ -1977,10 +1977,7 @@ impl BytecodeArray {
         // Exponential cooldown: skip Maglev until enough interpreter
         // invocations have elapsed since last deopt.
         let next = self.inner.maglev_next_try_at.get();
-        if next > 0 && self.inner.invocation_count.get() < next {
-            return true;
-        }
-        false
+        next > 0 && self.inner.invocation_count.get() < next
     }
 
     /// Returns the current Maglev deopt count for diagnostics.

@@ -5042,41 +5042,8 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline fast path for [`ValueNode::SpeculativeCallFusion`].
     ///
     /// When `resolved_slot` and `resolved_k` are `Some`, the optimizer has
-    /// pre-analysed the callee's bytecodes.  The codegen uses a **global
-    /// inline cache** (`FUSION_CTX_CALLEE` / `FUSION_CTX_SLOT_PTR`) to
-    /// bypass the runtime resolve stub entirely on cache hit:
-    ///
-    /// ```text
-    ///   ; ── Global IC fast path (no calls) ─────────────
-    ///   mov   r11, [&FUSION_CTX_CALLEE]       ; load cached callee
-    ///   mov   r10, <callee>
-    ///   cmp   r10, r11
-    ///   jne   slow_path
-    ///   mov   r10, [&FUSION_CTX_SLOT_PTR]     ; cached slot_ptr
-    ///   jmp   arithmetic
-    ///
-    ///   slow_path:
-    ///   <save live regs>
-    ///   mov   rdi, r10                        ; callee
-    ///   mov   rsi, slot_index                 ; compile-time constant
-    ///   call  jit_runtime_fusion_ctx_slot_ptr  ; → RAX = slot_ptr
-    ///   mov   r10, rax
-    ///   <restore live regs>
-    ///   test  r10, r10
-    ///   jz    deopt
-    ///
-    ///   arithmetic:
-    ///   movzx rax, byte [r10 + disc_off]
-    ///   cmp   rax, smi_disc
-    ///   jne   deopt
-    ///   movsxd rax, dword [r10 + pay_off]
-    ///   imul  rdi, <k * trip_count>           ; k is compile-time imm
-    ///   add   rax, rdi
-    ///   movsxd r11, eax
-    ///   cmp   r11, rax
-    ///   jne   deopt_overflow
-    ///   mov   dword [r10 + pay_off], eax
-    /// ```
+    /// pre-analysed the callee's bytecodes and the codegen resolves the
+    /// context slot through the current runtime state.
     ///
     /// When `resolved_slot` / `resolved_k` are `None`, falls back to the
     /// original [`jit_runtime_fusion_resolve`] stub path.
@@ -5097,7 +5064,7 @@ impl<'a> MaglevCodegen<'a> {
         let payload_offset = jv_layout.smi_payload_offset as i32;
 
         if let (Some(slot), Some(k)) = (resolved_slot, resolved_k) {
-            // ── Resolved path: global IC + lighter stub ───────────────
+            // ── Resolved path: lighter runtime stub ───────────────────
             self.emit_resolved_fusion(
                 id,
                 callee,
@@ -5124,8 +5091,7 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
-    /// Resolved fusion fast path: global inline cache with zero-call hot
-    /// path and a lightweight stub fallback.
+    /// Resolved fusion fast path using the lightweight context-slot resolver.
     #[cfg(any(
         stator_maglev_jit_x86_64,
         all(target_arch = "x86_64", any(unix, windows))
@@ -5142,34 +5108,8 @@ impl<'a> MaglevCodegen<'a> {
         payload_offset: i32,
         smi_disc: u8,
     ) {
-        let mut slow_label = Label::new();
-        let mut arith_label = Label::new();
-
-        // Load callee into R10 (non-allocated scratch).
-        self.emit_load(callee, Reg64::R10);
-
-        // ── Global IC check ──────────────────────────────────────────
-        let callee_addr = jit_runtime::fusion_ctx_callee_addr() as i64;
-        self.masm.mov_ri(Reg64::R11, callee_addr);
-        // Compare callee with [&FUSION_CTX_CALLEE].
-        self.masm.cmp_rm(Reg64::R10, Reg64::R11, 0);
-        self.masm.jne(&mut slow_label);
-
-        // IC hit: load cached slot_ptr.
-        let slot_ptr_addr = jit_runtime::fusion_ctx_slot_ptr_addr() as i64;
-        self.masm.mov_ri(Reg64::R11, slot_ptr_addr);
-        self.masm.mov_load_base_disp32(Reg64::R10, Reg64::R11, 0);
-        // Verify cached slot_ptr is non-zero (safety).
-        self.masm.test_rr(Reg64::R10, Reg64::R10);
-        self.masm.je(&mut slow_label);
-
-        self.masm.jmp(&mut arith_label);
-
-        // ── Slow path: call lightweight resolve stub ─────────────────
-        self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        // R10 still holds the callee from emit_load above.
-        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_load(callee, Self::helper_arg_reg(0));
         self.emit_helper_arg_imm(1, i64::from(slot));
         let stub_addr = jit_runtime::jit_runtime_fusion_ctx_slot_ptr as *const () as usize as i64;
         self.emit_helper_call_addr(stub_addr);
@@ -5180,8 +5120,6 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.test_rr(Reg64::R10, Reg64::R10);
         self.masm.je(&mut self.deopt_stub_label);
 
-        // ── Inline Smi arithmetic ────────────────────────────────────
-        self.masm.bind_label(&mut arith_label);
         if disc_offset == 0 && payload_offset == 4 {
             // Packed qword load: single read for disc + payload.
             self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::R10, 0);
@@ -6315,6 +6253,14 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.sub_rr(Reg64::R11, Reg64::Rax);
         self.emit_store(id, Reg64::R11);
         true
+    }
+
+    #[cfg(not(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
+    fn try_emit_int32_mod_by_constant(&mut self, _id: NodeId, _left: NodeId, _d: i32) -> bool {
+        false
     }
 
     /// Inline Smi fast path for `GenericDivide`.

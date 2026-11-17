@@ -395,7 +395,7 @@ impl ImmixSpace {
 
     /// Drain all full blocks for collection processing.
     pub(crate) fn drain_full_blocks(&mut self) -> Vec<ImmixBlock> {
-        self.full_blocks.drain(..).collect()
+        std::mem::take(&mut self.full_blocks)
     }
 
     /// Re-insert blocks after collection.
