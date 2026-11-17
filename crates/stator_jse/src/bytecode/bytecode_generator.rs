@@ -8978,20 +8978,24 @@ fn compile_function_inner(
         ba = ba.with_source_text(source);
     }
 
-    // Detect writes to closure-context slots so Maglev can avoid functions
-    // whose captured state it cannot safely update yet.
-    let writes_closure = ba
+    // Detect closure-context accesses so Maglev can avoid functions whose
+    // captured state it cannot yet safely access.
+    let uses_closure = ba
         .instructions()
         .map(|instrs| {
             instrs.iter().any(|i| {
                 matches!(
                     i.opcode,
-                    Opcode::StaContextSlot | Opcode::StaCurrentContextSlot
+                    Opcode::LdaContextSlot
+                        | Opcode::LdaCurrentContextSlot
+                        | Opcode::LdaImmutableCurrentContextSlot
+                        | Opcode::StaContextSlot
+                        | Opcode::StaCurrentContextSlot
                 )
             })
         })
         .unwrap_or(false);
-    ba = ba.with_writes_closure_vars(writes_closure);
+    ba = ba.with_uses_closure_vars(uses_closure);
 
     Ok(ba)
 }
