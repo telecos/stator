@@ -5,7 +5,6 @@ edition = "2024"
 description = "Stator JavaScript engine — stable C FFI layer for embedding"
 license = "MIT"
 repository = "https://github.com/telecos/stator"
-homepage = "https://github.com/telecos/stator"
 readme = "README.md"
 keywords = ["javascript", "engine", "ffi", "embedding"]
 categories = ["compilers", "external-ffi-bindings"]
