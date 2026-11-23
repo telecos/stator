@@ -216,6 +216,29 @@ fn bucket_index_for_us(elapsed_us: u64) -> usize {
 static SLOTS: [TierSlot; PromotionTier::COUNT] =
     [TierSlot::new(), TierSlot::new(), TierSlot::new()];
 
+#[cfg(test)]
+pub(crate) fn run_counter_test_in_subprocess(test_name: &str) -> bool {
+    // Other parallel tests also update these process-global counters.
+    let test_name = test_name.split_once("::").unwrap().1;
+    const CHILD_TEST: &str = "STATOR_TIER_LATENCY_CHILD_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+        return false;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("running 1 test"),
+        "isolated test {test_name} failed:\n{stdout}\n{stderr}"
+    );
+    true
+}
+
 /// Record a tier-promotion request for `tier`.
 ///
 /// Call once at the start of every promotion entry point that may
@@ -408,18 +431,6 @@ impl PromotionTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // The counters are process-global, so tests that mutate them must
-    // run serially to avoid interfering with each other.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        match TEST_LOCK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
 
     #[test]
     fn tier_names_are_stable() {
@@ -430,7 +441,12 @@ mod tests {
 
     #[test]
     fn record_request_increments_only_requested() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::record_request_increments_only_requested"
+        )) {
+            return;
+        }
         reset();
         record_request(PromotionTier::Baseline);
         record_request(PromotionTier::Baseline);
@@ -445,7 +461,12 @@ mod tests {
 
     #[test]
     fn record_success_and_failure_are_per_tier() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::record_success_and_failure_are_per_tier"
+        )) {
+            return;
+        }
         reset();
         record_request(PromotionTier::Maglev);
         record_success(PromotionTier::Maglev, Duration::from_micros(123));
@@ -473,7 +494,12 @@ mod tests {
 
     #[test]
     fn max_latency_tracks_largest_sample() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::max_latency_tracks_largest_sample"
+        )) {
+            return;
+        }
         reset();
         record_request(PromotionTier::Baseline);
         record_success(PromotionTier::Baseline, Duration::from_micros(50));
@@ -492,7 +518,12 @@ mod tests {
 
     #[test]
     fn histogram_buckets_classify_correctly() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::histogram_buckets_classify_correctly"
+        )) {
+            return;
+        }
         reset();
         record_request(PromotionTier::Baseline);
         record_success(PromotionTier::Baseline, Duration::from_nanos(500)); // ≤ 1µs
@@ -516,7 +547,12 @@ mod tests {
 
     #[test]
     fn timer_records_request_and_success() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::timer_records_request_and_success"
+        )) {
+            return;
+        }
         reset();
         let timer = PromotionTimer::start(PromotionTier::Maglev);
         std::thread::sleep(Duration::from_micros(10));
@@ -533,7 +569,12 @@ mod tests {
 
     #[test]
     fn timer_records_request_and_failure() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::timer_records_request_and_failure"
+        )) {
+            return;
+        }
         reset();
         let timer = PromotionTimer::start(PromotionTier::Turbofan);
         timer.record_failure();
@@ -546,7 +587,12 @@ mod tests {
 
     #[test]
     fn timer_discard_records_request_only() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::timer_discard_records_request_only"
+        )) {
+            return;
+        }
         reset();
         let timer = PromotionTimer::start(PromotionTier::Baseline);
         timer.discard();
@@ -561,7 +607,12 @@ mod tests {
 
     #[test]
     fn reset_zeros_all_counters_and_buckets() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::reset_zeros_all_counters_and_buckets"
+        )) {
+            return;
+        }
         reset();
         for tier in PromotionTier::all() {
             record_request(tier);
@@ -591,7 +642,12 @@ mod tests {
 
     #[test]
     fn no_drift_after_reset_under_concurrent_updates() {
-        let _g = lock();
+        if run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::no_drift_after_reset_under_concurrent_updates"
+        )) {
+            return;
+        }
         reset();
         // Sequential workload, then reset, then verify no drift on a
         // subsequent read.  Genuine concurrency is exercised by the
