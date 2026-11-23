@@ -24249,14 +24249,12 @@ mod tests {
     #[test]
     fn test_force_tier_updates_tier_latency_counters() {
         use crate::compiler::tier_latency::{self, PromotionTier};
-        use std::sync::Mutex;
-        // tier_latency counters are process-global, so serialise with
-        // any other tests that mutate them.
-        static GUARD: Mutex<()> = Mutex::new(());
-        let _g = match GUARD.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        if tier_latency::run_counter_test_in_subprocess(concat!(
+            module_path!(),
+            "::test_force_tier_updates_tier_latency_counters"
+        )) {
+            return;
+        }
 
         // 1. JitDisabled path: counters untouched.
         tier_latency::reset();
