@@ -317,17 +317,28 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // The counters are process-global, so tests that mutate them must run
-    // serially.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        match TEST_LOCK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+    // Interpreter tests also update these process-global counters, so a mutex
+    // local to this module cannot isolate assertions about exact values.
+    fn isolated(test: &str) -> bool {
+        const CHILD_TEST: &str = "STATOR_IC_COUNTERS_CHILD_TEST";
+        let test = test.split_once("::").unwrap().1;
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+            return true;
         }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD_TEST, test)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "isolated test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
     }
 
     #[test]
@@ -371,7 +382,12 @@ mod tests {
 
     #[test]
     fn test_reset_and_snapshot_round_trip() {
-        let _g = lock();
+        if !isolated(concat!(
+            module_path!(),
+            "::test_reset_and_snapshot_round_trip"
+        )) {
+            return;
+        }
         reset();
         let before = snapshot();
         assert_eq!(before.total(), 0);
@@ -404,7 +420,12 @@ mod tests {
 
     #[test]
     fn test_tier_and_op_attribution_is_isolated() {
-        let _g = lock();
+        if !isolated(concat!(
+            module_path!(),
+            "::test_tier_and_op_attribution_is_isolated"
+        )) {
+            return;
+        }
         reset();
         record_hit(IcTier::Interpreter, IcOp::NamedLoad);
         record_miss(IcTier::Interpreter, IcOp::NamedStore);
@@ -444,7 +465,12 @@ mod tests {
 
     #[test]
     fn test_unsupported_tiers_stay_zero_when_interpreter_records() {
-        let _g = lock();
+        if !isolated(concat!(
+            module_path!(),
+            "::test_unsupported_tiers_stay_zero_when_interpreter_records"
+        )) {
+            return;
+        }
         reset();
         // Hammer the Interpreter row with mixed events.
         for _ in 0..16 {
@@ -464,7 +490,12 @@ mod tests {
 
     #[test]
     fn test_no_counter_drift_across_snapshots() {
-        let _g = lock();
+        if !isolated(concat!(
+            module_path!(),
+            "::test_no_counter_drift_across_snapshots"
+        )) {
+            return;
+        }
         reset();
         record_probe(IcTier::Interpreter, IcOp::NamedLoad);
         record_hit(IcTier::Interpreter, IcOp::NamedLoad);
@@ -478,7 +509,12 @@ mod tests {
 
     #[test]
     fn test_reset_clears_every_cell_then_no_drift() {
-        let _g = lock();
+        if !isolated(concat!(
+            module_path!(),
+            "::test_reset_clears_every_cell_then_no_drift"
+        )) {
+            return;
+        }
         reset();
         for tier in IcTier::all() {
             for op in IcOp::all() {
